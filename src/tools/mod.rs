@@ -72,6 +72,7 @@ pub mod screenshot;
 pub mod security_ops;
 pub mod shell;
 pub mod swarm;
+pub mod ticket;
 pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
@@ -134,6 +135,7 @@ pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
 pub use shell::ShellTool;
 pub use swarm::SwarmTool;
+pub use ticket::TicketTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -454,6 +456,9 @@ pub fn all_tools_with_runtime(
             mx.access_token.clone(),
         )));
     }
+
+    // Ticket management tool (config-driven, shells out to `tk` CLI)
+    tool_arcs.push(Arc::new(TicketTool::new(workspace_dir.to_path_buf())));
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));

@@ -3,6 +3,7 @@
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
 use super::AppState;
+use crate::cost::types::CostSummary;
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -567,14 +568,7 @@ pub async fn handle_api_cost(
         }
     } else {
         Json(serde_json::json!({
-            "cost": {
-                "session_cost_usd": 0.0,
-                "daily_cost_usd": 0.0,
-                "monthly_cost_usd": 0.0,
-                "total_tokens": 0,
-                "request_count": 0,
-                "by_model": {},
-            }
+            "cost": CostSummary::default()
         }))
         .into_response()
     }

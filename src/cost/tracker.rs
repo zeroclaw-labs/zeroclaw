@@ -152,10 +152,28 @@ impl CostTracker {
         let request_count = session_costs.len();
         let by_model = build_session_model_stats(&session_costs);
 
+        let (daily_remaining, monthly_remaining, daily_limit, monthly_limit) =
+            if self.config.enabled {
+                let dr = (self.config.daily_limit_usd - daily_cost).max(0.0);
+                let mr = (self.config.monthly_limit_usd - monthly_cost).max(0.0);
+                (
+                    Some(dr),
+                    Some(mr),
+                    Some(self.config.daily_limit_usd),
+                    Some(self.config.monthly_limit_usd),
+                )
+            } else {
+                (None, None, None, None)
+            };
+
         Ok(CostSummary {
             session_cost_usd: session_cost,
             daily_cost_usd: daily_cost,
             monthly_cost_usd: monthly_cost,
+            daily_remaining_usd: daily_remaining,
+            monthly_remaining_usd: monthly_remaining,
+            daily_limit_usd: daily_limit,
+            monthly_limit_usd: monthly_limit,
             total_tokens,
             request_count,
             by_model,

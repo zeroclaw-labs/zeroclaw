@@ -329,6 +329,494 @@ impl MatrixChannel {
         !body.trim().is_empty()
     }
 
+    fn is_usage_command(body: &str) -> bool {
+        let trimmed = body.trim().to_lowercase();
+        trimmed == "usage"
+            || trimmed == "!usage"
+            || trimmed == "#usage"
+            || trimmed == "/usage"
+            || trimmed.starts_with("usage ")
+            || trimmed.starts_with("!usage ")
+            || trimmed.starts_with("#usage ")
+            || trimmed.starts_with("/usage ")
+    }
+
+    async fn handle_usage_command() -> String {
+        // Fetch live quota from Anthropic's OAuth usage endpoint.
+        // Token is stored in macOS Keychain under "Claude Code-credentials".
+        if let Some(result) = Self::fetch_oauth_usage().await {
+            return result;
+        }
+        // Fallback: aggregate historical token counts from session JSONL files.
+        tokio::task::spawn_blocking(Self::aggregate_claude_code_usage)
+            .await
+            .unwrap_or_else(|_| "Usage data unavailable.".to_string())
+    }
+
+    async fn fetch_oauth_usage() -> Option<String> {
+        // Retrieve the OAuth access token from macOS Keychain.
+        let keychain_output = tokio::process::Command::new("security")
+            .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+            .output()
+            .await
+            .ok()?;
+
+        if !keychain_output.status.success() {
+            return None;
+        }
+
+        let json_str = String::from_utf8_lossy(&keychain_output.stdout);
+        let creds: serde_json::Value = serde_json::from_str(json_str.trim()).ok()?;
+        let token = creds
+            .get("claudeAiOauth")?
+            .get("accessToken")?
+            .as_str()?
+            .to_string();
+
+        // Call the usage endpoint.
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            reqwest::Client::new()
+                .get("https://api.anthropic.com/api/oauth/usage")
+                .header("Authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .header("User-Agent", "claude-code/2.0.32")
+                .send(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let data: serde_json::Value = resp.json().await.ok()?;
+
+        let fmt_bar = |pct: f64| -> String {
+            let filled = ((pct / 100.0) * 20.0).round() as usize;
+            let filled = filled.min(20);
+            format!("{}{} {:.0}%", "█".repeat(filled), "░".repeat(20 - filled), pct)
+        };
+
+        let fmt_reset = |resets_at: Option<&str>| -> String {
+            resets_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| {
+                    let local = dt.with_timezone(&chrono::Local);
+                    local.format("Resets %I:%M%P").to_string()
+                })
+                .unwrap_or_else(|| "No reset info".to_string())
+        };
+
+        let mut out = String::from("**Claude Code Usage**\n\n");
+
+        if let Some(fh) = data.get("five_hour") {
+            let pct = fh.get("utilization").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let reset = fh.get("resets_at").and_then(|v| v.as_str());
+            out.push_str(&format!("**Session (5h)**\n`{}`\n_{}_\n\n", fmt_bar(pct), fmt_reset(reset)));
+        }
+
+        if let Some(sd) = data.get("seven_day") {
+            let pct = sd.get("utilization").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let reset = sd.get("resets_at").and_then(|v| v.as_str());
+            out.push_str(&format!("**Week (all models)**\n`{}`\n_{}_\n\n", fmt_bar(pct), fmt_reset(reset)));
+        }
+
+        for (key, label) in &[
+            ("seven_day_sonnet", "Week (Sonnet)"),
+            ("seven_day_opus",   "Week (Opus)"),
+        ] {
+            if let Some(bucket) = data.get(key) {
+                if let Some(pct) = bucket.get("utilization").and_then(|v| v.as_f64()) {
+                    let reset = bucket.get("resets_at").and_then(|v| v.as_str());
+                    out.push_str(&format!("**{}**\n`{}`\n_{}_\n\n", label, fmt_bar(pct), fmt_reset(reset)));
+                }
+            }
+        }
+
+        if let Some(extra) = data.get("extra_usage") {
+            let enabled = extra.get("is_enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+            if enabled {
+                let pct = extra.get("utilization").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                out.push_str(&format!("**Extra usage**\n`{}`\n\n", fmt_bar(pct)));
+            } else {
+                out.push_str("**Extra usage:** not enabled\n");
+            }
+        }
+
+        Some(out.trim_end().to_string())
+    }
+
+    /// Estimate cost in USD from token counts based on model name.
+    fn estimate_cost(model: &str, input: u64, output: u64, cache_read: u64, cache_creation: u64) -> f64 {
+        // Prices per million tokens (as of mid-2025)
+        let (inp_pm, out_pm, cr_pm, cc_pm) = if model.contains("opus") {
+            (15.0, 75.0, 1.50, 18.75)
+        } else if model.contains("haiku") {
+            (0.80, 4.0, 0.08, 1.0)
+        } else {
+            // sonnet or unknown — use sonnet pricing
+            (3.0, 15.0, 0.30, 3.75)
+        };
+        (input as f64 * inp_pm
+            + output as f64 * out_pm
+            + cache_read as f64 * cr_pm
+            + cache_creation as f64 * cc_pm)
+            / 1_000_000.0
+    }
+
+    fn aggregate_claude_code_usage() -> String {
+        let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
+            Ok(h) => std::path::PathBuf::from(h),
+            Err(_) => return "Usage data unavailable: HOME not set.".to_string(),
+        };
+
+        let projects_dir = home.join(".claude").join("projects");
+        if !projects_dir.exists() {
+            return "Usage data unavailable: `~/.claude/projects` not found.".to_string();
+        }
+
+        #[derive(Default)]
+        struct Bucket {
+            input: u64,
+            output: u64,
+            cache_read: u64,
+            cache_creation: u64,
+            cost_usd: f64,
+            messages: u64,
+        }
+
+        let now_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        // week = last 7 days prefix strings
+        let week_starts: Vec<String> = (0u64..7)
+            .map(|d| {
+                (chrono::Utc::now() - chrono::Duration::days(d as i64))
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .collect();
+
+        let mut today = Bucket::default();
+        let mut week = Bucket::default();
+        let mut all_time = Bucket::default();
+        let mut model_map: std::collections::HashMap<String, Bucket> =
+            std::collections::HashMap::new();
+
+        let project_dirs = match std::fs::read_dir(&projects_dir) {
+            Ok(d) => d,
+            Err(_) => return "Usage data unavailable: cannot read `~/.claude/projects`.".to_string(),
+        };
+
+        // Deduplicate by message ID: streaming JSONL writes multiple partial records
+        // per turn. Keep only the entry with the highest output_tokens per message ID.
+        struct MsgRecord {
+            ts: String,
+            model: String,
+            inp: u64,
+            out: u64,
+            cr: u64,
+            cc: u64,
+        }
+        let mut best: std::collections::HashMap<String, MsgRecord> =
+            std::collections::HashMap::new();
+
+        for project_entry in project_dirs.flatten() {
+            let path = project_entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let files = match std::fs::read_dir(&path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            for file_entry in files.flatten() {
+                let fpath = file_entry.path();
+                if fpath.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let contents = match std::fs::read_to_string(&fpath) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                for line in contents.lines() {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                        continue;
+                    };
+                    let msg = match entry.get("message") {
+                        Some(m) => m,
+                        None => continue,
+                    };
+                    if msg.get("role").and_then(|r| r.as_str()) != Some("assistant") {
+                        continue;
+                    }
+                    let usage = match msg.get("usage") {
+                        Some(u) => u,
+                        None => continue,
+                    };
+                    let mid = msg.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let out = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+
+                    // Skip partial streaming records (no output yet)
+                    if out == 0 && mid.is_empty() {
+                        continue;
+                    }
+
+                    let existing_out = best.get(&mid).map(|r| r.out).unwrap_or(0);
+                    if out >= existing_out {
+                        best.insert(mid, MsgRecord {
+                            ts: entry.get("timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                            model: msg.get("model").and_then(|m| m.as_str()).unwrap_or("unknown").to_string(),
+                            inp: usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                            out,
+                            cr: usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                            cc: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                        });
+                    }
+                }
+            }
+        }
+
+        for rec in best.values() {
+            let cost = Self::estimate_cost(&rec.model, rec.inp, rec.out, rec.cr, rec.cc);
+
+            all_time.input += rec.inp;
+            all_time.output += rec.out;
+            all_time.cache_read += rec.cr;
+            all_time.cache_creation += rec.cc;
+            all_time.cost_usd += cost;
+            all_time.messages += 1;
+
+            if rec.ts.starts_with(&now_str) {
+                today.input += rec.inp;
+                today.output += rec.out;
+                today.cache_read += rec.cr;
+                today.cache_creation += rec.cc;
+                today.cost_usd += cost;
+                today.messages += 1;
+            }
+
+            if week_starts.iter().any(|d| rec.ts.starts_with(d.as_str())) {
+                week.input += rec.inp;
+                week.output += rec.out;
+                week.cache_read += rec.cr;
+                week.cache_creation += rec.cc;
+                week.cost_usd += cost;
+                week.messages += 1;
+            }
+
+            let entry = model_map
+                .entry(rec.model.clone())
+                .or_insert_with(Bucket::default);
+            entry.input += rec.inp;
+            entry.output += rec.out;
+            entry.cache_read += rec.cr;
+            entry.cache_creation += rec.cc;
+            entry.cost_usd += cost;
+            entry.messages += 1;
+        }
+
+        if all_time.messages == 0 {
+            return "No Claude Code usage data found.".to_string();
+        }
+
+        let fmt_tok = |n: u64| -> String {
+            if n >= 1_000_000 {
+                format!("{:.2}M", n as f64 / 1_000_000.0)
+            } else if n >= 1_000 {
+                format!("{:.1}k", n as f64 / 1_000.0)
+            } else {
+                n.to_string()
+            }
+        };
+
+        let fmt_cost = |c: f64| -> String { format!("${:.4}", c) };
+
+        let row = |b: &Bucket| -> String {
+            format!(
+                "in {} · out {} · cache r{}/w{} · {} · {} msgs",
+                fmt_tok(b.input),
+                fmt_tok(b.output),
+                fmt_tok(b.cache_read),
+                fmt_tok(b.cache_creation),
+                fmt_cost(b.cost_usd),
+                b.messages,
+            )
+        };
+
+        let mut out = String::from("**Claude Code Usage** _(API-rate estimates)_\n\n");
+        out.push_str(&format!("**Today:** {}\n", row(&today)));
+        out.push_str(&format!("**7 days:** {}\n", row(&week)));
+        out.push_str(&format!("**All time:** {}\n", row(&all_time)));
+
+        if !model_map.is_empty() {
+            let mut models: Vec<_> = model_map.iter().collect();
+            models.sort_by(|a, b| b.1.cost_usd.partial_cmp(&a.1.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+            out.push_str("\n**By model:**\n");
+            for (model, b) in models.iter().take(5) {
+                out.push_str(&format!(
+                    "- `{}` — {} msgs · {}\n",
+                    model, b.messages, fmt_cost(b.cost_usd)
+                ));
+            }
+        }
+
+        out
+    }
+
+    /// After initial sync, scan each accepted room for unanswered messages sent during downtime.
+    /// For each room, queues at most the single most-recent unanswered message. Rooms are
+    /// processed with a 500 ms inter-room delay to avoid response floods. Messages older than
+    /// 24 hours are ignored.
+    async fn check_unanswered_on_startup(
+        &self,
+        accepted_rooms: &HashSet<OwnedRoomId>,
+        my_user_id: &str,
+        dedupe: &Arc<Mutex<(std::collections::VecDeque<String>, std::collections::HashSet<String>)>>,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) {
+        let cutoff_ms = chrono::Utc::now().timestamp_millis() - 86_400_000;
+
+        let mut rooms: Vec<&OwnedRoomId> = accepted_rooms.iter().collect();
+        rooms.sort_by_key(|r| r.as_str());
+
+        for (i, room_id) in rooms.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            }
+
+            let encoded = Self::encode_path_segment(room_id.as_str());
+            let url = format!(
+                "{}/_matrix/client/v3/rooms/{}/messages?dir=b&limit=50",
+                self.homeserver, encoded
+            );
+
+            let resp = match self
+                .http_client
+                .get(&url)
+                .header("Authorization", self.auth_header_value())
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    tracing::warn!(
+                        "Startup check: messages API returned {} for {}",
+                        r.status(),
+                        room_id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Startup check: failed to fetch messages for {}: {}",
+                        room_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let data: serde_json::Value = match resp.json().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "Startup check: failed to parse messages for {}: {}",
+                        room_id,
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let chunk = match data.get("chunk").and_then(|c| c.as_array()) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            // chunk is newest-first (dir=b). Walk until we find the most recent
+            // allowed-user message. If a bot message appears first, the room is answered.
+            let mut candidate: Option<(String, String, String, i64)> = None;
+
+            for event in chunk {
+                let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if event_type != "m.room.message" {
+                    continue;
+                }
+
+                let ts = event
+                    .get("origin_server_ts")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0);
+                if ts < cutoff_ms {
+                    break;
+                }
+
+                let sender = event.get("sender").and_then(|s| s.as_str()).unwrap_or("");
+
+                if sender == my_user_id {
+                    break; // bot already replied — room is answered
+                }
+
+                if !Self::is_sender_allowed(&self.allowed_users, sender) {
+                    continue;
+                }
+
+                let body = event
+                    .get("content")
+                    .and_then(|c| c.get("body"))
+                    .and_then(|b| b.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if !Self::has_non_empty_body(&body) {
+                    continue;
+                }
+
+                let event_id = event
+                    .get("event_id")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                candidate = Some((event_id, sender.to_string(), body, ts));
+                break;
+            }
+
+            if let Some((event_id, sender, body, ts)) = candidate {
+                {
+                    let mut guard = dedupe.lock().await;
+                    let (recent_order, recent_lookup) = &mut *guard;
+                    if Self::cache_event_id(&event_id, recent_order, recent_lookup) {
+                        continue;
+                    }
+                }
+
+                tracing::info!(
+                    "Matrix startup: queuing unanswered message in {} from {}",
+                    room_id,
+                    sender
+                );
+
+                let msg = ChannelMessage {
+                    id: event_id,
+                    sender: sender.clone(),
+                    reply_target: format!("{}||{}", sender, room_id),
+                    content: body,
+                    channel: "matrix".to_string(),
+                    timestamp: (ts / 1000) as u64,
+                    thread_ts: None,
+                };
+
+                let _ = tx.send(msg).await;
+            }
+        }
+    }
+
     fn cache_event_id(
         event_id: &str,
         recent_order: &mut std::collections::VecDeque<String>,
@@ -1149,6 +1637,14 @@ impl Channel for MatrixChannel {
             std::collections::HashSet::new(),
         )));
 
+        self.check_unanswered_on_startup(
+            &accepted_rooms,
+            my_user_id.as_str(),
+            &recent_event_cache,
+            &tx,
+        )
+        .await;
+
         let tx_handler = tx.clone();
         let accepted_rooms_for_handler = Arc::new(accepted_rooms);
         let my_user_id_for_handler = my_user_id.clone();
@@ -1333,6 +1829,37 @@ impl Channel for MatrixChannel {
                     .await
                 {
                     tracing::warn!("Matrix failed to send read receipt: {error}");
+                }
+
+                // Check for usage command (zero-token operation)
+                if MatrixChannel::is_usage_command(&body) {
+                    let usage_result = MatrixChannel::handle_usage_command().await;
+                    let mut content = RoomMessageEventContent::text_markdown(&usage_result);
+
+                    if let Some(ref thread_ts) = match &event.content.relates_to {
+                        Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
+                        _ => None,
+                    } {
+                        if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
+                            content.relates_to = Some(Relation::Thread(Thread::plain(
+                                thread_root.clone(),
+                                thread_root,
+                            )));
+                        }
+                    }
+
+                    if let Err(e) = room.send(content).await {
+                        tracing::warn!("Matrix failed to send usage result: {}", e);
+                    } else {
+                        tracing::info!("Matrix usage command executed");
+                    }
+
+                    // Stop typing notification
+                    if let Err(error) = room.typing_notice(false).await {
+                        tracing::warn!("Matrix failed to stop typing notification: {error}");
+                    }
+
+                    return;
                 }
 
                 // Start typing notification while processing begins

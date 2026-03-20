@@ -86,6 +86,7 @@ Last refreshed: **February 18, 2026**.
 - [commands-reference.md](reference/cli/commands-reference.md)
 - [providers-reference.md](reference/api/providers-reference.md)
 - [channels-reference.md](reference/api/channels-reference.md)
+- [llama-cpp-setup.md](setup-guides/llama-cpp-setup.md)
 - [nextcloud-talk-setup.md](setup-guides/nextcloud-talk-setup.md)
 - [config-reference.md](reference/api/config-reference.md)
 - [custom-providers.md](contributing/custom-providers.md)

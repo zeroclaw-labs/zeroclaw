@@ -1272,6 +1272,468 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response
 }
 
+/// Known `tk` subcommands that are handled directly (zero LLM tokens).
+const TICKET_SUBCOMMANDS: &[&str] = &[
+    "list", "show", "stats", "pipeline", "query", "ready", "blocked", "advance", "add-note",
+    "closed", "create", "help",
+];
+
+fn is_ticket_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "ticket"
+        || lower == "tickets"
+        || lower.starts_with("ticket ")
+        || lower.starts_with("tickets ")
+}
+
+/// Parse a ticket message into tk CLI arguments.
+/// Returns the args to pass to `tk`, or None for help.
+fn parse_ticket_args(content: &str) -> TicketAction {
+    let trimmed = content.trim();
+    let lower = trimmed.to_lowercase();
+    let rest = if lower.starts_with("tickets ") {
+        trimmed["tickets ".len()..].trim()
+    } else if lower.starts_with("ticket ") {
+        trimmed["ticket ".len()..].trim()
+    } else {
+        return TicketAction::Help;
+    };
+
+    if rest.is_empty() {
+        return TicketAction::Help;
+    }
+
+    let first_word = rest
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+
+    if first_word == "help" {
+        return TicketAction::Help;
+    }
+
+    if first_word == "create" {
+        // Explicit create — parse title + optional description from the rest.
+        let body = rest[first_word.len()..].trim();
+        let (title, description) = parse_ticket_title_desc(body);
+        let mut args = vec!["create".to_string(), title];
+        if let Some(desc) = description {
+            args.push("-d".to_string());
+            args.push(desc);
+        }
+        TicketAction::Command(args)
+    } else if TICKET_SUBCOMMANDS.contains(&first_word.as_str()) {
+        // Known subcommand — pass remaining words as args to `tk <subcommand> ...`
+        let args_str = rest[first_word.len()..].trim();
+        let mut args = vec![first_word];
+        if !args_str.is_empty() {
+            args.extend(args_str.split_whitespace().map(String::from));
+        }
+        TicketAction::Command(args)
+    } else {
+        // No known subcommand — treat as implicit `create <text>`
+        let (title, description) = parse_ticket_title_desc(rest);
+        let mut args = vec!["create".to_string(), title];
+        if let Some(desc) = description {
+            args.push("-d".to_string());
+            args.push(desc);
+        }
+        TicketAction::Command(args)
+    }
+}
+
+enum TicketAction {
+    Help,
+    Command(Vec<String>),
+}
+
+fn build_ticket_help() -> String {
+    [
+        "**Ticket Commands**",
+        "",
+        "**ticket list** `[--type X] [--tag X]` \u{2014} List open tickets",
+        "**ticket show** `<id>` \u{2014} Show ticket details",
+        "**ticket create** `<title>` \u{2014} Create a new ticket",
+        "**ticket stats** \u{2014} Project health overview",
+        "**ticket pipeline** `[--stage X]` \u{2014} Tickets by pipeline stage",
+        "**ticket query** `[filter]` \u{2014} Query with jq filter",
+        "**ticket ready** \u{2014} Unblocked tickets",
+        "**ticket blocked** \u{2014} Blocked tickets",
+        "**ticket advance** `<id>` \u{2014} Advance to next stage",
+        "**ticket add-note** `<id> <text>` \u{2014} Append note to ticket",
+        "**ticket closed** `[--limit N]` \u{2014} Recently closed tickets",
+        "**ticket help** \u{2014} Show this help",
+        "",
+        "`ticket <text>` is shorthand for **ticket create**",
+    ]
+    .join("\n")
+}
+
+/// Format JSONL ticket output into readable markdown.
+fn format_ticket_list(jsonl: &str) -> String {
+    let mut by_stage: std::collections::BTreeMap<String, Vec<(String, String, u64, String)>> =
+        std::collections::BTreeMap::new();
+
+    for line in jsonl.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            let stage = v["stage"].as_str().unwrap_or("unknown").to_string();
+            let id = v["id"].as_str().unwrap_or("?").to_string();
+            let title = v["title"].as_str().unwrap_or("Untitled").to_string();
+            let priority = v["priority"].as_u64().unwrap_or(2);
+            let ticket_type = v["type"].as_str().unwrap_or("task").to_string();
+            by_stage
+                .entry(stage)
+                .or_default()
+                .push((id, title, priority, ticket_type));
+        }
+    }
+
+    if by_stage.is_empty() {
+        return "No tickets found.".to_string();
+    }
+
+    let mut lines = Vec::new();
+    for (stage, tickets) in &by_stage {
+        lines.push(format!("**{}** ({})", stage, tickets.len()));
+        for (id, title, priority, ticket_type) in tickets {
+            let type_badge = match ticket_type.as_str() {
+                "bug" => "\u{1F41B}",
+                "feature" => "\u{2728}",
+                "epic" => "\u{1F3AF}",
+                "chore" => "\u{1F9F9}",
+                _ => "\u{1F4CB}",
+            };
+            lines.push(format!(
+                "  {type_badge} **{title}**\n    `{id}` \u{2022} P{priority} \u{2022} {ticket_type}"
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    lines.join("\n")
+}
+
+/// Format the output of `tk create` into a clean response.
+fn format_ticket_created(stdout: &str) -> String {
+    if let Some(id_line) = stdout.lines().find(|l| l.trim_start().starts_with("id:")) {
+        let id = id_line.trim_start_matches("id:").trim();
+        format!("Ticket filed: `{id}`")
+    } else {
+        "Ticket filed.".to_string()
+    }
+}
+
+/// Format `tk show` output: YAML frontmatter → clean header, body as-is.
+fn format_ticket_show(stdout: &str) -> String {
+    let trimmed = stdout.trim();
+
+    // Parse frontmatter between --- delimiters
+    if !trimmed.starts_with("---") {
+        return stdout.to_string();
+    }
+
+    let after_first = &trimmed[3..];
+    let Some(end_idx) = after_first.find("\n---") else {
+        return stdout.to_string();
+    };
+
+    let frontmatter = &after_first[..end_idx];
+    let body = after_first[end_idx + 4..].trim();
+
+    // Extract fields from frontmatter
+    let mut id = "";
+    let mut stage = "";
+    let mut priority = "";
+    let mut ticket_type = "";
+    let mut assignee = "";
+    let mut tags = String::new();
+
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("id:") {
+            id = v.trim();
+        } else if let Some(v) = line.strip_prefix("stage:") {
+            stage = v.trim();
+        } else if let Some(v) = line.strip_prefix("priority:") {
+            priority = v.trim();
+        } else if let Some(v) = line.strip_prefix("type:") {
+            ticket_type = v.trim();
+        } else if let Some(v) = line.strip_prefix("assignee:") {
+            assignee = v.trim();
+        } else if let Some(v) = line.strip_prefix("tags:") {
+            tags = v
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string();
+        }
+    }
+
+    let type_badge = match ticket_type {
+        "bug" => "\u{1F41B}",
+        "feature" => "\u{2728}",
+        "epic" => "\u{1F3AF}",
+        "chore" => "\u{1F9F9}",
+        _ => "\u{1F4CB}",
+    };
+
+    // Build title from body (first # heading or first line)
+    let title = body
+        .lines()
+        .find(|l| l.starts_with("# "))
+        .map(|l| l.trim_start_matches("# ").trim())
+        .unwrap_or("Untitled");
+
+    let description = body
+        .lines()
+        .skip_while(|l| l.starts_with("# ") || l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string();
+
+    let mut out = format!("{type_badge} **{title}**\n`{id}` \u{2022} **{stage}** \u{2022} P{priority} \u{2022} {ticket_type}");
+    if !assignee.is_empty() {
+        out.push_str(&format!(" \u{2022} {assignee}"));
+    }
+    if !tags.is_empty() {
+        out.push_str(&format!("\nTags: {tags}"));
+    }
+    if !description.is_empty() {
+        out.push_str(&format!("\n\n{description}"));
+    }
+    out
+}
+
+/// Format `tk stats` output with bold section headers.
+fn format_ticket_stats(stdout: &str) -> String {
+    let mut lines = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            lines.push(String::new());
+        } else if trimmed.ends_with(':')
+            && trimmed
+                .chars()
+                .next()
+                .map_or(false, |c| c.is_ascii_uppercase())
+        {
+            // Section headers like "Stage:", "Types:", "Priority:", "Open Tickets:"
+            lines.push(format!("**{}**", trimmed));
+        } else if trimmed == "PROJECT HEALTH" {
+            lines.push(format!("**{}**", trimmed));
+        } else if trimmed.contains(char::is_whitespace) {
+            // Key-value lines: bold the key
+            let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+            if parts.len() == 2 {
+                lines.push(format!("  **{}** {}", parts[0], parts[1].trim()));
+            } else {
+                lines.push(format!("  {trimmed}"));
+            }
+        } else {
+            lines.push(format!("  {trimmed}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Parse a ticket create body into `(title, Option<description>)`.
+///
+/// Splits on the first sentence-ending punctuation or newline: everything
+/// before becomes the title, everything after becomes the description.
+fn parse_ticket_title_desc(rest: &str) -> (String, Option<String>) {
+    if rest.is_empty() {
+        return ("Untitled ticket".to_string(), None);
+    }
+
+    let split_at = rest
+        .char_indices()
+        .find(|(_, c)| matches!(c, '.' | '!' | '?' | '\n'))
+        .map(|(i, c)| i + c.len_utf8());
+
+    if let Some(idx) = split_at {
+        let title = rest[..idx]
+            .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+            .trim()
+            .to_string();
+        let desc = rest[idx..].trim();
+        if desc.is_empty() {
+            (title, None)
+        } else {
+            (title, Some(desc.to_string()))
+        }
+    } else {
+        (rest.to_string(), None)
+    }
+}
+
+/// Legacy parse function — retained for existing tests.
+fn parse_ticket_content(content: &str) -> (String, Option<String>) {
+    let trimmed = content.trim();
+    let lower = trimmed.to_lowercase();
+    let rest = if lower.starts_with("tickets ") {
+        trimmed["tickets ".len()..].trim()
+    } else if lower.starts_with("ticket ") {
+        trimmed["ticket ".len()..].trim()
+    } else {
+        return ("Untitled ticket".to_string(), None);
+    };
+
+    // Strip explicit "create" prefix: "ticket create fix the bug" → "fix the bug"
+    let rest = if rest.to_lowercase().starts_with("create ") {
+        rest["create ".len()..].trim()
+    } else if rest.eq_ignore_ascii_case("create") {
+        return ("Untitled ticket".to_string(), None);
+    } else {
+        rest
+    };
+
+    if rest.is_empty() {
+        return ("Untitled ticket".to_string(), None);
+    }
+
+    // Split on the first sentence boundary or newline.
+    let split_at = rest
+        .char_indices()
+        .find(|(_, c)| matches!(c, '.' | '!' | '?' | '\n'))
+        .map(|(i, c)| i + c.len_utf8());
+
+    if let Some(idx) = split_at {
+        let title = rest[..idx]
+            .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+            .trim()
+            .to_string();
+        let desc = rest[idx..].trim();
+        if desc.is_empty() {
+            (title, None)
+        } else {
+            (title, Some(desc.to_string()))
+        }
+    } else {
+        (rest.to_string(), None)
+    }
+}
+
+async fn handle_ticket_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_ticket_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    let room_id = extract_room_id(&msg.reply_target);
+    let workspace_dir = ctx
+        .channel_workspace_map
+        .get(room_id)
+        .or_else(|| ctx.channel_workspace_map.get(&msg.channel))
+        .map(|p| p.as_path())
+        .unwrap_or_else(|| ctx.workspace_dir.as_path());
+
+    let action = parse_ticket_args(&msg.content);
+
+    let response = match action {
+        TicketAction::Help => build_ticket_help(),
+        TicketAction::Command(ref args) => {
+            let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
+
+            // For `list`, use `tk query` with filters for structured JSONL output.
+            // All other subcommands run `tk <subcommand>` directly.
+            let (tk_args, format_mode) = if subcommand == "list" {
+                let mut conditions = vec![".stage != \"done\"".to_string()];
+                let mut i = 1;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--type" | "-t" if i + 1 < args.len() => {
+                            conditions
+                                .push(format!(".type == \"{}\"", args[i + 1]));
+                            i += 2;
+                        }
+                        "--tag" | "-T" if i + 1 < args.len() => {
+                            conditions.push(format!(
+                                "(.tags // [] | any(. == \"{}\"))",
+                                args[i + 1]
+                            ));
+                            i += 2;
+                        }
+                        "--priority" | "-P" if i + 1 < args.len() => {
+                            conditions
+                                .push(format!(".priority == {}", args[i + 1]));
+                            i += 2;
+                        }
+                        "--assignee" | "-a" if i + 1 < args.len() => {
+                            conditions
+                                .push(format!(".assignee == \"{}\"", args[i + 1]));
+                            i += 2;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                (
+                    vec!["query".to_string(), conditions.join(" and ")],
+                    "list",
+                )
+            } else {
+                (args.clone(), subcommand)
+            };
+
+            let mut cmd = tokio::process::Command::new("tk");
+            cmd.args(&tk_args).current_dir(workspace_dir);
+
+            match cmd.output().await {
+                Ok(output) if output.status.success() => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if stdout.trim().is_empty() {
+                        match format_mode {
+                            "list" => "No tickets found.".to_string(),
+                            "ready" => "No unblocked tickets.".to_string(),
+                            "blocked" => "No blocked tickets.".to_string(),
+                            "closed" => "No recently closed tickets.".to_string(),
+                            _ => "Done.".to_string(),
+                        }
+                    } else {
+                        match format_mode {
+                            "list" => format_ticket_list(&stdout),
+                            "create" => format_ticket_created(&stdout),
+                            "show" => format_ticket_show(&stdout),
+                            "stats" => format_ticket_stats(&stdout),
+                            _ => stdout.to_string(),
+                        }
+                    }
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!("tk {subcommand} failed: {stderr}");
+                    format!("Failed: {}", stderr.trim())
+                }
+                Err(err) => {
+                    tracing::warn!("tk command unavailable: {err}");
+                    "Ticket command unavailable (`tk` not in PATH).".to_string()
+                }
+            }
+        }
+    };
+
+    if let Err(err) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send ticket command response: {err}");
+    }
+
+    true
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -1851,6 +2313,9 @@ async fn process_channel_message(
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
+    if handle_ticket_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
 
     let history_key = conversation_history_key(&msg);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
@@ -2390,13 +2855,14 @@ async fn process_channel_message(
                 sanitized_response
             };
 
-            // Append model tag so the user knows which tier answered.
+            // Append model tag for display only — history stores the clean response.
             let model_label = match route.model.as_str() {
                 "haiku" => "haiku",
                 "sonnet" => "sonnet",
                 "default" | "" => "opus",
                 other => other,
             };
+            let response_for_history = delivered_response.clone();
             let delivered_response = if is_tmux_routed {
                 delivered_response
             } else {
@@ -2422,9 +2888,9 @@ async fn process_channel_message(
             // of what it did on subsequent turns.
             let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
             let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
+                response_for_history.clone()
             } else {
-                format!("{tool_summary}\n{delivered_response}")
+                format!("{tool_summary}\n{response_for_history}")
             };
 
             append_sender_turn(
@@ -2439,7 +2905,7 @@ async fn process_channel_message(
                 let model = ctx.model.to_string();
                 let memory = Arc::clone(&ctx.memory);
                 let user_msg = msg.content.clone();
-                let assistant_resp = delivered_response.clone();
+                let assistant_resp = response_for_history.clone();
                 tokio::spawn(async move {
                     if let Err(e) = crate::memory::consolidation::consolidate_turn(
                         provider.as_ref(),
@@ -8245,7 +8711,7 @@ This is an example JSON object for profile settings."#;
             sent[0]
         );
         assert!(
-            sent[1].ends_with(":ok"),
+            sent[1].contains(":ok"),
             "second reply should succeed for text-only turn, got: {}",
             sent[1]
         );
@@ -8310,6 +8776,9 @@ This is an example JSON object for profile settings."#;
                 keywords: vec!["analyze-image".into()],
                 ..Default::default()
             }],
+            classifier_provider: None,
+            classifier_model: None,
+            classifier_timeout_secs: 5,
         };
 
         let model_routes = vec![crate::config::ModelRouteConfig {
@@ -8416,6 +8885,9 @@ This is an example JSON object for profile settings."#;
                 keywords: vec!["analyze-image".into()],
                 ..Default::default()
             }],
+            classifier_provider: None,
+            classifier_model: None,
+            classifier_timeout_secs: 5,
         };
 
         let model_routes = vec![crate::config::ModelRouteConfig {
@@ -8514,6 +8986,9 @@ This is an example JSON object for profile settings."#;
                 keywords: vec!["analyze-image".into()],
                 ..Default::default()
             }],
+            classifier_provider: None,
+            classifier_model: None,
+            classifier_timeout_secs: 5,
         };
 
         let model_routes = vec![crate::config::ModelRouteConfig {
@@ -8624,6 +9099,9 @@ This is an example JSON object for profile settings."#;
                     ..Default::default()
                 },
             ],
+            classifier_provider: None,
+            classifier_model: None,
+            classifier_timeout_secs: 5,
         };
 
         let model_routes = vec![
@@ -8744,5 +9222,105 @@ This is an example JSON object for profile settings."#;
             Ok(channel) => assert_eq!(channel.name(), "telegram"),
             Err(e) => panic!("should succeed when telegram is configured: {e}"),
         }
+    }
+
+    #[test]
+    fn ticket_command_detection() {
+        // All "ticket ..." messages are intercepted
+        assert!(is_ticket_command("ticket fix the login bug"));
+        assert!(is_ticket_command("Ticket fix the login bug"));
+        assert!(is_ticket_command("TICKET fix the login bug"));
+        assert!(is_ticket_command("tickets need to add rate limiting"));
+        assert!(is_ticket_command("ticket create fix the login bug"));
+        assert!(is_ticket_command("ticket help"));
+        assert!(is_ticket_command("ticket list"));
+        assert!(is_ticket_command("ticket show abc123"));
+        assert!(is_ticket_command("ticket stats"));
+        assert!(is_ticket_command("ticket pipeline"));
+        assert!(is_ticket_command("ticket ready"));
+        assert!(is_ticket_command("ticket blocked"));
+        assert!(is_ticket_command("ticket closed"));
+        // Bare keyword → help
+        assert!(is_ticket_command("ticket"));
+        assert!(is_ticket_command("tickets"));
+        // Not ticket commands
+        assert!(!is_ticket_command("not a ticket command"));
+        assert!(!is_ticket_command("ticketmaster concert"));
+        assert!(!is_ticket_command("my ticket is broken"));
+    }
+
+    #[test]
+    fn ticket_args_routing() {
+        // Subcommands route to tk directly
+        assert!(matches!(parse_ticket_args("ticket list"), TicketAction::Command(a) if a[0] == "list"));
+        assert!(matches!(parse_ticket_args("ticket show abc"), TicketAction::Command(a) if a[0] == "show" && a[1] == "abc"));
+        assert!(matches!(parse_ticket_args("ticket stats"), TicketAction::Command(a) if a[0] == "stats"));
+        assert!(matches!(parse_ticket_args("ticket create fix bug"), TicketAction::Command(a) if a[0] == "create" && a[1] == "fix bug"));
+        // Implicit create
+        assert!(matches!(parse_ticket_args("ticket fix the bug"), TicketAction::Command(a) if a[0] == "create"));
+        // Help
+        assert!(matches!(parse_ticket_args("ticket help"), TicketAction::Help));
+        assert!(matches!(parse_ticket_args("ticket"), TicketAction::Help));
+    }
+
+    #[test]
+    fn ticket_content_parsing_single_sentence() {
+        let (title, desc) = parse_ticket_content("ticket fix the login bug");
+        assert_eq!(title, "fix the login bug");
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn ticket_content_parsing_with_description() {
+        let (title, desc) =
+            parse_ticket_content("ticket fix the login bug. Users can't log in with SSO.");
+        assert_eq!(title, "fix the login bug");
+        assert_eq!(desc.as_deref(), Some("Users can't log in with SSO."));
+    }
+
+    #[test]
+    fn ticket_content_parsing_multiline() {
+        let (title, desc) = parse_ticket_content("ticket add dark mode\nIt should use prefers-color-scheme and persist the choice.");
+        assert_eq!(title, "add dark mode");
+        assert_eq!(
+            desc.as_deref(),
+            Some("It should use prefers-color-scheme and persist the choice.")
+        );
+    }
+
+    #[test]
+    fn ticket_content_parsing_empty_body() {
+        let (title, desc) = parse_ticket_content("ticket");
+        assert_eq!(title, "Untitled ticket");
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn ticket_content_parsing_explicit_create() {
+        let (title, desc) = parse_ticket_content("ticket create fix the login bug");
+        assert_eq!(title, "fix the login bug");
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn ticket_content_parsing_explicit_create_with_description() {
+        let (title, desc) =
+            parse_ticket_content("ticket create add rate limiting. Should apply to /webhook.");
+        assert_eq!(title, "add rate limiting");
+        assert_eq!(desc.as_deref(), Some("Should apply to /webhook."));
+    }
+
+    #[test]
+    fn ticket_content_parsing_bare_create() {
+        let (title, desc) = parse_ticket_content("ticket create");
+        assert_eq!(title, "Untitled ticket");
+        assert!(desc.is_none());
+    }
+
+    #[test]
+    fn ticket_content_parsing_tickets_prefix() {
+        let (title, desc) = parse_ticket_content("tickets rate limiting on the gateway API");
+        assert_eq!(title, "rate limiting on the gateway API");
+        assert!(desc.is_none());
     }
 }

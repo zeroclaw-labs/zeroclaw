@@ -994,6 +994,9 @@ mod tests {
                     max_length: None,
                     priority: 10,
                 }],
+                classifier_provider: None,
+                classifier_model: None,
+                classifier_timeout_secs: 5,
             })
             .available_hints(vec!["fast".to_string()])
             .route_model_by_hint(route_model_by_hint)

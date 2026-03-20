@@ -4,6 +4,7 @@ import {
   TrendingUp,
   Hash,
   Layers,
+  Gauge,
 } from 'lucide-react';
 import type { CostSummary } from '@/types/api';
 import { getCost } from '@/lib/api';
@@ -65,6 +66,44 @@ export default function Cost() {
           </div>
         ))}
       </div>
+
+      {/* Budget Remaining */}
+      {cost.daily_limit_usd != null && cost.monthly_limit_usd != null && (
+        <div className="glass-card p-5 animate-slide-in-up" style={{ animationDelay: '150ms' }}>
+          <div className="flex items-center gap-3 mb-4">
+            <div className="p-2 rounded-xl" style={{ background: '#00e68a15' }}>
+              <Gauge className="h-5 w-5" style={{ color: '#00e68a' }} />
+            </div>
+            <h3 className="text-sm font-semibold text-white uppercase tracking-wider">
+              Budget Remaining
+            </h3>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            {[
+              { label: 'Daily', used: cost.daily_cost_usd, limit: cost.daily_limit_usd, remaining: cost.daily_remaining_usd ?? 0 },
+              { label: 'Monthly', used: cost.monthly_cost_usd, limit: cost.monthly_limit_usd, remaining: cost.monthly_remaining_usd ?? 0 },
+            ].map(({ label, used, limit, remaining }) => {
+              const pct = limit > 0 ? (used / limit) * 100 : 0;
+              const barColor = pct >= 90 ? '#ff4466' : pct >= 70 ? '#ff8800' : '#00e68a';
+              return (
+                <div key={label} className="rounded-xl p-4" style={{ background: 'rgba(0,128,255,0.04)', border: '1px solid rgba(0,128,255,0.08)' }}>
+                  <div className="flex justify-between items-baseline mb-2">
+                    <p className="text-xs text-[#556080] uppercase tracking-wider">{label}</p>
+                    <p className="text-xs text-[#556080] font-mono">{formatUSD(used)} / {formatUSD(limit)}</p>
+                  </div>
+                  <div className="w-full h-2 bg-[#0a0a18] rounded-full overflow-hidden mb-2">
+                    <div
+                      className="h-full rounded-full transition-all duration-700"
+                      style={{ width: `${Math.min(pct, 100)}%`, background: barColor }}
+                    />
+                  </div>
+                  <p className="text-lg font-bold text-white font-mono">{formatUSD(remaining)} <span className="text-xs text-[#556080] font-normal">remaining</span></p>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Token Statistics */}
       <div className="glass-card p-5 animate-slide-in-up" style={{ animationDelay: '200ms' }}>

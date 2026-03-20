@@ -79,6 +79,10 @@ export interface CostSummary {
   session_cost_usd: number;
   daily_cost_usd: number;
   monthly_cost_usd: number;
+  daily_remaining_usd?: number;
+  monthly_remaining_usd?: number;
+  daily_limit_usd?: number;
+  monthly_limit_usd?: number;
   total_tokens: number;
   request_count: number;
   by_model: Record<string, ModelStats>;

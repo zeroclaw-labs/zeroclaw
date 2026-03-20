@@ -111,6 +111,39 @@ impl ClaudeCodeProvider {
         }
     }
 
+    /// Returns true when the response text indicates the accumulated session
+    /// context was too large for the model to process.
+    fn is_context_overflow(response: &str) -> bool {
+        let lower = response.to_lowercase();
+        lower.contains("prompt is too long")
+            || lower.contains("context length exceeded")
+            || lower.contains("context window exceeded")
+            || lower.contains("too many tokens")
+    }
+
+    /// Returns true when a lighter-weight model reported it lacks the capability
+    /// to fulfill the request (tool access, shell, etc.). Only meaningful when
+    /// a non-default model was used — the default model should not self-escalate.
+    fn is_capability_failure(model: &str, response: &str) -> bool {
+        if !Self::should_forward_model(model) {
+            return false; // already at default tier, don't escalate
+        }
+        let lower = response.to_lowercase();
+        lower.contains("don't have direct shell access")
+            || lower.contains("don't have access to")
+            || lower.contains("do not have access to")
+            || lower.contains("unable to access")
+            || lower.contains("cannot access")
+            || lower.contains("can't access")
+            || lower.contains("i'm not able to run")
+            || lower.contains("i cannot run")
+            || lower.contains("i can't run")
+            || lower.contains("no access to")
+            || lower.contains("blocked by security policy")
+            || lower.contains("permission denied")
+            || lower.contains("not permitted")
+    }
+
     fn should_forward_model(model: &str) -> bool {
         let trimmed = model.trim();
         !trimmed.is_empty() && trimmed != DEFAULT_MODEL_MARKER
@@ -674,7 +707,7 @@ impl ClaudeCodeProvider {
             )
             .await;
 
-        // If --resume failed, clear stale session and retry without it.
+        // If --resume failed (hard error), clear stale session and retry without it.
         if result.is_err() && resume_id.is_some() {
             if let Some(ref key) = session_key {
                 tracing::warn!(
@@ -695,7 +728,69 @@ impl ClaudeCodeProvider {
             return Ok(self.finalize_response(fresh, session_key.as_deref()));
         }
 
-        Ok(self.finalize_response(result?, session_key.as_deref()))
+        let encoded = result?;
+
+        // If the assigned model reported context overflow or a capability failure,
+        // escalate to the default model and retry. Context overflow retries with
+        // the same session; capability failure retries fresh (no session needed).
+        if Self::is_capability_failure(model, &encoded) {
+            tracing::warn!(
+                model = model,
+                "Capability failure detected, escalating to default model"
+            );
+            let escalated = self
+                .invoke_cli_inner(
+                    message,
+                    DEFAULT_MODEL_MARKER,
+                    cwd.as_ref(),
+                    resume_id.as_deref(),
+                    CLAUDE_CODE_RESUME_TIMEOUT,
+                )
+                .await?;
+            return Ok(self.finalize_response(escalated, session_key.as_deref()));
+        }
+
+        if Self::is_context_overflow(&encoded) && resume_id.is_some() {
+            tracing::warn!(
+                model = model,
+                "Context overflow with session resume, escalating to default model"
+            );
+            let escalated = self
+                .invoke_cli_inner(
+                    message,
+                    DEFAULT_MODEL_MARKER,
+                    cwd.as_ref(),
+                    resume_id.as_deref(),
+                    CLAUDE_CODE_RESUME_TIMEOUT,
+                )
+                .await
+                .unwrap_or_default();
+
+            if !Self::is_context_overflow(&escalated) {
+                return Ok(self.finalize_response(escalated, session_key.as_deref()));
+            }
+
+            // Even the full model overflows — session is unrecoverable; clear and retry fresh.
+            if let Some(ref key) = session_key {
+                tracing::warn!(
+                    session_key = key.as_str(),
+                    "Session unrecoverable after escalation, clearing and retrying fresh"
+                );
+                self.clear_session(key);
+            }
+            let fresh = self
+                .invoke_cli_inner(
+                    message,
+                    DEFAULT_MODEL_MARKER,
+                    cwd.as_ref(),
+                    None,
+                    CLAUDE_CODE_REQUEST_TIMEOUT,
+                )
+                .await?;
+            return Ok(self.finalize_response(fresh, session_key.as_deref()));
+        }
+
+        Ok(self.finalize_response(encoded, session_key.as_deref()))
     }
 
     /// Store session ID from the result and return the formatted response.

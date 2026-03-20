@@ -118,6 +118,18 @@ pub struct CostSummary {
     pub daily_cost_usd: f64,
     /// Total cost for the month
     pub monthly_cost_usd: f64,
+    /// Remaining daily budget (None when cost tracking is disabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_remaining_usd: Option<f64>,
+    /// Remaining monthly budget (None when cost tracking is disabled)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monthly_remaining_usd: Option<f64>,
+    /// Configured daily spending limit
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daily_limit_usd: Option<f64>,
+    /// Configured monthly spending limit
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monthly_limit_usd: Option<f64>,
     /// Total tokens used
     pub total_tokens: u64,
     /// Number of requests
@@ -145,6 +157,10 @@ impl Default for CostSummary {
             session_cost_usd: 0.0,
             daily_cost_usd: 0.0,
             monthly_cost_usd: 0.0,
+            daily_remaining_usd: None,
+            monthly_remaining_usd: None,
+            daily_limit_usd: None,
+            monthly_limit_usd: None,
             total_tokens: 0,
             request_count: 0,
             by_model: std::collections::HashMap::new(),
