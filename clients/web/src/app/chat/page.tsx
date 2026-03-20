@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Send, Bot, User, AlertCircle, ArrowLeft, Settings, LogOut } from 'lucide-react';
+import { Send, Bot, User, AlertCircle, ArrowLeft, Settings, LogOut, Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 import { getToken, clearToken, isAuthenticated } from '@/lib/auth';
@@ -17,6 +17,50 @@ interface ChatMessage {
 
 let fallbackMessageIdCounter = 0;
 const EMPTY_DONE_FALLBACK = 'Tool execution completed, but no final response text was returned.';
+
+// ---------------------------------------------------------------------------
+// Free browser-native STT / TTS helpers (Web Speech API — zero cost)
+// ---------------------------------------------------------------------------
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+function createSpeechRecognition(lang: string) {
+  const W = window as any;
+  const SR = W.SpeechRecognition ?? W.webkitSpeechRecognition;
+  if (!SR) return null;
+  const r = new SR();
+  r.lang = lang;
+  r.interimResults = true;
+  r.continuous = true;
+  r.maxAlternatives = 1;
+  return r;
+}
+/* eslint-enable @typescript-eslint/no-explicit-any */
+
+function speakText(text: string, lang: string, onEnd?: () => void) {
+  const plain = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/#{1,6}\s*/g, '')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .trim();
+  if (!plain) { onEnd?.(); return; }
+  window.speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(plain);
+  u.lang = lang;
+  if (onEnd) { u.onend = onEnd; u.onerror = onEnd; }
+  window.speechSynthesis.speak(u);
+}
+
+function detectLang(text: string): string {
+  for (const ch of text) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if ((cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x1100 && cp <= 0x11FF)) return 'ko-KR';
+    if ((cp >= 0x3040 && cp <= 0x309F) || (cp >= 0x30A0 && cp <= 0x30FF)) return 'ja-JP';
+    if (cp >= 0x4E00 && cp <= 0x9FFF) return 'zh-CN';
+  }
+  return navigator.language || 'en-US';
+}
 
 function makeMessageId(): string {
   const uuid = globalThis.crypto?.randomUUID?.();
@@ -34,6 +78,13 @@ export default function ChatPage() {
   const [error, setError] = useState<string | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
 
+  const [listening, setListening] = useState(false);
+  const [voiceMode, setVoiceMode] = useState(false);
+  const [chatLang, setChatLang] = useState('en-US');
+  const recognitionRef = useRef<ReturnType<typeof createSpeechRecognition> | null>(null);
+  const voiceModeRef = useRef(false);
+  const chatLangRef = useRef(chatLang);
+
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -47,6 +98,62 @@ export default function ChatPage() {
     }
     setAuthChecked(true);
   }, [router]);
+
+  // Keep refs in sync
+  useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
+  useEffect(() => { chatLangRef.current = chatLang; }, [chatLang]);
+  useEffect(() => { return () => { recognitionRef.current?.stop(); window.speechSynthesis.cancel(); }; }, []);
+
+  // Set browser language on mount
+  useEffect(() => { setChatLang(navigator.language || 'en-US'); }, []);
+
+  const startListening = (lang: string) => {
+    const recognition = createSpeechRecognition(lang);
+    if (!recognition) return;
+    let finalTranscript = '';
+    recognition.onresult = (event: { results: SpeechRecognitionResultList }) => {
+      let interim = '';
+      finalTranscript = '';
+      for (let i = 0; i < event.results.length; i++) {
+        const r = event.results[i];
+        if (!r?.[0]) continue;
+        if (r.isFinal) finalTranscript += r[0].transcript;
+        else interim += r[0].transcript;
+      }
+      setInput(finalTranscript + interim);
+    };
+    recognition.onerror = (e: { error?: string }) => {
+      if (e.error === 'no-speech' || e.error === 'aborted') return;
+      setListening(false); setVoiceMode(false);
+    };
+    recognition.onend = () => {
+      if (voiceModeRef.current && finalTranscript.trim()) {
+        setInput(finalTranscript.trim());
+        setTimeout(() => {
+          const btn = document.querySelector('[data-voice-send]') as HTMLButtonElement | null;
+          btn?.click();
+        }, 50);
+      } else if (voiceModeRef.current) {
+        setTimeout(() => { if (voiceModeRef.current) startListening(chatLangRef.current); }, 300);
+      } else {
+        setListening(false);
+      }
+    };
+    recognitionRef.current = recognition;
+    recognition.start();
+    setListening(true);
+  };
+
+  const toggleVoiceMode = () => {
+    if (listening || voiceMode) {
+      recognitionRef.current?.stop();
+      window.speechSynthesis.cancel();
+      setListening(false); setVoiceMode(false);
+      return;
+    }
+    setVoiceMode(true);
+    startListening(chatLang);
+  };
 
   // WebSocket connection (only after auth is confirmed)
   useEffect(() => {
@@ -85,6 +192,13 @@ export default function ChatPage() {
           setMessages((prev) => [...prev, { id: makeMessageId(), role: 'agent', content: finalContent, timestamp: new Date() }]);
           pendingContentRef.current = '';
           setTyping(false);
+          // Auto-TTS in voice mode
+          if (voiceModeRef.current && finalContent !== EMPTY_DONE_FALLBACK) {
+            recognitionRef.current?.stop();
+            speakText(finalContent, chatLangRef.current, () => {
+              if (voiceModeRef.current) startListening(chatLangRef.current);
+            });
+          }
           break;
         }
         case 'tool_call':
@@ -113,6 +227,8 @@ export default function ChatPage() {
   const handleSend = () => {
     const trimmed = input.trim();
     if (!trimmed || !wsRef.current?.connected) return;
+    const detected = detectLang(trimmed);
+    if (detected !== chatLang) setChatLang(detected);
     setMessages((prev) => [...prev, { id: makeMessageId(), role: 'user', content: trimmed, timestamp: new Date() }]);
     try {
       wsRef.current.sendMessage(trimmed);
@@ -260,6 +376,19 @@ export default function ChatPage() {
             />
           </div>
           <button
+            onClick={toggleVoiceMode}
+            disabled={!connected}
+            className={`flex-shrink-0 rounded-xl p-3 transition-all active:scale-95 ${
+              voiceMode
+                ? 'bg-red-500 hover:bg-red-600 text-white animate-pulse'
+                : 'bg-dark-800 hover:bg-dark-700 text-dark-400 hover:text-white border border-dark-700'
+            } disabled:opacity-50`}
+            title={voiceMode ? 'Stop voice mode' : 'Voice mode (free STT/TTS)'}
+          >
+            {voiceMode || listening ? <MicOff className="h-5 w-5" /> : <Mic className="h-5 w-5" />}
+          </button>
+          <button
+            data-voice-send
             onClick={handleSend}
             disabled={!connected || !input.trim()}
             className="flex-shrink-0 bg-primary-500 hover:bg-primary-600 disabled:bg-dark-700 disabled:text-dark-500 text-white rounded-xl p-3 transition-all active:scale-95"
@@ -267,9 +396,16 @@ export default function ChatPage() {
             <Send className="h-5 w-5" />
           </button>
         </div>
-        <p className="mt-2 text-center text-[10px] text-dark-600">
-          Shift+Enter for newline | Enter to send
-        </p>
+        <div className="mt-2 flex items-center justify-center gap-3">
+          <p className="text-[10px] text-dark-600">
+            Shift+Enter for newline | Enter to send
+          </p>
+          {voiceMode && (
+            <span className="text-[10px] text-red-400 animate-pulse">
+              Voice mode ({chatLang.split('-')[0]?.toUpperCase()})
+            </span>
+          )}
+        </div>
       </div>
     </div>
   );

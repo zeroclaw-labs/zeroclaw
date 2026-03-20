@@ -1390,6 +1390,18 @@ html, body {
   background: rgba(34, 197, 94, 0.08);
 }
 
+.chat-mic-active {
+  color: #ef4444 !important;
+  border-color: #ef4444 !important;
+  background: rgba(239, 68, 68, 0.15) !important;
+  animation: pulse-mic 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-mic {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
 /* ── Workspace indicator in chat input area ── */
 
 .chat-workspace-indicator {
