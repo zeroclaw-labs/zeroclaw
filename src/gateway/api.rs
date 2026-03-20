@@ -68,7 +68,14 @@ pub struct CronRunsQuery {
 pub struct CronAddBody {
     pub name: Option<String>,
     pub schedule: String,
-    pub command: String,
+    pub command: Option<String>,
+    pub job_type: Option<String>,
+    pub prompt: Option<String>,
+    pub delivery: Option<serde_json::Value>,
+    pub session_target: Option<String>,
+    pub model: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub delete_after_run: Option<bool>,
 }
 
 // ── Handlers ────────────────────────────────────────────────────
@@ -228,7 +235,11 @@ pub async fn handle_api_cron_list(
                     serde_json::json!({
                         "id": job.id,
                         "name": job.name,
+                        "job_type": job.job_type,
                         "command": job.command,
+                        "prompt": job.prompt,
+                        "schedule": job.schedule,
+                        "delivery": job.delivery,
                         "next_run": job.next_run.to_rfc3339(),
                         "last_run": job.last_run.map(|t| t.to_rfc3339()),
                         "last_status": job.last_status,
@@ -262,19 +273,105 @@ pub async fn handle_api_cron_add(
         tz: None,
     };
 
-    match crate::cron::add_shell_job_with_approval(
-        &config,
-        body.name,
-        schedule,
-        &body.command,
-        false,
-    ) {
+    // Determine job type: explicit field, or infer "agent" when prompt is provided.
+    let is_agent = matches!(body.job_type.as_deref(), Some("agent"))
+        || (body.job_type.is_none() && body.prompt.is_some());
+
+    let result = if is_agent {
+        let prompt = match body.prompt.as_deref() {
+            Some(p) if !p.trim().is_empty() => p,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Missing 'prompt' for agent job"})),
+                )
+                    .into_response();
+            }
+        };
+
+        let session_target = body
+            .session_target
+            .as_deref()
+            .map(crate::cron::SessionTarget::parse)
+            .unwrap_or_default();
+
+        let delivery_config = match &body.delivery {
+            Some(v) => match serde_json::from_value::<crate::cron::DeliveryConfig>(v.clone()) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Invalid delivery config: {e}")})),
+                    )
+                        .into_response();
+                }
+            },
+            None => None,
+        };
+
+        let default_delete = matches!(schedule, crate::cron::Schedule::At { .. });
+        let delete_after_run = body.delete_after_run.unwrap_or(default_delete);
+
+        crate::cron::add_agent_job(
+            &config,
+            body.name,
+            schedule,
+            prompt,
+            session_target,
+            body.model,
+            delivery_config,
+            delete_after_run,
+            body.allowed_tools,
+        )
+    } else {
+        let command = match body.command.as_deref() {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Missing 'command' for shell job"})),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut job_result =
+            crate::cron::add_shell_job_with_approval(&config, body.name, schedule, command, false);
+
+        // If delivery was provided, patch the created job to persist delivery config.
+        if let (Ok(ref job), Some(ref delivery_val)) = (&job_result, &body.delivery) {
+            match serde_json::from_value::<crate::cron::DeliveryConfig>(delivery_val.clone()) {
+                Ok(delivery_cfg) => {
+                    let patch = crate::cron::CronJobPatch {
+                        delivery: Some(delivery_cfg),
+                        ..crate::cron::CronJobPatch::default()
+                    };
+                    job_result = crate::cron::update_job(&config, &job.id, patch);
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Invalid delivery config: {e}")})),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        job_result
+    };
+
+    match result {
         Ok(job) => Json(serde_json::json!({
             "status": "ok",
             "job": {
                 "id": job.id,
                 "name": job.name,
+                "job_type": job.job_type,
                 "command": job.command,
+                "prompt": job.prompt,
+                "schedule": job.schedule,
+                "delivery": job.delivery,
                 "enabled": job.enabled,
             }
         }))
