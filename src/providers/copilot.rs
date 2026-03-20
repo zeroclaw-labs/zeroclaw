@@ -799,7 +799,9 @@ mod tests {
                     matches!(&parts[1], ContentPart::ImageUrl { image_url } if image_url.url == "data:image/png;base64,abc123")
                 );
             }
-            ApiContent::Text(_) => panic!("expected ApiContent::Parts for user message with image marker"),
+            ApiContent::Text(_) => {
+                panic!("expected ApiContent::Parts for user message with image marker")
+            }
         }
     }
 
