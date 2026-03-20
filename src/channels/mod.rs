@@ -346,6 +346,7 @@ struct ChannelRouteSelection {
 enum ChannelRuntimeCommand {
     Models(Option<String>),
     NewSession,
+    Skills,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -446,6 +447,10 @@ struct ChannelRuntimeContext {
     ack_reactions: bool,
     show_tool_calls: bool,
     session_store: Option<Arc<session_store::SessionStore>>,
+    /// Loaded skill summaries for slash-command menu: `(name, description)`.
+    loaded_skills: Arc<Vec<(String, String)>>,
+    /// Autonomy config (needed for per-user overrides).
+    autonomy_config: Arc<crate::config::AutonomyConfig>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[autonomy]` config; auto-denies tools that would need interactive
@@ -856,7 +861,57 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/skills" => Some(ChannelRuntimeCommand::Skills),
         _ => None,
+    }
+}
+
+/// Format loaded skills as a numbered list for the `/skills` command response.
+fn format_skills_list(skills: &[(String, String)]) -> String {
+    if skills.is_empty() {
+        return "No skills loaded.".to_string();
+    }
+    let mut out = String::from("Available skills:\n");
+    for (i, (name, desc)) in skills.iter().enumerate() {
+        let cmd_name = name.replace('-', "_");
+        use std::fmt::Write as _;
+        let _ = write!(out, "\n{}. /{} — {}", i + 1, cmd_name, desc);
+    }
+    out
+}
+
+/// Try to rewrite a `/skill_name args` message into `[Skill: skill-name] args`.
+/// Returns `Some(rewritten)` if the command matches a loaded skill, `None` otherwise.
+fn try_rewrite_skill_command(content: &str, skills: &[(String, String)]) -> Option<String> {
+    let trimmed = strip_reply_quote(content).trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let command_token = parts.next()?;
+    let args = parts.next().unwrap_or("").trim();
+
+    // Strip leading '/' and optional @bot_name suffix
+    let cmd = command_token
+        .trim_start_matches('/')
+        .split('@')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    // Map underscores back to hyphens for skill lookup
+    let skill_name = cmd.replace('_', "-");
+
+    // Check if it matches a loaded skill
+    if skills.iter().any(|(name, _)| *name == skill_name) {
+        if args.is_empty() {
+            Some(format!("[Skill: {skill_name}]"))
+        } else {
+            Some(format!("[Skill: {skill_name}] {args}"))
+        }
+    } else {
+        None
     }
 }
 
@@ -1776,6 +1831,7 @@ async fn handle_runtime_command_if_needed(
             clear_pending_selection(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
+        ChannelRuntimeCommand::Skills => format_skills_list(&ctx.loaded_skills),
     };
 
     if let Err(err) = channel
@@ -2348,6 +2404,11 @@ async fn process_channel_message(
         return;
     }
 
+    // Rewrite `/skill_name args` → `[Skill: skill-name] args` so LLM gets a hint
+    if let Some(rewritten) = try_rewrite_skill_command(&msg.content, &ctx.loaded_skills) {
+        msg.content = rewritten;
+    }
+
     let history_key = conversation_history_key(&msg);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
@@ -2706,6 +2767,31 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+
+    // Per-user autonomy override: if user has a higher autonomy level,
+    // create a per-message ApprovalManager so their tools aren't auto-denied.
+    let per_user_approval: Option<ApprovalManager>;
+    let effective_approval: &ApprovalManager = {
+        let username = msg.sender.as_str();
+        if let Some(&override_level) = ctx.autonomy_config.user_overrides.get(username) {
+            if override_level != ctx.autonomy_config.level {
+                tracing::info!(
+                    username = username,
+                    level = ?override_level,
+                    "Applying per-user autonomy override for approval"
+                );
+                let mut ac = (*ctx.autonomy_config).clone();
+                ac.level = override_level;
+                per_user_approval = Some(ApprovalManager::for_non_interactive(&ac));
+                per_user_approval.as_ref().unwrap()
+            } else {
+                &ctx.approval_manager
+            }
+        } else {
+            &ctx.approval_manager
+        }
+    };
+
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -2721,7 +2807,7 @@ async fn process_channel_message(
                     route.model.as_str(),
                     runtime_defaults.temperature,
                     true,
-                    Some(&*ctx.approval_manager),
+                    Some(effective_approval),
                     msg.channel.as_str(),
                     &ctx.multimodal,
                     ctx.max_tool_iterations,
@@ -4499,6 +4585,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let tools_registry = Arc::new(built_tools);
 
     let skills = crate::skills::load_skills_with_config(&workspace, &config);
+    let skill_summaries: Vec<(String, String)> = skills
+        .iter()
+        .map(|s| (s.name.clone(), s.description.clone()))
+        .collect();
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
@@ -4759,6 +4849,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         } else {
             None
         },
+        loaded_skills: Arc::new(skill_summaries),
+        autonomy_config: Arc::new(config.autonomy.clone()),
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
     });
@@ -5053,9 +5145,11 @@ mod tests {
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         };
 
@@ -5165,9 +5259,11 @@ mod tests {
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         };
 
@@ -5233,9 +5329,11 @@ mod tests {
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         };
 
@@ -5320,9 +5418,11 @@ mod tests {
             ack_reactions: true,
             show_tool_calls: true,
             session_store: Some(Arc::clone(&store)),
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         };
 
@@ -5874,9 +5974,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -5951,9 +6053,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6042,9 +6146,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6118,9 +6224,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6211,9 +6319,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6322,9 +6432,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6410,9 +6522,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6516,9 +6630,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6604,9 +6720,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6682,9 +6800,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6871,9 +6991,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -6969,9 +7091,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -7081,9 +7205,11 @@ BTC is currently around $65,000 based on latest tool output."#
             model_routes: Arc::new(Vec::new()),
             max_parallel_tool_calls: 5,
             max_tool_result_chars: 4000,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
         });
@@ -7192,9 +7318,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -7284,9 +7412,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -7360,9 +7490,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -8020,9 +8152,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -8123,9 +8257,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -8228,9 +8364,11 @@ BTC is currently around $65,000 based on latest tool output."#
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -8796,9 +8934,11 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -8879,9 +9019,11 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -9037,9 +9179,11 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -9144,9 +9288,11 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -9243,9 +9389,11 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 
@@ -9362,9 +9510,11 @@ This is an example JSON object for profile settings."#;
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            autonomy_config: Arc::new(crate::config::AutonomyConfig::default()),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
+            loaded_skills: Arc::new(Vec::new()),
             activated_tools: None,
         });
 

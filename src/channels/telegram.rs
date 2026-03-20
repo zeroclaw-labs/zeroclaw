@@ -553,6 +553,56 @@ impl TelegramChannel {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
 
+    /// Register bot commands with Telegram's `setMyCommands` API.
+    /// Includes system commands (`/new`, `/models`, `/skills`) plus dynamic
+    /// per-skill commands derived from loaded skills in the workspace.
+    async fn register_commands(&self, skills: &[(String, String)]) -> anyhow::Result<()> {
+        let mut commands = vec![
+            serde_json::json!({"command": "new", "description": "Start a new conversation"}),
+            serde_json::json!({"command": "models", "description": "Show or switch the current model"}),
+            serde_json::json!({"command": "skills", "description": "List available skills"}),
+        ];
+        for (name, description) in skills {
+            let cmd_name = name.replace('-', "_");
+            // Telegram limits command descriptions to 256 chars
+            let desc = if description.len() > 256 {
+                format!("{}…", &description[..255])
+            } else {
+                description.clone()
+            };
+            commands.push(serde_json::json!({"command": cmd_name, "description": desc}));
+        }
+
+        let url = self.api_url("setMyCommands");
+        let body = serde_json::json!({ "commands": commands });
+        let resp = self.http_client().post(&url).json(&body).send().await?;
+
+        if resp.status().is_success() {
+            tracing::info!(
+                count = commands.len(),
+                "Telegram bot commands registered successfully"
+            );
+        } else {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            let detail = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| {
+                    let code = v.get("error_code");
+                    let desc = v.get("description").and_then(|d| d.as_str());
+                    match (code, desc) {
+                        (Some(c), Some(d)) => Some(format!("error_code={c}, description={d}")),
+                        (_, Some(d)) => Some(format!("description={d}")),
+                        _ => None,
+                    }
+                })
+                .unwrap_or_else(|| "no parseable error detail".to_string());
+            tracing::warn!("setMyCommands failed: status={status}, {detail}");
+        }
+
+        Ok(())
+    }
+
     async fn classify_edit_message_response(resp: reqwest::Response) -> EditMessageResult {
         if resp.status().is_success() {
             return EditMessageResult::Success;
@@ -2601,6 +2651,21 @@ impl Channel for TelegramChannel {
 
         if self.mention_only {
             let _ = self.get_bot_username().await;
+        }
+
+        // Register slash commands (system + dynamic skills) with Telegram
+        {
+            let skill_summaries: Vec<(String, String)> = if let Some(ref ws) = self.workspace_dir {
+                crate::skills::load_skills(ws)
+                    .into_iter()
+                    .map(|s| (s.name, s.description))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            if let Err(e) = self.register_commands(&skill_summaries).await {
+                tracing::warn!("Failed to register Telegram bot commands: {e}");
+            }
         }
 
         tracing::info!("Telegram channel listening for messages...");
