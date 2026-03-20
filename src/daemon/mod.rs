@@ -5,6 +5,7 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::signal;
+use tokio::signal::unix::{signal, SignalKind};
 
 /// Daemon configuration.
 pub struct DaemonConfig {
@@ -14,17 +15,31 @@ pub struct DaemonConfig {
     pub socket_path: PathBuf,
     /// Log directory.
     pub log_dir: PathBuf,
+    /// Heartbeat file (written every 30s for watchdog).
+    pub heartbeat_path: PathBuf,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         let home = dirs_home();
+        let app_support = home.join("Library/Application Support/Augusta");
         Self {
-            pid_file: home.join("Library/Application Support/Augusta/augusta.pid"),
-            socket_path: home.join("Library/Application Support/Augusta/augusta.sock"),
+            pid_file: app_support.join("augusta.pid"),
+            socket_path: app_support.join("augusta.sock"),
             log_dir: home.join("Library/Logs/Augusta"),
+            heartbeat_path: app_support.join("heartbeat"),
         }
     }
+}
+
+/// Daemon exit codes.
+pub mod exit_code {
+    /// Intentional shutdown (daemon stop) — launchd does NOT restart.
+    pub const SUCCESS: i32 = 0;
+    /// Crash or panic — launchd restarts.
+    pub const CRASH: i32 = 1;
+    /// Fatal config error — launchd restarts (retries with ThrottleInterval).
+    pub const CONFIG_ERROR: i32 = 2;
 }
 
 /// Daemon entry point — runs the main event loop.
@@ -32,6 +47,13 @@ pub async fn run_daemon(
     config: DaemonConfig,
     app_config: Option<&crate::config::Config>,
 ) -> Result<()> {
+    // Install panic handler — ensures non-zero exit on panic so launchd restarts
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("Augusta daemon panicked: {info}");
+        tracing::error!("PANIC: {info}");
+        std::process::exit(exit_code::CRASH);
+    }));
+
     // Ensure directories exist
     if let Some(parent) = config.pid_file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -64,8 +86,18 @@ pub async fn run_daemon(
 
     let start_time = Arc::new(Instant::now());
 
-    // Start health monitor loop
-    let health_handle = tokio::spawn(health_monitor_loop());
+    // Start health monitor
+    let monitor = Arc::new(crate::health::monitor::HealthMonitor::new());
+    monitor.register("daemon".into(), "system".into()).await;
+    monitor.record_ping("daemon").await;
+
+    let heartbeat_path = config.heartbeat_path.clone();
+    let monitor_for_loop = Arc::clone(&monitor);
+    let health_handle = tokio::spawn(heartbeat_loop(monitor_for_loop, heartbeat_path));
+
+    // Signal handlers
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to register SIGTERM handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("failed to register SIGHUP handler");
 
     // IPC + shutdown select loop
     loop {
@@ -74,7 +106,9 @@ pub async fn run_daemon(
                 match accept_result {
                     Ok((stream, _addr)) => {
                         let t = Arc::clone(&start_time);
-                        tokio::spawn(handle_ipc_client(stream, t));
+                        let m = Arc::clone(&monitor);
+                        let hb = config.heartbeat_path.clone();
+                        tokio::spawn(handle_ipc_client(stream, t, m, hb));
                     }
                     Err(e) => {
                         tracing::warn!("IPC accept error: {e}");
@@ -82,8 +116,15 @@ pub async fn run_daemon(
                 }
             }
             _ = signal::ctrl_c() => {
-                tracing::info!("Received shutdown signal");
+                tracing::info!("Received SIGINT — shutting down");
                 break;
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM — shutting down");
+                break;
+            }
+            _ = sighup.recv() => {
+                tracing::info!("Received SIGHUP — config reload not yet implemented");
             }
         }
     }
@@ -103,6 +144,7 @@ pub async fn run_daemon(
     // Cleanup
     let _ = std::fs::remove_file(&config.pid_file);
     let _ = std::fs::remove_file(&config.socket_path);
+    let _ = std::fs::remove_file(&config.heartbeat_path);
 
     Ok(())
 }
@@ -162,8 +204,13 @@ async fn start_createos_sync(
 /// Handle a single IPC client connection.
 ///
 /// Protocol: newline-delimited commands. Each command gets a JSON response.
-/// Supported commands: `ping`, `status`, `version`.
-async fn handle_ipc_client(stream: tokio::net::UnixStream, start_time: Arc<Instant>) {
+/// Supported commands: `ping`, `status`, `version`, `health`.
+pub async fn handle_ipc_client(
+    stream: tokio::net::UnixStream,
+    start_time: Arc<Instant>,
+    monitor: Arc<crate::health::monitor::HealthMonitor>,
+    heartbeat_path: PathBuf,
+) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -184,10 +231,11 @@ async fn handle_ipc_client(stream: tokio::net::UnixStream, start_time: Arc<Insta
                 "status": "ok",
                 "version": env!("CARGO_PKG_VERSION"),
             }),
+            "health" => build_health_response(&monitor, &heartbeat_path).await,
             cmd => serde_json::json!({
                 "status": "error",
                 "error": format!("Unknown command: {cmd}"),
-                "available": ["ping", "status", "version"],
+                "available": ["ping", "status", "version", "health"],
             }),
         };
 
@@ -199,11 +247,89 @@ async fn handle_ipc_client(stream: tokio::net::UnixStream, start_time: Arc<Insta
     }
 }
 
-/// Periodic health check loop (emits ping events every 60 seconds).
-async fn health_monitor_loop() {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+/// Build the JSON response for the `health` IPC command.
+async fn build_health_response(
+    monitor: &crate::health::monitor::HealthMonitor,
+    heartbeat_path: &std::path::Path,
+) -> serde_json::Value {
+    let snapshot = monitor.snapshot().await;
+    let dead = monitor.dead_agents().await;
+    let stuck = monitor.stuck_agents().await;
+
+    let agents: Vec<serde_json::Value> = snapshot
+        .iter()
+        .map(|h| {
+            serde_json::json!({
+                "name": h.name,
+                "role": h.role,
+                "status": format!("{:?}", h.status),
+                "kill_count": h.kill_count,
+            })
+        })
+        .collect();
+
+    let heartbeat_age_secs = heartbeat_age(heartbeat_path).await.unwrap_or(u64::MAX);
+
+    let monitor_status = if !dead.is_empty() {
+        "critical"
+    } else if !stuck.is_empty() || heartbeat_age_secs > 120 {
+        "degraded"
+    } else {
+        "healthy"
+    };
+
+    serde_json::json!({
+        "status": "ok",
+        "monitor_status": monitor_status,
+        "heartbeat_age_secs": heartbeat_age_secs,
+        "agents": agents,
+        "dead_agents": dead,
+        "stuck_agents": stuck,
+    })
+}
+
+/// Read heartbeat file and return age in seconds.
+async fn heartbeat_age(path: &std::path::Path) -> Option<u64> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let ts: u64 = content.trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(now.saturating_sub(ts))
+}
+
+/// Heartbeat loop — pings HealthMonitor, writes heartbeat file, evaluates health every 30s.
+async fn heartbeat_loop(
+    monitor: Arc<crate::health::monitor::HealthMonitor>,
+    heartbeat_path: PathBuf,
+) {
+    use std::time::Duration;
+
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
     loop {
         interval.tick().await;
+
+        // Record daemon ping
+        monitor.record_ping("daemon").await;
+        monitor.record_activity("daemon").await;
+
+        // Write heartbeat timestamp
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = tokio::fs::write(&heartbeat_path, format!("{ts}\n")).await;
+
+        // Evaluate all registered agents
+        monitor
+            .evaluate_all(
+                Duration::from_secs(90),  // ping timeout
+                3,                        // max consecutive failures
+                Duration::from_secs(300), // stuck threshold
+            )
+            .await;
+
         crate::tui::event_bus::emit("daemon", "system", "ping_success", "Health check OK");
     }
 }
@@ -217,40 +343,105 @@ pub fn install_launchd() -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
+    // Bootout existing service first (ignore errors if not loaded)
+    let _ = launchctl_bootout(&plist_dest);
+
     if plist_source.exists() {
         std::fs::copy(&plist_source, &plist_dest)?;
     } else {
-        // Generate default plist
         let plist_content = generate_plist()?;
         std::fs::write(&plist_dest, plist_content)?;
     }
 
-    // Load the agent
+    // Bootstrap the agent (modern launchctl)
+    let plist_str = plist_dest.to_str().unwrap_or_default();
+    let domain_target = format!("gui/{}", unsafe { libc::getuid() });
     let status = std::process::Command::new("launchctl")
-        .args(["load", plist_dest.to_str().unwrap_or_default()])
+        .args(["bootstrap", &domain_target, plist_str])
         .status()?;
 
     if status.success() {
-        tracing::info!("Installed and loaded com.lightwave.augusta");
+        tracing::info!("Installed and bootstrapped com.lightwave.augusta");
     } else {
-        anyhow::bail!("launchctl load failed with exit code: {}", status);
+        // Fall back to legacy load for older macOS
+        let fallback = std::process::Command::new("launchctl")
+            .args(["load", plist_str])
+            .status()?;
+        if fallback.success() {
+            tracing::info!("Installed com.lightwave.augusta (legacy load)");
+        } else {
+            anyhow::bail!("launchctl bootstrap/load failed");
+        }
+    }
+
+    // Install watchdog
+    install_watchdog()?;
+
+    Ok(())
+}
+
+/// Install the watchdog launchd agent.
+fn install_watchdog() -> Result<()> {
+    let source = watchdog_plist_path_source();
+    let dest = watchdog_plist_path_dest();
+
+    if !source.exists() {
+        tracing::debug!("Watchdog plist not found at source, skipping");
+        return Ok(());
+    }
+
+    let _ = launchctl_bootout(&dest);
+    std::fs::copy(&source, &dest)?;
+
+    let dest_str = dest.to_str().unwrap_or_default();
+    let domain_target = format!("gui/{}", unsafe { libc::getuid() });
+    let status = std::process::Command::new("launchctl")
+        .args(["bootstrap", &domain_target, dest_str])
+        .status()?;
+
+    if !status.success() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["load", dest_str])
+            .status();
+    }
+
+    tracing::info!("Installed watchdog agent");
+    Ok(())
+}
+
+/// Uninstall the launchd plist and watchdog.
+pub fn uninstall_launchd() -> Result<()> {
+    let plist_dest = plist_path_dest();
+    if plist_dest.exists() {
+        let _ = launchctl_bootout(&plist_dest);
+        std::fs::remove_file(&plist_dest)?;
+        tracing::info!("Uninstalled com.lightwave.augusta");
+    }
+
+    let watchdog_dest = watchdog_plist_path_dest();
+    if watchdog_dest.exists() {
+        let _ = launchctl_bootout(&watchdog_dest);
+        std::fs::remove_file(&watchdog_dest)?;
+        tracing::info!("Uninstalled watchdog agent");
     }
 
     Ok(())
 }
 
-/// Uninstall the launchd plist.
-pub fn uninstall_launchd() -> Result<()> {
-    let plist_dest = plist_path_dest();
+/// Bootout a launchd service using modern launchctl, falling back to legacy unload.
+fn launchctl_bootout(plist_path: &std::path::Path) -> Result<()> {
+    let plist_str = plist_path.to_str().unwrap_or_default();
+    let domain_target = format!("gui/{}", unsafe { libc::getuid() });
+    let status = std::process::Command::new("launchctl")
+        .args(["bootout", &domain_target, plist_str])
+        .status()?;
 
-    if plist_dest.exists() {
-        let _ = std::process::Command::new("launchctl")
-            .args(["unload", plist_dest.to_str().unwrap_or_default()])
-            .status();
-        std::fs::remove_file(&plist_dest)?;
-        tracing::info!("Uninstalled com.lightwave.augusta");
+    if !status.success() {
+        // Fall back to legacy unload
+        std::process::Command::new("launchctl")
+            .args(["unload", plist_str])
+            .status()?;
     }
-
     Ok(())
 }
 
@@ -373,12 +564,19 @@ fn dirs_sys_home() -> Option<PathBuf> {
 }
 
 fn plist_path_source() -> PathBuf {
-    // Relative to the package root
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("com.lightwave.augusta.plist")
+}
+
+fn watchdog_plist_path_source() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("com.lightwave.augusta.watchdog.plist")
 }
 
 fn plist_path_dest() -> PathBuf {
     dirs_home().join("Library/LaunchAgents/com.lightwave.augusta.plist")
+}
+
+fn watchdog_plist_path_dest() -> PathBuf {
+    dirs_home().join("Library/LaunchAgents/com.lightwave.augusta.watchdog.plist")
 }
 
 fn generate_plist() -> Result<String> {
@@ -404,7 +602,21 @@ fn generate_plist() -> Result<String> {
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Standard</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
     <key>StandardOutPath</key>
     <string>{stdout}</string>
     <key>StandardErrorPath</key>

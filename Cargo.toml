@@ -92,6 +92,9 @@ ring = "0.17"
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled", "load_extension"] }
+
+# Local ONNX embeddings (brain vector DB)
+fastembed = { version = "4", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 
@@ -139,6 +142,7 @@ lightwave-macos = { path = "crates/lightwave-macos" }
 [features]
 default = ["createos"]
 createos = []
+brain = ["dep:fastembed"]
 browser-native = ["dep:fantoccini"]
 orchestrator = ["dep:redis"]
 gateway = ["dep:axum"]

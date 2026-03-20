@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
+pub mod brain;
 pub mod channels;
 pub mod config;
 #[cfg(feature = "createos")]
@@ -114,6 +115,41 @@ pub enum MemoryCommands {
         #[arg(long)]
         yes: bool,
     },
+}
+
+/// Brain vector DB subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum BrainCommands {
+    /// Index brain files (incremental by default)
+    Index {
+        /// Full rebuild (re-index all files)
+        #[arg(long)]
+        full: bool,
+    },
+    /// Hybrid search the brain index
+    Query {
+        /// Search text
+        text: String,
+        /// Filter by session (e.g., backend, frontend)
+        #[arg(long)]
+        session: Option<String>,
+        /// Token budget for results
+        #[arg(long, default_value = "8000")]
+        budget: usize,
+        /// Number of results
+        #[arg(long, default_value = "10")]
+        top_k: usize,
+        /// Output format: text (default) or markdown
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Filter by categories (comma-separated)
+        #[arg(long)]
+        categories: Option<String>,
+    },
+    /// Show index statistics
+    Stats,
+    /// Verify content hashes against disk
+    Validate,
 }
 
 /// Migration subcommands

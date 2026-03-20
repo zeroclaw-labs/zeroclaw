@@ -42,7 +42,7 @@ use lightwave_sys::daemon;
 use lightwave_sys::memory;
 #[cfg(feature = "createos")]
 use lightwave_sys::CreateOsCommands;
-use lightwave_sys::{ChannelCommands, MemoryCommands};
+use lightwave_sys::{BrainCommands, ChannelCommands, MemoryCommands};
 
 /// LightWave Augusta — local AI agent runtime for macOS.
 #[derive(Parser, Debug)]
@@ -99,6 +99,25 @@ Examples:
     Memory {
         #[command(subcommand)]
         memory_command: MemoryCommands,
+    },
+
+    /// Brain vector DB (index, query, stats, validate)
+    #[command(long_about = "\
+Manage the Brain vector database for ~/.brain/ knowledge retrieval.
+
+Indexes YAML, Markdown, and Mermaid files with local ONNX embeddings
+(BGE-small-en-v1.5) and provides hybrid FTS5 + cosine similarity search.
+
+Examples:
+  augusta brain index              # incremental index
+  augusta brain index --full       # full rebuild
+  augusta brain query \"multi-tenant database\"
+  augusta brain query --session backend --budget 4000
+  augusta brain stats              # chunk/file counts
+  augusta brain validate           # hash verification")]
+    Brain {
+        #[command(subcommand)]
+        brain_command: BrainCommands,
     },
 
     /// Manage the background daemon
@@ -258,6 +277,10 @@ async fn main() -> Result<()> {
 
         Commands::Memory { memory_command } => {
             memory::cli::handle_command(memory_command, &config).await?;
+        }
+
+        Commands::Brain { brain_command } => {
+            lightwave_sys::brain::cli::handle_command(brain_command).await?;
         }
 
         Commands::Daemon { action } => match action {

@@ -41,3 +41,6 @@ credentials.json
 
 # Coverage artifacts
 lcov.info
+
+# ONNX model cache (fastembed downloads)
+.fastembed_cache/

@@ -396,6 +396,49 @@ impl Channel for OrchestratorChannel {
 
                 match result {
                     Ok(entries) => {
+                        // Check for brain messages first (type: brain_query|brain_index)
+                        if let Some(fields) = parse_stream_fields(&entries) {
+                            if let Some(msg_type) = fields.get("type") {
+                                if msg_type == "brain_query" || msg_type == "brain_index" {
+                                    let request_id = fields
+                                        .get("request_id")
+                                        .or_else(|| fields.get("run_id"))
+                                        .cloned()
+                                        .unwrap_or_default();
+
+                                    if let Some(response) = handle_brain_message(&fields).await {
+                                        // Publish result to the results stream
+                                        if !request_id.is_empty() {
+                                            let result_stream =
+                                                format!("{}:{}", self.results_prefix, request_id);
+                                            let mut conn = match self.get_connection().await {
+                                                Ok(c) => c,
+                                                Err(e) => {
+                                                    tracing::error!(error = %e, "Brain result: Redis connect failed");
+                                                    continue;
+                                                }
+                                            };
+                                            let _: redis::RedisResult<String> = redis::cmd("XADD")
+                                                .arg(&result_stream)
+                                                .arg("*")
+                                                .arg("run_id")
+                                                .arg(&request_id)
+                                                .arg("status")
+                                                .arg("completed")
+                                                .arg("output")
+                                                .arg(&response)
+                                                .arg("duration_ms")
+                                                .arg("0")
+                                                .query_async(&mut conn)
+                                                .await;
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // Normal agent task
                         if let Some(task) = parse_stream_entries(&entries) {
                             let mut metadata = std::collections::HashMap::new();
                             if let Some(ctx) = task.system_context {
@@ -444,6 +487,136 @@ impl Channel for OrchestratorChannel {
     }
 }
 
+/// Handle brain-specific message types (brain_query, brain_index).
+///
+/// Returns `Some(json_response)` if the message was a brain message,
+/// `None` if it should be processed as a normal agent task.
+#[cfg(feature = "orchestrator")]
+pub async fn handle_brain_message(
+    fields: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let msg_type = fields.get("type")?;
+
+    match msg_type.as_str() {
+        "brain_query" => {
+            let query_text = fields.get("query").cloned().unwrap_or_default();
+            let session = fields.get("session").cloned();
+            let top_k: usize = fields
+                .get("top_k")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10);
+            let budget: usize = fields
+                .get("budget")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8000);
+            let categories: Vec<String> = fields
+                .get("categories")
+                .and_then(|c| serde_json::from_str(c).ok())
+                .unwrap_or_default();
+
+            let brain_dir = crate::brain::brain_dir();
+            let brain = crate::brain::BrainIndex::new(&brain_dir);
+
+            // Try to compute query embedding
+            let query_embedding = {
+                #[cfg(feature = "brain")]
+                {
+                    crate::brain::onnx_embedding::OnnxEmbedding::new()
+                        .ok()
+                        .and_then(|emb| {
+                            use crate::memory::embeddings::EmbeddingProvider;
+                            tokio::task::block_in_place(|| {
+                                tokio::runtime::Handle::current()
+                                    .block_on(emb.embed_one(&query_text))
+                                    .ok()
+                            })
+                        })
+                }
+                #[cfg(not(feature = "brain"))]
+                {
+                    None::<Vec<f32>>
+                }
+            };
+
+            let opts = crate::brain::query::QueryOptions {
+                session,
+                categories,
+                top_k,
+                budget,
+                query_embedding,
+            };
+
+            match crate::brain::query::query(&brain, &query_text, &opts) {
+                Ok(results) => {
+                    let total_tokens: i32 = results.iter().map(|r| r.token_count).sum();
+                    let stale_count = 0; // We clean stale on index, not query
+                    let chunks: Vec<serde_json::Value> = results
+                        .iter()
+                        .map(|r| {
+                            serde_json::json!({
+                                "file_path": r.file_path,
+                                "chunk_key": r.chunk_key,
+                                "content": r.content,
+                                "score": r.score,
+                                "category": r.category,
+                                "token_count": r.token_count,
+                            })
+                        })
+                        .collect();
+
+                    Some(
+                        serde_json::json!({
+                            "chunks": chunks,
+                            "total_tokens": total_tokens,
+                            "stale_count": stale_count,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => Some(serde_json::json!({"error": format!("{e}")}).to_string()),
+            }
+        }
+        "brain_index" => {
+            let mode = fields
+                .get("mode")
+                .cloned()
+                .unwrap_or_else(|| "incremental".to_string());
+            let full = mode == "full";
+
+            let brain_dir = crate::brain::brain_dir();
+            let brain = crate::brain::BrainIndex::new(&brain_dir);
+
+            let embedder: std::sync::Arc<dyn crate::memory::embeddings::EmbeddingProvider> = {
+                #[cfg(feature = "brain")]
+                {
+                    match crate::brain::onnx_embedding::OnnxEmbedding::new() {
+                        Ok(p) => std::sync::Arc::new(p),
+                        Err(_) => std::sync::Arc::new(crate::memory::embeddings::NoopEmbedding),
+                    }
+                }
+                #[cfg(not(feature = "brain"))]
+                {
+                    std::sync::Arc::new(crate::memory::embeddings::NoopEmbedding)
+                }
+            };
+
+            match crate::brain::index::index_brain(&brain, embedder.as_ref(), full).await {
+                Ok(result) => Some(
+                    serde_json::json!({
+                        "files_scanned": result.files_scanned,
+                        "files_indexed": result.files_indexed,
+                        "chunks_created": result.chunks_created,
+                        "errors": result.errors,
+                    })
+                    .to_string(),
+                ),
+                Err(e) => Some(serde_json::json!({"error": format!("{e}")}).to_string()),
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Parse the duration tag and classify output to determine status and error code.
 ///
 /// The `start_orchestrator` loop prepends `__duration_ms:{N}__\n` to the output.
@@ -477,15 +650,11 @@ fn classify_output(raw: &str) -> (&str, u64, Option<ErrorCode>, &str) {
     }
 }
 
-/// Parse Redis Stream XREADGROUP response to extract flat field pairs.
-///
-/// The Elixir orchestrator publishes flat key-value fields:
-///   XADD augusta:tasks * run_id <id> agent_type <type> prompt <msg> ...
-///
-/// This function extracts those fields into a HashMap, then builds an
-/// OrchestratorTask from them.
+/// Extract raw field pairs from a Redis Stream XREADGROUP response.
 #[cfg(feature = "orchestrator")]
-fn parse_stream_entries(entries: &[redis::Value]) -> Option<OrchestratorTask> {
+fn parse_stream_fields(
+    entries: &[redis::Value],
+) -> Option<std::collections::HashMap<String, String>> {
     use redis::Value;
     use std::collections::HashMap;
 
@@ -519,7 +688,18 @@ fn parse_stream_entries(entries: &[redis::Value]) -> Option<OrchestratorTask> {
         i += 2;
     }
 
-    // Build OrchestratorTask from flat fields
+    Some(map)
+}
+
+/// Parse Redis Stream XREADGROUP response to extract flat field pairs,
+/// then build an OrchestratorTask from them.
+///
+/// The Elixir orchestrator publishes flat key-value fields:
+///   XADD augusta:tasks * run_id <id> agent_type <type> prompt <msg> ...
+#[cfg(feature = "orchestrator")]
+fn parse_stream_entries(entries: &[redis::Value]) -> Option<OrchestratorTask> {
+    let map = parse_stream_fields(entries)?;
+
     let run_id = map.get("run_id")?.clone();
     let agent_type = map.get("agent_type").cloned().unwrap_or_default();
     let prompt = map.get("prompt").cloned().unwrap_or_default();

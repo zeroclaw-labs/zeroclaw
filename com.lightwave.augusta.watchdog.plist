@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lightwave.augusta.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>
+HB="$HOME/Library/Application Support/Augusta/heartbeat"
+PID_FILE="$HOME/Library/Application Support/Augusta/augusta.pid"
+STALE_THRESHOLD=120
+
+[ ! -f "$HB" ] &amp;&amp; exit 0
+[ ! -f "$PID_FILE" ] &amp;&amp; exit 0
+
+HB_TS=$(cat "$HB" 2>/dev/null | tr -d '[:space:]')
+[ -z "$HB_TS" ] &amp;&amp; exit 0
+
+NOW=$(date +%s)
+AGE=$((NOW - HB_TS))
+
+if [ "$AGE" -gt "$STALE_THRESHOLD" ]; then
+    PID=$(cat "$PID_FILE" 2>/dev/null | tr -d '[:space:]')
+    if [ -n "$PID" ] &amp;&amp; kill -0 "$PID" 2>/dev/null; then
+        logger -t augusta.watchdog "Heartbeat stale (${AGE}s) — sending SIGTERM to PID $PID"
+        kill -TERM "$PID"
+    fi
+fi
+        </string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>StandardOutPath</key>
+    <string>~/Library/Logs/Augusta/watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>~/Library/Logs/Augusta/watchdog.log</string>
+</dict>
+</plist>
