@@ -1,6 +1,6 @@
 ---
 id: add-usage-remaining-a4f4
-stage: verify
+stage: done
 deps: []
 links: []
 created: 2026-03-19T17:05:19Z
@@ -8,7 +8,7 @@ type: feature
 priority: 2
 assignee: Dustin Reynolds
 tags: [feature, usage]
-version: 6
+version: 7
 ---
 # Add usage remaining display when asked for 'usage'
 

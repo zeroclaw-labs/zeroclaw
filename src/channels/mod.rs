@@ -2601,12 +2601,13 @@ async fn process_channel_message(
 
     // Resolve tmux target for this channel (if configured).
     // Activate tmux routing when the message starts with a recognized prefix.
-    let tmux_prefixes: &[&str] = &[">> ", "TMUX ", "tmux "];
-    let tmux_prefix_match = tmux_prefixes
+    let tmux_prefixes: &[&str] = &[">> ", "tmux "];
+    let content_lower = msg.content.to_lowercase();
+    let tmux_prefix_len = tmux_prefixes
         .iter()
-        .find(|p| msg.content.starts_with(*p))
-        .copied();
-    let tmux_target = if tmux_prefix_match.is_some() {
+        .find(|&&p| content_lower.starts_with(p))
+        .map(|p| p.len());
+    let tmux_target = if tmux_prefix_len.is_some() {
         ctx.channel_tmux_targets
             .get(room_id_for_ws)
             .or_else(|| ctx.channel_tmux_targets.get(&msg.channel))
@@ -2615,8 +2616,8 @@ async fn process_channel_message(
         None
     };
     let is_tmux_routed = tmux_target.is_some();
-    let user_content = if let (true, Some(prefix)) = (is_tmux_routed, tmux_prefix_match) {
-        msg.content[prefix.len()..].to_string()
+    let user_content = if let (true, Some(len)) = (is_tmux_routed, tmux_prefix_len) {
+        msg.content[len..].to_string()
     } else {
         msg.content.clone()
     };

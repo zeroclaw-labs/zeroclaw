@@ -1,6 +1,6 @@
 ---
 id: haiku-local-model-2db7
-stage: test
+stage: done
 deps: [tiered-model-routing-63c1]
 links: []
 created: 2026-03-19T15:52:15Z
@@ -8,7 +8,8 @@ type: feature
 priority: 1
 assignee: Dustin Reynolds
 tags: [providers, cost, routing, haiku]
-version: 7
+skipped: [verify]
+version: 8
 ---
 # Haiku/local model classifier for intelligent query routing
 

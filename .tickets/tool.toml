@@ -1,0 +1,156 @@
+# Ticket tool subcommand definitions.
+# Edit this file to add/modify subcommands — no recompilation needed.
+#
+# Each [commands.<name>] section defines a subcommand:
+#   description  — shown in help and LLM tool schema
+#   args         — base tk CLI arguments
+#   [commands.<name>.params.<param>] — parameter definitions:
+#     type        — "string" or "integer"
+#     description — shown in help and schema
+#     flag        — CLI flag to pass (e.g. "--type")
+#     positional  — if true, appended as a positional arg (no flag)
+#     required    — if true, must be provided
+
+[commands.list]
+description = "List open tickets grouped by workflow status"
+args = ["list", "--json"]
+
+[commands.list.params.type]
+flag = "--type"
+type = "string"
+description = "Filter by type (bug, feature, task, epic, chore)"
+
+[commands.list.params.priority]
+flag = "--priority"
+type = "integer"
+description = "Filter by priority (0=critical, 4=backlog)"
+
+[commands.list.params.assignee]
+flag = "--assignee"
+type = "string"
+description = "Filter by assignee"
+
+[commands.list.params.tag]
+flag = "--tag"
+type = "string"
+description = "Filter by tag"
+
+[commands.show]
+description = "Show full ticket details by ID (supports partial matching)"
+args = ["show"]
+
+[commands.show.params.id]
+positional = true
+required = true
+type = "string"
+description = "Ticket ID or partial ID"
+
+[commands.create]
+description = "Create a new ticket"
+args = ["create"]
+
+[commands.create.params.title]
+positional = true
+required = true
+type = "string"
+description = "Ticket title"
+
+[commands.create.params.type]
+flag = "--type"
+type = "string"
+description = "Ticket type (bug, feature, task, epic, chore)"
+
+[commands.create.params.priority]
+flag = "--priority"
+type = "integer"
+description = "Priority (0=critical, 4=backlog)"
+
+[commands.create.params.description]
+flag = "-d"
+type = "string"
+description = "Ticket description"
+
+[commands.create.params.tags]
+flag = "--tags"
+type = "string"
+description = "Comma-separated tags"
+
+[commands.create.params.assignee]
+flag = "--assignee"
+type = "string"
+description = "Assignee name"
+
+[commands.stats]
+description = "Project health: open/closed counts, stage distribution, velocity"
+args = ["stats"]
+
+[commands.pipeline]
+description = "Show tickets grouped by pipeline stage"
+args = ["pipeline"]
+
+[commands.pipeline.params.stage]
+flag = "--stage"
+type = "string"
+description = "Filter to specific stage (triage, spec, design, implement, test, verify, done)"
+
+[commands.query]
+description = "Query tickets with a jq filter expression. Example: '.type == \"bug\" and .priority <= 1'"
+args = ["query"]
+
+[commands.query.params.filter]
+positional = true
+type = "string"
+description = "jq filter expression (passed to select()). Omit for all tickets."
+
+[commands.ready]
+description = "Show tickets that are unblocked and ready to work"
+args = ["ready"]
+
+[commands.ready.params.tag]
+flag = "--tag"
+type = "string"
+description = "Filter by tag"
+
+[commands.blocked]
+description = "Show tickets blocked by unresolved dependencies"
+args = ["blocked"]
+
+[commands.advance]
+description = "Advance a ticket to the next pipeline stage"
+args = ["advance"]
+
+[commands.advance.params.id]
+positional = true
+required = true
+type = "string"
+description = "Ticket ID"
+
+[commands.advance.params.force]
+flag = "--force"
+type = "boolean"
+description = "Bypass gate checks"
+
+[commands.add-note]
+description = "Append a timestamped note to a ticket"
+args = ["add-note"]
+
+[commands.add-note.params.id]
+positional = true
+required = true
+type = "string"
+description = "Ticket ID"
+
+[commands.add-note.params.text]
+positional = true
+required = true
+type = "string"
+description = "Note text to append"
+
+[commands.closed]
+description = "Show recently closed tickets"
+args = ["closed"]
+
+[commands.closed.params.limit]
+flag = "--limit"
+type = "integer"
+description = "Number of closed tickets to show (default: 20)"

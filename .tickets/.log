@@ -16,3 +16,39 @@
 2026-03-19T17:08:28Z add-usage-remaining-a4f4 stage design→implement
 2026-03-19T17:08:28Z add-usage-remaining-a4f4 stage implement→test
 2026-03-19T17:13:32Z add-usage-remaining-a4f4 stage test→verify
+2026-03-19T17:38:05Z document-llama-cpp-c47c created
+2026-03-19T22:43:05Z add-usage-remaining-a4f4 stage verify→done
+2026-03-19T22:47:34Z haiku-local-model-2db7 stage test→done
+2026-03-19T22:57:58Z check-unanswered-messages-9037 stage triage→done
+2026-03-19T22:59:23Z document-llama-cpp-c47c stage triage→done
+2026-03-20T13:51:27Z zero-token-ticket-a748 created
+2026-03-20T13:53:29Z proactive-automated-ticket-2343 created
+2026-03-20T13:58:37Z matrix-room-history-6fdb created
+2026-03-20T14:04:15Z zero-token-ticket-a748 stage triage→spec
+2026-03-20T14:04:15Z zero-token-ticket-a748 stage spec→design
+2026-03-20T14:04:15Z zero-token-ticket-a748 stage design→implement
+2026-03-20T14:04:15Z zero-token-ticket-a748 stage implement→test
+2026-03-20T14:04:15Z zero-token-ticket-a748 stage test→done
+2026-03-20T14:51:08Z ticket-still-valid-fadb created
+2026-03-20T15:10:45Z test-zero-token-c350 created
+2026-03-20T15:14:35Z look-tickets-clear-6cd0 created
+2026-03-20T15:15:43Z test-zero-token-c350 stage triage→done
+2026-03-20T15:15:43Z ticket-still-valid-fadb stage triage→done
+2026-03-20T15:15:43Z look-tickets-clear-6cd0 stage triage→done
+2026-03-20T15:19:24Z need-create-additional-64ea created
+2026-03-20T15:23:36Z need-create-additional-64ea stage triage→implement
+2026-03-20T15:23:36Z need-create-additional-64ea stage implement→test
+2026-03-20T15:23:36Z need-create-additional-64ea stage test→verify
+2026-03-20T15:24:28Z fix-usage-also-15eb created
+2026-03-20T15:27:35Z need-create-additional-64ea stage verify→done
+2026-03-20T15:40:50Z help-92ad created
+2026-03-20T15:55:44Z help-92ad stage triage→done
+2026-03-20T16:03:55Z create-zero-token-437b created
+2026-03-20T16:16:17Z zero-token-command-a2da created
+2026-03-20T17:11:24Z sending-tmux-commands-bddf created
+2026-03-20T17:13:45Z create-zero-token-437b stage triage→done
+2026-03-20T17:19:20Z move-matrix-new-b12f created
+2026-03-20T17:27:44Z like-peek-command-f4e2 created
+2026-03-20T17:44:03Z need-command-get-ba18 created
+2026-03-20T17:51:17Z like-peek-command-f4e2 stage triage→done
+2026-03-20T18:03:01Z need-zero-token-2193 created
