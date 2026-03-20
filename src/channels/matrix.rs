@@ -331,7 +331,7 @@ impl MatrixChannel {
 
     fn is_help_command(body: &str) -> bool {
         let t = body.trim().to_lowercase();
-        t == "help" || t == "!help" || t == "/help" || t == "commands" || t == "!commands"
+        t == "help" || t == "!help" || t == "/help" || t == "commands" || t == "!commands" || t == "command"
     }
 
     fn handle_help_command() -> String {
