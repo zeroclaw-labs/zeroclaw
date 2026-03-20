@@ -1,1 +1,15 @@
 edition = "2021"
+
+# Formatting constraints (stable)
+max_width = 100
+tab_spaces = 4
+hard_tabs = false
+
+# Code style (stable)
+use_field_init_shorthand = true
+use_try_shorthand = true
+reorder_imports = true
+reorder_modules = true
+
+# Match arm formatting (stable)
+match_arm_leading_pipes = "Never"

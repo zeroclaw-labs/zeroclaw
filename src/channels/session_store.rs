@@ -110,6 +110,16 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Delete a session's JSONL file. Returns `true` if the file existed.
+    pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        let path = self.session_path(session_key);
+        if !path.exists() {
+            return Ok(false);
+        }
+        std::fs::remove_file(&path)?;
+        Ok(true)
+    }
+
     /// List all session keys that have files on disk.
     pub fn list_sessions(&self) -> Vec<String> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
@@ -146,6 +156,10 @@ impl SessionBackend for SessionStore {
 
     fn compact(&self, session_key: &str) -> std::io::Result<()> {
         self.compact(session_key)
+    }
+
+    fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+        self.delete_session(session_key)
     }
 }
 
@@ -307,5 +321,45 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].content, "world");
+    }
+
+    #[test]
+    fn delete_session_removes_jsonl_file() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let key = "delete_test";
+
+        store.append(key, &ChatMessage::user("hello")).unwrap();
+        assert_eq!(store.load(key).len(), 1);
+
+        let deleted = store.delete_session(key).unwrap();
+        assert!(deleted);
+        assert!(store.load(key).is_empty());
+        assert!(!store.session_path(key).exists());
+    }
+
+    #[test]
+    fn delete_session_nonexistent_returns_false() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        let deleted = store.delete_session("nonexistent").unwrap();
+        assert!(!deleted);
+    }
+
+    #[test]
+    fn delete_session_via_trait() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+
+        backend
+            .append("trait_delete", &ChatMessage::user("hello"))
+            .unwrap();
+        assert_eq!(backend.load("trait_delete").len(), 1);
+
+        let deleted = backend.delete_session("trait_delete").unwrap();
+        assert!(deleted);
+        assert!(backend.load("trait_delete").is_empty());
     }
 }
