@@ -307,10 +307,9 @@ impl JiraTool {
             .map_err(|e| anyhow::anyhow!("Jira list_projects users request failed: {e}"))?;
 
         let users: Vec<Value> = if users_resp.status().is_success() {
-            users_resp
-                .json()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to parse Jira list_projects users response: {e}"))?
+            users_resp.json().await.map_err(|e| {
+                anyhow::anyhow!("Failed to parse Jira list_projects users response: {e}")
+            })?
         } else {
             let status = users_resp.status();
             let text = users_resp.text().await.unwrap_or_default();
@@ -1490,7 +1489,10 @@ mod tests {
             .collect();
         assert_eq!(gp_statuses, vec!["Design", "Done", "To Do"]);
 
-        assert!(arr[0].get("users").is_none(), "users should not be in per-project data");
+        assert!(
+            arr[0].get("users").is_none(),
+            "users should not be in per-project data"
+        );
     }
 
     #[test]
