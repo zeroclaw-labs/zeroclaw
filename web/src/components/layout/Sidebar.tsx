@@ -34,7 +34,7 @@ export default function Sidebar() {
         <div className="relative shrink-0">
           <div className="absolute -inset-1.5 rounded-xl" style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }} />
           <img
-            src="/_app/logo.png"
+            src="/_app/zeroclaw-trans.png"
             alt="ZeroClaw"
             className="relative h-9 w-9 rounded-xl object-cover"
             onError={(e) => {

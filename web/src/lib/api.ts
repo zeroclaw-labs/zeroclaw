@@ -193,6 +193,25 @@ export function getCronRuns(
   ).then((data) => unwrapField(data, 'runs'));
 }
 
+export interface CronSettings {
+  enabled: boolean;
+  catch_up_on_startup: boolean;
+  max_run_history: number;
+}
+
+export function getCronSettings(): Promise<CronSettings> {
+  return apiFetch<CronSettings>('/api/cron/settings');
+}
+
+export function patchCronSettings(
+  patch: Partial<CronSettings>,
+): Promise<CronSettings> {
+  return apiFetch<CronSettings & { status: string }>('/api/cron/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Integrations
 // ---------------------------------------------------------------------------
