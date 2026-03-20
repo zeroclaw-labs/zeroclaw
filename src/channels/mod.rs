@@ -7323,7 +7323,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_compact_mode_omits_instructions_and_tools() {
+    fn prompt_skills_compact_mode_omits_instructions_but_keeps_tools() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
@@ -7361,7 +7361,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt
             .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        assert!(!prompt.contains("<tools>"));
+        // Compact mode should still include tools so the LLM knows about them
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("<name>lint</name>"));
+        assert!(prompt.contains("<kind>shell</kind>"));
     }
 
     #[test]
