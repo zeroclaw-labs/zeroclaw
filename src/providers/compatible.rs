@@ -57,6 +57,59 @@ pub enum AuthStyle {
     XApiKey,
     /// Custom header name
     Custom(String),
+    /// Zhipu/GLM JWT auth: the credential is `id.secret`, and a short-lived
+    /// JWT (HMAC-SHA256, 3.5 min expiry) is generated per request.
+    /// Used by Z.AI and GLM providers.
+    ZhipuJwt,
+}
+
+/// Generate a Zhipu JWT from an `id.secret` API key.
+/// Returns `Authorization: Bearer <jwt>` value. Token is valid for 3.5 minutes.
+fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
+    let (id, secret) = credential
+        .split_once('.')
+        .ok_or_else(|| "Zhipu API key must be in 'id.secret' format".to_string())?;
+
+    #[allow(clippy::cast_possible_truncation)] // millis won't exceed u64 until year 584 million
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis() as u64;
+    let exp_ms = now_ms + 210_000; // 3.5 minutes
+
+    // Header: {"alg":"HS256","typ":"JWT","sign_type":"SIGN"}
+    let header_b64 = base64url_no_pad(br#"{"alg":"HS256","typ":"JWT","sign_type":"SIGN"}"#);
+    let payload = format!(r#"{{"api_key":"{id}","exp":{exp_ms},"timestamp":{now_ms}}}"#);
+    let payload_b64 = base64url_no_pad(payload.as_bytes());
+
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let sig = ring::hmac::sign(&key, signing_input.as_bytes());
+    let sig_b64 = base64url_no_pad(sig.as_ref());
+
+    Ok(format!("Bearer {signing_input}.{sig_b64}"))
+}
+
+fn base64url_no_pad(data: &[u8]) -> String {
+    use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+    URL_SAFE_NO_PAD.encode(data)
+}
+
+/// Apply auth to a request builder (usable from spawned tasks without `&self`).
+fn apply_auth_to_request(
+    req: reqwest::RequestBuilder,
+    style: &AuthStyle,
+    credential: &str,
+) -> reqwest::RequestBuilder {
+    match style {
+        AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
+        AuthStyle::XApiKey => req.header("x-api-key", credential),
+        AuthStyle::Custom(header) => req.header(header, credential),
+        AuthStyle::ZhipuJwt => match zhipu_jwt_bearer(credential) {
+            Ok(val) => req.header("Authorization", val),
+            Err(_) => req.header("Authorization", format!("Bearer {credential}")),
+        },
+    }
 }
 
 impl OpenAiCompatibleProvider {
@@ -965,6 +1018,10 @@ impl OpenAiCompatibleProvider {
             AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
             AuthStyle::XApiKey => req.header("x-api-key", credential),
             AuthStyle::Custom(header) => req.header(header, credential),
+            AuthStyle::ZhipuJwt => match zhipu_jwt_bearer(credential) {
+                Ok(val) => req.header("Authorization", val),
+                Err(_) => req.header("Authorization", format!("Bearer {credential}")),
+            },
         }
     }
 
@@ -1797,13 +1854,7 @@ impl Provider for OpenAiCompatibleProvider {
             let mut req_builder = client.post(&url).json(&request);
 
             // Apply auth header
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", credential))
-                }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
+            req_builder = apply_auth_to_request(req_builder, &auth_header, &credential);
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
@@ -1840,6 +1891,90 @@ impl Provider for OpenAiCompatibleProvider {
         });
 
         // Convert channel receiver to stream
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let credential = match self.credential.as_ref() {
+            Some(value) => value.clone(),
+            None => {
+                let provider_name = self.name.clone();
+                return stream::once(async move {
+                    Err(StreamError::Provider(format!(
+                        "{} API key not set",
+                        provider_name
+                    )))
+                })
+                .boxed();
+            }
+        };
+
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(messages)
+        } else {
+            messages.to_vec()
+        };
+        let native_messages =
+            Self::convert_messages_for_native(&effective_messages, !self.merge_system_into_user);
+        let request = NativeChatRequest {
+            model: model.to_string(),
+            messages: native_messages,
+            temperature,
+            stream: Some(options.enabled),
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+        };
+
+        let url = self.chat_completions_url();
+        let client = self.http_client();
+        let auth_header = self.auth_header.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        tokio::spawn(async move {
+            let mut req_builder = client.post(&url).json(&request);
+            req_builder = apply_auth_to_request(req_builder, &auth_header, &credential);
+            req_builder = req_builder.header("Accept", "text/event-stream");
+
+            let response = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = match response.text().await {
+                    Ok(e) => e,
+                    Err(_) => format!("HTTP error: {}", status),
+                };
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
+                return;
+            }
+
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            while let Some(chunk) = chunk_stream.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         stream::unfold(rx, |mut rx| async move {
             rx.recv().await.map(|chunk| (chunk, rx))
         })
@@ -1997,6 +2132,79 @@ mod tests {
             AuthStyle::Custom("X-Custom-Key".into()),
         );
         assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
+    }
+
+    #[test]
+    fn zhipu_jwt_produces_valid_three_part_token() {
+        let result = zhipu_jwt_bearer("testid.testsecret").unwrap();
+        assert!(result.starts_with("Bearer "));
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have 3 dot-separated parts: {jwt}");
+    }
+
+    #[test]
+    fn zhipu_jwt_header_is_correct() {
+        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+        let result = zhipu_jwt_bearer("myid.mysecret").unwrap();
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let header_b64 = jwt.split('.').next().unwrap();
+        let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+        assert_eq!(header["alg"], "HS256");
+        assert_eq!(header["typ"], "JWT");
+        assert_eq!(header["sign_type"], "SIGN");
+    }
+
+    #[test]
+    fn zhipu_jwt_payload_contains_api_key_and_timestamps() {
+        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+        let result = zhipu_jwt_bearer("myapiid.mysecretkey").unwrap();
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let payload_b64 = jwt.split('.').nth(1).unwrap();
+        let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload["api_key"], "myapiid");
+        assert!(payload["exp"].is_number());
+        assert!(payload["timestamp"].is_number());
+        // exp should be ~210s after timestamp
+        let ts = payload["timestamp"].as_u64().unwrap();
+        let exp = payload["exp"].as_u64().unwrap();
+        assert_eq!(exp - ts, 210_000);
+    }
+
+    #[test]
+    fn zhipu_jwt_signature_is_verifiable() {
+        let secret = "testsecret123";
+        let credential = format!("testid.{secret}");
+        let result = zhipu_jwt_bearer(&credential).unwrap();
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+        // Verify HMAC-SHA256 signature
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        ring::hmac::verify(&key, signing_input.as_bytes(), &sig_bytes)
+            .expect("signature must verify");
+    }
+
+    #[test]
+    fn zhipu_jwt_rejects_invalid_key_format() {
+        assert!(zhipu_jwt_bearer("no-dot-here").is_err());
+        assert!(zhipu_jwt_bearer("").is_err());
+    }
+
+    #[test]
+    fn zhipu_jwt_auth_style_applies_correctly() {
+        let p = OpenAiCompatibleProvider::new(
+            "Z.AI",
+            "https://api.z.ai/api/coding/paas/v4",
+            Some("testid.testsecret"),
+            AuthStyle::ZhipuJwt,
+        );
+        assert!(matches!(p.auth_header, AuthStyle::ZhipuJwt));
     }
 
     #[tokio::test]

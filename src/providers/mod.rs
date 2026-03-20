@@ -1216,14 +1216,14 @@ fn create_provider_with_url_and_options(
             "Z.AI",
             zai_base_url(name).expect("checked in guard"),
             key,
-            AuthStyle::Bearer,
+            AuthStyle::ZhipuJwt,
         ))),
         name if glm_base_url(name).is_some() => {
             Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",
                 glm_base_url(name).expect("checked in guard"),
                 key,
-                AuthStyle::Bearer,
+                AuthStyle::ZhipuJwt,
             )))
         }
         name if minimax_base_url(name).is_some() => Ok(compat(
