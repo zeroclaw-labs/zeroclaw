@@ -1,7 +1,12 @@
-import { useState, useEffect } from "react";
-import { Puzzle, Check, Zap, Clock } from "lucide-react";
-import type { Integration } from "@/types/api";
+import { useState, useEffect, useCallback } from "react";
+import { Puzzle, Check, Zap, Clock, Settings, Plus } from "lucide-react";
+import type { Integration, ChannelSchema } from "@/types/api";
 import { getIntegrations } from "@/lib/api";
+import {
+  INTEGRATION_TO_CHANNEL_KEY,
+  getChannelSchema,
+} from "@/lib/channelSchemas";
+import ChannelConfigModal from "@/components/ChannelConfigModal";
 
 function statusBadge(status: Integration["status"]) {
   switch (status) {
@@ -34,13 +39,19 @@ export default function Integrations() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<string>("all");
+  const [modalSchema, setModalSchema] = useState<ChannelSchema | null>(null);
 
-  useEffect(() => {
+  const loadIntegrations = useCallback(() => {
+    setLoading(true);
     getIntegrations()
       .then(setIntegrations)
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
   }, []);
+
+  useEffect(() => {
+    loadIntegrations();
+  }, [loadIntegrations]);
 
   const categories = [
     "all",
@@ -52,7 +63,6 @@ export default function Integrations() {
       ? integrations
       : integrations.filter((i) => i.category === activeCategory);
 
-  // Group by category for display
   const grouped = filtered.reduce<Record<string, Integration[]>>(
     (acc, item) => {
       const key = item.category;
@@ -62,6 +72,18 @@ export default function Integrations() {
     },
     {},
   );
+
+  const openChannelConfig = (integrationName: string) => {
+    const channelKey = INTEGRATION_TO_CHANNEL_KEY[integrationName];
+    if (!channelKey) return;
+    const schema = getChannelSchema(channelKey);
+    if (schema) setModalSchema(schema);
+  };
+
+  const handleModalSaved = () => {
+    setModalSchema(null);
+    loadIntegrations();
+  };
 
   if (error) {
     return (
@@ -131,6 +153,12 @@ export default function Integrations() {
                 {items.map((integration) => {
                   const badge = statusBadge(integration.status);
                   const BadgeIcon = badge.icon;
+                  const channelKey =
+                    INTEGRATION_TO_CHANNEL_KEY[integration.name];
+                  const hasSchema = channelKey
+                    ? !!getChannelSchema(channelKey)
+                    : false;
+
                   return (
                     <div
                       key={integration.name}
@@ -153,12 +181,45 @@ export default function Integrations() {
                           {badge.label}
                         </span>
                       </div>
+
+                      {/* Configure / Setup button */}
+                      {hasSchema && integration.status !== "ComingSoon" && (
+                        <button
+                          onClick={() => openChannelConfig(integration.name)}
+                          className={`mt-3 w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold transition-all ${
+                            integration.status === "Active"
+                              ? "text-[#0080ff] border border-[#0080ff30] hover:bg-[#0080ff10]"
+                              : "btn-electric"
+                          }`}
+                        >
+                          {integration.status === "Active" ? (
+                            <>
+                              <Settings className="h-3.5 w-3.5" />
+                              Configure
+                            </>
+                          ) : (
+                            <>
+                              <Plus className="h-3.5 w-3.5" />
+                              Setup
+                            </>
+                          )}
+                        </button>
+                      )}
                     </div>
                   );
                 })}
               </div>
             </div>
           ))
+      )}
+
+      {/* Channel Config Modal */}
+      {modalSchema && (
+        <ChannelConfigModal
+          schema={modalSchema}
+          onClose={() => setModalSchema(null)}
+          onSaved={handleModalSaved}
+        />
       )}
     </div>
   );

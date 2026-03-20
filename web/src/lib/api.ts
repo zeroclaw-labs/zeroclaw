@@ -15,6 +15,9 @@ import type {
   GraphNodesResponse,
   GraphBudget,
   GraphNode,
+  Skill,
+  McpServer,
+  McpServerInput,
 } from "../types/api";
 import { clearToken, getToken, setToken } from "./auth";
 
@@ -371,5 +374,83 @@ export function switchMemoryBackend(
   return apiFetch("/api/memory/backend", {
     method: "PUT",
     body: JSON.stringify({ backend }),
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Channel Config
+// ---------------------------------------------------------------------------
+
+export function getChannelConfig(name: string): Promise<{
+  channel: string;
+  configured: boolean;
+  config: Record<string, unknown> | null;
+}> {
+  return apiFetch(`/api/channels/${encodeURIComponent(name)}/config`);
+}
+
+export function putChannelConfig(
+  name: string,
+  config: Record<string, unknown>,
+): Promise<{ status: string }> {
+  return apiFetch(`/api/channels/${encodeURIComponent(name)}`, {
+    method: "PUT",
+    body: JSON.stringify(config),
+  });
+}
+
+export function deleteChannelConfig(name: string): Promise<{ status: string }> {
+  return apiFetch(`/api/channels/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Skills
+// ---------------------------------------------------------------------------
+
+export function getSkills(): Promise<Skill[]> {
+  return apiFetch<Skill[] | { skills: Skill[] }>("/api/skills").then((data) =>
+    unwrapField(data, "skills"),
+  );
+}
+
+export function installSkill(
+  source: string,
+): Promise<{ status: string; name: string }> {
+  return apiFetch("/api/skills/install", {
+    method: "POST",
+    body: JSON.stringify({ source }),
+  });
+}
+
+export function deleteSkill(name: string): Promise<{ status: string }> {
+  return apiFetch(`/api/skills/${encodeURIComponent(name)}`, {
+    method: "DELETE",
+  });
+}
+
+// ---------------------------------------------------------------------------
+// MCP Servers
+// ---------------------------------------------------------------------------
+
+export function getMcpServers(): Promise<McpServer[]> {
+  return apiFetch<McpServer[] | { servers: McpServer[] }>(
+    "/api/mcp/servers",
+  ).then((data) => unwrapField(data, "servers"));
+}
+
+export function addMcpServer(
+  server: McpServerInput,
+): Promise<{ status: string; name: string }> {
+  return apiFetch("/api/mcp/servers", {
+    method: "POST",
+    body: JSON.stringify(server),
+  });
+}
+
+export function deleteMcpServer(name: string): Promise<{ status: string }> {
+  return apiFetch(`/api/mcp/servers/${encodeURIComponent(name)}`, {
+    method: "DELETE",
   });
 }

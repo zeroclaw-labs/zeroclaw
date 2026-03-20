@@ -661,6 +661,541 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+// ── Channel Config API ──────────────────────────────────────────
+
+/// GET /api/channels/:name/config — return channel config (masked secrets)
+pub async fn handle_api_channel_config_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let masked = mask_sensitive_fields(&config);
+    let cc = &masked.channels_config;
+
+    let value: Option<serde_json::Value> = match name.as_str() {
+        "telegram" => cc.telegram.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "discord" => cc.discord.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "slack" => cc.slack.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "whatsapp" => cc.whatsapp.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "signal" => cc.signal.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "matrix" => cc.matrix.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "email" => cc.email.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "irc" => cc.irc.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "mattermost" => cc.mattermost.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "wati" => cc.wati.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "linq" => cc.linq.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        #[cfg(feature = "channel-nostr")]
+        "nostr" => cc.nostr.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "webhook" => cc.webhook.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        "clawdtalk" => cc.clawdtalk.as_ref().map(|c| serde_json::to_value(c).unwrap()),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Unknown channel: {name}")})),
+            )
+                .into_response();
+        }
+    };
+
+    Json(serde_json::json!({
+        "channel": name,
+        "configured": value.is_some(),
+        "config": value,
+    }))
+    .into_response()
+}
+
+/// PUT /api/channels/:name — create or update channel config
+pub async fn handle_api_channel_config_put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Deserialize body into the correct channel config struct
+    macro_rules! set_channel {
+        ($field:ident, $ty:ty) => {{
+            match serde_json::from_value::<$ty>(body.clone()) {
+                Ok(mut new_cfg) => {
+                    // Restore masked secrets from current config
+                    let current = state.config.lock().clone();
+                    if let Some(ref current_ch) = current.channels_config.$field {
+                        restore_channel_secrets_typed(&mut new_cfg, current_ch);
+                    }
+                    {
+                        let mut config = state.config.lock();
+                        config.channels_config.$field = Some(new_cfg);
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(format!("Invalid {}: {e}", stringify!($field))),
+            }
+        }};
+    }
+
+    let result: Result<(), String> = match name.as_str() {
+        "telegram" => set_channel!(telegram, crate::config::schema::TelegramConfig),
+        "discord" => set_channel!(discord, crate::config::schema::DiscordConfig),
+        "slack" => set_channel!(slack, crate::config::schema::SlackConfig),
+        "whatsapp" => set_channel!(whatsapp, crate::config::schema::WhatsAppConfig),
+        "signal" => set_channel!(signal, crate::config::schema::SignalConfig),
+        "matrix" => set_channel!(matrix, crate::config::schema::MatrixConfig),
+        "email" => set_channel!(email, crate::channels::email_channel::EmailConfig),
+        "irc" => set_channel!(irc, crate::config::schema::IrcConfig),
+        "mattermost" => set_channel!(mattermost, crate::config::schema::MattermostConfig),
+        "wati" => set_channel!(wati, crate::config::schema::WatiConfig),
+        "linq" => set_channel!(linq, crate::config::schema::LinqConfig),
+        #[cfg(feature = "channel-nostr")]
+        "nostr" => set_channel!(nostr, crate::config::schema::NostrConfig),
+        "webhook" => set_channel!(webhook, crate::config::schema::WebhookConfig),
+        "clawdtalk" => set_channel!(clawdtalk, crate::channels::ClawdTalkConfig),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Unknown channel: {name}")})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = result {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response();
+    }
+
+    // Save to disk
+    let config_snapshot = state.config.lock().clone();
+    if let Err(e) = config_snapshot.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "channel": name})).into_response()
+}
+
+/// DELETE /api/channels/:name — remove channel config
+pub async fn handle_api_channel_config_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let removed = {
+        let mut config = state.config.lock();
+        let cc = &mut config.channels_config;
+        match name.as_str() {
+            "telegram" => { let had = cc.telegram.is_some(); cc.telegram = None; had }
+            "discord" => { let had = cc.discord.is_some(); cc.discord = None; had }
+            "slack" => { let had = cc.slack.is_some(); cc.slack = None; had }
+            "whatsapp" => { let had = cc.whatsapp.is_some(); cc.whatsapp = None; had }
+            "signal" => { let had = cc.signal.is_some(); cc.signal = None; had }
+            "matrix" => { let had = cc.matrix.is_some(); cc.matrix = None; had }
+            "email" => { let had = cc.email.is_some(); cc.email = None; had }
+            "irc" => { let had = cc.irc.is_some(); cc.irc = None; had }
+            "mattermost" => { let had = cc.mattermost.is_some(); cc.mattermost = None; had }
+            "wati" => { let had = cc.wati.is_some(); cc.wati = None; had }
+            "linq" => { let had = cc.linq.is_some(); cc.linq = None; had }
+            #[cfg(feature = "channel-nostr")]
+            "nostr" => { let had = cc.nostr.is_some(); cc.nostr = None; had }
+            "webhook" => { let had = cc.webhook.is_some(); cc.webhook = None; had }
+            "clawdtalk" => { let had = cc.clawdtalk.is_some(); cc.clawdtalk = None; had }
+            _ => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": format!("Unknown channel: {name}")})),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    if !removed {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Channel {name} not configured")})),
+        )
+            .into_response();
+    }
+
+    // Save to disk
+    let config_snapshot = state.config.lock().clone();
+    if let Err(e) = config_snapshot.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "channel": name})).into_response()
+}
+
+/// Type-erased secret restoration for channel configs.
+/// We compare field-by-field using serde_json Values to avoid per-channel boilerplate.
+fn restore_channel_secrets_typed<T: serde::Serialize + serde::de::DeserializeOwned>(
+    new: &mut T,
+    current: &T,
+) {
+    if let (Ok(mut new_val), Ok(current_val)) = (
+        serde_json::to_value(&*new),
+        serde_json::to_value(current),
+    ) {
+        if let (Some(new_obj), Some(current_obj)) =
+            (new_val.as_object_mut(), current_val.as_object())
+        {
+            for (key, new_field) in new_obj.iter_mut() {
+                if new_field.as_str() == Some(MASKED_SECRET) {
+                    if let Some(current_field) = current_obj.get(key) {
+                        *new_field = current_field.clone();
+                    }
+                }
+            }
+        }
+        if let Ok(restored) = serde_json::from_value::<T>(new_val) {
+            *new = restored;
+        }
+    }
+}
+
+// ── Skills API ─────────────────────────────────────────────────────
+
+/// GET /api/skills — list installed skills
+pub async fn handle_api_skills_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let workspace_dir = config.workspace_dir.clone();
+
+    let skills = crate::skills::load_skills_with_config(&workspace_dir, &config);
+    let skills_json: Vec<serde_json::Value> = skills
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "description": s.description,
+                "version": s.version,
+                "author": s.author,
+                "tags": s.tags,
+                "tools": s.tools.iter().map(|t| serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "kind": t.kind,
+                    "command": t.command,
+                })).collect::<Vec<_>>(),
+                "prompts": s.prompts,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({"skills": skills_json})).into_response()
+}
+
+/// POST /api/skills/install — install skill from git URL or local path
+pub async fn handle_api_skills_install(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(source) = body.get("source").and_then(|v| v.as_str()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Missing 'source' field (git URL or local path)"})),
+        )
+            .into_response();
+    };
+
+    let source = source.to_string();
+    let config = state.config.lock().clone();
+    let workspace_dir = config.workspace_dir.clone();
+
+    let skills_dir = workspace_dir.join("skills");
+
+    // Run git clone in a blocking task
+    let result = tokio::task::spawn_blocking(move || {
+        // Validate: no path traversal
+        if source.contains("..") {
+            return Err("Path traversal not allowed".to_string());
+        }
+
+        let local_path = std::path::Path::new(&source);
+        if local_path.is_dir() {
+            // Local install: copy/symlink
+            let name = local_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let dest = skills_dir.join(&name);
+            if dest.exists() {
+                return Err(format!("Skill '{name}' already exists"));
+            }
+            // Copy recursively
+            copy_dir_recursive(local_path, &dest)
+                .map_err(|e| format!("Failed to copy skill: {e}"))?;
+            Ok(name)
+        } else if source.starts_with("http://")
+            || source.starts_with("https://")
+            || source.starts_with("git@")
+        {
+            // Git clone
+            std::fs::create_dir_all(&skills_dir)
+                .map_err(|e| format!("Failed to create skills dir: {e}"))?;
+            let output = std::process::Command::new("git")
+                .args(["clone", "--depth", "1", &source])
+                .current_dir(&skills_dir)
+                .output()
+                .map_err(|e| format!("Failed to run git clone: {e}"))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("git clone failed: {stderr}"));
+            }
+            // Extract name from URL
+            let name = source
+                .rsplit('/')
+                .next()
+                .unwrap_or("unknown")
+                .trim_end_matches(".git")
+                .to_string();
+            Ok(name)
+        } else {
+            Err("Source must be a git URL or local directory path".to_string())
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(name)) => {
+            Json(serde_json::json!({"status": "ok", "name": name})).into_response()
+        }
+        Ok(Err(e)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Task failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/skills/:name — remove installed skill
+pub async fn handle_api_skills_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Validate no path traversal
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid skill name"})),
+        )
+            .into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let workspace_dir = config.workspace_dir.clone();
+
+    let skill_path = workspace_dir.join("skills").join(&name);
+    if !skill_path.exists() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("Skill '{name}' not found")})),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = std::fs::remove_dir_all(&skill_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to remove skill: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "name": name})).into_response()
+}
+
+/// Recursively copy a directory.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let dest_path = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+// ── MCP Servers API ────────────────────────────────────────────────
+
+/// GET /api/mcp/servers — list MCP servers
+pub async fn handle_api_mcp_servers_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let servers: Vec<serde_json::Value> = config
+        .mcp
+        .servers
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "transport": s.transport,
+                "url": s.url,
+                "command": s.command,
+                "args": s.args,
+                "env": s.env,
+                "headers": s.headers,
+                "tool_timeout_secs": s.tool_timeout_secs,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({"servers": servers})).into_response()
+}
+
+/// POST /api/mcp/servers — add MCP server
+pub async fn handle_api_mcp_servers_add(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let server: crate::config::schema::McpServerConfig = match serde_json::from_value(body) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid MCP server config: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    if server.name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Server name is required"})),
+        )
+            .into_response();
+    }
+
+    {
+        let mut config = state.config.lock();
+        // Check for duplicate name
+        if config.mcp.servers.iter().any(|s| s.name == server.name) {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": format!("MCP server '{}' already exists", server.name)})),
+            )
+                .into_response();
+        }
+        config.mcp.servers.push(server.clone());
+        config.mcp.enabled = true;
+    }
+
+    // Save to disk
+    let config_snapshot = state.config.lock().clone();
+    if let Err(e) = config_snapshot.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "name": server.name})).into_response()
+}
+
+/// DELETE /api/mcp/servers/:name — remove MCP server
+pub async fn handle_api_mcp_servers_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let removed = {
+        let mut config = state.config.lock();
+        let before = config.mcp.servers.len();
+        config.mcp.servers.retain(|s| s.name != name);
+        let after = config.mcp.servers.len();
+        if config.mcp.servers.is_empty() {
+            config.mcp.enabled = false;
+        }
+        before != after
+    };
+
+    if !removed {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!("MCP server '{name}' not found")})),
+        )
+            .into_response();
+    }
+
+    // Save to disk
+    let config_snapshot = state.config.lock().clone();
+    if let Err(e) = config_snapshot.save().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
+        )
+            .into_response();
+    }
+
+    Json(serde_json::json!({"status": "ok", "name": name})).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn is_masked_secret(value: &str) -> bool {

@@ -163,3 +163,80 @@ export interface GraphBudget {
   total_tokens: number;
   backend: string;
 }
+
+// ---------------------------------------------------------------------------
+// Skills
+// ---------------------------------------------------------------------------
+
+export interface Skill {
+  name: string;
+  description: string;
+  version: string;
+  author: string | null;
+  tags: string[];
+  tools: SkillTool[];
+  prompts: string[];
+}
+
+export interface SkillTool {
+  name: string;
+  description: string;
+  kind: string;
+  command: string;
+}
+
+// ---------------------------------------------------------------------------
+// MCP Servers
+// ---------------------------------------------------------------------------
+
+export interface McpServer {
+  name: string;
+  transport: string;
+  url: string | null;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  headers: Record<string, string>;
+  tool_timeout_secs: number | null;
+}
+
+export interface McpServerInput {
+  name: string;
+  transport: string;
+  url?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  headers?: Record<string, string>;
+  tool_timeout_secs?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Channel Config Schema (for dynamic form rendering)
+// ---------------------------------------------------------------------------
+
+export type FieldType =
+  | "text"
+  | "password"
+  | "number"
+  | "boolean"
+  | "string_array"
+  | "select";
+
+export interface ChannelFieldSpec {
+  name: string;
+  label: string;
+  type: FieldType;
+  required: boolean;
+  placeholder?: string;
+  default_value?: unknown;
+  options?: string[];
+  help_text?: string;
+}
+
+export interface ChannelSchema {
+  channel_key: string;
+  display_name: string;
+  description?: string;
+  fields: ChannelFieldSpec[];
+}

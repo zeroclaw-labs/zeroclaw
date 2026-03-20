@@ -716,6 +716,30 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        // ── Channel Config API routes ──
+        .route(
+            "/api/channels/{name}/config",
+            get(api::handle_api_channel_config_get),
+        )
+        .route(
+            "/api/channels/{name}",
+            put(api::handle_api_channel_config_put)
+                .delete(api::handle_api_channel_config_delete),
+        )
+        // ── Skills API routes ──
+        .route("/api/skills", get(api::handle_api_skills_list))
+        .route("/api/skills/install", post(api::handle_api_skills_install))
+        .route(
+            "/api/skills/{name}",
+            delete(api::handle_api_skills_delete),
+        )
+        // ── MCP Servers API routes ──
+        .route("/api/mcp/servers", get(api::handle_api_mcp_servers_list))
+        .route("/api/mcp/servers", post(api::handle_api_mcp_servers_add))
+        .route(
+            "/api/mcp/servers/{name}",
+            delete(api::handle_api_mcp_servers_delete),
+        )
         // ── Graph Knowledge API routes ──
         .route("/api/graph/stats", get(api_graph::handle_graph_stats))
         .route("/api/graph/search", get(api_graph::handle_graph_search))
