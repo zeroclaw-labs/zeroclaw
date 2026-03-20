@@ -108,6 +108,7 @@ export default function Pairing() {
       {error && (
         <div className="rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
           {error}
+          <button onClick={() => setError(null)} className="ml-2 font-bold">×</button>
         </div>
       )}
 
