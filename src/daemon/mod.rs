@@ -237,7 +237,9 @@ async fn run_synthesizer_worker(config: Config) -> Result<()> {
     #[cfg(feature = "memory-graph")]
     let synthesizer = {
         let db_path = config.workspace_dir.join(&graph_config.db_path);
-        match cozo::DbInstance::new("sled", db_path.to_string_lossy().as_ref(), "") {
+        let engine = graph_config.engine.trim();
+        let engine = if engine.is_empty() { "sled" } else { engine };
+        match cozo::DbInstance::new(engine, db_path.to_string_lossy().as_ref(), "") {
             Ok(db) => Synthesizer::new(std::sync::Arc::new(db), budget, true),
             Err(e) => {
                 tracing::error!("Synthesizer: failed to open graph DB: {e}");

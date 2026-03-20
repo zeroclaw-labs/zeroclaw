@@ -88,16 +88,22 @@ mod backend {
                 std::fs::create_dir_all(parent)?;
             }
 
-            let db = DbInstance::new("sled", db_path.to_string_lossy().as_ref(), "")
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let engine = config.engine.trim();
+            let engine = if engine.is_empty() { "sled" } else { engine };
+            let db = DbInstance::new(engine, db_path.to_string_lossy().as_ref(), "")
+                .map_err(|e| anyhow::anyhow!("CozoDB ({engine}): {e}"))?;
 
             // Initialize schema (idempotent — CozoDB skips existing relations)
-            let init_script = schema::schema_init_script();
-            if let Err(e) =
-                db.run_script(init_script, BTreeMap::default(), ScriptMutability::Mutable)
-            {
-                // Schema might already exist, log but don't fail
-                tracing::debug!("Graph schema init (may already exist): {e}");
+            for script in schema::schema_init_scripts() {
+                if let Err(e) =
+                    db.run_script(script, BTreeMap::default(), ScriptMutability::Mutable)
+                {
+                    // "already exists" / "conflicts" is expected on subsequent runs
+                    let msg = e.to_string();
+                    if !msg.contains("already exists") && !msg.contains("conflicts") {
+                        tracing::warn!("Graph schema init failed: {msg}");
+                    }
+                }
             }
 
             // Create HNSW indexes
@@ -115,7 +121,8 @@ mod backend {
             ));
 
             tracing::info!(
-                "🧠 Graph memory backend initialized ({})",
+                "🧠 Graph memory backend initialized (engine={}, path={})",
+                engine,
                 db_path.display()
             );
 
@@ -162,19 +169,14 @@ mod backend {
             let vad = emotion::analyze_emotion(content);
 
             let put_script = format!(
-                r#":put episode {{
-                    id: '{id}',
-                    content: $content,
-                    session_id: '{session}',
-                    heat: {heat},
-                    emotion_valence: {v},
-                    emotion_arousal: {a},
-                    emotion_dominance: {d},
-                    last_accessed: '{now}',
-                    created_at: '{now}'
-                }}"#,
+                r#"
+                ?[id, content, session_id, heat, emotion_valence, emotion_arousal, emotion_dominance, last_accessed, created_at] <- [[
+                    '{id}', $content, '{session}', {heat}, {v}, {a}, {d}, '{now}', '{now}'
+                ]]
+                :put episode {{id => content, session_id, heat, emotion_valence, emotion_arousal, emotion_dominance, last_accessed, created_at}}
+                "#,
                 id = id,
-                session = session,
+                session = session.replace('\'', ""),
                 heat = self.config.initial_heat,
                 v = vad.valence,
                 a = vad.arousal,
@@ -208,14 +210,12 @@ mod backend {
 
                     // Upsert entity
                     let upsert = format!(
-                        r#":put entity {{
-                            id: '{ent_id}',
-                            name: $name,
-                            entity_type: '{etype}',
-                            heat: {heat},
-                            last_accessed: '{now}',
-                            created_at: '{now}'
-                        }}"#,
+                        r#"
+                        ?[id, name, entity_type, heat, last_accessed, created_at] <- [[
+                            '{ent_id}', $name, '{etype}', {heat}, '{now}', '{now}'
+                        ]]
+                        :put entity {{id => name, entity_type, heat, last_accessed, created_at}}
+                        "#,
                         ent_id = ent_id,
                         etype = entity.entity_type,
                         heat = config_heat,
@@ -234,11 +234,12 @@ mod backend {
 
                     // Link entity to episode
                     let link = format!(
-                        r#":put mentioned_in {{
-                            entity_id: '{ent_id}',
-                            episode_id: '{ep_id}',
-                            created_at: '{now}'
-                        }}"#,
+                        r#"
+                        ?[entity_id, episode_id, created_at] <- [[
+                            '{ent_id}', '{ep_id}', '{now}'
+                        ]]
+                        :put mentioned_in {{entity_id, episode_id => created_at}}
+                        "#,
                         ent_id = ent_id,
                         ep_id = id_clone,
                         now = now_clone,
@@ -257,18 +258,14 @@ mod backend {
         fn store_core(&self, key: &str, content: &str) {
             let now = Utc::now().to_rfc3339();
             let id = format!("fact_{}", key.replace(' ', "_"));
-
             let put_script = format!(
-                r#":put fact {{
-                    id: '{id}',
-                    content: $content,
-                    source: 'user',
-                    confidence: 1.0,
-                    heat: {heat},
-                    last_accessed: '{now}',
-                    created_at: '{now}'
-                }}"#,
-                id = id,
+                r#"
+                ?[id, content, source, confidence, heat, last_accessed, created_at] <- [[
+                    '{id}', $content, 'user', 1.0, {heat}, '{now}', '{now}'
+                ]]
+                :put fact {{id => content, source, confidence, heat, last_accessed, created_at}}
+                "#,
+                id = id.replace('\'', ""),
                 heat = self.config.initial_heat,
                 now = now,
             );
@@ -290,15 +287,13 @@ mod backend {
             let id = format!("pref_{}", key.replace(' ', "_"));
 
             let put_script = format!(
-                r#":put preference {{
-                    id: '{id}',
-                    key: $key,
-                    value: $value,
-                    heat: {heat},
-                    last_accessed: '{now}',
-                    created_at: '{now}'
-                }}"#,
-                id = id,
+                r#"
+                ?[id, key, value, heat, last_accessed, created_at] <- [[
+                    '{id}', $key, $value, {heat}, '{now}', '{now}'
+                ]]
+                :put preference {{id => key, value, heat, last_accessed, created_at}}
+                "#,
+                id = id.replace('\'', ""),
                 heat = self.config.initial_heat,
                 now = now,
             );

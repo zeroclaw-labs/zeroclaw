@@ -6,7 +6,14 @@ use serde::{Deserialize, Serialize};
 /// Configuration for the CozoDB graph memory backend (`[memory.graph]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GraphConfig {
-    /// Path to the CozoDB SQLite file (relative to workspace dir).
+    /// CozoDB storage engine: "sled", "rocksdb", or "mem".
+    /// Sled is the default (single-process; holds an exclusive file lock).
+    /// Use "rocksdb" for concurrent multi-process access (requires libclang
+    /// at build time). "mem" is in-memory only (no persistence).
+    #[serde(default = "default_engine")]
+    pub engine: String,
+
+    /// Path to the CozoDB database (relative to workspace dir).
     #[serde(default = "default_db_path")]
     pub db_path: String,
 
@@ -47,6 +54,10 @@ pub struct GraphConfig {
     pub daily_cost_cap_usd: f64,
 }
 
+fn default_engine() -> String {
+    "sled".into()
+}
+
 fn default_db_path() -> String {
     "knowledge.db".into()
 }
@@ -82,6 +93,7 @@ fn default_max_research_depth() -> usize {
 impl Default for GraphConfig {
     fn default() -> Self {
         Self {
+            engine: default_engine(),
             db_path: default_db_path(),
             embedding_dim: default_embedding_dim(),
             heat_lambda: default_heat_lambda(),

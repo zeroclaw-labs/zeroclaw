@@ -8,6 +8,8 @@ use crate::config::Config;
 use anyhow::Context;
 use anyhow::{bail, Result};
 use console::style;
+#[cfg(feature = "memory-graph")]
+use super::graph;
 
 /// Handle `jhedaiclaw memory <subcommand>` CLI commands.
 pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> Result<()> {
@@ -70,6 +72,28 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
         #[cfg(not(feature = "memory-postgres"))]
         MemoryBackendKind::Postgres => {
             bail!("memory backend 'postgres' requires the 'memory-postgres' feature to be enabled");
+        }
+        MemoryBackendKind::Graph => {
+            #[cfg(feature = "memory-graph")]
+            {
+                let graph_config = config.memory.graph.clone().unwrap_or_default();
+                match graph::GraphMemoryBackend::new(&config.workspace_dir, graph_config) {
+                    Ok(backend) => Ok(Box::new(backend)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Graph backend unavailable for CLI: {e}; falling back to sqlite"
+                        );
+                        Ok(Box::new(super::SqliteMemory::new(&config.workspace_dir)?))
+                    }
+                }
+            }
+            #[cfg(not(feature = "memory-graph"))]
+            {
+                tracing::warn!(
+                    "memory backend 'graph' requested but compiled without `memory-graph`; falling back to sqlite"
+                );
+                Ok(Box::new(super::SqliteMemory::new(&config.workspace_dir)?))
+            }
         }
         _ => create_memory_for_migration(&backend, &config.workspace_dir),
     }
