@@ -294,6 +294,7 @@ struct InterruptOnNewMessageConfig {
     slack: bool,
     discord: bool,
     mattermost: bool,
+    matrix: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -303,6 +304,7 @@ impl InterruptOnNewMessageConfig {
             "slack" => self.slack,
             "discord" => self.discord,
             "mattermost" => self.mattermost,
+            "matrix" => self.matrix,
             _ => false,
         }
     }
@@ -569,6 +571,15 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
+        ),
+        "qq" => Some(
+            "When responding on QQ:\n\
+             - Use Markdown formatting\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
+             - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         _ => None,
     }
@@ -3850,11 +3861,14 @@ fn collect_configured_channels(
     if let Some(ref qq) = config.channels_config.qq {
         channels.push(ConfiguredChannel {
             display_name: "QQ",
-            channel: Arc::new(QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                qq.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                QQChannel::new(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    qq.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 
@@ -4413,6 +4427,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .mattermost
         .as_ref()
         .is_some_and(|mm| mm.interrupt_on_new_message);
+    let interrupt_on_new_message_matrix = config
+        .channels_config
+        .matrix
+        .as_ref()
+        .is_some_and(|mx| mx.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -4443,6 +4462,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             slack: interrupt_on_new_message_slack,
             discord: interrupt_on_new_message_discord,
             mattermost: interrupt_on_new_message_mattermost,
+            matrix: interrupt_on_new_message_matrix,
         },
         multimodal: config.multimodal.clone(),
         hooks: if config.hooks.enabled {
@@ -4761,6 +4781,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4875,6 +4896,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4945,6 +4967,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5034,6 +5057,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5577,6 +5601,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5656,6 +5681,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5749,6 +5775,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5827,6 +5854,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5915,6 +5943,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6024,6 +6053,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6114,6 +6144,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6219,6 +6250,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6309,6 +6341,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6389,6 +6422,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6580,6 +6614,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6680,6 +6715,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6795,6 +6831,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: true,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -6907,6 +6944,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7001,6 +7039,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7079,6 +7118,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7843,6 +7883,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7972,6 +8013,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8141,6 +8183,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8245,6 +8288,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8814,6 +8858,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8899,6 +8944,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9059,6 +9105,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9168,6 +9215,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9269,6 +9317,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9390,6 +9439,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9520,6 +9570,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: true,
+            matrix: false,
         };
         assert!(cfg.enabled_for_channel("mattermost"));
     }
@@ -9531,6 +9582,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: false,
+            matrix: false,
         };
         assert!(!cfg.enabled_for_channel("mattermost"));
     }
@@ -9542,6 +9594,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: true,
             mattermost: false,
+            matrix: false,
         };
         assert!(cfg.enabled_for_channel("discord"));
     }
@@ -9553,6 +9606,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: false,
+            matrix: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
     }
@@ -9644,6 +9698,7 @@ This is an example JSON object for profile settings."#;
                 slack: true,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
