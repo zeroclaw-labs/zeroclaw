@@ -258,24 +258,11 @@ impl Agent {
             config.api_key.as_deref(),
         )?);
 
-        let composio_key = if config.composio.enabled {
-            config.composio.api_key.as_deref()
-        } else {
-            None
-        };
-        let composio_entity_id = if config.composio.enabled {
-            Some(config.composio.entity_id.as_str())
-        } else {
-            None
-        };
-
         let tools = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
             memory.clone(),
-            composio_key,
-            composio_entity_id,
             &config.browser,
             &config.http_request,
             &config.web_fetch,

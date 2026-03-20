@@ -43,6 +43,8 @@ pub(crate) mod approval;
 pub(crate) mod auth;
 pub mod channels;
 pub mod config;
+#[cfg(feature = "createos")]
+pub mod createos;
 pub mod daemon;
 pub mod gateway;
 pub mod health;
@@ -61,6 +63,8 @@ pub mod tui;
 pub(crate) mod util;
 
 pub use config::Config;
+#[cfg(feature = "createos")]
+pub use createos::cli::CreateOsCommands;
 
 /// Channel management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

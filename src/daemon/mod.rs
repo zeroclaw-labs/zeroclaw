@@ -1,5 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::signal;
@@ -49,6 +51,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
     let listener = UnixListener::bind(&config.socket_path)?;
     tracing::info!("IPC socket bound: {}", config.socket_path.display());
 
+    let start_time = Arc::new(Instant::now());
+
     // Start health monitor loop
     let health_handle = tokio::spawn(health_monitor_loop());
 
@@ -58,7 +62,8 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _addr)) => {
-                        tokio::spawn(handle_ipc_client(stream));
+                        let t = Arc::clone(&start_time);
+                        tokio::spawn(handle_ipc_client(stream, t));
                     }
                     Err(e) => {
                         tracing::warn!("IPC accept error: {e}");
@@ -88,7 +93,7 @@ pub async fn run_daemon(config: DaemonConfig) -> Result<()> {
 ///
 /// Protocol: newline-delimited commands. Each command gets a JSON response.
 /// Supported commands: `ping`, `status`, `version`.
-async fn handle_ipc_client(stream: tokio::net::UnixStream) {
+async fn handle_ipc_client(stream: tokio::net::UnixStream, start_time: Arc<Instant>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
@@ -102,7 +107,7 @@ async fn handle_ipc_client(stream: tokio::net::UnixStream) {
             "status" => serde_json::json!({
                 "status": "ok",
                 "pid": std::process::id(),
-                "uptime_secs": 0, // TODO: track actual uptime
+                "uptime_secs": start_time.elapsed().as_secs(),
                 "version": env!("CARGO_PKG_VERSION"),
             }),
             "version" => serde_json::json!({
@@ -212,10 +217,18 @@ pub fn daemon_stop() -> Result<String> {
     Ok(format!("Augusta daemon stopped (PID: {pid})"))
 }
 
-/// Query daemon status via PID file.
+/// Query daemon status — tries Unix socket first for rich info, falls back to PID file.
 pub fn daemon_status() -> Result<String> {
     let config = DaemonConfig::default();
 
+    // Try socket-based status first (richer: uptime, version)
+    if config.socket_path.exists() {
+        if let Ok(info) = query_daemon_socket(&config.socket_path) {
+            return Ok(info);
+        }
+    }
+
+    // Fall back to PID file check
     if !config.pid_file.exists() {
         return Ok("Augusta daemon is not running".into());
     }
@@ -232,6 +245,52 @@ pub fn daemon_status() -> Result<String> {
         // Stale PID file
         let _ = std::fs::remove_file(&config.pid_file);
         Ok("Augusta daemon is not running (stale PID file cleaned)".into())
+    }
+}
+
+/// Connect to daemon socket and query live status.
+fn query_daemon_socket(socket_path: &std::path::Path) -> Result<String> {
+    use std::io::{BufRead, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream =
+        UnixStream::connect(socket_path).map_err(|e| anyhow::anyhow!("socket connect: {e}"))?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
+
+    stream.write_all(b"status\n")?;
+    stream.flush()?;
+
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+
+    let resp: serde_json::Value =
+        serde_json::from_str(line.trim()).map_err(|e| anyhow::anyhow!("parse: {e}"))?;
+
+    if resp["status"] != "ok" {
+        anyhow::bail!("daemon returned error");
+    }
+
+    let pid = resp["pid"].as_u64().unwrap_or(0);
+    let uptime = resp["uptime_secs"].as_u64().unwrap_or(0);
+    let version = resp["version"].as_str().unwrap_or("unknown");
+
+    let uptime_str = format_uptime(uptime);
+    Ok(format!(
+        "Augusta daemon is running (PID: {pid}, uptime: {uptime_str}, v{version})"
+    ))
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else if secs < 86400 {
+        format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d {}h", secs / 86400, (secs % 86400) / 3600)
     }
 }
 

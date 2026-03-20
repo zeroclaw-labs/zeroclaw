@@ -2815,21 +2815,11 @@ pub async fn run(
     }
 
     // ── Tools (including memory tools and peripherals) ────────────
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
     let mut tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
         mem.clone(),
-        composio_key,
-        composio_entity_id,
         &config.browser,
         &config.http_request,
         &config.web_fetch,
@@ -2956,12 +2946,6 @@ pub async fn run(
         tool_descs.push((
             "browser_open",
             "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
-        ));
-    }
-    if config.composio.enabled {
-        tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
     }
     if config.web_fetch.enabled {
@@ -3313,21 +3297,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
     )?);
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
     let mut tools_registry = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
         mem.clone(),
-        composio_key,
-        composio_entity_id,
         &config.browser,
         &config.http_request,
         &config.web_fetch,
@@ -3384,9 +3358,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     ];
     if config.browser.enabled {
         tool_descs.push(("browser_open", "Open approved URLs in browser."));
-    }
-    if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
         tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));

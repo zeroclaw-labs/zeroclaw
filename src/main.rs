@@ -40,6 +40,8 @@ use lightwave_sys::channels;
 use lightwave_sys::config::Config;
 use lightwave_sys::daemon;
 use lightwave_sys::memory;
+#[cfg(feature = "createos")]
+use lightwave_sys::CreateOsCommands;
 use lightwave_sys::{ChannelCommands, MemoryCommands};
 
 /// LightWave Augusta — local AI agent runtime for macOS.
@@ -142,6 +144,26 @@ Examples:
         /// Show only problems (stuck agents, failures)
         #[arg(long)]
         problems: bool,
+    },
+
+    /// Manage createOS pipeline (tasks, epics, sprints)
+    #[cfg(feature = "createos")]
+    #[command(long_about = "\
+Manage the createOS planning pipeline via local SQLite (offline-first).
+
+Syncs bidirectionally with PostgreSQL via PowerSync when connected.
+Works fully offline — changes queue locally until sync resumes.
+
+Examples:
+  augusta createos tasks                        # list all tasks
+  augusta createos tasks --status in_progress   # filter by status
+  augusta createos epics                        # list epics
+  augusta createos sprints --status active      # active sprints
+  augusta createos sync                         # show sync status")]
+    #[command(name = "createos")]
+    CreateOS {
+        #[command(subcommand)]
+        createos_command: CreateOsCommands,
     },
 
     /// Show version and system info
@@ -279,6 +301,12 @@ async fn main() -> Result<()> {
             } else {
                 lightwave_sys::tui::tui_render::run_tui(problems)?;
             }
+        }
+
+        #[cfg(feature = "createos")]
+        Commands::CreateOS { createos_command } => {
+            lightwave_sys::createos::cli::handle_command(createos_command, &config.workspace_dir)
+                .await?;
         }
 
         Commands::Version => {

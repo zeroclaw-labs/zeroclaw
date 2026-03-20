@@ -90,9 +90,12 @@ async-trait = "0.1"
 ring = "0.17"
 
 # Memory / persistence
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled", "load_extension"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
+
+# PowerSync (local-first sync for createOS)
+powersync = { version = "0.0.4", features = ["tokio"] }
 
 # Interactive CLI prompts
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
@@ -141,7 +144,7 @@ gateway = ["dep:axum"]
 [lints.rust.unexpected_cfgs]
 level = "allow"
 check-cfg = [
-    'cfg(feature, values("channel-nostr", "memory-postgres", "rag-pdf"))',
+    'cfg(feature, values("channel-nostr", "createos", "memory-postgres", "rag-pdf"))',
 ]
 
 [profile.release]

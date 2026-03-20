@@ -124,6 +124,61 @@ async fn daemon_ipc_status_protocol() {
     handler.abort();
 }
 
+/// Test socket-based daemon status query returns rich info (uptime, version, PID).
+/// Uses async client to avoid sync/async timing issues.
+#[tokio::test]
+async fn daemon_ipc_socket_status_query() {
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let dir = tempfile::tempdir().unwrap();
+    let sock_path = dir.path().join("test.sock");
+
+    let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+    let start_time = Arc::new(Instant::now());
+
+    let t = Arc::clone(&start_time);
+    let handler = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let response = match line.trim() {
+                "status" => serde_json::json!({
+                    "status": "ok",
+                    "pid": std::process::id(),
+                    "uptime_secs": t.elapsed().as_secs(),
+                    "version": env!("CARGO_PKG_VERSION"),
+                }),
+                _ => serde_json::json!({"status": "error"}),
+            };
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            writer.write_all(&bytes).await.unwrap();
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Connect and query status
+    let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    writer.write_all(b"status\n").await.unwrap();
+    let line = lines.next_line().await.unwrap().unwrap();
+    let resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+
+    assert_eq!(resp["status"], "ok");
+    assert!(resp["pid"].as_u64().unwrap() > 0);
+    assert!(resp["uptime_secs"].as_u64().is_some());
+    assert!(resp["version"].as_str().unwrap().starts_with("0."));
+
+    handler.abort();
+}
+
 /// Test the event bus roundtrip: emit → load → verify.
 #[test]
 fn event_bus_roundtrip() {
