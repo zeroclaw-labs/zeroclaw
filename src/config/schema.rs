@@ -8502,6 +8502,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
     use std::io;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
