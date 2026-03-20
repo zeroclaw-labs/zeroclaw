@@ -1428,14 +1428,20 @@ fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
-fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
+fn fetch_anthropic_models(api_key: Option<&str>, base_url: Option<&str>) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
         bail!("Anthropic model fetch requires API key or OAuth token");
     };
 
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .unwrap_or("https://api.anthropic.com");
+    let models_url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+
     let client = build_model_fetch_client()?;
     let mut request = client
-        .get("https://api.anthropic.com/v1/models")
+        .get(&models_url)
         .header("anthropic-version", "2023-06-01");
 
     if api_key.starts_with("sk-ant-oat01-") {
@@ -1448,10 +1454,21 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
 
     let response = request
         .send()
-        .context("model fetch failed: GET https://api.anthropic.com/v1/models")?;
+        .context(format!("model fetch failed: GET {models_url}"))?;
 
     let status = response.status();
     if !status.is_success() {
+        // MiniMax Anthropic-compatible endpoint does not expose a /v1/models endpoint.
+        // Fall back to a known MiniMax model list.
+        if status.as_u16() == 404 && base_url.contains("minimaxi") {
+            return Ok(vec![
+                "MiniMax-M2.7-highspeed".to_string(),
+                "MiniMax-M2.5".to_string(),
+                "MiniMax-M2.0".to_string(),
+                "MiniMax-Text-01".to_string(),
+                "MiniMax-Embedding-01".to_string(),
+            ]);
+        }
         let body = response.text().unwrap_or_default();
         bail!("Anthropic model list request failed (HTTP {status}): {body}");
     }
@@ -1606,7 +1623,7 @@ fn fetch_live_models_for_provider(
 
     let models = match provider_name {
         "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
-        "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
+        "anthropic" => fetch_anthropic_models(api_key.as_deref(), provider_api_url)?,
         "gemini" => fetch_gemini_models(api_key.as_deref())?,
         "ollama" => {
             if ollama_remote {
