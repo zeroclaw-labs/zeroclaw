@@ -314,6 +314,46 @@ temperature = 0.2
 - 使用精确域或子域匹配（例如 `"api.example.com"`、`"example.com"`），或 `"*"` 允许任何公共域。
 - 即使配置了 `"*"`，本地/私有目标仍然被阻止。
 
+## `[google_workspace]`
+
+| 键 | 默认值 | 用途 |
+|---|---|---|
+| `enabled` | `false` | 启用 `google_workspace` 工具 |
+| `credentials_path` | 未设置 | Google 服务账号或 OAuth 凭据 JSON 的路径 |
+| `default_account` | 未设置 | 传递给 `gws` 的 `--account` 默认 Google 账号 |
+| `allowed_services` | （内置列表） | 代理可访问的服务：`drive`、`gmail`、`calendar`、`sheets`、`docs`、`slides`、`tasks`、`people`、`chat`、`classroom`、`forms`、`keep`、`meet`、`events` |
+| `rate_limit_per_minute` | `60` | 每分钟最大 `gws` 调用次数 |
+| `timeout_secs` | `30` | 每次调用超时时间（秒） |
+| `audit_log` | `false` | 为每次 `gws` 调用记录 `INFO` 日志 |
+
+### `[[google_workspace.allowed_operations]]`
+
+非空时，仅精确匹配的调用通过。当 `service`、`resource`、`sub_resource` 和 `method` 全部一致时，条目匹配。
+为空时（默认），`allowed_services` 内的所有组合均可用。
+
+| 键 | 是否必填 | 用途 |
+|---|---|---|
+| `service` | 是 | 服务标识符（须匹配 `allowed_services` 中的条目） |
+| `resource` | 是 | 顶层资源名称（Gmail 为 `users`，Drive 为 `files`，Calendar 为 `events`） |
+| `sub_resource` | 否 | 4 段 gws 命令的子资源。Gmail 操作使用 `gws gmail users <sub_resource> <method>`，因此 Gmail 条目需填写 `sub_resource` 才能在运行时匹配。Drive、Calendar 等使用 3 段命令，省略此字段。 |
+| `methods` | 是 | 该资源/子资源上允许的一个或多个方法名称 |
+
+Gmail 所有操作使用 `gws gmail users <sub_resource> <method>` 格式。未填写 `sub_resource` 的 Gmail 条目在运行时将永远无法匹配。Drive 和 Calendar 使用 3 段命令，省略 `sub_resource`。
+
+```toml
+[google_workspace]
+enabled = true
+default_account = "owner@company.com"
+allowed_services = ["gmail"]
+audit_log = true
+
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "users"
+sub_resource = "drafts"
+methods = ["list", "get", "create", "update"]
+```
+
 ## `[gateway]`
 
 | 键 | 默认值 | 用途 |
