@@ -1,10 +1,14 @@
 use anyhow::{Context, Result};
 use directories::UserDirs;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime};
+
+use zip::ZipArchive;
 
 mod audit;
 #[cfg(feature = "skill-creation")]
@@ -13,6 +17,12 @@ pub mod creator;
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
+
+// ─── ClawhHub / OpenClaw registry installers ───────────────────────────────
+const CLAWHUB_DOMAIN: &str = "clawhub.ai";
+const CLAWHUB_WWW_DOMAIN: &str = "www.clawhub.ai";
+const CLAWHUB_DOWNLOAD_API: &str = "https://clawhub.ai/api/v1/download";
+const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
@@ -791,37 +801,99 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The ClawHub registry download API base URL.
-const CLAWHUB_DOWNLOAD_API: &str = "https://wry-manatee-359.convex.site/api/v1/download";
-
-/// Check if a source URL points to the ClawHub registry.
-fn is_clawhub_source(source: &str) -> bool {
-    let lower = source.to_ascii_lowercase();
-    lower.starts_with("https://clawhub.ai/") || lower.starts_with("http://clawhub.ai/")
+fn is_clawhub_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case(CLAWHUB_DOMAIN) || host.eq_ignore_ascii_case(CLAWHUB_WWW_DOMAIN)
 }
 
-/// Extract the skill slug from a ClawHub URL.
-///
-/// `https://clawhub.ai/steipete/summarize` → `"summarize"`
-/// `https://clawhub.ai/steipete/summarize/` → `"summarize"`
-fn clawhub_slug(source: &str) -> Option<&str> {
-    let rest = source
-        .strip_prefix("https://clawhub.ai/")
-        .or_else(|| source.strip_prefix("http://clawhub.ai/"))
-        .or_else(|| source.strip_prefix("https://CLAWHUB.AI/"))
-        .or_else(|| {
-            let lower = source.to_ascii_lowercase();
-            if lower.starts_with("https://clawhub.ai/") || lower.starts_with("http://clawhub.ai/") {
-                // Safe: the prefix length is fixed, works on the original source
-                let prefix_len = source.find("clawhub.ai/").unwrap() + "clawhub.ai/".len();
-                Some(&source[prefix_len..])
-            } else {
-                None
-            }
-        })?;
-    let rest = rest.trim_end_matches('/');
-    // Expected pattern: owner/skill-name — take the last segment
-    rest.rsplit('/').next().filter(|s| !s.is_empty())
+fn parse_clawhub_url(source: &str) -> Option<Url> {
+    let parsed = Url::parse(source).ok()?;
+    match parsed.scheme() {
+        "https" | "http" => {}
+        _ => return None,
+    }
+
+    if !parsed.host_str().is_some_and(is_clawhub_host) {
+        return None;
+    }
+
+    Some(parsed)
+}
+
+fn is_clawhub_source(source: &str) -> bool {
+    if source.starts_with("clawhub:") {
+        return true;
+    }
+    parse_clawhub_url(source).is_some()
+}
+
+fn clawhub_download_url(source: &str) -> Result<String> {
+    // Short prefix: clawhub:<slug>
+    if let Some(slug) = source.strip_prefix("clawhub:") {
+        let slug = slug.trim().trim_end_matches('/');
+        if slug.is_empty() || slug.contains('/') {
+            anyhow::bail!(
+                "invalid clawhub source '{}': expected 'clawhub:<slug>' (no slashes in slug)",
+                source
+            );
+        }
+        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}"));
+    }
+
+    // Profile URL: https://clawhub.ai/<owner>/<slug> or https://www.clawhub.ai/<slug>
+    if let Some(parsed) = parse_clawhub_url(source) {
+        let path = parsed
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("/");
+
+        if path.is_empty() {
+            anyhow::bail!("could not extract slug from ClawhHub URL: {source}");
+        }
+
+        return Ok(format!("{CLAWHUB_DOWNLOAD_API}?slug={path}"));
+    }
+
+    anyhow::bail!("unrecognised ClawhHub source format: {source}")
+}
+
+fn normalize_skill_name(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c == '-' { '_' } else { c })
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect()
+}
+
+fn clawhub_skill_dir_name(source: &str) -> Result<String> {
+    if let Some(slug) = source.strip_prefix("clawhub:") {
+        let slug = slug.trim().trim_end_matches('/');
+        let base = slug.rsplit('/').next().unwrap_or(slug);
+        let name = normalize_skill_name(base);
+        return Ok(if name.is_empty() {
+            "skill".to_string()
+        } else {
+            name
+        });
+    }
+
+    let parsed = parse_clawhub_url(source)
+        .ok_or_else(|| anyhow::anyhow!("invalid clawhub URL: {source}"))?;
+
+    let path = parsed
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let base = path.last().copied().unwrap_or("skill");
+    let name = normalize_skill_name(base);
+    Ok(if name.is_empty() {
+        "skill".to_string()
+    } else {
+        name
+    })
 }
 
 fn is_git_source(source: &str) -> bool {
@@ -1037,65 +1109,97 @@ fn install_git_skill_source(
     }
 }
 
-/// Download and install a skill from the ClawHub registry.
-///
-/// Fetches the skill ZIP from the ClawHub download API, extracts it into a
-/// subdirectory named after the slug, and runs the security audit.
 fn install_clawhub_skill_source(
     source: &str,
     skills_path: &Path,
     allow_scripts: bool,
 ) -> Result<(PathBuf, usize)> {
-    let slug = clawhub_slug(source).ok_or_else(|| {
-        anyhow::anyhow!("Could not extract skill name from ClawHub URL: {source}")
-    })?;
-
-    let url = format!("{CLAWHUB_DOWNLOAD_API}?slug={slug}");
-
-    // Download the ZIP to a temporary file
-    let response = reqwest::blocking::get(&url)
-        .with_context(|| format!("Failed to download skill from ClawHub: {url}"))?;
-
-    if !response.status().is_success() {
+    let download_url = clawhub_download_url(source)
+        .with_context(|| format!("invalid ClawhHub source: {source}"))?;
+    let skill_dir_name = clawhub_skill_dir_name(source)?;
+    let installed_dir = skills_path.join(&skill_dir_name);
+    if installed_dir.exists() {
         anyhow::bail!(
-            "ClawHub download failed (HTTP {}): {url}",
-            response.status()
+            "Destination skill already exists: {}",
+            installed_dir.display()
         );
     }
 
-    let zip_bytes = response
-        .bytes()
-        .context("Failed to read ClawHub response body")?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
 
-    // Write ZIP to a temp file
-    let tmp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-    let zip_path = tmp_dir.path().join(format!("{slug}.zip"));
-    std::fs::write(&zip_path, &zip_bytes)
-        .with_context(|| format!("Failed to write temp zip: {}", zip_path.display()))?;
+    let resp = client
+        .get(&download_url)
+        .send()
+        .with_context(|| format!("failed to fetch zip from {download_url}"))?;
 
-    // Extract into the skills directory under the slug name
-    let dest = skills_path.join(slug);
-    std::fs::create_dir_all(&dest)
-        .with_context(|| format!("Failed to create skill directory: {}", dest.display()))?;
-
-    let output = std::process::Command::new("unzip")
-        .args(["-o", "-q"])
-        .arg(&zip_path)
-        .arg("-d")
-        .arg(&dest)
-        .output()
-        .context("Failed to run unzip — is it installed?")?;
-
-    if !output.status.success() {
-        let _ = std::fs::remove_dir_all(&dest);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to extract ClawHub skill archive: {stderr}");
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        anyhow::bail!("ClawhHub rate limit reached (HTTP 429). Wait a moment and retry.");
+    }
+    if !resp.status().is_success() {
+        anyhow::bail!("ClawhHub download failed (HTTP {})", resp.status());
     }
 
-    match enforce_skill_security_audit(&dest, allow_scripts) {
-        Ok(report) => Ok((dest, report.files_scanned)),
+    let bytes = resp.bytes()?.to_vec();
+    if bytes.len() as u64 > MAX_CLAWHUB_ZIP_BYTES {
+        anyhow::bail!(
+            "ClawhHub zip rejected: too large ({} bytes > {})",
+            bytes.len(),
+            MAX_CLAWHUB_ZIP_BYTES
+        );
+    }
+
+    std::fs::create_dir_all(&installed_dir)?;
+
+    let cursor = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
+
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let raw_name = entry.name().to_string();
+
+        if raw_name.is_empty()
+            || raw_name.contains("..")
+            || raw_name.starts_with('/')
+            || raw_name.contains('\\')
+            || raw_name.contains(':')
+        {
+            let _ = std::fs::remove_dir_all(&installed_dir);
+            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
+        }
+
+        let out_path = installed_dir.join(&raw_name);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut out_file = std::fs::File::create(&out_path)
+            .with_context(|| format!("failed to create extracted file: {}", out_path.display()))?;
+        std::io::copy(&mut entry, &mut out_file)?;
+    }
+
+    let has_manifest =
+        installed_dir.join("SKILL.md").exists() || installed_dir.join("SKILL.toml").exists();
+    if !has_manifest {
+        std::fs::write(
+            installed_dir.join("SKILL.toml"),
+            format!(
+                "[skill]\nname = \"{}\"\ndescription = \"ClawhHub installed skill\"\nversion = \"0.1.0\"\n",
+                skill_dir_name
+            ),
+        )?;
+    }
+
+    match enforce_skill_security_audit(&installed_dir, allow_scripts) {
+        Ok(report) => Ok((installed_dir, report.files_scanned)),
         Err(err) => {
-            let _ = std::fs::remove_dir_all(&dest);
+            let _ = std::fs::remove_dir_all(&installed_dir);
             Err(err)
         }
     }
@@ -1672,41 +1776,31 @@ description = "Bare minimum"
     }
 
     #[test]
-    fn clawhub_source_detected_and_excluded_from_git() {
-        let clawhub_urls = [
-            "https://clawhub.ai/steipete/summarize",
-            "https://clawhub.ai/steipete/summarize/",
-            "http://clawhub.ai/user/skill",
-        ];
-
-        for url in clawhub_urls {
-            assert!(
-                is_clawhub_source(url),
-                "expected clawhub detection for '{url}'"
-            );
-            assert!(
-                !is_git_source(url),
-                "clawhub URL should NOT be detected as git source: '{url}'"
-            );
-        }
+    fn clawhub_source_is_not_git_source() {
+        assert!(!is_git_source("https://clawhub.ai/steipete/summarize"));
+        assert!(!is_git_source("https://www.clawhub.ai/steipete/summarize"));
+        assert!(is_clawhub_source("https://clawhub.ai/steipete/summarize"));
+        assert!(is_clawhub_source("clawhub:summarize"));
     }
 
     #[test]
-    fn clawhub_slug_extracts_skill_name() {
+    fn clawhub_download_url_building() {
         assert_eq!(
-            clawhub_slug("https://clawhub.ai/steipete/summarize"),
-            Some("summarize")
+            clawhub_download_url("https://clawhub.ai/steipete/gog").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=steipete/gog"
         );
         assert_eq!(
-            clawhub_slug("https://clawhub.ai/steipete/summarize/"),
-            Some("summarize")
+            clawhub_download_url("https://www.clawhub.ai/steipete/gog").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=steipete/gog"
         );
         assert_eq!(
-            clawhub_slug("http://clawhub.ai/user/my-skill"),
-            Some("my-skill")
+            clawhub_download_url("https://clawhub.ai/gog").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=gog"
         );
-        assert_eq!(clawhub_slug("https://clawhub.ai/"), None);
-        assert_eq!(clawhub_slug("https://github.com/owner/repo"), None);
+        assert_eq!(
+            clawhub_download_url("clawhub:gog").unwrap(),
+            "https://clawhub.ai/api/v1/download?slug=gog"
+        );
     }
 
     #[test]
