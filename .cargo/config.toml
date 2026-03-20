@@ -10,3 +10,12 @@ linker = "armv7a-linux-androideabi21-clang"
 
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android21-clang"
+
+# riscv64gc-unknown-linux-musl target, produces a static binary with musl, but requires a custom linker and flags
+[target.riscv64gc-unknown-linux-musl]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "link-arg=-static",
+  "-C", "link-arg=-no-pie",
+]
+linker = "riscv64-linux-musl-gcc"
