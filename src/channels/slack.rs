@@ -165,6 +165,23 @@ impl SlackChannel {
             .map(str::to_string)
     }
 
+    /// Returns the interruption scope identifier for a Slack message.
+    ///
+    /// Returns `Some(thread_ts)` only when the message is a genuine thread reply
+    /// (Slack's `thread_ts` field is present and differs from the message's own `ts`).
+    /// Returns `None` for top-level messages and thread parent messages (where
+    /// `thread_ts == ts`), placing them in the 3-component scope key
+    /// (`channel_reply_target_sender`).
+    ///
+    /// Intentional: top-level messages and threaded replies are separate conversational
+    /// scopes and should not cancel each other's in-flight tasks.
+    fn inbound_interruption_scope_id(msg: &serde_json::Value, ts: &str) -> Option<String> {
+        msg.get("thread_ts")
+            .and_then(|t| t.as_str())
+            .filter(|&t| t != ts)
+            .map(str::to_string)
+    }
+
     fn normalized_channel_id(input: Option<&str>) -> Option<String> {
         input
             .map(str::trim)
@@ -1792,6 +1809,7 @@ impl SlackChannel {
                         .unwrap_or_default()
                         .as_secs(),
                     thread_ts: Self::inbound_thread_ts(event, ts),
+                    interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                 };
 
                 if tx.send(channel_msg).await.is_err() {
@@ -2356,6 +2374,7 @@ impl Channel for SlackChannel {
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: Self::inbound_thread_ts(msg, ts),
+                            interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -2440,6 +2459,7 @@ impl Channel for SlackChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
+                        interruption_scope_id: Some(thread_ts.clone()),
                     };
 
                     if tx.send(channel_msg).await.is_err() {

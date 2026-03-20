@@ -294,6 +294,7 @@ end tell"#
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: None,
+                            interruption_scope_id: None,
                         };
 
                         if tx.send(msg).await.is_err() {
