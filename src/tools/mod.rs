@@ -19,6 +19,7 @@ pub mod backup_tool;
 pub mod browser;
 pub mod browser_delegate;
 pub mod browser_open;
+pub mod calculator;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
@@ -75,6 +76,7 @@ pub mod screenshot;
 pub mod security_ops;
 pub mod shell;
 pub mod swarm;
+pub mod text_browser;
 pub mod tool_search;
 pub mod traits;
 pub mod web_fetch;
@@ -86,6 +88,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 #[allow(unused_imports)]
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
+pub use calculator::CalculatorTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
@@ -139,6 +142,7 @@ pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
 pub use shell::ShellTool;
 pub use swarm::SwarmTool;
+pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -323,6 +327,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(CalculatorTool::new()),
     ];
 
     if matches!(
@@ -394,6 +399,15 @@ pub fn all_tools_with_runtime(
             web_fetch_config.blocked_domains.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
+        )));
+    }
+
+    // Text browser tool (headless text-based browser rendering)
+    if root_config.text_browser.enabled {
+        tool_arcs.push(Arc::new(TextBrowserTool::new(
+            security.clone(),
+            root_config.text_browser.preferred_browser.clone(),
+            root_config.text_browser.timeout_secs,
         )));
     }
 

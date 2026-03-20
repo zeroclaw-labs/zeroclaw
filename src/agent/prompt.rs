@@ -445,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn skills_section_compact_mode_omits_instructions_and_tools() {
+    fn skills_section_compact_mode_omits_instructions_but_keeps_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -482,7 +482,10 @@ mod tests {
         assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
         assert!(output.contains("read_skill(name)"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(!output.contains("<tools>"));
+        // Compact mode should still include tools so the LLM knows about them
+        assert!(output.contains("<tools>"));
+        assert!(output.contains("<name>release_checklist</name>"));
+        assert!(output.contains("<kind>shell</kind>"));
     }
 
     #[test]
