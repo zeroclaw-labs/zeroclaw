@@ -106,7 +106,7 @@ impl Tunnel for PinggyTunnel {
             .await;
 
             match stream_line {
-                Ok(StreamLine::Stdout(Ok(Some(l)))) | Ok(StreamLine::Stderr(Ok(Some(l)))) => {
+                Ok(StreamLine::Stdout(Ok(Some(l))) | StreamLine::Stderr(Ok(Some(l)))) => {
                     tracing::debug!("pinggy: {l}");
                     // Pinggy prints tunnel URLs like: https://xxxxx.a.free.pinggy.link
                     // Skip non-tunnel URLs (e.g. dashboard.pinggy.io promo links).
@@ -124,7 +124,7 @@ impl Tunnel for PinggyTunnel {
                 }
                 Ok(StreamLine::Stdout(Ok(None))) => stdout_done = true,
                 Ok(StreamLine::Stderr(Ok(None))) => stderr_done = true,
-                Ok(StreamLine::Stdout(Err(e))) | Ok(StreamLine::Stderr(Err(e))) => {
+                Ok(StreamLine::Stdout(Err(e)) | StreamLine::Stderr(Err(e))) => {
                     bail!("Error reading pinggy output: {e}")
                 }
                 Err(_) => {} // timeout — retry
@@ -154,9 +154,8 @@ impl Tunnel for PinggyTunnel {
         let mut guard = self.proc.lock().await;
         match guard.as_mut() {
             Some(tp) => match tp.child.try_wait() {
-                Ok(None) => true,     // still running
-                Ok(Some(_)) => false, // exited
-                Err(_) => false,
+                Ok(None) => true,              // still running
+                Ok(Some(_)) | Err(_) => false, // exited or error
             },
             None => false,
         }

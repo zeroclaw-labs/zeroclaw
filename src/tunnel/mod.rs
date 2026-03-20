@@ -156,8 +156,7 @@ mod tests {
     use super::*;
     use crate::config::schema::{
         CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, OpenVpnTunnelConfig,
-        PinggyTunnelConfig,
-        TunnelConfig,
+        PinggyTunnelConfig, TunnelConfig,
     };
     use tokio::process::Command;
 
