@@ -8040,7 +8040,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                !histories.contains_key("telegram_alice"),
+                !histories.contains_key("telegram_chat-refresh_alice"),
                 "/new should clear the cached sender history before the next message"
             );
         }
@@ -8051,7 +8051,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                pending_new_sessions.contains("telegram_alice"),
+                pending_new_sessions.contains("telegram_chat-refresh_alice"),
                 "/new should mark the sender for a fresh next-message prompt rebuild"
             );
         }
