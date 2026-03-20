@@ -234,39 +234,9 @@ async fn main() -> Result<()> {
             }
         },
 
-        Commands::Memory { memory_command } => match memory_command {
-            MemoryCommands::List {
-                category,
-                session: _,
-                limit,
-                offset,
-            } => {
-                let mem = memory::create_memory(
-                    &config.memory,
-                    &config.workspace_dir,
-                    config.api_key.as_deref(),
-                )?;
-                // TODO: implement memory list with filters
-                println!("Memory list (category={category:?}, limit={limit}, offset={offset})");
-                drop(mem);
-            }
-            MemoryCommands::Get { key } => {
-                println!("Memory get: {key}");
-                // TODO: implement
-            }
-            MemoryCommands::Stats => {
-                println!("Memory stats:");
-                // TODO: implement
-            }
-            MemoryCommands::Clear { key, category, yes } => {
-                if !yes {
-                    println!("Are you sure? Use --yes to confirm.");
-                    return Ok(());
-                }
-                println!("Clearing memory (key={key:?}, category={category:?})");
-                // TODO: implement
-            }
-        },
+        Commands::Memory { memory_command } => {
+            memory::cli::handle_command(memory_command, &config).await?;
+        }
 
         Commands::Daemon { action } => match action {
             DaemonCommands::Start => {
@@ -274,10 +244,8 @@ async fn main() -> Result<()> {
                 daemon::run_daemon(config).await?;
             }
             DaemonCommands::Stop => {
-                // Send SIGTERM to the daemon via its PID file
-                let status = daemon::daemon_status()?;
-                println!("{status}");
-                // TODO: send SIGTERM to PID
+                let result = daemon::daemon_stop()?;
+                println!("{result}");
             }
             DaemonCommands::Status => {
                 let status = daemon::daemon_status()?;

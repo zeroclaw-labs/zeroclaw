@@ -110,6 +110,39 @@ pub fn uninstall_launchd() -> Result<()> {
     Ok(())
 }
 
+/// Stop the daemon by sending SIGTERM to the PID in the PID file.
+pub fn daemon_stop() -> Result<String> {
+    let config = DaemonConfig::default();
+
+    if !config.pid_file.exists() {
+        return Ok("Augusta daemon is not running (no PID file)".into());
+    }
+
+    let pid_str = std::fs::read_to_string(&config.pid_file)?;
+    let pid: i32 = pid_str.trim().parse()?;
+
+    // Check if process is alive before sending signal
+    let alive = unsafe { libc::kill(pid, 0) == 0 };
+    if !alive {
+        let _ = std::fs::remove_file(&config.pid_file);
+        return Ok("Augusta daemon is not running (stale PID file cleaned)".into());
+    }
+
+    // Send SIGTERM for graceful shutdown
+    let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if result != 0 {
+        anyhow::bail!(
+            "Failed to send SIGTERM to PID {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    // Clean up PID file (daemon also cleans up on exit, but be safe)
+    let _ = std::fs::remove_file(&config.pid_file);
+
+    Ok(format!("Augusta daemon stopped (PID: {pid})"))
+}
+
 /// Query daemon status via PID file.
 pub fn daemon_status() -> Result<String> {
     let config = DaemonConfig::default();
