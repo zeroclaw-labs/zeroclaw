@@ -5,12 +5,16 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, ChatResponse, Provider, TokenUsage};
+use crate::multimodal;
+use crate::providers::traits::{
+    ChatMessage, ChatResponse, Provider, ProviderCapabilities, TokenUsage,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -136,7 +140,38 @@ struct Content {
 
 #[derive(Debug, Serialize, Clone)]
 struct Part {
-    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(rename = "inlineData", skip_serializing_if = "Option::is_none")]
+    inline_data: Option<InlineData>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct InlineData {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    data: String,
+}
+
+impl Part {
+    /// Create a new text part.
+    fn new_text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            inline_data: None,
+        }
+    }
+
+    /// Create a new image part.
+    fn new_image(mime_type: impl Into<String>, data: impl Into<String>) -> Self {
+        Self {
+            text: None,
+            inline_data: Some(InlineData {
+                mime_type: mime_type.into(),
+                data: data.into(),
+            }),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -954,31 +989,8 @@ impl GeminiProvider {
             _ => None,
         };
 
-        // For OAuth: get a valid (potentially refreshed) token and resolve project
-        let (mut oauth_token, mut project) = match auth {
-            GeminiAuth::OAuthToken(state) => {
-                let token = Self::get_valid_oauth_token(state).await?;
-                let proj = self.resolve_oauth_project(&token).await?;
-                (Some(token), Some(proj))
-            }
-            GeminiAuth::ManagedOAuth => {
-                let auth_service = self
-                    .auth_service
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("ManagedOAuth requires auth_service"))?;
-                let token = auth_service
-                    .get_valid_gemini_access_token(self.auth_profile_override.as_deref())
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Gemini auth profile not found. Run `zeroclaw auth login --provider gemini`."
-                        )
-                    })?;
-                let proj = self.resolve_oauth_project(&token).await?;
-                (Some(token), Some(proj))
-            }
-            _ => (None, None),
-        };
+        // Resolve token and project
+        let (oauth_token, project) = self.resolve_auth_info(auth).await?;
 
         let request = GenerateContentRequest {
             contents,
@@ -1024,28 +1036,11 @@ impl GeminiProvider {
                 };
 
                 if can_retry {
-                    // Re-fetch token (may be refreshed)
-                    let (new_token, new_project) = match auth {
-                        GeminiAuth::OAuthToken(state) => {
-                            let token = Self::get_valid_oauth_token(state).await?;
-                            let proj = self.resolve_oauth_project(&token).await?;
-                            (token, proj)
-                        }
-                        GeminiAuth::ManagedOAuth => {
-                            let auth_service = self.auth_service.as_ref().unwrap();
-                            let token = auth_service
-                                .get_valid_gemini_access_token(
-                                    self.auth_profile_override.as_deref(),
-                                )
-                                .await?
-                                .ok_or_else(|| anyhow::anyhow!("Gemini auth profile not found"))?;
-                            let proj = self.resolve_oauth_project(&token).await?;
-                            (token, proj)
-                        }
-                        _ => unreachable!(),
-                    };
-                    oauth_token = Some(new_token);
-                    project = Some(new_project);
+                    let (new_token, new_project) = self.resolve_auth_info(auth).await?;
+                    let (new_token, new_project) = (
+                        new_token.ok_or_else(|| anyhow::anyhow!("Retry without token"))?,
+                        new_project.ok_or_else(|| anyhow::anyhow!("Retry without project"))?,
+                    );
                     response = self
                         .build_generate_content_request(
                             auth,
@@ -1053,8 +1048,8 @@ impl GeminiProvider {
                             &request,
                             model,
                             true,
-                            project.as_deref(),
-                            oauth_token.as_deref(),
+                            Some(&new_project),
+                            Some(&new_token),
                         )
                         .send()
                         .await?;
@@ -1140,10 +1135,82 @@ impl GeminiProvider {
 
         Ok((text, usage))
     }
+
+    fn to_gemini_parts(content: &str) -> Vec<Part> {
+        let (cleaned_text, image_refs) = multimodal::parse_image_markers(content);
+        let mut parts = Vec::with_capacity(image_refs.len() + 1);
+
+        let trimmed_text = cleaned_text.trim();
+        if !trimmed_text.is_empty() {
+            parts.push(Part::new_text(trimmed_text));
+        }
+
+        for image_ref in image_refs {
+            if let Some(comma_idx) = image_ref.find(',') {
+                let header = &image_ref[..comma_idx];
+                let data = &image_ref[comma_idx + 1..];
+
+                let mime_type = if let Some(start) = header.find(':') {
+                    if let Some(end) = header[start..].find(';') {
+                        header[start + 1..start + end].to_string()
+                    } else {
+                        "image/png".to_string()
+                    }
+                } else {
+                    "image/png".to_string()
+                };
+
+                parts.push(Part::new_image(mime_type, data));
+            }
+        }
+
+        if parts.is_empty() && !content.is_empty() {
+            parts.push(Part::new_text(content));
+        }
+
+        parts
+    }
+
+    async fn resolve_auth_info(
+        &self,
+        auth: &GeminiAuth,
+    ) -> anyhow::Result<(Option<String>, Option<String>)> {
+        match auth {
+            GeminiAuth::OAuthToken(state) => {
+                let token = Self::get_valid_oauth_token(state).await?;
+                let proj = self.resolve_oauth_project(&token).await?;
+                Ok((Some(token), Some(proj)))
+            }
+            GeminiAuth::ManagedOAuth => {
+                let auth_service = self
+                    .auth_service
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("ManagedOAuth requires auth_service"))?;
+                let token = auth_service
+                    .get_valid_gemini_access_token(self.auth_profile_override.as_deref())
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Gemini auth profile not found. Run `zeroclaw auth login --provider gemini`."
+                        )
+                    })?;
+                let proj = self.resolve_oauth_project(&token).await?;
+                Ok((Some(token), Some(proj)))
+            }
+            _ => Ok((None, None)),
+        }
+    }
 }
 
 #[async_trait]
 impl Provider for GeminiProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: false,
+            vision: true,
+            prompt_caching: false,
+        }
+    }
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -1153,16 +1220,12 @@ impl Provider for GeminiProvider {
     ) -> anyhow::Result<String> {
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
-            parts: vec![Part {
-                text: sys.to_string(),
-            }],
+            parts: vec![Part::new_text(sys)],
         });
 
         let contents = vec![Content {
             role: Some("user".to_string()),
-            parts: vec![Part {
-                text: message.to_string(),
-            }],
+            parts: Self::to_gemini_parts(message),
         }];
 
         let (text, _usage) = self
@@ -1181,28 +1244,21 @@ impl Provider for GeminiProvider {
         let mut contents: Vec<Content> = Vec::new();
 
         for msg in messages {
-            match msg.role.as_str() {
+            let role: Option<Cow<'static, str>> = match msg.role.as_str() {
                 "system" => {
                     system_parts.push(&msg.content);
+                    None
                 }
-                "user" => {
-                    contents.push(Content {
-                        role: Some("user".to_string()),
-                        parts: vec![Part {
-                            text: msg.content.clone(),
-                        }],
-                    });
-                }
-                "assistant" => {
-                    // Gemini API uses "model" role instead of "assistant"
-                    contents.push(Content {
-                        role: Some("model".to_string()),
-                        parts: vec![Part {
-                            text: msg.content.clone(),
-                        }],
-                    });
-                }
-                _ => {}
+                "user" => Some("user".into()),
+                "assistant" => Some("model".into()), // Gemini uses "model" role
+                _ => None,
+            };
+
+            if let Some(role) = role {
+                contents.push(Content {
+                    role: Some(role.to_string()),
+                    parts: Self::to_gemini_parts(&msg.content),
+                });
             }
         }
 
@@ -1211,9 +1267,7 @@ impl Provider for GeminiProvider {
         } else {
             Some(Content {
                 role: None,
-                parts: vec![Part {
-                    text: system_parts.join("\n\n"),
-                }],
+                parts: vec![Part::new_text(system_parts.join("\n\n"))],
             })
         };
 
@@ -1233,21 +1287,21 @@ impl Provider for GeminiProvider {
         let mut contents: Vec<Content> = Vec::new();
 
         for msg in request.messages {
-            match msg.role.as_str() {
-                "system" => system_parts.push(&msg.content),
-                "user" => contents.push(Content {
-                    role: Some("user".to_string()),
-                    parts: vec![Part {
-                        text: msg.content.clone(),
-                    }],
-                }),
-                "assistant" => contents.push(Content {
-                    role: Some("model".to_string()),
-                    parts: vec![Part {
-                        text: msg.content.clone(),
-                    }],
-                }),
-                _ => {}
+            let role: Option<Cow<'static, str>> = match msg.role.as_str() {
+                "system" => {
+                    system_parts.push(&msg.content);
+                    None
+                }
+                "user" => Some("user".into()),
+                "assistant" => Some("model".into()),
+                _ => None,
+            };
+
+            if let Some(role) = role {
+                contents.push(Content {
+                    role: Some(role.to_string()),
+                    parts: Self::to_gemini_parts(&msg.content),
+                });
             }
         }
 
@@ -1256,9 +1310,7 @@ impl Provider for GeminiProvider {
         } else {
             Some(Content {
                 role: None,
-                parts: vec![Part {
-                    text: system_parts.join("\n\n"),
-                }],
+                parts: vec![Part::new_text(system_parts.join("\n\n"))],
             })
         };
 
@@ -1543,9 +1595,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
+                parts: vec![Part::new_text("hello")],
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
@@ -1584,9 +1634,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
+                parts: vec![Part::new_text("hello")],
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
@@ -1628,9 +1676,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
-                    text: "hello".into(),
-                }],
+                parts: vec![Part::new_text("hello")],
             }],
             system_instruction: None,
             generation_config: GenerationConfig {
@@ -1660,15 +1706,11 @@ mod tests {
         let request = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".to_string()),
-                parts: vec![Part {
-                    text: "Hello".to_string(),
-                }],
+                parts: vec![Part::new_text("Hello")],
             }],
             system_instruction: Some(Content {
                 role: None,
-                parts: vec![Part {
-                    text: "You are helpful".to_string(),
-                }],
+                parts: vec![Part::new_text("You are helpful")],
             }),
             generation_config: GenerationConfig {
                 temperature: 0.7,
@@ -1694,9 +1736,7 @@ mod tests {
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
-                    parts: vec![Part {
-                        text: "Hello".to_string(),
-                    }],
+                    parts: vec![Part::new_text("Hello")],
                 }],
                 system_instruction: None,
                 generation_config: Some(GenerationConfig {
@@ -1726,9 +1766,7 @@ mod tests {
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
-                    parts: vec![Part {
-                        text: "Hello".to_string(),
-                    }],
+                    parts: vec![Part::new_text("Hello")],
                 }],
                 system_instruction: None,
                 generation_config: None,
@@ -1749,9 +1787,7 @@ mod tests {
             request: InternalGenerateContentRequest {
                 contents: vec![Content {
                     role: Some("user".to_string()),
-                    parts: vec![Part {
-                        text: "Hello".to_string(),
-                    }],
+                    parts: vec![Part::new_text("Hello")],
                 }],
                 system_instruction: None,
                 generation_config: None,
