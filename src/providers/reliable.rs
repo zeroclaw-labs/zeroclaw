@@ -804,6 +804,26 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
+                    // Log the full message payload on the first attempt of each
+                    // call (not on retries). Enabled by `--log-llm` / TRACE level.
+                    if attempt == 0 && tracing::enabled!(tracing::Level::TRACE) {
+                        tracing::trace!(
+                            provider = %provider_name,
+                            model = %current_model,
+                            message_count = effective_messages.len(),
+                            "LLM request"
+                        );
+                        for (i, msg) in effective_messages.iter().enumerate() {
+                            tracing::trace!(
+                                index = i,
+                                role = %msg.role,
+                                chars = msg.content.len(),
+                                "\n{}\n",
+                                msg.content
+                            );
+                        }
+                    }
+
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
