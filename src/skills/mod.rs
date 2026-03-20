@@ -791,6 +791,26 @@ pub fn init_skills_dir(workspace_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve ClawHub URLs to their backing GitHub repository.
+///
+/// ClawHub (`clawhub.ai`) is a skill discovery portal, not a Git host.
+/// Skills listed there are hosted on GitHub at the same `author/name` path.
+/// This function transparently rewrites ClawHub URLs so that `skills install`
+/// can clone them via the normal Git path.
+fn resolve_skill_source_url(source: &str) -> String {
+    let s = source.trim();
+    // Handle https://clawhub.ai/author/skill, http://…, and bare clawhub.ai/…
+    for prefix in &["https://clawhub.ai/", "http://clawhub.ai/", "clawhub.ai/"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            let path = rest.trim_end_matches('/');
+            if !path.is_empty() {
+                return format!("https://github.com/{path}");
+            }
+        }
+    }
+    s.to_string()
+}
+
 fn is_git_source(source: &str) -> bool {
     is_git_scheme_source(source, "https://")
         || is_git_scheme_source(source, "http://")
@@ -1084,13 +1104,23 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
         crate::SkillCommands::Install { source } => {
             println!("Installing skill from: {source}");
 
+            // Resolve ClawHub URLs to their backing GitHub repository
+            let resolved_source = resolve_skill_source_url(&source);
+            if resolved_source != source {
+                println!(
+                    "  {} Resolved ClawHub URL to GitHub: {}",
+                    console::style("ℹ").blue().bold(),
+                    resolved_source
+                );
+            }
+
             let skills_path = skills_dir(workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
 
-            if is_git_source(&source) {
+            if is_git_source(&resolved_source) {
                 let (installed_dir, files_scanned) =
-                    install_git_skill_source(&source, &skills_path, config.skills.allow_scripts)
-                        .with_context(|| format!("failed to install git skill source: {source}"))?;
+                    install_git_skill_source(&resolved_source, &skills_path, config.skills.allow_scripts)
+                        .with_context(|| format!("failed to install git skill source: {resolved_source}"))?;
                 println!(
                     "  {} Skill installed and audited: {} ({} files scanned)",
                     console::style("✓").green().bold(),
@@ -1099,9 +1129,9 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 );
             } else {
                 let (dest, files_scanned) =
-                    install_local_skill_source(&source, &skills_path, config.skills.allow_scripts)
+                    install_local_skill_source(&resolved_source, &skills_path, config.skills.allow_scripts)
                         .with_context(|| {
-                            format!("failed to install local skill source: {source}")
+                            format!("failed to install local skill source: {resolved_source}")
                         })?;
                 println!(
                     "  {} Skill installed and audited: {} ({} files scanned)",
