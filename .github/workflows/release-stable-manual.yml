@@ -170,6 +170,22 @@ jobs:
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-gnueabihf
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
+            skip_prometheus: true
+          - os: ubuntu-22.04
+            target: arm-unknown-linux-gnueabihf
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
+            skip_prometheus: true
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
@@ -215,7 +231,15 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
+          FEATURES="${{ env.RELEASE_CARGO_FEATURES }}"
+          DEFAULT_FLAGS=""
+          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
+            # 32-bit ARM targets lack native AtomicU64; disable observability-prometheus
+            # and re-specify remaining default features explicitly.
+            DEFAULT_FLAGS="--no-default-features"
+            FEATURES="channel-nostr,skill-creation,${FEATURES}"
+          fi
+          cargo build --release --locked $DEFAULT_FLAGS --features "$FEATURES" --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
