@@ -295,7 +295,43 @@ fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::V
 }
 
 fn autosave_memory_key(prefix: &str) -> String {
-    format!("{prefix}_{}", Uuid::new_v4())
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    format!("{prefix}_{ts}")
+}
+
+/// Build a procedural memory trace from the conversation history if tool calls occurred.
+///
+/// Returns `None` when no tool-calling turn was detected (no role="tool" messages
+/// and no `[Tool results]` user messages in the history).  Otherwise returns the
+/// conversation trace as `ProceduralMessage` entries suitable for `Memory::store_procedural`.
+fn build_procedural_trace(history: &[ChatMessage]) -> Option<Vec<memory::ProceduralMessage>> {
+    let had_tools = history
+        .iter()
+        .any(|m| m.role == "tool" || (m.role == "user" && m.content.starts_with("[Tool results]")));
+    if !had_tools {
+        return None;
+    }
+
+    // Skip the system prompt and collect the rest as procedural trace.
+    let messages: Vec<memory::ProceduralMessage> = history
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| memory::ProceduralMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            name: None,
+        })
+        .collect();
+
+    if messages.is_empty() {
+        None
+    } else {
+        Some(messages)
+    }
 }
 
 fn memory_session_id_from_state_file(path: &Path) -> Option<String> {
@@ -454,49 +490,79 @@ fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Res
     Ok(())
 }
 
+/// Returns `true` when `session_id` looks like a group conversation
+/// (e.g. Signal `group:…` or WhatsApp `…@g.us`).
+fn is_group_session(session_id: &str) -> bool {
+    session_id.contains("group") || session_id.contains("@g.us")
+}
+
 /// Build context preamble by searching memory for relevant entries.
 /// Entries with a hybrid score below `min_relevance_score` are dropped to
 /// prevent unrelated memories from bleeding into the conversation.
+///
+/// For group chats (detected by `session_id` containing "group" or "@g.us"),
+/// a second recall is issued under the `sender` scope so personal memories
+/// are included alongside group-scoped ones.  Results are deduplicated by
+/// memory ID.
 async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
+    sender: Option<&str>,
 ) -> String {
     let mut context = String::new();
 
-    // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
-        let relevant: Vec<_> = entries
-            .iter()
-            .filter(|e| match e.score {
-                Some(score) => score >= min_relevance_score,
-                None => true,
-            })
-            .collect();
+    // Primary recall under the current session scope.
+    let mut entries = mem
+        .recall(user_msg, 5, session_id)
+        .await
+        .unwrap_or_default();
 
-        if !relevant.is_empty() {
-            context.push_str("[Memory context]\n");
-            for entry in &relevant {
-                if memory::is_assistant_autosave_key(&entry.key) {
-                    continue;
+    // Dual-scope: for group chats, also recall under the sender scope
+    // and merge, deduplicating by memory ID.
+    if let (Some(sid), Some(sndr)) = (session_id, sender) {
+        if is_group_session(sid) && sndr != sid {
+            if let Ok(sender_entries) = mem.recall(user_msg, 5, Some(sndr)).await {
+                let seen: HashSet<String> = entries.iter().map(|e| e.id.clone()).collect();
+                for entry in sender_entries {
+                    if !seen.contains(&entry.id) {
+                        entries.push(entry);
+                    }
                 }
-                if memory::should_skip_autosave_content(&entry.content) {
-                    continue;
-                }
-                // Skip entries containing tool_result blocks — they can leak
-                // stale tool output from previous heartbeat ticks into new
-                // sessions, presenting the LLM with orphan tool_result data.
-                if entry.content.contains("<tool_result") {
-                    continue;
-                }
-                let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
-            if context == "[Memory context]\n" {
-                context.clear();
-            } else {
-                context.push('\n');
+        }
+    }
+
+    let relevant: Vec<_> = entries
+        .iter()
+        .filter(|e| match e.score {
+            Some(score) => score >= min_relevance_score,
+            None => true,
+        })
+        .collect();
+
+    if !relevant.is_empty() {
+        context.push_str("[Memory context]\n");
+        for entry in &relevant {
+            if memory::is_assistant_autosave_key(&entry.key) {
+                continue;
             }
+            if memory::should_skip_autosave_content(&entry.content) {
+                continue;
+            }
+            // Skip entries containing tool_result blocks — they can leak
+            // stale tool output from previous heartbeat ticks into new
+            // sessions, presenting the LLM with orphan tool_result data.
+            if entry.content.contains("<tool_result") {
+                continue;
+            }
+            let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
+        }
+        if context == "[Memory context]\n" {
+            context.clear();
+        } else {
+            context.push('\n');
         }
     }
 
@@ -2504,6 +2570,83 @@ async fn execute_tools_sequential(
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
+/// Try to describe images via the configured MCP vision fallback tool.
+/// Falls back to simple `[Generated image: <ref>]` text when the MCP
+/// tool is unavailable or the call fails.
+async fn describe_or_strip_images(
+    refs: &[String],
+    multimodal_config: &crate::config::MultimodalConfig,
+    tools_registry: &[Box<dyn Tool>],
+) -> Vec<String> {
+    if let Some(ref server_name) = multimodal_config.vision_mcp_fallback {
+        let prefix = format!("{server_name}__");
+        let vision_tool: Option<&dyn Tool> = tools_registry
+            .iter()
+            .find(|t| {
+                t.name().strip_prefix(&prefix).is_some_and(|part| {
+                    part.contains("vision") || part.contains("describe") || part.contains("image")
+                })
+            })
+            .map(|t| t.as_ref());
+
+        if let Some(tool) = vision_tool {
+            let schema = tool.parameters_schema();
+            let image_param = schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .and_then(|props| {
+                    if props.contains_key("image_source") {
+                        Some("image_source")
+                    } else if props.contains_key("image") {
+                        Some("image")
+                    } else {
+                        props
+                            .keys()
+                            .find(|k| k.contains("image"))
+                            .map(|k| k.as_str())
+                    }
+                })
+                .unwrap_or("image_source");
+
+            let vision_timeout = std::time::Duration::from_secs(120);
+            let mut descriptions = Vec::with_capacity(refs.len());
+            for image_ref in refs {
+                let args = serde_json::json!({
+                    image_param: image_ref,
+                    "prompt": "Briefly describe this image in 2-3 sentences."
+                });
+                match tokio::time::timeout(vision_timeout, tool.execute(args)).await {
+                    Ok(Ok(result)) => {
+                        let truncated: String = result.output.chars().take(800).collect();
+                        descriptions.push(format!(
+                            "[Image file: {image_ref} — Description: {truncated}]"
+                        ));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("Vision MCP fallback failed for {image_ref}: {e}");
+                        descriptions.push(format!("[Generated image: {image_ref}]"));
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "Vision MCP fallback timed out for {image_ref} ({vision_timeout:?})"
+                        );
+                        descriptions.push(format!("[Generated image: {image_ref}]"));
+                    }
+                }
+            }
+            return descriptions;
+        }
+        tracing::warn!(
+            "vision_mcp_fallback=\"{server_name}\" configured but no matching tool found"
+        );
+    }
+
+    // No MCP fallback configured or tool not found — plain text references.
+    refs.iter()
+        .map(|r| format!("[Generated image: {r}]"))
+        .collect()
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 #[allow(clippy::too_many_arguments)]
@@ -2540,89 +2683,27 @@ pub(crate) async fn run_tool_call_loop(
     // ── MCP vision fallback ─────────────────────────────────────────
     // When the active provider does not support vision input AND the
     // config specifies `vision_mcp_fallback`, describe images in the
-    // *latest* user message via the named MCP server so the LLM
-    // receives text descriptions instead of raw [IMAGE:] markers.
-    // Only the last user message is processed — older history entries
-    // keep their [IMAGE:path] markers so the agent can reference them.
+    // *latest* user message via the MCP vision tool so the LLM receives
+    // text descriptions instead of raw [IMAGE:] markers.  Only the last
+    // user message is processed — older history entries keep their
+    // [IMAGE:path] markers for reference.  When `vision_mcp_fallback`
+    // is NOT configured, markers are left in place so the hard error at
+    // the top of the loop fires for user-sent images.
     let image_marker_count = crate::multimodal::count_image_markers(history);
-    if image_marker_count > 0 && !provider.supports_vision() {
-        if let Some(ref server_name) = multimodal_config.vision_mcp_fallback {
-            let prefix = format!("{server_name}__");
-            let is_vision_tool_name = |n: &str| -> bool {
-                if let Some(tool_part) = n.strip_prefix(&prefix) {
-                    tool_part.contains("vision")
-                        || tool_part.contains("describe")
-                        || tool_part.contains("image")
+    if image_marker_count > 0
+        && !provider.supports_vision()
+        && multimodal_config.vision_mcp_fallback.is_some()
+    {
+        if let Some(msg) = history.iter_mut().rev().find(|m| m.role == "user") {
+            let (cleaned, refs) = crate::multimodal::parse_image_markers(&msg.content);
+            if !refs.is_empty() {
+                let descriptions =
+                    describe_or_strip_images(&refs, multimodal_config, tools_registry).await;
+                msg.content = if cleaned.is_empty() {
+                    descriptions.join("\n\n")
                 } else {
-                    false
-                }
-            };
-
-            // Find a suitable vision tool from the registry.
-            let vision_tool: Option<&dyn Tool> = tools_registry
-                .iter()
-                .find(|t| is_vision_tool_name(t.name()))
-                .map(|t| t.as_ref());
-
-            if let Some(tool) = vision_tool {
-                // Only process the LAST user message — keep old [IMAGE:path]
-                // markers in history so the agent can reference them later.
-                if let Some(msg) = history.iter_mut().rev().find(|m| m.role == "user") {
-                    let (cleaned, refs) = crate::multimodal::parse_image_markers(&msg.content);
-                    if !refs.is_empty() {
-                        let schema = tool.parameters_schema();
-                        let image_param = schema
-                            .get("properties")
-                            .and_then(|p| p.as_object())
-                            .and_then(|props| {
-                                if props.contains_key("image_source") {
-                                    Some("image_source")
-                                } else if props.contains_key("image") {
-                                    Some("image")
-                                } else {
-                                    props
-                                        .keys()
-                                        .find(|k| k.contains("image"))
-                                        .map(|k| k.as_str())
-                                }
-                            })
-                            .unwrap_or("image_source");
-
-                        let mut descriptions = Vec::new();
-                        for image_ref in &refs {
-                            let args = serde_json::json!({
-                                image_param: image_ref,
-                                "prompt": "Briefly describe this image in 2-3 sentences."
-                            });
-                            match tool.execute(args).await {
-                                Ok(result) => {
-                                    let truncated: String =
-                                        result.output.chars().take(800).collect();
-                                    descriptions.push(format!(
-                                        "[Image file: {image_ref} — Description: {truncated}]"
-                                    ));
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "Vision MCP fallback failed for {}: {e}",
-                                        image_ref
-                                    );
-                                    descriptions
-                                        .push(format!("[Image: could not describe — {image_ref}]"));
-                                }
-                            }
-                        }
-                        msg.content = if cleaned.is_empty() {
-                            descriptions.join("\n\n")
-                        } else {
-                            format!("{}\n\n{}", descriptions.join("\n\n"), cleaned)
-                        };
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    "vision_mcp_fallback=\"{server_name}\" configured but no matching tool found"
-                );
+                    format!("{}\n\n{}", descriptions.join("\n\n"), cleaned)
+                };
             }
         }
     }
@@ -2676,14 +2757,40 @@ pub(crate) async fn run_tool_call_loop(
 
         let image_marker_count = multimodal::count_image_markers(history);
         if image_marker_count > 0 && !provider.supports_vision() {
-            return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                ),
+            let has_read_image = tools_registry.iter().any(|t| t.name() == "read_image");
+            if has_read_image {
+                // Replace [IMAGE:ref] markers with a text hint so the LLM
+                // can call the read_image tool instead.  The replacement
+                // format avoids the [IMAGE: prefix, keeping count_image_markers
+                // at zero on subsequent iterations.
+                for msg in history.iter_mut().filter(|m| m.role == "user") {
+                    if msg.content.contains("[IMAGE:") {
+                        let (cleaned, refs) = multimodal::parse_image_markers(&msg.content);
+                        if !refs.is_empty() {
+                            let hints: Vec<String> = refs
+                                .iter()
+                                .map(|r| {
+                                    format!("[Attached image: {r} — use read_image tool to view]")
+                                })
+                                .collect();
+                            msg.content = if cleaned.is_empty() {
+                                hints.join("\n")
+                            } else {
+                                format!("{}\n{}", hints.join("\n"), cleaned)
+                            };
+                        }
+                    }
+                }
+            } else {
+                return Err(ProviderCapabilityError {
+                    provider: provider_name.to_string(),
+                    capability: "vision".to_string(),
+                    message: format!(
+                        "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                    ),
+                }
+                .into());
             }
-            .into());
         }
 
         let prepared_messages =
@@ -2737,7 +2844,10 @@ pub(crate) async fn run_tool_call_loop(
         // When the channel has a delta sender AND the provider supports streaming
         // AND we are NOT using native tool calling, stream tokens in real-time so
         // the channel can deliver segments to the user before the full response is
-        // ready.
+        // ready.  The accumulated text is then parsed for tool calls after the
+        // stream ends.  If tool calls are found, we send a CLEAR sentinel and
+        // continue the tool loop; the segments already sent to the user serve as
+        // "thinking" feedback.
         let can_realtime_stream =
             on_delta.is_some() && provider.supports_streaming() && !use_native_tools;
         let mut streamed_this_iteration = false;
@@ -2746,7 +2856,7 @@ pub(crate) async fn run_tool_call_loop(
             use crate::providers::traits::StreamOptions;
             use futures_util::StreamExt;
 
-            // Signal the channel to clear progress lines and prepare for
+            // Signal the channel to clear progress lines and prepare for real
             // streaming content.
             if let Some(ref tx) = on_delta {
                 let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
@@ -2786,6 +2896,7 @@ pub(crate) async fn run_tool_call_loop(
                         }
                         if !chunk.delta.is_empty() {
                             accumulated.push_str(&chunk.delta);
+                            // Forward delta to channel for real-time segment delivery
                             if let Some(ref tx) = on_delta {
                                 let _ = tx.send(chunk.delta).await;
                             }
@@ -2796,7 +2907,7 @@ pub(crate) async fn run_tool_call_loop(
                         stream_error = true;
                         break;
                     }
-                    None => break,
+                    None => break, // stream ended
                 }
             }
 
@@ -2806,6 +2917,7 @@ pub(crate) async fn run_tool_call_loop(
                 if let Some(ref tx) = on_delta {
                     let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
                 }
+                // Fall back to non-streaming call
                 let chat_future = provider.chat(
                     ChatRequest {
                         messages: &prepared_messages.messages,
@@ -2823,6 +2935,7 @@ pub(crate) async fn run_tool_call_loop(
                     chat_future.await
                 }
             } else {
+                // Build a synthetic ProviderChatResponse from accumulated text
                 streamed_this_iteration = true;
                 Ok(crate::providers::ChatResponse {
                     text: Some(accumulated),
@@ -3020,11 +3133,16 @@ pub(crate) async fn run_tool_call_loop(
                 }),
             );
             // No tool calls — this is the final response.
-            // If we already streamed tokens in real-time, the text has already
-            // been forwarded through `on_delta` — skip post-hoc chunking.
+            // If we already streamed tokens in real-time via `stream_chat_with_history`,
+            // the text has already been forwarded through `on_delta` — skip post-hoc
+            // chunking. Otherwise, relay the text in small chunks so the channel can
+            // progressively update the draft message.
             if !streamed_this_iteration {
                 if let Some(ref tx) = on_delta {
+                    // Clear accumulated progress lines before streaming the final answer.
                     let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                    // Split on whitespace boundaries, accumulating chunks of at least
+                    // STREAM_CHUNK_MIN_CHARS characters for progressive draft updates.
                     let mut chunk = String::new();
                     for word in display_text.split_inclusive(char::is_whitespace) {
                         if cancellation_token
@@ -3037,7 +3155,7 @@ pub(crate) async fn run_tool_call_loop(
                         if chunk.len() >= STREAM_CHUNK_MIN_CHARS
                             && tx.send(std::mem::take(&mut chunk)).await.is_err()
                         {
-                            break;
+                            break; // receiver dropped
                         }
                     }
                     if !chunk.is_empty() {
@@ -3359,6 +3477,38 @@ pub(crate) async fn run_tool_call_loop(
                 truncate_with_ellipsis(&outcome.output, MAX_TOOL_RESULT_CHARS)
             } else {
                 outcome.output.clone()
+            };
+            // When the provider does not support vision, strip [IMAGE:]
+            // markers from tool outputs so they don't trigger
+            // ProviderCapabilityError on the next loop iteration.
+            // When read_image is registered, use a hint so the LLM can
+            // call it; otherwise fall back to MCP or plain text reference.
+            let output = if !provider.supports_vision() && output.contains("[IMAGE:") {
+                let (cleaned, refs) = multimodal::parse_image_markers(&output);
+                if refs.is_empty() {
+                    output
+                } else {
+                    tracing::info!(
+                        tool = %tool_name,
+                        count = refs.len(),
+                        "Stripping image markers from tool output (provider lacks vision)"
+                    );
+                    let has_read_image = tools_registry.iter().any(|t| t.name() == "read_image");
+                    let descriptions = if has_read_image {
+                        refs.iter()
+                            .map(|r| format!("[Attached image: {r} — use read_image tool to view]"))
+                            .collect()
+                    } else {
+                        describe_or_strip_images(&refs, multimodal_config, tools_registry).await
+                    };
+                    let mut parts = descriptions;
+                    if !cleaned.is_empty() {
+                        parts.push(cleaned);
+                    }
+                    parts.join("\n")
+                }
+            } else {
+                output
             };
             individual_results.push((tool_call_id, output.clone()));
             let _ = writeln!(
@@ -3847,28 +3997,13 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.auto_save
-            && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            && !memory::should_skip_autosave_content(&msg)
-        {
-            let user_key = autosave_memory_key("user_msg");
-            let _ = mem
-                .store(
-                    &user_key,
-                    &msg,
-                    MemoryCategory::Conversation,
-                    memory_session_id.as_deref(),
-                )
-                .await;
-        }
-
         // Inject memory + hardware RAG context into user message
         let mem_context = build_context(
             mem.as_ref(),
             &msg,
             config.memory.min_relevance_score,
             memory_session_id.as_deref(),
+            None, // CLI path — no sender scope
         )
         .await;
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -3982,6 +4117,44 @@ pub async fn run(
             }
         }
         final_output = response.clone();
+
+        // Auto-save user+assistant pair to memory (skip short/trivial messages)
+        if config.memory.auto_save
+            && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            && !memory::should_skip_autosave_content(&msg)
+        {
+            let user_key = autosave_memory_key("user_msg");
+            let mem_clone = Arc::clone(&mem);
+            let pair = format!("User: {msg}\nAssistant: {response}");
+            let sid_clone = memory_session_id.clone();
+            tokio::spawn(async move {
+                let _ = mem_clone
+                    .store(
+                        &user_key,
+                        &pair,
+                        MemoryCategory::Conversation,
+                        sid_clone.as_deref(),
+                    )
+                    .await;
+            });
+        }
+
+        // Store procedural memory from tool-calling turns (fire-and-forget).
+        if config.memory.auto_save {
+            if let Some(trace) = build_procedural_trace(&history) {
+                let mem_clone = Arc::clone(&mem);
+                let sid_clone = memory_session_id.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = mem_clone
+                        .store_procedural(&trace, sid_clone.as_deref())
+                        .await
+                    {
+                        tracing::warn!("procedural memory store failed: {e}");
+                    }
+                });
+            }
+        }
+
         println!("{response}");
         observer.record_event(&ObserverEvent::TurnComplete);
     } else {
@@ -4076,28 +4249,13 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns (skip short/trivial messages)
-            if config.memory.auto_save
-                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                && !memory::should_skip_autosave_content(&user_input)
-            {
-                let user_key = autosave_memory_key("user_msg");
-                let _ = mem
-                    .store(
-                        &user_key,
-                        &user_input,
-                        MemoryCategory::Conversation,
-                        memory_session_id.as_deref(),
-                    )
-                    .await;
-            }
-
             // Inject memory + hardware RAG context into user message
             let mem_context = build_context(
                 mem.as_ref(),
                 &user_input,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
+                None, // interactive path — no sender scope
             )
             .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -4196,6 +4354,43 @@ pub async fn run(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
+            // Auto-save user+assistant pair to memory (skip short/trivial messages)
+            if config.memory.auto_save
+                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                && !memory::should_skip_autosave_content(&user_input)
+            {
+                let user_key = autosave_memory_key("user_msg");
+                let mem_clone = Arc::clone(&mem);
+                let pair = format!("User: {user_input}\nAssistant: {response}");
+                let sid_clone = memory_session_id.clone();
+                tokio::spawn(async move {
+                    let _ = mem_clone
+                        .store(
+                            &user_key,
+                            &pair,
+                            MemoryCategory::Conversation,
+                            sid_clone.as_deref(),
+                        )
+                        .await;
+                });
+            }
+
+            // Store procedural memory from tool-calling turns (fire-and-forget).
+            if config.memory.auto_save {
+                if let Some(trace) = build_procedural_trace(&history) {
+                    let mem_clone = Arc::clone(&mem);
+                    let sid_clone = memory_session_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = mem_clone
+                            .store_procedural(&trace, sid_clone.as_deref())
+                            .await
+                        {
+                            tracing::warn!("procedural memory store failed: {e}");
+                        }
+                    });
+                }
+            }
+
             // Auto-compaction before hard trimming to preserve long-context signal.
             if let Ok(compacted) = auto_compact_history(
                 &mut history,
@@ -4234,10 +4429,15 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
+///
+/// `sender` is the originating user identifier (e.g. phone number).  When
+/// `session_id` identifies a group conversation, a secondary recall is issued
+/// under `sender` so that personal memories are merged with group context.
 pub async fn process_message(
     config: Config,
     message: &str,
     session_id: Option<&str>,
+    sender: Option<&str>,
 ) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -4488,6 +4688,7 @@ pub async fn process_message(
         message,
         config.memory.min_relevance_score,
         session_id,
+        sender,
     )
     .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -4513,7 +4714,7 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
-    agent_turn(
+    let mut result = agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
@@ -4532,7 +4733,369 @@ pub async fn process_message(
         activated_handle_pm.as_ref(),
         None,
     )
+    .await;
+
+    // ── Emotion sticker post-processing ────────────────────────
+    let emotion_cfg = EmotionStickerConfig::from_agent_config(&config.agent, &config);
+    if let Ok(ref mut response) = result {
+        if !response.is_empty() {
+            *response = maybe_append_emotion_sticker(
+                response,
+                &emotion_cfg,
+                &config.workspace_dir,
+                &tools_registry,
+            )
+            .await;
+        }
+    }
+
+    result
+}
+
+// ── Emotion Sticker System ─────────────────────────────────────────────────
+
+/// Configuration for the emotion sticker system, extracted from `AgentConfig`.
+/// Uses atomic bool for `enabled` so it can be toggled at runtime via `/emotion`.
+#[derive(Debug)]
+pub struct EmotionStickerConfig {
+    pub enabled: portable_atomic::AtomicBool,
+    pub emotion_provider: Option<String>,
+    pub emotion_model: Option<String>,
+    pub sticker_dir: String,
+    pub emotion_comfyui_server: String,
+    pub sticker_style: String,
+    /// Negative prompt for SD generation.
+    pub sticker_negative_prompt: String,
+    /// Character identity extracted from IDENTITY.md / SOUL.md at startup.
+    /// Injected into ComfyUI prompt so stickers match the agent's persona.
+    pub identity_prompt: String,
+    /// Backend override for emotion sticker image generation.
+    /// Empty string means use `image_generation.default_backend`.
+    pub emotion_image_backend: String,
+    /// Default backend from `image_generation.default_backend`.
+    pub image_generation_default_backend: String,
+    /// Fallback provider name when emotion_provider is not set.
+    pub default_provider: Option<String>,
+    /// Fallback API key for provider creation.
+    pub api_key: Option<String>,
+}
+
+impl Default for EmotionStickerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: portable_atomic::AtomicBool::new(false),
+            emotion_provider: None,
+            emotion_model: None,
+            sticker_dir: "stickers".into(),
+            emotion_comfyui_server: "comfyui".into(),
+            sticker_style: "chibi character, white background, simple, expressive, sticker style"
+                .into(),
+            sticker_negative_prompt: String::new(),
+            identity_prompt: String::new(),
+            emotion_image_backend: String::new(),
+            image_generation_default_backend: "comfyui".into(),
+            default_provider: None,
+            api_key: None,
+        }
+    }
+}
+
+impl EmotionStickerConfig {
+    pub fn from_agent_config(
+        agent: &crate::config::schema::AgentConfig,
+        config: &crate::config::Config,
+    ) -> Self {
+        // Read IDENTITY.md and SOUL.md from workspace to build character prompt.
+        let identity_prompt = Self::load_identity_from_workspace(&config.workspace_dir);
+
+        Self {
+            enabled: portable_atomic::AtomicBool::new(agent.emotion_sticker),
+            emotion_provider: agent.emotion_provider.clone(),
+            emotion_model: agent.emotion_model.clone(),
+            sticker_dir: agent.sticker_dir.clone(),
+            emotion_comfyui_server: agent.emotion_comfyui_server.clone(),
+            sticker_style: agent.sticker_style.clone(),
+            sticker_negative_prompt: agent.sticker_negative_prompt.clone(),
+            identity_prompt,
+            emotion_image_backend: agent.emotion_image_backend.clone(),
+            image_generation_default_backend: config.image_generation.default_backend.clone(),
+            default_provider: config.default_provider.clone(),
+            api_key: config.api_key.clone(),
+        }
+    }
+
+    /// Extract character identity from IDENTITY.md and SOUL.md as SD-friendly keywords.
+    fn load_identity_from_workspace(workspace_dir: &Path) -> String {
+        let mut name = String::new();
+        let mut creature = String::new();
+
+        // Read IDENTITY.md — extract Name and Creature
+        let identity_path = workspace_dir.join("IDENTITY.md");
+        if let Ok(content) = std::fs::read_to_string(&identity_path) {
+            for line in content.lines() {
+                let trimmed = line.trim().trim_start_matches("- ");
+                if let Some(val) = trimmed
+                    .strip_prefix("**Name:**")
+                    .or_else(|| trimmed.strip_prefix("**Creature:**"))
+                {
+                    let clean = val.trim().replace("**", "");
+                    if trimmed.contains("Name:") {
+                        name = clean;
+                    } else {
+                        creature = clean;
+                    }
+                }
+            }
+        }
+
+        // Build concise SD-friendly identity
+        let identity = if !name.is_empty() && !creature.is_empty() {
+            format!("{name}, {creature}")
+        } else if !name.is_empty() {
+            name.clone()
+        } else if !creature.is_empty() {
+            creature.clone()
+        } else {
+            String::new()
+        };
+
+        if !identity.is_empty() {
+            tracing::info!("Emotion sticker: loaded identity: {identity}");
+        }
+        identity
+    }
+}
+
+/// System prompt for the lightweight emotion classification call.
+const EMOTION_CLASSIFY_SYSTEM: &str = "Classify the emotion in this assistant reply. Return ONLY one word: happy, sad, excited, thinking, proud, amused, sympathetic, surprised, confused, angry, love, cool, or 'none' if no strong emotion.";
+
+/// Known valid emotion labels.
+const EMOTION_LABELS: &[&str] = &[
+    "happy",
+    "sad",
+    "excited",
+    "thinking",
+    "proud",
+    "amused",
+    "sympathetic",
+    "surprised",
+    "confused",
+    "angry",
+    "love",
+    "cool",
+];
+
+/// Classify the emotional tone of a response and, if a matching sticker exists
+/// (or can be generated via ComfyUI MCP), append an `[IMAGE:path]` marker.
+///
+/// This function is intentionally non-fatal: any failure results in a warning
+/// log and the original response is returned unchanged.
+pub async fn maybe_append_emotion_sticker(
+    response: &str,
+    cfg: &EmotionStickerConfig,
+    workspace_dir: &Path,
+    tools_registry: &[Box<dyn Tool>],
+) -> String {
+    if !cfg.enabled.load(portable_atomic::Ordering::Relaxed) {
+        return response.to_string();
+    }
+
+    append_emotion_sticker(response, cfg, workspace_dir, tools_registry).await
+}
+
+/// Inner implementation that skips the `enabled` check — used by
+/// channel code which performs its own per-chat gating.
+pub async fn append_emotion_sticker(
+    response: &str,
+    cfg: &EmotionStickerConfig,
+    workspace_dir: &Path,
+    tools_registry: &[Box<dyn Tool>],
+) -> String {
+    // Truncate the response for classification to avoid sending huge payloads.
+    let classify_input: String = response.chars().take(500).collect();
+
+    // ── 1. Create a lightweight provider for classification ──────
+    let provider_name = cfg
+        .emotion_provider
+        .as_deref()
+        .or(cfg.default_provider.as_deref())
+        .unwrap_or("openrouter");
+
+    // If emotion_provider is explicitly set AND differs from the default
+    // provider, let the provider resolve its own env-var credential.
+    // Otherwise reuse the global api_key so we don't require a separate
+    // env var when the emotion provider is the same as the main one.
+    let credential = if cfg.emotion_provider.is_some()
+        && cfg.emotion_provider.as_deref() != cfg.default_provider.as_deref()
+    {
+        None
+    } else {
+        cfg.api_key.as_deref()
+    };
+
+    let provider = match providers::create_provider_with_url_and_options(
+        provider_name,
+        credential,
+        None,
+        &providers::ProviderRuntimeOptions::default(),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("Emotion sticker: failed to create provider '{provider_name}': {e}");
+            return response.to_string();
+        }
+    };
+
+    let model = cfg.emotion_model.as_deref().unwrap_or("openai/gpt-4o-mini");
+
+    // ── 2. Classify emotion ─────────────────────────────────────
+    let messages = vec![
+        ChatMessage::system(EMOTION_CLASSIFY_SYSTEM),
+        ChatMessage::user(&classify_input),
+    ];
+
+    let emotion = match tokio::time::timeout(
+        Duration::from_secs(30),
+        provider.chat(
+            ChatRequest {
+                messages: &messages,
+                tools: None,
+            },
+            model,
+            0.0,
+        ),
+    )
     .await
+    {
+        Ok(Ok(chat_resp)) => {
+            let raw = chat_resp.text_or_empty().trim().to_ascii_lowercase();
+            // Extract the first word in case the LLM returns extra text.
+            let first_word = raw.split_whitespace().next().unwrap_or("none");
+            first_word.to_string()
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("Emotion sticker: classification call failed: {e}");
+            return response.to_string();
+        }
+        Err(_) => {
+            tracing::warn!("Emotion sticker: classification call timed out");
+            return response.to_string();
+        }
+    };
+
+    if emotion == "none" || !EMOTION_LABELS.contains(&emotion.as_str()) {
+        tracing::debug!("Emotion sticker: classified as '{emotion}', skipping");
+        return response.to_string();
+    }
+
+    tracing::info!("Emotion sticker: classified as '{emotion}'");
+
+    // ── 3. Check for cached sticker ─────────────────────────────
+    let sticker_dir = workspace_dir.join(&cfg.sticker_dir);
+    let sticker_path = sticker_dir.join(format!("{emotion}.png"));
+
+    if sticker_path.exists() {
+        // Use EMOTION_STICKER marker so the channel layer can send it as a
+        // separate message (pure image, no caption) after the text reply.
+        return format!("{response}\n[EMOTION_STICKER:{}]", sticker_path.display());
+    }
+
+    // ── 4. Build SD prompt directly from config ────────────────
+    let prompt = format!("{emotion} expression, {style}", style = cfg.sticker_style);
+    tracing::info!("Emotion sticker: SD prompt: {prompt}");
+
+    // ── 5. Generate via gen_image tool ──────────────────────────
+    let gen_image_tool: Option<&dyn Tool> = tools_registry
+        .iter()
+        .find(|t| t.name() == "gen_image")
+        .map(|t| t.as_ref());
+
+    if let Some(tool) = gen_image_tool {
+        // Ensure directory exists
+        if let Err(e) = tokio::fs::create_dir_all(&sticker_dir).await {
+            tracing::warn!("Emotion sticker: failed to create sticker dir: {e}");
+            return response.to_string();
+        }
+
+        // Determine the backend: emotion_image_backend > image_generation.default_backend
+        let backend = if cfg.emotion_image_backend.is_empty() {
+            cfg.image_generation_default_backend.clone()
+        } else {
+            cfg.emotion_image_backend.clone()
+        };
+
+        let mut args = serde_json::json!({
+            "prompt": prompt,
+            "output_path": sticker_path.to_string_lossy(),
+            "backend": backend,
+        });
+        if !cfg.sticker_negative_prompt.is_empty() {
+            args["negative_prompt"] =
+                serde_json::Value::String(cfg.sticker_negative_prompt.clone());
+        }
+
+        match tokio::time::timeout(Duration::from_secs(120), tool.execute(args)).await {
+            Ok(Ok(result)) => {
+                if result.success {
+                    // gen_image returns "[IMAGE:/path/to/file.png]" on success.
+                    // Extract the path from the output.
+                    let generated_path = result
+                        .output
+                        .lines()
+                        .find_map(|line| {
+                            let trimmed = line.trim();
+                            if let Some(start) = trimmed.find("[IMAGE:") {
+                                let after = &trimmed[start + 7..];
+                                if let Some(end) = after.find(']') {
+                                    let p = after[..end].trim();
+                                    if Path::new(p).exists() {
+                                        return Some(p.to_string());
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .or_else(|| {
+                            if sticker_path.exists() {
+                                Some(sticker_path.display().to_string())
+                            } else {
+                                None
+                            }
+                        });
+
+                    if let Some(src_path) = generated_path {
+                        // Copy to stickers dir for caching if generated elsewhere
+                        if src_path != sticker_path.display().to_string() {
+                            let _ = tokio::fs::create_dir_all(&sticker_dir).await;
+                            if let Err(e) = tokio::fs::copy(&src_path, &sticker_path).await {
+                                tracing::warn!("Emotion sticker: failed to cache sticker: {e}");
+                            }
+                        }
+                        tracing::info!(
+                            "Emotion sticker: generated '{emotion}' sticker via gen_image ({backend})"
+                        );
+                        let send_path = if sticker_path.exists() {
+                            sticker_path.display().to_string()
+                        } else {
+                            src_path
+                        };
+                        return format!("{response}\n[EMOTION_STICKER:{send_path}]");
+                    }
+                }
+                tracing::warn!("Emotion sticker: gen_image did not produce file for '{emotion}'");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("Emotion sticker: gen_image generation failed: {e}");
+            }
+            Err(_) => {
+                tracing::warn!("Emotion sticker: gen_image generation timed out");
+            }
+        }
+    } else {
+        tracing::debug!("Emotion sticker: gen_image tool not found in tools registry");
+    }
+
+    response.to_string()
 }
 
 #[cfg(test)]
@@ -6622,7 +7185,7 @@ Tail"#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0, None).await;
+        let context = build_context(&mem, "status updates", 0.0, None, None).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));

@@ -268,7 +268,8 @@ temperature = 0.2
   - 数据 URI（例如 ``[IMAGE:data:image/png;base64,...]``）
   - 仅当 `allow_remote_fetch = true` 时支持远程 URL
 - 允许的 MIME 类型：`image/png`、`image/jpeg`、`image/webp`、`image/gif`、`image/bmp`。
-- 当提供商不支持视觉且未设置 `vision_mcp_fallback` 时，请求会失败并返回结构化能力错误（`capability=vision`），而不是静默丢弃图像。
+- 内置的 `read_image` 工具始终注册，为非视觉提供商提供视觉级联。级联依次尝试：(1) 默认提供商（如支持视觉），(2) `[[model_routes]]` 中 `hint = "vision"` 的条目，(3) `vision_mcp_fallback` 指定的 MCP 服务器。当 `read_image` 可用时，图像标记会被替换为提示，LLM 可调用该工具而非直接失败。
+- 当没有配置视觉提供商、视觉模型路由和 `vision_mcp_fallback` 时，包含图像标记的请求会失败并返回结构化能力错误（`capability=vision`）。
 - 当设置了 `vision_mcp_fallback` 时，代理会自动从指定的 MCP 服务器发现视觉工具（匹配名称包含 "vision"、"describe" 或 "image" 的工具），并在发送给 LLM 之前将图像标记替换为文本描述。
 
 ## `[browser]`

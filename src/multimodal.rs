@@ -85,6 +85,61 @@ pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
     (cleaned.trim().to_string(), refs)
 }
 
+/// Strip `[IMAGE:path]` markers whose local file does not exist.
+///
+/// Markers pointing to URLs or data URIs are left untouched — only local
+/// filesystem paths are validated.  When a non-existent path is found the
+/// marker is removed and a warning is logged so the user does not see raw
+/// `[IMAGE:/fake/path.png]` placeholder text.
+pub fn strip_nonexistent_image_markers(content: &str) -> String {
+    if !content.contains(IMAGE_MARKER_PREFIX) {
+        return content.to_string();
+    }
+
+    let mut result = String::with_capacity(content.len());
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = content[cursor..].find(IMAGE_MARKER_PREFIX) {
+        let start = cursor + rel_start;
+        result.push_str(&content[cursor..start]);
+
+        let marker_start = start + IMAGE_MARKER_PREFIX.len();
+        let Some(rel_end) = content[marker_start..].find(']') else {
+            result.push_str(&content[start..]);
+            cursor = content.len();
+            break;
+        };
+
+        let end = marker_start + rel_end;
+        let candidate = content[marker_start..end].trim();
+
+        // Keep: empty markers, URLs, data URIs.
+        if candidate.is_empty()
+            || candidate.starts_with("http://")
+            || candidate.starts_with("https://")
+            || candidate.starts_with("data:")
+        {
+            result.push_str(&content[start..=end]);
+        } else if Path::new(candidate).is_file() {
+            // Local path exists — keep the marker.
+            result.push_str(&content[start..=end]);
+        } else {
+            // Local path does NOT exist — drop the marker.
+            tracing::warn!(
+                "Stripped outbound [IMAGE:] marker for non-existent file: {candidate}"
+            );
+        }
+
+        cursor = end + 1;
+    }
+
+    if cursor < content.len() {
+        result.push_str(&content[cursor..]);
+    }
+
+    result
+}
+
 pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
@@ -191,7 +246,7 @@ fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
     content
 }
 
-async fn normalize_image_reference(
+pub(crate) async fn normalize_image_reference(
     source: &str,
     config: &MultimodalConfig,
     max_bytes: usize,
@@ -591,5 +646,43 @@ mod tests {
             "expected empty string, got: {cleaned:?}"
         );
         assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
+    fn strip_nonexistent_image_markers_removes_fake_path() {
+        let input = "Here is your image [IMAGE:/tmp/definitely_not_real_xyz.png] enjoy!";
+        let result = strip_nonexistent_image_markers(input);
+        assert_eq!(result, "Here is your image  enjoy!");
+        assert!(!result.contains("[IMAGE:"));
+    }
+
+    #[test]
+    fn strip_nonexistent_image_markers_keeps_real_file() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().display().to_string();
+        let input = format!("See this [IMAGE:{path}] cool!");
+        let result = strip_nonexistent_image_markers(&input);
+        assert!(result.contains(&format!("[IMAGE:{path}]")));
+    }
+
+    #[test]
+    fn strip_nonexistent_image_markers_keeps_urls() {
+        let input = "[IMAGE:https://example.com/img.png] text";
+        let result = strip_nonexistent_image_markers(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn strip_nonexistent_image_markers_keeps_data_uris() {
+        let input = "[IMAGE:data:image/png;base64,abc] text";
+        let result = strip_nonexistent_image_markers(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn strip_nonexistent_image_markers_no_markers_passthrough() {
+        let input = "Hello, no images here.";
+        let result = strip_nonexistent_image_markers(input);
+        assert_eq!(result, input);
     }
 }

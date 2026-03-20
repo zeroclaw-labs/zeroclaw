@@ -67,7 +67,8 @@ ZeroClaw supports multimodal input through inline message markers:
 Operational notes:
 
 - Marker parsing applies to user-role messages before provider calls.
-- Provider capability is enforced at runtime: if the selected provider does not support vision, the request fails with a structured capability error (`capability=vision`).
+- A built-in `read_image` tool handles vision fallback: when the active provider lacks vision support, image markers are replaced with a hint and the LLM can call `read_image` to describe images via a cascade of vision-capable providers or MCP servers.
+- If no vision capability is available at all (no vision provider, no vision model route, no MCP fallback), the request fails with a structured capability error (`capability=vision`).
 - Linq webhook `media` parts with `image/*` MIME type are automatically converted to this marker format.
 
 ## Channel Matrix

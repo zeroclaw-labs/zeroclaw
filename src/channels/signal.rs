@@ -151,6 +151,7 @@ impl SignalChannel {
         ignore_stories: bool,
     ) -> Self {
         let http_url = http_url.trim_end_matches('/').to_string();
+        let download_attachments = download_attachments || !ignore_attachments;
         Self {
             http_url,
             account,
@@ -416,18 +417,18 @@ impl SignalChannel {
         path.exists().then_some(path)
     }
 
-    fn attachment_marker_label(content_type: Option<&str>) -> &'static str {
+    fn attachment_marker_kind(content_type: Option<&str>) -> &'static str {
         match content_type {
-            Some(content_type) if content_type.starts_with("image/") => "Image file",
-            Some(content_type) if content_type.starts_with("video/") => "Video file",
-            Some(content_type) if content_type.starts_with("audio/") => "Audio file",
+            Some(content_type) if content_type.starts_with("image/") => "IMAGE",
+            Some(content_type) if content_type.starts_with("video/") => "VIDEO",
+            Some(content_type) if content_type.starts_with("audio/") => "AUDIO",
             Some(content_type)
                 if content_type.starts_with("application/")
                     || content_type.starts_with("text/") =>
             {
-                "Document file"
+                "DOCUMENT"
             }
-            _ => "Attachment file",
+            _ => "DOCUMENT",
         }
     }
 
@@ -533,12 +534,49 @@ impl SignalChannel {
             .rpc_request("getAttachment", params)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Signal getAttachment returned no result"))?;
-        let encoded = result
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("Signal getAttachment result was not a string"))?;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|err| anyhow::anyhow!("invalid base64 attachment payload: {err}"))?;
+
+        // signal-cli returns base64 data as a plain string in older versions.
+        // Newer versions (0.14+) may return a JSON object with a file path
+        // or nested data field instead.
+        let bytes = if let Some(encoded) = result.as_str() {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|err| anyhow::anyhow!("invalid base64 attachment payload: {err}"))?
+        } else if let Some(path_str) = result
+            .get("file")
+            .or_else(|| result.get("path"))
+            .or_else(|| result.get("filename"))
+            .and_then(|v| v.as_str())
+        {
+            // Newer signal-cli returns a file path — read directly.
+            let src = std::path::PathBuf::from(path_str);
+            if src.exists() {
+                tokio::fs::read(&src).await.map_err(|err| {
+                    anyhow::anyhow!(
+                        "Failed to read signal-cli attachment at {}: {err}",
+                        src.display()
+                    )
+                })?
+            } else {
+                anyhow::bail!("Signal getAttachment returned path that does not exist: {path_str}");
+            }
+        } else if let Some(encoded) = result
+            .get("data")
+            .or_else(|| result.get("base64"))
+            .and_then(|v| v.as_str())
+        {
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|err| anyhow::anyhow!("invalid base64 attachment payload: {err}"))?
+        } else {
+            tracing::warn!(
+                "Signal getAttachment returned unexpected format: {}",
+                serde_json::to_string(&result).unwrap_or_default()
+            );
+            anyhow::bail!(
+                "Signal getAttachment result has unexpected format (not a string, no file/data field)"
+            );
+        };
 
         let path = self.attachment_storage_path(attachment, attachment_id);
         if let Some(parent) = path.parent() {
@@ -560,8 +598,8 @@ impl SignalChannel {
             .await
         {
             Ok(Some(path)) => Some(format!(
-                "[{}: {}]",
-                Self::attachment_marker_label(Self::attachment_content_type(attachment)),
+                "[{}:{}]",
+                Self::attachment_marker_kind(Self::attachment_content_type(attachment)),
                 path.display()
             )),
             Ok(None) => None,
@@ -701,6 +739,109 @@ fn truncate_reply_preview(text: &str, max_chars: usize) -> String {
     }
 }
 
+impl SignalChannel {
+    /// Parse inline formatting markers (`*bold*`, `_italic_`, `~strike~`,
+    /// `` `mono` ``) and return the cleaned text plus a list of signal-cli
+    /// `textStyle` range strings (`"start:length:STYLE"`).
+    ///
+    /// Offsets are in UTF-16 code units as required by signal-cli.
+    fn extract_text_styles(input: &str) -> (String, Vec<String>) {
+        // Order matters: process code first (most specific delimiter) so that
+        // formatting chars inside backticks are not consumed by later passes.
+        let patterns: &[(&str, &str, &str)] = &[
+            ("`", "`", "MONOSPACE"),
+            ("*", "*", "BOLD"),
+            ("_", "_", "ITALIC"),
+            ("~", "~", "STRIKETHROUGH"),
+        ];
+
+        let mut output = input.to_string();
+        let mut styles: Vec<String> = Vec::new();
+
+        for &(open, close, style) in patterns {
+            let mut result = String::with_capacity(output.len());
+            let mut remaining = output.as_str();
+
+            loop {
+                let Some(start_idx) = remaining.find(open) else {
+                    result.push_str(remaining);
+                    break;
+                };
+
+                // Look for matching close delimiter after the opener.
+                let after_open = start_idx + open.len();
+                let search_region = &remaining[after_open..];
+
+                let Some(end_offset) = search_region.find(close) else {
+                    result.push_str(remaining);
+                    break;
+                };
+
+                // Don't match empty content (e.g. ** or __)
+                if end_offset == 0 {
+                    result.push_str(&remaining[..after_open]);
+                    remaining = &remaining[after_open..];
+                    continue;
+                }
+
+                let inner = &remaining[after_open..after_open + end_offset];
+
+                // Push text before the open delimiter.
+                result.push_str(&remaining[..start_idx]);
+
+                // Record the style range (UTF-16 offset of where inner starts in result).
+                let utf16_start: usize = result.encode_utf16().count();
+                let utf16_len: usize = inner.encode_utf16().count();
+                styles.push(format!("{utf16_start}:{utf16_len}:{style}"));
+
+                // Append the inner text without delimiters.
+                result.push_str(inner);
+
+                // Advance past the close delimiter.
+                remaining = &remaining[after_open + end_offset + close.len()..];
+            }
+
+            output = result;
+        }
+
+        (output, styles)
+    }
+
+    /// Parse `@+phonenumber` patterns into signal-cli mention ranges.
+    ///
+    /// Each `@+12345678` is replaced with a Unicode replacement char (U+FFFC)
+    /// placeholder in the text, and a `"start:length:recipientNumber"` entry
+    /// is emitted. Signal renders the placeholder as the contact's display
+    /// name.
+    fn extract_outbound_mentions(input: &str) -> (String, Vec<String>) {
+        let mention_re = regex::Regex::new(r"@(\+\d{7,15})").unwrap();
+        let mut result = String::with_capacity(input.len());
+        let mut mentions: Vec<String> = Vec::new();
+        let mut last_end = 0;
+
+        for caps in mention_re.captures_iter(input) {
+            let full_match = caps.get(0).unwrap();
+            let phone = &caps[1];
+
+            // Append text before this match.
+            result.push_str(&input[last_end..full_match.start()]);
+
+            // Record the mention range. The placeholder is a single UTF-16
+            // code unit (U+FFFC), so length is always 1.
+            let utf16_start = result.encode_utf16().count();
+            mentions.push(format!("{utf16_start}:1:{phone}"));
+
+            // Insert the placeholder char that Signal expects for mentions.
+            result.push('\u{FFFC}');
+
+            last_end = full_match.end();
+        }
+
+        result.push_str(&input[last_end..]);
+        (result, mentions)
+    }
+}
+
 #[async_trait]
 impl Channel for SignalChannel {
     fn name(&self) -> &str {
@@ -716,18 +857,86 @@ impl Channel for SignalChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let params = match Self::parse_recipient_target(&message.recipient) {
+        // Extract [IMAGE:path] markers — send as attachments via signal-cli.
+        let image_re = regex::Regex::new(r"\[IMAGE:([^\]]+)\]").unwrap();
+        let mut attachments: Vec<String> = Vec::new();
+        let mut text = message.content.clone();
+
+        for caps in image_re.captures_iter(&message.content) {
+            let path_str = caps[1].trim();
+            let path = std::path::Path::new(path_str);
+            if path.exists() {
+                // Read file and encode as base64 data URI so signal-cli on a
+                // remote host can receive the image without needing filesystem
+                // access to the local path.
+                match std::fs::read(path) {
+                    Ok(bytes) => {
+                        let mime = if path_str.ends_with(".png") {
+                            "image/png"
+                        } else if path_str.ends_with(".jpg") || path_str.ends_with(".jpeg") {
+                            "image/jpeg"
+                        } else if path_str.ends_with(".gif") {
+                            "image/gif"
+                        } else if path_str.ends_with(".webp") {
+                            "image/webp"
+                        } else {
+                            "application/octet-stream"
+                        };
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        let data_uri = format!(
+                            "data:{mime};filename={};base64,{b64}",
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        );
+                        tracing::info!(
+                            "Signal: sending image as base64 data URI ({} bytes, {mime}) from {}",
+                            bytes.len(),
+                            path.display()
+                        );
+                        attachments.push(data_uri);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Signal: failed to read image file for outbound: {path_str}: {e}"
+                        );
+                    }
+                }
+            } else {
+                tracing::warn!("Signal: image file not found for outbound: {path_str}");
+            }
+        }
+
+        if !attachments.is_empty() {
+            text = image_re.replace_all(&text, "").trim().to_string();
+        }
+
+        // Parse inline formatting markers into signal-cli textStyle ranges.
+        let (text, text_styles) = Self::extract_text_styles(&text);
+
+        // Parse @+phonenumber mentions into signal-cli mention ranges.
+        let (text, mentions) = Self::extract_outbound_mentions(&text);
+
+        let mut params = match Self::parse_recipient_target(&message.recipient) {
             RecipientTarget::Direct(number) => serde_json::json!({
                 "recipient": [number],
-                "message": &message.content,
+                "message": &text,
                 "account": &self.account,
             }),
             RecipientTarget::Group(group_id) => serde_json::json!({
                 "groupId": group_id,
-                "message": &message.content,
+                "message": &text,
                 "account": &self.account,
             }),
         };
+
+        if !attachments.is_empty() {
+            params["attachments"] = serde_json::json!(attachments);
+        }
+        if !text_styles.is_empty() {
+            params["textStyle"] = serde_json::json!(text_styles);
+        }
+        if !mentions.is_empty() {
+            params["mention"] = serde_json::json!(mentions);
+        }
 
         self.rpc_request("send", params).await?;
         Ok(())
@@ -880,6 +1089,7 @@ impl Channel for SignalChannel {
                 "account": &self.account,
             }),
         };
+        tracing::info!(recipient = %recipient, "Signal: sending typing indicator");
         self.rpc_request("sendTyping", params).await?;
         Ok(())
     }
@@ -949,7 +1159,7 @@ mod tests {
         assert_eq!(ch.allowed_from.len(), 1);
         assert!(!ch.mention_only);
         assert!(!ch.ignore_attachments);
-        assert!(!ch.download_attachments);
+        assert!(ch.download_attachments);
         assert!(!ch.ignore_stories);
     }
 
@@ -1732,7 +1942,7 @@ mod tests {
             .process_envelope_with_attachments(&env)
             .await
             .expect("attachment-only dm should be exposed");
-        let path = extract_attachment_path(&msg.content, "[Image file: ");
+        let path = extract_attachment_path(&msg.content, "[IMAGE:");
 
         assert!(Path::new(path).exists());
         assert_eq!(tokio::fs::read(path).await.unwrap(), b"image-bytes");
@@ -1797,13 +2007,29 @@ mod tests {
             .lines()
             .last()
             .expect("attachment marker should be appended");
-        let path = extract_attachment_path(marker, "[Document file: ");
+        let path = extract_attachment_path(marker, "[DOCUMENT:");
 
         assert_eq!(msg.content.lines().next(), Some("report"));
         assert!(Path::new(path).exists());
         assert_eq!(tokio::fs::read(path).await.unwrap(), b"report-bytes");
 
         tokio::fs::remove_file(path).await.unwrap();
+    }
+
+    #[test]
+    fn signal_enables_attachment_downloads_when_attachments_are_not_ignored() {
+        let ch = SignalChannel::new(
+            "http://127.0.0.1:8686".to_string(),
+            "+1234567890".to_string(),
+            None,
+            vec!["*".to_string()],
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(ch.download_attachments);
     }
 
     #[test]

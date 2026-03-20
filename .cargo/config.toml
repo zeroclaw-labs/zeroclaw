@@ -1,4 +1,5 @@
 [target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
 rustflags = ["-C", "link-arg=-static"]
 
 [target.aarch64-unknown-linux-musl]

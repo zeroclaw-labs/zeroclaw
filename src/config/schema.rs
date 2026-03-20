@@ -366,6 +366,10 @@ pub struct Config {
     #[serde(default)]
     pub linkedin: LinkedInConfig,
 
+    /// Unified image generation configuration (`[image_generation]`).
+    #[serde(default)]
+    pub image_generation: ImageGenerationConfig,
+
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     pub plugins: PluginsConfig,
@@ -1185,6 +1189,45 @@ pub struct AgentConfig {
     /// Default: `[]` (no filtering — all tools included).
     #[serde(default)]
     pub tool_filter_groups: Vec<ToolFilterGroup>,
+
+    /// Enable emotion sticker reactions. When enabled, the agent evaluates each
+    /// response for emotional content and may append a sticker image. Stickers
+    /// are lazily generated via ComfyUI MCP and cached for reuse.
+    /// Toggle at runtime with `/emotion on|off`. Default: `false`.
+    #[serde(default)]
+    pub emotion_sticker: bool,
+
+    /// Provider name used for the lightweight emotion classification call.
+    /// Should be a fast, cheap model. Default: `""` (uses the main provider).
+    #[serde(default)]
+    pub emotion_model: Option<String>,
+
+    /// Provider name for the emotion classification. Default: uses default_provider.
+    #[serde(default)]
+    pub emotion_provider: Option<String>,
+
+    /// Directory for cached emotion sticker images. Default: `"stickers"` (relative to workspace).
+    #[serde(default = "default_sticker_dir")]
+    pub sticker_dir: String,
+
+    /// ComfyUI MCP server name used for generating sticker images.
+    /// Default: `"comfyui"`.
+    #[serde(default = "default_comfyui_server")]
+    pub emotion_comfyui_server: String,
+
+    /// Base style prompt appended to all sticker generation requests.
+    /// Default: `"chibi character, white background, simple, expressive, sticker style"`.
+    #[serde(default = "default_sticker_style")]
+    pub sticker_style: String,
+
+    /// Negative prompt for sticker generation (Stable Diffusion).
+    #[serde(default)]
+    pub sticker_negative_prompt: String,
+
+    /// Backend override for emotion sticker generation. Values: `"comfyui"`, `"dalle"`, `"stability"`.
+    /// Default: `""` (uses `image_generation.default_backend`).
+    #[serde(default)]
+    pub emotion_image_backend: String,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1203,6 +1246,18 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_sticker_dir() -> String {
+    "stickers".into()
+}
+
+fn default_comfyui_server() -> String {
+    "comfyui".into()
+}
+
+fn default_sticker_style() -> String {
+    "chibi character, white background, simple, expressive, sticker style".into()
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -1214,6 +1269,14 @@ impl Default for AgentConfig {
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
+            emotion_sticker: false,
+            emotion_model: None,
+            emotion_provider: None,
+            sticker_dir: default_sticker_dir(),
+            emotion_comfyui_server: default_comfyui_server(),
+            sticker_style: default_sticker_style(),
+            sticker_negative_prompt: String::new(),
+            emotion_image_backend: String::new(),
         }
     }
 }
@@ -2780,6 +2843,174 @@ impl Default for ImageProviderFluxConfig {
         Self {
             api_key_env: default_flux_api_key_env(),
             model: default_flux_model(),
+        }
+    }
+}
+
+// ── Image Generation ────────────────────────────────────────────
+
+/// Unified image generation configuration (`[image_generation]`).
+///
+/// Routes `gen_image` tool calls to different backends: ComfyUI MCP,
+/// DALL-E, or Stability AI. The emotion sticker system also uses this
+/// when `emotion_image_backend` is set.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ImageGenerationConfig {
+    /// Default backend for image generation. Values: `"comfyui"`, `"dalle"`, `"stability"`.
+    /// Default: `"comfyui"`.
+    #[serde(default = "default_image_gen_backend")]
+    pub default_backend: String,
+
+    /// ComfyUI backend settings.
+    #[serde(default)]
+    pub comfyui: ComfyUiBackendConfig,
+
+    /// DALL-E backend settings.
+    #[serde(default)]
+    pub dalle: DalleBackendConfig,
+
+    /// Stability AI backend settings.
+    #[serde(default)]
+    pub stability: StabilityBackendConfig,
+}
+
+fn default_image_gen_backend() -> String {
+    "comfyui".into()
+}
+
+impl Default for ImageGenerationConfig {
+    fn default() -> Self {
+        Self {
+            default_backend: default_image_gen_backend(),
+            comfyui: ComfyUiBackendConfig::default(),
+            dalle: DalleBackendConfig::default(),
+            stability: StabilityBackendConfig::default(),
+        }
+    }
+}
+
+/// ComfyUI backend configuration for `gen_image`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ComfyUiBackendConfig {
+    /// ComfyUI server hostname. Default: `"127.0.0.1"`.
+    #[serde(default = "default_comfyui_host")]
+    pub host: String,
+
+    /// ComfyUI server port. Default: `8189`.
+    #[serde(default = "default_comfyui_port")]
+    pub port: u16,
+
+    /// SD checkpoint model name. Default: `""` (uses ComfyUI's default).
+    #[serde(default)]
+    pub checkpoint: String,
+
+    /// Path to custom workflow JSON file. Empty = use built-in SDXL workflow.
+    #[serde(default)]
+    pub workflow_path: String,
+
+    /// Sampling steps. Default: `25`.
+    #[serde(default = "default_comfyui_steps")]
+    pub steps: u32,
+
+    /// CFG scale. Default: `7.0`.
+    #[serde(default = "default_comfyui_cfg")]
+    pub cfg: f32,
+
+    /// Image width. Default: `1024`.
+    #[serde(default = "default_comfyui_width")]
+    pub width: u32,
+
+    /// Image height. Default: `1024`.
+    #[serde(default = "default_comfyui_height")]
+    pub height: u32,
+}
+
+fn default_comfyui_host() -> String {
+    "127.0.0.1".into()
+}
+
+fn default_comfyui_port() -> u16 {
+    8189
+}
+
+fn default_comfyui_steps() -> u32 {
+    25
+}
+
+fn default_comfyui_cfg() -> f32 {
+    7.0
+}
+
+fn default_comfyui_width() -> u32 {
+    1024
+}
+
+fn default_comfyui_height() -> u32 {
+    1024
+}
+
+impl Default for ComfyUiBackendConfig {
+    fn default() -> Self {
+        Self {
+            host: default_comfyui_host(),
+            port: default_comfyui_port(),
+            checkpoint: String::new(),
+            workflow_path: String::new(),
+            steps: default_comfyui_steps(),
+            cfg: default_comfyui_cfg(),
+            width: default_comfyui_width(),
+            height: default_comfyui_height(),
+        }
+    }
+}
+
+/// DALL-E backend configuration for `gen_image`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DalleBackendConfig {
+    /// Environment variable name holding the OpenAI API key.
+    /// Default: `"OPENAI_API_KEY"`.
+    #[serde(default = "default_dalle_backend_api_key_env")]
+    pub api_key_env: String,
+
+    /// DALL-E model identifier. Default: `"dall-e-3"`.
+    #[serde(default = "default_dalle_backend_model")]
+    pub model: String,
+}
+
+fn default_dalle_backend_api_key_env() -> String {
+    "OPENAI_API_KEY".into()
+}
+
+fn default_dalle_backend_model() -> String {
+    "dall-e-3".into()
+}
+
+impl Default for DalleBackendConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_dalle_backend_api_key_env(),
+            model: default_dalle_backend_model(),
+        }
+    }
+}
+
+/// Stability AI backend configuration for `gen_image`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StabilityBackendConfig {
+    /// Environment variable name holding the Stability AI API key.
+    /// Default: `"STABILITY_API_KEY"`.
+    #[serde(default = "default_stability_backend_api_key_env")]
+    pub api_key_env: String,
+}
+
+fn default_stability_backend_api_key_env() -> String {
+    "STABILITY_API_KEY".into()
+}
+
+impl Default for StabilityBackendConfig {
+    fn default() -> Self {
+        Self {
+            api_key_env: default_stability_backend_api_key_env(),
         }
     }
 }
@@ -6368,6 +6599,7 @@ impl Default for Config {
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            image_generation: ImageGenerationConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
         }
@@ -9134,6 +9366,7 @@ default_temperature = 0.7
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            image_generation: ImageGenerationConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
         };
@@ -9472,6 +9705,7 @@ tool_dispatcher = "xml"
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            image_generation: ImageGenerationConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
         };

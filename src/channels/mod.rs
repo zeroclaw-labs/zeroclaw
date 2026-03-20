@@ -91,6 +91,8 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::approval::ApprovalManager;
+use crate::channels::session_backend::SessionBackend;
+use crate::channels::session_sqlite::SqliteSessionBackend;
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -244,6 +246,10 @@ enum ChannelRuntimeCommand {
     ShowModel,
     SetModel(String),
     NewSession,
+    SetEmotion(bool),
+    EmotionList,
+    EmotionShow(String),
+    EmotionRemove(String),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -345,7 +351,7 @@ struct ChannelRuntimeContext {
     query_classification: crate::config::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
-    session_store: Option<Arc<session_store::SessionStore>>,
+    session_store: Option<Arc<dyn SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[autonomy]` config; auto-denies tools that would need interactive
@@ -354,6 +360,12 @@ struct ChannelRuntimeContext {
     activated_tools: Option<std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     /// Global default context window budget from `[agent] max_context_tokens`.
     max_context_tokens: usize,
+    /// Emotion sticker configuration from `[agent]`.
+    emotion_sticker_config: Arc<crate::agent::loop_::EmotionStickerConfig>,
+    /// Per-chat emotion sticker overrides (sender_key → enabled).
+    /// `Some(true)` = explicitly on, `Some(false)` = explicitly off.
+    /// Missing key = use global default from `emotion_sticker_config.enabled`.
+    emotion_overrides: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 #[derive(Clone)]
@@ -593,6 +605,21 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - When you see [Replying to ...], the user is replying to a previous message. \
                The number after 'Replying to' is an internal ID, not a phone number.",
         ),
+        "signal" => Some(
+            "When responding on Signal:\n\
+             - Use Signal formatting (NOT Markdown):\n\
+               *bold* for bold, _italic_ for italic, ~strikethrough~ for strikethrough,\n\
+               `code` for inline code, ```code block``` for code blocks.\n\
+             - Do NOT use Markdown syntax: no **double asterisks**, no ## headings, no [links](url).\n\
+             - Keep replies concise and direct.\n\
+             - For longer answers, use *bold text* as section headers, numbered lists, and line breaks.\n\
+             - SENDING IMAGES: To send an image file to the user, include [IMAGE:/full/path/to/file.ext] \
+               in your text response. The system will automatically upload and send it as a Signal attachment. \
+               Any text outside the [IMAGE:...] marker becomes the message caption.\n\
+             - MENTIONING USERS: To mention/tag a user, write @+<phone> (e.g. @+85251159218). \
+               The system will convert it to a native Signal mention that highlights and notifies the user. \
+               Only use phone numbers from the [From: +<phone>] sender field or known contacts.",
+        ),
         _ => None,
     }
 }
@@ -700,7 +727,7 @@ fn strip_tool_result_content(text: &str) -> String {
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(
         channel_name,
-        "telegram" | "discord" | "matrix" | "whatsapp" | "whatsapp_web"
+        "telegram" | "discord" | "matrix" | "signal" | "whatsapp" | "whatsapp_web"
     )
 }
 
@@ -746,6 +773,30 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/emotion" => {
+            let arg = parts.next().unwrap_or("").to_ascii_lowercase();
+            match arg.as_str() {
+                "list" => Some(ChannelRuntimeCommand::EmotionList),
+                "show" => {
+                    let emotion = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+                    if emotion.is_empty() {
+                        Some(ChannelRuntimeCommand::EmotionList)
+                    } else {
+                        Some(ChannelRuntimeCommand::EmotionShow(emotion))
+                    }
+                }
+                "remove" => {
+                    let emotion = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+                    if emotion.is_empty() {
+                        Some(ChannelRuntimeCommand::EmotionList)
+                    } else {
+                        Some(ChannelRuntimeCommand::EmotionRemove(emotion))
+                    }
+                }
+                "off" | "false" | "0" => Some(ChannelRuntimeCommand::SetEmotion(false)),
+                _ => Some(ChannelRuntimeCommand::SetEmotion(true)),
+            }
+        }
         _ => None,
     }
 }
@@ -985,6 +1036,31 @@ fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> Channel
         .unwrap_or_else(|| default_route_selection(ctx))
 }
 
+fn route_selection_from_model_route(
+    route: &crate::config::ModelRouteConfig,
+    default_max_context_tokens: usize,
+) -> ChannelRouteSelection {
+    ChannelRouteSelection {
+        provider: route.provider.clone(),
+        model: route.model.clone(),
+        max_context_tokens: route
+            .max_context_tokens
+            .unwrap_or(default_max_context_tokens),
+        api_key: route.api_key.clone(),
+    }
+}
+
+fn find_model_route_by_hint(
+    model_routes: &[crate::config::ModelRouteConfig],
+    hint: &str,
+    default_max_context_tokens: usize,
+) -> Option<ChannelRouteSelection> {
+    model_routes
+        .iter()
+        .find(|route| route.hint.eq_ignore_ascii_case(hint))
+        .map(|route| route_selection_from_model_route(route, default_max_context_tokens))
+}
+
 fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
     let default_route = default_route_selection(ctx);
     let mut routes = ctx
@@ -1135,7 +1211,7 @@ fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
-    // Persist to JSONL before adding to in-memory history.
+    // Persist before adding to in-memory history.
     if let Some(ref store) = ctx.session_store {
         if let Err(e) = store.append(sender_key, &turn) {
             tracing::warn!("Failed to persist session turn: {e}");
@@ -1151,6 +1227,32 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     while turns.len() > MAX_CHANNEL_HISTORY {
         turns.remove(0);
     }
+}
+
+fn ensure_sender_history_loaded(ctx: &ChannelRuntimeContext, sender_key: &str) {
+    let already_loaded = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(sender_key);
+    if already_loaded {
+        return;
+    }
+
+    let Some(ref store) = ctx.session_store else {
+        return;
+    };
+
+    let turns = store.load(sender_key);
+    if turns.is_empty() {
+        return;
+    }
+
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    histories.entry(sender_key.to_string()).or_insert(turns);
 }
 
 fn rollback_orphan_user_turn(
@@ -1178,7 +1280,7 @@ fn rollback_orphan_user_turn(
         histories.remove(sender_key);
     }
 
-    // Also remove the orphan turn from the persisted JSONL session store so
+    // Also remove the orphan turn from the persisted session store so
     // it doesn't resurface after a daemon restart (fixes #3674).
     if let Some(ref store) = ctx.session_store {
         if let Err(e) = store.remove_last(sender_key) {
@@ -1509,6 +1611,91 @@ async fn handle_runtime_command_if_needed(
             mark_sender_for_new_session(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
+        ChannelRuntimeCommand::SetEmotion(enabled) => {
+            ctx.emotion_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(sender_key.clone(), enabled);
+            if enabled {
+                "Emotion stickers enabled for this chat. Responses may include sticker reactions."
+                    .to_string()
+            } else {
+                "Emotion stickers disabled for this chat.".to_string()
+            }
+        }
+        ChannelRuntimeCommand::EmotionList => {
+            let sticker_dir = ctx
+                .workspace_dir
+                .join(&ctx.emotion_sticker_config.sticker_dir);
+            match std::fs::read_dir(&sticker_dir) {
+                Ok(entries) => {
+                    let names: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| {
+                            let path = e.path();
+                            if path.extension().and_then(|ext| ext.to_str()) == Some("png") {
+                                path.file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if names.is_empty() {
+                        "No cached stickers.".to_string()
+                    } else {
+                        format!("Cached stickers: {}", names.join(", "))
+                    }
+                }
+                Err(_) => "No cached stickers.".to_string(),
+            }
+        }
+        ChannelRuntimeCommand::EmotionShow(emotion) => {
+            let sticker_path = ctx
+                .workspace_dir
+                .join(&ctx.emotion_sticker_config.sticker_dir)
+                .join(format!("{emotion}.png"));
+            if sticker_path.exists() {
+                format!("[IMAGE:{}]", sticker_path.display())
+            } else {
+                format!("No cached sticker for '{emotion}'.")
+            }
+        }
+        ChannelRuntimeCommand::EmotionRemove(emotion) => {
+            let sticker_dir = ctx
+                .workspace_dir
+                .join(&ctx.emotion_sticker_config.sticker_dir);
+            if emotion == "all" {
+                match std::fs::read_dir(&sticker_dir) {
+                    Ok(entries) => {
+                        let mut count = 0usize;
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            let path = entry.path();
+                            if path.extension().and_then(|ext| ext.to_str()) == Some("png")
+                                && std::fs::remove_file(&path).is_ok()
+                            {
+                                count += 1;
+                            }
+                        }
+                        format!("Removed {count} cached sticker(s).")
+                    }
+                    Err(_) => "No cached stickers to remove.".to_string(),
+                }
+            } else {
+                let sticker_path = sticker_dir.join(format!("{emotion}.png"));
+                if sticker_path.exists() {
+                    match std::fs::remove_file(&sticker_path) {
+                        Ok(()) => format!("Removed cached sticker '{emotion}'."),
+                        Err(err) => {
+                            format!("Failed to remove sticker '{emotion}': {err}")
+                        }
+                    }
+                } else {
+                    format!("No cached sticker for '{emotion}'.")
+                }
+            }
+        }
     };
 
     if let Err(err) = channel
@@ -1677,6 +1864,7 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
 /// then falls back to any whitespace boundary.  Returns a **byte** offset
 /// suitable for `String::drain`.  Returns `None` only if no boundary exists.
 fn find_segment_boundary(text: &str, min_chars: usize) -> Option<usize> {
+    // Translate min_chars into a byte offset on a char boundary.
     let byte_start = text
         .char_indices()
         .nth(min_chars)
@@ -1694,6 +1882,7 @@ fn find_segment_boundary(text: &str, min_chars: usize) -> Option<usize> {
         .or_else(|| search.find("? "))
         .or_else(|| search.find('\n'));
     if let Some(offset) = sentence_end {
+        // Include the punctuation and the space/newline in this segment.
         let boundary = byte_start
             + offset
             + if search.as_bytes().get(offset) == Some(&b'\n') {
@@ -1706,6 +1895,7 @@ fn find_segment_boundary(text: &str, min_chars: usize) -> Option<usize> {
 
     // Fall back to any whitespace
     if let Some(offset) = search.find(char::is_whitespace) {
+        // Include the whitespace character (may be multi-byte)
         let ws_char = search[offset..].chars().next().unwrap();
         return Some(byte_start + offset + ws_char.len_utf8());
     }
@@ -2120,6 +2310,7 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
+    ensure_sender_history_loaded(ctx.as_ref(), &history_key);
     let mut route = get_route_selection(ctx.as_ref(), &history_key);
 
     // ── Query classification: override route when a rule matches ──
@@ -2138,19 +2329,12 @@ async fn process_channel_message(
                 channel = %msg.channel,
                 "Channel message classified — overriding route"
             );
-            route = ChannelRouteSelection {
-                provider: matched_route.provider.clone(),
-                model: matched_route.model.clone(),
-                max_context_tokens: matched_route
-                    .max_context_tokens
-                    .unwrap_or(ctx.max_context_tokens),
-                api_key: matched_route.api_key.clone(),
-            };
+            route = route_selection_from_model_route(matched_route, ctx.max_context_tokens);
         }
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let active_provider = match get_or_create_provider(
+    let mut active_provider = match get_or_create_provider(
         ctx.as_ref(),
         &route.provider,
         route.api_key.as_deref(),
@@ -2175,20 +2359,87 @@ async fn process_channel_message(
             return;
         }
     };
+
+    if msg.content.contains("[IMAGE:") && !active_provider.supports_vision() {
+        if let Some(vision_route) =
+            find_model_route_by_hint(&ctx.model_routes, "vision", ctx.max_context_tokens)
+        {
+            if vision_route.provider != route.provider || vision_route.model != route.model {
+                match get_or_create_provider(
+                    ctx.as_ref(),
+                    &vision_route.provider,
+                    vision_route.api_key.as_deref(),
+                )
+                .await
+                {
+                    Ok(provider) if provider.supports_vision() => {
+                        tracing::info!(
+                            channel = %msg.channel,
+                            sender = %msg.sender,
+                            provider = %vision_route.provider,
+                            model = %vision_route.model,
+                            "Image marker detected — rerouting channel message to vision route"
+                        );
+                        route = vision_route;
+                        active_provider = provider;
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            provider = %vision_route.provider,
+                            model = %vision_route.model,
+                            "Configured vision route does not report vision support; keeping current route"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            provider = %vision_route.provider,
+                            model = %vision_route.model,
+                            "Failed to initialize configured vision route: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     if ctx.auto_save_memory
         && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !memory::should_skip_autosave_content(&msg.content)
     {
+        // Background store — non-blocking so it doesn't delay the response.
+        let mem = ctx.memory.clone();
         let autosave_key = conversation_memory_key(&msg);
-        let _ = ctx
-            .memory
-            .store(
-                &autosave_key,
-                &msg.content,
-                crate::memory::MemoryCategory::Conversation,
-                Some(&history_key),
-            )
-            .await;
+        let content = msg.content.clone();
+        let sender = msg.sender.clone();
+        let is_group_for_save =
+            msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
+        let group_key = if is_group_for_save {
+            Some(history_key.clone())
+        } else {
+            None
+        };
+        tokio::spawn(async move {
+            // Dual-scope save: store under sender scope (personal facts)
+            let _ = mem
+                .store(
+                    &autosave_key,
+                    &content,
+                    crate::memory::MemoryCategory::Conversation,
+                    Some(&sender),
+                )
+                .await;
+            // For group chats, also store under group scope (shared context)
+            if let Some(ref gk) = group_key {
+                let _ = mem
+                    .store(
+                        &autosave_key,
+                        &content,
+                        crate::memory::MemoryCategory::Conversation,
+                        Some(gk),
+                    )
+                    .await;
+            }
+        });
     }
 
     // observe_group: store in session for context but do not invoke the LLM.
@@ -2284,30 +2535,54 @@ async fn process_channel_message(
         );
     }
 
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
-    if !had_prior_history {
-        let memory_context = build_memory_context(
+    // ── Dual-scope memory recall ──────────────────────────────────
+    // Always recall before each LLM call (not just first turn).
+    // For group chats: merge sender-scope + group-scope memories.
+    // For DMs: sender-scope only.
+    let is_group_chat =
+        msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
+
+    let sender_memory = build_memory_context(
+        ctx.memory.as_ref(),
+        &msg.content,
+        ctx.min_relevance_score,
+        Some(&msg.sender),
+    )
+    .await;
+
+    let group_memory = if is_group_chat {
+        build_memory_context(
             ctx.memory.as_ref(),
             &msg.content,
             ctx.min_relevance_score,
             Some(&history_key),
         )
-        .await;
-        if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
-            }
-        }
-    }
+        .await
+    } else {
+        String::new()
+    };
 
+    // Merge sender + group memories, avoiding duplicates
+    let memory_context = if group_memory.is_empty() {
+        sender_memory
+    } else if sender_memory.is_empty() {
+        group_memory
+    } else {
+        format!("{sender_memory}\n{group_memory}")
+    };
+
+    // Inject memory into system prompt (not user message) so it
+    // doesn't pollute session history and is re-fetched each turn.
     let base_system_prompt = if had_prior_history {
         ctx.system_prompt.as_str().to_string()
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let system_prompt =
+    let mut system_prompt =
         build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
+    if !memory_context.is_empty() {
+        let _ = write!(system_prompt, "\n\n{memory_context}");
+    }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_draft_streaming = target_channel
@@ -2390,7 +2665,7 @@ async fn process_channel_message(
     };
 
     // Segment updater: for channels that send sequential new messages
-    // (WhatsApp, Signal).  Accumulates streamed tokens and sends a new
+    // (WhatsApp, Signal) — accumulates streamed tokens and sends a new
     // message once the buffer exceeds the configured segment size.
     let segment_updater = if use_segment_streaming {
         if let (Some(rx), Some(channel_ref)) = (delta_rx.take(), target_channel.as_ref()) {
@@ -2402,9 +2677,12 @@ async fn process_channel_message(
                 let mut rx = rx;
                 let mut buffer = String::new();
                 // CLEAR sentinel toggles acceptance on/off:
-                //   before any CLEAR → skip (progress lines)
-                //   after odd CLEAR  → accept (real content)
-                //   after even CLEAR → skip (tool calls found, reset)
+                //   - Before any CLEAR: skip (progress lines)
+                //   - After 1st CLEAR: accept (real streaming content)
+                //   - After 2nd CLEAR: skip (tool calls found, reset)
+                //   - After 3rd CLEAR: accept again (next iteration's
+                //     final answer)
+                // i.e. each CLEAR flips the gate and clears the buffer.
                 let mut accepting = false;
                 while let Some(delta) = rx.recv().await {
                     if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
@@ -2416,6 +2694,7 @@ async fn process_channel_message(
                         continue;
                     }
                     buffer.push_str(&delta);
+                    // Send when buffer exceeds threshold (char count) at a sentence boundary
                     while buffer.chars().count() >= chunk_size {
                         if let Some(split) = find_segment_boundary(&buffer, chunk_size) {
                             let segment: String = buffer.drain(..split).collect();
@@ -2429,10 +2708,11 @@ async fn process_channel_message(
                                     .await;
                             }
                         } else {
-                            break;
+                            break; // no good boundary, wait for more text
                         }
                     }
                 }
+                // Send remaining buffer
                 let remaining = buffer.trim().to_string();
                 if !remaining.is_empty() {
                     let _ = channel
@@ -2464,12 +2744,22 @@ async fn process_channel_message(
 
     let typing_cancellation = target_channel.as_ref().map(|_| CancellationToken::new());
     let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
-        (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
-            Arc::clone(channel),
-            msg.reply_target.clone(),
-            token.clone(),
-        )),
-        _ => None,
+        (Some(channel), Some(token)) => {
+            tracing::info!(
+                channel = %msg.channel,
+                recipient = %msg.reply_target,
+                "Spawning typing indicator task"
+            );
+            Some(spawn_scoped_typing_task(
+                Arc::clone(channel),
+                msg.reply_target.clone(),
+                token.clone(),
+            ))
+        }
+        _ => {
+            tracing::info!(channel = %msg.channel, "No target channel for typing indicator");
+            None
+        }
     };
 
     // Wrap observer to forward tool events as live thread messages
@@ -2667,13 +2957,45 @@ async fn process_channel_message(
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
-            let delivered_response = if sanitized_response.is_empty()
+            let mut delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
             } else {
                 sanitized_response
             };
+
+            // ── Emotion sticker post-processing ────────────────────────
+            if !delivered_response.is_empty() {
+                let chat_key = conversation_history_key(&msg);
+                let emotion_enabled = ctx
+                    .emotion_overrides
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&chat_key)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        ctx.emotion_sticker_config
+                            .enabled
+                            .load(portable_atomic::Ordering::Relaxed)
+                    });
+                if emotion_enabled {
+                    delivered_response = crate::agent::loop_::append_emotion_sticker(
+                        &delivered_response,
+                        &ctx.emotion_sticker_config,
+                        &ctx.workspace_dir,
+                        ctx.tools_registry.as_ref(),
+                    )
+                    .await;
+                }
+            }
+
+            // Strip [IMAGE:path] markers that point to non-existent local files.
+            // This prevents hallucinated or stale paths from leaking into the
+            // channel as raw `[IMAGE:/fake/path.png]` text.
+            delivered_response =
+                crate::multimodal::strip_nonexistent_image_markers(&delivered_response);
+
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -2735,34 +3057,65 @@ async fn process_channel_message(
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
+                // Split emotion sticker into a separate message so the sticker
+                // arrives as a standalone image after the text reply.
+                let emotion_re = regex::Regex::new(r"\[EMOTION_STICKER:([^\]]+)\]").unwrap();
+                let emotion_sticker_path: Option<String> = emotion_re
+                    .captures(&delivered_response)
+                    .map(|caps| caps[1].trim().to_string());
+                let text_only = emotion_re
+                    .replace_all(&delivered_response, "")
+                    .trim()
+                    .to_string();
+
+                let send_text = if text_only.is_empty() {
+                    &delivered_response
+                } else {
+                    &text_only
+                };
+
                 if use_segment_streaming {
                     // Text was already delivered as segments by the segment
-                    // updater task.  Only send the emotion sticker if present.
+                    // updater task. Only send the emotion sticker if present.
                     tracing::debug!(
                         "Skipping final send for segment-streamed response ({}B already delivered)",
-                        delivered_response.len()
+                        send_text.len()
                     );
                 } else if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
+                        .finalize_draft(&msg.reply_target, draft_id, send_text)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
                             .send(
-                                &SendMessage::new(&delivered_response, &msg.reply_target)
+                                &SendMessage::new(send_text, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
+                        &SendMessage::new(send_text, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
                 {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                }
+
+                // Send emotion sticker as a separate pure-image message.
+                if let Some(sticker_path) = emotion_sticker_path {
+                    let sticker_msg = format!("[IMAGE:{sticker_path}]");
+                    if let Err(e) = channel
+                        .send(
+                            &SendMessage::new(&sticker_msg, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to send emotion sticker: {e}");
+                    }
                 }
             }
         }
@@ -3577,6 +3930,70 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     }
 
     Ok(false)
+}
+
+fn create_channel_session_backend(config: &Config) -> Option<Arc<dyn SessionBackend>> {
+    if !config.channels_config.session_persistence {
+        return None;
+    }
+
+    let backend_name = config
+        .channels_config
+        .session_backend
+        .trim()
+        .to_ascii_lowercase();
+
+    match backend_name.as_str() {
+        "jsonl" => match session_store::SessionStore::new(&config.workspace_dir) {
+            Ok(store) => {
+                tracing::info!("Channel session persistence enabled (JSONL)");
+                Some(Arc::new(store))
+            }
+            Err(e) => {
+                tracing::warn!("Session persistence disabled: {e}");
+                None
+            }
+        },
+        "sqlite" | "" => match SqliteSessionBackend::new(&config.workspace_dir) {
+            Ok(backend) => {
+                if let Ok(migrated) = backend.migrate_from_jsonl(&config.workspace_dir) {
+                    if migrated > 0 {
+                        tracing::info!("Migrated {migrated} channel session file(s) to SQLite");
+                    }
+                }
+                if config.channels_config.session_ttl_hours > 0 {
+                    if let Ok(cleaned) =
+                        backend.cleanup_stale(config.channels_config.session_ttl_hours)
+                    {
+                        if cleaned > 0 {
+                            tracing::info!("Cleaned up {cleaned} stale channel session(s)");
+                        }
+                    }
+                }
+                tracing::info!("Channel session persistence enabled (SQLite)");
+                Some(Arc::new(backend))
+            }
+            Err(e) => {
+                tracing::warn!("Session persistence disabled: {e}");
+                None
+            }
+        },
+        other => {
+            tracing::warn!(
+                "Unknown channels_config.session_backend `{other}`; falling back to SQLite"
+            );
+            match SqliteSessionBackend::new(&config.workspace_dir) {
+                Ok(backend) => {
+                    tracing::info!("Channel session persistence enabled (SQLite)");
+                    Some(Arc::new(backend))
+                }
+                Err(e) => {
+                    tracing::warn!("Session persistence disabled: {e}");
+                    None
+                }
+            }
+        }
+    }
 }
 
 pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
@@ -4650,44 +5067,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels_config.ack_reactions,
         show_tool_calls: config.channels_config.show_tool_calls,
-        session_store: if config.channels_config.session_persistence {
-            match session_store::SessionStore::new(&config.workspace_dir) {
-                Ok(store) => {
-                    tracing::info!("📂 Session persistence enabled");
-                    Some(Arc::new(store))
-                }
-                Err(e) => {
-                    tracing::warn!("Session persistence disabled: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        },
+        session_store: create_channel_session_backend(&config),
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
         max_context_tokens: config.agent.max_context_tokens,
+        emotion_sticker_config: Arc::new(
+            crate::agent::loop_::EmotionStickerConfig::from_agent_config(&config.agent, &config),
+        ),
+        emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
     });
-
-    // Hydrate in-memory conversation histories from persisted JSONL session files.
-    if let Some(ref store) = runtime_ctx.session_store {
-        let mut hydrated = 0usize;
-        let mut histories = runtime_ctx
-            .conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        for key in store.list_sessions() {
-            let msgs = store.load(&key);
-            if !msgs.is_empty() {
-                hydrated += 1;
-                histories.insert(key, msgs);
-            }
-        }
-        drop(histories);
-        if hydrated > 0 {
-            tracing::info!("📂 Restored {hydrated} session(s) from disk");
-        }
-    }
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
 
@@ -4966,6 +5354,8 @@ mod tests {
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -5081,6 +5471,8 @@ mod tests {
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -5152,6 +5544,8 @@ mod tests {
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -5172,6 +5566,7 @@ mod tests {
     fn rollback_orphan_user_turn_also_removes_from_session_store() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+        let backend: Arc<dyn SessionBackend> = store.clone();
 
         let sender = "telegram_u4".to_string();
 
@@ -5236,12 +5631,14 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
-            session_store: Some(Arc::clone(&store)),
+            session_store: Some(backend),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         };
 
         assert!(rollback_orphan_user_turn(
@@ -5267,6 +5664,27 @@ mod tests {
         );
         assert_eq!(persisted[0].content, "first");
         assert_eq!(persisted[1].content, "ok");
+    }
+
+    #[test]
+    fn create_channel_session_backend_uses_sqlite_when_configured() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.channels_config.session_persistence = true;
+        config.channels_config.session_backend = "sqlite".to_string();
+
+        let backend =
+            create_channel_session_backend(&config).expect("sqlite backend should be created");
+        backend
+            .append("signal_+85212345678", &ChatMessage::user("hello"))
+            .unwrap();
+
+        assert!(
+            tmp.path().join("sessions").join("sessions.db").exists(),
+            "channel runtime should honor the configured sqlite backend"
+        );
+        assert_eq!(backend.load("signal_+85212345678").len(), 1);
     }
 
     struct DummyProvider;
@@ -5662,10 +6080,19 @@ BTC is currently around $65,000 based on latest tool output."#
     struct ModelCaptureProvider {
         call_count: AtomicUsize,
         models: std::sync::Mutex<Vec<String>>,
+        vision: bool,
     }
 
     #[async_trait::async_trait]
     impl Provider for ModelCaptureProvider {
+        fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
+            crate::providers::traits::ProviderCapabilities {
+                native_tool_calling: false,
+                vision: self.vision,
+                prompt_caching: false,
+            }
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -5782,6 +6209,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -5863,6 +6292,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -5958,6 +6389,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6038,6 +6471,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6128,6 +6563,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6240,6 +6677,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6332,6 +6771,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6439,6 +6880,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6531,6 +6974,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6613,6 +7058,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -6806,6 +7253,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -6909,6 +7358,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7027,6 +7478,8 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             max_context_tokens: 32_000,
             query_classification: crate::config::QueryClassificationConfig::default(),
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7142,6 +7595,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7239,6 +7694,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7319,6 +7776,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -7725,6 +8184,17 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn build_channel_system_prompt_includes_signal_delivery_instructions() {
+        let prompt = build_channel_system_prompt("base prompt", "signal", "+85212345678");
+
+        assert!(prompt.starts_with("base prompt"));
+        assert!(prompt.contains("When responding on Signal:"));
+        assert!(prompt.contains("*bold* for bold"));
+        assert!(prompt.contains("Do NOT use Markdown syntax"));
+        assert!(prompt.contains("reply_target=+85212345678"));
+    }
+
+    #[test]
     fn readonly_prompt_explains_policy_blocks_without_fake_approval() {
         let ws = make_workspace();
         let config = crate::config::AutonomyConfig {
@@ -8092,6 +8562,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8224,6 +8696,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8344,6 +8818,108 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_restores_signal_history_from_session_store_after_restart() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("signal".to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureProvider::default());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+        let backend: Arc<dyn SessionBackend> = store.clone();
+        let history_key = "signal_+85212345678_+85212345678".to_string();
+
+        store
+            .append(&history_key, &ChatMessage::user("before restart"))
+            .unwrap();
+        store
+            .append(&history_key, &ChatMessage::assistant("still here"))
+            .unwrap();
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: provider_impl.clone(),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(tmp.path().to_path_buf()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            max_context_tokens: 32_000,
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: Some(backend),
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-after-restart".to_string(),
+                sender: "+85212345678".to_string(),
+                reply_target: "+85212345678".to_string(),
+                content: "follow up".to_string(),
+                channel: "signal".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+                observe_group: false,
+                interruption_scope_id: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 4);
+        assert_eq!(calls[0][0].0, "system");
+        assert_eq!(calls[0][1].0, "user");
+        assert_eq!(calls[0][2].0, "assistant");
+        assert_eq!(calls[0][3].0, "user");
+        assert!(calls[0][1].1.contains("before restart"));
+        assert!(calls[0][2].1.contains("still here"));
+        assert!(calls[0][3].1.contains("follow up"));
+    }
+
+    #[tokio::test]
     async fn process_channel_message_enriches_current_turn_without_persisting_context() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -8397,6 +8973,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -8422,9 +9000,12 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
+        // Memory context is injected into the system prompt, not the user message
+        assert_eq!(calls[0][0].0, "system");
+        assert!(calls[0][0].1.contains("[Memory context]"));
+        assert!(calls[0][0].1.contains("Age is 45"));
+        // User message is the second entry
         assert_eq!(calls[0][1].0, "user");
-        assert!(calls[0][1].1.contains("[Memory context]"));
-        assert!(calls[0][1].1.contains("Age is 45"));
         assert!(calls[0][1].1.contains("hello"));
 
         let histories = runtime_ctx
@@ -8503,6 +9084,8 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9074,6 +9657,8 @@ This is an example JSON object for profile settings."#;
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -9161,6 +9746,8 @@ This is an example JSON object for profile settings."#;
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9325,6 +9912,8 @@ This is an example JSON object for profile settings."#;
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9437,6 +10026,8 @@ This is an example JSON object for profile settings."#;
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9541,6 +10132,8 @@ This is an example JSON object for profile settings."#;
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9563,6 +10156,123 @@ This is an example JSON object for profile settings."#;
         // Default provider should be used since no classification rule matched.
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 1);
         assert_eq!(vision_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_image_marker_prefers_configured_vision_route() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let default_provider_impl = Arc::new(ModelCaptureProvider::default());
+        let default_provider: Arc<dyn Provider> = default_provider_impl.clone();
+        let vision_provider_impl = Arc::new(ModelCaptureProvider {
+            vision: true,
+            ..Default::default()
+        });
+        let vision_provider: Arc<dyn Provider> = vision_provider_impl.clone();
+
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
+        provider_cache_seed.insert("vision-provider".to_string(), vision_provider);
+
+        let model_routes = vec![crate::config::ModelRouteConfig {
+            hint: "vision".into(),
+            provider: "vision-provider".into(),
+            model: "gpt-4-vision".into(),
+            api_key: None,
+            max_context_tokens: None,
+        }];
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("sample.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .unwrap();
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&default_provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(model_routes),
+            query_classification: crate::config::QueryClassificationConfig {
+                enabled: false,
+                rules: Vec::new(),
+            },
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-image-route".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: format!("[IMAGE:{}]\n\nWhat is this?", image_path.display()),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                observe_group: false,
+                interruption_scope_id: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
+        assert_eq!(vision_provider_impl.call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            vision_provider_impl
+                .models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["gpt-4-vision".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -9666,6 +10376,8 @@ This is an example JSON object for profile settings."#;
             )),
             activated_tools: None,
             max_context_tokens: 32_000,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         process_channel_message(
@@ -9925,6 +10637,8 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
+            emotion_sticker_config: Arc::new(crate::agent::loop_::EmotionStickerConfig::default()),
+            emotion_overrides: Arc::new(Mutex::new(HashMap::new())),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);

@@ -303,7 +303,8 @@ Notes:
 - Data URI (for example ``[IMAGE:data:image/png;base64,...]``)
 - Remote URL only when `allow_remote_fetch = true`
 - Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`, `image/gif`, `image/bmp`.
-- When the active provider does not support vision and `vision_mcp_fallback` is not set, requests fail with a structured capability error (`capability=vision`) instead of silently dropping images.
+- A built-in `read_image` tool is always registered and provides a vision cascade for non-vision providers. The cascade tries, in order: (1) the default provider if it supports vision, (2) a `[[model_routes]]` entry with `hint = "vision"`, (3) the MCP server named by `vision_mcp_fallback`. When `read_image` is available, image markers are replaced with a hint so the LLM can call the tool instead of failing outright.
+- When no vision-capable provider, no vision model route, and no `vision_mcp_fallback` are configured, requests with image markers fail with a structured capability error (`capability=vision`).
 - When `vision_mcp_fallback` is set, the agent automatically discovers a vision tool from the named MCP server (matching tool names containing "vision", "describe", or "image") and replaces image markers with text descriptions before sending to the LLM.
 
 ## `[browser]`

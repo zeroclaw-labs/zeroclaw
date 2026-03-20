@@ -1010,9 +1010,13 @@ async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
+    sender: Option<&str>,
 ) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-    Box::pin(crate::agent::process_message(config, message, session_id)).await
+    Box::pin(crate::agent::process_message(
+        config, message, session_id, sender,
+    ))
+    .await
 }
 
 /// Webhook request body
@@ -1356,6 +1360,7 @@ async fn handle_whatsapp_message(
             &state,
             &msg.content,
             Some(&session_id),
+            Some(&msg.sender),
         ))
         .await
         {
@@ -1476,6 +1481,7 @@ async fn handle_linq_webhook(
             &state,
             &msg.content,
             Some(&session_id),
+            Some(&msg.sender),
         ))
         .await
         {
@@ -1580,6 +1586,7 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
             &state,
             &msg.content,
             Some(&session_id),
+            Some(&msg.sender),
         ))
         .await
         {
@@ -1696,6 +1703,7 @@ async fn handle_nextcloud_talk_webhook(
             &state,
             &msg.content,
             Some(&session_id),
+            Some(&msg.sender),
         ))
         .await
         {

@@ -1094,7 +1094,7 @@ pub fn create_provider_with_url(
 
 /// Factory: create provider with optional base URL and runtime options.
 #[allow(clippy::too_many_lines)]
-fn create_provider_with_url_and_options(
+pub(crate) fn create_provider_with_url_and_options(
     name: &str,
     api_key: Option<&str>,
     api_url: Option<&str>,

@@ -36,6 +36,7 @@ pub mod delegate;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod gen_image;
 pub mod git_operations;
 pub mod glob_search;
 pub mod google_workspace;
@@ -68,6 +69,7 @@ pub mod pdf_read;
 pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
+pub mod read_image;
 pub mod read_skill;
 pub mod report_templates;
 pub mod schedule;
@@ -104,6 +106,7 @@ pub use delegate::DelegateTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use gen_image::GenImageTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
 pub use google_workspace::GoogleWorkspaceTool;
@@ -153,6 +156,7 @@ pub use workspace_tool::WorkspaceTool;
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
+use crate::providers::Provider;
 use crate::runtime::{NativeRuntime, RuntimeAdapter};
 use crate::security::{create_sandbox, SecurityPolicy};
 use async_trait::async_trait;
@@ -646,6 +650,47 @@ pub fn all_tools_with_runtime(
         api_path: root_config.api_path.clone(),
     };
 
+    // Shared tools handle — used by ReadImageTool (MCP vision fallback) and
+    // DelegateTool (parent-tools). The channel code pushes MCP tools to this
+    // handle after construction, making them visible to both.
+    let shared_tools_handle: DelegateParentToolsHandle = Arc::new(RwLock::new(tool_arcs.clone()));
+
+    // ── read_image tool (vision cascade) ──────────────────────────────
+    {
+        let default_provider: Option<Arc<dyn Provider>> =
+            root_config.default_provider.as_deref().and_then(|name| {
+                crate::providers::create_provider_with_options(
+                    name,
+                    root_config.api_key.as_deref().or(fallback_api_key),
+                    &provider_runtime_options,
+                )
+                .ok()
+                .map(|p| Arc::from(p) as Arc<dyn Provider>)
+            });
+
+        tool_arcs.push(Arc::new(read_image::ReadImageTool::new(
+            security.clone(),
+            default_provider.as_ref(),
+            root_config.default_model.as_deref().unwrap_or(""),
+            &root_config.model_routes,
+            fallback_api_key,
+            &provider_runtime_options,
+            root_config.multimodal.clone(),
+            Arc::clone(&shared_tools_handle),
+        )));
+
+        // Update the shared handle with the newly-added read_image tool.
+        *shared_tools_handle.write() = tool_arcs.clone();
+    }
+
+    // ── gen_image tool (unified image generation) ────────────────────
+    tool_arcs.push(Arc::new(GenImageTool::new(
+        root_config.image_generation.clone(),
+        workspace_dir.to_path_buf(),
+    )));
+    *shared_tools_handle.write() = tool_arcs.clone();
+
+    // ── delegate tool ─────────────────────────────────────────────────
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
     } else {
@@ -653,18 +698,17 @@ pub fn all_tools_with_runtime(
             .iter()
             .map(|(name, cfg)| (name.clone(), cfg.clone()))
             .collect();
-        let parent_tools = Arc::new(RwLock::new(tool_arcs.clone()));
         let delegate_tool = DelegateTool::new_with_options(
             delegate_agents,
             delegate_fallback_credential.clone(),
             security.clone(),
             provider_runtime_options.clone(),
         )
-        .with_parent_tools(Arc::clone(&parent_tools))
+        .with_parent_tools(Arc::clone(&shared_tools_handle))
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone());
         tool_arcs.push(Arc::new(delegate_tool));
-        Some(parent_tools)
+        Some(Arc::clone(&shared_tools_handle))
     };
 
     // Add swarm tool when swarms are configured

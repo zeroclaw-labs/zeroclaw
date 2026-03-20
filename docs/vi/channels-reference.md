@@ -64,7 +64,8 @@ ZeroClaw hỗ trợ đầu vào multimodal qua các marker nội tuyến trong t
 Lưu ý vận hành:
 
 - Marker được phân tích trong các tin nhắn người dùng trước khi gọi provider.
-- Capability của provider được kiểm tra tại runtime: nếu provider không hỗ trợ vision, request thất bại với lỗi capability có cấu trúc (`capability=vision`).
+- Tool `read_image` tích hợp sẵn xử lý fallback vision: khi provider đang hoạt động không hỗ trợ vision, các image marker được thay thế bằng gợi ý và LLM có thể gọi `read_image` để mô tả hình ảnh thông qua cascade provider vision hoặc MCP server.
+- Nếu không có khả năng vision nào (không có vision provider, không có vision model route, không có MCP fallback), request thất bại với lỗi capability có cấu trúc (`capability=vision`).
 - Các phần `media` của Linq webhook có MIME type `image/*` được tự động chuyển đổi sang định dạng marker này.
 
 ## Channel Matrix

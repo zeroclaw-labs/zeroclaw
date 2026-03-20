@@ -191,13 +191,20 @@ impl WhatsAppWebChannel {
     /// Returns `(preview_text, quoted_stanza_id)`.
     fn extract_reply_context(
         msg: &wa_rs_proto::whatsapp::Message,
+        workspace_dir: Option<&std::path::Path>,
     ) -> Option<(String, Option<String>)> {
         use wa_rs_core::proto_helpers::MessageExt;
 
         let base = msg.get_base_message();
 
         /// Try to extract a displayable preview from a quoted message.
-        fn quoted_preview(quoted: &wa_rs_proto::whatsapp::Message) -> Option<String> {
+        /// If `stanza_id` and `workspace_dir` are provided, look up the
+        /// previously downloaded image to include its path.
+        fn quoted_preview(
+            quoted: &wa_rs_proto::whatsapp::Message,
+            stanza_id: Option<&str>,
+            workspace_dir: Option<&std::path::Path>,
+        ) -> Option<String> {
             use wa_rs_core::proto_helpers::MessageExt as _;
             if let Some(text) = quoted.text_content() {
                 if !text.is_empty() {
@@ -205,13 +212,21 @@ impl WhatsAppWebChannel {
                 }
             }
             if let Some(ref img) = quoted.image_message {
-                return Some(
-                    img.caption
-                        .as_deref()
-                        .filter(|c| !c.trim().is_empty())
-                        .map(|c| format!("[Photo] {}", truncate_reply_preview(c, 180)))
-                        .unwrap_or_else(|| "[Photo]".to_string()),
-                );
+                // Try to find the previously downloaded image on disk.
+                let image_path = stanza_id.and_then(|sid| {
+                    WhatsAppWebChannel::find_image_by_stanza_id(workspace_dir, sid)
+                });
+                let caption = img.caption.as_deref().filter(|c| !c.trim().is_empty());
+                return Some(match (image_path, caption) {
+                    (Some(p), Some(c)) => {
+                        format!("[IMAGE:{}] {}", p.display(), truncate_reply_preview(c, 180))
+                    }
+                    (Some(p), None) => format!("[IMAGE:{}]", p.display()),
+                    (None, Some(c)) => {
+                        format!("[Photo] {}", truncate_reply_preview(c, 180))
+                    }
+                    (None, None) => "[Photo]".to_string(),
+                });
             }
             if let Some(ref vid) = quoted.video_message {
                 return Some(
@@ -251,7 +266,8 @@ impl WhatsAppWebChannel {
                     if let Some(ref m) = base.$field {
                         if let Some(ref ctx) = m.context_info {
                             if let Some(ref quoted) = ctx.quoted_message {
-                                if let Some(preview) = quoted_preview(quoted) {
+                                let stanza_ref = ctx.stanza_id.as_deref();
+                                if let Some(preview) = quoted_preview(quoted, stanza_ref, workspace_dir) {
                                     let stanza = ctx.stanza_id.clone();
                                     let header = format!("[Replying to: \"{preview}\"]");
                                     return Some((header, stanza));
@@ -1195,23 +1211,15 @@ impl Channel for WhatsAppWebChannel {
                                 // Prepend reply/quote context so the agent knows
                                 // what message the user is responding to.
                                 // If replying to an image, resolve the cached file.
-                                if let Some((quote, stanza_id)) = Self::extract_reply_context(&msg) {
-                                    // Check if the quoted message has a cached image
-                                    let image_ref = stanza_id.as_deref().and_then(|sid| {
-                                        Self::find_image_by_stanza_id(
-                                            workspace_dir.as_deref(),
-                                            sid,
-                                        )
-                                    });
-                                    let mut parts = Vec::new();
-                                    if let Some(img_path) = image_ref {
-                                        parts.push(format!("[IMAGE:{}]", img_path.display()));
+                                if let Some((quote, _stanza_id)) = Self::extract_reply_context(
+                                    &msg,
+                                    workspace_dir.as_deref(),
+                                ) {
+                                    if content.is_empty() {
+                                        content = quote;
+                                    } else {
+                                        content = format!("{quote}\n\n{content}");
                                     }
-                                    parts.push(quote);
-                                    if !content.is_empty() {
-                                        parts.push(content);
-                                    }
-                                    content = parts.join("\n\n");
                                 }
 
                                 // In group chats, prepend sender phone so the agent
