@@ -81,6 +81,7 @@ pub mod tool_search;
 pub mod traits;
 pub mod verifiable_intent;
 pub mod web_fetch;
+mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod workspace_tool;
 
