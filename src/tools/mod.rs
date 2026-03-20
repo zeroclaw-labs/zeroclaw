@@ -71,6 +71,7 @@ pub mod schema;
 pub mod screenshot;
 pub mod security_ops;
 pub mod shell;
+pub mod skill_shell;
 pub mod swarm;
 pub mod tool_search;
 pub mod traits;
@@ -132,6 +133,8 @@ pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
 pub use shell::ShellTool;
+#[allow(unused_imports)]
+pub use skill_shell::SkillShellTool;
 pub use swarm::SwarmTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;

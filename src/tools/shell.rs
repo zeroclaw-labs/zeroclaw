@@ -8,21 +8,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Maximum shell command execution time before kill.
-const SHELL_TIMEOUT_SECS: u64 = 60;
+pub(crate) const SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
-const MAX_OUTPUT_BYTES: usize = 1_048_576;
+pub(crate) const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 #[cfg(not(target_os = "windows"))]
-const SAFE_ENV_VARS: &[&str] = &[
+pub(crate) const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
 /// Environment variables safe to pass to shell commands on Windows.
 /// Includes Windows-specific variables needed for cmd.exe and program resolution.
 #[cfg(target_os = "windows")]
-const SAFE_ENV_VARS: &[&str] = &[
+pub(crate) const SAFE_ENV_VARS: &[&str] = &[
     "PATH",
     "PATHEXT",
     "HOME",
@@ -52,7 +52,7 @@ impl ShellTool {
     }
 }
 
-fn is_valid_env_var_name(name: &str) -> bool {
+pub(crate) fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
@@ -61,7 +61,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
+pub(crate) fn collect_allowed_shell_env_vars(security: &SecurityPolicy) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for key in SAFE_ENV_VARS
