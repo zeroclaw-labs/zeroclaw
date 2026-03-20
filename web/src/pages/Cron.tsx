@@ -61,7 +61,11 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
           <span className="text-xs" style={{ color: 'var(--color-status-error)' }}>
             {t('cron.load_run_history_error')}: {error}
           </span>
-          <button onClick={fetchRuns} className="btn-icon"><RefreshCw className="h-3.5 w-3.5" /></button>
+          <button
+            onClick={fetchRuns}
+            className="btn-icon">
+            <RefreshCw className="h-3.5 w-3.5" />
+          </button>
         </div>
       </div>
     );
@@ -71,7 +75,12 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
     return (
       <div className="px-4 py-3 flex items-center justify-between">
         <span className="text-xs" style={{ color: 'var(--pc-text-faint)' }}>{t('cron.no_runs')}</span>
-        <button onClick={fetchRuns} className="btn-icon"><RefreshCw className="h-3.5 w-3.5" /></button>
+        <button
+          onClick={fetchRuns}
+          className="btn-icon"
+        >
+          <RefreshCw className="h-3.5 w-3.5" />
+        </button>
       </div>
     );
   }
@@ -82,7 +91,11 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
         <span className="text-xs font-medium" style={{ color: 'var(--pc-text-secondary)' }}>
           {t('cron.recent_runs')} ({runs.length})
         </span>
-        <button onClick={fetchRuns} className="btn-icon" title="Refresh runs">
+        <button
+          onClick={fetchRuns}
+          className="btn-icon"
+          title="Refresh runs"
+        >
           <RefreshCw className="h-3.5 w-3.5" />
         </button>
       </div>
@@ -90,8 +103,7 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
         {runs.map((run) => (
           <div
             key={run.id}
-            className="rounded-xl px-3 py-2 text-xs border"
-            style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}
+            className="rounded-xl px-3 py-2 text-xs border" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}
           >
             <div className="flex items-center justify-between mb-1">
               <div className="flex items-center gap-2">
@@ -102,16 +114,15 @@ function RunHistoryPanel({ jobId }: { jobId: string }) {
                 )}
                 <span style={{ color: 'var(--pc-text-secondary)' }}>{run.status}</span>
               </div>
-              <span style={{ color: 'var(--pc-text-muted)' }}>{formatDuration(run.duration_ms)}</span>
+              <span style={{ color: 'var(--pc-text-muted)' }}>
+                {formatDuration(run.duration_ms)}
+              </span>
             </div>
             <div className="flex items-center gap-3" style={{ color: 'var(--pc-text-muted)' }}>
               <span>{formatDate(run.started_at)}</span>
             </div>
             {run.output && (
-              <pre
-                className="mt-1.5 rounded-lg p-2 text-xs overflow-x-auto max-h-24 whitespace-pre-wrap break-words font-mono"
-                style={{ background: 'var(--pc-bg-base)', color: 'var(--pc-text-secondary)' }}
-              >
+              <pre className="mt-1.5 rounded-lg p-2 text-xs overflow-x-auto max-h-24 whitespace-pre-wrap break-words font-mono" style={{ background: 'var(--pc-bg-base)', color: 'var(--pc-text-secondary)' }}>
                 {run.output}
               </pre>
             )}
@@ -129,6 +140,8 @@ export default function Cron() {
   const [showForm, setShowForm] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
+
+  // Form state
   const [formName, setFormName] = useState('');
   const [formSchedule, setFormSchedule] = useState('');
   const [formCommand, setFormCommand] = useState('');
@@ -147,7 +160,11 @@ export default function Cron() {
     setSubmitting(true);
     setFormError(null);
     try {
-      const job = await addCronJob({ name: formName.trim() || undefined, schedule: formSchedule.trim(), command: formCommand.trim() });
+      const job = await addCronJob({
+        name: formName.trim() || undefined,
+        schedule: formSchedule.trim(),
+        command: formCommand.trim(),
+      });
       setJobs((prev) => [...prev, job]);
       setShowForm(false);
       setFormName(''); setFormSchedule(''); setFormCommand('');
@@ -159,36 +176,51 @@ export default function Cron() {
   };
 
   const handleDelete = async (id: string) => {
-    try { await deleteCronJob(id); setJobs((prev) => prev.filter((j) => j.id !== id)); }
-    catch (err: unknown) { setError(err instanceof Error ? err.message : t('cron.delete_error')); }
-    finally { setConfirmDelete(null); }
+    try {
+      await deleteCronJob(id);
+      setJobs((prev) => prev.filter((j) => j.id !== id));
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t('cron.delete_error'));
+    } finally {
+      setConfirmDelete(null);
+    }
   };
 
   const statusIcon = (status: string | null) => {
     if (!status) return null;
     switch (status.toLowerCase()) {
-      case 'ok': case 'success': return <CheckCircle className="h-4 w-4" style={{ color: 'var(--color-status-success)' }} />;
-      case 'error': case 'failed': return <XCircle className="h-4 w-4" style={{ color: 'var(--color-status-error)' }} />;
-      default: return <AlertCircle className="h-4 w-4" style={{ color: 'var(--color-status-warning)' }} />;
+      case 'ok':
+        case 'success':
+          return <CheckCircle className="h-4 w-4" style={{ color: 'var(--color-status-success)' }} />;
+      case 'error':
+        case 'failed':
+          return <XCircle className="h-4 w-4" style={{ color: 'var(--color-status-error)' }} />;
+      default:
+        return <AlertCircle className="h-4 w-4" style={{ color: 'var(--color-status-warning)' }} />;
     }
   };
 
-  if (error) return (
-    <div className="p-6 animate-fade-in">
-      <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
-        {t('cron.load_error')}: {error}
+  if (error) {
+    return (
+      <div className="p-6 animate-fade-in">
+        <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+          {t('cron.load_error')}: {error}
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
 
-  if (loading) return (
-    <div className="flex items-center justify-center h-64">
-      <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
-    </div>
-  );
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+      </div>
+    );
+  }
 
   return (
     <div className="p-6 space-y-6 animate-fade-in">
+      {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Clock className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
@@ -196,17 +228,28 @@ export default function Cron() {
             {t('cron.scheduled_tasks')} ({jobs.length})
           </h2>
         </div>
-        <button onClick={() => setShowForm(true)} className="btn-electric flex items-center gap-2 text-sm px-4 py-2">
+        <button
+          onClick={() => setShowForm(true)}
+          className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
+        >
           <Plus className="h-4 w-4" />{t('cron.add_job')}
         </button>
       </div>
 
+      {/* Add Job Form Modal */}
       {showForm && (
         <div className="fixed inset-0 modal-backdrop flex items-center justify-center z-50">
           <div className="surface-panel p-6 w-full max-w-md mx-4 animate-fade-in-scale">
             <div className="flex items-center justify-between mb-4">
               <h3 className="text-lg font-semibold" style={{ color: 'var(--pc-text-primary)' }}>{t('cron.add_modal_title')}</h3>
-              <button onClick={() => { setShowForm(false); setFormError(null); }} className="btn-icon"><X className="h-5 w-5" /></button>
+              <button
+                onClick={() => {
+                  setShowForm(false);
+                  setFormError(null);
+                }}
+                className="btn-icon">
+                <X className="h-5 w-5" />
+              </button>
             </div>
             {formError && (
               <div className="mb-4 rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
@@ -215,7 +258,9 @@ export default function Cron() {
             )}
             <div className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>{t('cron.name_optional')}</label>
+                <label className="block text-xs font-semibold mb-1.5 uppercase tracking-wider" style={{ color: 'var(--pc-text-secondary)' }}>
+                  {t('cron.name_optional')}
+                </label>
                 <input type="text" value={formName} onChange={(e) => setFormName(e.target.value)} placeholder="e.g. Daily cleanup" className="input-electric w-full px-3 py-2.5 text-sm" />
               </div>
               <div>
@@ -232,13 +277,22 @@ export default function Cron() {
               </div>
             </div>
             <div className="flex justify-end gap-3 mt-6">
-              <button onClick={() => { setShowForm(false); setFormError(null); }} className="btn-secondary px-4 py-2 text-sm font-medium">{t('cron.cancel')}</button>
+              <button
+                onClick={() => {
+                  setShowForm(false);
+                  setFormError(null);
+                }}
+                className="btn-secondary px-4 py-2 text-sm font-medium"
+              >
+                {t('cron.cancel')}
+              </button>
               <button onClick={handleAdd} disabled={submitting} className="btn-electric px-4 py-2 text-sm font-medium">{submitting ? t('cron.adding') : t('cron.add_job')}</button>
             </div>
           </div>
         </div>
       )}
 
+      {/* Jobs Table */}
       {jobs.length === 0 ? (
         <div className="card p-8 text-center">
           <Clock className="h-10 w-10 mx-auto mb-3" style={{ color: 'var(--pc-text-faint)' }} />
@@ -263,16 +317,39 @@ export default function Cron() {
                 <React.Fragment key={job.id}>
                   <tr>
                     <td className="font-mono text-xs">
-                      <button onClick={() => setExpandedJob((prev) => prev === job.id ? null : job.id)} className="flex items-center gap-1 btn-icon" title="Toggle run history">
-                        {expandedJob === job.id ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                      <button
+                        onClick={() =>
+                          setExpandedJob((prev) =>
+                            prev === job.id ? null : job.id,
+                          )
+                      }
+                        className="flex items-center gap-1 btn-icon"
+                        title="Toggle run history"
+                      >
+                        {expandedJob === job.id ? (
+                          <ChevronDown className="h-3.5 w-3.5" />
+                        ) : (
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        )}
                         {job.id.slice(0, 8)}
                       </button>
                     </td>
-                    <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>{job.name ?? '-'}</td>
-                    <td className="font-mono text-xs max-w-[200px] truncate" style={{ color: 'var(--pc-text-secondary)' }}>{job.command}</td>
-                    <td className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>{formatDate(job.next_run)}</td>
+                    <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>
+                      {job.name ?? '-'}
+                    </td>
+                    <td className="font-mono text-xs max-w-[200px] truncate" style={{ color: 'var(--pc-text-secondary)' }}>
+                      {job.command}
+                    </td>
+                    <td className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+                      {formatDate(job.next_run)}
+                    </td>
                     <td>
-                      <div className="flex items-center gap-1.5">{statusIcon(job.last_status)}<span className="text-xs capitalize" style={{ color: 'var(--pc-text-secondary)' }}>{job.last_status ?? '-'}</span></div>
+                      <div className="flex items-center gap-1.5">
+                        {statusIcon(job.last_status)}
+                        <span className="text-xs capitalize" style={{ color: 'var(--pc-text-secondary)' }}>
+                          {job.last_status ?? '-'}
+                        </span>
+                      </div>
                     </td>
                     <td>
                       <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold border"
@@ -283,17 +360,37 @@ export default function Cron() {
                     <td className="text-right">
                       {confirmDelete === job.id ? (
                         <div className="flex items-center justify-end gap-2 animate-fade-in">
-                          <span className="text-xs" style={{ color: 'var(--color-status-error)' }}>{t('cron.confirm_delete')}</span>
-                          <button onClick={() => handleDelete(job.id)} className="text-xs font-medium" style={{ color: 'var(--color-status-error)' }}>{t('cron.yes')}</button>
-                          <button onClick={() => setConfirmDelete(null)} className="text-xs font-medium" style={{ color: 'var(--pc-text-muted)' }}>{t('cron.no')}</button>
+                          <span className="text-xs" style={{ color: 'var(--color-status-error)' }}>
+                            {t('cron.confirm_delete')}
+                          </span>
+                          <button
+                            onClick={() => handleDelete(job.id)}
+                            className="text-xs font-medium"
+                            style={{ color: 'var(--color-status-error)' }}>
+                            {t('cron.yes')}
+                          </button>
+                          <button
+                            onClick={() => setConfirmDelete(null)}
+                            className="text-xs font-medium"
+                            style={{ color: 'var(--pc-text-muted)' }}>
+                            {t('cron.no')}
+                          </button>
                         </div>
                       ) : (
-                        <button onClick={() => setConfirmDelete(job.id)} className="btn-icon"><Trash2 className="h-4 w-4" /></button>
+                        <button
+                          onClick={() => setConfirmDelete(job.id)}
+                          className="btn-icon">
+                          <Trash2 className="h-4 w-4" />
+                        </button>
                       )}
                     </td>
                   </tr>
                   {expandedJob === job.id && (
-                    <tr><td colSpan={7} style={{ background: 'var(--pc-bg-elevated)' }}><RunHistoryPanel jobId={job.id} /></td></tr>
+                    <tr>
+                      <td colSpan={7} style={{ background: 'var(--pc-bg-elevated)' }}>
+                        <RunHistoryPanel jobId={job.id} />
+                      </td>
+                    </tr>
                   )}
                 </React.Fragment>
               ))}

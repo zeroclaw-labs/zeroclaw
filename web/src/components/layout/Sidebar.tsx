@@ -28,15 +28,9 @@ const navItems = [
 
 export default function Sidebar() {
   return (
-    <aside
-      className="fixed top-0 left-0 h-screen w-60 flex flex-col border-r"
-      style={{ background: 'var(--pc-bg-base)', borderColor: 'var(--pc-border)' }}
-    >
+    <aside className="fixed top-0 left-0 h-screen w-60 flex flex-col border-r" style={{ background: 'var(--pc-bg-base)', borderColor: 'var(--pc-border)' }}>
       {/* Logo / Title */}
-      <div
-        className="flex items-center gap-3 px-4 py-4 border-b h-14"
-        style={{ borderColor: 'var(--pc-border)' }}
-      >
+      <div className="flex items-center gap-3 px-4 py-4 border-b h-14" style={{ borderColor: 'var(--pc-border)' }}>
         <div className="relative shrink-0">
           <div className="absolute -inset-1.5 rounded-xl" style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }} />
           <img
@@ -88,10 +82,7 @@ export default function Sidebar() {
       </nav>
 
       {/* Footer */}
-      <div
-        className="px-5 py-4 border-t text-[10px] uppercase tracking-wider"
-        style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}
-      >
+      <div className="px-5 py-4 border-t text-[10px] uppercase tracking-wider" style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}>
         ZeroClaw Runtime
       </div>
     </aside>

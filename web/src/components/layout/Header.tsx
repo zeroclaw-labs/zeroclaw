@@ -29,24 +29,16 @@ export default function Header() {
   const pageTitle = t(titleKey);
 
   const toggleLanguage = () => {
+    // Cycle through: en -> zh -> tr -> en
     const nextLocale = locale === 'en' ? 'zh' : locale === 'zh' ? 'tr' : 'en';
     setAppLocale(nextLocale);
   };
 
   return (
     <>
-      <header
-        className="h-14 flex items-center justify-between px-6 border-b animate-fade-in"
-        style={{
-          background: 'var(--pc-bg-surface)',
-          borderColor: 'var(--pc-border)',
-          backdropFilter: 'blur(12px)',
-        }}
-      >
+      <header className="h-14 flex items-center justify-between px-6 border-b animate-fade-in" style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)', backdropFilter: 'blur(12px)', }}>
         {/* Page title */}
-        <h1 className="h-9 leading-9 text-lg font-semibold tracking-tight" style={{ color: 'var(--pc-text-primary)' }}>
-          {pageTitle}
-        </h1>
+        <h1 className="h-9 leading-9 text-lg font-semibold tracking-tight" style={{ color: 'var(--pc-text-primary)' }}>{pageTitle}</h1>
 
         {/* Right-side controls */}
         <div className="flex items-center gap-2 h-9">

@@ -18,11 +18,26 @@ import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
 import { getAdminPairCode } from './lib/api';
 
-interface LocaleContextType { locale: string; setAppLocale: (locale: string) => void; }
-export const LocaleContext = createContext<LocaleContextType>({ locale: 'en', setAppLocale: () => {} });
+// Locale context
+interface LocaleContextType {
+  locale: string;
+  setAppLocale: (locale: string) => void;
+}
+export const LocaleContext = createContext<LocaleContextType>({
+  locale: 'en',
+  setAppLocale: () => {},
+});
+
 export const useLocaleContext = () => useContext(LocaleContext);
 
-interface ErrorBoundaryState { error: Error | null; }
+// ---------------------------------------------------------------------------
+// Error boundary — catches render crashes and shows a recoverable message
+// instead of a black screen
+// ---------------------------------------------------------------------------
+
+interface ErrorBoundaryState {
+  error: Error | null;
+}
 
 export class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryState> {
   constructor(props: { children: ReactNode }) {
@@ -43,12 +58,19 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBound
       return (
         <div className="p-6">
           <div className="card p-6 w-full max-w-lg" style={{ borderColor: 'rgba(239, 68, 68, 0.3)' }}>
-            <h2 className="text-lg font-semibold mb-2" style={{ color: 'var(--color-status-error)' }}>Something went wrong</h2>
-            <p className="text-sm mb-4" style={{ color: 'var(--pc-text-muted)' }}>A render error occurred. Check the browser console for details.</p>
+            <h2 className="text-lg font-semibold mb-2" style={{ color: 'var(--color-status-error)' }}>
+              Something went wrong
+            </h2>
+            <p className="text-sm mb-4" style={{ color: 'var(--pc-text-muted)' }}>
+              A render error occurred. Check the browser console for details.
+            </p>
             <pre className="text-xs rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-all font-mono" style={{ background: 'var(--pc-bg-base)', color: 'var(--color-status-error)' }}>
               {this.state.error.message}
             </pre>
-            <button onClick={() => this.setState({ error: null })} className="btn-electric mt-6 px-4 py-2 text-sm font-medium">
+            <button
+              onClick={() => this.setState({ error: null })}
+              className="btn-electric mt-6 px-4 py-2 text-sm font-medium"
+            >
               Try again
             </button>
           </div>
@@ -59,6 +81,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBound
   }
 }
 
+// Pairing dialog component
 function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) {
   const [code, setCode] = useState('');
   const [error, setError] = useState('');
@@ -66,11 +89,18 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
   const [displayCode, setDisplayCode] = useState<string | null>(null);
   const [codeLoading, setCodeLoading] = useState(true);
 
+  // Fetch the current pairing code from the admin endpoint (localhost only)
   useEffect(() => {
     let cancelled = false;
     getAdminPairCode()
-      .then((data) => { if (!cancelled && data.pairing_code) setDisplayCode(data.pairing_code); })
-      .catch(() => {})
+      .then((data) => {
+        if (!cancelled && data.pairing_code) {
+          setDisplayCode(data.pairing_code);
+        }
+      })
+      .catch(() => {
+        // Admin endpoint not reachable (non-localhost) — user must check terminal
+      })
       .finally(() => { if (!cancelled) setCodeLoading(false); });
     return () => { cancelled = true; };
   }, []);
@@ -79,13 +109,20 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
     e.preventDefault();
     setLoading(true);
     setError('');
-    try { await onPair(code); } catch (err: unknown) { setError(err instanceof Error ? err.message : 'Pairing failed'); }
-    finally { setLoading(false); }
+    try {
+      await onPair(code);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'Pairing failed');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
     <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--pc-bg-base)' }}>
+      {/* Ambient glow */}
       <div className="relative surface-panel p-8 w-full max-w-md animate-fade-in-scale">
+
         <div className="text-center mb-8">
           <img
             src="/_app/logo.png"
@@ -99,6 +136,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
           </p>
         </div>
 
+        {/* Show the pairing code if available (localhost) */}
         {!codeLoading && displayCode && (
           <div className="mb-6 p-4 rounded-2xl text-center border" style={{ background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-accent-dim)' }}>
             <div className="text-4xl font-mono font-bold tracking-[0.4em] py-2" style={{ color: 'var(--pc-text-primary)' }}>
@@ -118,9 +156,19 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             maxLength={6}
             autoFocus
           />
-          {error && <p className="text-sm mb-4 text-center animate-fade-in" style={{ color: 'var(--color-status-error)' }}>{error}</p>}
-          <button type="submit" disabled={loading || code.length < 6} className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide">
-            {loading ? <span className="flex items-center justify-center gap-2"><span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />Pairing...</span> : 'Pair'}
+          {error && (
+            <p className="text-sm mb-4 text-center animate-fade-in" style={{ color: 'var(--color-status-error)' }}>{error}</p>
+          )}
+          <button type="submit"
+                  disabled={loading || code.length < 6}
+                  className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide"
+          >
+            {loading ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="h-4 w-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                Pairing...
+              </span>
+            ) : 'Pair'}
           </button>
         </form>
       </div>
@@ -132,24 +180,33 @@ function AppContent() {
   const { isAuthenticated, requiresPairing, loading, pair, logout } = useAuth();
   const [locale, setLocaleState] = useState('en');
   const draftStore = useDraftStore();
-  const setAppLocale = (newLocale: string) => { setLocaleState(newLocale); setLocale(newLocale as Locale); };
 
+  const setAppLocale = (newLocale: string) => {
+    setLocaleState(newLocale);
+    setLocale(newLocale as Locale);
+  };
+
+  // Listen for 401 events to force logout
   useEffect(() => {
     const handler = () => { logout(); };
     window.addEventListener('zeroclaw-unauthorized', handler);
     return () => window.removeEventListener('zeroclaw-unauthorized', handler);
   }, [logout]);
 
-  if (loading) return (
-    <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--pc-bg-base)' }}>
-      <div className="flex flex-col items-center gap-4 animate-fade-in">
-        <div className="h-10 w-10 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
-        <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>Connecting...</p>
+  if (loading) {
+    return (
+      <div className="min-h-screen flex items-center justify-center" style={{ background: 'var(--pc-bg-base)' }}>
+        <div className="flex flex-col items-center gap-4 animate-fade-in">
+          <div className="h-10 w-10 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+          <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>Connecting...</p>
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
 
-  if (!isAuthenticated && requiresPairing) return <PairingDialog onPair={pair} />;
+  if (!isAuthenticated && requiresPairing) {
+    return <PairingDialog onPair={pair} />;
+  }
 
   return (
     <DraftContext.Provider value={draftStore}>

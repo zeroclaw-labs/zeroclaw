@@ -1,5 +1,10 @@
 import { useState, useEffect } from 'react';
-import { DollarSign, TrendingUp, Hash, Layers } from 'lucide-react';
+import {
+  DollarSign,
+  TrendingUp,
+  Hash,
+  Layers,
+} from 'lucide-react';
 import type { CostSummary } from '@/types/api';
 import { getCost } from '@/lib/api';
 import { t } from '@/lib/i18n';
@@ -17,19 +22,23 @@ export default function Cost() {
     getCost().then(setCost).catch((err) => setError(err.message)).finally(() => setLoading(false));
   }, []);
 
-  if (error) return (
-    <div className="p-6 animate-fade-in">
-      <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
-        {t('cost.load_error')}: {error}
+  if (error) {
+    return (
+      <div className="p-6 animate-fade-in">
+        <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+          {t('cost.load_error')}: {error}
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
 
-  if (loading || !cost) return (
-    <div className="flex items-center justify-center h-64">
-      <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
-    </div>
-  );
+  if (loading || !cost) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+      </div>
+    );
+  }
 
   const models = Object.values(cost.by_model);
 
@@ -74,13 +83,17 @@ export default function Cost() {
         </div>
       </div>
 
-      {/* Model Breakdown */}
+      {/* Model Breakdown Table */}
       <div className="card overflow-hidden animate-slide-in-up rounded-2xl" style={{ animationDelay: '300ms' }}>
         <div className="px-5 py-4 border-b" style={{ borderColor: 'var(--pc-border)' }}>
-          <h3 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('cost.model_breakdown')}</h3>
+          <h3 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>
+            {t('cost.model_breakdown')}
+          </h3>
         </div>
         {models.length === 0 ? (
-          <div className="p-8 text-center" style={{ color: 'var(--pc-text-faint)' }}>{t('cost.no_model_data')}</div>
+          <div className="p-8 text-center" style={{ color: 'var(--pc-text-faint)' }}>
+            {t('cost.no_model_data')}
+          </div>
         ) : (
           <div className="overflow-x-auto">
             <table className="table-electric">
@@ -98,16 +111,29 @@ export default function Cost() {
                   const share = cost.monthly_cost_usd > 0 ? (m.cost_usd / cost.monthly_cost_usd) * 100 : 0;
                   return (
                     <tr key={m.model}>
-                      <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>{m.model}</td>
-                      <td className="text-right font-mono text-sm" style={{ color: 'var(--pc-text-secondary)' }}>{formatUSD(m.cost_usd)}</td>
-                      <td className="text-right text-sm" style={{ color: 'var(--pc-text-secondary)' }}>{m.total_tokens.toLocaleString()}</td>
-                      <td className="text-right text-sm" style={{ color: 'var(--pc-text-secondary)' }}>{m.request_count.toLocaleString()}</td>
+                      <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>
+                        {m.model}
+                      </td>
+                      <td className="text-right font-mono text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
+                        {formatUSD(m.cost_usd)}
+                      </td>
+                      <td className="text-right text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
+                        {m.total_tokens.toLocaleString()}
+                      </td>
+                      <td className="text-right text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
+                        {m.request_count.toLocaleString()}
+                      </td>
                       <td>
                         <div className="flex items-center gap-2">
                           <div className="w-20 h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--pc-hover)' }}>
-                            <div className="h-full rounded-full progress-bar-animated transition-all duration-700" style={{ width: `${Math.max(share, 2)}%`, background: 'var(--pc-accent)' }} />
+                            <div
+                              className="h-full rounded-full progress-bar-animated transition-all duration-700"
+                              style={{ width: `${Math.max(share, 2)}%`, background: 'var(--pc-accent)' }}
+                            />
                           </div>
-                          <span className="text-xs font-mono w-10 text-right" style={{ color: 'var(--pc-text-muted)' }}>{share.toFixed(1)}%</span>
+                          <span className="text-xs font-mono w-10 text-right" style={{ color: 'var(--pc-text-muted)' }}>
+                            {share.toFixed(1)}%
+                          </span>
                         </div>
                       </td>
                     </tr>

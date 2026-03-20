@@ -9,6 +9,7 @@ type ConcreteTheme = 'dark' | 'light' | 'oled';
 const themes: Record<ConcreteTheme, Record<string, string>> = {
   dark: {
     '--pc-bg-base': '#1e1e24',
+    '--color-scheme': 'dark',
     '--pc-bg-surface': '#232329',
     '--pc-bg-elevated': '#27272a',
     '--pc-bg-input': '#1a1a20',
@@ -29,6 +30,7 @@ const themes: Record<ConcreteTheme, Record<string, string>> = {
   },
   light: {
     '--pc-bg-base': '#f4f4f5',
+    '--color-scheme': 'light',
     '--pc-bg-surface': '#ffffff',
     '--pc-bg-elevated': '#e4e4e7',
     '--pc-bg-input': '#ffffff',
@@ -49,6 +51,7 @@ const themes: Record<ConcreteTheme, Record<string, string>> = {
   },
   oled: {
     '--pc-bg-base': '#000000',
+    '--color-scheme': 'dark',
     '--pc-bg-surface': '#0a0a0a',
     '--pc-bg-elevated': '#141414',
     '--pc-bg-input': '#0a0a0a',
@@ -117,7 +120,11 @@ const accents: Record<AccentColor, Record<string, string>> = {
 function applyVars(vars: Record<string, string>) {
   const root = document.documentElement;
   for (const [k, v] of Object.entries(vars)) {
-    root.style.setProperty(k, v);
+    if (k === '--color-scheme') {
+      root.style.colorScheme = v as 'light' | 'dark';
+    } else {
+      root.style.setProperty(k, v);
+    }
   }
 }
 

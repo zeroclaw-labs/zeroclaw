@@ -15,7 +15,8 @@ export default function Layout() {
       <div className="ml-60 flex flex-col min-h-screen">
         <Header />
 
-        {/* Page content */}
+        {/* Page content — ErrorBoundary keyed by pathname so the nav shell
+            survives a page crash and the boundary resets on route change */}
         <main className="flex-1 overflow-y-auto">
           <ErrorBoundary key={pathname}>
             <Outlet />

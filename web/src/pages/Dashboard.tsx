@@ -91,14 +91,7 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div
-          className="rounded-2xl border p-4"
-          style={{
-            background: 'rgba(239, 68, 68, 0.08)',
-            borderColor: 'rgba(239, 68, 68, 0.2)',
-            color: '#f87171',
-          }}
-        >
+        <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171', }}>
           {t('dashboard.load_error')}: {error}
         </div>
       </div>
@@ -108,10 +101,7 @@ export default function Dashboard() {
   if (!status || !cost) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div
-          className="h-8 w-8 border-2 rounded-full animate-spin"
-          style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
-        />
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}/>
       </div>
     );
   }
@@ -122,32 +112,18 @@ export default function Dashboard() {
     <div className="p-6 space-y-6 animate-fade-in">
       {/* Status Cards Grid */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
-        {STATUS_CARDS.map(({ icon: Icon, accent, labelKey, getValue, getSub }) => {
-          return (
+        {STATUS_CARDS.map(({ icon: Icon, accent, labelKey, getValue, getSub }) => (
             <div key={labelKey} className="card p-5 animate-slide-in-up">
               <div className="flex items-center gap-3 mb-3">
-                <div
-                  className="p-2 rounded-2xl"
-                  style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: accent }}
-                >
+                <div className="p-2 rounded-2xl" style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: accent }}>
                   <Icon className="h-5 w-5" />
                 </div>
-                <span
-                  className="text-xs uppercase tracking-wider font-medium"
-                  style={{ color: 'var(--pc-text-muted)' }}
-                >
-                  {t(labelKey)}
-                </span>
+                <span className="text-xs uppercase tracking-wider font-medium" style={{ color: 'var(--pc-text-muted)' }}>{t(labelKey)}</span>
               </div>
-              <p className="text-lg font-semibold truncate capitalize" style={{ color: 'var(--pc-text-primary)' }}>
-                {getValue(status)}
-              </p>
-              <p className="text-sm truncate" style={{ color: 'var(--pc-text-muted)' }}>
-                {getSub(status)}
-              </p>
+              <p className="text-lg font-semibold truncate capitalize" style={{ color: 'var(--pc-text-primary)' }}>{getValue(status)}</p>
+              <p className="text-sm truncate" style={{ color: 'var(--pc-text-muted)' }}>{getSub(status)}</p>
             </div>
-          );
-        })}
+        ))}
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 stagger-children">
@@ -155,12 +131,7 @@ export default function Dashboard() {
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
             <DollarSign className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-            <h2
-              className="text-sm font-semibold uppercase tracking-wider"
-              style={{ color: 'var(--pc-text-primary)' }}
-            >
-              {t('dashboard.cost_overview')}
-            </h2>
+            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('dashboard.cost_overview')}</h2>
           </div>
           <div className="space-y-4">
             {[
@@ -171,17 +142,9 @@ export default function Dashboard() {
               <div key={label}>
                 <div className="flex justify-between text-sm mb-1.5">
                   <span style={{ color: 'var(--pc-text-muted)' }}>{label}</span>
-                  <span
-                    className="font-medium font-mono"
-                    style={{ color: 'var(--pc-text-primary)' }}
-                  >
-                    {formatUSD(value)}
-                  </span>
+                  <span className="font-medium font-mono" style={{ color: 'var(--pc-text-primary)' }}>{formatUSD(value)}</span>
                 </div>
-                <div
-                  className="w-full h-1.5 rounded-full overflow-hidden"
-                  style={{ background: 'var(--pc-hover)' }}
-                >
+                <div className="w-full h-1.5 rounded-full overflow-hidden" style={{ background: 'var(--pc-hover)' }}>
                   <div
                     className="h-full rounded-full progress-bar-animated transition-all duration-700 ease-out"
                     style={{ width: `${Math.max((value / maxCost) * 100, 2)}%`, background: color }}
@@ -192,15 +155,11 @@ export default function Dashboard() {
           </div>
           <div className="mt-5 pt-4 border-t flex justify-between text-sm" style={{ borderColor: 'var(--pc-border)' }}>
             <span style={{ color: 'var(--pc-text-muted)' }}>{t('dashboard.total_tokens_label')}</span>
-            <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
-              {cost.total_tokens.toLocaleString()}
-            </span>
+            <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>{cost.total_tokens.toLocaleString()}</span>
           </div>
           <div className="flex justify-between text-sm mt-1">
             <span style={{ color: 'var(--pc-text-muted)' }}>{t('dashboard.requests_label')}</span>
-            <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>
-              {cost.request_count.toLocaleString()}
-            </span>
+            <span className="font-mono" style={{ color: 'var(--pc-text-primary)' }}>{cost.request_count.toLocaleString()}</span>
           </div>
         </div>
 
@@ -208,18 +167,11 @@ export default function Dashboard() {
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
             <Radio className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-            <h2
-              className="text-sm font-semibold uppercase tracking-wider"
-              style={{ color: 'var(--pc-text-primary)' }}
-            >
-              {t('dashboard.active_channels')}
-            </h2>
+            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('dashboard.active_channels')}</h2>
           </div>
           <div className="space-y-2">
             {Object.entries(status.channels).length === 0 ? (
-              <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>
-                {t('dashboard.no_channels')}
-              </p>
+              <p className="text-sm" style={{ color: 'var(--pc-text-faint)' }}>{t('dashboard.no_channels')}</p>
             ) : (
               Object.entries(status.channels).map(([name, active]) => (
                 <div
@@ -254,18 +206,11 @@ export default function Dashboard() {
         <div className="card p-5 animate-slide-in-up">
           <div className="flex items-center gap-2 mb-5">
             <Activity className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-            <h2
-              className="text-sm font-semibold uppercase tracking-wider"
-              style={{ color: 'var(--pc-text-primary)' }}
-            >
-              {t('dashboard.component_health')}
-            </h2>
+            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('dashboard.component_health')}</h2>
           </div>
           <div className="grid grid-cols-2 gap-3">
             {Object.entries(status.health.components).length === 0 ? (
-              <p className="text-sm col-span-2" style={{ color: 'var(--pc-text-faint)' }}>
-                {t('dashboard.no_components')}
-              </p>
+              <p className="text-sm col-span-2" style={{ color: 'var(--pc-text-faint)' }}>{t('dashboard.no_components')}</p>
             ) : (
               Object.entries(status.health.components).map(([name, comp]) => (
                 <div
@@ -279,23 +224,12 @@ export default function Dashboard() {
                   onMouseLeave={(e) => { e.currentTarget.style.transform = 'scale(1)'; }}
                 >
                   <div className="flex items-center gap-2 mb-1">
-                    <span
-                      className="status-dot"
-                      style={{
-                        background: healthColor(comp.status),
-                        boxShadow: `0 0 6px ${healthColor(comp.status)}`,
-                      }}
-                    />
-                    <span
-                      className="text-sm font-medium truncate capitalize"
-                      style={{ color: 'var(--pc-text-primary)' }}
-                    >
+                    <span className="status-dot" style={{ background: healthColor(comp.status), boxShadow: `0 0 6px ${healthColor(comp.status)}`, }}/>
+                    <span className="text-sm font-medium truncate capitalize" style={{ color: 'var(--pc-text-primary)' }}>
                       {name}
                     </span>
                   </div>
-                  <p className="text-xs capitalize" style={{ color: 'var(--pc-text-muted)' }}>
-                    {comp.status}
-                  </p>
+                  <p className="text-xs capitalize" style={{ color: 'var(--pc-text-muted)' }}>{comp.status}</p>
                   {comp.restart_count > 0 && (
                     <p className="text-xs mt-1" style={{ color: 'var(--color-status-warning)' }}>
                       {t('dashboard.restarts')}: {comp.restart_count}

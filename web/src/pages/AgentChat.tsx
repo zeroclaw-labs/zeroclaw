@@ -29,6 +29,7 @@ export default function AgentChat() {
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const pendingContentRef = useRef('');
 
+  // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
@@ -177,21 +178,12 @@ export default function AgentChat() {
     });
   }, []);
 
-  const isUser = (role: string) => role === 'user';
-
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
-      {/* Connection error banner */}
+      {/* Connection status bar */}
       {error && (
-        <div
-          className="px-4 py-2 border-b flex items-center gap-2 text-sm animate-fade-in"
-          style={{
-            background: 'rgba(239, 68, 68, 0.08)',
-            borderColor: 'rgba(239, 68, 68, 0.2)',
-            color: '#f87171',
-          }}
-        >
-          <AlertCircle className="h-4 w-4 flex-shrink-0" />
+        <div className="px-4 py-2 border-b flex items-center gap-2 text-sm animate-fade-in" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171', }}>
+          <AlertCircle className="h-4 w-4 shrink-0" />
           {error}
         </div>
       )}
@@ -199,22 +191,12 @@ export default function AgentChat() {
       {/* Messages area */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
         {messages.length === 0 && (
-          <div
-            className="flex flex-col items-center justify-center h-full text-center animate-fade-in"
-            style={{ color: 'var(--pc-text-muted)' }}
-          >
-            <div
-              className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float"
-              style={{ background: 'var(--pc-accent-glow)' }}
-            >
+          <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
+            <div className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float" style={{ background: 'var(--pc-accent-glow)' }}>
               <Bot className="h-8 w-8" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            <p className="text-lg font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>
-              ZeroClaw Agent
-            </p>
-            <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
-              {t('agent.start_conversation')}
-            </p>
+            <p className="text-lg font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>ZeroClaw Agent</p>
+            <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>{t('agent.start_conversation')}</p>
           </div>
         )}
 
@@ -222,64 +204,43 @@ export default function AgentChat() {
           <div
             key={msg.id}
             className={`group flex items-start gap-3 ${
-              isUser(msg.role) ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
+              msg.role === 'user' ? 'flex-row-reverse animate-slide-in-right' : 'animate-slide-in-left'
             }`}
             style={{ animationDelay: `${Math.min(idx * 30, 200)}ms` }}
           >
-            {/* Avatar */}
             <div
               className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
               style={{
-                background: isUser(msg.role) ? 'var(--pc-accent)' : 'var(--pc-bg-elevated)',
-                borderColor: isUser(msg.role) ? 'var(--pc-accent)' : 'var(--pc-border)',
+                background: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-bg-elevated)',
+                borderColor: msg.role === 'user' ? 'var(--pc-accent)' : 'var(--pc-border)',
               }}
             >
-              {isUser(msg.role) ? (
+              {msg.role === 'user' ? (
                 <User className="h-4 w-4 text-white" />
               ) : (
                 <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
               )}
             </div>
-
-            {/* Bubble */}
             <div className="relative max-w-[75%]">
               <div
                 className="rounded-2xl px-4 py-3 border"
                 style={
-                  isUser(msg.role)
-                    ? {
-                        background: 'var(--pc-accent-glow)',
-                        borderColor: 'var(--pc-accent-dim)',
-                        color: 'var(--pc-text-primary)',
-                      }
-                    : {
-                        background: 'var(--pc-bg-elevated)',
-                        borderColor: 'var(--pc-border)',
-                        color: 'var(--pc-text-primary)',
-                      }
+                  msg.role === 'user'
+                    ? { background: 'var(--pc-accent-glow)', borderColor: 'var(--pc-accent-dim)', color: 'var(--pc-text-primary)', }
+                    : { background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)', }
                 }
               >
-                <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">
-                  {msg.content}
-                </p>
+                <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
                 <p
-                  className="text-[10px] mt-1.5"
-                  style={{ color: isUser(msg.role) ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}
-                >
+                  className="text-[10px] mt-1.5" style={{ color: msg.role === 'user' ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}>
                   {msg.timestamp.toLocaleTimeString()}
                 </p>
               </div>
-
-              {/* Copy button — hover reveal */}
               <button
                 onClick={() => handleCopy(msg.id, msg.content)}
                 aria-label={t('agent.copy_message')}
                 className="absolute top-1 right-1 opacity-0 group-hover:opacity-100 transition-all p-1.5 rounded-xl"
-                style={{
-                  background: 'var(--pc-bg-elevated)',
-                  border: '1px solid var(--pc-border)',
-                  color: 'var(--pc-text-muted)',
-                }}
+                style={{ background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)', color: 'var(--pc-text-muted)', }}
                 onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-text-primary)'; e.currentTarget.style.borderColor = 'var(--pc-accent-dim)'; }}
                 onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.borderColor = 'var(--pc-border)'; }}
               >
@@ -293,19 +254,12 @@ export default function AgentChat() {
           </div>
         ))}
 
-        {/* Typing indicator */}
         {typing && (
           <div className="flex items-start gap-3 animate-fade-in">
-            <div
-              className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border"
-              style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}
-            >
+            <div className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
               <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            <div
-              className="rounded-2xl px-4 py-3 border flex items-center gap-1.5"
-              style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}
-            >
+            <div className="rounded-2xl px-4 py-3 border flex items-center gap-1.5" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
               <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
               <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
               <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
@@ -317,13 +271,7 @@ export default function AgentChat() {
       </div>
 
       {/* Input area */}
-      <div
-        className="border-t p-4"
-        style={{
-          borderColor: 'var(--pc-border)',
-          background: 'var(--pc-bg-surface)',
-        }}
-      >
+      <div className="border-t p-4" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
         <div className="flex items-center gap-3 max-w-4xl mx-auto">
           <textarea
             ref={inputRef}
@@ -346,8 +294,6 @@ export default function AgentChat() {
             <Send className="h-5 w-5" />
           </button>
         </div>
-
-        {/* Connection status */}
         <div className="flex items-center justify-center mt-2 gap-2">
           <span
             className="status-dot"

@@ -1,5 +1,12 @@
 import { useState, useEffect } from 'react';
-import { Wrench, Search, ChevronDown, ChevronRight, Terminal, Package } from 'lucide-react';
+import {
+  Wrench,
+  Search,
+  ChevronDown,
+  ChevronRight,
+  Terminal,
+  Package,
+} from 'lucide-react';
 import type { ToolSpec, CliTool } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
 import { t } from '@/lib/i18n';
@@ -29,19 +36,23 @@ export default function Tools() {
     t.category.toLowerCase().includes(search.toLowerCase()),
   );
 
-  if (error) return (
-    <div className="p-6 animate-fade-in">
-      <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
-        {t('tools.load_error')}: {error}
+  if (error) {
+    return (
+      <div className="p-6 animate-fade-in">
+        <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+          {t('tools.load_error')}: {error}
+        </div>
       </div>
-    </div>
-  );
+    );
+  }
 
-  if (loading) return (
-    <div className="flex items-center justify-center h-64">
-      <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
-    </div>
-  );
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+      </div>
+    );
+  }
 
   return (
     <div className="p-6 space-y-6 animate-fade-in">
@@ -73,7 +84,10 @@ export default function Tools() {
             {filtered.map((tool) => {
               const isExpanded = expandedTool === tool.name;
               return (
-                <div key={tool.name} className="card overflow-hidden animate-slide-in-up">
+                <div
+                  key={tool.name}
+                  className="card overflow-hidden animate-slide-in-up"
+                >
                   <button
                     onClick={() => setExpandedTool(isExpanded ? null : tool.name)}
                     className="w-full text-left p-4 transition-all"
@@ -86,9 +100,14 @@ export default function Tools() {
                         <Package className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} />
                         <h3 className="text-sm font-semibold truncate" style={{ color: 'var(--pc-text-primary)' }}>{tool.name}</h3>
                       </div>
-                      {isExpanded ? <ChevronDown className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} /> : <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-faint)' }} />}
+                      {isExpanded
+                        ? <ChevronDown className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} />
+                        : <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-faint)' }} />
+                      }
                     </div>
-                    <p className="text-sm mt-2 line-clamp-2" style={{ color: 'var(--pc-text-muted)' }}>{tool.description}</p>
+                    <p className="text-sm mt-2 line-clamp-2" style={{ color: 'var(--pc-text-muted)' }}>
+                      {tool.description}
+                    </p>
                   </button>
 
                   {isExpanded && tool.parameters && (
@@ -96,10 +115,7 @@ export default function Tools() {
                       <p className="text-[10px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--pc-text-muted)' }}>
                         {t('tools.parameter_schema')}
                       </p>
-                      <pre
-                        className="text-xs rounded-xl p-3 overflow-x-auto max-h-64 overflow-y-auto font-mono"
-                        style={{ background: 'var(--pc-bg-base)', color: 'var(--pc-text-secondary)' }}
-                      >
+                      <pre className="text-xs rounded-xl p-3 overflow-x-auto max-h-64 overflow-y-auto font-mono" style={{ background: 'var(--pc-bg-base)', color: 'var(--pc-text-secondary)' }}>
                         {JSON.stringify(tool.parameters, null, 2)}
                       </pre>
                     </div>
@@ -111,7 +127,7 @@ export default function Tools() {
         )}
       </div>
 
-      {/* CLI Tools */}
+      {/* CLI Tools Section */}
       {filteredCli.length > 0 && (
         <div className="animate-slide-in-up" style={{ animationDelay: '200ms' }}>
           <div className="flex items-center gap-2 mb-4">
@@ -134,9 +150,15 @@ export default function Tools() {
               <tbody>
                 {filteredCli.map((tool) => (
                   <tr key={tool.name}>
-                    <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>{tool.name}</td>
-                    <td className="font-mono text-xs truncate max-w-[200px]" style={{ color: 'var(--pc-text-muted)' }}>{tool.path}</td>
-                    <td style={{ color: 'var(--pc-text-muted)' }}>{tool.version ?? '-'}</td>
+                    <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>
+                      {tool.name}
+                    </td>
+                    <td className="font-mono text-xs truncate max-w-[200px]" style={{ color: 'var(--pc-text-muted)' }}>
+                      {tool.path}
+                    </td>
+                    <td style={{ color: 'var(--pc-text-muted)' }}>
+                      {tool.version ?? '-'}
+                    </td>
                     <td>
                       <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold capitalize border" style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-secondary)', background: 'var(--pc-accent-glow)' }}>
                         {tool.category}

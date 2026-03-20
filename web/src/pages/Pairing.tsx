@@ -22,50 +22,73 @@ export default function Pairing() {
 
   const fetchDevices = useCallback(async () => {
     try {
-      const res = await fetch('/api/devices', { headers: { Authorization: `Bearer ${token}` } });
+      const res = await fetch('/api/devices', {
+        headers: { Authorization: `Bearer ${token}` },
+      });
       if (res.ok) {
         const data = await res.json();
         setDevices(data.devices || []);
       }
-    } catch {
+    } catch (err) {
       setError('Failed to load devices');
     } finally {
       setLoading(false);
     }
   }, [token]);
 
+  // Fetch the current pairing code on mount (if one is active)
   useEffect(() => {
     getAdminPairCode()
-      .then((data) => { if (data.pairing_code) setPairingCode(data.pairing_code); })
-      .catch(() => {});
+      .then((data) => {
+        if (data.pairing_code) {
+          setPairingCode(data.pairing_code);
+        }
+      })
+      .catch(() => {
+        // Admin endpoint not reachable — code will show after clicking "Pair New Device"
+      });
   }, []);
 
   useEffect(() => { fetchDevices(); }, [fetchDevices]);
 
   const handleInitiatePairing = async () => {
     try {
-      const res = await fetch('/api/pairing/initiate', { method: 'POST', headers: { Authorization: `Bearer ${token}` } });
-      if (res.ok) { const data = await res.json(); setPairingCode(data.pairing_code); }
-      else setError('Failed to generate pairing code');
-    } catch {
+      const res = await fetch('/api/pairing/initiate', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setPairingCode(data.pairing_code);
+      } else {
+        setError('Failed to generate pairing code');
+      }
+    } catch (err) {
       setError('Failed to generate pairing code');
     }
   };
 
   const handleRevokeDevice = async (deviceId: string) => {
     try {
-      const res = await fetch(`/api/devices/${deviceId}`, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
-      if (res.ok) setDevices((prev) => prev.filter((d) => d.id !== deviceId));
-    } catch {
+      const res = await fetch(`/api/devices/${deviceId}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        setDevices(devices.filter(d => d.id !== deviceId));
+      }
+    } catch (err) {
       setError('Failed to revoke device');
     }
   };
 
-  if (loading) return (
-    <div className="flex items-center justify-center h-64">
-      <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
-    </div>
-  );
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+      </div>
+    );
+  }
 
   return (
     <div className="p-6 space-y-6 animate-fade-in">
@@ -73,7 +96,10 @@ export default function Pairing() {
         <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>
           {t('pairing.title')}
         </h2>
-        <button onClick={handleInitiatePairing} className="btn-electric flex items-center gap-2 text-sm px-4 py-2">
+        <button
+          onClick={handleInitiatePairing}
+          className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
+        >
           <Smartphone className="h-4 w-4" />
           {t('pairing.pair_new_device')}
         </button>
@@ -122,11 +148,20 @@ export default function Pairing() {
                 <tr key={device.id}>
                   <td style={{ color: 'var(--pc-text-primary)' }}>{device.name || 'Unnamed'}</td>
                   <td style={{ color: 'var(--pc-text-secondary)' }}>{device.device_type || 'Unknown'}</td>
-                  <td className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>{new Date(device.paired_at).toLocaleDateString()}</td>
-                  <td className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>{new Date(device.last_seen).toLocaleString()}</td>
-                  <td className="font-mono text-xs" style={{ color: 'var(--pc-text-secondary)' }}>{device.ip_address || '-'}</td>
+                  <td className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+                    {new Date(device.paired_at).toLocaleDateString()}
+                  </td>
+                  <td className="text-xs" style={{ color: 'var(--pc-text-muted)' }}>
+                    {new Date(device.last_seen).toLocaleString()}
+                  </td>
+                  <td className="font-mono text-xs" style={{ color: 'var(--pc-text-secondary)' }}>
+                    {device.ip_address || '-'}
+                  </td>
                   <td className="text-right">
-                    <button onClick={() => handleRevokeDevice(device.id)} className="btn-icon">
+                    <button
+                      onClick={() => handleRevokeDevice(device.id)}
+                      className="btn-icon"
+                    >
                       <Trash2 className="h-4 w-4" />
                     </button>
                   </td>
