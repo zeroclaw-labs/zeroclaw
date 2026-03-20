@@ -233,14 +233,26 @@ impl Default for ActivatedToolSet {
 
 /// Build the `<available-deferred-tools>` section for the system prompt.
 /// Lists only tool names so the LLM knows what is available without
-/// consuming context window on full schemas.
+/// consuming context window on full schemas. Includes an instruction
+/// block that tells the LLM to call `tool_search` to activate them.
 pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
     if deferred.is_empty() {
         return String::new();
     }
-    let mut out = String::from("<available-deferred-tools>\n");
+    let mut out = String::new();
+    out.push_str("## Deferred Tools\n\n");
+    out.push_str(
+        "The tools listed below are available but NOT yet loaded. \
+         To use any of them you MUST first call the `tool_search` tool \
+         to fetch their full schemas. Use `\"select:name1,name2\"` for \
+         exact tools or keywords to search. Once activated, the tools \
+         become callable for the rest of the conversation.\n\n",
+    );
+    out.push_str("<available-deferred-tools>\n");
     for stub in &deferred.stubs {
         out.push_str(&stub.prefixed_name);
+        out.push_str(" - ");
+        out.push_str(&stub.description);
         out.push('\n');
     }
     out.push_str("</available-deferred-tools>\n");
@@ -411,9 +423,58 @@ mod tests {
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("<available-deferred-tools>"));
-        assert!(section.contains("fs__read_file"));
-        assert!(section.contains("git__status"));
+        assert!(section.contains("fs__read_file - Read a file"));
+        assert!(section.contains("git__status - Git status"));
         assert!(section.contains("</available-deferred-tools>"));
+    }
+
+    #[test]
+    fn build_deferred_section_includes_tool_search_instruction() {
+        let stubs = vec![make_stub("fs__read_file", "Read a file")];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+        };
+        let section = build_deferred_tools_section(&set);
+        assert!(
+            section.contains("tool_search"),
+            "deferred section must instruct the LLM to use tool_search"
+        );
+        assert!(
+            section.contains("## Deferred Tools"),
+            "deferred section must include a heading"
+        );
+    }
+
+    #[test]
+    fn build_deferred_section_multiple_servers() {
+        let stubs = vec![
+            make_stub("server_a__list", "List items"),
+            make_stub("server_a__create", "Create item"),
+            make_stub("server_b__query", "Query records"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+        };
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("server_a__list"));
+        assert!(section.contains("server_a__create"));
+        assert!(section.contains("server_b__query"));
+        assert!(
+            section.contains("tool_search"),
+            "section must mention tool_search for multi-server setups"
+        );
     }
 
     #[test]
@@ -456,5 +517,36 @@ mod tests {
         };
         assert!(set.get_by_name("a__one").is_some());
         assert!(set.get_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn search_across_multiple_servers() {
+        let stubs = vec![
+            make_stub("server_a__read_file", "Read a file from disk"),
+            make_stub("server_b__read_config", "Read configuration from database"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+        };
+
+        // "read" should match stubs from both servers
+        let results = set.search("read", 10);
+        assert_eq!(results.len(), 2);
+
+        // "file" should match only server_a
+        let results = set.search("file", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].prefixed_name, "server_a__read_file");
+
+        // "config database" should rank server_b highest (2 hits)
+        let results = set.search("config database", 10);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].prefixed_name, "server_b__read_config");
     }
 }
