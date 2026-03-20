@@ -409,6 +409,30 @@ Notes:
 
 - Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
 
+### `[memory.mem0]`
+
+Mem0 (OpenMemory) backend — connects to a self-hosted mem0 server for vector-based memory with LLM-powered fact extraction. Requires feature flag `memory-mem0` at build time and `backend = "mem0"` in config.
+
+| Key | Default | Env var | Purpose |
+|---|---|---|---|
+| `url` | `http://localhost:8765` | `MEM0_URL` | OpenMemory server URL |
+| `user_id` | `zeroclaw` | `MEM0_USER_ID` | User ID for scoping memories |
+| `app_name` | `zeroclaw` | `MEM0_APP_NAME` | Application name registered in mem0 |
+| `infer` | `true` | — | Use LLM to extract facts from stored text (`true`) or store raw (`false`) |
+| `extraction_prompt` | unset | `MEM0_EXTRACTION_PROMPT` | Custom prompt for LLM fact extraction (e.g. for non-English content) |
+
+```toml
+[memory]
+backend = "mem0"
+
+[memory.mem0]
+url = "http://192.168.0.171:8765"
+user_id = "zeroclaw-bot"
+extraction_prompt = "Extract facts in the original language..."
+```
+
+Server deployment scripts are in `deploy/mem0/`.
+
 ## `[[model_routes]]` and `[[embedding_routes]]`
 
 Use route hints so integrations can keep stable names while model IDs evolve.

@@ -3675,6 +3675,12 @@ pub struct Mem0Config {
     /// stored text (`infer = true`) or store raw text as-is (`false`).
     #[serde(default = "default_mem0_infer")]
     pub infer: bool,
+    /// Custom prompt for guiding LLM-based fact extraction when `infer = true`.
+    /// Useful for non-English content (e.g. Cantonese/Chinese).
+    /// Falls back to `MEM0_EXTRACTION_PROMPT` env var.
+    /// If unset, the mem0 server uses its built-in default prompt.
+    #[serde(default = "default_mem0_extraction_prompt")]
+    pub extraction_prompt: Option<String>,
 }
 
 fn default_mem0_url() -> String {
@@ -3689,6 +3695,11 @@ fn default_mem0_app_name() -> String {
 fn default_mem0_infer() -> bool {
     true
 }
+fn default_mem0_extraction_prompt() -> Option<String> {
+    std::env::var("MEM0_EXTRACTION_PROMPT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
 
 impl Default for Mem0Config {
     fn default() -> Self {
@@ -3697,6 +3708,7 @@ impl Default for Mem0Config {
             user_id: default_mem0_user_id(),
             app_name: default_mem0_app_name(),
             infer: default_mem0_infer(),
+            extraction_prompt: default_mem0_extraction_prompt(),
         }
     }
 }

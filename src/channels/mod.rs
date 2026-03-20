@@ -250,6 +250,7 @@ enum ChannelRuntimeCommand {
     EmotionList,
     EmotionShow(String),
     EmotionRemove(String),
+    EmotionGen(String),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -783,6 +784,14 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                         Some(ChannelRuntimeCommand::EmotionList)
                     } else {
                         Some(ChannelRuntimeCommand::EmotionShow(emotion))
+                    }
+                }
+                "gen" | "generate" => {
+                    let emotion = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+                    if emotion.is_empty() {
+                        Some(ChannelRuntimeCommand::EmotionList)
+                    } else {
+                        Some(ChannelRuntimeCommand::EmotionGen(emotion))
                     }
                 }
                 "remove" => {
@@ -1660,6 +1669,111 @@ async fn handle_runtime_command_if_needed(
                 format!("[IMAGE:{}]", sticker_path.display())
             } else {
                 format!("No cached sticker for '{emotion}'.")
+            }
+        }
+        ChannelRuntimeCommand::EmotionGen(emotion) => {
+            use crate::agent::loop_::EMOTION_LABELS;
+
+            if EMOTION_LABELS.contains(&emotion.as_str()) {
+                let cfg = &ctx.emotion_sticker_config;
+                let sticker_dir = ctx.workspace_dir.join(&cfg.sticker_dir);
+                let sticker_path = sticker_dir.join(format!("{emotion}.png"));
+
+                // Remove cached sticker so we always regenerate
+                let _ = std::fs::remove_file(&sticker_path);
+
+                let gen_image_tool: Option<&dyn crate::tools::traits::Tool> = ctx
+                    .tools_registry
+                    .iter()
+                    .find(|t| t.name() == "gen_image")
+                    .map(|t| t.as_ref());
+
+                if let Some(tool) = gen_image_tool {
+                    let _ = tokio::fs::create_dir_all(&sticker_dir).await;
+
+                    let backend = if cfg.emotion_image_backend.is_empty() {
+                        cfg.image_generation_default_backend.clone()
+                    } else {
+                        cfg.emotion_image_backend.clone()
+                    };
+
+                    let prompt = format!(
+                        "{emotion} expression, {style}",
+                        style = cfg.sticker_style
+                    );
+
+                    let mut args = serde_json::json!({
+                        "prompt": prompt,
+                        "output_path": sticker_path.to_string_lossy(),
+                        "backend": backend,
+                    });
+                    if !cfg.sticker_negative_prompt.is_empty() {
+                        args["negative_prompt"] =
+                            serde_json::Value::String(cfg.sticker_negative_prompt.clone());
+                    }
+
+                    tracing::info!(
+                        emotion = %emotion,
+                        backend = %backend,
+                        prompt = %prompt,
+                        output_path = %sticker_path.display(),
+                        "Emotion gen command: generating sticker"
+                    );
+
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(120),
+                        tool.execute(args),
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) => {
+                            tracing::info!(
+                                emotion = %emotion,
+                                success = result.success,
+                                output = %result.output,
+                                error = ?result.error,
+                                file_exists = sticker_path.exists(),
+                                "Emotion gen command: gen_image returned"
+                            );
+                            if result.success && sticker_path.exists() {
+                                format!(
+                                    "Generated '{emotion}' sticker ✓\n[IMAGE:{}]",
+                                    sticker_path.display()
+                                )
+                            } else {
+                                let err_detail = result
+                                    .error
+                                    .as_deref()
+                                    .unwrap_or(&result.output);
+                                format!(
+                                    "gen_image returned but no file produced for '{emotion}'.\nDetail: {err_detail}"
+                                )
+                            }
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                emotion = %emotion,
+                                error = %e,
+                                "Emotion gen command: gen_image error"
+                            );
+                            format!("gen_image failed for '{emotion}': {e}")
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                emotion = %emotion,
+                                "Emotion gen command: gen_image timed out"
+                            );
+                            format!("gen_image timed out for '{emotion}' (120s)")
+                        }
+                    }
+                } else {
+                    "gen_image tool not found in tools registry.".to_string()
+                }
+            } else {
+                format!(
+                    "Unknown emotion '{emotion}'. Valid: {}",
+                    EMOTION_LABELS.join(", ")
+                )
             }
         }
         ChannelRuntimeCommand::EmotionRemove(emotion) => {
@@ -2542,25 +2656,33 @@ async fn process_channel_message(
     let is_group_chat =
         msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
 
-    let sender_memory = build_memory_context(
+    let mem_recall_start = Instant::now();
+    let sender_memory_fut = build_memory_context(
         ctx.memory.as_ref(),
         &msg.content,
         ctx.min_relevance_score,
         Some(&msg.sender),
-    )
-    .await;
+    );
 
-    let group_memory = if is_group_chat {
-        build_memory_context(
+    let (sender_memory, group_memory) = if is_group_chat {
+        let group_memory_fut = build_memory_context(
             ctx.memory.as_ref(),
             &msg.content,
             ctx.min_relevance_score,
             Some(&history_key),
-        )
-        .await
+        );
+        tokio::join!(sender_memory_fut, group_memory_fut)
     } else {
-        String::new()
+        (sender_memory_fut.await, String::new())
     };
+    #[allow(clippy::cast_possible_truncation)]
+    let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        mem_recall_ms,
+        sender_empty = sender_memory.is_empty(),
+        group_empty = group_memory.is_empty(),
+        "⏱ Memory recall completed"
+    );
 
     // Merge sender + group memories, avoiding duplicates
     let memory_context = if group_memory.is_empty() {
@@ -2803,6 +2925,10 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let llm_call_start = Instant::now();
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
+    tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -2855,6 +2981,12 @@ async fn process_channel_message(
     if let Some(handle) = notify_task {
         let _ = handle.await;
     }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let llm_call_ms = llm_call_start.elapsed().as_millis() as u64;
+    #[allow(clippy::cast_possible_truncation)]
+    let total_ms = started_at.elapsed().as_millis() as u64;
+    tracing::info!(llm_call_ms, total_ms, "⏱ LLM call completed");
 
     if let Some(token) = typing_cancellation.as_ref() {
         token.cancel();
@@ -2965,11 +3097,12 @@ async fn process_channel_message(
                 sanitized_response
             };
 
-            // ── Emotion sticker post-processing ────────────────────────
-            if !delivered_response.is_empty() {
+            // ── Emotion sticker — resolved async AFTER text reply ──────
+            let emotion_enabled = if delivered_response.is_empty() {
+                false
+            } else {
                 let chat_key = conversation_history_key(&msg);
-                let emotion_enabled = ctx
-                    .emotion_overrides
+                ctx.emotion_overrides
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .get(&chat_key)
@@ -2978,17 +3111,8 @@ async fn process_channel_message(
                         ctx.emotion_sticker_config
                             .enabled
                             .load(portable_atomic::Ordering::Relaxed)
-                    });
-                if emotion_enabled {
-                    delivered_response = crate::agent::loop_::append_emotion_sticker(
-                        &delivered_response,
-                        &ctx.emotion_sticker_config,
-                        &ctx.workspace_dir,
-                        ctx.tools_registry.as_ref(),
-                    )
-                    .await;
-                }
-            }
+                    })
+            };
 
             // Strip [IMAGE:path] markers that point to non-existent local files.
             // This prevents hallucinated or stale paths from leaking into the
@@ -3057,46 +3181,27 @@ async fn process_channel_message(
                 truncate_with_ellipsis(&delivered_response, 80)
             );
             if let Some(channel) = target_channel.as_ref() {
-                // Split emotion sticker into a separate message so the sticker
-                // arrives as a standalone image after the text reply.
-                let emotion_re = regex::Regex::new(r"\[EMOTION_STICKER:([^\]]+)\]").unwrap();
-                let emotion_sticker_path: Option<String> = emotion_re
-                    .captures(&delivered_response)
-                    .map(|caps| caps[1].trim().to_string());
-                let text_only = emotion_re
-                    .replace_all(&delivered_response, "")
-                    .trim()
-                    .to_string();
-
-                let send_text = if text_only.is_empty() {
-                    &delivered_response
-                } else {
-                    &text_only
-                };
-
                 if use_segment_streaming {
-                    // Text was already delivered as segments by the segment
-                    // updater task. Only send the emotion sticker if present.
                     tracing::debug!(
                         "Skipping final send for segment-streamed response ({}B already delivered)",
-                        send_text.len()
+                        delivered_response.len()
                     );
                 } else if let Some(ref draft_id) = draft_message_id {
                     if let Err(e) = channel
-                        .finalize_draft(&msg.reply_target, draft_id, send_text)
+                        .finalize_draft(&msg.reply_target, draft_id, &delivered_response)
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
                         let _ = channel
                             .send(
-                                &SendMessage::new(send_text, &msg.reply_target)
+                                &SendMessage::new(&delivered_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(send_text, &msg.reply_target)
+                        &SendMessage::new(&delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
@@ -3104,18 +3209,40 @@ async fn process_channel_message(
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
 
-                // Send emotion sticker as a separate pure-image message.
-                if let Some(sticker_path) = emotion_sticker_path {
-                    let sticker_msg = format!("[IMAGE:{sticker_path}]");
-                    if let Err(e) = channel
-                        .send(
-                            &SendMessage::new(&sticker_msg, &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
+                // Fire-and-forget: classify emotion + send sticker as a
+                // separate image message AFTER the text reply is delivered.
+                if emotion_enabled {
+                    let emotion_cfg = ctx.emotion_sticker_config.clone();
+                    let workspace = ctx.workspace_dir.clone();
+                    let tools = Arc::clone(&ctx.tools_registry);
+                    let reply_target = msg.reply_target.clone();
+                    let thread_ts = msg.thread_ts.clone();
+                    let channel = Arc::clone(channel);
+                    let response_for_emotion = delivered_response.clone();
+                    tokio::spawn(async move {
+                        let result = crate::agent::loop_::append_emotion_sticker(
+                            &response_for_emotion,
+                            &emotion_cfg,
+                            &workspace,
+                            tools.as_ref(),
                         )
-                        .await
-                    {
-                        tracing::warn!("Failed to send emotion sticker: {e}");
-                    }
+                        .await;
+                        // Extract [EMOTION_STICKER:path] if appended.
+                        let re = regex::Regex::new(r"\[EMOTION_STICKER:([^\]]+)\]").unwrap();
+                        if let Some(caps) = re.captures(&result) {
+                            let sticker_path = caps[1].trim().to_string();
+                            let sticker_msg = format!("[IMAGE:{sticker_path}]");
+                            if let Err(e) = channel
+                                .send(
+                                    &SendMessage::new(&sticker_msg, &reply_target)
+                                        .in_thread(thread_ts),
+                                )
+                                .await
+                            {
+                                tracing::warn!("Failed to send emotion sticker: {e}");
+                            }
+                        }
+                    });
                 }
             }
         }
