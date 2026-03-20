@@ -226,6 +226,7 @@ impl RedditChannel {
             timestamp,
             thread_ts: item.parent_id.clone(),
             observe_group: false,
+            interruption_scope_id: None,
         })
     }
 }

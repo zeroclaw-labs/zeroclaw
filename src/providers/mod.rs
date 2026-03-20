@@ -1164,7 +1164,10 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
+        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(
+            key,
+            options.provider_timeout_secs,
+        ))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
@@ -1202,9 +1205,12 @@ fn create_provider_with_url_and_options(
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
         // ── OpenAI-compatible providers ──────────────────────
-        "venice" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
-        ))),
+        "venice" => Ok(compat(
+            OpenAiCompatibleProvider::new(
+                "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
+            )
+            .without_native_tools(),
+        )),
         "vercel" | "vercel-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Vercel AI Gateway",
             VERCEL_AI_GATEWAY_BASE_URL,
@@ -2529,7 +2535,11 @@ mod tests {
 
     #[test]
     fn factory_venice() {
-        assert!(create_provider("venice", Some("vn-key")).is_ok());
+        let provider = create_provider("venice", Some("vn-key")).unwrap();
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "Venice should use prompt-guided tools, not native tool calling"
+        );
     }
 
     #[test]

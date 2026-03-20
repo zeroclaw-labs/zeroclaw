@@ -34,6 +34,8 @@ pub struct SignalChannel {
     ignore_attachments: bool,
     download_attachments: bool,
     ignore_stories: bool,
+    streaming: bool,
+    streaming_chunk_size: usize,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -131,6 +133,7 @@ impl ProcessedEnvelope {
             timestamp: self.timestamp / 1000,
             thread_ts: None,
             observe_group: self.observe_group,
+            interruption_scope_id: None,
         })
     }
 }
@@ -157,7 +160,17 @@ impl SignalChannel {
             ignore_attachments,
             download_attachments,
             ignore_stories,
+            streaming: false,
+            streaming_chunk_size: 200,
         }
+    }
+
+    /// Enable streaming: LLM responses are delivered as sequential message
+    /// segments rather than a single response.
+    pub fn with_streaming(mut self, enabled: bool, chunk_size: usize) -> Self {
+        self.streaming = enabled;
+        self.streaming_chunk_size = chunk_size;
+        self
     }
 
     fn http_client(&self) -> Client {
@@ -692,6 +705,14 @@ fn truncate_reply_preview(text: &str, max_chars: usize) -> String {
 impl Channel for SignalChannel {
     fn name(&self) -> &str {
         "signal"
+    }
+
+    fn supports_stream_segments(&self) -> bool {
+        self.streaming
+    }
+
+    fn stream_segment_size(&self) -> usize {
+        self.streaming_chunk_size
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {

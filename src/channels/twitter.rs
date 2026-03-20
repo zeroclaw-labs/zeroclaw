@@ -289,6 +289,7 @@ impl Channel for TwitterChannel {
                                     .and_then(|c| c.as_str())
                                     .map(|s| s.to_string()),
                                 observe_group: false,
+                                interruption_scope_id: None,
                             };
 
                             if tx.send(channel_msg).await.is_err() {

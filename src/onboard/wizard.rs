@@ -179,6 +179,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
+        delegate: crate::config::DelegateToolConfig::default(),
         agents: std::collections::HashMap::new(),
         swarms: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
@@ -190,6 +191,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         nodes: crate::config::NodesConfig::default(),
         workspace: crate::config::WorkspaceConfig::default(),
         notion: crate::config::NotionConfig::default(),
+        jira: crate::config::JiraConfig::default(),
         node_transport: crate::config::NodeTransportConfig::default(),
         knowledge: crate::config::KnowledgeConfig::default(),
         linkedin: crate::config::LinkedInConfig::default(),
@@ -465,6 +467,47 @@ fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
     (config_dir.clone(), config_dir.join("workspace"))
 }
 
+fn homebrew_prefix_for_exe(exe: &Path) -> Option<&'static str> {
+    let exe = exe.to_string_lossy();
+    if exe == "/opt/homebrew/bin/zeroclaw"
+        || exe.starts_with("/opt/homebrew/Cellar/zeroclaw/")
+        || exe.starts_with("/opt/homebrew/opt/zeroclaw/")
+    {
+        return Some("/opt/homebrew");
+    }
+
+    if exe == "/usr/local/bin/zeroclaw"
+        || exe.starts_with("/usr/local/Cellar/zeroclaw/")
+        || exe.starts_with("/usr/local/opt/zeroclaw/")
+    {
+        return Some("/usr/local");
+    }
+
+    None
+}
+
+fn quick_setup_homebrew_service_note(
+    config_path: &Path,
+    workspace_dir: &Path,
+    exe: &Path,
+) -> Option<String> {
+    let prefix = homebrew_prefix_for_exe(exe)?;
+    let service_root = Path::new(prefix).join("var").join("zeroclaw");
+    let service_config = service_root.join("config.toml");
+    let service_workspace = service_root.join("workspace");
+
+    if config_path == service_config || workspace_dir == service_workspace {
+        return None;
+    }
+
+    Some(format!(
+        "Homebrew service note: `brew services` uses {} (config {}) by default. Your onboarding just wrote {}. If you plan to run ZeroClaw as a service, copy or link this workspace first.",
+        service_workspace.display(),
+        service_config.display(),
+        config_path.display(),
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_quick_setup_with_home(
     credential_override: Option<&str>,
@@ -556,6 +599,7 @@ async fn run_quick_setup_with_home(
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
+        delegate: crate::config::DelegateToolConfig::default(),
         agents: std::collections::HashMap::new(),
         swarms: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
@@ -567,6 +611,7 @@ async fn run_quick_setup_with_home(
         nodes: crate::config::NodesConfig::default(),
         workspace: crate::config::WorkspaceConfig::default(),
         notion: crate::config::NotionConfig::default(),
+        jira: crate::config::JiraConfig::default(),
         node_transport: crate::config::NodeTransportConfig::default(),
         knowledge: crate::config::KnowledgeConfig::default(),
         linkedin: crate::config::LinkedInConfig::default(),
@@ -653,6 +698,16 @@ async fn run_quick_setup_with_home(
         style("Config saved:").white().bold(),
         style(config_path.display()).green()
     );
+    if cfg!(target_os = "macos") {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(note) =
+                quick_setup_homebrew_service_note(&config_path, &workspace_dir, &exe)
+            {
+                println!();
+                println!("  {}", style(note).yellow());
+            }
+        }
+    }
     println!();
     println!("  {}", style("Next steps:").white().bold());
     if credential_override.is_none() {
@@ -731,10 +786,15 @@ fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
 }
 
 /// Pick a sensible default model for the given provider.
-const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
-    ("MiniMax-M2.5", "MiniMax M2.5 (latest, recommended)"),
+const MINIMAX_ONBOARD_MODELS: [(&str, &str); 7] = [
+    (
+        "MiniMax-M2.7",
+        "MiniMax M2.7 (latest flagship, recommended)",
+    ),
+    ("MiniMax-M2.7-highspeed", "MiniMax M2.7 High-Speed (faster)"),
+    ("MiniMax-M2.5", "MiniMax M2.5 (stable)"),
     ("MiniMax-M2.5-highspeed", "MiniMax M2.5 High-Speed (faster)"),
-    ("MiniMax-M2.1", "MiniMax M2.1 (stable)"),
+    ("MiniMax-M2.1", "MiniMax M2.1 (previous gen)"),
     ("MiniMax-M2.1-highspeed", "MiniMax M2.1 High-Speed (faster)"),
     ("MiniMax-M2", "MiniMax M2 (legacy)"),
 ];
@@ -751,12 +811,12 @@ fn default_model_for_provider(provider: &str) -> String {
         "xai" => "grok-4-1-fast-reasoning".into(),
         "perplexity" => "sonar-pro".into(),
         "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct".into(),
-        "novita" => "minimax/minimax-m2.5".into(),
+        "novita" => "minimax/minimax-m2.7".into(),
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
         "cohere" => "command-a-03-2025".into(),
         "moonshot" => "kimi-k2.5".into(),
         "glm" | "zai" => "glm-5".into(),
-        "minimax" => "MiniMax-M2.5".into(),
+        "minimax" => "MiniMax-M2.7".into(),
         "qwen" => "qwen-plus".into(),
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
@@ -945,10 +1005,16 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Mixtral 8x22B".to_string(),
             ),
         ],
-        "novita" => vec![(
-            "minimax/minimax-m2.5".to_string(),
-            "MiniMax M2.5".to_string(),
-        )],
+        "novita" => vec![
+            (
+                "minimax/minimax-m2.7".to_string(),
+                "MiniMax M2.7 (latest flagship)".to_string(),
+            ),
+            (
+                "minimax/minimax-m2.5".to_string(),
+                "MiniMax M2.5".to_string(),
+            ),
+        ],
         "together-ai" => vec![
             (
                 "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
@@ -1014,8 +1080,16 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "minimax" => vec![
             (
+                "MiniMax-M2.7".to_string(),
+                "MiniMax M2.7 (latest flagship)".to_string(),
+            ),
+            (
+                "MiniMax-M2.7-highspeed".to_string(),
+                "MiniMax M2.7 High-Speed (fast)".to_string(),
+            ),
+            (
                 "MiniMax-M2.5".to_string(),
-                "MiniMax M2.5 (latest flagship)".to_string(),
+                "MiniMax M2.5 (stable)".to_string(),
             ),
             (
                 "MiniMax-M2.5-highspeed".to_string(),
@@ -1023,7 +1097,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
             (
                 "MiniMax-M2.1".to_string(),
-                "MiniMax M2.1 (strong coding/reasoning)".to_string(),
+                "MiniMax M2.1 (previous gen)".to_string(),
             ),
         ],
         "qwen" => vec![
@@ -1569,7 +1643,7 @@ fn fetch_live_models_for_provider(
                     "qwen3-coder-next:cloud".to_string(),
                     "qwen3-coder:480b:cloud".to_string(),
                     "kimi-k2.5:cloud".to_string(),
-                    "minimax-m2.5:cloud".to_string(),
+                    "minimax-m2.7:cloud".to_string(),
                     "deepseek-v3.1:671b:cloud".to_string(),
                 ]
             } else {
@@ -3792,6 +3866,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     guild_id: if guild.is_empty() { None } else { Some(guild) },
                     allowed_users,
                     listen_to_bots: false,
+                    interrupt_on_new_message: false,
                     mention_only: false,
                 });
             }
@@ -3921,6 +3996,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     },
                     allowed_users,
                     interrupt_on_new_message: false,
+                    thread_replies: None,
                     mention_only: false,
                 });
             }
@@ -4178,6 +4254,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     mention_only,
                     ignore_attachments,
                     ignore_stories,
+                    streaming: false,
+                    streaming_chunk_size: 200,
                 });
 
                 println!("  {} Signal configured", style("✅").green().bold());
@@ -4276,6 +4354,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                             .then(|| pair_code.trim().to_string()),
                         allowed_numbers,
                         mention_only: false,
+                        streaming: false,
+                        streaming_chunk_size: 200,
                     });
 
                     println!(
@@ -4378,6 +4458,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     pair_code: None,
                     allowed_numbers,
                     mention_only: false,
+                    streaming: false,
+                    streaming_chunk_size: 200,
                 });
             }
             ChannelMenuChoice::Linq => {
@@ -5383,7 +5465,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          Participate, don't dominate. Respond when mentioned or when you add genuine value.\n\
          Stay silent when it's casual banter or someone already answered.\n\n\
          ## Tools & Skills\n\n\
-         Skills are listed in the system prompt. Use `read` on a skill's SKILL.md for details.\n\
+         Skills are listed in the system prompt. Use `read_skill` when available, or `file_read` on a skill file, for full details.\n\
          Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.\n\n\
          ## Crash Recovery\n\n\
          - If a run stops unexpectedly, recover context before acting.\n\
@@ -6082,6 +6164,52 @@ mod tests {
         assert_eq!(config.config_path, expected_config_path);
     }
 
+    #[test]
+    fn homebrew_prefix_for_exe_detects_supported_layouts() {
+        assert_eq!(
+            homebrew_prefix_for_exe(Path::new("/opt/homebrew/bin/zeroclaw")),
+            Some("/opt/homebrew")
+        );
+        assert_eq!(
+            homebrew_prefix_for_exe(Path::new(
+                "/opt/homebrew/Cellar/zeroclaw/0.5.0/bin/zeroclaw",
+            )),
+            Some("/opt/homebrew")
+        );
+        assert_eq!(
+            homebrew_prefix_for_exe(Path::new("/usr/local/bin/zeroclaw")),
+            Some("/usr/local")
+        );
+        assert_eq!(homebrew_prefix_for_exe(Path::new("/tmp/zeroclaw")), None);
+    }
+
+    #[test]
+    fn quick_setup_homebrew_service_note_mentions_service_workspace() {
+        let note = quick_setup_homebrew_service_note(
+            Path::new("/Users/alix/.zeroclaw/config.toml"),
+            Path::new("/Users/alix/.zeroclaw/workspace"),
+            Path::new("/opt/homebrew/bin/zeroclaw"),
+        )
+        .expect("homebrew installs should emit a service workspace note");
+
+        assert!(note.contains("/opt/homebrew/var/zeroclaw/workspace"));
+        assert!(note.contains("/opt/homebrew/var/zeroclaw/config.toml"));
+        assert!(note.contains("/Users/alix/.zeroclaw/config.toml"));
+    }
+
+    #[test]
+    fn quick_setup_homebrew_service_note_skips_matching_service_layout() {
+        let service_config = Path::new("/opt/homebrew/var/zeroclaw/config.toml");
+        let service_workspace = Path::new("/opt/homebrew/var/zeroclaw/workspace");
+
+        assert!(quick_setup_homebrew_service_note(
+            service_config,
+            service_workspace,
+            Path::new("/opt/homebrew/bin/zeroclaw"),
+        )
+        .is_none());
+    }
+
     // ── scaffold_workspace: basic file creation ─────────────────
 
     #[tokio::test]
@@ -6564,7 +6692,7 @@ mod tests {
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
         assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
-        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
+        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.7");
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
@@ -7264,6 +7392,8 @@ mod tests {
             mention_only: false,
             ignore_attachments: false,
             ignore_stories: true,
+            streaming: false,
+            streaming_chunk_size: 200,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7275,6 +7405,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            interrupt_on_new_message: false,
         });
         assert!(has_launchable_channels(&channels));
 

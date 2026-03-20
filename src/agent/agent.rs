@@ -42,6 +42,9 @@ pub struct Agent {
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
     tool_descriptions: Option<ToolDescriptions>,
+    /// Pre-rendered security policy summary injected into the system prompt
+    /// so the LLM knows the concrete constraints before making tool calls.
+    security_summary: Option<String>,
 }
 
 pub struct AgentBuilder {
@@ -67,6 +70,7 @@ pub struct AgentBuilder {
     allowed_tools: Option<Vec<String>>,
     response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
     tool_descriptions: Option<ToolDescriptions>,
+    security_summary: Option<String>,
 }
 
 impl AgentBuilder {
@@ -94,6 +98,7 @@ impl AgentBuilder {
             allowed_tools: None,
             response_cache: None,
             tool_descriptions: None,
+            security_summary: None,
         }
     }
 
@@ -216,6 +221,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn security_summary(mut self, summary: Option<String>) -> Self {
+        self.security_summary = summary;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -267,6 +277,7 @@ impl AgentBuilder {
             allowed_tools: allowed,
             response_cache: self.response_cache,
             tool_descriptions: self.tool_descriptions,
+            security_summary: self.security_summary,
         })
     }
 }
@@ -426,6 +437,7 @@ impl Agent {
             ))
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
+            .security_summary(Some(security.prompt_summary()))
             .build()
     }
 
@@ -467,6 +479,7 @@ impl Agent {
             identity_config: Some(&self.identity_config),
             dispatcher_instructions: &instructions,
             tool_descriptions: self.tool_descriptions.as_ref(),
+            security_summary: self.security_summary.clone(),
         };
         self.prompt_builder.build(&ctx)
     }
@@ -558,6 +571,16 @@ impl Agent {
                 )));
         }
 
+        let context = self
+            .memory_loader
+            .load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
+            .await
+            .unwrap_or_default();
+
         if self.auto_save {
             let _ = self
                 .memory
@@ -569,16 +592,6 @@ impl Agent {
                 )
                 .await;
         }
-
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {

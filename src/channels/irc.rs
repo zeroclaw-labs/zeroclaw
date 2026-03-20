@@ -581,6 +581,7 @@ impl Channel for IrcChannel {
                             .as_secs(),
                         thread_ts: None,
                         observe_group: false,
+                        interruption_scope_id: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

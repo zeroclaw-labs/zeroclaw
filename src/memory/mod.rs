@@ -105,6 +105,7 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
 
     let lowered = normalized.to_ascii_lowercase();
     lowered.starts_with("[cron:")
+        || lowered.starts_with("[heartbeat task")
         || lowered.starts_with("[distilled_")
         || lowered.contains("distilled_index_sig:")
 }
@@ -351,9 +352,7 @@ pub fn create_memory_with_storage_and_routes(
     }
 
     #[cfg(not(feature = "memory-mem0"))]
-    fn build_mem0_memory(
-        _config: &crate::config::MemoryConfig,
-    ) -> anyhow::Result<Box<dyn Memory>> {
+    fn build_mem0_memory(_config: &crate::config::MemoryConfig) -> anyhow::Result<Box<dyn Memory>> {
         anyhow::bail!(
             "memory backend 'mem0' requested but this build was compiled without `memory-mem0`; rebuild with `--features memory-mem0`"
         );
@@ -498,6 +497,12 @@ mod tests {
         assert!(should_skip_autosave_content("[cron:auto] patrol check"));
         assert!(should_skip_autosave_content(
             "[DISTILLED_MEMORY_CHUNK 1/2] DISTILLED_INDEX_SIG:abc123"
+        ));
+        assert!(should_skip_autosave_content(
+            "[Heartbeat Task | decision] Should I run tasks?"
+        ));
+        assert!(should_skip_autosave_content(
+            "[Heartbeat Task | high] Execute scheduled patrol"
         ));
         assert!(!should_skip_autosave_content(
             "User prefers concise answers."
