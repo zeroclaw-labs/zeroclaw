@@ -26,6 +26,7 @@ pub struct SlackChannel {
     channel_ids: Vec<String>,
     allowed_users: Vec<String>,
     mention_only: bool,
+    thread_replies: bool,
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
     workspace_dir: Option<PathBuf>,
@@ -76,6 +77,7 @@ impl SlackChannel {
             channel_ids,
             allowed_users,
             mention_only: false,
+            thread_replies: true,
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
@@ -91,6 +93,14 @@ impl SlackChannel {
         self.mention_only = mention_only;
         self.group_reply_allowed_sender_ids =
             Self::normalize_group_reply_allowed_sender_ids(allowed_sender_ids);
+        self
+    }
+
+    /// Configure whether replies are threaded on the original message.
+    /// When `false`, replies go to the channel root and inbound `thread_ts` is
+    /// cleared so that sessions are scoped per-channel instead of per-thread.
+    pub fn with_thread_replies(mut self, enabled: bool) -> Self {
+        self.thread_replies = enabled;
         self
     }
 
@@ -147,6 +157,16 @@ impl SlackChannel {
             .and_then(|t| t.as_str())
             .or(if ts.is_empty() { None } else { Some(ts) })
             .map(str::to_string)
+    }
+
+    /// Like `inbound_thread_ts`, but returns `None` when `thread_replies` is
+    /// disabled so that the session is scoped per-channel instead of per-thread.
+    fn resolve_inbound_thread_ts(&self, msg: &serde_json::Value, ts: &str) -> Option<String> {
+        if self.thread_replies {
+            Self::inbound_thread_ts(msg, ts)
+        } else {
+            None
+        }
     }
 
     fn normalized_channel_id(input: Option<&str>) -> Option<String> {
@@ -1775,7 +1795,7 @@ impl SlackChannel {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    thread_ts: Self::inbound_thread_ts(event, ts),
+                    thread_ts: self.resolve_inbound_thread_ts(event, ts),
                 };
 
                 if tx.send(channel_msg).await.is_err() {
@@ -2149,8 +2169,10 @@ impl Channel for SlackChannel {
             "text": message.content
         });
 
-        if let Some(ref ts) = message.thread_ts {
-            body["thread_ts"] = serde_json::json!(ts);
+        if self.thread_replies {
+            if let Some(ref ts) = message.thread_ts {
+                body["thread_ts"] = serde_json::json!(ts);
+            }
         }
 
         let resp = self
@@ -2339,7 +2361,7 @@ impl Channel for SlackChannel {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
-                            thread_ts: Self::inbound_thread_ts(msg, ts),
+                            thread_ts: self.resolve_inbound_thread_ts(msg, ts),
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -2423,7 +2445,11 @@ impl Channel for SlackChannel {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
-                        thread_ts: Some(thread_ts.clone()),
+                        thread_ts: if self.thread_replies {
+                            Some(thread_ts.clone())
+                        } else {
+                            None
+                        },
                     };
 
                     if tx.send(channel_msg).await.is_err() {
