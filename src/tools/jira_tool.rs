@@ -930,6 +930,53 @@ mod tests {
         assert!(result.error.as_deref().unwrap().contains("read-only"));
     }
 
+    // ── myself action ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parameters_schema_includes_myself_action() {
+        let schema = test_tool(vec!["myself"]).parameters_schema();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+        assert!(action_strs.contains(&"myself"));
+    }
+
+    #[tokio::test]
+    async fn execute_myself_disallowed_returns_error() {
+        let result = test_tool(vec!["get_ticket"])
+            .execute(json!({"action": "myself"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("not enabled"));
+        assert!(err.contains("allowed_actions"));
+    }
+
+    #[tokio::test]
+    async fn execute_myself_not_blocked_in_readonly_mode() {
+        // myself is a Read operation — the security policy should not block it.
+        // The call will fail at the HTTP level (no real server), not at the
+        // policy level, so the error must NOT contain "read-only".
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            "https://test.atlassian.net".into(),
+            "test@example.com".into(),
+            "token".into(),
+            vec!["myself".into()],
+            security,
+            30,
+        );
+        let result = tool
+            .execute(json!({"action": "myself"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(!result.error.as_deref().unwrap_or("").contains("read-only"));
+    }
+
     // ── Issue key validation ──────────────────────────────────────────────────
 
     #[test]
