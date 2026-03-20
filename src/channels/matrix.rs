@@ -900,6 +900,7 @@ impl Channel for MatrixChannel {
                         .unwrap_or_default()
                         .as_secs(),
                     thread_ts: thread_ts.clone(),
+                    observe_group: false,
                     interruption_scope_id: thread_ts,
                 };
 
