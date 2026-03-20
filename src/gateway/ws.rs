@@ -150,7 +150,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
 
     // Build a persistent Agent for this connection so history is maintained across turns.
     let config = state.config.lock().clone();
-    let mut agent = match crate::agent::Agent::from_config(&config) {
+    let mut agent = match crate::agent::Agent::from_config(&config).await {
         Ok(a) => a,
         Err(e) => {
             let err = serde_json::json!({"type": "error", "message": format!("Failed to initialise agent: {e}")});
