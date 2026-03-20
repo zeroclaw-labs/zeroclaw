@@ -132,12 +132,9 @@ impl TextBrowserTool {
     }
 
     /// Build the command arguments for the selected browser with `-dump` flag.
-    fn build_dump_args(browser: &str, url: &str) -> Vec<String> {
-        match browser {
-            "links" => vec!["-dump".to_string(), url.to_string()],
-            // lynx and w3m both use `-dump`
-            _ => vec!["-dump".to_string(), url.to_string()],
-        }
+    fn build_dump_args(_browser: &str, url: &str) -> Vec<String> {
+        // All supported browsers (lynx, links, w3m) use the same `-dump` flag
+        vec!["-dump".to_string(), url.to_string()]
     }
 }
 
