@@ -78,8 +78,6 @@ impl GoogleWorkspaceTool {
     }
 
     /// Build the positional `gws` arguments: `[service, resource, (sub_resource,)? method]`.
-    /// Exposed for tests so the argument ordering can be verified without spawning a process.
-    #[cfg(test)]
     fn positional_cmd_args(
         service: &str,
         resource: &str,
@@ -91,6 +89,21 @@ impl GoogleWorkspaceTool {
             args.push(sub.to_string());
         }
         args.push(method.to_string());
+        args
+    }
+
+    /// Build the `--page-all` and `--page-limit` flags from validated pagination inputs.
+    /// `page_limit` alone (without `page_all`) caps page count; both together fetch all pages
+    /// up to the limit.
+    fn build_pagination_args(page_all: bool, page_limit: Option<u64>) -> Vec<String> {
+        let mut args = Vec::new();
+        if page_all {
+            args.push("--page-all".into());
+        }
+        if page_all || page_limit.is_some() {
+            args.push("--page-limit".into());
+            args.push(page_limit.unwrap_or(10).to_string());
+        }
         args
     }
 
@@ -273,13 +286,7 @@ impl Tool for GoogleWorkspaceTool {
         }
 
         // Build the gws command — validate all optional fields before consuming budget
-        let mut cmd_args: Vec<String> = vec![service.to_string(), resource.to_string()];
-
-        if let Some(sub) = sub_resource {
-            cmd_args.push(sub.to_string());
-        }
-
-        cmd_args.push(method.to_string());
+        let mut cmd_args = Self::positional_cmd_args(service, resource, sub_resource, method);
 
         if let Some(params) = args.get("params") {
             if !params.is_object() {
@@ -346,10 +353,6 @@ impl Tool for GoogleWorkspaceTool {
             },
             None => false,
         };
-        if page_all {
-            cmd_args.push("--page-all".into());
-        }
-
         let page_limit = match args.get("page_limit") {
             Some(v) => match v.as_u64() {
                 Some(n) => Some(n),
@@ -363,10 +366,7 @@ impl Tool for GoogleWorkspaceTool {
             },
             None => None,
         };
-        if page_all || page_limit.is_some() {
-            cmd_args.push("--page-limit".into());
-            cmd_args.push(page_limit.unwrap_or(10).to_string());
-        }
+        cmd_args.extend(Self::build_pagination_args(page_all, page_limit));
 
         // Charge action budget only after all validation passes
         if !self.security.record_action() {
@@ -998,29 +998,38 @@ mod tests {
         assert!(!tool.is_operation_allowed("gmail", "users", Some(" drafts "), "create"));
     }
 
-    // ── page_limit behavior ──────────────────────────────────
+    // ── page_limit / page_all flag building ─────────────────
 
-    #[tokio::test]
-    async fn page_limit_without_page_all_is_accepted() {
-        // page_limit alone (without page_all) is a valid request — it caps page
-        // count without requiring --page-all. Validation must pass; only
-        // command execution fails (no gws binary in test environment).
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 1, false);
-        let result = tool
-            .execute(json!({
-                "service": "drive",
-                "resource": "files",
-                "method": "list",
-                "page_limit": 5
-            }))
-            .await
-            .expect("execute should not panic");
-        // Must not be a validation error — any failure here is command execution.
-        let error = result.error.as_deref().unwrap_or("");
-        assert!(
-            !error.contains("must be") && !error.contains("Invalid"),
-            "page_limit without page_all should not produce a validation error, got: {error}"
-        );
+    #[test]
+    fn pagination_page_limit_alone_appends_limit_without_page_all() {
+        // page_limit without page_all caps page count without requesting all pages.
+        let flags = GoogleWorkspaceTool::build_pagination_args(false, Some(5));
+        assert!(flags.contains(&"--page-limit".to_string()));
+        assert!(!flags.contains(&"--page-all".to_string()));
+        let limit_idx = flags.iter().position(|f| f == "--page-limit").unwrap();
+        assert_eq!(flags[limit_idx + 1], "5");
+    }
+
+    #[test]
+    fn pagination_page_all_without_limit_uses_default() {
+        let flags = GoogleWorkspaceTool::build_pagination_args(true, None);
+        assert!(flags.contains(&"--page-all".to_string()));
+        assert!(flags.contains(&"--page-limit".to_string()));
+        let limit_idx = flags.iter().position(|f| f == "--page-limit").unwrap();
+        assert_eq!(flags[limit_idx + 1], "10"); // default cap
+    }
+
+    #[test]
+    fn pagination_page_all_with_limit_appends_both() {
+        let flags = GoogleWorkspaceTool::build_pagination_args(true, Some(20));
+        assert!(flags.contains(&"--page-all".to_string()));
+        let limit_idx = flags.iter().position(|f| f == "--page-limit").unwrap();
+        assert_eq!(flags[limit_idx + 1], "20");
+    }
+
+    #[test]
+    fn pagination_neither_appends_nothing() {
+        let flags = GoogleWorkspaceTool::build_pagination_args(false, None);
+        assert!(flags.is_empty());
     }
 }
