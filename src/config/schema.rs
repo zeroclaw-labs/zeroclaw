@@ -274,6 +274,10 @@ pub struct Config {
     #[serde(default)]
     pub web_fetch: WebFetchConfig,
 
+    /// Text browser tool configuration (`[text_browser]`).
+    #[serde(default)]
+    pub text_browser: TextBrowserConfig,
+
     /// Web search tool configuration (`[web_search]`).
     #[serde(default)]
     pub web_search: WebSearchConfig,
@@ -2105,6 +2109,39 @@ impl Default for WebFetchConfig {
             blocked_domains: vec![],
             max_response_size: default_web_fetch_max_response_size(),
             timeout_secs: default_web_fetch_timeout_secs(),
+        }
+    }
+}
+
+// ── Text browser ─────────────────────────────────────────────────
+
+/// Text browser tool configuration (`[text_browser]` section).
+///
+/// Uses text-based browsers (lynx, links, w3m) to render web pages as plain
+/// text. Designed for headless/SSH environments without graphical browsers.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TextBrowserConfig {
+    /// Enable `text_browser` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Preferred text browser ("lynx", "links", or "w3m"). If unset, auto-detects.
+    #[serde(default)]
+    pub preferred_browser: Option<String>,
+    /// Request timeout in seconds (default: 30)
+    #[serde(default = "default_text_browser_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_text_browser_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for TextBrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preferred_browser: None,
+            timeout_secs: default_text_browser_timeout_secs(),
         }
     }
 }
@@ -6307,6 +6344,7 @@ impl Default for Config {
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
@@ -9072,6 +9110,7 @@ default_temperature = 0.7
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),
@@ -9409,6 +9448,7 @@ tool_dispatcher = "xml"
             http_request: HttpRequestConfig::default(),
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
             project_intel: ProjectIntelConfig::default(),
             google_workspace: GoogleWorkspaceConfig::default(),

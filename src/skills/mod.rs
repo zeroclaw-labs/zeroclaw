@@ -714,26 +714,29 @@ pub fn skills_to_prompt_with_mode(
         );
         write_xml_text_element(&mut prompt, 4, "location", &location);
 
-        if matches!(mode, crate::config::SkillsPromptInjectionMode::Full) {
-            if !skill.prompts.is_empty() {
-                let _ = writeln!(prompt, "    <instructions>");
-                for instruction in &skill.prompts {
-                    write_xml_text_element(&mut prompt, 6, "instruction", instruction);
-                }
-                let _ = writeln!(prompt, "    </instructions>");
+        // In Full mode, inline both instructions and tools.
+        // In Compact mode, skip instructions (loaded on demand) but keep tools
+        // so the LLM knows which skill tools are available.
+        if matches!(mode, crate::config::SkillsPromptInjectionMode::Full)
+            && !skill.prompts.is_empty()
+        {
+            let _ = writeln!(prompt, "    <instructions>");
+            for instruction in &skill.prompts {
+                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
             }
+            let _ = writeln!(prompt, "    </instructions>");
+        }
 
-            if !skill.tools.is_empty() {
-                let _ = writeln!(prompt, "    <tools>");
-                for tool in &skill.tools {
-                    let _ = writeln!(prompt, "      <tool>");
-                    write_xml_text_element(&mut prompt, 8, "name", &tool.name);
-                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
-                    write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
-                    let _ = writeln!(prompt, "      </tool>");
-                }
-                let _ = writeln!(prompt, "    </tools>");
+        if !skill.tools.is_empty() {
+            let _ = writeln!(prompt, "    <tools>");
+            for tool in &skill.tools {
+                let _ = writeln!(prompt, "      <tool>");
+                write_xml_text_element(&mut prompt, 8, "name", &tool.name);
+                write_xml_text_element(&mut prompt, 8, "description", &tool.description);
+                write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
+                let _ = writeln!(prompt, "      </tool>");
             }
+            let _ = writeln!(prompt, "    </tools>");
         }
 
         let _ = writeln!(prompt, "  </skill>");
@@ -1286,7 +1289,7 @@ command = "echo hello"
     }
 
     #[test]
-    fn skills_to_prompt_compact_mode_omits_instructions_and_tools() {
+    fn skills_to_prompt_compact_mode_omits_instructions_but_keeps_tools() {
         let skills = vec![Skill {
             name: "test".to_string(),
             description: "A test".to_string(),
@@ -1316,7 +1319,10 @@ command = "echo hello"
         assert!(prompt.contains("read_skill(name)"));
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
-        assert!(!prompt.contains("<tools>"));
+        // Compact mode should still include tools so the LLM knows about them
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("<name>run</name>"));
+        assert!(prompt.contains("<kind>shell</kind>"));
     }
 
     #[test]

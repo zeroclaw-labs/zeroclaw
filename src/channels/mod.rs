@@ -7549,7 +7549,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_compact_mode_omits_instructions_and_tools() {
+    fn prompt_skills_compact_mode_omits_instructions_but_keeps_tools() {
         let ws = make_workspace();
         let skills = vec![crate::skills::Skill {
             name: "code-review".into(),
@@ -7587,7 +7587,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt
             .contains("<instruction>Always run cargo test before final response.</instruction>"));
-        assert!(!prompt.contains("<tools>"));
+        // Compact mode should still include tools so the LLM knows about them
+        assert!(prompt.contains("<tools>"));
+        assert!(prompt.contains("<name>lint</name>"));
+        assert!(prompt.contains("<kind>shell</kind>"));
     }
 
     #[test]
@@ -8199,6 +8202,7 @@ BTC is currently around $65,000 based on latest tool output."#
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(config.workspace_dir.clone()),
             prompt_config: Arc::new(config.clone()),
+            max_context_tokens: 128_000,
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -8220,7 +8224,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
-            max_context_tokens: 128_000,
         });
 
         process_channel_message(
@@ -9900,6 +9903,7 @@ This is an example JSON object for profile settings."#;
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
+            max_context_tokens: 128_000,
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: false,
@@ -9921,7 +9925,6 @@ This is an example JSON object for profile settings."#;
                 &crate::config::AutonomyConfig::default(),
             )),
             activated_tools: None,
-            max_context_tokens: 128_000,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
