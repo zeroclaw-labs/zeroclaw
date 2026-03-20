@@ -324,47 +324,6 @@ React 19 + Vite 6 + Tailwind CSS 4 网页仪表板直接从 Gateway 提供：
 - CI/CD：beta（推送时自动）→ stable（手动触发）→ Docker、crates.io、Scoop、AUR、Homebrew、tweet。
 - 预构建二进制文件支持 Linux（x86_64、aarch64、armv7）、macOS（x86_64、aarch64）、Windows（x86_64）。
 
-## 工作原理（简述）
-
-```
-WhatsApp / Telegram / Slack / Discord / Signal / iMessage / Matrix / IRC / Email
-Bluesky / Nostr / Mattermost / DingTalk / Lark / QQ / Reddit / MQTT / WebSocket
-               │
-               ▼
-┌───────────────────────────────┐
-│            Gateway            │
-│       (control plane)         │
-│    http://127.0.0.1:42617     │
-├───────────────────────────────┤
-│  Web Dashboard (React 19)     │
-│  REST API + WebSocket + SSE   │
-│  Pairing + Rate Limiting      │
-└──────────────┬────────────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│ Agent  │ │  Cron  │ │ Hands  │
-│  Loop  │ │Scheduler│ │ Swarm  │
-└───┬────┘ └───┬────┘ └───┬────┘
-    │          │          │
-    └──────────┼──────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│Provider│ │ Tools  │ │ Memory │
-│ (LLM)  │ │ (70+)  │ │(md/sql)│
-└────────┘ └────────┘ └────────┘
-    │          │
-    ▼          ▼
-┌────────┐ ┌────────────┐
-│Security│ │ Peripherals│
-│ Policy │ │(ESP32/STM32)│
-└────────┘ └────────────┘
-```
 
 ## 配置
 
