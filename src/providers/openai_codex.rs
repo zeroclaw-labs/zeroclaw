@@ -108,8 +108,8 @@ impl OpenAiCodexProvider {
             gateway_api_key: gateway_api_key.map(ToString::to_string),
             reasoning_effort: options.reasoning_effort.clone(),
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         })
