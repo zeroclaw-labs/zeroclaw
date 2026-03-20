@@ -1034,6 +1034,12 @@ impl Channel for QQChannel {
                 msg = read.next() => {
                     let msg = match msg {
                         Some(Ok(Message::Text(t))) => t,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if write.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                            continue;
+                        }
                         Some(Ok(Message::Close(_))) | None => break,
                         _ => continue,
                     };
