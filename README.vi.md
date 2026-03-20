@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Tham khảo đầy đủ các lệnh: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Yêu cầu hệ thống
 
 <details>
@@ -640,6 +642,8 @@ Chỉ cài từ binary, không fallback sang build source:
 > **Lưu ý:** Lệnh `cargo build --release` mặc định dùng `codegen-units=1` để giảm áp lực biên dịch đỉnh. Để build nhanh hơn trên máy mạnh, dùng `cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Binary dựng sẵn
 

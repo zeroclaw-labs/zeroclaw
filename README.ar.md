@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 مرجع الأوامر الكامل: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## المتطلبات الأساسية
 
 <details>
@@ -640,6 +642,8 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 > **ملاحظة:** الأمر الافتراضي `cargo build --release` يستخدم `codegen-units=1` لتقليل ضغط التجميع الذروة. للبناء الأسرع على أجهزة قوية، استخدم `cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### ملفات ثنائية مُعدة مسبقًا
 

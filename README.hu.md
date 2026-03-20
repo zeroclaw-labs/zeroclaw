@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Teljes parancs referencia: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Elofeltetelek
 
 <details>
@@ -640,6 +642,8 @@ Kizarolag binaris telepiteshez forras alternativa nelkul:
 > **Megjegyzes:** Az alapertelmezett `cargo build --release` `codegen-units=1` erteket hasznal a csucs forditasi terheles csokkenteseere. Gyorsabb epitesekhez eros gepeken hasznald a `cargo build --profile release-fast` parancsot.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Elore elkeszitett binarisok
 

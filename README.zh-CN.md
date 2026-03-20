@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 完整命令参考：[docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## 前置条件
 
 <details>
@@ -640,6 +642,8 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 > **注意：** 默认的 `cargo build --release` 使用 `codegen-units=1` 以降低编译峰值压力。对于强大的机器，使用 `cargo build --profile release-fast` 加速构建。
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### 预构建二进制文件
 

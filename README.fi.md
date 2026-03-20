@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Taysi komentoreferenssi: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Esivaatimukset
 
 <details>
@@ -640,6 +642,8 @@ Pelkan binaarin asennukseen ilman lahdekoodi-vaihtoehtoa:
 > **Huomautus:** Oletus `cargo build --release` kayttaa `codegen-units=1` kaannoshuippupaineen vahentamiseksi. Nopeampiin kaanntöihin tehokkailla koneilla kayta `cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Valmiit binaarit
 

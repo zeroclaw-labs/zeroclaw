@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Referință completă comenzi: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Cerințe preliminare
 
 <details>
@@ -640,6 +642,8 @@ Pentru a impune instalare doar cu binar, fără fallback sursă:
 > **Notă:** `cargo build --release` implicit folosește `codegen-units=1` pentru a reduce presiunea maximă de compilare. Pentru build-uri mai rapide pe mașini puternice, folosește `cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Binare pre-construite
 

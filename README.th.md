@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 อ้างอิงคำสั่งฉบับเต็ม: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## ข้อกำหนดเบื้องต้น
 
 <details>
@@ -640,6 +642,8 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 > **หมายเหตุ:** `cargo build --release` เริ่มต้นใช้ `codegen-units=1` เพื่อลดความดันการคอมไพล์สูงสุด สำหรับ build ที่เร็วขึ้นบนเครื่องที่แรง ใช้ `cargo build --profile release-fast`
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### ไบนารี pre-built
 

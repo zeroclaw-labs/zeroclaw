@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 مکمل کمانڈز حوالہ: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## شرائط
 
 <details>
@@ -640,6 +642,8 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 > **نوٹ:** ڈیفالٹ `cargo build --release` چوٹی کمپائل دباؤ کم کرنے کے لیے `codegen-units=1` استعمال کرتا ہے۔ طاقتور مشینوں پر تیز بلڈز کے لیے، `cargo build --profile release-fast` استعمال کریں۔
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### پری بلٹ بائنریز
 

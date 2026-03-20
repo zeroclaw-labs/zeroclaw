@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Referencia completa de comandos: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Prerrequisitos
 
 <details>
@@ -640,6 +642,8 @@ Para requerir instalación solo de binarios sin compilación de respaldo:
 > **Nota:** El `cargo build --release` predeterminado usa `codegen-units=1` para reducir la presión máxima de compilación. Para compilaciones más rápidas en máquinas potentes, usa `cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Binarios preconstruidos
 

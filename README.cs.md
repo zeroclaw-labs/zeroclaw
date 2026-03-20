@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Kompletní reference příkazů: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Předpoklady
 
 <details>
@@ -640,6 +642,8 @@ Pro vynucení instalace pouze z binárky bez fallbacku na zdrojový kód:
 > **Poznámka:** Výchozí `cargo build --release` používá `codegen-units=1` pro snížení špičkového zatížení kompilace. Pro rychlejší buildy na výkonných strojích použijte `cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Předpřipravené binárky
 

@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Tam komut referansı: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Ön koşullar
 
 <details>
@@ -640,6 +642,8 @@ Kaynak fallback'ı olmadan yalnızca ikili kurulum zorlamak için:
 > **Not:** Varsayılan `cargo build --release`, derleme baskısını düşürmek için `codegen-units=1` kullanır. Güçlü makinelerde daha hızlı derlemeler için `cargo build --profile release-fast` kullanın.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Önceden derlenmiş ikili dosyalar
 

@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Πλήρης αναφορά εντολών: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Προαπαιτούμενα
 
 <details>
@@ -640,6 +642,8 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 > **Σημείωση:** Η προεπιλεγμένη `cargo build --release` χρησιμοποιεί `codegen-units=1` για μείωση της μέγιστης πίεσης μεταγλώττισης. Για ταχύτερες κατασκευές σε ισχυρά μηχανήματα, χρησιμοποιήστε `cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Προκατασκευασμένα δυαδικά
 

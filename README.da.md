@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Fuld kommandoreference: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Forudsaetninger
 
 <details>
@@ -640,6 +642,8 @@ For kun-binaer-installation uden kildekodefallback:
 > **Notat:** Standard `cargo build --release` bruger `codegen-units=1` for at reducere spidskompileringspresset. For hurtigere builds pa kraftige maskiner, brug `cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Forhaandsbyggede binaerer
 

@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 完全なコマンドリファレンス：[docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## 前提条件
 
 <details>
@@ -640,6 +642,8 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 > **注意：** デフォルトの `cargo build --release` は `codegen-units=1` を使用してコンパイルのピーク圧力を低減します。強力なマシンでのビルド高速化には `cargo build --profile release-fast` を使用してください。
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### プリビルドバイナリ
 

@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 Referensi perintah lengkap: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## Prasyarat
 
 <details>
@@ -640,6 +642,8 @@ Untuk memerlukan instalasi hanya-biner tanpa fallback sumber:
 > **Catatan:** Default `cargo build --release` menggunakan `codegen-units=1` untuk menurunkan tekanan kompilasi puncak. Untuk build lebih cepat di mesin yang kuat, gunakan `cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### Biner pre-built
 

@@ -545,6 +545,8 @@ zeroclaw completions zsh > ~/.zfunc/_zeroclaw
 
 מדריך פקודות מלא: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
 
+<!-- markdownlint-disable MD001 MD024 -->
+
 ## דרישות מקדימות
 
 <details>
@@ -640,6 +642,8 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 > **הערה:** ברירת המחדל `cargo build --release` משתמשת ב-`codegen-units=1` כדי להפחית לחץ קומפילציה שיא. לבנייות מהירות יותר על מכונות חזקות, השתמש ב-`cargo build --profile release-fast`.
 
 </details>
+
+<!-- markdownlint-enable MD001 MD024 -->
 
 ### בינאריים מוכנים מראש
 
