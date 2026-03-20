@@ -2,6 +2,74 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // =============================================================================
+// Input Types (for write operations)
+// =============================================================================
+
+/// Input for creating a new task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewTask {
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub acceptance_criteria: String,
+    pub domain_id: Option<String>,
+    pub epic_id: Option<String>,
+    pub sprint_id: Option<String>,
+    pub user_story_id: Option<String>,
+    #[serde(default = "default_task_status")]
+    pub status: String,
+    #[serde(default = "default_priority")]
+    pub priority: String,
+    #[serde(default = "default_task_type")]
+    pub task_type: String,
+    #[serde(default = "default_task_category")]
+    pub task_category: String,
+    pub due_date: Option<String>,
+}
+
+fn default_task_status() -> String {
+    "approved".to_string()
+}
+fn default_priority() -> String {
+    "p3_medium".to_string()
+}
+fn default_task_type() -> String {
+    "chore".to_string()
+}
+fn default_task_category() -> String {
+    "general".to_string()
+}
+
+/// Input for updating an existing task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskUpdate {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub acceptance_criteria: Option<String>,
+    pub sprint_id: Option<String>,
+    pub status: Option<String>,
+    pub priority: Option<String>,
+    pub assigned_agent: Option<String>,
+    pub agent_status: Option<String>,
+    pub branch_name: Option<String>,
+    pub pr_url: Option<String>,
+    pub ai_summary: Option<String>,
+    pub note: Option<String>,
+}
+
+/// Input for creating a new sprint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewSprint {
+    pub name: String,
+    #[serde(default)]
+    pub objectives: String,
+    pub domain_id: Option<String>,
+    pub epic_id: Option<String>,
+    pub start_date: Option<String>,
+    pub end_date: Option<String>,
+}
+
+// =============================================================================
 // Status Enums
 // =============================================================================
 
