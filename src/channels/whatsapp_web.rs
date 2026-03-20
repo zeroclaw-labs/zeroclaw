@@ -79,6 +79,8 @@ pub struct WhatsAppWebChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Chats whose last incoming message was a voice note.
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    streaming: bool,
+    streaming_chunk_size: usize,
 }
 
 impl WhatsAppWebChannel {
@@ -111,6 +113,8 @@ impl WhatsAppWebChannel {
             workspace_dir: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            streaming: false,
+            streaming_chunk_size: 200,
         }
     }
 
@@ -118,6 +122,13 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     pub fn with_mention_only(mut self, mention_only: bool) -> Self {
         self.mention_only = mention_only;
+        self
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_streaming(mut self, enabled: bool, chunk_size: usize) -> Self {
+        self.streaming = enabled;
+        self.streaming_chunk_size = chunk_size;
         self
     }
 
@@ -754,6 +765,14 @@ impl Channel for WhatsAppWebChannel {
         "whatsapp"
     }
 
+    fn supports_stream_segments(&self) -> bool {
+        self.streaming
+    }
+
+    fn stream_segment_size(&self) -> usize {
+        self.streaming_chunk_size
+    }
+
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {
@@ -1277,6 +1296,7 @@ impl Channel for WhatsAppWebChannel {
                                                         timestamp: chrono::Utc::now().timestamp().cast_unsigned(),
                                                         thread_ts: None,
                                                         observe_group: true,
+                                                        interruption_scope_id: None,
                                                     })
                                                     .await;
                                             }
@@ -1296,6 +1316,8 @@ impl Channel for WhatsAppWebChannel {
                                         timestamp: chrono::Utc::now().timestamp().cast_unsigned(),
                                         thread_ts: None,
                                         observe_group: false,
+                                        interruption_scope_id: None,
+
                                     })
                                     .await
                                 {
@@ -1564,6 +1586,10 @@ impl WhatsAppWebChannel {
     }
 
     pub fn with_mention_only(self, _mention_only: bool) -> Self {
+        self
+    }
+
+    pub fn with_streaming(self, _enabled: bool, _chunk_size: usize) -> Self {
         self
     }
 }

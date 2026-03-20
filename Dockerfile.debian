@@ -27,7 +27,7 @@ RUN npm run build
 FROM rust:1.94-bookworm AS builder
 
 WORKDIR /app
-ARG ZEROCLAW_CARGO_FEATURES=""
+ARG ZEROCLAW_CARGO_FEATURES="memory-postgres"
 
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -122,4 +122,4 @@ EXPOSE 42617
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 --start-period=10s \
     CMD ["zeroclaw", "status", "--format=exit-code"]
 ENTRYPOINT ["zeroclaw"]
-CMD ["gateway"]
+CMD ["daemon"]

@@ -76,7 +76,7 @@ runtime_trace_max_entries = 200
 
 | 键 | 默认值 | 用途 |
 |---|---|---|
-| `compact_context` | `false` | 为 true 时：bootstrap_max_chars=6000，rag_chunk_limit=2。适用于 13B 或更小的模型 |
+| `compact_context` | `true` | 为 true 时：bootstrap_max_chars=6000，rag_chunk_limit=2。适用于 13B 或更小的模型 |
 | `max_tool_iterations` | `10` | 跨 CLI、网关和渠道的每条用户消息的最大工具调用循环轮次 |
 | `max_history_messages` | `50` | 每个会话保留的最大对话历史消息数 |
 | `parallel_tools` | `false` | 在单次迭代中启用并行工具执行 |

@@ -22,6 +22,13 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return false;
     }
 
+    // Tool schema validation errors are NOT non-retryable — the provider's
+    // built-in fallback in compatible.rs can recover by switching to
+    // prompt-guided tool instructions.
+    if is_tool_schema_error(err) {
+        return false;
+    }
+
     // 4xx errors are generally non-retryable (bad request, auth failure, etc.),
     // except 429 (rate-limit — transient) and 408 (timeout — worth retrying).
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
@@ -71,6 +78,22 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("unsupported")
             || msg_lower.contains("does not exist")
             || msg_lower.contains("invalid"))
+}
+
+/// Check if an error is a tool schema validation failure (e.g. Groq returning
+/// "tool call validation failed: attempted to call tool '...' which was not in request").
+/// These errors should NOT be classified as non-retryable because the provider's
+/// built-in fallback logic (`compatible.rs::is_native_tool_schema_unsupported`)
+/// can recover by switching to prompt-guided tool instructions.
+pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    let hints = [
+        "tool call validation failed",
+        "was not in request",
+        "not found in tool list",
+        "invalid_tool_call",
+    ];
+    hints.iter().any(|hint| lower.contains(hint))
 }
 
 fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
@@ -2188,5 +2211,56 @@ mod tests {
         assert_eq!(result, "recovered after truncation");
         // Should have been called twice: once with full messages, once with truncated
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ── Tool schema error detection tests ───────────────────────────────
+
+    #[test]
+    fn tool_schema_error_detects_groq_validation_failure() {
+        let msg = r#"Groq API error (400 Bad Request): {"error":{"message":"tool call validation failed: attempted to call tool 'memory_recall' which was not in request"}}"#;
+        let err = anyhow::anyhow!("{}", msg);
+        assert!(is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn tool_schema_error_detects_not_in_request() {
+        let err = anyhow::anyhow!("tool 'search' was not in request");
+        assert!(is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn tool_schema_error_detects_not_found_in_tool_list() {
+        let err = anyhow::anyhow!("function 'foo' not found in tool list");
+        assert!(is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn tool_schema_error_detects_invalid_tool_call() {
+        let err = anyhow::anyhow!("invalid_tool_call: no matching function");
+        assert!(is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn tool_schema_error_ignores_unrelated_errors() {
+        let err = anyhow::anyhow!("invalid api key");
+        assert!(!is_tool_schema_error(&err));
+
+        let err = anyhow::anyhow!("model not found");
+        assert!(!is_tool_schema_error(&err));
+    }
+
+    #[test]
+    fn non_retryable_returns_false_for_tool_schema_400() {
+        // A 400 error with tool schema validation text should NOT be non-retryable.
+        let msg = "400 Bad Request: tool call validation failed: attempted to call tool 'x' which was not in request";
+        let err = anyhow::anyhow!("{}", msg);
+        assert!(!is_non_retryable(&err));
+    }
+
+    #[test]
+    fn non_retryable_returns_true_for_other_400_errors() {
+        // A regular 400 error (e.g. invalid API key) should still be non-retryable.
+        let err = anyhow::anyhow!("400 Bad Request: invalid api key provided");
+        assert!(is_non_retryable(&err));
     }
 }

@@ -279,6 +279,7 @@ impl Provider for ClaudeCodeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -375,32 +376,35 @@ mod tests {
 
     /// Helper: create a provider that uses a shell script echoing stdin back.
     /// The script ignores CLI flags (`--print`, `--model`, `-`) and just cats stdin.
-    ///
-    /// Uses `OnceLock` to write the script file exactly once, avoiding
-    /// "Text file busy" (ETXTBSY) races when parallel tests try to
-    /// overwrite a script that another test is currently executing.
     fn echo_provider() -> ClaudeCodeProvider {
-        use std::sync::OnceLock;
+        use std::io::Write;
 
-        static SCRIPT_PATH: OnceLock<PathBuf> = OnceLock::new();
-        let script = SCRIPT_PATH.get_or_init(|| {
-            use std::io::Write;
-            let dir = std::env::temp_dir().join("zeroclaw_test_claude_code");
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join(format!("fake_claude_{}.sh", std::process::id()));
-            let mut f = std::fs::File::create(&path).unwrap();
-            writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
-            drop(f);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            path
-        });
-        ClaudeCodeProvider {
-            binary_path: script.clone(),
+        static SCRIPT_ID: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join("zeroclaw_test_claude_code");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let script_id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = dir.join(format!(
+            "fake_claude_{}_{}.sh",
+            std::process::id(),
+            script_id
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        ClaudeCodeProvider { binary_path: path }
+    }
+
+    #[test]
+    fn echo_provider_uses_unique_script_paths() {
+        let first = echo_provider();
+        let second = echo_provider();
+        assert_ne!(first.binary_path, second.binary_path);
     }
 
     #[tokio::test]

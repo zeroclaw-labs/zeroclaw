@@ -295,6 +295,7 @@ end tell"#
                                 .as_secs(),
                             thread_ts: None,
                             observe_group: false,
+                            interruption_scope_id: None,
                         };
 
                         if tx.send(msg).await.is_err() {

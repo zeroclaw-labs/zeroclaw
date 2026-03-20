@@ -143,6 +143,7 @@ impl WhatsAppChannel {
                         timestamp,
                         thread_ts: None,
                         observe_group: false,
+                        interruption_scope_id: None,
                     });
                 }
             }

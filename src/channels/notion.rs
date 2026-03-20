@@ -361,6 +361,7 @@ impl Channel for NotionChannel {
                                 timestamp,
                                 thread_ts: None,
                                 observe_group: false,
+                                interruption_scope_id: None,
                             })
                             .await
                             .is_err()

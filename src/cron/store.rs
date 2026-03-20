@@ -77,6 +77,7 @@ pub fn add_agent_job(
     model: Option<String>,
     delivery: Option<DeliveryConfig>,
     delete_after_run: bool,
+    allowed_tools: Option<Vec<String>>,
 ) -> Result<CronJob> {
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
@@ -90,8 +91,8 @@ pub fn add_agent_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11)",
+                enabled, delivery, delete_after_run, allowed_tools, created_at, next_run
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12)",
             params![
                 id,
                 expression,
@@ -102,6 +103,7 @@ pub fn add_agent_job(
                 model,
                 serde_json::to_string(&delivery)?,
                 if delete_after_run { 1 } else { 0 },
+                encode_allowed_tools(allowed_tools.as_ref())?,
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
             ],
@@ -117,7 +119,8 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    allowed_tools
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -135,7 +138,8 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    allowed_tools
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -168,7 +172,8 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    allowed_tools
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -176,6 +181,34 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         )?;
 
         let rows = stmt.query_map(params![now.to_rfc3339(), lim], map_cron_job_row)?;
+
+        let mut jobs = Vec::new();
+        for row in rows {
+            match row {
+                Ok(job) => jobs.push(job),
+                Err(e) => tracing::warn!("Skipping cron job with unparseable row data: {e}"),
+            }
+        }
+        Ok(jobs)
+    })
+}
+
+/// Return **all** enabled overdue jobs without the `max_tasks` limit.
+///
+/// Used by the scheduler startup catch-up to ensure every missed job is
+/// executed at least once after a period of downtime (late boot, daemon
+/// restart, etc.).
+pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, allowed_tools
+             FROM cron_jobs
+             WHERE enabled = 1 AND next_run <= ?1
+             ORDER BY next_run ASC",
+        )?;
+
+        let rows = stmt.query_map(params![now.to_rfc3339()], map_cron_job_row)?;
 
         let mut jobs = Vec::new();
         for row in rows {
@@ -222,6 +255,9 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     if let Some(delete_after_run) = patch.delete_after_run {
         job.delete_after_run = delete_after_run;
     }
+    if let Some(allowed_tools) = patch.allowed_tools {
+        job.allowed_tools = Some(allowed_tools);
+    }
 
     if schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
@@ -232,8 +268,8 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 next_run = ?12
-             WHERE id = ?13",
+                 allowed_tools = ?12, next_run = ?13
+             WHERE id = ?14",
             params![
                 job.expression,
                 job.command,
@@ -246,6 +282,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 if job.enabled { 1 } else { 0 },
                 serde_json::to_string(&job.delivery)?,
                 if job.delete_after_run { 1 } else { 0 },
+                encode_allowed_tools(job.allowed_tools.as_ref())?,
                 job.next_run.to_rfc3339(),
                 job.id,
             ],
@@ -446,6 +483,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let next_run_raw: String = row.get(13)?;
     let last_run_raw: Option<String> = row.get(14)?;
     let created_at_raw: String = row.get(12)?;
+    let allowed_tools_raw: Option<String> = row.get(17)?;
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -468,7 +506,8 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         },
         last_status: row.get(15)?,
         last_output: row.get(16)?,
-        allowed_tools: None,
+        allowed_tools: decode_allowed_tools(allowed_tools_raw.as_deref())
+            .map_err(sql_conversion_error)?,
     })
 }
 
@@ -500,6 +539,25 @@ fn decode_delivery(delivery_raw: Option<&str>) -> Result<DeliveryConfig> {
         }
     }
     Ok(DeliveryConfig::default())
+}
+
+fn encode_allowed_tools(allowed_tools: Option<&Vec<String>>) -> Result<Option<String>> {
+    allowed_tools
+        .map(serde_json::to_string)
+        .transpose()
+        .context("Failed to serialize cron allowed_tools")
+}
+
+fn decode_allowed_tools(raw: Option<&str>) -> Result<Option<Vec<String>>> {
+    if let Some(raw) = raw {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return serde_json::from_str(trimmed)
+                .map(Some)
+                .with_context(|| format!("Failed to parse cron allowed_tools JSON: {trimmed}"));
+        }
+    }
+    Ok(None)
 }
 
 fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
@@ -557,6 +615,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             enabled          INTEGER NOT NULL DEFAULT 1,
             delivery         TEXT,
             delete_after_run INTEGER NOT NULL DEFAULT 0,
+            allowed_tools    TEXT,
             created_at       TEXT NOT NULL,
             next_run         TEXT NOT NULL,
             last_run         TEXT,
@@ -590,6 +649,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
     add_column_if_missing(&conn, "delivery", "TEXT")?;
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "allowed_tools", "TEXT")?;
 
     f(&conn)
 }
@@ -702,6 +762,108 @@ mod tests {
         let far_future = Utc::now() + ChronoDuration::days(365);
         let due = due_jobs(&config, far_future).unwrap();
         assert_eq!(due.len(), 2);
+    }
+
+    #[test]
+    fn all_overdue_jobs_ignores_max_tasks_limit() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.scheduler.max_tasks = 2;
+
+        let _ = add_job(&config, "* * * * *", "echo ov-1").unwrap();
+        let _ = add_job(&config, "* * * * *", "echo ov-2").unwrap();
+        let _ = add_job(&config, "* * * * *", "echo ov-3").unwrap();
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+        // due_jobs respects the limit
+        let due = due_jobs(&config, far_future).unwrap();
+        assert_eq!(due.len(), 2);
+        // all_overdue_jobs returns everything
+        let overdue = all_overdue_jobs(&config, far_future).unwrap();
+        assert_eq!(overdue.len(), 3);
+    }
+
+    #[test]
+    fn all_overdue_jobs_excludes_disabled_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_job(&config, "* * * * *", "echo disabled").unwrap();
+        let _ = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        let far_future = Utc::now() + ChronoDuration::days(365);
+        let overdue = all_overdue_jobs(&config, far_future).unwrap();
+        assert!(overdue.is_empty());
+    }
+
+    #[test]
+    fn add_agent_job_persists_allowed_tools() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_agent_job(
+            &config,
+            Some("agent".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "do work",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec!["file_read".into(), "web_search".into()]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            job.allowed_tools,
+            Some(vec!["file_read".into(), "web_search".into()])
+        );
+
+        let stored = get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.allowed_tools, job.allowed_tools);
+    }
+
+    #[test]
+    fn update_job_persists_allowed_tools_patch() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_agent_job(
+            &config,
+            Some("agent".into()),
+            Schedule::Every { every_ms: 60_000 },
+            "do work",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        let updated = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                allowed_tools: Some(vec!["shell".into()]),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.allowed_tools, Some(vec!["shell".into()]));
+        assert_eq!(
+            get_job(&config, &job.id).unwrap().allowed_tools,
+            Some(vec!["shell".into()])
+        );
     }
 
     #[test]

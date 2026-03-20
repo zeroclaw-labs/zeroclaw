@@ -125,6 +125,7 @@ impl Channel for MatrixTestChannel {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -566,6 +567,7 @@ fn channel_message_thread_ts_preserved_on_clone() {
         timestamp: 1700000000,
         thread_ts: Some("1700000000.000001".into()),
         observe_group: false,
+        interruption_scope_id: None,
     };
 
     let cloned = msg.clone();
@@ -583,6 +585,7 @@ fn channel_message_none_thread_ts_preserved() {
         timestamp: 1700000000,
         thread_ts: None,
         observe_group: false,
+        interruption_scope_id: None,
     };
 
     assert!(msg.clone().thread_ts.is_none());
@@ -637,6 +640,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "discord" => ChannelMessage {
             id: "dc_1".into(),
@@ -647,6 +651,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "slack" => ChannelMessage {
             id: "sl_1".into(),
@@ -657,6 +662,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: Some("1700000000.000001".into()),
             observe_group: false,
+            interruption_scope_id: None,
         },
         "imessage" => ChannelMessage {
             id: "im_1".into(),
@@ -667,6 +673,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "irc" => ChannelMessage {
             id: "irc_1".into(),
@@ -677,6 +684,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "email" => ChannelMessage {
             id: "email_1".into(),
@@ -687,6 +695,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "signal" => ChannelMessage {
             id: "sig_1".into(),
@@ -697,6 +706,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "mattermost" => ChannelMessage {
             id: "mm_1".into(),
@@ -707,6 +717,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: Some("root_msg_id".into()),
             observe_group: false,
+            interruption_scope_id: None,
         },
         "whatsapp" => ChannelMessage {
             id: "wa_1".into(),
@@ -717,6 +728,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "nextcloud_talk" => ChannelMessage {
             id: "nc_1".into(),
@@ -727,6 +739,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "wecom" => ChannelMessage {
             id: "wc_1".into(),
@@ -737,6 +750,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "dingtalk" => ChannelMessage {
             id: "dt_1".into(),
@@ -747,6 +761,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "qq" => ChannelMessage {
             id: "qq_1".into(),
@@ -757,6 +772,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "linq" => ChannelMessage {
             id: "lq_1".into(),
@@ -767,6 +783,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "wati" => ChannelMessage {
             id: "wt_1".into(),
@@ -777,6 +794,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
@@ -787,6 +805,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         },
         _ => panic!("Unknown platform: {platform}"),
     }
@@ -1088,6 +1107,7 @@ fn channel_message_zero_timestamp() {
         timestamp: 0,
         thread_ts: None,
         observe_group: false,
+        interruption_scope_id: None,
     };
     assert_eq!(msg.timestamp, 0);
 }
@@ -1103,6 +1123,7 @@ fn channel_message_max_timestamp() {
         timestamp: u64::MAX,
         thread_ts: None,
         observe_group: false,
+        interruption_scope_id: None,
     };
     assert_eq!(msg.timestamp, u64::MAX);
 }

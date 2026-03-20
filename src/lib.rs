@@ -299,6 +299,9 @@ Examples:
         /// Treat the argument as an agent prompt instead of a shell command
         #[arg(long)]
         agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -317,6 +320,9 @@ Examples:
         /// Treat the argument as an agent prompt instead of a shell command
         #[arg(long)]
         agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -335,6 +341,9 @@ Examples:
         /// Treat the argument as an agent prompt instead of a shell command
         #[arg(long)]
         agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -355,6 +364,9 @@ Examples:
         /// Treat the argument as an agent prompt instead of a shell command
         #[arg(long)]
         agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -388,6 +400,9 @@ Examples:
         /// New job name
         #[arg(long)]
         name: Option<String>,
+        /// Replace the agent job allowlist with the specified tool names (repeatable)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
     },
     /// Pause a scheduled task
     Pause {

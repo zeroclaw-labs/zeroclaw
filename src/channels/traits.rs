@@ -17,6 +17,11 @@ pub struct ChannelMessage {
     /// `mention_only` to passively observe group conversation.
     #[cfg_attr(test, allow(dead_code))]
     pub observe_group: bool,
+    /// Thread scope identifier for interruption/cancellation grouping.
+    /// Distinct from `thread_ts` (reply anchor): this is `Some` only when the message
+    /// is genuinely inside a reply thread and should be isolated from other threads.
+    /// `None` means top-level — scope is sender+channel only.
+    pub interruption_scope_id: Option<String>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -31,6 +36,7 @@ impl Default for ChannelMessage {
             timestamp: 0,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         }
     }
 }
@@ -108,6 +114,17 @@ pub trait Channel: Send + Sync {
     /// Whether this channel supports progressive message updates via draft edits.
     fn supports_draft_updates(&self) -> bool {
         false
+    }
+
+    /// Whether this channel delivers streamed responses as sequential new
+    /// messages (segments) rather than editing a single draft in place.
+    fn supports_stream_segments(&self) -> bool {
+        false
+    }
+
+    /// Minimum character count per streamed segment.
+    fn stream_segment_size(&self) -> usize {
+        200
     }
 
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
@@ -204,6 +221,7 @@ mod tests {
                 timestamp: 123,
                 thread_ts: None,
                 observe_group: false,
+                interruption_scope_id: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -221,6 +239,7 @@ mod tests {
             timestamp: 999,
             thread_ts: None,
             observe_group: false,
+            interruption_scope_id: None,
         };
 
         let cloned = message.clone();
