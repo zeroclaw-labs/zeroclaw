@@ -45,6 +45,8 @@ pub struct Agent {
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
     security_summary: Option<String>,
+    /// Autonomy level from config; controls safety prompt instructions.
+    autonomy_level: crate::security::AutonomyLevel,
 }
 
 pub struct AgentBuilder {
@@ -71,6 +73,7 @@ pub struct AgentBuilder {
     response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
     tool_descriptions: Option<ToolDescriptions>,
     security_summary: Option<String>,
+    autonomy_level: Option<crate::security::AutonomyLevel>,
 }
 
 impl AgentBuilder {
@@ -99,6 +102,7 @@ impl AgentBuilder {
             response_cache: None,
             tool_descriptions: None,
             security_summary: None,
+            autonomy_level: None,
         }
     }
 
@@ -226,6 +230,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn autonomy_level(mut self, level: crate::security::AutonomyLevel) -> Self {
+        self.autonomy_level = Some(level);
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -278,6 +287,9 @@ impl AgentBuilder {
             response_cache: self.response_cache,
             tool_descriptions: self.tool_descriptions,
             security_summary: self.security_summary,
+            autonomy_level: self
+                .autonomy_level
+                .unwrap_or(crate::security::AutonomyLevel::Supervised),
         })
     }
 }
@@ -498,6 +510,7 @@ impl Agent {
             .skills_prompt_mode(config.skills.prompt_injection_mode)
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))
+            .autonomy_level(config.autonomy.level)
             .build()
     }
 
@@ -540,6 +553,7 @@ impl Agent {
             dispatcher_instructions: &instructions,
             tool_descriptions: self.tool_descriptions.as_ref(),
             security_summary: self.security_summary.clone(),
+            autonomy_level: self.autonomy_level,
         };
         self.prompt_builder.build(&ctx)
     }
