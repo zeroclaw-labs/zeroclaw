@@ -253,6 +253,46 @@ impl JiraTool {
         })
     }
 
+    async fn get_myself(&self) -> anyhow::Result<ToolResult> {
+        let url = format!("{}/rest/api/3/myself", self.base_url);
+
+        let resp = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Jira myself request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Jira myself failed ({status}): {}",
+                crate::util::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        let raw: Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Jira myself response: {e}"))?;
+
+        let shaped = json!({
+            "accountId":    raw["accountId"],
+            "displayName":  raw["displayName"],
+            "emailAddress": raw["emailAddress"],
+            "active":       raw["active"],
+        });
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&shaped).unwrap_or_else(|_| shaped.to_string()),
+            error: None,
+        })
+    }
+
     async fn resolve_email(&self, email: &str) -> Option<(String, String)> {
         let url = format!("{}/rest/api/3/user/search", self.base_url);
         let result = self
@@ -289,7 +329,7 @@ impl Tool for JiraTool {
     }
 
     fn description(&self) -> &str {
-        "Interact with Jira: get tickets with configurable detail level, search issues with JQL, and add comments with mention and formatting support."
+        "Interact with Jira: get tickets with configurable detail level, search issues with JQL, add comments with mention and formatting support."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -298,8 +338,8 @@ impl Tool for JiraTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get_ticket", "search_tickets", "comment_ticket"],
-                    "description": "The Jira action to perform. Enabled actions are configured in [jira].allowed_actions."
+                    "enum": ["get_ticket", "search_tickets", "comment_ticket", "myself"],
+                    "description": "The Jira action to perform. Enabled actions are configured in [jira].allowed_actions. Use 'myself' to verify that credentials are valid and the Jira connection is working."
                 },
                 "issue_key": {
                     "type": "string",
@@ -342,12 +382,12 @@ impl Tool for JiraTool {
 
         // Reject unknown actions before the allowlist check so typos produce a
         // clear "unknown action" error rather than a misleading "not enabled" one.
-        if !matches!(action, "get_ticket" | "search_tickets" | "comment_ticket") {
+        if !matches!(action, "get_ticket" | "search_tickets" | "comment_ticket" | "myself") {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket"
+                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket, myself"
                 )),
             });
         }
@@ -365,7 +405,7 @@ impl Tool for JiraTool {
         }
 
         let operation = match action {
-            "get_ticket" | "search_tickets" => ToolOperation::Read,
+            "get_ticket" | "search_tickets" | "myself" => ToolOperation::Read,
             "comment_ticket" => ToolOperation::Act,
             _ => unreachable!(),
         };
@@ -415,6 +455,7 @@ impl Tool for JiraTool {
                     .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
                 self.search_tickets(jql, max_results).await
             }
+            "myself" => self.get_myself().await,
             "comment_ticket" => {
                 let issue_key = match args.get("issue_key").and_then(|v| v.as_str()) {
                     Some(k) => k,
