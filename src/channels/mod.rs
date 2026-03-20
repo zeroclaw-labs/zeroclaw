@@ -1275,7 +1275,7 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
 /// Known `tk` subcommands that are handled directly (zero LLM tokens).
 const TICKET_SUBCOMMANDS: &[&str] = &[
     "list", "show", "stats", "pipeline", "query", "ready", "blocked", "advance", "add-note",
-    "closed", "create", "help",
+    "closed", "create", "help", "tree", "dep", "edit",
 ];
 
 fn is_peek_command(content: &str) -> bool {
@@ -1431,8 +1431,10 @@ fn build_ticket_help() -> String {
         "**Ticket Commands**",
         "",
         "**ticket list** `[--type X] [--tag X]` \u{2014} List open tickets",
+        "**ticket tree** \u{2014} Show tickets as parent/child tree",
         "**ticket show** `<id>` \u{2014} Show ticket details",
-        "**ticket create** `<title>` \u{2014} Create a new ticket",
+        "**ticket create** `<title> [--parent <id>]` \u{2014} Create a new ticket",
+        "**ticket edit** `<id> [--parent <id>] [--title X]` \u{2014} Edit ticket fields",
         "**ticket stats** \u{2014} Project health overview",
         "**ticket pipeline** `[--stage X]` \u{2014} Tickets by pipeline stage",
         "**ticket query** `[filter]` \u{2014} Query with jq filter",
@@ -1440,6 +1442,7 @@ fn build_ticket_help() -> String {
         "**ticket blocked** \u{2014} Blocked tickets",
         "**ticket advance** `<id>` \u{2014} Advance to next stage",
         "**ticket add-note** `<id> <text>` \u{2014} Append note to ticket",
+        "**ticket dep tree** `<id>` \u{2014} Show dependency tree for a ticket",
         "**ticket closed** `[--limit N]` \u{2014} Recently closed tickets",
         "**ticket help** \u{2014} Show this help",
         "",

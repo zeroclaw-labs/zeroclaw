@@ -80,6 +80,80 @@ flag = "--assignee"
 type = "string"
 description = "Assignee name"
 
+[commands.create.params.parent]
+flag = "--parent"
+type = "string"
+description = "Parent ticket ID (makes this a child of an epic)"
+
+[commands.tree]
+description = "Show all tickets as a parent/child hierarchy tree"
+args = ["tree"]
+
+[commands.tree.params.type]
+flag = "--type"
+type = "string"
+description = "Filter by type (bug, feature, task, epic, chore)"
+
+[commands.edit]
+description = "Edit ticket fields (title, parent, priority, assignee, tags, stage)"
+args = ["edit"]
+
+[commands.edit.params.id]
+positional = true
+required = true
+type = "string"
+description = "Ticket ID or partial ID"
+
+[commands.edit.params.parent]
+flag = "--parent"
+type = "string"
+description = "Set parent ticket ID"
+
+[commands.edit.params.title]
+flag = "--title"
+type = "string"
+description = "New title"
+
+[commands.edit.params.priority]
+flag = "--priority"
+type = "integer"
+description = "New priority (0=critical, 4=backlog)"
+
+[commands.edit.params.assignee]
+flag = "--assignee"
+type = "string"
+description = "New assignee"
+
+[commands.edit.params.tags]
+flag = "--tags"
+type = "string"
+description = "Comma-separated tags"
+
+[commands.edit.params.stage]
+flag = "--stage"
+type = "string"
+description = "Override pipeline stage (triage, spec, design, implement, test, verify, done)"
+
+[commands.dep]
+description = "Manage ticket dependencies. Use subcommand: 'tree <id>' to show dependency tree, 'add <id> <dep-id>' to add, 'remove <id> <dep-id>' to remove, 'cycle' to find cycles"
+args = ["dep"]
+
+[commands.dep.params.subcommand]
+positional = true
+required = true
+type = "string"
+description = "Subcommand: tree, add, remove, cycle"
+
+[commands.dep.params.id]
+positional = true
+type = "string"
+description = "Ticket ID (required for tree/add/remove)"
+
+[commands.dep.params.dep_id]
+positional = true
+type = "string"
+description = "Dependency ticket ID (required for add/remove)"
+
 [commands.stats]
 description = "Project health: open/closed counts, stage distribution, velocity"
 args = ["stats"]
