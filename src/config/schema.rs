@@ -2325,7 +2325,14 @@ pub struct GoogleWorkspaceConfig {
     ///
     /// When empty (the default), all methods under `allowed_services` remain
     /// available for backward compatibility. When non-empty, the runtime denies
-    /// any `(service, resource, method)` triple that is not explicitly listed.
+    /// any `(service, resource, sub_resource, method)` combination that is not
+    /// explicitly listed. `sub_resource` is optional per entry: an entry without
+    /// it matches only 3-segment `gws` calls; an entry with it matches only calls
+    /// that supply that exact sub_resource value.
+    ///
+    /// Each entry's `service` must appear in `allowed_services` when that list is
+    /// non-empty; config validation rejects entries that would never match at
+    /// runtime.
     #[serde(default)]
     pub allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
     /// Path to service account JSON or OAuth client credentials file.
@@ -7375,6 +7382,23 @@ impl Config {
             }
         }
 
+        // Build the effective allowed-services set for cross-validation.
+        // Only validate when allowed_services is explicitly configured; when it is
+        // empty the tool falls back to a built-in default list defined in the tool
+        // layer, so we cannot enumerate it here without duplicating that constant.
+        let explicit_services: Option<std::collections::HashSet<&str>> =
+            if self.google_workspace.allowed_services.is_empty() {
+                None
+            } else {
+                Some(
+                    self.google_workspace
+                        .allowed_services
+                        .iter()
+                        .map(|s| s.trim())
+                        .collect(),
+                )
+            };
+
         let mut seen_gws_operations = std::collections::HashSet::new();
         for (i, operation) in self.google_workspace.allowed_operations.iter().enumerate() {
             let service = operation.service.trim();
@@ -7387,6 +7411,15 @@ impl Config {
                 anyhow::bail!(
                     "google_workspace.allowed_operations[{i}].resource must not be empty"
                 );
+            }
+
+            if let Some(ref allowed) = explicit_services {
+                if !allowed.contains(service) {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].service '{service}' is not in \
+                         allowed_services; this entry can never match at runtime"
+                    );
+                }
             }
             if !service
                 .chars()
@@ -12365,6 +12398,42 @@ require_otp_to_resume = true
 
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("duplicate service/resource/sub_resource entry"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_operation_service_not_in_allowed_services() {
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        cfg.google_workspace.allowed_services = vec!["gmail".into()];
+        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "drive".into(), // drive is not in allowed_services
+            resource: "files".into(),
+            sub_resource: None,
+            methods: vec!["list".into()],
+        }];
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("not in allowed_services"),
+            "expected not-in-allowed_services error, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn config_validate_skips_service_cross_check_when_allowed_services_empty() {
+        // When allowed_services is empty, the tool uses a built-in default list.
+        // Validation cannot enumerate that list, so it skips the cross-check.
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        // allowed_services deliberately left empty
+        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "drive".into(),
+            resource: "files".into(),
+            sub_resource: None,
+            methods: vec!["list".into()],
+        }];
+
+        assert!(cfg.validate().is_ok());
     }
 
     // ── Bootstrap files ─────────────────────────────────────

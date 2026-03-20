@@ -335,11 +335,10 @@ temperature = 0.2
 |---|---|---|
 | `service` | 是 | 服务标识符（须匹配 `allowed_services` 中的条目） |
 | `resource` | 是 | 顶层资源名称（Gmail 为 `users`，Drive 为 `files`，Calendar 为 `events`） |
-| `sub_resource` | 否 | 4 段 gws 命令的子资源（Gmail 所有操作必填；Drive、Calendar 等省略） |
+| `sub_resource` | 否 | 4 段 gws 命令的子资源。Gmail 操作使用 `gws gmail users <sub_resource> <method>`，因此 Gmail 条目需填写 `sub_resource` 才能在运行时匹配。Drive、Calendar 等使用 3 段命令，省略此字段。 |
 | `methods` | 是 | 该资源/子资源上允许的一个或多个方法名称 |
 
-Gmail 所有操作均使用 `gws gmail users <sub_resource> <method>` 的 4 段命令格式，
-因此每个 Gmail 条目均需填写 `sub_resource`。Drive 和 Calendar 使用 3 段命令，无需填写。
+Gmail 所有操作使用 `gws gmail users <sub_resource> <method>` 格式。未填写 `sub_resource` 的 Gmail 条目在运行时将永远无法匹配。Drive 和 Calendar 使用 3 段命令，省略 `sub_resource`。
 
 ```toml
 [google_workspace]

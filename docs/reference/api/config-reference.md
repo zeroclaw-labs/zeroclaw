@@ -371,12 +371,12 @@ empty (the default), all combinations within `allowed_services` are available.
 |---|---|---|
 | `service` | yes | Service identifier (must match an entry in `allowed_services`) |
 | `resource` | yes | Top-level resource name (`users` for Gmail, `files` for Drive, `events` for Calendar) |
-| `sub_resource` | no | Sub-resource for 4-segment gws commands (required for all Gmail operations; omit for Drive, Calendar, etc.) |
+| `sub_resource` | no | Sub-resource for 4-segment gws commands. Gmail operations use `gws gmail users <sub_resource> <method>`, so Gmail entries need `sub_resource` to match at runtime. Drive, Calendar, and most other services use 3-segment commands and omit it. |
 | `methods` | yes | One or more method names allowed on that resource/sub_resource |
 
-Gmail uses `gws gmail users <sub_resource> <method>` for all operations, so every
-Gmail entry requires `sub_resource`. Drive and Calendar use 3-segment commands and
-omit it.
+Gmail uses `gws gmail users <sub_resource> <method>` for all operations. A Gmail
+entry without `sub_resource` will never match at runtime. Drive and Calendar use
+3-segment commands and omit `sub_resource`.
 
 ```toml
 [google_workspace]
