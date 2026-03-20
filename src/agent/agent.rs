@@ -1190,7 +1190,9 @@ mod tests {
             .extra_headers
             .insert("X-Title".to_string(), "zeroclaw-web".to_string());
 
-        let mut agent = Agent::from_config(&config).await.expect("agent from config");
+        let mut agent = Agent::from_config(&config)
+            .await
+            .expect("agent from config");
         let response = agent.turn("hello").await.expect("agent turn");
 
         assert_eq!(response, "hello from mock");

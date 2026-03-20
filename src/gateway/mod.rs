@@ -454,18 +454,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Ok(registry) => {
                 let registry = std::sync::Arc::new(registry);
                 if config.mcp.deferred_loading {
-                    let deferred_set = tools::DeferredMcpToolSet::from_registry(
-                        std::sync::Arc::clone(&registry),
-                    )
-                    .await;
+                    let deferred_set =
+                        tools::DeferredMcpToolSet::from_registry(std::sync::Arc::clone(&registry))
+                            .await;
                     tracing::info!(
                         "Gateway MCP deferred: {} tool stub(s) from {} server(s)",
                         deferred_set.len(),
                         registry.server_count()
                     );
-                    let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                        tools::ActivatedToolSet::new(),
-                    ));
+                    let activated =
+                        std::sync::Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
                     tools_registry_raw.push(Box::new(tools::ToolSearchTool::new(
                         deferred_set,
                         activated,
@@ -484,8 +482,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                             if let Some(ref handle) = _delegate_handle_gw {
                                 handle.write().push(std::sync::Arc::clone(&wrapper));
                             }
-                            tools_registry_raw
-                                .push(Box::new(tools::ArcToolRef(wrapper)));
+                            tools_registry_raw.push(Box::new(tools::ArcToolRef(wrapper)));
                             registered += 1;
                         }
                     }
