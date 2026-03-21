@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Terminal,
   Package,
+  ChevronsUpDown,
 } from 'lucide-react';
 import type { ToolSpec, CliTool } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
@@ -16,6 +17,8 @@ export default function Tools() {
   const [cliTools, setCliTools] = useState<CliTool[]>([]);
   const [search, setSearch] = useState('');
   const [expandedTool, setExpandedTool] = useState<string | null>(null);
+  const [agentSectionOpen, setAgentSectionOpen] = useState(true);
+  const [cliSectionOpen, setCliSectionOpen] = useState(true);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -70,14 +73,22 @@ export default function Tools() {
 
       {/* Agent Tools Grid */}
       <div>
-        <div className="flex items-center gap-2 mb-4">
+        <button
+          onClick={() => setAgentSectionOpen((v) => !v)}
+          className="flex items-center gap-2 mb-4 w-full text-left group"
+          style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 0 }}
+        >
           <Wrench className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-          <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>
+          <h2 className="text-sm font-semibold uppercase tracking-wider flex-1" style={{ color: 'var(--pc-text-primary)' }}>
             {t('tools.agent_tools')} ({filtered.length})
           </h2>
-        </div>
+          <ChevronsUpDown
+            className="h-4 w-4 opacity-40 group-hover:opacity-100"
+            style={{ color: 'var(--pc-text-muted)', transform: agentSectionOpen ? 'rotate(0deg)' : 'rotate(180deg)', transition: 'transform 0.2s ease, opacity 0.2s ease' }}
+          />
+        </button>
 
-        {filtered.length === 0 ? (
+        {agentSectionOpen && (filtered.length === 0 ? (
           <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>{t('tools.empty')}</p>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
@@ -124,20 +135,28 @@ export default function Tools() {
               );
             })}
           </div>
-        )}
+        ))}
       </div>
 
       {/* CLI Tools Section */}
       {filteredCli.length > 0 && (
         <div className="animate-slide-in-up" style={{ animationDelay: '200ms' }}>
-          <div className="flex items-center gap-2 mb-4">
+          <button
+            onClick={() => setCliSectionOpen((v) => !v)}
+            className="flex items-center gap-2 mb-4 w-full text-left group"
+            style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 0 }}
+          >
             <Terminal className="h-5 w-5" style={{ color: 'var(--color-status-success)' }} />
-            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>
+            <h2 className="text-sm font-semibold uppercase tracking-wider flex-1" style={{ color: 'var(--pc-text-primary)' }}>
               {t('tools.cli_tools')} ({filteredCli.length})
             </h2>
-          </div>
+            <ChevronsUpDown
+              className="h-4 w-4 opacity-40 group-hover:opacity-100"
+              style={{ color: 'var(--pc-text-muted)', transform: cliSectionOpen ? 'rotate(0deg)' : 'rotate(180deg)', transition: 'transform 0.2s ease, opacity 0.2s ease' }}
+            />
+          </button>
 
-          <div className="card overflow-hidden rounded-2xl">
+          {cliSectionOpen && <div className="card overflow-hidden rounded-2xl">
             <table className="table-electric">
               <thead>
                 <tr>
@@ -168,7 +187,7 @@ export default function Tools() {
                 ))}
               </tbody>
             </table>
-          </div>
+          </div>}
         </div>
       )}
     </div>
