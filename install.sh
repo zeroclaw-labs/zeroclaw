@@ -1182,6 +1182,21 @@ else
     install_system_deps
   fi
 
+  # Always check Xcode/CLT license on macOS, regardless of --install-system-deps.
+  # An un-accepted license causes `cc` to exit 69, breaking all Rust builds.
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
+    printf 'int main(){return 0;}\n' > "$_xcode_test_file"
+    if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
+      rm -f "$_xcode_test_file"
+      error "The C compiler failed (Xcode/CLT license not accepted)."
+      error "Run:  sudo xcodebuild -license accept"
+      error "then re-run this installer."
+      exit 1
+    fi
+    rm -f "$_xcode_test_file"
+  fi
+
   if [[ "$INSTALL_RUST" == true ]]; then
     install_rust_toolchain
   fi
