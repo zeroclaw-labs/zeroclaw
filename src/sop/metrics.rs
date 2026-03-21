@@ -637,6 +637,9 @@ mod tests {
         total_steps: u32,
         step_results: Vec<SopStepResult>,
     ) -> SopRun {
+        let now = Utc::now();
+        let started = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let completed = now.to_rfc3339();
         SopRun {
             run_id: run_id.into(),
             sop_name: sop_name.into(),
@@ -644,8 +647,8 @@ mod tests {
             status,
             current_step: total_steps,
             total_steps,
-            started_at: "2026-02-19T12:00:00Z".into(),
-            completed_at: Some("2026-02-19T12:05:00Z".into()),
+            started_at: started,
+            completed_at: Some(completed),
             step_results,
             waiting_since: None,
             llm_calls_saved: 0,
