@@ -576,7 +576,13 @@ MSG
       if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
         rm -f "$_xcode_test_file"
         warn "Xcode/CLT license has not been accepted. Attempting to accept it now..."
-        if run_privileged xcodebuild -license accept; then
+        _xcode_accept_ok=false
+        if [[ "$(id -u)" -eq 0 ]]; then
+          xcodebuild -license accept && _xcode_accept_ok=true
+        elif [[ -c /dev/tty ]] && have_cmd sudo; then
+          sudo xcodebuild -license accept < /dev/tty && _xcode_accept_ok=true
+        fi
+        if [[ "$_xcode_accept_ok" == true ]]; then
           step_ok "Xcode license accepted"
         else
           error "Could not accept Xcode license. Run manually:"
@@ -1195,7 +1201,14 @@ else
     if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
       rm -f "$_xcode_test_file"
       warn "Xcode/CLT license has not been accepted. Attempting to accept it now..."
-      if run_privileged xcodebuild -license accept; then
+      # Use /dev/tty so sudo can prompt for a password even in a curl|bash pipe.
+      _xcode_accept_ok=false
+      if [[ "$(id -u)" -eq 0 ]]; then
+        xcodebuild -license accept && _xcode_accept_ok=true
+      elif [[ -c /dev/tty ]] && have_cmd sudo; then
+        sudo xcodebuild -license accept < /dev/tty && _xcode_accept_ok=true
+      fi
+      if [[ "$_xcode_accept_ok" == true ]]; then
         step_ok "Xcode license accepted"
         # Re-test compilation to confirm it's fixed.
         _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
