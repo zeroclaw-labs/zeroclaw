@@ -1211,7 +1211,7 @@ pub struct GoogleSttConfig {
 
 /// Local/self-hosted Whisper-compatible STT endpoint (`[transcription.local_whisper]`).
 ///
-/// Audio is sent over WireGuard; never leaves the platform perimeter.
+/// Configures a self-hosted STT endpoint. Can be on localhost, a private network host, or any reachable URL.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct LocalWhisperConfig {
     /// HTTP or HTTPS endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
