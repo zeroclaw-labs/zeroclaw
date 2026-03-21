@@ -50,8 +50,21 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
+/// Default request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Read gateway request timeout from `ZEROCLAW_GATEWAY_TIMEOUT_SECS` env var
+/// at runtime, falling back to [`REQUEST_TIMEOUT_SECS`].
+///
+/// Agentic workloads with tool use (web search, MCP tools, sub-agent
+/// delegation) regularly exceed 30 seconds. This allows operators to
+/// increase the timeout without recompiling.
+pub fn gateway_request_timeout_secs() -> u64 {
+    std::env::var("ZEROCLAW_GATEWAY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(REQUEST_TIMEOUT_SECS)
+}
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -352,7 +365,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         anyhow::bail!(
             "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
              Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
-             [gateway] allow_public_bind = true in config.toml (NOT recommended)."
+             [gateway] allow_public_bind = true in config.toml (NOT recommended).\n\n\
+             Docker: if you need to reach the gateway from a Docker container, set\n\
+             [gateway] host = \"0.0.0.0\" and allow_public_bind = true in config.toml,\n\
+             then connect from the container via ws://host.docker.internal:{port}."
         );
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
@@ -821,7 +837,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(gateway_request_timeout_secs()),
         ))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
@@ -1850,8 +1866,15 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
+    fn security_timeout_default_is_30_seconds() {
         assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn gateway_timeout_falls_back_to_default() {
+        // When env var is not set, should return the default constant
+        std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS");
+        assert_eq!(gateway_request_timeout_secs(), 30);
     }
 
     #[test]

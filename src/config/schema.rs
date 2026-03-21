@@ -367,6 +367,10 @@ pub struct Config {
     /// `LANG`, or `LC_ALL` environment variables (defaulting to `"en"`).
     #[serde(default)]
     pub locale: Option<String>,
+
+    /// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]`).
+    #[serde(default)]
+    pub verifiable_intent: VerifiableIntentConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -871,6 +875,33 @@ impl Default for McpConfig {
             enabled: false,
             deferred_loading: default_deferred_loading(),
             servers: Vec::new(),
+        }
+    }
+}
+
+/// Verifiable Intent (VI) credential verification and issuance (`[verifiable_intent]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VerifiableIntentConfig {
+    /// Enable VI credential verification on commerce tool calls (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Strictness mode for constraint evaluation: "strict" (fail-closed on unknown
+    /// constraint types) or "permissive" (skip unknown types with a warning).
+    /// Default: "strict".
+    #[serde(default = "default_vi_strictness")]
+    pub strictness: String,
+}
+
+fn default_vi_strictness() -> String {
+    "strict".to_owned()
+}
+
+impl Default for VerifiableIntentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strictness: default_vi_strictness(),
         }
     }
 }
@@ -2329,6 +2360,29 @@ impl Default for DataRetentionConfig {
 
 // ── Google Workspace ─────────────────────────────────────────────
 
+/// Built-in default service allowlist for the `google_workspace` tool.
+///
+/// Applied when `allowed_services` is empty. Defined here (not in the tool layer)
+/// so that config validation can cross-check `allowed_operations` entries against
+/// the effective service set in all cases, including when the operator relies on
+/// the default.
+pub const DEFAULT_GWS_SERVICES: &[&str] = &[
+    "drive",
+    "sheets",
+    "gmail",
+    "calendar",
+    "docs",
+    "slides",
+    "tasks",
+    "people",
+    "chat",
+    "classroom",
+    "forms",
+    "keep",
+    "meet",
+    "events",
+];
+
 /// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
 ///
 /// ## Defaults
@@ -2341,6 +2395,47 @@ impl Default for DataRetentionConfig {
 /// - `rate_limit_per_minute`: `60`.
 /// - `timeout_secs`: `30`.
 /// - `audit_log`: `false`.
+/// - `credentials_path`: `None` (uses default `gws` credential discovery).
+/// - `default_account`: `None` (uses the `gws` active account).
+/// - `rate_limit_per_minute`: `60`.
+/// - `timeout_secs`: `30`.
+/// - `audit_log`: `false`.
+///
+/// ## Compatibility
+/// Configs that omit the `[google_workspace]` section entirely are treated as
+/// `GoogleWorkspaceConfig::default()` (disabled, all defaults allowed). Adding
+/// the section is purely opt-in and does not affect other config sections.
+///
+/// ## Rollback / Migration
+/// To revert, remove the `[google_workspace]` section from the config file (or
+/// set `enabled = false`). No data migration is required; the tool simply stops
+/// being registered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct GoogleWorkspaceAllowedOperation {
+    /// Google Workspace service ID (for example `gmail` or `drive`).
+    pub service: String,
+    /// Top-level resource name for the service (for example `users` for Gmail or `files` for Drive).
+    pub resource: String,
+    /// Optional sub-resource for 4-segment gws commands
+    /// (for example `messages` or `drafts` under `gmail users`).
+    /// When present, the entry only matches calls that include this exact sub_resource.
+    /// When absent, the entry only matches calls with no sub_resource.
+    #[serde(default)]
+    pub sub_resource: Option<String>,
+    /// Allowed methods for the service/resource/sub_resource combination.
+    #[serde(default)]
+    pub methods: Vec<String>,
+}
+
+/// Google Workspace CLI (`gws`) tool configuration (`[google_workspace]` section).
+///
+/// ## Defaults
+/// - `enabled`: `false` (tool is not registered unless explicitly opted-in).
+/// - `allowed_services`: empty vector, which grants access to the full default
+///   service set: `drive`, `sheets`, `gmail`, `calendar`, `docs`, `slides`,
+///   `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events`.
+/// - `allowed_operations`: empty vector, which preserves the legacy behavior of
+///   allowing any resource/method under the allowed service set.
 /// - `credentials_path`: `None` (uses default `gws` credential discovery).
 /// - `default_account`: `None` (uses the `gws` active account).
 /// - `rate_limit_per_minute`: `60`.
@@ -2369,6 +2464,20 @@ pub struct GoogleWorkspaceConfig {
     /// optional underscores/hyphens, and unique.
     #[serde(default)]
     pub allowed_services: Vec<String>,
+    /// Restrict which resource/method combinations the agent can access.
+    ///
+    /// When empty (the default), all methods under `allowed_services` remain
+    /// available for backward compatibility. When non-empty, the runtime denies
+    /// any `(service, resource, sub_resource, method)` combination that is not
+    /// explicitly listed. `sub_resource` is optional per entry: an entry without
+    /// it matches only 3-segment `gws` calls; an entry with it matches only calls
+    /// that supply that exact sub_resource value.
+    ///
+    /// Each entry's `service` must appear in `allowed_services` when that list is
+    /// non-empty; config validation rejects entries that would never match at
+    /// runtime.
+    #[serde(default)]
+    pub allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
     /// Path to service account JSON or OAuth client credentials file.
     ///
     /// When `None`, the tool relies on the default `gws` credential discovery
@@ -2406,6 +2515,7 @@ impl Default for GoogleWorkspaceConfig {
         Self {
             enabled: false,
             allowed_services: Vec::new(),
+            allowed_operations: Vec::new(),
             credentials_path: None,
             default_account: None,
             rate_limit_per_minute: default_gws_rate_limit(),
@@ -3391,6 +3501,77 @@ impl Default for QdrantConfig {
     }
 }
 
+/// Configuration for the mem0 (OpenMemory) memory backend.
+///
+/// Connects to a self-hosted OpenMemory server via its REST API.
+/// Deploy OpenMemory with `docker compose up` from the mem0 repo,
+/// then point `url` at the API (default `http://localhost:8765`).
+///
+/// ```toml
+/// [memory]
+/// backend = "mem0"
+///
+/// [memory.mem0]
+/// url = "http://localhost:8765"
+/// user_id = "zeroclaw"
+/// app_name = "zeroclaw"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Mem0Config {
+    /// OpenMemory server URL (e.g. `http://localhost:8765`).
+    /// Falls back to `MEM0_URL` env var if not set.
+    #[serde(default = "default_mem0_url")]
+    pub url: String,
+    /// User ID for scoping memories within mem0.
+    /// Falls back to `MEM0_USER_ID` env var, or default `"zeroclaw"`.
+    #[serde(default = "default_mem0_user_id")]
+    pub user_id: String,
+    /// Application name registered in mem0.
+    /// Falls back to `MEM0_APP_NAME` env var, or default `"zeroclaw"`.
+    #[serde(default = "default_mem0_app_name")]
+    pub app_name: String,
+    /// Whether mem0 should use its built-in LLM to extract facts from
+    /// stored text (`infer = true`) or store raw text as-is (`false`).
+    #[serde(default = "default_mem0_infer")]
+    pub infer: bool,
+    /// Custom prompt for guiding LLM-based fact extraction when `infer = true`.
+    /// Useful for non-English content (e.g. Cantonese/Chinese).
+    /// Falls back to `MEM0_EXTRACTION_PROMPT` env var.
+    /// If unset, the mem0 server uses its built-in default prompt.
+    #[serde(default = "default_mem0_extraction_prompt")]
+    pub extraction_prompt: Option<String>,
+}
+
+fn default_mem0_url() -> String {
+    std::env::var("MEM0_URL").unwrap_or_else(|_| "http://localhost:8765".into())
+}
+fn default_mem0_user_id() -> String {
+    std::env::var("MEM0_USER_ID").unwrap_or_else(|_| "zeroclaw".into())
+}
+fn default_mem0_app_name() -> String {
+    std::env::var("MEM0_APP_NAME").unwrap_or_else(|_| "zeroclaw".into())
+}
+fn default_mem0_infer() -> bool {
+    true
+}
+fn default_mem0_extraction_prompt() -> Option<String> {
+    std::env::var("MEM0_EXTRACTION_PROMPT")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+impl Default for Mem0Config {
+    fn default() -> Self {
+        Self {
+            url: default_mem0_url(),
+            user_id: default_mem0_user_id(),
+            app_name: default_mem0_app_name(),
+            infer: default_mem0_infer(),
+            extraction_prompt: default_mem0_extraction_prompt(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
@@ -3476,6 +3657,13 @@ pub struct MemoryConfig {
     /// Only used when `backend = "qdrant"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+
+    // ── Mem0 backend options ─────────────────────────────────
+    /// Configuration for mem0 (OpenMemory) backend.
+    /// Only used when `backend = "mem0"`.
+    /// Requires `--features memory-mem0` at build time.
+    #[serde(default)]
+    pub mem0: Mem0Config,
 }
 
 fn default_embedding_provider() -> String {
@@ -3551,6 +3739,7 @@ impl Default for MemoryConfig {
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            mem0: Mem0Config::default(),
         }
     }
 }
@@ -3750,7 +3939,16 @@ pub struct AutonomyConfig {
 }
 
 fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into()]
+    vec![
+        "file_read".into(),
+        "memory_recall".into(),
+        "web_search_tool".into(),
+        "web_fetch".into(),
+        "calculator".into(),
+        "glob_search".into(),
+        "content_search".into(),
+        "image_info".into(),
+    ]
 }
 
 fn default_always_ask() -> Vec<String> {
@@ -4264,10 +4462,10 @@ impl Default for CronConfig {
 
 /// Tunnel configuration for exposing the gateway publicly (`[tunnel]` section).
 ///
-/// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"custom"`.
+/// Supported providers: `"none"` (default), `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, `"custom"`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TunnelConfig {
-    /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, or `"custom"`. Default: `"none"`.
+    /// Tunnel provider: `"none"`, `"cloudflare"`, `"tailscale"`, `"ngrok"`, `"openvpn"`, `"pinggy"`, or `"custom"`. Default: `"none"`.
     pub provider: String,
 
     /// Cloudflare Tunnel configuration (used when `provider = "cloudflare"`).
@@ -4289,6 +4487,10 @@ pub struct TunnelConfig {
     /// Custom tunnel command configuration (used when `provider = "custom"`).
     #[serde(default)]
     pub custom: Option<CustomTunnelConfig>,
+
+    /// Pinggy tunnel configuration (used when `provider = "pinggy"`).
+    #[serde(default)]
+    pub pinggy: Option<PinggyTunnelConfig>,
 }
 
 impl Default for TunnelConfig {
@@ -4300,6 +4502,7 @@ impl Default for TunnelConfig {
             ngrok: None,
             openvpn: None,
             custom: None,
+            pinggy: None,
         }
     }
 }
@@ -4355,6 +4558,16 @@ pub struct OpenVpnTunnelConfig {
 
 fn default_openvpn_timeout() -> u64 {
     30
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PinggyTunnelConfig {
+    /// Pinggy access token (optional — free tier works without one).
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Server region: `"us"` (USA), `"eu"` (Europe), `"ap"` (Asia), `"br"` (South America), `"au"` (Australia), or omit for auto.
+    #[serde(default)]
+    pub region: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -4853,6 +5066,9 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+    /// Whether to interrupt an in-flight agent response when a new message arrives.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -6248,6 +6464,7 @@ impl Default for Config {
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
+            verifiable_intent: VerifiableIntentConfig::default(),
         }
     }
 }
@@ -6774,8 +6991,45 @@ impl Config {
             )
             .context("Failed to deserialize config file")?;
 
-            // Warn about each unknown config key
+            // Warn about each unknown config key.
+            // serde_ignored + #[serde(default)] on nested structs can produce
+            // false positives: parent-level fields get re-reported under the
+            // nested key (e.g. "memory.mem0.auto_hydrate" even though
+            // auto_hydrate belongs to MemoryConfig, not Mem0Config).  We
+            // suppress these by checking whether the leaf key is a known field
+            // on the parent struct.
+            let known_memory_fields: &[&str] = &[
+                "backend",
+                "auto_save",
+                "hygiene_enabled",
+                "archive_after_days",
+                "purge_after_days",
+                "conversation_retention_days",
+                "embedding_provider",
+                "embedding_model",
+                "embedding_dimensions",
+                "vector_weight",
+                "keyword_weight",
+                "min_relevance_score",
+                "embedding_cache_size",
+                "chunk_max_tokens",
+                "response_cache_enabled",
+                "response_cache_ttl_minutes",
+                "response_cache_max_entries",
+                "response_cache_hot_entries",
+                "snapshot_enabled",
+                "snapshot_on_hygiene",
+                "auto_hydrate",
+                "sqlite_open_timeout_secs",
+            ];
             for path in ignored_paths {
+                // Skip false positives from nested memory sub-sections
+                if path.starts_with("memory.mem0.") || path.starts_with("memory.qdrant.") {
+                    let leaf = path.rsplit('.').next().unwrap_or("");
+                    if known_memory_fields.contains(&leaf) {
+                        continue;
+                    }
+                }
                 tracing::warn!(
                     "Unknown config key ignored: \"{}\". Check config.toml for typos or deprecated options.",
                     path
@@ -6791,6 +7045,9 @@ impl Config {
                 &mut config.composio.api_key,
                 "config.composio.api_key",
             )?;
+            if let Some(ref mut pinggy) = config.tunnel.pinggy {
+                decrypt_optional_secret(&store, &mut pinggy.token, "config.tunnel.pinggy.token")?;
+            }
             decrypt_optional_secret(
                 &store,
                 &mut config.microsoft365.client_secret,
@@ -7286,6 +7543,9 @@ impl Config {
                 "security.otp.cache_valid_secs must be greater than or equal to security.otp.token_ttl_secs"
             );
         }
+        if self.security.otp.challenge_max_attempts == 0 {
+            anyhow::bail!("security.otp.challenge_max_attempts must be greater than 0");
+        }
         for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
             let normalized = action.trim();
             if normalized.is_empty() {
@@ -7532,6 +7792,115 @@ impl Config {
             }
         }
 
+        // Build the effective allowed-services set for cross-validation.
+        // When the operator leaves allowed_services empty the tool falls back to
+        // DEFAULT_GWS_SERVICES; use the same constant here so validation is
+        // consistent in both cases.
+        let effective_services: std::collections::HashSet<&str> =
+            if self.google_workspace.allowed_services.is_empty() {
+                DEFAULT_GWS_SERVICES.iter().copied().collect()
+            } else {
+                self.google_workspace
+                    .allowed_services
+                    .iter()
+                    .map(|s| s.trim())
+                    .collect()
+            };
+
+        let mut seen_gws_operations = std::collections::HashSet::new();
+        for (i, operation) in self.google_workspace.allowed_operations.iter().enumerate() {
+            let service = operation.service.trim();
+            let resource = operation.resource.trim();
+
+            if service.is_empty() {
+                anyhow::bail!("google_workspace.allowed_operations[{i}].service must not be empty");
+            }
+            if resource.is_empty() {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations[{i}].resource must not be empty"
+                );
+            }
+
+            if !effective_services.contains(service) {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations[{i}].service '{service}' is not in the \
+                     effective allowed_services; this entry can never match at runtime"
+                );
+            }
+            if !service
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
+                );
+            }
+            if !resource
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
+                );
+            }
+
+            if let Some(ref sub_resource) = operation.sub_resource {
+                let sub = sub_resource.trim();
+                if sub.is_empty() {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].sub_resource must not be empty when present"
+                    );
+                }
+                if !sub
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
+                    );
+                }
+            }
+
+            if operation.methods.is_empty() {
+                anyhow::bail!("google_workspace.allowed_operations[{i}].methods must not be empty");
+            }
+
+            let mut seen_methods = std::collections::HashSet::new();
+            for (j, method) in operation.methods.iter().enumerate() {
+                let normalized = method.trim();
+                if normalized.is_empty() {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].methods[{j}] must not be empty"
+                    );
+                }
+                if !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
+                    );
+                }
+                if !seen_methods.insert(normalized.to_string()) {
+                    anyhow::bail!(
+                        "google_workspace.allowed_operations[{i}].methods contains duplicate entry: {normalized}"
+                    );
+                }
+            }
+
+            let sub_key = operation
+                .sub_resource
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("");
+            let operation_key = format!("{service}:{resource}:{sub_key}");
+            if !seen_gws_operations.insert(operation_key.clone()) {
+                anyhow::bail!(
+                    "google_workspace.allowed_operations contains duplicate service/resource/sub_resource entry: {operation_key}"
+                );
+            }
+        }
+
         // Project intelligence
         if self.project_intel.enabled {
             let lang = &self.project_intel.default_language;
@@ -7577,6 +7946,18 @@ impl Config {
             }
             if self.notion.result_property.trim().is_empty() {
                 anyhow::bail!("notion.result_property must not be empty");
+            }
+        }
+
+        // Pinggy tunnel region — validate allowed values (case-insensitive, auto-lowercased at runtime).
+        if let Some(ref pinggy) = self.tunnel.pinggy {
+            if let Some(ref region) = pinggy.region {
+                let r = region.trim().to_ascii_lowercase();
+                if !r.is_empty() && !matches!(r.as_str(), "us" | "eu" | "ap" | "br" | "au") {
+                    anyhow::bail!(
+                        "tunnel.pinggy.region must be one of: us, eu, ap, br, au (or omitted for auto)"
+                    );
+                }
             }
         }
 
@@ -8070,6 +8451,9 @@ impl Config {
             &mut config_to_save.composio.api_key,
             "config.composio.api_key",
         )?;
+        if let Some(ref mut pinggy) = config_to_save.tunnel.pinggy {
+            encrypt_optional_secret(&store, &mut pinggy.token, "config.tunnel.pinggy.token")?;
+        }
         encrypt_optional_secret(
             &store,
             &mut config_to_save.microsoft365.client_secret,
@@ -8966,6 +9350,7 @@ default_temperature = 0.7
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
+            verifiable_intent: VerifiableIntentConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -9303,6 +9688,7 @@ tool_dispatcher = "xml"
             linkedin: LinkedInConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
+            verifiable_intent: VerifiableIntentConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -9580,6 +9966,7 @@ tool_dispatcher = "xml"
             device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
+            interrupt_on_new_message: false,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -9600,6 +9987,7 @@ tool_dispatcher = "xml"
             device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
+            interrupt_on_new_message: false,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -9689,6 +10077,7 @@ allowed_users = ["@ops:matrix.org"]
                 device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
+                interrupt_on_new_message: false,
             }),
             signal: None,
             whatsapp: None,
@@ -11473,6 +11862,116 @@ default_model = "persisted-profile"
         clear_proxy_env_test_vars();
     }
 
+    #[test]
+    async fn google_workspace_allowed_operations_require_methods() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "gmail".into(),
+            resource: "users".into(),
+            sub_resource: Some("drafts".into()),
+            methods: Vec::new(),
+        }];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("google_workspace.allowed_operations[0].methods"));
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_reject_duplicate_service_resource_sub_resource_entries(
+    ) {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["update".into()],
+            },
+        ];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate service/resource/sub_resource entry"));
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_allow_same_resource_different_sub_resource() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("messages".into()),
+                methods: vec!["list".into(), "get".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into(), "update".into()],
+            },
+        ];
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_reject_duplicate_methods_within_entry() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "gmail".into(),
+            resource: "users".into(),
+            sub_resource: Some("drafts".into()),
+            methods: vec!["create".into(), "create".into()],
+        }];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("duplicate entry"),
+            "expected duplicate entry error, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_accept_valid_entries() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("messages".into()),
+                methods: vec!["list".into(), "get".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "drive".into(),
+                resource: "files".into(),
+                sub_resource: None,
+                methods: vec!["list".into(), "get".into()],
+            },
+        ];
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_reject_invalid_sub_resource_characters() {
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "gmail".into(),
+            resource: "users".into(),
+            sub_resource: Some("bad resource!".into()),
+            methods: vec!["list".into()],
+        }];
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("sub_resource contains invalid characters"));
+    }
+
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
         match runtime_proxy_client_cache().read() {
             Ok(guard) => guard.contains_key(cache_key),
@@ -12523,6 +13022,144 @@ require_otp_to_resume = true
         assert!(
             !effective,
             "must fall back to top-level false when channel omits field"
+        );
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_deserialize_from_toml() {
+        let toml_str = r#"
+            enabled = true
+
+            [[allowed_operations]]
+            service = "gmail"
+            resource = "users"
+            sub_resource = "drafts"
+            methods = ["create", "update"]
+        "#;
+
+        let cfg: GoogleWorkspaceConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.allowed_operations.len(), 1);
+        assert_eq!(cfg.allowed_operations[0].service, "gmail");
+        assert_eq!(cfg.allowed_operations[0].resource, "users");
+        assert_eq!(
+            cfg.allowed_operations[0].sub_resource.as_deref(),
+            Some("drafts")
+        );
+        assert_eq!(
+            cfg.allowed_operations[0].methods,
+            vec!["create".to_string(), "update".to_string()]
+        );
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_deserialize_without_sub_resource() {
+        let toml_str = r#"
+            enabled = true
+
+            [[allowed_operations]]
+            service = "drive"
+            resource = "files"
+            methods = ["list", "get"]
+        "#;
+
+        let cfg: GoogleWorkspaceConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.allowed_operations[0].sub_resource, None);
+    }
+
+    #[test]
+    async fn config_validate_accepts_google_workspace_allowed_operations() {
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        cfg.google_workspace.allowed_services = vec!["gmail".into()];
+        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "gmail".into(),
+            resource: "users".into(),
+            sub_resource: Some("drafts".into()),
+            methods: vec!["create".into(), "update".into()],
+        }];
+
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    async fn config_validate_rejects_duplicate_google_workspace_allowed_operations() {
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        cfg.google_workspace.allowed_services = vec!["gmail".into()];
+        cfg.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["update".into()],
+            },
+        ];
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("duplicate service/resource/sub_resource entry"));
+    }
+
+    #[test]
+    async fn config_validate_rejects_operation_service_not_in_allowed_services() {
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        cfg.google_workspace.allowed_services = vec!["gmail".into()];
+        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "drive".into(), // drive is not in allowed_services
+            resource: "files".into(),
+            sub_resource: None,
+            methods: vec!["list".into()],
+        }];
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("not in the effective allowed_services"),
+            "expected not-in-allowed_services error, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn config_validate_accepts_default_service_when_allowed_services_empty() {
+        // When allowed_services is empty the validator uses DEFAULT_GWS_SERVICES.
+        // A known default service must pass.
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        // allowed_services deliberately left empty (falls back to defaults)
+        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "drive".into(),
+            resource: "files".into(),
+            sub_resource: None,
+            methods: vec!["list".into()],
+        }];
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    async fn config_validate_rejects_unknown_service_when_allowed_services_empty() {
+        // Even with allowed_services empty (using defaults), an operation whose
+        // service is not in DEFAULT_GWS_SERVICES must fail validation — not silently
+        // pass through to be rejected at runtime.
+        let mut cfg = Config::default();
+        cfg.google_workspace.enabled = true;
+        // allowed_services deliberately left empty
+        cfg.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
+            service: "not_a_real_service".into(),
+            resource: "files".into(),
+            sub_resource: None,
+            methods: vec!["list".into()],
+        }];
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("not in the effective allowed_services"),
+            "expected effective-allowed_services error, got: {err}"
         );
     }
 

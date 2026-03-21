@@ -324,47 +324,6 @@ React 19 + Vite 6 + Tailwind CSS 4 nettbasert dashbord servert direkte fra Gatew
 - CI/CD: beta (auto pa push) -> stabil (manuell utsendelse) -> Docker, crates.io, Scoop, AUR, Homebrew, tweet.
 - Forhandsbygde binarfiler for Linux (x86_64, aarch64, armv7), macOS (x86_64, aarch64), Windows (x86_64).
 
-## Slik fungerer det (kort)
-
-```
-WhatsApp / Telegram / Slack / Discord / Signal / iMessage / Matrix / IRC / Email
-Bluesky / Nostr / Mattermost / DingTalk / Lark / QQ / Reddit / MQTT / WebSocket
-               │
-               ▼
-┌───────────────────────────────┐
-│            Gateway            │
-│       (kontrollplan)          │
-│    http://127.0.0.1:42617     │
-├───────────────────────────────┤
-│  Nettbasert dashbord (React 19)│
-│  REST API + WebSocket + SSE   │
-│  Paring + Hastighetsbegrensning│
-└──────────────┬────────────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│ Agent  │ │  Cron  │ │ Hands  │
-│ Sloyfe │ │Planleg.│ │ Sverm  │
-└───┬────┘ └───┬────┘ └───┬────┘
-    │          │          │
-    └──────────┼──────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│Leveran.│ │Verktoy │ │ Minne  │
-│ (LLM)  │ │ (70+)  │ │(md/sql)│
-└────────┘ └────────┘ └────────┘
-    │          │
-    ▼          ▼
-┌────────┐ ┌────────────┐
-│Sikker- │ │Periferiutst│
-│ het    │ │(ESP32/STM32)│
-└────────┘ └────────────┘
-```
 
 ## Konfigurasjon
 

@@ -549,7 +549,12 @@ code, kbd, pre {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   padding: 0.75rem 1rem;
-  text-align: left;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  /* Match glass-card background so rows do not bleed through on scroll */
+  background: linear-gradient(135deg, rgba(13, 13, 32, 0.95), rgba(5, 5, 16, 0.90));
+  backdrop-filter: blur(8px);
 }
 
 .table-electric tbody tr {

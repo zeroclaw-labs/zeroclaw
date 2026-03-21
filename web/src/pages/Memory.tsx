@@ -93,7 +93,7 @@ export default function Memory() {
   }
 
   return (
-    <div className="p-6 space-y-6 animate-fade-in">
+    <div className="flex flex-col h-full p-6 gap-6 animate-fade-in overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
