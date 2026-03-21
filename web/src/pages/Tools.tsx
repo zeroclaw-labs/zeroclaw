@@ -6,7 +6,6 @@ import {
   ChevronRight,
   Terminal,
   Package,
-  ChevronsUpDown,
 } from 'lucide-react';
 import type { ToolSpec, CliTool } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
@@ -77,65 +76,69 @@ export default function Tools() {
           onClick={() => setAgentSectionOpen((v) => !v)}
           className="flex items-center gap-2 mb-4 w-full text-left group"
           style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 0 }}
+          aria-expanded={agentSectionOpen}
+          aria-controls="agent-tools-section"
         >
           <Wrench className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
-          <h2 className="text-sm font-semibold uppercase tracking-wider flex-1" style={{ color: 'var(--pc-text-primary)' }}>
+          <span className="text-sm font-semibold uppercase tracking-wider flex-1" role="heading" aria-level={2} style={{ color: 'var(--pc-text-primary)' }}>
             {t('tools.agent_tools')} ({filtered.length})
-          </h2>
-          <ChevronsUpDown
+          </span>
+          <ChevronDown
             className="h-4 w-4 opacity-40 group-hover:opacity-100"
-            style={{ color: 'var(--pc-text-muted)', transform: agentSectionOpen ? 'rotate(0deg)' : 'rotate(180deg)', transition: 'transform 0.2s ease, opacity 0.2s ease' }}
+            style={{ color: 'var(--pc-text-muted)', transform: agentSectionOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform 0.2s ease, opacity 0.2s ease' }}
           />
         </button>
 
-        {agentSectionOpen && (filtered.length === 0 ? (
-          <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>{t('tools.empty')}</p>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
-            {filtered.map((tool) => {
-              const isExpanded = expandedTool === tool.name;
-              return (
-                <div
-                  key={tool.name}
-                  className="card overflow-hidden animate-slide-in-up"
-                >
-                  <button
-                    onClick={() => setExpandedTool(isExpanded ? null : tool.name)}
-                    className="w-full text-left p-4 transition-all"
-                    style={{ background: 'transparent' }}
-                    onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--pc-hover)'; }}
-                    onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+        <div id="agent-tools-section">
+          {agentSectionOpen && (filtered.length === 0 ? (
+            <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>{t('tools.empty')}</p>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 stagger-children">
+              {filtered.map((tool) => {
+                const isExpanded = expandedTool === tool.name;
+                return (
+                  <div
+                    key={tool.name}
+                    className="card overflow-hidden animate-slide-in-up"
                   >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex items-center gap-2 min-w-0">
-                        <Package className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} />
-                        <h3 className="text-sm font-semibold truncate" style={{ color: 'var(--pc-text-primary)' }}>{tool.name}</h3>
+                    <button
+                      onClick={() => setExpandedTool(isExpanded ? null : tool.name)}
+                      className="w-full text-left p-4 transition-all"
+                      style={{ background: 'transparent' }}
+                      onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--pc-hover)'; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Package className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} />
+                          <h3 className="text-sm font-semibold truncate" style={{ color: 'var(--pc-text-primary)' }}>{tool.name}</h3>
+                        </div>
+                        {isExpanded
+                          ? <ChevronDown className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} />
+                          : <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-faint)' }} />
+                        }
                       </div>
-                      {isExpanded
-                        ? <ChevronDown className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-accent)' }} />
-                        : <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-faint)' }} />
-                      }
-                    </div>
-                    <p className="text-sm mt-2 line-clamp-2" style={{ color: 'var(--pc-text-muted)' }}>
-                      {tool.description}
-                    </p>
-                  </button>
-
-                  {isExpanded && tool.parameters && (
-                    <div className="border-t p-4 animate-fade-in" style={{ borderColor: 'var(--pc-border)' }}>
-                      <p className="text-[10px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--pc-text-muted)' }}>
-                        {t('tools.parameter_schema')}
+                      <p className="text-sm mt-2 line-clamp-2" style={{ color: 'var(--pc-text-muted)' }}>
+                        {tool.description}
                       </p>
-                      <pre className="text-xs rounded-xl p-3 overflow-x-auto max-h-64 overflow-y-auto font-mono" style={{ background: 'var(--pc-bg-base)', color: 'var(--pc-text-secondary)' }}>
-                        {JSON.stringify(tool.parameters, null, 2)}
-                      </pre>
-                    </div>
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        ))}
+                    </button>
+
+                    {isExpanded && tool.parameters && (
+                      <div className="border-t p-4 animate-fade-in" style={{ borderColor: 'var(--pc-border)' }}>
+                        <p className="text-[10px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--pc-text-muted)' }}>
+                          {t('tools.parameter_schema')}
+                        </p>
+                        <pre className="text-xs rounded-xl p-3 overflow-x-auto max-h-64 overflow-y-auto font-mono" style={{ background: 'var(--pc-bg-base)', color: 'var(--pc-text-secondary)' }}>
+                          {JSON.stringify(tool.parameters, null, 2)}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
       </div>
 
       {/* CLI Tools Section */}
@@ -145,49 +148,53 @@ export default function Tools() {
             onClick={() => setCliSectionOpen((v) => !v)}
             className="flex items-center gap-2 mb-4 w-full text-left group"
             style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: 0 }}
+            aria-expanded={cliSectionOpen}
+            aria-controls="cli-tools-section"
           >
             <Terminal className="h-5 w-5" style={{ color: 'var(--color-status-success)' }} />
-            <h2 className="text-sm font-semibold uppercase tracking-wider flex-1" style={{ color: 'var(--pc-text-primary)' }}>
+            <span className="text-sm font-semibold uppercase tracking-wider flex-1" role="heading" aria-level={2} style={{ color: 'var(--pc-text-primary)' }}>
               {t('tools.cli_tools')} ({filteredCli.length})
-            </h2>
-            <ChevronsUpDown
+            </span>
+            <ChevronDown
               className="h-4 w-4 opacity-40 group-hover:opacity-100"
-              style={{ color: 'var(--pc-text-muted)', transform: cliSectionOpen ? 'rotate(0deg)' : 'rotate(180deg)', transition: 'transform 0.2s ease, opacity 0.2s ease' }}
+              style={{ color: 'var(--pc-text-muted)', transform: cliSectionOpen ? 'rotate(0deg)' : 'rotate(-90deg)', transition: 'transform 0.2s ease, opacity 0.2s ease' }}
             />
           </button>
 
-          {cliSectionOpen && <div className="card overflow-hidden rounded-2xl">
-            <table className="table-electric">
-              <thead>
-                <tr>
-                  <th>{t('tools.name')}</th>
-                  <th>{t('tools.path')}</th>
-                  <th>{t('tools.version')}</th>
-                  <th>{t('tools.category')}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {filteredCli.map((tool) => (
-                  <tr key={tool.name}>
-                    <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>
-                      {tool.name}
-                    </td>
-                    <td className="font-mono text-xs truncate max-w-[200px]" style={{ color: 'var(--pc-text-muted)' }}>
-                      {tool.path}
-                    </td>
-                    <td style={{ color: 'var(--pc-text-muted)' }}>
-                      {tool.version ?? '-'}
-                    </td>
-                    <td>
-                      <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold capitalize border" style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-secondary)', background: 'var(--pc-accent-glow)' }}>
-                        {tool.category}
-                      </span>
-                    </td>
+          <div id="cli-tools-section">
+            {cliSectionOpen && <div className="card overflow-hidden rounded-2xl">
+              <table className="table-electric">
+                <thead>
+                  <tr>
+                    <th>{t('tools.name')}</th>
+                    <th>{t('tools.path')}</th>
+                    <th>{t('tools.version')}</th>
+                    <th>{t('tools.category')}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>}
+                </thead>
+                <tbody>
+                  {filteredCli.map((tool) => (
+                    <tr key={tool.name}>
+                      <td className="font-medium text-sm" style={{ color: 'var(--pc-text-primary)' }}>
+                        {tool.name}
+                      </td>
+                      <td className="font-mono text-xs truncate max-w-[200px]" style={{ color: 'var(--pc-text-muted)' }}>
+                        {tool.path}
+                      </td>
+                      <td style={{ color: 'var(--pc-text-muted)' }}>
+                        {tool.version ?? '-'}
+                      </td>
+                      <td>
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold capitalize border" style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-secondary)', background: 'var(--pc-accent-glow)' }}>
+                          {tool.category}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>}
+          </div>
         </div>
       )}
     </div>
