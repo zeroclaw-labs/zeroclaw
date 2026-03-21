@@ -4471,7 +4471,7 @@ mod tests {
         );
 
         // 2. Call transcribe_audio() — tests the shim directly (production Telegram path
-        //    now goes through TranscriptionManager; shim remains until PR 15 removes it)
+        //    now goes through TranscriptionManager; shim remains until transcribe_audio() is removed)
         let config = crate::config::TranscriptionConfig {
             enabled: true,
             ..Default::default()
