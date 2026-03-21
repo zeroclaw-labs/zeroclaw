@@ -43,7 +43,9 @@ impl MemoryLoader for DefaultMemoryLoader {
         user_message: &str,
         session_id: Option<&str>,
     ) -> anyhow::Result<String> {
-        let entries = memory.recall(user_message, self.limit, session_id).await?;
+        let entries = memory
+            .recall(user_message, self.limit, session_id, None, None)
+            .await?;
         if entries.is_empty() {
             return Ok(String::new());
         }
@@ -102,6 +104,8 @@ mod tests {
             _query: &str,
             limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             if limit == 0 {
                 return Ok(vec![]);
@@ -163,6 +167,8 @@ mod tests {
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(self.entries.as_ref().clone())
         }
