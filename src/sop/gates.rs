@@ -665,6 +665,7 @@ mod tests {
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
             }],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         collector.record_run_complete(&run);
 

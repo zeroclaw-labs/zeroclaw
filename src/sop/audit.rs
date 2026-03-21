@@ -166,6 +166,7 @@ mod tests {
             completed_at: None,
             step_results: Vec::new(),
             waiting_since: None,
+            llm_calls_saved: 0,
         }
     }
 

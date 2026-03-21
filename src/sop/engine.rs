@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use tracing::{info, warn};
@@ -8,8 +8,9 @@ use tracing::{info, warn};
 use super::condition::evaluate_condition;
 use super::load_sops;
 use super::types::{
-    Sop, SopEvent, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepResult,
-    SopStepStatus, SopTrigger, SopTriggerSource,
+    DeterministicRunState, DeterministicSavings, Sop, SopEvent, SopExecutionMode, SopPriority,
+    SopRun, SopRunAction, SopRunStatus, SopStep, SopStepKind, SopStepResult, SopStepStatus,
+    SopTrigger, SopTriggerSource,
 };
 use crate::config::SopConfig;
 
@@ -21,6 +22,8 @@ pub struct SopEngine {
     finished_runs: Vec<SopRun>,
     config: SopConfig,
     run_counter: u64,
+    /// Cumulative savings from deterministic execution.
+    deterministic_savings: DeterministicSavings,
 }
 
 impl SopEngine {
@@ -32,6 +35,7 @@ impl SopEngine {
             finished_runs: Vec::new(),
             config,
             run_counter: 0,
+            deterministic_savings: DeterministicSavings::default(),
         }
     }
 
@@ -40,7 +44,7 @@ impl SopEngine {
         self.sops = load_sops(
             workspace_dir,
             self.config.sops_dir.as_deref(),
-            self.config.default_execution_mode,
+            super::parse_execution_mode(&self.config.default_execution_mode),
         );
         info!("SOP engine loaded {} SOPs", self.sops.len());
     }
@@ -118,7 +122,15 @@ impl SopEngine {
     }
 
     /// Start a new SOP run. Returns the first action to take.
+    /// Deterministic SOPs are automatically routed to `start_deterministic_run`.
     pub fn start_run(&mut self, sop_name: &str, event: SopEvent) -> Result<SopRunAction> {
+        // Route deterministic SOPs to dedicated path
+        if self.get_sop(sop_name).map_or(false, |s| {
+            s.execution_mode == SopExecutionMode::Deterministic
+        }) {
+            return self.start_deterministic_run(sop_name, event);
+        }
+
         let sop = self
             .get_sop(sop_name)
             .ok_or_else(|| anyhow::anyhow!("SOP not found: {sop_name}"))?
@@ -154,6 +166,7 @@ impl SopEngine {
             completed_at: None,
             step_results: Vec::new(),
             waiting_since: None,
+            llm_calls_saved: 0,
         };
 
         self.active_runs.insert(run_id.clone(), run);
@@ -281,6 +294,273 @@ impl SopEngine {
             .iter()
             .filter(|r| sop_name.map_or(true, |name| r.sop_name == name))
             .collect()
+    }
+
+    /// Return cumulative deterministic execution savings.
+    pub fn deterministic_savings(&self) -> &DeterministicSavings {
+        &self.deterministic_savings
+    }
+
+    // ── Deterministic execution ─────────────────────────────────
+
+    /// Start a deterministic SOP run. Steps execute sequentially without LLM
+    /// round-trips. Returns the first action (DeterministicStep or CheckpointWait).
+    pub fn start_deterministic_run(
+        &mut self,
+        sop_name: &str,
+        event: SopEvent,
+    ) -> Result<SopRunAction> {
+        let sop = self
+            .get_sop(sop_name)
+            .ok_or_else(|| anyhow::anyhow!("SOP not found: {sop_name}"))?
+            .clone();
+
+        if sop.execution_mode != SopExecutionMode::Deterministic {
+            bail!(
+                "SOP '{}' is not in deterministic mode (mode: {})",
+                sop_name,
+                sop.execution_mode
+            );
+        }
+
+        if !self.can_start(sop_name) {
+            bail!(
+                "Cannot start SOP '{}': cooldown or concurrency limit reached",
+                sop_name
+            );
+        }
+
+        if sop.steps.is_empty() {
+            bail!("SOP '{}' has no steps defined", sop_name);
+        }
+
+        self.run_counter += 1;
+        let dur = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let epoch_ms = dur.as_secs() * 1000 + u64::from(dur.subsec_millis());
+        let run_id = format!("det-{epoch_ms}-{:04}", self.run_counter);
+        let now = now_iso8601();
+
+        let total_steps = u32::try_from(sop.steps.len()).unwrap_or(u32::MAX);
+        let run = SopRun {
+            run_id: run_id.clone(),
+            sop_name: sop_name.to_string(),
+            trigger_event: event,
+            status: SopRunStatus::Running,
+            current_step: 1,
+            total_steps,
+            started_at: now,
+            completed_at: None,
+            step_results: Vec::new(),
+            waiting_since: None,
+            llm_calls_saved: 0,
+        };
+
+        self.active_runs.insert(run_id.clone(), run);
+        info!(
+            "Deterministic SOP run {} started for '{}'",
+            run_id, sop_name
+        );
+
+        // Produce first step action
+        let step = sop.steps[0].clone();
+        let input = serde_json::Value::Null;
+        self.resolve_deterministic_action(&sop, &run_id, &step, input)
+    }
+
+    /// Advance a deterministic run with the output of the current step.
+    /// The output is piped as input to the next step.
+    pub fn advance_deterministic_step(
+        &mut self,
+        run_id: &str,
+        step_output: serde_json::Value,
+    ) -> Result<SopRunAction> {
+        let run = self
+            .active_runs
+            .get_mut(run_id)
+            .ok_or_else(|| anyhow::anyhow!("Active run not found: {run_id}"))?;
+
+        let sop = self
+            .sops
+            .iter()
+            .find(|s| s.name == run.sop_name)
+            .ok_or_else(|| anyhow::anyhow!("SOP '{}' no longer loaded", run.sop_name))?
+            .clone();
+
+        // Record step result
+        let now = now_iso8601();
+        let step_result = SopStepResult {
+            step_number: run.current_step,
+            status: SopStepStatus::Completed,
+            output: step_output.to_string(),
+            started_at: run.started_at.clone(),
+            completed_at: Some(now),
+        };
+        run.step_results.push(step_result);
+
+        // Each deterministic step saves one LLM call
+        run.llm_calls_saved += 1;
+
+        // Advance to next step
+        let next_step_num = run.current_step + 1;
+        if next_step_num > run.total_steps {
+            info!(
+                "Deterministic SOP run {run_id} completed ({} LLM calls saved)",
+                run.llm_calls_saved
+            );
+            let saved = run.llm_calls_saved;
+            self.deterministic_savings.total_llm_calls_saved += saved;
+            self.deterministic_savings.total_runs += 1;
+            return Ok(self.finish_run(run_id, SopRunStatus::Completed, None));
+        }
+
+        let run = self.active_runs.get_mut(run_id).unwrap();
+        run.current_step = next_step_num;
+
+        let step_idx = (next_step_num - 1) as usize;
+        let step = sop.steps[step_idx].clone();
+        let run_id_owned = run_id.to_string();
+
+        self.resolve_deterministic_action(&sop, &run_id_owned, &step, step_output)
+    }
+
+    /// Resume a deterministic run from persisted state.
+    pub fn resume_deterministic_run(
+        &mut self,
+        state: DeterministicRunState,
+    ) -> Result<SopRunAction> {
+        let run = self
+            .active_runs
+            .get_mut(&state.run_id)
+            .ok_or_else(|| anyhow::anyhow!("Active run not found: {}", state.run_id))?;
+
+        if run.status != SopRunStatus::PausedCheckpoint {
+            bail!(
+                "Run {} is not paused at checkpoint (status: {})",
+                state.run_id,
+                run.status
+            );
+        }
+
+        let sop = self
+            .sops
+            .iter()
+            .find(|s| s.name == run.sop_name)
+            .ok_or_else(|| anyhow::anyhow!("SOP '{}' no longer loaded", run.sop_name))?
+            .clone();
+
+        run.status = SopRunStatus::Running;
+        run.waiting_since = None;
+        run.llm_calls_saved = state.llm_calls_saved;
+
+        // Resume from the step after the last completed one
+        let next_step_num = state.last_completed_step + 1;
+        if next_step_num > state.total_steps {
+            info!(
+                "Deterministic SOP run {} completed on resume ({} LLM calls saved)",
+                state.run_id, state.llm_calls_saved
+            );
+            self.deterministic_savings.total_llm_calls_saved += state.llm_calls_saved;
+            self.deterministic_savings.total_runs += 1;
+            return Ok(self.finish_run(&state.run_id, SopRunStatus::Completed, None));
+        }
+
+        let run = self.active_runs.get_mut(&state.run_id).unwrap();
+        run.current_step = next_step_num;
+
+        let step_idx = (next_step_num - 1) as usize;
+        let step = sop.steps[step_idx].clone();
+
+        // Use last step's output as input, or Null
+        let last_output = state
+            .step_outputs
+            .get(&state.last_completed_step)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+
+        let run_id = state.run_id.clone();
+        self.resolve_deterministic_action(&sop, &run_id, &step, last_output)
+    }
+
+    /// Resolve the action for a deterministic step (execute or checkpoint).
+    fn resolve_deterministic_action(
+        &mut self,
+        sop: &Sop,
+        run_id: &str,
+        step: &SopStep,
+        input: serde_json::Value,
+    ) -> Result<SopRunAction> {
+        if step.kind == SopStepKind::Checkpoint {
+            // Pause at checkpoint — persist state and wait for approval
+            if let Some(run) = self.active_runs.get_mut(run_id) {
+                run.status = SopRunStatus::PausedCheckpoint;
+                run.waiting_since = Some(now_iso8601());
+            }
+
+            let state_file = self.persist_deterministic_state(run_id, sop)?;
+
+            info!(
+                "Deterministic SOP run {run_id}: checkpoint at step {} '{}', state persisted to {}",
+                step.number,
+                step.title,
+                state_file.display()
+            );
+
+            Ok(SopRunAction::CheckpointWait {
+                run_id: run_id.to_string(),
+                step: step.clone(),
+                state_file,
+            })
+        } else {
+            Ok(SopRunAction::DeterministicStep {
+                run_id: run_id.to_string(),
+                step: step.clone(),
+                input,
+            })
+        }
+    }
+
+    /// Persist the current deterministic run state to a JSON file.
+    fn persist_deterministic_state(&self, run_id: &str, sop: &Sop) -> Result<PathBuf> {
+        let run = self
+            .active_runs
+            .get(run_id)
+            .ok_or_else(|| anyhow::anyhow!("Run not found: {run_id}"))?;
+
+        let mut step_outputs = HashMap::new();
+        for result in &run.step_results {
+            // Try to parse output as JSON, fall back to string value
+            let value = serde_json::from_str(&result.output)
+                .unwrap_or_else(|_| serde_json::Value::String(result.output.clone()));
+            step_outputs.insert(result.step_number, value);
+        }
+
+        let state = DeterministicRunState {
+            run_id: run_id.to_string(),
+            sop_name: run.sop_name.clone(),
+            last_completed_step: run.current_step.saturating_sub(1),
+            total_steps: run.total_steps,
+            step_outputs,
+            persisted_at: now_iso8601(),
+            llm_calls_saved: run.llm_calls_saved,
+            paused_at_checkpoint: run.status == SopRunStatus::PausedCheckpoint,
+        };
+
+        // Write to SOP location directory, or temp dir
+        let dir = sop.location.as_deref().unwrap_or_else(|| Path::new("."));
+        let state_file = dir.join(format!("{run_id}.state.json"));
+        let json = serde_json::to_string_pretty(&state)?;
+        std::fs::write(&state_file, json)?;
+
+        Ok(state_file)
+    }
+
+    /// Load a persisted deterministic run state from a JSON file.
+    pub fn load_deterministic_state(path: &Path) -> Result<DeterministicRunState> {
+        let content = std::fs::read_to_string(path)?;
+        let state: DeterministicRunState = serde_json::from_str(&content)?;
+        Ok(state)
     }
 
     // ── Approval timeout ──────────────────────────────────────────
@@ -487,21 +767,21 @@ fn resolve_step_action(sop: &Sop, step: &SopStep, run_id: String, context: Strin
     }
 
     let needs_approval = match sop.execution_mode {
-        crate::sop::SopExecutionMode::Auto => false,
-        crate::sop::SopExecutionMode::Supervised => {
+        // Deterministic mode is handled via start_deterministic_run;
+        // if we reach here via the standard path, treat as Auto.
+        SopExecutionMode::Auto | SopExecutionMode::Deterministic => false,
+        SopExecutionMode::Supervised => {
             // Supervised: approval only before the first step
             step.number == 1
         }
-        crate::sop::SopExecutionMode::StepByStep => true,
-        crate::sop::SopExecutionMode::PriorityBased => {
-            match sop.priority {
-                SopPriority::Critical | SopPriority::High => false,
-                SopPriority::Normal | SopPriority::Low => {
-                    // Supervised behavior for normal/low
-                    step.number == 1
-                }
+        SopExecutionMode::StepByStep => true,
+        SopExecutionMode::PriorityBased => match sop.priority {
+            SopPriority::Critical | SopPriority::High => false,
+            SopPriority::Normal | SopPriority::Low => {
+                // Supervised behavior for normal/low
+                step.number == 1
             }
-        }
+        },
     };
 
     if needs_approval {
@@ -680,6 +960,8 @@ mod tests {
                     body: "Do step one".into(),
                     suggested_tools: vec!["shell".into()],
                     requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
                 },
                 SopStep {
                     number: 2,
@@ -687,11 +969,14 @@ mod tests {
                     body: "Do step two".into(),
                     suggested_tools: vec![],
                     requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
                 },
             ],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
+            deterministic: false,
         }
     }
 
@@ -706,6 +991,8 @@ mod tests {
         match action {
             SopRunAction::ExecuteStep { run_id, .. }
             | SopRunAction::WaitApproval { run_id, .. }
+            | SopRunAction::DeterministicStep { run_id, .. }
+            | SopRunAction::CheckpointWait { run_id, .. }
             | SopRunAction::Completed { run_id, .. }
             | SopRunAction::Failed { run_id, .. } => run_id,
         }
@@ -1359,6 +1646,7 @@ mod tests {
             completed_at: None,
             step_results: Vec::new(),
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         let ctx = format_step_context(&sop, &run, &sop.steps[0]);
         assert!(ctx.contains("pump-shutdown"));

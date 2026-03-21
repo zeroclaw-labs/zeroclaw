@@ -648,6 +648,7 @@ mod tests {
             completed_at: Some("2026-02-19T12:05:00Z".into()),
             step_results,
             waiting_since: None,
+            llm_calls_saved: 0,
         }
     }
 
@@ -1245,6 +1246,7 @@ mod tests {
             completed_at: None,
             step_results: vec![],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         audit.log_run_start(&run).await.unwrap();
 
@@ -1342,6 +1344,7 @@ mod tests {
             completed_at: None,
             step_results: vec![],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         audit.log_run_start(&running_run).await.unwrap();
         audit.log_approval(&running_run, 1).await.unwrap();

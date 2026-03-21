@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -42,6 +43,10 @@ pub enum SopExecutionMode {
     StepByStep,
     /// Critical/High → Auto, Normal/Low → Supervised.
     PriorityBased,
+    /// Execute steps sequentially without LLM round-trips.
+    /// Step outputs are piped as inputs to the next step.
+    /// Checkpoint steps pause for human approval.
+    Deterministic,
 }
 
 impl fmt::Display for SopExecutionMode {
@@ -51,6 +56,7 @@ impl fmt::Display for SopExecutionMode {
             Self::Supervised => write!(f, "supervised"),
             Self::StepByStep => write!(f, "step_by_step"),
             Self::PriorityBased => write!(f, "priority_based"),
+            Self::Deterministic => write!(f, "deterministic"),
         }
     }
 }
@@ -93,6 +99,44 @@ impl fmt::Display for SopTrigger {
     }
 }
 
+// ── Step kind ────────────────────────────────────────────────────
+
+/// The kind of a workflow step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SopStepKind {
+    /// Normal step — executed by the agent (or deterministic handler).
+    #[default]
+    Execute,
+    /// Checkpoint step — pauses execution and waits for human approval.
+    Checkpoint,
+}
+
+impl fmt::Display for SopStepKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Execute => write!(f, "execute"),
+            Self::Checkpoint => write!(f, "checkpoint"),
+        }
+    }
+}
+
+// ── Typed step parameters ────────────────────────────────────────
+
+/// JSON Schema fragment for validating step input/output data.
+///
+/// Stored as a raw `serde_json::Value` so callers can validate without
+/// pulling in a full JSON Schema library.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepSchema {
+    /// JSON Schema object describing expected input shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    /// JSON Schema object describing expected output shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
+}
+
 // ── Step ────────────────────────────────────────────────────────
 
 /// A single step in an SOP procedure, parsed from SOP.md.
@@ -105,6 +149,12 @@ pub struct SopStep {
     pub suggested_tools: Vec<String>,
     #[serde(default)]
     pub requires_confirmation: bool,
+    /// Step kind: `execute` (default) or `checkpoint`.
+    #[serde(default)]
+    pub kind: SopStepKind,
+    /// Typed input/output schemas for deterministic data flow validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<StepSchema>,
 }
 
 // ── SOP ─────────────────────────────────────────────────────────
@@ -125,6 +175,10 @@ pub struct Sop {
     pub max_concurrent: u32,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    /// When true, sets execution_mode to Deterministic.
+    /// Steps execute sequentially without LLM round-trips.
+    #[serde(default)]
+    pub deterministic: bool,
 }
 
 fn default_cooldown_secs() -> u64 {
@@ -160,6 +214,9 @@ pub(crate) struct SopMeta {
     pub cooldown_secs: u64,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
+    /// Opt-in deterministic execution (no LLM round-trips between steps).
+    #[serde(default)]
+    pub deterministic: bool,
 }
 
 fn default_sop_version() -> String {
@@ -214,6 +271,8 @@ pub enum SopRunStatus {
     Pending,
     Running,
     WaitingApproval,
+    /// Paused at a checkpoint in a deterministic workflow.
+    PausedCheckpoint,
     Completed,
     Failed,
     Cancelled,
@@ -225,6 +284,7 @@ impl fmt::Display for SopRunStatus {
             Self::Pending => write!(f, "pending"),
             Self::Running => write!(f, "running"),
             Self::WaitingApproval => write!(f, "waiting_approval"),
+            Self::PausedCheckpoint => write!(f, "paused_checkpoint"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Cancelled => write!(f, "cancelled"),
@@ -276,6 +336,44 @@ pub struct SopRun {
     /// ISO-8601 timestamp when the run entered WaitingApproval (for timeout tracking).
     #[serde(default)]
     pub waiting_since: Option<String>,
+    /// Number of LLM calls saved by deterministic execution in this run.
+    #[serde(default)]
+    pub llm_calls_saved: u64,
+}
+
+// ── Deterministic workflow state (persistence + resume) ──────────
+
+/// Persisted state for a deterministic workflow run, enabling resume
+/// after interruption. Serialized to a JSON file alongside the SOP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeterministicRunState {
+    /// Identifier of this run.
+    pub run_id: String,
+    /// SOP name this state belongs to.
+    pub sop_name: String,
+    /// Last successfully completed step number (0 = none completed).
+    pub last_completed_step: u32,
+    /// Total steps in the workflow.
+    pub total_steps: u32,
+    /// Output of each completed step, keyed by step number.
+    pub step_outputs: HashMap<u32, serde_json::Value>,
+    /// ISO-8601 timestamp when this state was last persisted.
+    pub persisted_at: String,
+    /// Number of LLM calls that were saved by deterministic execution.
+    pub llm_calls_saved: u64,
+    /// Whether the run is paused at a checkpoint awaiting approval.
+    pub paused_at_checkpoint: bool,
+}
+
+// ── Cost savings metric ──────────────────────────────────────────
+
+/// Tracks how many LLM round-trips were saved by deterministic execution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeterministicSavings {
+    /// Total LLM calls saved across all deterministic runs.
+    pub total_llm_calls_saved: u64,
+    /// Total deterministic runs completed.
+    pub total_runs: u64,
 }
 
 /// What the engine instructs the caller to do next after a state transition.
@@ -292,6 +390,20 @@ pub enum SopRunAction {
         run_id: String,
         step: SopStep,
         context: String,
+    },
+    /// Execute a step deterministically (no LLM). The `input` is the piped
+    /// output from the previous step (or trigger payload for step 1).
+    DeterministicStep {
+        run_id: String,
+        step: SopStep,
+        input: serde_json::Value,
+    },
+    /// Deterministic workflow hit a checkpoint — pause for human approval.
+    /// Workflow state has been persisted so it can resume after approval.
+    CheckpointWait {
+        run_id: String,
+        step: SopStep,
+        state_file: PathBuf,
     },
     /// The SOP run completed successfully.
     Completed { run_id: String, sop_name: String },
@@ -459,6 +571,7 @@ path = "/sop/test"
                 completed_at: Some("2026-02-19T12:00:05Z".into()),
             }],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();
