@@ -17,6 +17,10 @@ pub struct ChannelMessage {
     /// is genuinely inside a reply thread and should be isolated from other threads.
     /// `None` means top-level — scope is sender+channel only.
     pub interruption_scope_id: Option<String>,
+    /// Media attachments (audio, images, video) for the media pipeline.
+    /// Channels populate this when they receive media alongside a text message.
+    /// Defaults to empty — existing channels are unaffected.
+    pub attachments: Vec<super::media_pipeline::MediaAttachment>,
 }
 
 /// Message to send through a channel
@@ -188,6 +192,7 @@ mod tests {
                 timestamp: 123,
                 thread_ts: None,
                 interruption_scope_id: None,
+                attachments: vec![],
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -205,6 +210,7 @@ mod tests {
             timestamp: 999,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         };
 
         let cloned = message.clone();
