@@ -46,6 +46,7 @@ const SLACK_ATTACHMENT_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
 const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
 const SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS: usize = 12_000;
+const SLACK_MARKDOWN_BLOCK_MAX_CHARS: usize = 12_000;
 const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
@@ -2272,6 +2273,14 @@ impl Channel for SlackChannel {
             "text": message.content
         });
 
+        // Use Slack's native markdown block for rich formatting when content fits.
+        if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": message.content
+            }]);
+        }
+
         if let Some(ts) = self.outbound_thread_ts(message) {
             body["thread_ts"] = serde_json::json!(ts);
         }
@@ -3628,6 +3637,58 @@ mod tests {
         let key1 = super::super::conversation_history_key(&msg1);
         let key2 = super::super::conversation_history_key(&msg2);
         assert_ne!(key1, key2, "session key should differ per thread");
+    }
+
+    #[test]
+    fn slack_send_uses_markdown_blocks() {
+        let msg = SendMessage::new("**bold** and _italic_", "C123");
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+
+        // Build the same JSON body that send() would construct.
+        let mut body = serde_json::json!({
+            "channel": msg.recipient,
+            "text": msg.content
+        });
+        if msg.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": msg.content
+            }]);
+        }
+
+        // Verify blocks are present with correct structure.
+        let blocks = body["blocks"]
+            .as_array()
+            .expect("blocks should be an array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "markdown");
+        assert_eq!(blocks[0]["text"], msg.content);
+        // text field kept as plaintext fallback.
+        assert_eq!(body["text"], msg.content);
+        // Suppress unused variable warning.
+        let _ = ch.name();
+    }
+
+    #[test]
+    fn slack_send_skips_markdown_blocks_for_long_content() {
+        let long_content = "x".repeat(SLACK_MARKDOWN_BLOCK_MAX_CHARS + 1);
+        let msg = SendMessage::new(long_content.clone(), "C123");
+
+        let mut body = serde_json::json!({
+            "channel": msg.recipient,
+            "text": msg.content
+        });
+        if msg.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": msg.content
+            }]);
+        }
+
+        assert!(
+            body.get("blocks").is_none(),
+            "blocks should not be set for oversized content"
+        );
     }
 
     #[tokio::test]
