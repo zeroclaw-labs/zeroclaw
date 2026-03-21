@@ -53,8 +53,35 @@ fi
 tmux_state="no-target"
 tmux_detail=""
 if [[ -n "$tmux_target" ]]; then
+    # Primary signal: what command is currently running in the pane?
+    # When Claude Code is active, pane_current_command will be 'claude' or 'node',
+    # not a shell. This is far more reliable than content scraping.
+    pane_cmd="$(tmux display-message -t "$tmux_target" -p '#{pane_current_command}' 2>/dev/null || echo "")"
     pane="$(tmux capture-pane -p -t "$tmux_target" 2>/dev/null || echo "")"
-    tmux_state="$(echo "$pane" | grep -v '^\s*$' | tail -20 | python3 -c "
+
+    shell_commands="bash zsh sh fish dash ksh tcsh csh"
+    is_shell=false
+    for sc in $shell_commands; do
+        if [[ "$pane_cmd" == "$sc" ]]; then is_shell=true; break; fi
+    done
+
+    if [[ -n "$pane_cmd" && "$is_shell" == "false" ]]; then
+        # Non-shell process running — check content only for question detection
+        tmux_state="$(echo "$pane" | python3 -c "
+import sys, re
+raw = sys.stdin.read(); lower = raw.lower()
+question_patterns = [
+    r'\[y/n\]', r'\[yes/no\]', r'\[y/n/s\]', r'\(y/n\)',
+    r'do you want.*\?', r'would you like.*\?', r'should i .*\?', r'allow.*\?\s*\$',
+]
+for p in question_patterns:
+    if re.search(p, lower):
+        print('question'); sys.exit()
+print('active')
+" 2>/dev/null || echo "active")"
+    else
+        # Shell is running — fall back to content-based detection
+        tmux_state="$(echo "$pane" | grep -v '^\s*$' | tail -20 | python3 -c "
 import sys, re
 raw = sys.stdin.read(); lower = raw.lower()
 spinner_chars = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
@@ -69,13 +96,14 @@ for p in active_patterns:
         print('active'); sys.exit()
 question_patterns = [
     r'\[y/n\]', r'\[yes/no\]', r'\[y/n/s\]', r'\(y/n\)',
-    r'do you want.*\?', r'would you like.*\?', r'should i .*\?', r'allow.*\?\s*$',
+    r'do you want.*\?', r'would you like.*\?', r'should i .*\?', r'allow.*\?\s*\$',
 ]
 for p in question_patterns:
     if re.search(p, lower):
         print('question'); sys.exit()
 print('idle')
 " 2>/dev/null || echo "idle")"
+    fi
     tmux_detail=" (\`${tmux_target}\`)"
 fi
 

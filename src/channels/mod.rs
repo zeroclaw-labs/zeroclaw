@@ -1470,17 +1470,8 @@ async fn check_tmux_pending_questions(
     };
 
     for (room_id, tmux_target) in tmux_targets.iter() {
-        let out = match tokio::process::Command::new("tmux")
-            .args(["capture-pane", "-p", "-t", tmux_target])
-            .output()
-            .await
-        {
-            Ok(out) if out.status.success() => out,
-            _ => continue,
-        };
-
-        let content = String::from_utf8_lossy(&out.stdout);
-        if tmux_pane_has_pending_question(&content) {
+        let state = classify_tmux_target(tmux_target).await;
+        if state == "question" {
             let reply_target = format!("cron-watch||{room_id}");
             let msg = format!(
                 "⚠️ **Pending question in tmux** (`{tmux_target}`)\n\nThe Claude Code session appears to be waiting for input. Use `peek` to see the current state or `tmux` to send a reply."
@@ -1566,8 +1557,63 @@ fn is_idle_command(content: &str) -> bool {
     lower == "idle" || lower == "!idle" || lower == "/idle"
 }
 
+/// Classify a tmux target by checking the running command and pane content.
+///
+/// Uses `pane_current_command` as the primary signal — if a non-shell process
+/// is running (e.g. `claude`, `node`, `python3`), the pane is active regardless
+/// of what the content looks like. Falls through to content analysis for the
+/// question/idle distinction when a shell is the current command.
+async fn classify_tmux_target(target: &str) -> &'static str {
+    // 1. Check what command is currently running in the pane.
+    let current_cmd = tokio::process::Command::new("tmux")
+        .args(["display-message", "-t", target, "-p", "#{pane_current_command}"])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase());
+
+    let shell_commands = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh"];
+
+    if let Some(ref cmd) = current_cmd {
+        let cmd = cmd.as_str();
+        if !cmd.is_empty() && !shell_commands.contains(&cmd) {
+            // A non-shell process is running (e.g. claude, node, cargo, python3).
+            // Capture pane content to distinguish "question" from "active".
+            if let Ok(out) = tokio::process::Command::new("tmux")
+                .args(["capture-pane", "-p", "-t", target])
+                .output()
+                .await
+            {
+                if out.status.success() {
+                    let content = String::from_utf8_lossy(&out.stdout);
+                    let classified = classify_tmux_pane_content(&content);
+                    if classified == "question" {
+                        return "question";
+                    }
+                }
+            }
+            return "active";
+        }
+    }
+
+    // Shell is running — check pane content for question patterns or stalled prompts.
+    match tokio::process::Command::new("tmux")
+        .args(["capture-pane", "-p", "-t", target])
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => {
+            let content = String::from_utf8_lossy(&out.stdout);
+            classify_tmux_pane_content(&content)
+        }
+        Ok(_) => "unavailable",
+        Err(_) => "unavailable",
+    }
+}
+
 /// Classify raw tmux pane content into one of: "active", "question", "idle".
-fn classify_tmux_pane(pane: &str) -> &'static str {
+fn classify_tmux_pane_content(pane: &str) -> &'static str {
     let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     if spinner_chars.iter().any(|c| pane.contains(*c)) {
         return "active";
@@ -1646,20 +1692,14 @@ async fn handle_idle_command_if_needed(
     }
 
     // Capture all panes concurrently.
-    let mut captures: Vec<(String, String, &'static str)> = Vec::new();
+    let mut futs = Vec::new();
     for (room_id, target) in targets.iter() {
-        let state = match tokio::process::Command::new("tmux")
-            .args(["capture-pane", "-p", "-t", target])
-            .output()
-            .await
-        {
-            Ok(out) if out.status.success() => {
-                let content = String::from_utf8_lossy(&out.stdout);
-                classify_tmux_pane(&content)
-            }
-            _ => "unavailable",
-        };
-        captures.push((room_id.clone(), target.clone(), state));
+        futs.push((room_id.clone(), target.clone()));
+    }
+    let mut captures: Vec<(String, String, &'static str)> = Vec::new();
+    for (room_id, target) in futs {
+        let state = classify_tmux_target(&target).await;
+        captures.push((room_id, target, state));
     }
 
     // Sort: questions first, then active, then idle, then unavailable.
