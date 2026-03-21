@@ -134,6 +134,8 @@ prost = { version = "0.14", default-features = false, features = ["derive"], opt
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
 postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"], optional = true }
+pgvector = { version = "0.4", features = ["postgres"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
@@ -231,6 +233,7 @@ channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
 memory-postgres = ["dep:postgres"]
+memory-pgvector = ["dep:tokio-postgres", "dep:pgvector"]
 # memory-mem0 = Mem0 (OpenMemory) memory backend via REST API
 memory-mem0 = []
 observability-prometheus = ["dep:prometheus"]

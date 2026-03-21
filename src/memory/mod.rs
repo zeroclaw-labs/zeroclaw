@@ -10,6 +10,8 @@ pub mod markdown;
 #[cfg(feature = "memory-mem0")]
 pub mod mem0;
 pub mod none;
+#[cfg(feature = "memory-pgvector")]
+pub mod pgvector;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
@@ -29,6 +31,8 @@ pub use markdown::MarkdownMemory;
 #[cfg(feature = "memory-mem0")]
 pub use mem0::Mem0Memory;
 pub use none::NoneMemory;
+#[cfg(feature = "memory-pgvector")]
+pub use pgvector::PgVectorMemory;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
@@ -60,7 +64,7 @@ where
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
-        MemoryBackendKind::Postgres => postgres_builder(),
+        MemoryBackendKind::Postgres | MemoryBackendKind::PgVector => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Mem0 | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
@@ -355,6 +359,62 @@ pub fn create_memory_with_storage_and_routes(
     fn build_mem0_memory(_config: &crate::config::MemoryConfig) -> anyhow::Result<Box<dyn Memory>> {
         anyhow::bail!(
             "memory backend 'mem0' requested but this build was compiled without `memory-mem0`; rebuild with `--features memory-mem0`"
+        );
+    }
+
+    #[cfg(feature = "memory-pgvector")]
+    if matches!(backend_kind, MemoryBackendKind::PgVector) {
+        let storage = storage_provider
+            .context("memory backend 'pgvector' requires [storage.provider.config] settings")?;
+        let db_url = storage
+            .db_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .context("pgvector backend requires [storage.provider.config].db_url")?;
+
+        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+            Arc::from(embeddings::create_embedding_provider(
+                &resolved_embedding.provider,
+                resolved_embedding.api_key.as_deref(),
+                &resolved_embedding.model,
+                resolved_embedding.dimensions,
+            ));
+
+        #[allow(clippy::cast_possible_truncation)]
+        let vector_weight = config.vector_weight as f32;
+        #[allow(clippy::cast_possible_truncation)]
+        let keyword_weight = config.keyword_weight as f32;
+
+        tracing::info!(
+            "📦 pgvector memory backend configured (schema: {}, table: {})",
+            storage.schema,
+            storage.table
+        );
+
+        let schema = storage.schema.clone();
+        let table = storage.table.clone();
+        let url = db_url.to_string();
+        let mem = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                PgVectorMemory::new(
+                    &url,
+                    &schema,
+                    &table,
+                    embedder,
+                    vector_weight,
+                    keyword_weight,
+                )
+                .await
+            })
+        })?;
+        return Ok(Box::new(mem));
+    }
+
+    #[cfg(not(feature = "memory-pgvector"))]
+    if matches!(backend_kind, MemoryBackendKind::PgVector) {
+        anyhow::bail!(
+            "memory backend 'pgvector' requested but this build was compiled without `memory-pgvector`; rebuild with `--features memory-pgvector`"
         );
     }
 

@@ -3,6 +3,7 @@ pub enum MemoryBackendKind {
     Sqlite,
     Lucid,
     Postgres,
+    PgVector,
     Qdrant,
     Mem0,
     Markdown,
@@ -51,6 +52,15 @@ const MARKDOWN_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
 const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     key: "postgres",
     label: "PostgreSQL — remote durable storage via [storage.provider.config]",
+    auto_save_default: true,
+    uses_sqlite_hygiene: false,
+    sqlite_based: false,
+    optional_dependency: true,
+};
+
+const PGVECTOR_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
+    key: "pgvector",
+    label: "PostgreSQL + pgvector — hybrid semantic + keyword search with vector embeddings",
     auto_save_default: true,
     uses_sqlite_hygiene: false,
     sqlite_based: false,
@@ -113,6 +123,7 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
         "sqlite" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
         "postgres" => MemoryBackendKind::Postgres,
+        "pgvector" => MemoryBackendKind::PgVector,
         "qdrant" => MemoryBackendKind::Qdrant,
         "mem0" | "openmemory" => MemoryBackendKind::Mem0,
         "markdown" => MemoryBackendKind::Markdown,
@@ -126,6 +137,7 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
         MemoryBackendKind::Postgres => POSTGRES_PROFILE,
+        MemoryBackendKind::PgVector => PGVECTOR_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
         MemoryBackendKind::Mem0 => MEM0_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
