@@ -42,6 +42,7 @@ pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
 pub mod channels;
+pub(crate) mod cli_input;
 pub mod commands;
 pub mod config;
 pub(crate) mod cost;

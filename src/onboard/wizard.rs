@@ -1,3 +1,4 @@
+use crate::cli_input::Input;
 #[cfg(feature = "channel-nostr")]
 use crate::config::schema::{default_nostr_relays, NostrConfig};
 use crate::config::schema::{
@@ -20,7 +21,7 @@ use crate::providers::{
 };
 use anyhow::{bail, Context, Result};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -2400,7 +2401,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
         let model: String = Input::new()
             .with_prompt("  Model name (e.g. llama3, gpt-4o, mistral)")
-            .default("default".into())
+            .default("default")
             .interact_text()?;
 
         let provider_name = format!("custom:{base_url}");
@@ -2436,7 +2437,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         if use_remote_ollama {
             let raw_url: String = Input::new()
                 .with_prompt("  Remote Ollama endpoint URL")
-                .default("https://ollama.com".into())
+                .default("https://ollama.com")
                 .interact_text()?;
 
             let normalized_url = normalize_ollama_endpoint_url(&raw_url);
@@ -2483,7 +2484,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if matches!(provider_name, "llamacpp" | "llama.cpp") {
         let raw_url: String = Input::new()
             .with_prompt("  llama.cpp server endpoint URL")
-            .default("http://localhost:8080/v1".into())
+            .default("http://localhost:8080/v1")
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2514,7 +2515,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "sglang" {
         let raw_url: String = Input::new()
             .with_prompt("  SGLang server endpoint URL")
-            .default("http://localhost:30000/v1".into())
+            .default("http://localhost:30000/v1")
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2545,7 +2546,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "vllm" {
         let raw_url: String = Input::new()
             .with_prompt("  vLLM server endpoint URL")
-            .default("http://localhost:8000/v1".into())
+            .default("http://localhost:8000/v1")
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2576,7 +2577,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "osaurus" {
         let raw_url: String = Input::new()
             .with_prompt("  Osaurus server endpoint URL")
-            .default("http://localhost:1337/v1".into())
+            .default("http://localhost:1337/v1")
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -3266,7 +3267,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
             // User chose serial but no device discovered — ask for manual path
             let manual_port: String = Input::new()
                 .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
-                .default("/dev/ttyUSB0".into())
+                .default("/dev/ttyUSB0")
                 .interact_text()?;
             hw_config.serial_port = Some(manual_port);
         }
@@ -3292,7 +3293,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
             4 => {
                 let custom: String = Input::new()
                     .with_prompt("  Custom baud rate")
-                    .default("115200".into())
+                    .default("115200")
                     .interact_text()?;
                 custom.parse::<u32>().unwrap_or(115_200)
             }
@@ -3306,7 +3307,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
     {
         let target: String = Input::new()
             .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
-            .default("STM32F411CEUx".into())
+            .default("STM32F411CEUx")
             .interact_text()?;
         hw_config.probe_target = Some(target);
     }
@@ -3366,7 +3367,7 @@ fn setup_project_context() -> Result<ProjectContext> {
 
     let user_name: String = Input::new()
         .with_prompt("  Your name")
-        .default("User".into())
+        .default("User")
         .interact_text()?;
 
     let tz_options = vec![
@@ -3390,7 +3391,7 @@ fn setup_project_context() -> Result<ProjectContext> {
     let timezone = if tz_idx == tz_options.len() - 1 {
         Input::new()
             .with_prompt("  Enter timezone (e.g. America/New_York)")
-            .default("UTC".into())
+            .default("UTC")
             .interact_text()?
     } else {
         // Extract the short label before the parenthetical
@@ -3404,7 +3405,7 @@ fn setup_project_context() -> Result<ProjectContext> {
 
     let agent_name: String = Input::new()
         .with_prompt("  Agent name")
-        .default("ZeroClaw".into())
+        .default("ZeroClaw")
         .interact_text()?;
 
     let style_options = vec![
@@ -3433,7 +3434,7 @@ fn setup_project_context() -> Result<ProjectContext> {
         _ => Input::new()
             .with_prompt("  Custom communication style")
             .default(
-                "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing.".into(),
+                "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing.",
             )
             .interact_text()?,
     };
@@ -4057,7 +4058,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let contacts_str: String = Input::new()
                     .with_prompt("  Allowed contacts (comma-separated phone/email, or * for all)")
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_contacts = if contacts_str.trim() == "*" {
@@ -4170,7 +4171,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let users_str: String = Input::new()
                     .with_prompt("  Allowed users (comma-separated @user:server, or * for all)")
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_users = if users_str.trim() == "*" {
@@ -4204,7 +4205,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let http_url: String = Input::new()
                     .with_prompt("  signal-cli HTTP URL")
-                    .default("http://127.0.0.1:8686".into())
+                    .default("http://127.0.0.1:8686")
                     .interact_text()?;
 
                 if http_url.trim().is_empty() {
@@ -4251,7 +4252,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .with_prompt(
                         "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
                     )
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_from = if allowed_from_raw.trim() == "*" {
@@ -4328,7 +4329,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                     let session_path: String = Input::new()
                         .with_prompt("  Session database path")
-                        .default("~/.zeroclaw/state/whatsapp-web/session.db".into())
+                        .default("~/.zeroclaw/state/whatsapp-web/session.db")
                         .interact_text()?;
 
                     if session_path.trim().is_empty() {
@@ -4358,7 +4359,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .with_prompt(
                             "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
                         )
-                        .default("*".into())
+                        .default("*")
                         .interact_text()?;
 
                     let allowed_numbers = if users_str.trim() == "*" {
@@ -4418,7 +4419,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let verify_token: String = Input::new()
                     .with_prompt("  Webhook verify token (create your own)")
-                    .default("zeroclaw-whatsapp-verify".into())
+                    .default("zeroclaw-whatsapp-verify")
                     .interact_text()?;
 
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
@@ -4461,7 +4462,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .with_prompt(
                         "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
                     )
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_numbers = if users_str.trim() == "*" {
@@ -4548,7 +4549,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .with_prompt(
                         "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
                     )
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_senders = if users_str.trim() == "*" {
@@ -4596,7 +4597,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let port_str: String = Input::new()
                     .with_prompt("  Port")
-                    .default("6697".into())
+                    .default("6697")
                     .interact_text()?;
 
                 let port: u16 = match port_str.trim().parse() {
@@ -4723,7 +4724,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let port: String = Input::new()
                     .with_prompt("  Port")
-                    .default("8080".into())
+                    .default("8080")
                     .interact_text()?;
 
                 let secret: String = Input::new()
@@ -4790,7 +4791,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let allowed_users_raw: String = Input::new()
                     .with_prompt("  Allowed Nextcloud actor IDs (comma-separated, or * for all)")
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_users = if allowed_users_raw.trim() == "*" {
@@ -5114,7 +5115,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let port = if receive_mode == LarkReceiveMode::Webhook {
                     let p: String = Input::new()
                         .with_prompt("  Webhook Port")
-                        .default("8080".into())
+                        .default("8080")
                         .interact_text()?;
                     Some(p.parse().unwrap_or(8080))
                 } else {
