@@ -1561,6 +1561,143 @@ async fn handle_cron_command_if_needed(
     true
 }
 
+fn is_idle_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "idle" || lower == "!idle" || lower == "/idle"
+}
+
+/// Classify raw tmux pane content into one of: "active", "question", "idle".
+fn classify_tmux_pane(pane: &str) -> &'static str {
+    let spinner_chars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    if spinner_chars.iter().any(|c| pane.contains(*c)) {
+        return "active";
+    }
+    let lower = pane.to_lowercase();
+    let active_patterns: &[&str] = &[
+        "esc to interrupt",
+        "auto-accept edits on",
+    ];
+    for pat in active_patterns {
+        if lower.contains(pat) {
+            return "active";
+        }
+    }
+    // Bullet + verb on its own line (Claude Code tool execution)
+    for line in pane.lines() {
+        let t = line.trim().to_lowercase();
+        if t.starts_with('●')
+            && (t.contains("running")
+                || t.contains("thinking")
+                || t.contains("reading")
+                || t.contains("writing")
+                || t.contains("searching")
+                || t.contains("fetching")
+                || t.contains("executing"))
+        {
+            return "active";
+        }
+    }
+    let question_patterns: &[&str] = &[
+        "[y/n]", "[yes/no]", "[y/n/s]", "(y/n)",
+    ];
+    for pat in question_patterns {
+        if lower.contains(pat) {
+            return "question";
+        }
+    }
+    // Natural-language question patterns
+    let nl_question: &[&str] = &[
+        "do you want", "would you like", "should i ", "shall i ",
+    ];
+    for pat in nl_question {
+        if lower.contains(pat) && lower.contains('?') {
+            return "question";
+        }
+    }
+    "idle"
+}
+
+async fn handle_idle_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_idle_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    let targets = &ctx.channel_tmux_targets;
+
+    if targets.is_empty() {
+        let _ = channel
+            .send(
+                &SendMessage::new(
+                    "No tmux targets configured.",
+                    &msg.reply_target,
+                )
+                .in_thread(msg.thread_ts.clone()),
+            )
+            .await;
+        return true;
+    }
+
+    // Capture all panes concurrently.
+    let mut captures: Vec<(String, String, &'static str)> = Vec::new();
+    for (room_id, target) in targets.iter() {
+        let state = match tokio::process::Command::new("tmux")
+            .args(["capture-pane", "-p", "-t", target])
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                let content = String::from_utf8_lossy(&out.stdout);
+                classify_tmux_pane(&content)
+            }
+            _ => "unavailable",
+        };
+        captures.push((room_id.clone(), target.clone(), state));
+    }
+
+    // Sort: questions first, then active, then idle, then unavailable.
+    captures.sort_by_key(|(_, _, state)| match *state {
+        "question" => 0,
+        "active" => 1,
+        "idle" => 2,
+        _ => 3,
+    });
+
+    let mut lines = vec!["**Tmux Status** — all rooms\n".to_string()];
+    for (room_id, target, state) in &captures {
+        let icon = match *state {
+            "active" => "⚙️",
+            "question" => "⚠️",
+            "idle" => "💤",
+            _ => "❓",
+        };
+        // Shorten room id for display: keep the localpart only.
+        let room_short = room_id
+            .trim_start_matches('!')
+            .split(':')
+            .next()
+            .unwrap_or(room_id);
+        lines.push(format!("{icon} `{target}` ({room_short}): **{state}**"));
+    }
+
+    let response = lines.join("\n");
+    if let Err(e) = channel
+        .send(&SendMessage::new(response, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+        .await
+    {
+        tracing::warn!("Failed to send idle status: {e}");
+    }
+
+    true
+}
+
 fn is_peek_command(content: &str) -> bool {
     let lower = content.trim().to_lowercase();
     lower == "peek" || lower.starts_with("peek ") || lower == "!peek" || lower.starts_with("!peek ")
@@ -2669,6 +2806,9 @@ async fn process_channel_message(
         return;
     }
     if handle_cron_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
+    if handle_idle_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
     if handle_peek_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
