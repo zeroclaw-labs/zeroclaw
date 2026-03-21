@@ -3939,7 +3939,16 @@ pub struct AutonomyConfig {
 }
 
 fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into()]
+    vec![
+        "file_read".into(),
+        "memory_recall".into(),
+        "web_search_tool".into(),
+        "web_fetch".into(),
+        "calculator".into(),
+        "glob_search".into(),
+        "content_search".into(),
+        "image_info".into(),
+    ]
 }
 
 fn default_always_ask() -> Vec<String> {
