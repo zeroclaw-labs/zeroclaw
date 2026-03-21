@@ -34,6 +34,7 @@ impl SystemPromptBuilder {
         Self {
             sections: vec![
                 Box::new(IdentitySection),
+                Box::new(ModelGuidanceSection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
@@ -72,6 +73,7 @@ pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
 pub struct ChannelMediaSection;
+pub struct ModelGuidanceSection;
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -220,6 +222,23 @@ impl PromptSection for ChannelMediaSection {
             - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
             - `[Document: <name>] <path>` — A file attachment saved to the workspace."
             .into())
+    }
+}
+
+impl PromptSection for ModelGuidanceSection {
+    fn name(&self) -> &str {
+        "model_guidance"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let mut guidance = String::new();
+
+        if ctx.model_name.to_lowercase().contains("grok") {
+            guidance.push_str("## Model Specific Guidance\n\n");
+            guidance.push_str("- **Tool Calls**: When generating tool calls (especially shell commands), DO NOT HTML-encode special characters. Use raw characters like `&`, `<`, `>`, and `\"` directly. For example, use `&` instead of `&amp;`.\n");
+        }
+
+        Ok(guidance)
     }
 }
 
@@ -448,6 +467,41 @@ mod tests {
         assert!(payload.chars().any(|c| c.is_ascii_digit()));
         assert!(payload.contains(" ("));
         assert!(payload.ends_with(')'));
+    }
+
+    #[test]
+    fn model_guidance_section_includes_grok_specific_instructions() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "grok-2-1212",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let rendered = ModelGuidanceSection.build(&ctx).unwrap();
+        assert!(rendered.contains("## Model Specific Guidance"));
+        assert!(rendered.contains("DO NOT HTML-encode"));
+    }
+
+    #[test]
+    fn model_guidance_section_is_empty_for_other_models() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "gpt-4o",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let rendered = ModelGuidanceSection.build(&ctx).unwrap();
+        assert!(rendered.is_empty());
     }
 
     #[test]

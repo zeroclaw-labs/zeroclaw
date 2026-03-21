@@ -5450,6 +5450,7 @@ BTC is currently around $65,000 based on latest tool output."#
                         api_key: None,
                         api_url: None,
                         reliability: crate::config::ReliabilityConfig::default(),
+                        model_routes: vec![],
                     },
                     last_applied_stamp: None,
                 },
@@ -7907,6 +7908,9 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
             session_store: None,
         });
 
@@ -8006,6 +8010,9 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
             session_store: None,
         });
 
@@ -8097,6 +8104,9 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
             session_store: None,
         });
 
@@ -8208,6 +8218,9 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
             session_store: None,
         });
 
