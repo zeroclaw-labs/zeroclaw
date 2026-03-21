@@ -5077,9 +5077,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_rejects_oversized_image_payload() {
+    async fn run_tool_call_loop_rejects_image_for_non_vision_provider() {
+        // Non-vision providers reject image markers before prepare_messages
+        // gets a chance to skip oversized images. This is correct: the pre-check
+        // guards against sending [IMAGE:] markers to providers that can't handle them.
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
+        let provider = NonVisionProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -5120,11 +5123,9 @@ mod tests {
             &crate::config::PacingConfig::default(),
         )
         .await
-        .expect_err("oversized payload must fail");
+        .expect_err("non-vision provider must reject image markers");
 
-        assert!(err
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
+        assert!(err.to_string().contains("does not support vision"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 

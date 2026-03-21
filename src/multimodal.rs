@@ -138,6 +138,7 @@ pub async fn prepare_messages_for_provider(
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
+    let mut has_successful_images = false;
     for message in messages {
         if message.role != "user" {
             normalized_messages.push(message.clone());
@@ -181,6 +182,9 @@ pub async fn prepare_messages_for_provider(
         } else {
             cleaned_text.clone()
         };
+        if !normalized_refs.is_empty() {
+            has_successful_images = true;
+        }
         let content = compose_multimodal_message(&effective_text, &normalized_refs);
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
@@ -190,7 +194,7 @@ pub async fn prepare_messages_for_provider(
 
     Ok(PreparedMessages {
         messages: normalized_messages,
-        contains_images: true,
+        contains_images: has_successful_images,
     })
 }
 
