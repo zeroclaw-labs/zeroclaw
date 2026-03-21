@@ -1402,5 +1402,4 @@ mod tests {
             .unwrap();
         assert_eq!(val, 2);
     }
-
 }
