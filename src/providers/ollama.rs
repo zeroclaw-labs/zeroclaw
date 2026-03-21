@@ -153,13 +153,19 @@ impl OllamaProvider {
             .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
     }
 
+    fn is_ollama_cloud_endpoint(&self) -> bool {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_string()))
+            .is_some_and(|host| host == "ollama.com")
+    }
+
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.ollama", 300, 10)
     }
 
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {
         let requests_cloud = model.ends_with(":cloud");
-        let normalized_model = model.strip_suffix(":cloud").unwrap_or(model).to_string();
 
         if requests_cloud && self.is_local_endpoint() {
             anyhow::bail!(
@@ -168,16 +174,26 @@ impl OllamaProvider {
             );
         }
 
-        if requests_cloud && self.api_key.is_none() {
-            anyhow::bail!(
-                "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
-                model
-            );
+        // When targeting Ollama Cloud (ollama.com), strip the :cloud suffix and require auth.
+        // Ollama Cloud maps the base model name (e.g. "glm-5") to the cloud-hosted version.
+        //
+        // When targeting a private remote Ollama server, preserve the full model name including
+        // the :cloud tag, since local Ollama stores cloud-proxy models under their full name
+        // (e.g. "glm-5:cloud"). No auth header is sent to private servers.
+        if requests_cloud && self.is_ollama_cloud_endpoint() {
+            if self.api_key.is_none() {
+                anyhow::bail!(
+                    "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
+                    model
+                );
+            }
+            let normalized_model = model.strip_suffix(":cloud").unwrap_or(model).to_string();
+            return Ok((normalized_model, true));
         }
 
         let should_auth = self.api_key.is_some() && !self.is_local_endpoint();
 
-        Ok((normalized_model, should_auth))
+        Ok((model.to_string(), should_auth))
     }
 
     fn parse_tool_arguments(arguments: &str) -> serde_json::Value {
@@ -945,6 +961,26 @@ mod tests {
         let p = OllamaProvider::new(Some("https://ollama.com"), Some("ollama-key"));
         let (_model, should_auth) = p.resolve_request_details("qwen3").unwrap();
         assert!(should_auth);
+    }
+
+    #[test]
+    fn private_remote_server_cloud_suffix_preserves_model_name() {
+        // A private Ollama server stores cloud-proxy models with the :cloud tag intact
+        // (e.g. "glm-5:cloud"). The model name must NOT be stripped — unlike Ollama Cloud
+        // which maps "glm-5" to the cloud version, a private server would 404 on "glm-5".
+        let p = OllamaProvider::new(Some("http://192.168.1.100:11434"), Some("ollama-key"));
+        let (model, should_auth) = p.resolve_request_details("glm-5:cloud").unwrap();
+        assert_eq!(model, "glm-5:cloud");
+        assert!(should_auth);
+    }
+
+    #[test]
+    fn private_remote_server_cloud_suffix_no_key_still_works() {
+        // Private Ollama servers typically don't require an API key.
+        let p = OllamaProvider::new(Some("http://192.168.1.100:11434"), None);
+        let (model, should_auth) = p.resolve_request_details("glm-5:cloud").unwrap();
+        assert_eq!(model, "glm-5:cloud");
+        assert!(!should_auth);
     }
 
     #[test]
