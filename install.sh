@@ -569,12 +569,19 @@ MSG
         exit 0
       fi
       # Detect un-accepted Xcode/CLT license (causes `cc` to exit 69).
-      if ! /usr/bin/xcrun --show-sdk-path >/dev/null 2>&1; then
-        warn "Xcode license has not been accepted. Run:"
+      # xcrun --show-sdk-path can succeed even without an accepted license,
+      # so we test-compile a trivial C file which reliably triggers the error.
+      _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
+      printf 'int main(){return 0;}\n' > "$_xcode_test_file"
+      if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
+        rm -f "$_xcode_test_file"
+        warn "The C compiler failed. This usually means the Xcode/CLT license"
+        warn "has not been accepted. Run:"
         warn "  sudo xcodebuild -license accept"
         warn "then re-run this installer."
         exit 1
       fi
+      rm -f "$_xcode_test_file"
       if ! have_cmd git; then
         warn "git is not available. Install git (e.g., Homebrew) and re-run bootstrap."
       fi
