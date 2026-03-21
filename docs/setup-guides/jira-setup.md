@@ -16,7 +16,7 @@ verify credentials, and navigate Confluence spaces and pages.
 | `myself` | Verify credentials and return account info | No |
 | `comment_ticket` | Post a comment (supports @mentions and **bold**) | Yes |
 
-### Confluence Actions
+### Confluence
 
 | Action | Description | Mutating |
 |--------|-------------|----------|
