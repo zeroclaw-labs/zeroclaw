@@ -116,39 +116,71 @@ for line in open(sys.argv[2]):
 " "$ROOM_ID" "$CONFIG_TOML" 2>/dev/null || echo "")"
 fi
 
+tmux_active="no"
 if [[ -n "$tmux_target" ]]; then
     pane_content="$(tmux capture-pane -p -t "$tmux_target" 2>/dev/null || echo "")"
     if [[ -n "$pane_content" ]]; then
-        # Check last 15 non-empty lines for question patterns
-        pending="$(echo "$pane_content" | grep -v '^\s*$' | tail -15 | python3 -c "
+        # Classify the pane into one of three states:
+        #   active   — Claude Code is currently running (spinner, tool calls, thinking)
+        #   question — waiting for user input ([y/n], approval prompt, etc.)
+        #   idle     — prompt visible, nothing in flight
+        pane_state="$(echo "$pane_content" | grep -v '^\s*$' | tail -20 | python3 -c "
 import sys, re
-lines = sys.stdin.read().lower()
-patterns = [
+
+raw = sys.stdin.read()
+lower = raw.lower()
+
+# ── Active: Claude Code is processing ─────────────────────────────────────
+# Braille spinner chars used by Claude Code during tool execution
+spinner_chars = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+if any(c in raw for c in spinner_chars):
+    print('active'); sys.exit(0)
+
+active_patterns = [
+    r'^\s*●\s+(running|thinking|reading|writing|searching|fetching|executing)',
+    r'tools? used:',
+    r'tool calls? in progress',
+    r'\besc to interrupt\b',
+    r'auto-accept edits on',
+]
+for p in active_patterns:
+    if re.search(p, lower, re.MULTILINE):
+        print('active'); sys.exit(0)
+
+# ── Question: waiting for user input ──────────────────────────────────────
+question_patterns = [
     r'\[y/n\]', r'\[yes/no\]', r'\[y/n/s\]', r'\(y/n\)',
     r'do you want.*\?', r'would you like.*\?',
     r'should i .*\?', r'shall i .*\?',
-    r'allow.*\?$',
+    r'allow.*\?\s*$',
 ]
-for p in patterns:
-    if re.search(p, lines):
-        print('yes')
-        sys.exit(0)
-sys.exit(1)
-" 2>/dev/null && echo "yes" || echo "")"
+for p in question_patterns:
+    if re.search(p, lower):
+        print('question'); sys.exit(0)
 
-        if [[ "$pending" == "yes" ]]; then
-            now_utc="$(date -u '+%Y-%m-%d %H:%M UTC')"
+print('idle')
+" 2>/dev/null || echo "idle")"
+
+        now_utc="$(date -u '+%Y-%m-%d %H:%M UTC')"
+
+        if [[ "$pane_state" == "active" ]]; then
+            tmux_active="yes"
+            notice="⏳ **Claude Code is running** in tmux \`${tmux_target}\` — ${now_utc}
+
+A task is currently in progress. Triage postponed until next check."
+            post_to_room "$notice" "tmux-active"
+        elif [[ "$pane_state" == "question" ]]; then
             notice="⚠️ **Pending question** in tmux \`${tmux_target}\` — ${now_utc}
 
-Claude Code appears to be waiting for input. Use \`peek\` to see the current state or \`tmux <reply>\` to respond."
+Claude Code is waiting for input. Use \`peek\` to see the current state or \`tmux <reply>\` to respond."
             post_to_room "$notice" "tmux-alert"
         fi
     fi
 fi
 
 # ── Step 3: Idle + dedup check ─────────────────────────────────────────────
-# Skip ticket triage if usage is exhausted — tmux alerts above still fire.
-if [[ "$usage_exhausted" == "yes" ]]; then
+# Skip ticket triage if usage is exhausted or tmux session is active.
+if [[ "$usage_exhausted" == "yes" || "$tmux_active" == "yes" ]]; then
     exit 0
 fi
 
