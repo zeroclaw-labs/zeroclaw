@@ -1373,7 +1373,6 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn with_transcription_sets_config_when_enabled() {
-        std::env::remove_var("GROQ_API_KEY");
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
         tc.api_key = Some("fake-key".to_string()); // Groq registers; manager builds
@@ -1468,17 +1467,26 @@ mod tests {
 
         let ch = make_channel().with_transcription(config);
 
-        let manager = ch
-            .transcription_manager
-            .as_ref()
-            .expect("manager must be initialized for local_whisper config");
+        // Simulate the closure capture that listen() performs (lines 656-657):
+        //   let transcription_config = self.transcription.clone();
+        //   let transcription_manager = self.transcription_manager.clone();
+        // This verifies the cloned manager still routes correctly — the property
+        // the move closure relies on.
+        let transcription_config = ch.transcription.clone();
+        let transcription_manager = ch.transcription_manager.clone();
 
-        // This is the nearest reachable integration path: try_transcribe_voice_note() is
-        // dependency-injected (takes manager: Option<&TranscriptionManager> explicitly), so
-        // the dispatch call site is compile-time safe. The only untestable segment is
-        // client.download(), which requires a live wa_rs::Client. Everything after that
-        // — manager selection, transcribe() dispatch, and result handling — is covered
-        // by this test calling manager.transcribe() directly against a mock HTTP server.
+        assert!(
+            transcription_config.is_some(),
+            "transcription config must survive the clone that listen() performs"
+        );
+        let manager = transcription_manager
+            .as_ref()
+            .expect("manager must survive the clone that listen() performs");
+
+        // Verify the cloned manager dispatches correctly to the mock backend.
+        // Untested segment: listen() → on_event closure → try_transcribe_voice_note(client, audio, ...)
+        // That path requires a live wa_rs::Client (audio download step) and cannot be unit-tested.
+        // Everything after the download — manager dispatch and result handling — is covered here.
         let result = manager
             .transcribe(b"fake audio", "voice.ogg")
             .await
