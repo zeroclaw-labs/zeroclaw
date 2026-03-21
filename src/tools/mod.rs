@@ -444,24 +444,20 @@ pub fn all_tools_with_runtime(
 
     // Jira integration (config-gated)
     if root_config.jira.enabled {
-        let api_token = if root_config.jira.api_token.trim().is_empty() {
-            std::env::var("JIRA_API_TOKEN").unwrap_or_default()
-        } else {
-            root_config.jira.api_token.trim().to_string()
-        };
-        if api_token.trim().is_empty() {
-            tracing::warn!(
-                "Jira tool enabled but no API token found (set jira.api_token or JIRA_API_TOKEN env var)"
-            );
-        } else if root_config.jira.base_url.trim().is_empty() {
-            tracing::warn!("Jira tool enabled but jira.base_url is empty — skipping registration");
-        } else if root_config.jira.email.trim().is_empty() {
-            tracing::warn!("Jira tool enabled but jira.email is empty — skipping registration");
+        let base_url = std::env::var("JIRA_BASE_URL").unwrap_or_default();
+        let email = std::env::var("JIRA_EMAIL").unwrap_or_default();
+        let api_token = std::env::var("JIRA_API_TOKEN").unwrap_or_default();
+        if base_url.trim().is_empty() {
+            tracing::warn!("Jira tool enabled but JIRA_BASE_URL env var is not set — skipping registration");
+        } else if email.trim().is_empty() {
+            tracing::warn!("Jira tool enabled but JIRA_EMAIL env var is not set — skipping registration");
+        } else if api_token.trim().is_empty() {
+            tracing::warn!("Jira tool enabled but JIRA_API_TOKEN env var is not set — skipping registration");
         } else {
             tool_arcs.push(Arc::new(JiraTool::new(
-                root_config.jira.base_url.trim().to_string(),
-                root_config.jira.email.trim().to_string(),
-                api_token,
+                base_url.trim().to_string(),
+                email.trim().to_string(),
+                api_token.trim().to_string(),
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,

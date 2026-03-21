@@ -1,4 +1,14 @@
 # Example Config
+#
+# Note: credentials (API keys, tokens, passwords) belong in .env, not here.
+# See .env.example for the full list of supported environment variables.
+
+# ── Jira Integration ─────────────────────────────────────────────
+# Credentials (JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN) go in .env — not here.
+# [jira]
+# enabled = true
+# allowed_actions = ["get_ticket", "search_tickets", "comment_ticket", "list_projects", "myself"]
+# timeout_secs = 30
 
 # ── Delegate Tool Configuration ─────────────────────────────────
 # Global default timeouts for the delegate tool.

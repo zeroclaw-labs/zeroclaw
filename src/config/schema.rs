@@ -6091,34 +6091,26 @@ impl Default for NotionConfig {
 /// Jira integration configuration (`[jira]`).
 ///
 /// When `enabled = true`, registers the `jira` tool which can get tickets,
-/// search with JQL, and add comments. Requires `base_url` and `api_token`
-/// (or the `JIRA_API_TOKEN` env var).
+/// search with JQL, and add comments.
 ///
 /// ## Defaults
 /// - `enabled`: `false`
 /// - `allowed_actions`: `["get_ticket"]` — read-only by default.
-///   Add `"search_tickets"` or `"comment_ticket"` to unlock them.
+///   Add `"search_tickets"`, `"comment_ticket"`, `"list_projects"`, or `"myself"` to unlock them.
 /// - `timeout_secs`: `30`
 ///
 /// ## Auth
-/// Jira Cloud uses HTTP Basic auth: `email` + `api_token`.
-/// `api_token` is stored encrypted at rest; set it here or via `JIRA_API_TOKEN`.
+/// Credentials are read from environment variables only — do not put them in config.toml:
+/// - `JIRA_BASE_URL`   — Atlassian instance base URL, e.g. `https://yourco.atlassian.net`
+/// - `JIRA_EMAIL`      — Jira account email used for Basic auth
+/// - `JIRA_API_TOKEN`  — Jira API token
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct JiraConfig {
     /// Enable the `jira` tool. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
-    /// Atlassian instance base URL, e.g. `https://yourco.atlassian.net`.
-    #[serde(default)]
-    pub base_url: String,
-    /// Jira account email used for Basic auth.
-    #[serde(default)]
-    pub email: String,
-    /// Jira API token. Encrypted at rest. Falls back to `JIRA_API_TOKEN` env var.
-    #[serde(default)]
-    pub api_token: String,
     /// Actions the agent is permitted to call.
-    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`.
+    /// Valid values: `"get_ticket"`, `"search_tickets"`, `"comment_ticket"`, `"list_projects"`, `"myself"`.
     /// Defaults to `["get_ticket"]` (read-only).
     #[serde(default = "default_jira_allowed_actions")]
     pub allowed_actions: Vec<String>,
@@ -6139,9 +6131,6 @@ impl Default for JiraConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            base_url: String::new(),
-            email: String::new(),
-            api_token: String::new(),
             allowed_actions: default_jira_allowed_actions(),
             timeout_secs: default_jira_timeout_secs(),
         }
@@ -7357,11 +7346,6 @@ impl Config {
                 decrypt_secret(&store, &mut config.notion.api_key, "config.notion.api_key")?;
             }
 
-            // Jira API token
-            if !config.jira.api_token.is_empty() {
-                decrypt_secret(&store, &mut config.jira.api_token, "config.jira.api_token")?;
-            }
-
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -7963,20 +7947,31 @@ impl Config {
 
         // Jira
         if self.jira.enabled {
-            if self.jira.base_url.trim().is_empty() {
-                anyhow::bail!("jira.base_url must not be empty when jira.enabled = true");
-            }
-            if self.jira.email.trim().is_empty() {
-                anyhow::bail!("jira.email must not be empty when jira.enabled = true");
-            }
-            if self.jira.api_token.trim().is_empty()
-                && std::env::var("JIRA_API_TOKEN")
-                    .unwrap_or_default()
-                    .trim()
-                    .is_empty()
+            if std::env::var("JIRA_BASE_URL")
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
             {
                 anyhow::bail!(
-                    "jira.api_token must be set (or JIRA_API_TOKEN env var) when jira.enabled = true"
+                    "JIRA_BASE_URL env var must be set when jira.enabled = true"
+                );
+            }
+            if std::env::var("JIRA_EMAIL")
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!(
+                    "JIRA_EMAIL env var must be set when jira.enabled = true"
+                );
+            }
+            if std::env::var("JIRA_API_TOKEN")
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                anyhow::bail!(
+                    "JIRA_API_TOKEN env var must be set when jira.enabled = true"
                 );
             }
             let valid_actions = [
@@ -8773,14 +8768,7 @@ impl Config {
             )?;
         }
 
-        // Jira API token
-        if !config_to_save.jira.api_token.is_empty() {
-            encrypt_secret(
-                &store,
-                &mut config_to_save.jira.api_token,
-                "config.jira.api_token",
-            )?;
-        }
+
 
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
