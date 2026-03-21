@@ -5212,7 +5212,10 @@ mod tests {
         // Transcription endpoint — should NOT be reached
         Mock::given(method("POST"))
             .and(path("/v1/transcribe"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "should not reach"})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "should not reach"})),
+            )
             .expect(0)
             .mount(&server)
             .await;
@@ -5243,7 +5246,10 @@ mod tests {
         });
 
         let result = ch.try_parse_voice_message(&update).await;
-        assert!(result.is_none(), "voice message exceeding duration limit must be skipped");
+        assert!(
+            result.is_none(),
+            "voice message exceeding duration limit must be skipped"
+        );
     }
 
     #[tokio::test]

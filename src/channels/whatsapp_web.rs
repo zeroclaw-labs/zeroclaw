@@ -1490,7 +1490,9 @@ mod tests {
         let mut second = crate::config::TranscriptionConfig::default();
         second.enabled = false;
 
-        let ch = make_channel().with_transcription(first).with_transcription(second);
+        let ch = make_channel()
+            .with_transcription(first)
+            .with_transcription(second);
 
         assert!(
             ch.transcription.is_none(),
