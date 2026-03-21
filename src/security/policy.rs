@@ -111,6 +111,12 @@ fn default_allowed_commands() -> Vec<String> {
         "head".into(),
         "tail".into(),
         "date".into(),
+        "df".into(),
+        "du".into(),
+        "uname".into(),
+        "uptime".into(),
+        "free".into(),
+        "hostname".into(),
     ]
 }
 
@@ -142,6 +148,11 @@ fn default_allowed_commands() -> Vec<String> {
         "wc".into(),
         "head".into(),
         "tail".into(),
+        "df".into(),
+        "du".into(),
+        "uname".into(),
+        "uptime".into(),
+        "hostname".into(),
     ]
 }
 
