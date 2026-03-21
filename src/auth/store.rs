@@ -111,9 +111,11 @@ impl AuthStore {
                 device_name TEXT NOT NULL,
                 platform TEXT,
                 pairing_code_hash TEXT,
+                fingerprint TEXT,
                 last_seen INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);",
+            CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
+            CREATE INDEX IF NOT EXISTS idx_devices_fingerprint ON devices(fingerprint);",
         )?;
 
         // Migration: add pairing_code_hash column if missing
@@ -122,6 +124,17 @@ impl AuthStore {
             .is_ok();
         if !has_pairing_code {
             let _ = conn.execute_batch("ALTER TABLE devices ADD COLUMN pairing_code_hash TEXT;");
+        }
+
+        // Migration: add fingerprint column if missing
+        let has_fingerprint: bool = conn
+            .prepare("SELECT fingerprint FROM devices LIMIT 0")
+            .is_ok();
+        if !has_fingerprint {
+            let _ = conn.execute_batch(
+                "ALTER TABLE devices ADD COLUMN fingerprint TEXT;
+                 CREATE INDEX IF NOT EXISTS idx_devices_fingerprint ON devices(fingerprint);",
+            );
         }
 
         // Migration: add email column to users table if missing
@@ -332,25 +345,67 @@ impl AuthStore {
     // ── Device Management ───────────────────────────────────────────
 
     /// Register or update a device for a user.
+    /// If `fingerprint` is provided and a device with the same fingerprint already
+    /// exists for this user, the existing device is updated (reused) instead of
+    /// creating a duplicate entry. Returns the actual device_id used.
     pub fn register_device(
         &self,
         user_id: &str,
         device_id: &str,
         device_name: &str,
         platform: Option<&str>,
-    ) -> Result<()> {
+        fingerprint: Option<&str>,
+    ) -> Result<String> {
         let now = epoch_secs() as i64;
         let conn = self.conn.lock();
+
+        // If fingerprint is provided, check for an existing device with the same fingerprint
+        let actual_device_id = if let Some(fp) = fingerprint {
+            if let Some(existing_id) = self.find_device_by_fingerprint_inner(&conn, user_id, fp) {
+                existing_id
+            } else {
+                device_id.to_string()
+            }
+        } else {
+            device_id.to_string()
+        };
+
         conn.execute(
-            "INSERT INTO devices (device_id, user_id, device_name, platform, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO devices (device_id, user_id, device_name, platform, fingerprint, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(device_id) DO UPDATE SET
                 device_name = excluded.device_name,
                 platform = excluded.platform,
+                fingerprint = COALESCE(excluded.fingerprint, devices.fingerprint),
                 last_seen = excluded.last_seen",
-            rusqlite::params![device_id, user_id, device_name, platform, now],
+            rusqlite::params![actual_device_id, user_id, device_name, platform, fingerprint, now],
         )?;
-        Ok(())
+        Ok(actual_device_id)
+    }
+
+    /// Find a device by fingerprint for a given user (internal, requires lock held).
+    fn find_device_by_fingerprint_inner(
+        &self,
+        conn: &rusqlite::Connection,
+        user_id: &str,
+        fingerprint: &str,
+    ) -> Option<String> {
+        conn.query_row(
+            "SELECT device_id FROM devices WHERE user_id = ?1 AND fingerprint = ?2 LIMIT 1",
+            rusqlite::params![user_id, fingerprint],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    /// Find a device by fingerprint for a given user.
+    pub fn find_device_by_fingerprint(
+        &self,
+        user_id: &str,
+        fingerprint: &str,
+    ) -> Option<String> {
+        let conn = self.conn.lock();
+        self.find_device_by_fingerprint_inner(&conn, user_id, fingerprint)
     }
 
     /// List all devices for a user.
@@ -818,10 +873,10 @@ mod tests {
         let user_id = store.register("test_user", "securepassword123").unwrap();
 
         store
-            .register_device(&user_id, "dev_1", "Phone", Some("android"))
+            .register_device(&user_id, "dev_1", "Phone", Some("android"), None)
             .unwrap();
         store
-            .register_device(&user_id, "dev_2", "Laptop", Some("linux"))
+            .register_device(&user_id, "dev_2", "Laptop", Some("linux"), None)
             .unwrap();
 
         let devices = store.list_devices(&user_id).unwrap();
@@ -835,10 +890,10 @@ mod tests {
         let user_id = store.register("test_user", "securepassword123").unwrap();
 
         store
-            .register_device(&user_id, "dev_1", "Old Name", None)
+            .register_device(&user_id, "dev_1", "Old Name", None, None)
             .unwrap();
         store
-            .register_device(&user_id, "dev_1", "New Name", Some("ios"))
+            .register_device(&user_id, "dev_1", "New Name", Some("ios"), None)
             .unwrap();
 
         let devices = store.list_devices(&user_id).unwrap();
@@ -847,12 +902,36 @@ mod tests {
     }
 
     #[test]
+    fn device_fingerprint_dedup() {
+        let (_tmp, store) = test_store();
+
+        let user_id = store.register("test_user", "securepassword123").unwrap();
+
+        // Register device with fingerprint
+        let id1 = store
+            .register_device(&user_id, "dev_1", "Phone", Some("android"), Some("fp_abc123"))
+            .unwrap();
+        assert_eq!(id1, "dev_1");
+
+        // Register with a different device_id but same fingerprint → should reuse dev_1
+        let id2 = store
+            .register_device(&user_id, "dev_new", "Phone Reinstalled", Some("android"), Some("fp_abc123"))
+            .unwrap();
+        assert_eq!(id2, "dev_1");
+
+        // Should still be only 1 device
+        let devices = store.list_devices(&user_id).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_name, "Phone Reinstalled");
+    }
+
+    #[test]
     fn device_remove() {
         let (_tmp, store) = test_store();
 
         let user_id = store.register("test_user", "securepassword123").unwrap();
         store
-            .register_device(&user_id, "dev_1", "Phone", None)
+            .register_device(&user_id, "dev_1", "Phone", None, None)
             .unwrap();
 
         assert!(store.remove_device(&user_id, "dev_1").unwrap());

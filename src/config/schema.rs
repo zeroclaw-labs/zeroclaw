@@ -2613,7 +2613,7 @@ fn default_web_search_max_results() -> usize {
 }
 
 fn default_web_search_timeout_secs() -> u64 {
-    15
+    300 // 5 minutes — generous to avoid timeouts on slow search providers (DuckDuckGo, etc.)
 }
 
 fn default_web_search_retries_per_provider() -> u32 {

@@ -33,7 +33,28 @@ function createSpeechRecognition(lang: string) {
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
 
-function speakText(text: string, lang: string, onEnd?: () => void) {
+interface TtsSettings {
+  rate: number;    // 0.5 – 2.0 (default 1.0)
+  pitch: number;   // 0.0 – 2.0 (default 1.0)
+  volume: number;  // 0.0 – 1.0 (default 1.0)
+  voiceURI: string | null; // selected voice URI, null = system default
+}
+
+const TTS_STORAGE_KEY = "zeroclaw_tts_settings";
+
+function loadTtsSettings(): TtsSettings {
+  try {
+    const stored = localStorage.getItem(TTS_STORAGE_KEY);
+    if (stored) return { ...{ rate: 1.0, pitch: 1.0, volume: 1.0, voiceURI: null }, ...JSON.parse(stored) };
+  } catch { /* ignore */ }
+  return { rate: 1.0, pitch: 1.0, volume: 1.0, voiceURI: null };
+}
+
+function saveTtsSettings(s: TtsSettings) {
+  localStorage.setItem(TTS_STORAGE_KEY, JSON.stringify(s));
+}
+
+function speakText(text: string, lang: string, onEnd?: () => void, settings?: TtsSettings) {
   const plain = text
     .replace(/```[\s\S]*?```/g, " ")
     .replace(/`([^`]+)`/g, "$1")
@@ -47,7 +68,14 @@ function speakText(text: string, lang: string, onEnd?: () => void) {
   window.speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(plain);
   u.lang = lang;
-  u.rate = 1.0;
+  const s = settings ?? loadTtsSettings();
+  u.rate = s.rate;
+  u.pitch = s.pitch;
+  u.volume = s.volume;
+  if (s.voiceURI) {
+    const voice = window.speechSynthesis.getVoices().find(v => v.voiceURI === s.voiceURI);
+    if (voice) u.voice = voice;
+  }
   if (onEnd) { u.onend = onEnd; u.onerror = onEnd; }
   window.speechSynthesis.speak(u);
 }
@@ -112,8 +140,24 @@ export function Chat({
   const recognitionRef = useRef<ReturnType<typeof createSpeechRecognition> | null>(null);
   const voiceModeRef = useRef(false);
   const chatLangRef = useRef(chatLang);
+  // Prevents STT from restarting while TTS is playing (echo suppression)
+  const isSpeakingRef = useRef(false);
+  // TTS voice settings
+  const [ttsSettings, setTtsSettings] = useState<TtsSettings>(loadTtsSettings);
+  const [showTtsSettings, setShowTtsSettings] = useState(false);
+  const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const ttsSettingsRef = useRef(ttsSettings);
+  useEffect(() => { ttsSettingsRef.current = ttsSettings; }, [ttsSettings]);
   useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
   useEffect(() => { chatLangRef.current = chatLang; }, [chatLang]);
+
+  // Load available TTS voices
+  useEffect(() => {
+    const loadVoices = () => setAvailableVoices(window.speechSynthesis.getVoices());
+    loadVoices();
+    window.speechSynthesis.onvoiceschanged = loadVoices;
+    return () => { window.speechSynthesis.onvoiceschanged = null; };
+  }, []);
 
   // Cleanup STT + TTS on unmount
   useEffect(() => {
@@ -247,6 +291,11 @@ export function Chat({
       setVoiceMode(false);
     };
     recognition.onend = () => {
+      // Don't restart STT while TTS is playing (echo suppression)
+      if (isSpeakingRef.current) {
+        setListening(false);
+        return;
+      }
       if (voiceModeRef.current && finalTranscript.trim()) {
         setInput(finalTranscript.trim());
         // Auto-send on next tick
@@ -256,7 +305,7 @@ export function Chat({
         }, 50);
       } else if (voiceModeRef.current) {
         setTimeout(() => {
-          if (voiceModeRef.current) startListening(chatLangRef.current);
+          if (voiceModeRef.current && !isSpeakingRef.current) startListening(chatLangRef.current);
         }, 300);
       } else {
         setListening(false);
@@ -270,6 +319,7 @@ export function Chat({
   // Toggle voice mode on/off
   const toggleVoiceMode = useCallback(() => {
     if (listening || voiceMode) {
+      isSpeakingRef.current = false;
       recognitionRef.current?.stop();
       window.speechSynthesis.cancel();
       setListening(false);
@@ -287,10 +337,14 @@ export function Chat({
     if (messages.length > prevMsgCountRef.current) {
       const last = messages[messages.length - 1];
       if (last && last.role === "assistant") {
+        // Mute STT during TTS to prevent echo (speaker → mic → STT loop)
+        isSpeakingRef.current = true;
         recognitionRef.current?.stop();
+        setListening(false);
         speakText(last.content, chatLangRef.current, () => {
+          isSpeakingRef.current = false;
           if (voiceModeRef.current) startListening(chatLangRef.current);
-        });
+        }, ttsSettingsRef.current);
       }
     }
     prevMsgCountRef.current = messages.length;
@@ -720,7 +774,145 @@ export function Chat({
               ? (locale === "ko" ? "중지" : "Stop")
               : (locale === "ko" ? "음성" : "Voice")}</span>
           </button>
+          <button
+            type="button"
+            className="chat-action-btn"
+            onClick={() => setShowTtsSettings(prev => !prev)}
+            title={locale === "ko" ? "음성 설정" : "Voice settings"}
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="3" />
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+            </svg>
+            <span>{locale === "ko" ? "음성 설정" : "TTS"}</span>
+          </button>
         </div>
+
+        {/* TTS Voice Settings Panel */}
+        {showTtsSettings && (
+          <div className="tts-settings-panel" style={{
+            padding: "12px 16px",
+            background: "var(--bg-secondary, #1e1e2e)",
+            borderRadius: "8px",
+            marginTop: "8px",
+            display: "flex",
+            flexDirection: "column",
+            gap: "10px",
+            fontSize: "13px",
+          }}>
+            <div style={{ fontWeight: 600, marginBottom: "2px" }}>
+              {locale === "ko" ? "TTS 음성 설정" : "TTS Voice Settings"}
+            </div>
+
+            {/* Speed / Rate */}
+            <label style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span style={{ minWidth: "60px" }}>{locale === "ko" ? "속도" : "Speed"}</span>
+              <input type="range" min="0.5" max="2.0" step="0.1"
+                value={ttsSettings.rate}
+                onChange={e => {
+                  const s = { ...ttsSettings, rate: parseFloat(e.target.value) };
+                  setTtsSettings(s); saveTtsSettings(s);
+                }}
+                style={{ flex: 1 }}
+              />
+              <span style={{ minWidth: "32px", textAlign: "right" }}>{ttsSettings.rate.toFixed(1)}x</span>
+            </label>
+
+            {/* Pitch */}
+            <label style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span style={{ minWidth: "60px" }}>{locale === "ko" ? "톤" : "Pitch"}</span>
+              <input type="range" min="0.0" max="2.0" step="0.1"
+                value={ttsSettings.pitch}
+                onChange={e => {
+                  const s = { ...ttsSettings, pitch: parseFloat(e.target.value) };
+                  setTtsSettings(s); saveTtsSettings(s);
+                }}
+                style={{ flex: 1 }}
+              />
+              <span style={{ minWidth: "32px", textAlign: "right" }}>{ttsSettings.pitch.toFixed(1)}</span>
+            </label>
+
+            {/* Volume */}
+            <label style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span style={{ minWidth: "60px" }}>{locale === "ko" ? "볼륨" : "Volume"}</span>
+              <input type="range" min="0.0" max="1.0" step="0.1"
+                value={ttsSettings.volume}
+                onChange={e => {
+                  const s = { ...ttsSettings, volume: parseFloat(e.target.value) };
+                  setTtsSettings(s); saveTtsSettings(s);
+                }}
+                style={{ flex: 1 }}
+              />
+              <span style={{ minWidth: "32px", textAlign: "right" }}>{Math.round(ttsSettings.volume * 100)}%</span>
+            </label>
+
+            {/* Voice Selection */}
+            <label style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+              <span style={{ minWidth: "60px" }}>{locale === "ko" ? "목소리" : "Voice"}</span>
+              <select
+                value={ttsSettings.voiceURI ?? ""}
+                onChange={e => {
+                  const s = { ...ttsSettings, voiceURI: e.target.value || null };
+                  setTtsSettings(s); saveTtsSettings(s);
+                }}
+                style={{
+                  flex: 1,
+                  background: "var(--bg-primary, #11111b)",
+                  color: "var(--text-primary, #cdd6f4)",
+                  border: "1px solid var(--border-color, #45475a)",
+                  borderRadius: "4px",
+                  padding: "4px 8px",
+                  fontSize: "12px",
+                }}
+              >
+                <option value="">{locale === "ko" ? "시스템 기본" : "System default"}</option>
+                {availableVoices
+                  .filter(v => {
+                    const vl = v.lang.toLowerCase();
+                    const cl = chatLang.toLowerCase().slice(0, 2);
+                    return vl.startsWith(cl);
+                  })
+                  .map(v => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {v.name} ({v.lang})
+                    </option>
+                  ))}
+                {/* Show all voices if none match current language */}
+                {availableVoices.filter(v => v.lang.toLowerCase().startsWith(chatLang.toLowerCase().slice(0, 2))).length === 0 &&
+                  availableVoices.map(v => (
+                    <option key={v.voiceURI} value={v.voiceURI}>
+                      {v.name} ({v.lang})
+                    </option>
+                  ))
+                }
+              </select>
+            </label>
+
+            {/* Test button */}
+            <button
+              type="button"
+              onClick={() => speakText(
+                locale === "ko" ? "안녕하세요, 이것은 음성 테스트입니다." : "Hello, this is a voice test.",
+                chatLang,
+                undefined,
+                ttsSettings,
+              )}
+              style={{
+                alignSelf: "flex-end",
+                padding: "4px 12px",
+                background: "var(--accent-color, #89b4fa)",
+                color: "var(--bg-primary, #11111b)",
+                border: "none",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "12px",
+                fontWeight: 600,
+              }}
+            >
+              {locale === "ko" ? "테스트" : "Test"}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );

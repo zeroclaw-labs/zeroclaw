@@ -3,6 +3,7 @@ import {
   getSyncStatus,
   triggerFullSync,
   getPlatformInfo,
+  getDeviceFingerprint,
   disconnectBackend,
   setServerUrl as setBackendServerUrl,
   type SyncStatus,
@@ -177,6 +178,7 @@ export class MoAClient {
 
   async login(username: string, password: string): Promise<LoginResponse> {
     const deviceName = await this.getDeviceName();
+    const fingerprint = await getDeviceFingerprint();
     const res = await fetch(`${this.relayUrl}/api/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -185,6 +187,7 @@ export class MoAClient {
         password,
         device_id: this.deviceId,
         device_name: deviceName,
+        fingerprint,
       }),
     });
 
@@ -193,7 +196,13 @@ export class MoAClient {
       throw new Error(data.error || `Login failed (${res.status})`);
     }
 
-    const data: LoginResponse = await res.json();
+    const data: LoginResponse & { resolved_device_id?: string } = await res.json();
+
+    // If server matched an existing device by fingerprint, adopt that device_id
+    if (data.resolved_device_id) {
+      this.deviceId = data.resolved_device_id;
+      localStorage.setItem(STORAGE_KEY_DEVICE_ID, data.resolved_device_id);
+    }
 
     // Save auth state
     this.token = data.token;
@@ -295,7 +304,8 @@ export class MoAClient {
   async registerDevice(deviceName: string, platform?: string): Promise<void> {
     if (!this.token) return;
 
-    await fetch(`${this.relayUrl}/api/auth/devices`, {
+    const fingerprint = await getDeviceFingerprint();
+    const res = await fetch(`${this.relayUrl}/api/auth/devices`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -305,8 +315,18 @@ export class MoAClient {
         device_id: this.deviceId,
         device_name: deviceName,
         platform,
+        fingerprint,
       }),
     });
+
+    if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      // If server matched an existing device by fingerprint, adopt that device_id
+      if (data.resolved_device_id) {
+        this.deviceId = data.resolved_device_id;
+        localStorage.setItem(STORAGE_KEY_DEVICE_ID, data.resolved_device_id);
+      }
+    }
   }
 
   async setDevicePairingCode(deviceId: string, code: string | null): Promise<void> {
@@ -676,23 +696,22 @@ export class MoAClient {
         : {}),
     };
 
-    // ── Determine routing order with fallback ──
-    // ★ ALWAYS try local gateway first (even without LLM key).
-    // When proxy_url + proxy_token are provided, the local gateway uses
-    // ProxyProvider for LLM calls → local tool keys are preserved.
-    // Fallback to relay only if local gateway is completely unreachable.
+    // ── Determine routing ──
+    // ★ Local-first: when user has their own API key, ALL chat goes through
+    // the local gateway only — never fall back to Railway relay.
+    // This ensures the user's key is used directly and chat stays local.
+    // Fallback to relay is only allowed when NO local key is available
+    // (proxy mode: local gateway routes LLM calls through Railway proxy).
     const primaryUrl = this.serverUrl;
-    const fallbackUrl = this.relayUrl;
 
-    // ── Try primary ──
+    // ── Try local gateway ──
     let res = await this.tryChatRequest(primaryUrl, body);
 
     if (res !== null) {
-      // Primary connected — check for fallback-eligible errors.
-      // Both local gateway and relay can signal fallback via:
-      // - { fallback_to_relay: true } or { code: "missing_api_key" | "provider_auth_error" }
-      // - Or raw error text containing auth-related keywords (e.g. relay without explicit flags)
-      if (!res.ok && (res.status === 400 || res.status === 500)) {
+      // Local gateway connected — check for fallback-eligible errors.
+      // ★ Only fall back to relay when user has NO local API key.
+      // When user has their own key, errors are shown directly (no relay detour).
+      if (!res.ok && (res.status === 400 || res.status === 500) && !hasSelectedProviderKey) {
         const errorText = await res.text().catch(() => "");
         let shouldFallback = false;
         let errorJson: Record<string, unknown> = {};
@@ -701,8 +720,6 @@ export class MoAClient {
           shouldFallback = errorJson.fallback_to_relay === true
             || errorJson.code === "missing_api_key"
             || errorJson.code === "provider_auth_error";
-          // Also detect auth errors from the error message itself
-          // (e.g. relay server responses without explicit fallback flags)
           if (!shouldFallback) {
             const errMsg = (errorJson.error as string) || "";
             shouldFallback = errMsg.includes("401")
@@ -711,24 +728,20 @@ export class MoAClient {
               || errMsg.includes("API key");
           }
         } catch {
-          // Not JSON — might still be an API key issue, try fallback anyway
           shouldFallback = errorText.includes("API key")
             || errorText.includes("Unauthorized")
             || errorText.includes("authentication");
         }
 
         if (shouldFallback) {
-          // Try the other server — omit api_key when falling back to relay
-          const fallbackBody = fallbackUrl === this.relayUrl
-            ? { ...body, api_key: undefined }
-            : body;
-          const fallbackRes = await this.tryChatRequest(fallbackUrl, fallbackBody);
+          const fallbackBody = { ...body, api_key: undefined };
+          const fallbackRes = await this.tryChatRequest(this.relayUrl, fallbackBody);
           if (fallbackRes !== null && fallbackRes.ok) {
             return this.parseChatResponse(fallbackRes);
           }
         }
 
-        // Fallback didn't work — always sanitize error for user-friendly display
+        // Fallback didn't work — sanitize error for user-friendly display
         const rawError = (errorJson.error as string) || errorText || "";
         const errorMessage = this.sanitizeErrorForDisplay(rawError)
           || `Chat request failed (${res.status})`;
@@ -738,19 +751,24 @@ export class MoAClient {
       return this.parseChatResponse(res);
     }
 
-    // ── Primary failed (network error) — try fallback ──
-    // When falling back to relay without a local key, omit api_key
-    const fallbackBody = fallbackUrl === this.relayUrl
-      ? { ...body, api_key: undefined }
-      : body;
+    // ── Local gateway unreachable (network error) ──
+    // ★ When user has their own API key, do NOT fall back to relay.
+    // The user explicitly wants local-only chat.
+    if (hasSelectedProviderKey) {
+      throw new Error(
+        "Cannot connect to local MoA server. Please check that the local server is running.",
+      );
+    }
 
-    res = await this.tryChatRequest(fallbackUrl, fallbackBody);
+    // No local key — try relay server as fallback
+    const fallbackBody = { ...body, api_key: undefined };
+    res = await this.tryChatRequest(this.relayUrl, fallbackBody);
 
     if (res !== null) {
       return this.parseChatResponse(res);
     }
 
-    // ── Both failed ──
+    // Both failed
     throw new Error(
       "Cannot connect to MoA server. Both local gateway and relay server are unreachable. " +
         "Please check that either the local server is running or you have network access.",

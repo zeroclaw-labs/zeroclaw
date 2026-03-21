@@ -105,6 +105,7 @@ pub struct LoginBody {
     pub password: String,
     pub device_id: Option<String>,
     pub device_name: Option<String>,
+    pub fingerprint: Option<String>,
 }
 
 pub async fn handle_auth_login(
@@ -149,10 +150,21 @@ pub async fn handle_auth_login(
         }
     };
 
-    // Register device if provided
-    if let (Some(ref did), Some(ref dname)) = (&body.device_id, &body.device_name) {
-        let _ = auth_store.register_device(&user.id, did, dname, None);
-    }
+    // Register device if provided; fingerprint-based dedup may return an existing device_id
+    let resolved_device_id = if let (Some(ref did), Some(ref dname)) = (&body.device_id, &body.device_name) {
+        match auth_store.register_device(
+            &user.id,
+            did,
+            dname,
+            None,
+            body.fingerprint.as_deref(),
+        ) {
+            Ok(actual_id) => Some(actual_id),
+            Err(_) => Some(did.clone()),
+        }
+    } else {
+        None
+    };
 
     // List devices
     let devices = auth_store
@@ -171,17 +183,22 @@ pub async fn handle_auth_login(
         })
         .collect::<Vec<_>>();
 
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "token": token,
-            "user_id": user.id,
-            "username": user.username,
-            "devices": devices,
-        })),
-    )
-        .into_response()
+    let mut response = serde_json::json!({
+        "status": "ok",
+        "token": token,
+        "user_id": user.id,
+        "username": user.username,
+        "devices": devices,
+    });
+
+    // If the server resolved a different device_id (fingerprint match), inform the client
+    if let Some(ref actual_id) = resolved_device_id {
+        if body.device_id.as_deref() != Some(actual_id.as_str()) {
+            response["resolved_device_id"] = serde_json::json!(actual_id);
+        }
+    }
+
+    (StatusCode::OK, Json(response)).into_response()
 }
 
 // ── POST /api/auth/logout ───────────────────────────────────────
@@ -252,6 +269,7 @@ pub struct RegisterDeviceBody {
     pub device_id: String,
     pub device_name: String,
     pub platform: Option<String>,
+    pub fingerprint: Option<String>,
 }
 
 pub async fn handle_auth_devices_register(
@@ -267,8 +285,15 @@ pub async fn handle_auth_devices_register(
     let Some(auth_store) = state.auth_store.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
     };
-    match auth_store.register_device(&user_id, &body.device_id, &body.device_name, body.platform.as_deref()) {
-        Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
+    match auth_store.register_device(&user_id, &body.device_id, &body.device_name, body.platform.as_deref(), body.fingerprint.as_deref()) {
+        Ok(actual_device_id) => {
+            let mut resp = serde_json::json!({ "status": "ok" });
+            // If fingerprint matched an existing device, return the resolved device_id
+            if actual_device_id != body.device_id {
+                resp["resolved_device_id"] = serde_json::json!(actual_device_id);
+            }
+            Json(resp).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),

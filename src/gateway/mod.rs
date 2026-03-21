@@ -4,7 +4,7 @@
 //! - Proper HTTP/1.1 parsing and compliance
 //! - Content-Length validation (handled by hyper)
 //! - Request body size limits (64KB max)
-//! - Request timeouts (30s) to prevent slow-loris attacks
+//! - Request timeouts (300s global, matching chat endpoint timeout)
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
@@ -57,8 +57,10 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Global request timeout (300s) — matches the chat endpoint timeout so the
+/// global `TimeoutLayer` does not override per-route extended timeouts.
+/// Slow-loris protection is better handled at the reverse-proxy level.
+pub const REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Extended timeout for chat endpoints that go through the agent loop with
 /// tool execution (web search, composio, etc.) — these can easily exceed 30s.
 pub const CHAT_REQUEST_TIMEOUT_SECS: u64 = 300;
@@ -3602,8 +3604,8 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_is_300_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 300);
     }
 
     #[test]

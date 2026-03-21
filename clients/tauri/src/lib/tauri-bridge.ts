@@ -87,6 +87,14 @@ export async function getPlatformInfo(): Promise<PlatformInfo | null> {
   return invoke("get_platform_info") as Promise<PlatformInfo>;
 }
 
+/** Get a deterministic device fingerprint based on machine hardware info.
+ *  This survives app reinstalls and is used for device deduplication. */
+export async function getDeviceFingerprint(): Promise<string | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("get_device_fingerprint") as Promise<string>;
+}
+
 /** Notify backend that the app is going to background. */
 export async function onAppPause(): Promise<void> {
   const invoke = await getInvoke();

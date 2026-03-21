@@ -426,6 +426,25 @@ fn get_platform_info() -> serde_json::Value {
     })
 }
 
+/// Generate a deterministic device fingerprint based on machine-specific info.
+/// This fingerprint survives app reinstalls, enabling the server to recognize
+/// the same physical device even when localStorage/app data is wiped.
+#[tauri::command]
+fn get_device_fingerprint() -> String {
+    use sha2::{Digest, Sha256};
+
+    let hostname = hostname::get()
+        .map(|h| h.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+
+    // Combine stable machine attributes into a single fingerprint
+    let raw = format!("moa-fp:{}:{}:{}", hostname, os, arch);
+    let hash = Sha256::digest(raw.as_bytes());
+    format!("{:x}", hash)
+}
+
 // ── Sync Commands ────────────────────────────────────────────────
 
 /// Get sync connection status.
@@ -2121,6 +2140,7 @@ pub fn run() {
             is_authenticated,
             disconnect,
             get_platform_info,
+            get_device_fingerprint,
             get_sync_status,
             trigger_full_sync,
             on_app_pause,
