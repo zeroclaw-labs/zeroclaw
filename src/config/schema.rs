@@ -784,6 +784,9 @@ pub struct TranscriptionConfig {
     /// Google Cloud Speech-to-Text provider configuration.
     #[serde(default)]
     pub google: Option<GoogleSttConfig>,
+    /// Local/self-hosted Whisper-compatible STT provider.
+    #[serde(default)]
+    pub local_whisper: Option<LocalWhisperConfig>,
 }
 
 impl Default for TranscriptionConfig {
@@ -801,6 +804,7 @@ impl Default for TranscriptionConfig {
             deepgram: None,
             assemblyai: None,
             google: None,
+            local_whisper: None,
         }
     }
 }
@@ -1167,6 +1171,35 @@ pub struct GoogleSttConfig {
     /// BCP-47 language code (default: "en-US").
     #[serde(default = "default_google_stt_language_code")]
     pub language_code: String,
+}
+
+/// Local/self-hosted Whisper-compatible STT endpoint (`[transcription.local_whisper]`).
+///
+/// Audio is sent over WireGuard; never leaves the platform perimeter.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LocalWhisperConfig {
+    /// HTTP or HTTPS endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
+    pub url: String,
+    /// Bearer token for endpoint authentication.
+    pub bearer_token: String,
+    /// Maximum audio file size in bytes accepted by this endpoint.
+    /// Defaults to 25 MB — matching the cloud API cap for a safe out-of-the-box
+    /// experience. Self-hosted endpoints can accept much larger files; raise this
+    /// as needed, but note that each transcription call clones the audio buffer
+    /// into a multipart payload, so peak memory per request is ~2× this value.
+    #[serde(default = "default_local_whisper_max_audio_bytes")]
+    pub max_audio_bytes: usize,
+    /// Request timeout in seconds. Defaults to 300 (large files on local GPU).
+    #[serde(default = "default_local_whisper_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_local_whisper_max_audio_bytes() -> usize {
+    25 * 1024 * 1024
+}
+
+fn default_local_whisper_timeout_secs() -> u64 {
+    300
 }
 
 /// Agent orchestration configuration (`[agent]` section).
@@ -8081,10 +8114,10 @@ impl Config {
         {
             let dp = self.transcription.default_provider.trim();
             match dp {
-                "groq" | "openai" | "deepgram" | "assemblyai" | "google" => {}
+                "groq" | "openai" | "deepgram" | "assemblyai" | "google" | "local_whisper" => {}
                 other => {
                     anyhow::bail!(
-                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google (got '{other}')"
+                        "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper (got '{other}')"
                     );
                 }
             }
@@ -12421,6 +12454,30 @@ require_otp_to_resume = true
 
         let err = config.validate().expect_err("expected invalid domain glob");
         assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn validate_accepts_local_whisper_as_transcription_default_provider() {
+        let mut config = Config::default();
+        config.transcription.default_provider = "local_whisper".to_string();
+
+        config.validate().expect(
+            "local_whisper must be accepted by the transcription.default_provider allowlist",
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_unknown_transcription_default_provider() {
+        let mut config = Config::default();
+        config.transcription.default_provider = "unknown_stt".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("expected validation to reject unknown transcription provider");
+        assert!(
+            err.to_string().contains("transcription.default_provider"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
