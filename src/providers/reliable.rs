@@ -108,6 +108,7 @@ fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
         "token limit exceeded",
         "prompt is too long",
         "input is too long",
+        "prompt exceeds max length",
     ];
 
     hints.iter().any(|hint| lower.contains(hint))
