@@ -158,11 +158,17 @@ impl Tool for ReactionTool {
                 .await
         };
 
+        let past_tense = if action == "remove" {
+            "removed"
+        } else {
+            "added"
+        };
+
         match result {
             Ok(()) => Ok(ToolResult {
                 success: true,
                 output: format!(
-                    "Reaction {action}ed: {emoji} on message {message_id} in {channel_name}"
+                    "Reaction {past_tense}: {emoji} on message {message_id} in {channel_name}"
                 ),
                 error: None,
             }),
