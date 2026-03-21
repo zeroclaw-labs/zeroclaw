@@ -530,6 +530,7 @@ impl DelegateTool {
                 &[],
                 None,
                 None,
+                &crate::config::PacingConfig::default(),
             ),
         )
         .await;

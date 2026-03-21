@@ -165,6 +165,10 @@ pub struct Config {
     #[serde(default)]
     pub agent: AgentConfig,
 
+    /// Pacing controls for slow/local LLM workloads (`[pacing]`).
+    #[serde(default)]
+    pub pacing: PacingConfig,
+
     /// Skills loading and community repository behavior (`[skills]`).
     #[serde(default)]
     pub skills: SkillsConfig,
@@ -1275,6 +1279,43 @@ impl Default for AgentConfig {
             tool_filter_groups: Vec::new(),
         }
     }
+}
+
+// ── Pacing ────────────────────────────────────────────────────────
+
+/// Pacing controls for slow/local LLM workloads (`[pacing]` section).
+///
+/// All fields are optional and default to values that preserve existing
+/// behavior. When set, they extend — not replace — the existing timeout
+/// and loop-detection subsystems.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct PacingConfig {
+    /// Per-step timeout in seconds: the maximum time allowed for a single
+    /// LLM inference turn, independent of the total message budget.
+    /// `None` means no per-step timeout (existing behavior).
+    #[serde(default)]
+    pub step_timeout_secs: Option<u64>,
+
+    /// Minimum elapsed seconds before loop detection activates.
+    /// Tasks completing under this threshold get aggressive loop protection;
+    /// longer-running tasks receive a grace period before the detector starts
+    /// counting. `None` means loop detection is always active (existing behavior).
+    #[serde(default)]
+    pub loop_detection_min_elapsed_secs: Option<u64>,
+
+    /// Tool names excluded from identical-output / alternating-pattern loop
+    /// detection. Useful for browser workflows where `browser_screenshot`
+    /// structurally resembles a loop even when making progress.
+    #[serde(default)]
+    pub loop_ignore_tools: Vec<String>,
+
+    /// Override for the hardcoded timeout scaling cap (default: 4).
+    /// The channel message timeout budget is computed as:
+    ///   `message_timeout_secs * min(max_tool_iterations, message_timeout_scale_max)`
+    /// Raising this value lets long multi-step tasks with slow local models
+    /// receive a proportionally larger budget without inflating the base timeout.
+    #[serde(default)]
+    pub message_timeout_scale_max: Option<u64>,
 }
 
 /// Skills loading configuration (`[skills]` section).
@@ -6727,6 +6768,7 @@ impl Default for Config {
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
+            pacing: PacingConfig::default(),
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
@@ -9672,6 +9714,7 @@ default_temperature = 0.7
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
+            pacing: PacingConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
@@ -9943,6 +9986,47 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
     }
 
+    #[test]
+    async fn pacing_config_defaults_are_all_none_or_empty() {
+        let cfg = PacingConfig::default();
+        assert!(cfg.step_timeout_secs.is_none());
+        assert!(cfg.loop_detection_min_elapsed_secs.is_none());
+        assert!(cfg.loop_ignore_tools.is_empty());
+        assert!(cfg.message_timeout_scale_max.is_none());
+    }
+
+    #[test]
+    async fn pacing_config_deserializes_from_toml() {
+        let raw = r#"
+default_temperature = 0.7
+[pacing]
+step_timeout_secs = 120
+loop_detection_min_elapsed_secs = 60
+loop_ignore_tools = ["browser_screenshot", "browser_navigate"]
+message_timeout_scale_max = 8
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.pacing.step_timeout_secs, Some(120));
+        assert_eq!(parsed.pacing.loop_detection_min_elapsed_secs, Some(60));
+        assert_eq!(
+            parsed.pacing.loop_ignore_tools,
+            vec!["browser_screenshot", "browser_navigate"]
+        );
+        assert_eq!(parsed.pacing.message_timeout_scale_max, Some(8));
+    }
+
+    #[test]
+    async fn pacing_config_absent_preserves_defaults() {
+        let raw = r#"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(parsed.pacing.step_timeout_secs.is_none());
+        assert!(parsed.pacing.loop_detection_min_elapsed_secs.is_none());
+        assert!(parsed.pacing.loop_ignore_tools.is_empty());
+        assert!(parsed.pacing.message_timeout_scale_max.is_none());
+    }
+
     #[tokio::test]
     async fn sync_directory_handles_existing_directory() {
         let dir = std::env::temp_dir().join(format!(
@@ -10011,6 +10095,7 @@ tool_dispatcher = "xml"
             google_workspace: GoogleWorkspaceConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
+            pacing: PacingConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
