@@ -204,13 +204,37 @@ pub async fn prepare_messages_for_provider(
         }
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
-        for reference in refs {
-            let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
-            normalized_refs.push(data_uri);
+        let mut skipped_refs = Vec::new();
+        for reference in &refs {
+            match normalize_image_reference(reference, config, max_bytes, &remote_client).await {
+                Ok(data_uri) => normalized_refs.push(data_uri),
+                Err(e) => {
+                    tracing::warn!(
+                        image = %reference,
+                        error = %e,
+                        "Multimodal: skipping unresolvable image, continuing without it"
+                    );
+                    skipped_refs.push(reference.as_str());
+                }
+            }
         }
 
-        let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
+        // If all images failed, fall back to text-only with a note
+        let effective_text = if normalized_refs.is_empty() && !skipped_refs.is_empty() {
+            format!(
+                "{cleaned_text}\n\n(Note: {} attached image(s) could not be loaded)",
+                skipped_refs.len()
+            )
+        } else if !skipped_refs.is_empty() {
+            format!(
+                "{cleaned_text}\n\n(Note: {} of {} image(s) could not be loaded)",
+                skipped_refs.len(),
+                refs.len()
+            )
+        } else {
+            cleaned_text.clone()
+        };
+        let content = compose_multimodal_message(&effective_text, &normalized_refs);
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
