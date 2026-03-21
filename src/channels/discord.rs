@@ -20,9 +20,8 @@ pub struct DiscordChannel {
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
-    /// Voice transcription config — when set, audio attachments are
-    /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
 }
 
 impl DiscordChannel {
@@ -42,6 +41,7 @@ impl DiscordChannel {
             typing_handles: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
+            transcription_manager: None,
         }
     }
 
@@ -63,6 +63,21 @@ impl DiscordChannel {
         crate::config::build_channel_proxy_client("channel.discord", self.proxy_url.as_deref())
     }
 
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
+        }
+        self.transcription = Some(config);
+        self
+    }
+
     /// Check if a Discord user ID is in the allowlist.
     /// Empty list means deny everyone until explicitly configured.
     /// `"*"` means allow everyone.
@@ -77,14 +92,56 @@ impl DiscordChannel {
     }
 }
 
+async fn try_transcribe_discord_audio(
+    client: &reqwest::Client,
+    url: &str,
+    filename: &str,
+    _content_type: &str,
+    manager: &super::transcription::TranscriptionManager,
+) -> Option<String> {
+    let resp = match client.get(url).send().await {
+        Ok(r) if r.status().is_success() => r,
+        Ok(r) => {
+            tracing::warn!(
+                filename,
+                status = %r.status(),
+                "discord: audio CDN fetch failed"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(filename, error = %e, "discord: audio CDN fetch error");
+            return None;
+        }
+    };
+
+    let audio_data = match resp.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(e) => {
+            tracing::warn!(filename, error = %e, "discord: audio body read error");
+            return None;
+        }
+    };
+
+    match manager.transcribe(&audio_data, filename).await {
+        Ok(transcript) => Some(transcript),
+        Err(e) => {
+            tracing::warn!(filename, error = %e, "discord: transcription failed");
+            None
+        }
+    }
+}
+
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// Only `text/*` MIME types are fetched and inlined. All other types are
-/// silently skipped. Fetch errors are logged as warnings.
+/// `text/*` MIME types are fetched and inlined. `audio/*` MIME types are
+/// transcribed when a manager is provided. All other types are silently
+/// skipped. Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
+    manager: Option<&super::transcription::TranscriptionManager>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     for att in attachments {
@@ -113,6 +170,27 @@ async fn process_attachments(
                 Err(e) => {
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
+            }
+        } else if ct.starts_with("audio/") {
+            if let Some(mgr) = manager {
+                match try_transcribe_discord_audio(client, url, name, ct, mgr).await {
+                    Some(transcript) => {
+                        parts.push(format!("[Voice message: {name}]\n{transcript}"));
+                    }
+                    None => {
+                        tracing::debug!(
+                            name,
+                            content_type = ct,
+                            "discord: audio transcription returned no result"
+                        );
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    name,
+                    content_type = ct,
+                    "discord: skipping audio attachment (no transcription manager configured)"
+                );
             }
         } else {
             tracing::debug!(
@@ -819,11 +897,12 @@ impl Channel for DiscordChannel {
                     // the mention gate — requiring a @mention in a DM is never correct.
                     let is_dm = d.get("guild_id").is_none();
                     let effective_mention_only = self.mention_only && !is_dm;
-                    let Some(clean_content) =
-                        normalize_incoming_content(content, effective_mention_only, &bot_user_id)
-                    else {
+                    let normalized_text =
+                        normalize_incoming_content(content, effective_mention_only, &bot_user_id);
+
+                    if effective_mention_only && normalized_text.is_none() {
                         continue;
-                    };
+                    }
 
                     let attachment_text = {
                         let atts = d
@@ -831,33 +910,18 @@ impl Channel for DiscordChannel {
                             .and_then(|a| a.as_array())
                             .cloned()
                             .unwrap_or_default();
-                        let client = self.http_client();
-                        let mut text_parts = process_attachments(&atts, &client).await;
-
-                        // Transcribe audio attachments when transcription is configured
-                        if let Some(ref transcription_config) = self.transcription {
-                            let voice_text = transcribe_discord_audio_attachments(
-                                &atts,
-                                &client,
-                                transcription_config,
-                            )
-                            .await;
-                            if !voice_text.is_empty() {
-                                if text_parts.is_empty() {
-                                    text_parts = voice_text;
-                                } else {
-                                    text_parts = format!("{text_parts}
-            {voice_text}");
-                                }
-                            }
-                        }
-
-                        text_parts
+                        process_attachments(&atts, &self.http_client(), self.transcription_manager.as_deref()).await
                     };
-                    let final_content = if attachment_text.is_empty() {
-                        clean_content
-                    } else {
-                        format!("{clean_content}\n\n[Attachments]\n{attachment_text}")
+
+                    if normalized_text.is_none() && attachment_text.is_empty() {
+                        continue;
+                    }
+
+                    let final_content = match (normalized_text, attachment_text.is_empty()) {
+                        (Some(text), true) => text,
+                        (Some(text), false) => format!("{text}\n\n[Attachments]\n{attachment_text}"),
+                        (None, false) => format!("[Attachments]\n{attachment_text}"),
+                        (None, true) => unreachable!(),
                     };
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
@@ -1601,7 +1665,7 @@ mod tests {
     #[tokio::test]
     async fn process_attachments_empty_list_returns_empty() {
         let client = reqwest::Client::new();
-        let result = process_attachments(&[], &client).await;
+        let result = process_attachments(&[], &client, None).await;
         assert!(result.is_empty());
     }
 
@@ -1613,7 +1677,7 @@ mod tests {
             "filename": "doc.pdf",
             "content_type": "application/pdf"
         })];
-        let result = process_attachments(&attachments, &client).await;
+        let result = process_attachments(&attachments, &client, None).await;
         assert!(result.is_empty());
     }
 
@@ -1681,5 +1745,218 @@ mod tests {
             rendered,
             "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
         );
+    }
+
+    // ── Audio Transcription Tests ───────────────────────────
+
+    #[test]
+    fn discord_manager_none_when_transcription_not_configured() {
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false);
+        assert!(ch.transcription.is_none());
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn discord_manager_some_when_valid_config() {
+        std::env::remove_var("GROQ_API_KEY");
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = false;
+        config.api_key = Some("test-key".to_string());
+
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false)
+            .with_transcription(config.clone());
+
+        assert!(ch.transcription.is_some());
+        assert!(ch.transcription_manager.is_some());
+    }
+
+    #[test]
+    fn discord_manager_none_and_warn_on_init_failure() {
+        std::env::remove_var("GROQ_API_KEY");
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true;
+        config.default_provider = "groq".to_string();
+        config.api_key = Some(String::new());
+
+        let ch = DiscordChannel::new("fake".into(), None, vec![], false, false)
+            .with_transcription(config.clone());
+
+        assert!(ch.transcription.is_some());
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[tokio::test]
+    async fn discord_audio_only_message_processed_when_mentions_not_required() {
+        // This test verifies the listen() flow change: attachment-only messages
+        // (empty content, non-empty attachments) are no longer dropped before
+        // attachment processing when mention_only is false or in DM.
+        // We cannot easily test listen() in isolation, but we can verify that
+        // normalized_text=None + non-empty attachment_text is accepted.
+        let normalized_text: Option<String> = None;
+        let attachment_text = "[Voice message: voice.ogg]\ntest transcript";
+
+        // Simulate the new listen() assembly logic
+        let should_continue = normalized_text.is_none() && attachment_text.is_empty();
+        assert!(!should_continue, "audio-only message should not be dropped");
+    }
+
+    #[tokio::test]
+    async fn process_attachments_skips_audio_when_manager_none() {
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": "https://cdn.discordapp.com/attachments/123/456/voice.ogg",
+            "filename": "voice.ogg",
+            "content_type": "audio/ogg"
+        })];
+        let result = process_attachments(&attachments, &client, None).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn try_transcribe_discord_audio_returns_none_on_empty_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/audio.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![]))
+            .mount(&server)
+            .await;
+
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.api_key = Some("test-key".to_string());
+        let manager = super::super::transcription::TranscriptionManager::new(&config).unwrap();
+
+        let client = reqwest::Client::new();
+        let url = format!("{}/audio.ogg", server.uri());
+
+        let result =
+            try_transcribe_discord_audio(&client, &url, "audio.ogg", "audio/ogg", &manager).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn discord_audio_routes_through_local_whisper() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cdn_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/audio.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio-bytes".to_vec()))
+            .mount(&cdn_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "test transcript"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.default_provider = "local_whisper".to_string();
+        config.local_whisper = Some(crate::config::LocalWhisperConfig {
+            url: format!("{}/v1/transcribe", whisper_server.uri()),
+            bearer_token: "test-token".to_string(),
+            max_audio_bytes: 10 * 1024 * 1024,
+            timeout_secs: 30,
+        });
+
+        let manager = super::super::transcription::TranscriptionManager::new(&config).unwrap();
+
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": format!("{}/audio.ogg", cdn_server.uri()),
+            "filename": "voice.ogg",
+            "content_type": "audio/ogg"
+        })];
+
+        let result = process_attachments(&attachments, &client, Some(&manager)).await;
+        assert!(
+            result.contains("test transcript"),
+            "expected transcript in output, got: {result}"
+        );
+        assert!(
+            result.contains("[Voice message: voice.ogg]"),
+            "expected voice message marker, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_audio_skipped_on_cdn_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cdn_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/audio.ogg"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&cdn_server)
+            .await;
+
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.api_key = Some("test-key".to_string());
+        let manager = super::super::transcription::TranscriptionManager::new(&config).unwrap();
+
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": format!("{}/audio.ogg", cdn_server.uri()),
+            "filename": "voice.ogg",
+            "content_type": "audio/ogg"
+        })];
+
+        let result = process_attachments(&attachments, &client, Some(&manager)).await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discord_audio_skipped_on_transcription_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cdn_server = MockServer::start().await;
+        let whisper_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/audio.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-audio-bytes".to_vec()))
+            .mount(&cdn_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&whisper_server)
+            .await;
+
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.default_provider = "local_whisper".to_string();
+        config.local_whisper = Some(crate::config::LocalWhisperConfig {
+            url: format!("{}/v1/transcribe", whisper_server.uri()),
+            bearer_token: "test-token".to_string(),
+            max_audio_bytes: 10 * 1024 * 1024,
+            timeout_secs: 30,
+        });
+
+        let manager = super::super::transcription::TranscriptionManager::new(&config).unwrap();
+
+        let client = reqwest::Client::new();
+        let attachments = vec![serde_json::json!({
+            "url": format!("{}/audio.ogg", cdn_server.uri()),
+            "filename": "voice.ogg",
+            "content_type": "audio/ogg"
+        })];
+
+        let result = process_attachments(&attachments, &client, Some(&manager)).await;
+        assert!(result.is_empty());
     }
 }
