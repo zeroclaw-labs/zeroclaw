@@ -20,6 +20,7 @@ pub mod browser;
 pub mod browser_delegate;
 pub mod browser_open;
 pub mod calculator;
+pub mod claude_code;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
@@ -80,6 +81,7 @@ pub mod text_browser;
 pub mod tool_search;
 pub mod traits;
 pub mod verifiable_intent;
+pub mod weather_tool;
 pub mod web_fetch;
 mod web_search_provider_routing;
 pub mod web_search_tool;
@@ -91,6 +93,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
 pub use calculator::CalculatorTool;
+pub use claude_code::ClaudeCodeTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
@@ -150,6 +153,7 @@ pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use verifiable_intent::VerifiableIntentTool;
+pub use weather_tool::WeatherTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
@@ -331,6 +335,7 @@ pub fn all_tools_with_runtime(
             workspace_dir.to_path_buf(),
         )),
         Arc::new(CalculatorTool::new()),
+        Arc::new(WeatherTool::new()),
     ];
 
     if matches!(
@@ -525,6 +530,14 @@ pub fn all_tools_with_runtime(
         );
     }
 
+    // Claude Code delegation tool
+    if root_config.claude_code.enabled {
+        tool_arcs.push(Arc::new(ClaudeCodeTool::new(
+            security.clone(),
+            root_config.claude_code.clone(),
+        )));
+    }
+
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
@@ -666,7 +679,8 @@ pub fn all_tools_with_runtime(
         )
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone())
-        .with_delegate_config(root_config.delegate.clone());
+        .with_delegate_config(root_config.delegate.clone())
+        .with_workspace_dir(workspace_dir.to_path_buf());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
@@ -997,6 +1011,7 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
 

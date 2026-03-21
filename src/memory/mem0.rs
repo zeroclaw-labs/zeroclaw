@@ -364,14 +364,18 @@ impl Memory for Mem0Memory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // mem0 handles filtering server-side; since/until are not yet
+        // supported by the mem0 API, so we pass them through as no-ops.
         self.recall_filtered(query, limit, session_id, None, None, None)
             .await
     }
 
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
         // mem0 doesn't have a get-by-key API, so we search by key in metadata
-        let results = self.recall(key, 1, None).await?;
+        let results = self.recall(key, 1, None, None, None).await?;
         Ok(results.into_iter().find(|e| e.key == key))
     }
 

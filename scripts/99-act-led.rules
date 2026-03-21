@@ -1,0 +1,10 @@
+# Allow the gpio group to control the Raspberry Pi onboard ACT LED
+# via the Linux LED subsystem sysfs interface.
+#
+# Without this rule /sys/class/leds/ACT/{brightness,trigger} are
+# root-only writable, which prevents zeroclaw from blinking the LED.
+SUBSYSTEM=="leds", KERNEL=="ACT", ACTION=="add", \
+  RUN+="/bin/chgrp gpio /sys/%p/brightness", \
+  RUN+="/bin/chmod g+w /sys/%p/brightness", \
+  RUN+="/bin/chgrp gpio /sys/%p/trigger", \
+  RUN+="/bin/chmod g+w /sys/%p/trigger"

@@ -1,5 +1,8 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::config::schema::ModelPricing;
 use crate::config::Config;
+use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use crate::cost::CostTracker;
 use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
@@ -22,6 +25,108 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+// ── Cost tracking via task-local ──
+
+/// Context for cost tracking within the tool call loop.
+/// Scoped via `tokio::task_local!` at call sites (channels, gateway).
+#[derive(Clone)]
+pub(crate) struct ToolLoopCostTrackingContext {
+    pub tracker: Arc<CostTracker>,
+    pub prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+}
+
+impl ToolLoopCostTrackingContext {
+    pub(crate) fn new(
+        tracker: Arc<CostTracker>,
+        prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+    ) -> Self {
+        Self { tracker, prices }
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
+}
+
+/// 3-tier model pricing lookup:
+/// 1. Direct model name
+/// 2. Qualified `provider/model`
+/// 3. Suffix after last `/`
+fn lookup_model_pricing<'a>(
+    prices: &'a std::collections::HashMap<String, ModelPricing>,
+    provider_name: &str,
+    model: &str,
+) -> Option<&'a ModelPricing> {
+    prices
+        .get(model)
+        .or_else(|| prices.get(&format!("{provider_name}/{model}")))
+        .or_else(|| {
+            model
+                .rsplit_once('/')
+                .and_then(|(_, suffix)| prices.get(suffix))
+        })
+}
+
+/// Record token usage from an LLM response via the task-local cost tracker.
+/// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
+fn record_tool_loop_cost_usage(
+    provider_name: &str,
+    model: &str,
+    usage: &crate::providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    let input_tokens = usage.input_tokens.unwrap_or(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0);
+    let total_tokens = input_tokens.saturating_add(output_tokens);
+    if total_tokens == 0 {
+        return None;
+    }
+
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()?;
+    let pricing = lookup_model_pricing(&ctx.prices, provider_name, model);
+    let cost_usage = CostTokenUsage::new(
+        model,
+        input_tokens,
+        output_tokens,
+        pricing.map_or(0.0, |entry| entry.input),
+        pricing.map_or(0.0, |entry| entry.output),
+    );
+
+    if pricing.is_none() {
+        tracing::debug!(
+            provider = provider_name,
+            model,
+            "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
+        );
+    }
+
+    if let Err(error) = ctx.tracker.record_usage(cost_usage.clone()) {
+        tracing::warn!(
+            provider = provider_name,
+            model,
+            "Failed to record cost tracking usage: {error}"
+        );
+    }
+
+    Some((cost_usage.total_tokens, cost_usage.cost_usd))
+}
+
+/// Check budget before an LLM call. Returns `None` when no cost tracking
+/// context is scoped (tests, delegate, CLI without cost config).
+pub(crate) fn check_tool_loop_budget() -> Option<BudgetCheck> {
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .map(|ctx| {
+            ctx.tracker
+                .check_budget(0.0)
+                .unwrap_or(BudgetCheck::Allowed)
+        })
+}
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
@@ -256,6 +361,10 @@ pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 /// Used before streaming the final answer so progress lines are replaced by the clean response.
 pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
 
+tokio::task_local! {
+    pub(crate) static TOOL_CHOICE_OVERRIDE: Option<String>;
+}
+
 /// Extract a short hint from tool call arguments for progress display.
 fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
     let hint = match name {
@@ -461,7 +570,7 @@ async fn build_context(
     let mut context = String::new();
 
     // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id, None, None).await {
         let relevant: Vec<_> = entries
             .iter()
             .filter(|e| match e.score {
@@ -2222,6 +2331,7 @@ pub(crate) async fn agent_turn(
         dedup_exempt_tools,
         activated_tools,
         model_switch_callback,
+        &crate::config::PacingConfig::default(),
     )
     .await
 }
@@ -2531,6 +2641,7 @@ pub(crate) async fn run_tool_call_loop(
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
+    pacing: &crate::config::PacingConfig,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2539,6 +2650,14 @@ pub(crate) async fn run_tool_call_loop(
     };
 
     let turn_id = Uuid::new_v4().to_string();
+    let loop_started_at = Instant::now();
+    let loop_ignore_tools: HashSet<&str> = pacing
+        .loop_ignore_tools
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let mut consecutive_identical_outputs: usize = 0;
+    let mut last_tool_output_hash: Option<u64> = None;
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -2638,6 +2757,19 @@ pub(crate) async fn run_tool_call_loop(
             hooks.fire_llm_input(history, model).await;
         }
 
+        // Budget enforcement — block if limit exceeded (no-op when not scoped)
+        if let Some(BudgetCheck::Exceeded {
+            current_usd,
+            limit_usd,
+            period,
+        }) = check_tool_loop_budget()
+        {
+            return Err(anyhow::anyhow!(
+                "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
+                current_usd, limit_usd, period
+            ));
+        }
+
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
@@ -2655,13 +2787,43 @@ pub(crate) async fn run_tool_call_loop(
             temperature,
         );
 
-        let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
+        // Wrap the LLM call with an optional per-step timeout from pacing config.
+        // This catches a truly hung model response without terminating the overall
+        // task loop (the per-message budget handles that separately).
+        let chat_result = match pacing.step_timeout_secs {
+            Some(step_secs) if step_secs > 0 => {
+                let step_timeout = Duration::from_secs(step_secs);
+                if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = tokio::time::timeout(step_timeout, chat_future) => {
+                            match result {
+                                Ok(inner) => inner,
+                                Err(_) => anyhow::bail!(
+                                    "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                                ),
+                            }
+                        },
+                    }
+                } else {
+                    match tokio::time::timeout(step_timeout, chat_future).await {
+                        Ok(inner) => inner,
+                        Err(_) => anyhow::bail!(
+                            "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                        ),
+                    }
+                }
             }
-        } else {
-            chat_future.await
+            _ => {
+                if let Some(token) = cancellation_token.as_ref() {
+                    tokio::select! {
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        result = chat_future => result,
+                    }
+                } else {
+                    chat_future.await
+                }
+            }
         };
 
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
@@ -2682,6 +2844,12 @@ pub(crate) async fn run_tool_call_loop(
                         input_tokens: resp_input_tokens,
                         output_tokens: resp_output_tokens,
                     });
+
+                    // Record cost via task-local tracker (no-op when not scoped)
+                    let _ = resp
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
 
                     let response_text = resp.text_or_empty().to_string();
                     // First try native structured tool calls (OpenAI-format).
@@ -3154,13 +3322,66 @@ pub(crate) async fn run_tool_call_loop(
             ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
         }
 
+        // Collect tool results and build per-tool output for loop detection.
+        // Only non-ignored tool outputs contribute to the identical-output hash.
+        let mut detection_relevant_output = String::new();
         for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+            if !loop_ignore_tools.contains(tool_name.as_str()) {
+                detection_relevant_output.push_str(&outcome.output);
+            }
             individual_results.push((tool_call_id, outcome.output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
                 tool_name, outcome.output
             );
+        }
+
+        // ── Time-gated loop detection ──────────────────────────
+        // When pacing.loop_detection_min_elapsed_secs is set, identical-output
+        // loop detection activates after the task has been running that long.
+        // This avoids false-positive aborts on long-running browser/research
+        // workflows while keeping aggressive protection for quick tasks.
+        // When not configured, identical-output detection is disabled (preserving
+        // existing behavior where only max_iterations prevents runaway loops).
+        let loop_detection_active = match pacing.loop_detection_min_elapsed_secs {
+            Some(min_secs) => loop_started_at.elapsed() >= Duration::from_secs(min_secs),
+            None => false, // disabled when not configured (backwards compatible)
+        };
+
+        if loop_detection_active && !detection_relevant_output.is_empty() {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            detection_relevant_output.hash(&mut hasher);
+            let current_hash = hasher.finish();
+
+            if last_tool_output_hash == Some(current_hash) {
+                consecutive_identical_outputs += 1;
+            } else {
+                consecutive_identical_outputs = 0;
+                last_tool_output_hash = Some(current_hash);
+            }
+
+            // Bail if we see 3+ consecutive identical tool outputs (clear runaway).
+            if consecutive_identical_outputs >= 3 {
+                runtime_trace::record_event(
+                    "tool_loop_identical_output_abort",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("identical tool output detected 3 consecutive times"),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "consecutive_identical": consecutive_identical_outputs,
+                    }),
+                );
+                anyhow::bail!(
+                    "Agent loop aborted: identical tool output detected {} consecutive times",
+                    consecutive_identical_outputs
+                );
+            }
         }
 
         // Add assistant message with tool calls + tool results to history.
@@ -3712,6 +3933,7 @@ pub async fn run(
                 &config.agent.tool_call_dedup_exempt,
                 activated_handle.as_ref(),
                 Some(model_switch_callback.clone()),
+                &config.pacing,
             )
             .await
             {
@@ -3939,6 +4161,7 @@ pub async fn run(
                     &config.agent.tool_call_dedup_exempt,
                     activated_handle.as_ref(),
                     Some(model_switch_callback.clone()),
+                    &config.pacing,
                 )
                 .await
                 {
@@ -4836,6 +5059,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -4886,6 +5110,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect_err("oversized payload must fail");
@@ -4930,6 +5155,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5060,6 +5286,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("parallel execution should complete");
@@ -5130,6 +5357,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -5192,6 +5420,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -5249,6 +5478,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -5318,6 +5548,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -5378,6 +5609,7 @@ mod tests {
             &exempt,
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -5458,6 +5690,7 @@ mod tests {
             &exempt,
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("loop should complete");
@@ -5515,6 +5748,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("native fallback id flow should complete");
@@ -5596,6 +5830,7 @@ mod tests {
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -6391,7 +6626,7 @@ Tail"#;
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5, None).await.unwrap();
+        let recalled = mem.recall("45", 5, None, None, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 
@@ -7581,6 +7816,7 @@ Let me check the result."#;
             &[],
             None,
             None,
+            &crate::config::PacingConfig::default(),
         )
         .await
         .expect("tool loop should complete");
@@ -7657,5 +7893,216 @@ Let me check the result."#;
         let allowed: Vec<String> = vec![];
         let result = filter_by_allowed_tools(specs, Some(&allowed));
         assert!(result.is_empty());
+    }
+
+    // ── Cost tracking tests ──
+
+    #[tokio::test]
+    async fn cost_tracking_records_usage_when_scoped() {
+        use super::{
+            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+        };
+        use crate::config::schema::ModelPricing;
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut cost_config = crate::config::CostConfig {
+            enabled: true,
+            ..crate::config::CostConfig::default()
+        };
+        cost_config.prices = HashMap::from([(
+            "mock-model".to_string(),
+            ModelPricing {
+                input: 3.0,
+                output: 15.0,
+            },
+        )]);
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(cost_config.prices.clone()),
+        );
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &[],
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "test",
+                    None,
+                    &crate::config::MultimodalConfig::default(),
+                    2,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    &crate::config::PacingConfig::default(),
+                ),
+            )
+            .await
+            .expect("tool loop should succeed");
+
+        assert_eq!(result, "done");
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_200);
+        assert!(summary.session_cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn cost_tracking_enforces_budget() {
+        use super::{
+            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+        };
+        use crate::config::schema::ModelPricing;
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+
+        let provider = ScriptedProvider::from_text_responses(vec!["should not reach this"]);
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = crate::config::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.001, // very low limit
+            ..crate::config::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        // Record a usage that already exceeds the limit
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "mock-model",
+                100_000,
+                50_000,
+                1.0,
+                1.0,
+            ))
+            .unwrap();
+
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "mock-model".to_string(),
+                ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                },
+            )])),
+        );
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let err = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &[],
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "test",
+                    None,
+                    &crate::config::MultimodalConfig::default(),
+                    2,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                    &crate::config::PacingConfig::default(),
+                ),
+            )
+            .await
+            .expect_err("should fail with budget exceeded");
+
+        assert!(
+            err.to_string().contains("Budget exceeded"),
+            "error should mention budget: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_tracking_is_noop_without_scope() {
+        use super::run_tool_call_loop;
+        use crate::observability::noop::NoopObserver;
+
+        // No TOOL_LOOP_COST_TRACKING_CONTEXT scoped — should run fine
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &[],
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("should succeed without cost scope");
+
+        assert_eq!(result, "ok");
     }
 }

@@ -1,5 +1,6 @@
 import type { SSEEvent } from '../types/api';
 import { getToken } from './auth';
+import { basePath } from './basePath';
 
 export type SSEEventHandler = (event: SSEEvent) => void;
 export type SSEErrorHandler = (error: Event | Error) => void;
@@ -41,7 +42,7 @@ export class SSEClient {
   private readonly autoReconnect: boolean;
 
   constructor(options: SSEClientOptions = {}) {
-    this.path = options.path ?? '/api/events';
+    this.path = options.path ?? `${basePath}/api/events`;
     this.reconnectDelay = options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY;
     this.maxReconnectDelay = options.maxReconnectDelay ?? MAX_RECONNECT_DELAY;
     this.autoReconnect = options.autoReconnect ?? true;

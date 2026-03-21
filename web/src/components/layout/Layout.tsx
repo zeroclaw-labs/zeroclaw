@@ -7,7 +7,7 @@ export default function Layout() {
   const { pathname } = useLocation();
 
   return (
-    <div className="h-screen flex overflow-hidden text-white" style={{ background: 'linear-gradient(135deg, #050510 0%, #080818 50%, #050510 100%)' }}>
+    <div className="min-h-screen text-white" style={{ background: 'var(--pc-bg-base)' }}>
       {/* Fixed sidebar */}
       <Sidebar />
 

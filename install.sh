@@ -568,6 +568,13 @@ then re-run bootstrap.
 MSG
         exit 0
       fi
+      # Detect un-accepted Xcode/CLT license (causes `cc` to exit 69).
+      if ! /usr/bin/xcrun --show-sdk-path >/dev/null 2>&1; then
+        warn "Xcode license has not been accepted. Run:"
+        warn "  sudo xcodebuild -license accept"
+        warn "then re-run this installer."
+        exit 1
+      fi
       if ! have_cmd git; then
         warn "git is not available. Install git (e.g., Homebrew) and re-run bootstrap."
       fi

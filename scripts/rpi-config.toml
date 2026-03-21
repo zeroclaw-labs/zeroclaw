@@ -1,0 +1,631 @@
+# ZeroClaw — Raspberry Pi production configuration
+#
+# Copy this to ~/.zeroclaw/config.toml on the Pi.
+# deploy-rpi.sh does this automatically.
+#
+# API key is loaded from ~/.zeroclaw/.env (EnvironmentFile in systemd).
+# Set it there as: ANTHROPIC_API_KEY=your-key-here
+# Or set api_key directly below (not recommended for version control).
+
+# api_key = ""
+default_provider = "anthropic-custom:https://api.z.ai/api/anthropic"
+default_model = "claude-3-5-sonnet-20241022"
+default_temperature = 0.4
+model_routes = []
+embedding_routes = []
+
+[model_providers]
+
+[provider]
+
+[observability]
+backend = "none"
+runtime_trace_mode = "none"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 200
+
+[autonomy]
+level = "full"
+workspace_only = false
+allowed_commands = [
+    "git",
+    "npm",
+    "cargo",
+    "mkdir",
+    "touch",
+    "cp",
+    "mv",
+    "ls",
+    "cat",
+    "grep",
+    "find",
+    "echo",
+    "pwd",
+    "wc",
+    "head",
+    "tail",
+    "date",
+]
+command_context_rules = []
+forbidden_paths = [
+    "/etc",
+    "/root",
+    "/home",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/opt",
+    "/boot",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/var",
+    "/tmp",
+    "/mnt",
+    "~/.ssh",
+    "~/.gnupg",
+    "~/.aws",
+    "~/.config",
+]
+max_actions_per_hour = 100
+max_cost_per_day_cents = 1000
+require_approval_for_medium_risk = true
+block_high_risk_commands = true
+shell_env_passthrough = []
+allow_sensitive_file_reads = false
+allow_sensitive_file_writes = false
+auto_approve = [
+    "file_read",
+    "memory_recall",
+]
+always_ask = []
+allowed_roots = []
+non_cli_excluded_tools = [
+    "shell",
+    "process",
+    "file_write",
+    "file_edit",
+    "git_operations",
+    "browser",
+    "browser_open",
+    "http_request",
+    "schedule",
+    "cron_add",
+    "cron_remove",
+    "cron_update",
+    "cron_run",
+    "memory_store",
+    "memory_forget",
+    "proxy_config",
+    "web_search_config",
+    "web_access_config",
+    "model_routing_config",
+    "channel_ack_config",
+    "pushover",
+    "composio",
+    "delegate",
+    "screenshot",
+    "image_info",
+]
+non_cli_approval_approvers = []
+non_cli_natural_language_approval_mode = "direct"
+
+[autonomy.non_cli_natural_language_approval_mode_by_channel]
+
+[security]
+roles = []
+
+[security.sandbox]
+backend = "auto"
+firejail_args = []
+
+[security.resources]
+max_memory_mb = 512
+max_cpu_time_seconds = 60
+max_subprocesses = 10
+memory_monitoring = true
+
+[security.audit]
+enabled = true
+log_path = "audit.log"
+max_size_mb = 100
+sign_events = false
+
+[security.otp]
+enabled = true
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 300
+gated_actions = [
+    "shell",
+    "file_write",
+    "browser_open",
+    "browser",
+    "memory_forget",
+]
+gated_domains = []
+gated_domain_categories = []
+challenge_delivery = "dm"
+challenge_timeout_secs = 120
+challenge_max_attempts = 3
+
+[security.estop]
+enabled = false
+state_file = "~/.zeroclaw/estop-state.json"
+require_otp_to_resume = true
+
+[security.syscall_anomaly]
+enabled = true
+strict_mode = false
+alert_on_unknown_syscall = true
+max_denied_events_per_minute = 5
+max_total_events_per_minute = 120
+max_alerts_per_minute = 30
+alert_cooldown_secs = 20
+log_path = "syscall-anomalies.log"
+baseline_syscalls = [
+    "read",
+    "write",
+    "open",
+    "openat",
+    "close",
+    "stat",
+    "fstat",
+    "newfstatat",
+    "lseek",
+    "mmap",
+    "mprotect",
+    "munmap",
+    "brk",
+    "rt_sigaction",
+    "rt_sigprocmask",
+    "ioctl",
+    "fcntl",
+    "access",
+    "pipe2",
+    "dup",
+    "dup2",
+    "dup3",
+    "epoll_create1",
+    "epoll_ctl",
+    "epoll_wait",
+    "poll",
+    "ppoll",
+    "select",
+    "futex",
+    "clock_gettime",
+    "nanosleep",
+    "getpid",
+    "gettid",
+    "set_tid_address",
+    "set_robust_list",
+    "clone",
+    "clone3",
+    "fork",
+    "execve",
+    "wait4",
+    "exit",
+    "exit_group",
+    "socket",
+    "connect",
+    "accept",
+    "accept4",
+    "listen",
+    "sendto",
+    "recvfrom",
+    "sendmsg",
+    "recvmsg",
+    "getsockname",
+    "getpeername",
+    "setsockopt",
+    "getsockopt",
+    "getrandom",
+    "statx",
+]
+
+[security.perplexity_filter]
+enable_perplexity_filter = false
+perplexity_threshold = 18.0
+suffix_window_chars = 64
+min_prompt_chars = 32
+symbol_ratio_threshold = 0.2
+
+[security.outbound_leak_guard]
+enabled = true
+action = "redact"
+sensitivity = 0.7
+
+[security.url_access]
+block_private_ip = true
+allow_cidrs = []
+allow_domains = []
+allow_loopback = false
+require_first_visit_approval = false
+enforce_domain_allowlist = false
+domain_allowlist = []
+domain_blocklist = []
+approved_domains = []
+
+[runtime]
+kind = "native"
+
+[runtime.docker]
+image = "alpine:3.20"
+network = "none"
+memory_limit_mb = 512
+cpu_limit = 1.0
+read_only_rootfs = true
+mount_workspace = true
+allowed_workspace_roots = []
+
+[runtime.wasm]
+tools_dir = "tools/wasm"
+fuel_limit = 1000000
+memory_limit_mb = 64
+max_module_size_mb = 50
+allow_workspace_read = false
+allow_workspace_write = false
+allowed_hosts = []
+
+[runtime.wasm.security]
+require_workspace_relative_tools_dir = true
+reject_symlink_modules = true
+reject_symlink_tools_dir = true
+strict_host_validation = true
+capability_escalation_mode = "deny"
+module_hash_policy = "warn"
+
+[runtime.wasm.security.module_sha256]
+
+[research]
+enabled = false
+trigger = "never"
+keywords = [
+    "find",
+    "search",
+    "check",
+    "investigate",
+    "look",
+    "research",
+    "найди",
+    "проверь",
+    "исследуй",
+    "поищи",
+]
+min_message_length = 50
+max_iterations = 5
+show_progress = true
+system_prompt_prefix = ""
+
+[reliability]
+provider_retries = 2
+provider_backoff_ms = 500
+fallback_providers = []
+api_keys = []
+channel_initial_backoff_secs = 2
+channel_max_backoff_secs = 60
+scheduler_poll_secs = 15
+scheduler_retries = 2
+
+[reliability.model_fallbacks]
+
+[scheduler]
+enabled = true
+max_tasks = 64
+max_concurrent = 4
+
+[agent]
+compact_context = true
+max_tool_iterations = 20
+max_history_messages = 50
+parallel_tools = false
+tool_dispatcher = "auto"
+loop_detection_no_progress_threshold = 3
+loop_detection_ping_pong_cycles = 2
+loop_detection_failure_streak = 3
+safety_heartbeat_interval = 5
+safety_heartbeat_turn_interval = 10
+
+[agent.session]
+backend = "none"
+strategy = "per-sender"
+ttl_seconds = 3600
+max_messages = 50
+
+[agent.teams]
+enabled = true
+auto_activate = true
+max_agents = 32
+strategy = "adaptive"
+load_window_secs = 120
+inflight_penalty = 8
+recent_selection_penalty = 2
+recent_failure_penalty = 12
+
+[agent.subagents]
+enabled = true
+auto_activate = true
+max_concurrent = 10
+strategy = "adaptive"
+load_window_secs = 180
+inflight_penalty = 10
+recent_selection_penalty = 3
+recent_failure_penalty = 16
+queue_wait_ms = 15000
+queue_poll_ms = 200
+
+[skills]
+open_skills_enabled = false
+trusted_skill_roots = []
+allow_scripts = false
+prompt_injection_mode = "full"
+
+[query_classification]
+enabled = false
+rules = []
+
+[heartbeat]
+enabled = false
+interval_minutes = 30
+
+[cron]
+enabled = true
+max_run_history = 50
+
+[goal_loop]
+enabled = false
+interval_minutes = 10
+step_timeout_secs = 120
+max_steps_per_cycle = 3
+
+[channels_config]
+cli = true
+message_timeout_secs = 300
+
+[channels_config.webhook]
+port = 8080
+secret = "mytoken123"
+
+[channels_config.ack_reaction]
+
+[memory]
+backend = "sqlite"
+auto_save = true
+hygiene_enabled = true
+archive_after_days = 7
+purge_after_days = 30
+conversation_retention_days = 30
+embedding_provider = "none"
+embedding_model = "text-embedding-3-small"
+embedding_dimensions = 1536
+vector_weight = 0.7
+keyword_weight = 0.3
+min_relevance_score = 0.4
+embedding_cache_size = 10000
+chunk_max_tokens = 512
+response_cache_enabled = false
+response_cache_ttl_minutes = 60
+response_cache_max_entries = 5000
+snapshot_enabled = false
+snapshot_on_hygiene = false
+auto_hydrate = true
+sqlite_journal_mode = "wal"
+
+[memory.qdrant]
+collection = "zeroclaw_memories"
+
+[storage.provider.config]
+provider = ""
+schema = "public"
+table = "memories"
+tls = false
+
+[tunnel]
+provider = "none"
+
+[gateway]
+port = 8080
+host = "0.0.0.0"
+require_pairing = false
+trusted_ips = ["0.0.0.0/0"]
+allow_public_bind = true
+paired_tokens = []
+pair_rate_limit_per_minute = 10
+webhook_rate_limit_per_minute = 60
+trust_forwarded_headers = false
+rate_limit_max_keys = 10000
+idempotency_ttl_secs = 300
+idempotency_max_keys = 10000
+webhook_secret = "mytoken123"
+
+[gateway.node_control]
+enabled = false
+allowed_node_ids = []
+
+[composio]
+enabled = false
+entity_id = "default"
+
+[secrets]
+encrypt = true
+
+[browser]
+enabled = false
+allowed_domains = []
+browser_open = "default"
+backend = "agent_browser"
+auto_backend_priority = []
+agent_browser_command = "agent-browser"
+agent_browser_extra_args = []
+agent_browser_timeout_ms = 30000
+native_headless = true
+native_webdriver_url = "http://127.0.0.1:9515"
+
+[browser.computer_use]
+endpoint = "http://127.0.0.1:8787/v1/actions"
+timeout_ms = 15000
+allow_remote_endpoint = false
+window_allowlist = []
+
+[http_request]
+enabled = false
+allowed_domains = []
+max_response_size = 1000000
+timeout_secs = 30
+user_agent = "ZeroClaw/1.0"
+
+[http_request.credential_profiles]
+
+[multimodal]
+max_images = 4
+max_image_size_mb = 5
+allow_remote_fetch = false
+
+[web_fetch]
+enabled = false
+provider = "fast_html2md"
+allowed_domains = ["*"]
+blocked_domains = []
+max_response_size = 500000
+timeout_secs = 30
+user_agent = "ZeroClaw/1.0"
+
+[web_search]
+enabled = false
+provider = "duckduckgo"
+fallback_providers = []
+retries_per_provider = 0
+retry_backoff_ms = 250
+domain_filter = []
+language_filter = []
+exa_search_type = "auto"
+exa_include_text = false
+jina_site_filters = []
+max_results = 5
+timeout_secs = 15
+user_agent = "ZeroClaw/1.0"
+
+[proxy]
+enabled = false
+no_proxy = []
+scope = "zeroclaw"
+services = []
+
+[identity]
+format = "openclaw"
+extra_files = []
+
+[cost]
+enabled = false
+daily_limit_usd = 10.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+allow_override = false
+
+[cost.prices."anthropic/claude-opus-4-20250514"]
+input = 15.0
+output = 75.0
+
+[cost.prices."openai/gpt-4o"]
+input = 5.0
+output = 15.0
+
+[cost.prices."openai/gpt-4o-mini"]
+input = 0.15
+output = 0.6
+
+[cost.prices."anthropic/claude-sonnet-4-20250514"]
+input = 3.0
+output = 15.0
+
+[cost.prices."openai/o1-preview"]
+input = 15.0
+output = 60.0
+
+[cost.prices."anthropic/claude-3-haiku"]
+input = 0.25
+output = 1.25
+
+[cost.prices."google/gemini-2.0-flash"]
+input = 0.1
+output = 0.4
+
+[cost.prices."anthropic/claude-3.5-sonnet"]
+input = 3.0
+output = 15.0
+
+[cost.prices."google/gemini-1.5-pro"]
+input = 1.25
+output = 5.0
+
+[cost.enforcement]
+mode = "warn"
+route_down_model = "hint:fast"
+reserve_percent = 10
+
+[economic]
+enabled = false
+initial_balance = 1000.0
+min_evaluation_threshold = 0.6
+
+[economic.token_pricing]
+input_price_per_million = 3.0
+output_price_per_million = 15.0
+
+[peripherals]
+enabled = true
+boards = []
+
+[agents]
+
+[coordination]
+enabled = true
+lead_agent = "delegate-lead"
+max_inbox_messages_per_agent = 256
+max_dead_letters = 256
+max_context_entries = 512
+max_seen_message_ids = 4096
+
+[hooks]
+enabled = true
+
+[hooks.builtin]
+boot_script = false
+command_logger = false
+session_memory = false
+
+[plugins]
+enabled = true
+allow = []
+deny = []
+load_paths = []
+
+[plugins.entries]
+
+[hardware]
+enabled = true
+transport = "None"
+baud_rate = 115200
+workspace_datasheets = false
+
+[transcription]
+enabled = false
+api_url = "https://api.groq.com/openai/v1/audio/transcriptions"
+model = "whisper-large-v3-turbo"
+max_duration_secs = 120
+
+[agents_ipc]
+enabled = false
+db_path = "~/.zeroclaw/agents.db"
+staleness_secs = 300
+
+[mcp]
+enabled = false
+servers = []
+
+[wasm]
+enabled = true
+memory_limit_mb = 64
+fuel_limit = 1000000000
+registry_url = "https://zeromarket.vercel.app/api"

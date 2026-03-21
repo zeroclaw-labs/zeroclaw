@@ -285,6 +285,8 @@ pub struct QQChannel {
     upload_cache: Arc<RwLock<HashMap<String, UploadCacheEntry>>>,
     /// Passive reply tracker for QQ API rate limiting.
     reply_tracker: Arc<RwLock<HashMap<String, ReplyRecord>>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 impl QQChannel {
@@ -298,6 +300,7 @@ impl QQChannel {
             workspace_dir: None,
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
             reply_tracker: Arc::new(RwLock::new(HashMap::new())),
+            proxy_url: None,
         }
     }
 
@@ -307,8 +310,14 @@ impl QQChannel {
         self
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.qq")
+        crate::config::build_channel_proxy_client("channel.qq", self.proxy_url.as_deref())
     }
 
     fn is_user_allowed(&self, user_id: &str) -> bool {
