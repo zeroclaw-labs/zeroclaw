@@ -835,8 +835,10 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     normalized
 }
 
-fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord")
+fn supports_runtime_model_switch(_channel_name: &str) -> bool {
+    // Model/provider switching is now supported on all channels.
+    // Users can use /models, /model commands or natural language requests.
+    true
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -993,7 +995,307 @@ fn parse_natural_language_runtime_command(content: &str) -> Option<ChannelRuntim
         return Some(ChannelRuntimeCommand::RequestToolApproval(tool));
     }
 
+    // ── Natural language model/provider switching ──
+    // English: "switch to openai", "use claude", "change model to gpt-4.1"
+    // Korean: "모델 변경해줘", "openai로 변경", "claude로 바꿔줘", "모델 목록", "사용 가능한 모델"
+    if let Some(provider) = parse_natural_language_switch_provider(&lower, trimmed) {
+        return Some(ChannelRuntimeCommand::SetProvider(provider));
+    }
+    if let Some(model) = parse_natural_language_switch_model(&lower, trimmed) {
+        return Some(ChannelRuntimeCommand::SetModel(model));
+    }
+    if is_natural_language_show_models_intent(&lower, trimmed) {
+        return Some(ChannelRuntimeCommand::ShowProviders);
+    }
+    if is_natural_language_show_current_model_intent(&lower, trimmed) {
+        return Some(ChannelRuntimeCommand::ShowModel);
+    }
+
     None
+}
+
+/// Parse natural language intent to switch provider.
+/// Supported: EN, KO, ZH, JA, FR, DE, IT, ES, PT, RU, VI, HI
+fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option<String> {
+    // English patterns
+    for prefix in &[
+        "switch to ",
+        "switch provider to ",
+        "use provider ",
+        "change provider to ",
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let token = rest.trim().split_whitespace().next()?;
+            if is_runtime_token(token) {
+                return resolve_provider_alias(token).or_else(|| Some(token.to_string()));
+            }
+        }
+    }
+
+    // "use <provider>" — only if it matches a known provider alias
+    if let Some(rest) = lower.strip_prefix("use ") {
+        let token = rest.trim().split_whitespace().next()?;
+        if resolve_provider_alias(token).is_some() {
+            return resolve_provider_alias(token);
+        }
+    }
+
+    // Multi-language: "<prefix> <provider>" patterns (lowercase match)
+    for prefix in &[
+        // French
+        "passer à ",
+        "utiliser ",
+        "changer pour ",
+        // German
+        "wechsle zu ",
+        "wechseln zu ",
+        "verwende ",
+        // Italian
+        "passa a ",
+        "usa ",
+        "cambia a ",
+        // Spanish
+        "cambiar a ",
+        "usar ",
+        // Portuguese
+        "mudar para ",
+        "trocar para ",
+        // Russian (lowercase)
+        "переключить на ",
+        "переключиться на ",
+        "использовать ",
+        // Vietnamese
+        "chuyển sang ",
+        "dùng ",
+        "sử dụng ",
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let token = rest.trim().split_whitespace().next()?;
+            if is_runtime_token(token) {
+                return resolve_provider_alias(token).or_else(|| Some(token.to_string()));
+            }
+        }
+    }
+
+    // Multi-language: "<prefix> <provider>" patterns (original/Unicode match)
+    for prefix in &[
+        // Chinese
+        "切换到",
+        "换成",
+        "使用",
+        // Japanese
+        "に切り替え",
+        // Hindi
+        "प्रदाता बदलें ",
+    ] {
+        if let Some(rest) = original.strip_prefix(prefix) {
+            let token = rest.trim().split_whitespace().next()?;
+            let token_lower = token.to_ascii_lowercase();
+            if is_runtime_token(&token_lower) {
+                return resolve_provider_alias(&token_lower)
+                    .or_else(|| Some(token_lower));
+            }
+        }
+    }
+
+    // Suffix-based patterns: "<provider><suffix>"
+    // Korean: "로 변경", "로 바꿔" etc.
+    // Japanese: "に変更", "に切替"
+    // Chinese: "切换", (handled above as prefix)
+    for suffix in &[
+        // Korean
+        "로 변경", "로 바꿔줘", "로 바꿔", "로 전환",
+        "으로 변경", "으로 바꿔줘", "으로 바꿔", "으로 전환",
+        // Japanese
+        "に変更", "に切り替えて", "に切替", "を使って",
+        // Hindi
+        " पर स्विच करें", " में बदलें",
+    ] {
+        if let Some(rest) = original.strip_suffix(suffix) {
+            let token = rest.trim().split_whitespace().last()?;
+            let token_lower = token.to_ascii_lowercase();
+            if resolve_provider_alias(&token_lower).is_some() {
+                return resolve_provider_alias(&token_lower);
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse natural language intent to switch model.
+/// Supported: EN, KO, ZH, JA, FR, DE, IT, ES, PT, RU, VI, HI
+fn parse_natural_language_switch_model(lower: &str, original: &str) -> Option<String> {
+    // Multi-language prefix patterns (lowercase)
+    for prefix in &[
+        // English
+        "change model to ",
+        "switch model to ",
+        "set model to ",
+        "use model ",
+        // French
+        "changer le modèle en ",
+        "utiliser le modèle ",
+        // German
+        "modell wechseln zu ",
+        "modell ändern zu ",
+        // Italian
+        "cambia modello a ",
+        "usa modello ",
+        // Spanish
+        "cambiar modelo a ",
+        "usar modelo ",
+        // Portuguese
+        "mudar modelo para ",
+        "trocar modelo para ",
+        // Russian
+        "сменить модель на ",
+        "изменить модель на ",
+        "использовать модель ",
+        // Vietnamese
+        "đổi model sang ",
+        "chuyển model sang ",
+        "dùng model ",
+    ] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            let token = rest.trim().split_whitespace().next()?;
+            if is_runtime_token(token) {
+                return Some(token.to_string());
+            }
+        }
+    }
+
+    // Multi-language prefix patterns (original/Unicode)
+    for prefix in &[
+        // Korean
+        "모델을 ", "모델 ",
+        // Chinese
+        "模型切换到", "模型换成", "切换模型到", "换模型为",
+        // Japanese
+        "モデルを", "モデル変更 ",
+        // Hindi
+        "मॉडल बदलें ",
+    ] {
+        if let Some(rest) = original.strip_prefix(prefix) {
+            // Try suffix-based extraction first (Korean/Japanese)
+            for suffix in &[
+                "로 변경해줘", "로 변경", "로 바꿔줘", "로 바꿔", "로 전환",
+                "に変更", "に切り替え", "に変更して",
+            ] {
+                if let Some(model_part) = rest.strip_suffix(suffix) {
+                    let token = model_part.trim();
+                    if is_runtime_token(token) {
+                        return Some(token.to_ascii_lowercase());
+                    }
+                }
+            }
+            // Fallback: first token
+            let token = rest.trim().split_whitespace().next()?;
+            let token_lower = token.to_ascii_lowercase();
+            if is_runtime_token(&token_lower) {
+                return Some(token_lower);
+            }
+        }
+    }
+
+    None
+}
+
+/// Check if the user wants to see available models/providers.
+/// Supported: EN, KO, ZH, JA, FR, DE, IT, ES, PT, RU, VI, HI
+fn is_natural_language_show_models_intent(lower: &str, original: &str) -> bool {
+    matches!(
+        lower,
+        // English
+        "show models"
+            | "list models"
+            | "available models"
+            | "show providers"
+            | "list providers"
+            | "available providers"
+            | "what models are available"
+            | "which models can i use"
+            // French
+            | "modèles disponibles"
+            | "liste des modèles"
+            | "afficher les modèles"
+            // German
+            | "verfügbare modelle"
+            | "modelle anzeigen"
+            | "modelle auflisten"
+            // Italian
+            | "modelli disponibili"
+            | "mostra modelli"
+            // Spanish
+            | "modelos disponibles"
+            | "mostrar modelos"
+            | "listar modelos"
+            // Portuguese (mostrar/listar modelos same as Spanish — already covered)
+            | "modelos disponíveis"
+            // Russian
+            | "доступные модели"
+            | "показать модели"
+            | "список моделей"
+            // Vietnamese
+            | "danh sách model"
+            | "model nào có thể dùng"
+            | "các model có sẵn"
+    ) || matches!(
+        original,
+        // Korean
+        "모델 목록" | "사용 가능한 모델" | "모델 보여줘" | "어떤 모델 쓸 수 있어"
+        // Chinese
+        | "模型列表" | "可用模型" | "显示模型" | "有哪些模型"
+        // Japanese
+        | "モデル一覧" | "利用可能なモデル" | "モデルを表示"
+        // Hindi
+        | "उपलब्ध मॉडल" | "मॉडल दिखाएं" | "मॉडल सूची"
+    )
+}
+
+/// Check if the user wants to see the current model.
+/// Supported: EN, KO, ZH, JA, FR, DE, IT, ES, PT, RU, VI, HI
+fn is_natural_language_show_current_model_intent(lower: &str, original: &str) -> bool {
+    matches!(
+        lower,
+        // English
+        "current model"
+            | "what model"
+            | "which model"
+            | "what model am i using"
+            | "show current model"
+            // French
+            | "modèle actuel"
+            | "quel modèle"
+            // German
+            | "aktuelles modell"
+            | "welches modell"
+            // Italian
+            | "modello attuale"
+            | "quale modello"
+            // Spanish
+            | "modelo actual"
+            | "qué modelo"
+            // Portuguese
+            | "modelo atual"
+            | "qual modelo"
+            // Russian
+            | "текущая модель"
+            | "какая модель"
+            // Vietnamese
+            | "model hiện tại"
+            | "đang dùng model gì"
+    ) || matches!(
+        original,
+        // Korean
+        "지금 모델" | "현재 모델" | "어떤 모델 사용중" | "무슨 모델"
+        // Chinese
+        | "当前模型" | "正在用什么模型" | "现在的模型"
+        // Japanese
+        | "現在のモデル" | "今のモデル" | "どのモデル"
+        // Hindi
+        | "वर्तमान मॉडल" | "कौन सा मॉडल"
+    )
 }
 
 fn is_approval_management_command(command: &ChannelRuntimeCommand) -> bool {
@@ -2070,17 +2372,34 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     );
     response.push_str("Available providers:\n");
     for provider in providers::list_providers() {
+        let has_key = providers::has_provider_credential(provider.name, None);
+        let key_badge = if has_key { " [API Key OK]" } else { "" };
+        let active = if provider.name == current.provider {
+            " (active)"
+        } else {
+            ""
+        };
         if provider.aliases.is_empty() {
-            let _ = writeln!(response, "- {}", provider.name);
+            let _ = writeln!(
+                response,
+                "- {}{active}{key_badge}",
+                provider.display_name
+            );
         } else {
             let _ = writeln!(
                 response,
-                "- {} (aliases: {})",
-                provider.name,
+                "- {} (aliases: {}){active}{key_badge}",
+                provider.display_name,
                 provider.aliases.join(", ")
             );
         }
     }
+    response.push_str("\nNatural language model switching (12 languages):\n");
+    response.push_str("- EN: \"switch to openai\" / \"use model gpt-4.1\"\n");
+    response.push_str("- KO: \"openai로 변경\" / \"모델 목록\"\n");
+    response.push_str("- ZH: \"切换到openai\" / \"模型列表\"\n");
+    response.push_str("- JA: \"openaiに変更\" / \"モデル一覧\"\n");
+    response.push_str("- FR/DE/ES/PT/IT/RU/VI/HI also supported.\n");
     response
 }
 
