@@ -436,6 +436,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
+    let canvas_store = tools::CanvasStore::new();
+
     let (mut tools_registry_raw, delegate_handle_gw) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -450,6 +452,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
+        Some(canvas_store.clone()),
     );
 
     // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
@@ -814,7 +817,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
-        canvas_store: CanvasStore::new(),
+        canvas_store,
     };
 
     // Config PUT needs larger body limit (1MB)
