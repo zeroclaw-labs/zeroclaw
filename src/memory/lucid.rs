@@ -329,11 +329,11 @@ impl Memory for LucidMemory {
         until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
         let since_dt = since
-            .map(|s| chrono::DateTime::parse_from_rfc3339(s))
+            .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()
             .map_err(|e| anyhow::anyhow!("invalid 'since' date (expected RFC 3339): {e}"))?;
         let until_dt = until
-            .map(|u| chrono::DateTime::parse_from_rfc3339(u))
+            .map(chrono::DateTime::parse_from_rfc3339)
             .transpose()
             .map_err(|e| anyhow::anyhow!("invalid 'until' date (expected RFC 3339): {e}"))?;
         if let (Some(s), Some(u)) = (&since_dt, &until_dt) {
