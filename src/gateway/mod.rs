@@ -365,7 +365,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         anyhow::bail!(
             "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
              Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
-             [gateway] allow_public_bind = true in config.toml (NOT recommended)."
+             [gateway] allow_public_bind = true in config.toml (NOT recommended).\n\n\
+             Docker: if you need to reach the gateway from a Docker container, set\n\
+             [gateway] host = \"0.0.0.0\" and allow_public_bind = true in config.toml,\n\
+             then connect from the container via ws://host.docker.internal:{port}."
         );
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
