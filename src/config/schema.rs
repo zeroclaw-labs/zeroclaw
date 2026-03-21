@@ -1210,11 +1210,6 @@ pub struct AgentConfig {
     #[serde(default = "default_sticker_dir")]
     pub sticker_dir: String,
 
-    /// ComfyUI MCP server name used for generating sticker images.
-    /// Default: `"comfyui"`.
-    #[serde(default = "default_comfyui_server")]
-    pub emotion_comfyui_server: String,
-
     /// Base style prompt appended to all sticker generation requests.
     /// Default: `"chibi character, white background, simple, expressive, sticker style"`.
     #[serde(default = "default_sticker_style")]
@@ -1228,6 +1223,11 @@ pub struct AgentConfig {
     /// Default: `""` (uses `image_generation.default_backend`).
     #[serde(default)]
     pub emotion_image_backend: String,
+
+    /// Timeout in seconds for the emotion classification LLM call.
+    /// Default: `60`.
+    #[serde(default = "default_emotion_classification_timeout")]
+    pub emotion_classification_timeout_secs: u64,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1250,12 +1250,12 @@ fn default_sticker_dir() -> String {
     "stickers".into()
 }
 
-fn default_comfyui_server() -> String {
-    "comfyui".into()
-}
-
 fn default_sticker_style() -> String {
     "chibi character, white background, simple, expressive, sticker style".into()
+}
+
+fn default_emotion_classification_timeout() -> u64 {
+    60
 }
 
 impl Default for AgentConfig {
@@ -1273,10 +1273,10 @@ impl Default for AgentConfig {
             emotion_model: None,
             emotion_provider: None,
             sticker_dir: default_sticker_dir(),
-            emotion_comfyui_server: default_comfyui_server(),
             sticker_style: default_sticker_style(),
             sticker_negative_prompt: String::new(),
             emotion_image_backend: String::new(),
+            emotion_classification_timeout_secs: default_emotion_classification_timeout(),
         }
     }
 }

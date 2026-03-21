@@ -4762,7 +4762,6 @@ pub struct EmotionStickerConfig {
     pub emotion_provider: Option<String>,
     pub emotion_model: Option<String>,
     pub sticker_dir: String,
-    pub emotion_comfyui_server: String,
     pub sticker_style: String,
     /// Negative prompt for SD generation.
     pub sticker_negative_prompt: String,
@@ -4778,6 +4777,8 @@ pub struct EmotionStickerConfig {
     pub default_provider: Option<String>,
     /// Fallback API key for provider creation.
     pub api_key: Option<String>,
+    /// Timeout in seconds for the emotion classification LLM call.
+    pub classification_timeout_secs: u64,
 }
 
 impl Default for EmotionStickerConfig {
@@ -4787,7 +4788,6 @@ impl Default for EmotionStickerConfig {
             emotion_provider: None,
             emotion_model: None,
             sticker_dir: "stickers".into(),
-            emotion_comfyui_server: "comfyui".into(),
             sticker_style: "chibi character, white background, simple, expressive, sticker style"
                 .into(),
             sticker_negative_prompt: String::new(),
@@ -4796,6 +4796,7 @@ impl Default for EmotionStickerConfig {
             image_generation_default_backend: "comfyui".into(),
             default_provider: None,
             api_key: None,
+            classification_timeout_secs: 60,
         }
     }
 }
@@ -4813,7 +4814,6 @@ impl EmotionStickerConfig {
             emotion_provider: agent.emotion_provider.clone(),
             emotion_model: agent.emotion_model.clone(),
             sticker_dir: agent.sticker_dir.clone(),
-            emotion_comfyui_server: agent.emotion_comfyui_server.clone(),
             sticker_style: agent.sticker_style.clone(),
             sticker_negative_prompt: agent.sticker_negative_prompt.clone(),
             identity_prompt,
@@ -4821,6 +4821,7 @@ impl EmotionStickerConfig {
             image_generation_default_backend: config.image_generation.default_backend.clone(),
             default_provider: config.default_provider.clone(),
             api_key: config.api_key.clone(),
+            classification_timeout_secs: agent.emotion_classification_timeout_secs,
         }
     }
 
@@ -4955,7 +4956,7 @@ pub async fn append_emotion_sticker(
     ];
 
     let emotion = match tokio::time::timeout(
-        Duration::from_secs(30),
+        Duration::from_secs(cfg.classification_timeout_secs),
         provider.chat(
             ChatRequest {
                 messages: &messages,

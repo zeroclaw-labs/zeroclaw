@@ -248,9 +248,11 @@ enum ChannelRuntimeCommand {
     NewSession,
     SetEmotion(bool),
     EmotionList,
+    EmotionListAll,
     EmotionShow(String),
     EmotionRemove(String),
     EmotionGen(String),
+    EmotionGenAll,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -777,7 +779,14 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/emotion" => {
             let arg = parts.next().unwrap_or("").to_ascii_lowercase();
             match arg.as_str() {
-                "list" => Some(ChannelRuntimeCommand::EmotionList),
+                "list" => {
+                    let sub = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+                    if sub == "all" {
+                        Some(ChannelRuntimeCommand::EmotionListAll)
+                    } else {
+                        Some(ChannelRuntimeCommand::EmotionList)
+                    }
+                }
                 "show" => {
                     let emotion = parts.next().unwrap_or("").trim().to_ascii_lowercase();
                     if emotion.is_empty() {
@@ -788,7 +797,9 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 }
                 "gen" | "generate" => {
                     let emotion = parts.next().unwrap_or("").trim().to_ascii_lowercase();
-                    if emotion.is_empty() {
+                    if emotion == "all" {
+                        Some(ChannelRuntimeCommand::EmotionGenAll)
+                    } else if emotion.is_empty() {
                         Some(ChannelRuntimeCommand::EmotionList)
                     } else {
                         Some(ChannelRuntimeCommand::EmotionGen(emotion))
@@ -1660,6 +1671,19 @@ async fn handle_runtime_command_if_needed(
                 Err(_) => "No cached stickers.".to_string(),
             }
         }
+        ChannelRuntimeCommand::EmotionListAll => {
+            use crate::agent::loop_::EMOTION_LABELS;
+            let sticker_dir = ctx
+                .workspace_dir
+                .join(&ctx.emotion_sticker_config.sticker_dir);
+            let mut lines = Vec::new();
+            for label in EMOTION_LABELS {
+                let path = sticker_dir.join(format!("{label}.png"));
+                let status = if path.exists() { "✅" } else { "⬜" };
+                lines.push(format!("{status} {label}"));
+            }
+            format!("Emotion stickers:\n{}", lines.join("\n"))
+        }
         ChannelRuntimeCommand::EmotionShow(emotion) => {
             let sticker_path = ctx
                 .workspace_dir
@@ -1697,10 +1721,8 @@ async fn handle_runtime_command_if_needed(
                         cfg.emotion_image_backend.clone()
                     };
 
-                    let prompt = format!(
-                        "{emotion} expression, {style}",
-                        style = cfg.sticker_style
-                    );
+                    let prompt =
+                        format!("{emotion} expression, {style}", style = cfg.sticker_style);
 
                     let mut args = serde_json::json!({
                         "prompt": prompt,
@@ -1741,10 +1763,7 @@ async fn handle_runtime_command_if_needed(
                                     sticker_path.display()
                                 )
                             } else {
-                                let err_detail = result
-                                    .error
-                                    .as_deref()
-                                    .unwrap_or(&result.output);
+                                let err_detail = result.error.as_deref().unwrap_or(&result.output);
                                 format!(
                                     "gen_image returned but no file produced for '{emotion}'.\nDetail: {err_detail}"
                                 )
@@ -1774,6 +1793,110 @@ async fn handle_runtime_command_if_needed(
                     "Unknown emotion '{emotion}'. Valid: {}",
                     EMOTION_LABELS.join(", ")
                 )
+            }
+        }
+        ChannelRuntimeCommand::EmotionGenAll => {
+            use crate::agent::loop_::EMOTION_LABELS;
+
+            let cfg = &ctx.emotion_sticker_config;
+            let sticker_dir = ctx.workspace_dir.join(&cfg.sticker_dir);
+            let _ = tokio::fs::create_dir_all(&sticker_dir).await;
+
+            let gen_image_tool: Option<&dyn crate::tools::traits::Tool> = ctx
+                .tools_registry
+                .iter()
+                .find(|t| t.name() == "gen_image")
+                .map(|t| t.as_ref());
+
+            if let Some(tool) = gen_image_tool {
+                let backend = if cfg.emotion_image_backend.is_empty() {
+                    cfg.image_generation_default_backend.clone()
+                } else {
+                    cfg.emotion_image_backend.clone()
+                };
+
+                // Find which emotions are missing
+                let missing: Vec<&str> = EMOTION_LABELS
+                    .iter()
+                    .filter(|label| !sticker_dir.join(format!("{label}.png")).exists())
+                    .copied()
+                    .collect();
+
+                if missing.is_empty() {
+                    "All emotion stickers already generated ✅".to_string()
+                } else {
+                    let total = missing.len();
+                    let mut ok = 0usize;
+                    let mut failed = Vec::new();
+
+                    // Send progress message first
+                    if let Err(e) = channel
+                        .send(
+                            &SendMessage::new(
+                                format!(
+                                    "Generating {total} missing sticker(s): {}...",
+                                    missing.join(", ")
+                                ),
+                                &msg.reply_target,
+                            )
+                            .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        tracing::warn!("Failed to send gen-all progress: {e}");
+                    }
+
+                    for emotion in &missing {
+                        let sticker_path = sticker_dir.join(format!("{emotion}.png"));
+                        let prompt =
+                            format!("{emotion} expression, {style}", style = cfg.sticker_style);
+                        let mut args = serde_json::json!({
+                            "prompt": prompt,
+                            "output_path": sticker_path.to_string_lossy(),
+                            "backend": backend,
+                        });
+                        if !cfg.sticker_negative_prompt.is_empty() {
+                            args["negative_prompt"] =
+                                serde_json::Value::String(cfg.sticker_negative_prompt.clone());
+                        }
+
+                        tracing::info!(emotion = %emotion, "Emotion gen all: generating");
+
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(120),
+                            tool.execute(args),
+                        )
+                        .await
+                        {
+                            Ok(Ok(result)) if result.success && sticker_path.exists() => {
+                                ok += 1;
+                                tracing::info!(emotion = %emotion, "Emotion gen all: ✅");
+                            }
+                            Ok(Ok(result)) => {
+                                let detail = result.error.as_deref().unwrap_or(&result.output);
+                                tracing::warn!(emotion = %emotion, detail = %detail, "Emotion gen all: no file");
+                                failed.push(emotion.to_string());
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(emotion = %emotion, error = %e, "Emotion gen all: error");
+                                failed.push(emotion.to_string());
+                            }
+                            Err(_) => {
+                                tracing::warn!(emotion = %emotion, "Emotion gen all: timeout");
+                                failed.push(emotion.to_string());
+                            }
+                        }
+                    }
+
+                    let mut result_msg = format!("Generated {ok}/{total} sticker(s) ✅");
+                    if !failed.is_empty() {
+                        use std::fmt::Write;
+                        let _ = write!(result_msg, "\nFailed: {}", failed.join(", "));
+                    }
+                    result_msg
+                }
+            } else {
+                "gen_image tool not found in tools registry.".to_string()
             }
         }
         ChannelRuntimeCommand::EmotionRemove(emotion) => {
