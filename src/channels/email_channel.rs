@@ -125,6 +125,8 @@ type ImapSession = Session<TlsStream<TcpStream>>;
 pub struct EmailChannel {
     pub config: EmailConfig,
     seen_messages: Arc<Mutex<HashSet<String>>>,
+    transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
 }
 
 impl EmailChannel {
@@ -132,7 +134,22 @@ impl EmailChannel {
         Self {
             config,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
+            transcription: None,
+            transcription_manager: None,
         }
+    }
+
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(Arc::new(m));
+            }
+            Err(e) => {
+                warn!("transcription manager init failed, voice transcription disabled: {e}");
+            }
+        }
+        self.transcription = Some(config);
+        self
     }
 
     /// Check if a sender email is in the allowlist
@@ -210,6 +227,44 @@ impl EmailChannel {
             }
         }
         "(no readable content)".to_string()
+    }
+
+    /// Return the raw bytes and filename of the first audio/* MIME part, if any.
+    fn extract_audio_attachment(parsed: &mail_parser::Message) -> Option<(Vec<u8>, String)> {
+        let mut skipped: u32 = 0;
+        let mut found: Option<(Vec<u8>, String)> = None;
+
+        for part in parsed.attachments() {
+            let part: &mail_parser::MessagePart = part;
+            if let Some(ct) = MimeHeaders::content_type(part) {
+                if ct.ctype() == "audio" {
+                    if found.is_none() {
+                        let file_name = MimeHeaders::attachment_name(part)
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| {
+                                let ext = match ct.subtype().unwrap_or("bin") {
+                                    "mpeg" => "mp3",
+                                    "ogg" => "ogg",
+                                    "mp4" => "mp4",
+                                    "wav" | "x-wav" => "wav",
+                                    "webm" => "webm",
+                                    _ => "bin",
+                                };
+                                format!("voice.{ext}")
+                            });
+                        found = Some((part.contents().to_vec(), file_name));
+                    } else {
+                        skipped += 1;
+                    }
+                }
+            }
+        }
+
+        if skipped > 0 {
+            debug!("email: skipped {skipped} additional audio attachment(s)");
+        }
+
+        found
     }
 
     /// Connect to IMAP server with TLS and authenticate
@@ -303,12 +358,15 @@ impl EmailChannel {
                                 .unwrap_or(0)
                         });
 
+                    let audio_attachment = Self::extract_audio_attachment(&parsed);
+
                     results.push(ParsedEmail {
                         _uid: uid,
                         msg_id,
                         sender,
                         content,
                         timestamp: ts,
+                        audio_attachment,
                     });
                 }
             }
@@ -459,11 +517,28 @@ impl EmailChannel {
                 continue;
             }
 
+            let mut content = email.content;
+
+            if let (Some(manager), Some((audio_data, file_name))) = (
+                self.transcription_manager.as_deref(),
+                email.audio_attachment,
+            ) {
+                match manager.transcribe(&audio_data, &file_name).await {
+                    Ok(transcript) => {
+                        content.push_str("\n\n[Voice message transcript]\n");
+                        content.push_str(&transcript);
+                    }
+                    Err(e) => {
+                        warn!("email audio transcription failed: {e}");
+                    }
+                }
+            }
+
             let msg = ChannelMessage {
                 id: email.msg_id,
                 reply_target: email.sender.clone(),
                 sender: email.sender,
-                content: email.content,
+                content,
                 channel: "email".to_string(),
                 timestamp: email.timestamp,
                 thread_ts: None,
@@ -503,6 +578,7 @@ struct ParsedEmail {
     sender: String,
     content: String,
     timestamp: u64,
+    audio_attachment: Option<(Vec<u8>, String)>,
 }
 
 /// Result from waiting on IDLE
@@ -989,5 +1065,231 @@ mod tests {
         };
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("imap.debug.com"));
+    }
+
+    // ── Transcription tests ─────────────────────────────────────────
+
+    #[test]
+    fn email_manager_none_when_transcription_not_configured() {
+        let channel = EmailChannel::new(EmailConfig::default());
+        assert!(channel.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn email_manager_some_when_valid_config() {
+        let config = crate::config::TranscriptionConfig {
+            enabled: false,
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(EmailConfig::default()).with_transcription(config);
+        assert!(channel.transcription_manager.is_some());
+    }
+
+    #[test]
+    fn email_manager_none_and_warn_on_init_failure() {
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "groq".to_string(),
+            api_key: Some(String::new()),
+            ..Default::default()
+        };
+        let channel = EmailChannel::new(EmailConfig::default()).with_transcription(config);
+        assert!(channel.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn extract_audio_attachment_returns_none_for_text_only() {
+        let raw = b"From: test@example.com\r\nSubject: Test\r\n\r\nPlain text email";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        assert_eq!(EmailChannel::extract_audio_attachment(&parsed), None);
+    }
+
+    #[test]
+    fn extract_audio_attachment_finds_ogg_part() {
+        let raw = b"From: test@example.com\r\n\
+Subject: Test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Message text\r\n\
+--boundary123\r\n\
+Content-Type: audio/ogg\r\n\
+\r\n\
+fake-audio-bytes\r\n\
+--boundary123--\r\n";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        let result = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(result.is_some());
+        let (bytes, filename) = result.unwrap();
+        assert_eq!(bytes, b"fake-audio-bytes");
+        assert_eq!(filename, "voice.ogg");
+    }
+
+    #[test]
+    fn extract_audio_attachment_uses_filename_header() {
+        let raw = b"From: test@example.com\r\n\
+Subject: Test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Message text\r\n\
+--boundary123\r\n\
+Content-Type: audio/mp4\r\n\
+Content-Disposition: attachment; filename=\"memo.m4a\"\r\n\
+\r\n\
+fake-audio\r\n\
+--boundary123--\r\n";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        let result = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(result.is_some());
+        let (bytes, filename) = result.unwrap();
+        assert_eq!(bytes, b"fake-audio");
+        assert_eq!(filename, "memo.m4a");
+    }
+
+    #[test]
+    fn extract_audio_attachment_returns_first_of_multiple() {
+        let raw = b"From: test@example.com\r\n\
+Subject: Test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: audio/ogg\r\n\
+\r\n\
+first-audio\r\n\
+--boundary123\r\n\
+Content-Type: audio/wav\r\n\
+\r\n\
+second-audio\r\n\
+--boundary123--\r\n";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        let result = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(result.is_some());
+        let (bytes, filename) = result.unwrap();
+        assert_eq!(bytes, b"first-audio");
+        assert_eq!(filename, "voice.ogg");
+    }
+
+    #[test]
+    fn extract_audio_attachment_fallback_ext_mpeg() {
+        let raw = b"From: test@example.com\r\n\
+Subject: Test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: audio/mpeg\r\n\
+\r\n\
+audio-data\r\n\
+--boundary123--\r\n";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        let result = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(result.is_some());
+        let (_bytes, filename) = result.unwrap();
+        assert_eq!(filename, "voice.mp3");
+    }
+
+    #[test]
+    fn extract_audio_attachment_fallback_ext_webm() {
+        let raw = b"From: test@example.com\r\n\
+Subject: Test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: audio/webm\r\n\
+\r\n\
+audio-data\r\n\
+--boundary123--\r\n";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        let result = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(result.is_some());
+        let (_bytes, filename) = result.unwrap();
+        assert_eq!(filename, "voice.webm");
+    }
+
+    #[test]
+    fn extract_audio_attachment_unknown_subtype_falls_back_to_bin() {
+        let raw = b"From: test@example.com\r\n\
+Subject: Test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: audio/x-custom\r\n\
+\r\n\
+audio-data\r\n\
+--boundary123--\r\n";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        let result = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(result.is_some());
+        let (_bytes, filename) = result.unwrap();
+        assert_eq!(filename, "voice.bin");
+    }
+
+    #[tokio::test]
+    async fn email_audio_routes_through_local_whisper() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .and(header_exists("authorization"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "hello world"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let transcription_config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "local_whisper".to_string(),
+            local_whisper: Some(crate::config::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", mock_server.uri()),
+                bearer_token: "test-token".to_string(),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }),
+            ..Default::default()
+        };
+
+        let channel =
+            EmailChannel::new(EmailConfig::default()).with_transcription(transcription_config);
+
+        // Build a synthetic multipart/mixed email with audio/ogg attachment
+        let raw_email = b"From: test@example.com\r\n\
+Subject: Voice Message\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: text/plain\r\n\
+\r\n\
+Text content\r\n\
+--boundary123\r\n\
+Content-Type: audio/ogg\r\n\
+\r\n\
+fake-ogg-bytes\r\n\
+--boundary123--\r\n";
+
+        let parsed = MessageParser::default().parse(raw_email).unwrap();
+        let audio_attachment = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(audio_attachment.is_some());
+
+        let (audio_data, file_name) = audio_attachment.unwrap();
+        let manager = channel.transcription_manager.as_ref().unwrap();
+        let transcript = manager.transcribe(&audio_data, &file_name).await.unwrap();
+        assert_eq!(transcript, "hello world");
     }
 }

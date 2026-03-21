@@ -4022,7 +4022,10 @@ fn collect_configured_channels(
     if let Some(ref email_cfg) = config.channels_config.email {
         channels.push(ConfiguredChannel {
             display_name: "Email",
-            channel: Arc::new(EmailChannel::new(email_cfg.clone())),
+            channel: Arc::new(
+                EmailChannel::new(email_cfg.clone())
+                    .with_transcription(config.transcription.clone()),
+            ),
         });
     }
 
