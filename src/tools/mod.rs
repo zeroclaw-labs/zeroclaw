@@ -20,6 +20,7 @@ pub mod browser;
 pub mod browser_delegate;
 pub mod browser_open;
 pub mod calculator;
+pub mod claude_code;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
@@ -92,6 +93,7 @@ pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
 pub use calculator::CalculatorTool;
+pub use claude_code::ClaudeCodeTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
@@ -526,6 +528,14 @@ pub fn all_tools_with_runtime(
         tracing::warn!(
             "google_workspace: skipped registration because shell access is unavailable"
         );
+    }
+
+    // Claude Code delegation tool
+    if root_config.claude_code.enabled {
+        tool_arcs.push(Arc::new(ClaudeCodeTool::new(
+            security.clone(),
+            root_config.claude_code.clone(),
+        )));
     }
 
     // PDF extraction (feature-gated at compile time via rag-pdf)
