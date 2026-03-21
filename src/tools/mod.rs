@@ -34,6 +34,7 @@ pub mod cron_runs;
 pub mod cron_update;
 pub mod data_management;
 pub mod delegate;
+pub mod discord_search;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -106,6 +107,7 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use data_management::DataManagementTool;
 pub use delegate::DelegateTool;
+pub use discord_search::DiscordSearchTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
@@ -337,6 +339,18 @@ pub fn all_tools_with_runtime(
         Arc::new(CalculatorTool::new()),
         Arc::new(WeatherTool::new()),
     ];
+
+    // Register discord_search if discord_history channel is configured
+    if root_config.channels_config.discord_history.is_some() {
+        match crate::memory::SqliteMemory::new_named(workspace_dir, "discord") {
+            Ok(discord_mem) => {
+                tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
+            }
+            Err(e) => {
+                tracing::warn!("discord_search: failed to open discord.db: {e}");
+            }
+        }
+    }
 
     if matches!(
         root_config.skills.prompt_injection_mode,
