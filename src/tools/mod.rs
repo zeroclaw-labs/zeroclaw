@@ -47,6 +47,7 @@ pub mod hardware_memory_map;
 #[cfg(feature = "hardware")]
 pub mod hardware_memory_read;
 pub mod http_request;
+pub mod image_gen;
 pub mod image_info;
 pub mod jira_tool;
 pub mod knowledge_tool;
@@ -120,6 +121,7 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 #[cfg(feature = "hardware")]
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
+pub use image_gen::ImageGenTool;
 pub use image_info::ImageInfoTool;
 pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
@@ -563,6 +565,16 @@ pub fn all_tools_with_runtime(
             root_config.linkedin.api_version.clone(),
             root_config.linkedin.content.clone(),
             root_config.linkedin.image.clone(),
+        )));
+    }
+
+    // Standalone image generation tool (config-gated)
+    if root_config.image_gen.enabled {
+        tool_arcs.push(Arc::new(ImageGenTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+            root_config.image_gen.default_model.clone(),
+            root_config.image_gen.api_key_env.clone(),
         )));
     }
 
