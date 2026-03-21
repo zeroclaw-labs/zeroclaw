@@ -359,7 +359,7 @@ impl Agent {
             None
         };
 
-        let (mut tools, _delegate_handle) = tools::all_tools_with_runtime(
+        let (mut tools, delegate_handle) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -415,7 +415,7 @@ impl Agent {
                                         def,
                                         std::sync::Arc::clone(&registry),
                                     ));
-                                if let Some(ref handle) = _delegate_handle {
+                                if let Some(ref handle) = delegate_handle {
                                     handle.write().push(std::sync::Arc::clone(&wrapper));
                                 }
                                 tools.push(Box::new(tools::ArcToolRef(wrapper)));

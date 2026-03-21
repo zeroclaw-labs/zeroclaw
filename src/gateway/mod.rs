@@ -427,7 +427,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let (mut tools_registry_raw, _delegate_handle_gw) = tools::all_tools_with_runtime(
+    let (mut tools_registry_raw, delegate_handle_gw) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -479,7 +479,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                                     def,
                                     std::sync::Arc::clone(&registry),
                                 ));
-                            if let Some(ref handle) = _delegate_handle_gw {
+                            if let Some(ref handle) = delegate_handle_gw {
                                 handle.write().push(std::sync::Arc::clone(&wrapper));
                             }
                             tools_registry_raw.push(Box::new(tools::ArcToolRef(wrapper)));
