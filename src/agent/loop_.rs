@@ -258,6 +258,9 @@ pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
 
 tokio::task_local! {
     pub(crate) static TOOL_CHOICE_OVERRIDE: Option<String>;
+    /// Stable thread identifier from the incoming channel message.
+    /// Used by `PerSenderTracker` to scope rate-limit buckets per conversation.
+    pub(crate) static TOOL_LOOP_THREAD_ID: Option<String>;
 }
 
 /// Extract a short hint from tool call arguments for progress display.
