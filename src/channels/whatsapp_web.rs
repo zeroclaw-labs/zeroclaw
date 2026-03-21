@@ -74,6 +74,8 @@ pub struct WhatsAppWebChannel {
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
     /// Voice transcription (STT) config
     transcription: Option<crate::config::TranscriptionConfig>,
+    /// TranscriptionManager built from transcription config; routes to configured provider.
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     /// Text-to-speech config for voice replies
     tts_config: Option<crate::config::TtsConfig>,
     /// Chats awaiting a voice reply — maps chat JID to the latest substantive
@@ -122,6 +124,7 @@ impl WhatsAppWebChannel {
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
             transcription: None,
+            transcription_manager: None,
             tts_config: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -132,6 +135,16 @@ impl WhatsAppWebChannel {
     #[cfg(feature = "whatsapp-web")]
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
         if config.enabled {
+            match super::transcription::TranscriptionManager::new(&config) {
+                Ok(m) => {
+                    self.transcription_manager = Some(std::sync::Arc::new(m));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "transcription manager init failed, voice transcription disabled: {e}"
+                    );
+                }
+            }
             self.transcription = Some(config);
         }
         self
@@ -338,8 +351,10 @@ impl WhatsAppWebChannel {
         client: &wa_rs::Client,
         audio: &wa_rs_proto::whatsapp::message::AudioMessage,
         transcription_config: Option<&crate::config::TranscriptionConfig>,
+        manager: Option<&super::transcription::TranscriptionManager>,
     ) -> Option<String> {
         let config = transcription_config?;
+        let manager = manager?;
 
         // Enforce duration limit
         if let Some(seconds) = audio.seconds {
@@ -378,7 +393,7 @@ impl WhatsAppWebChannel {
             file_name
         );
 
-        match super::transcription::transcribe_audio(audio_data, file_name, config).await {
+        match manager.transcribe(audio_data, file_name).await {
             Ok(text) if text.trim().is_empty() => {
                 tracing::info!("WhatsApp Web: voice transcription returned empty text, skipping");
                 None
@@ -644,6 +659,7 @@ impl Channel for WhatsAppWebChannel {
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
             let transcription_config = self.transcription.clone();
+            let transcription_manager = self.transcription_manager.clone();
             let voice_chats = self.voice_chats.clone();
             let wa_mode = self.mode.clone();
             let wa_dm_policy = self.dm_policy.clone();
@@ -661,6 +677,7 @@ impl Channel for WhatsAppWebChannel {
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
                     let transcription_config = transcription_config.clone();
+                    let transcription_manager = transcription_manager.clone();
                     let voice_chats = voice_chats.clone();
                     let wa_mode = wa_mode.clone();
                     let wa_dm_policy = wa_dm_policy.clone();
@@ -763,6 +780,7 @@ impl Channel for WhatsAppWebChannel {
                                             &client,
                                             audio,
                                             transcription_config.as_ref(),
+                                            transcription_manager.as_deref(),
                                         )
                                         .await
                                     } else {
@@ -1368,4 +1386,39 @@ mod tests {
             ]
         );
     }
+
+    // ── TranscriptionManager wiring ──────────────────────────────
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_manager_none_when_not_configured() {
+        let ch = make_channel();
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_manager_some_when_valid_config() {
+        std::env::remove_var("GROQ_API_KEY");
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true;
+        config.api_key = Some("fake-test-key".to_string());
+        let ch = make_channel().with_transcription(config);
+        assert!(ch.transcription_manager.is_some());
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_manager_none_on_init_failure() {
+        std::env::remove_var("GROQ_API_KEY");
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true; // safety net fires: enabled + no key → bail
+        let ch = make_channel().with_transcription(config);
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    // whatsapp_web_voice_returns_none_when_manager_none and
+    // whatsapp_web_voice_routes_through_local_whisper require a wa_rs::Client,
+    // which cannot be constructed without a live connection. Those are covered
+    // by the wiremock integration tests added in the green phase.
 }
