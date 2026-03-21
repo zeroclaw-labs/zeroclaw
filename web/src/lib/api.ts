@@ -182,6 +182,19 @@ export function deleteCronJob(id: string): Promise<void> {
     method: 'DELETE',
   });
 }
+export function patchCronJob(
+  id: string,
+  patch: { name?: string; schedule?: string; command?: string },
+): Promise<CronJob> {
+  return apiFetch<CronJob | { status: string; job: CronJob }>(
+    `/api/cron/${encodeURIComponent(id)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    },
+  ).then((data) => (typeof (data as { job?: CronJob }).job === 'object' ? (data as { job: CronJob }).job : (data as CronJob)));
+}
+
 
 export function getCronRuns(
   jobId: string,

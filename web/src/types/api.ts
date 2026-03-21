@@ -35,11 +35,19 @@ export interface ToolSpec {
 export interface CronJob {
   id: string;
   name: string | null;
+  expression: string;
   command: string;
+  prompt: string | null;
+  job_type: string;
+  schedule: unknown;
+  enabled: boolean;
+  delivery: unknown;
+  delete_after_run: boolean;
+  created_at: string;
   next_run: string;
   last_run: string | null;
   last_status: string | null;
-  enabled: boolean;
+  last_output: string | null;
 }
 
 export interface CronRun {

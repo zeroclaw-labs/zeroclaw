@@ -672,7 +672,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Weather",
             description: "Forecasts & conditions",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |_| IntegrationStatus::Active,
         },
         IntegrationEntry {
             name: "Canvas",
@@ -995,7 +995,7 @@ mod tests {
     fn shell_and_filesystem_always_active() {
         let config = Config::default();
         let entries = all_integrations();
-        for name in ["Shell", "File System"] {
+        for name in ["Shell", "File System", "Weather"] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
             assert!(
                 matches!((entry.status_fn)(&config), IntegrationStatus::Active),
