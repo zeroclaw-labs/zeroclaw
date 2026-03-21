@@ -185,12 +185,15 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `max_iterations` | `10` | Max tool-call iterations for agentic mode |
 | `timeout_secs` | `120` | Timeout in seconds for non-agentic provider calls (1–3600) |
 | `agentic_timeout_secs` | `300` | Timeout in seconds for agentic sub-agent loops (1–3600) |
+| `skills_directory` | unset | Optional skills directory path (workspace-relative) for scoped skill loading |
 
 Notes:
 
 - `agentic = false` preserves existing single prompt→response delegate behavior.
 - `agentic = true` requires at least one matching entry in `allowed_tools`.
 - The `delegate` tool is excluded from sub-agent allowlists to prevent re-entrant delegation loops.
+- Sub-agents receive an enriched system prompt containing: tools section (allowed tools with parameters), skills section (from scoped or default directory), workspace path, current date/time, safety constraints, and shell policy when `shell` is in the effective tool list.
+- When `skills_directory` is unset or empty, the sub-agent loads skills from the default workspace `skills/` directory. When set, skills are loaded exclusively from that directory (relative to workspace root), enabling per-agent scoped skill sets.
 
 ```toml
 [agents.researcher]
@@ -208,6 +211,14 @@ provider = "ollama"
 model = "qwen2.5-coder:32b"
 temperature = 0.2
 timeout_secs = 60
+
+[agents.code_reviewer]
+provider = "anthropic"
+model = "claude-opus-4-5"
+system_prompt = "You are an expert code reviewer focused on security and performance."
+agentic = true
+allowed_tools = ["file_read", "shell"]
+skills_directory = "skills/code-review"
 ```
 
 ## `[runtime]`
