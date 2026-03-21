@@ -3772,6 +3772,10 @@ fn collect_configured_channels(
                                 wa.pair_phone.clone(),
                                 wa.pair_code.clone(),
                                 wa.allowed_numbers.clone(),
+                                wa.mode.clone(),
+                                wa.dm_policy.clone(),
+                                wa.group_policy.clone(),
+                                wa.self_chat_mode,
                             )
                             .with_transcription(config.transcription.clone())
                             .with_tts(config.tts.clone()),
