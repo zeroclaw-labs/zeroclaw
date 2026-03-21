@@ -1438,6 +1438,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            path_prefix: String::new(),
         }
     }
 
