@@ -14,7 +14,7 @@ use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -594,6 +594,46 @@ fn tool_call_signature(name: &str, arguments: &serde_json::Value) -> (String, St
     let canonical_args = canonicalize_json_for_tool_signature(arguments);
     let args_json = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
     (name.trim().to_ascii_lowercase(), args_json)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ToolLoopGuardConfig {
+    pub deduplicate_repeated_tool_results: bool,
+    pub tool_result_dedup_max_entries: usize,
+    pub tool_error_repeat_guard_threshold: usize,
+}
+
+impl Default for ToolLoopGuardConfig {
+    fn default() -> Self {
+        Self {
+            deduplicate_repeated_tool_results: true,
+            tool_result_dedup_max_entries: 1024,
+            tool_error_repeat_guard_threshold: 8,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ToolResultDedupState {
+    output_hash: u64,
+    repeat_count: usize,
+}
+
+fn hash_tool_result_content(content: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn compact_tool_result_preview(content: &str, max_chars: usize) -> String {
+    let normalized = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_with_ellipsis(&normalized, max_chars)
+}
+
+fn tool_signature_cache_key(signature: &(String, String)) -> String {
+    format!("{}\u{001F}{}", signature.0, signature.1)
 }
 
 fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
@@ -2524,6 +2564,56 @@ pub(crate) async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
 ) -> Result<String> {
+    run_tool_call_loop_with_guard_config(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        channel_reply_target,
+        multimodal_config,
+        max_tool_iterations,
+        cancellation_token,
+        on_delta,
+        hooks,
+        excluded_tools,
+        dedup_exempt_tools,
+        activated_tools,
+        model_switch_callback,
+        ToolLoopGuardConfig::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_call_loop_with_guard_config(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    channel_reply_target: Option<&str>,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    hooks: Option<&crate::hooks::HookRunner>,
+    excluded_tools: &[String],
+    dedup_exempt_tools: &[String],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    model_switch_callback: Option<ModelSwitchCallback>,
+    guard_config: ToolLoopGuardConfig,
+) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -2531,6 +2621,10 @@ pub(crate) async fn run_tool_call_loop(
     };
 
     let turn_id = Uuid::new_v4().to_string();
+    let mut tool_result_dedup_state: HashMap<String, ToolResultDedupState> = HashMap::new();
+    let mut tool_result_dedup_order: VecDeque<String> = VecDeque::new();
+    let mut repeated_tool_error_counts: HashMap<String, usize> = HashMap::new();
+    let mut tools_disabled_due_to_repeat_errors = false;
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -2632,7 +2726,7 @@ pub(crate) async fn run_tool_call_loop(
 
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
-        let request_tools = if use_native_tools {
+        let request_tools = if use_native_tools && !tools_disabled_due_to_repeat_errors {
             Some(tool_specs.as_slice())
         } else {
             None
@@ -2810,6 +2904,16 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
 
+        if tools_disabled_due_to_repeat_errors && !tool_calls.is_empty() {
+            let forced_response = if display_text.trim().is_empty() {
+                "Tool execution is disabled for this turn due to repeated tool errors. Please answer directly without calling tools.".to_string()
+            } else {
+                display_text.clone()
+            };
+            history.push(ChatMessage::assistant(response_text.clone()));
+            return Ok(forced_response);
+        }
+
         if tool_calls.is_empty() {
             runtime_trace::record_event(
                 "turn_final_response",
@@ -2876,11 +2980,19 @@ pub(crate) async fn run_tool_call_loop(
         // tool executions concurrently for lower wall-clock latency.
         let mut tool_results = String::new();
         let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
-        let mut ordered_results: Vec<Option<(String, Option<String>, ToolExecutionOutcome)>> =
-            (0..tool_calls.len()).map(|_| None).collect();
+        let mut ordered_results: Vec<
+            Option<(
+                String,
+                Option<String>,
+                ToolExecutionOutcome,
+                (String, String),
+            )>,
+        > = (0..tool_calls.len()).map(|_| None).collect();
         let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
+        let mut executable_signatures: Vec<(String, String)> = Vec::new();
+        let mut repeat_error_guard_notice: Option<String> = None;
 
         for (idx, call) in tool_calls.iter().enumerate() {
             // ── Hook: before_tool_call (modifying) ──────────
@@ -2926,6 +3038,7 @@ pub(crate) async fn run_tool_call_loop(
                                 error_reason: Some(scrub_credentials(&reason)),
                                 duration: Duration::ZERO,
                             },
+                            tool_call_signature(&tool_name, &tool_args),
                         ));
                         continue;
                     }
@@ -2942,6 +3055,7 @@ pub(crate) async fn run_tool_call_loop(
                 channel_name,
                 channel_reply_target,
             );
+            let signature = tool_call_signature(&tool_name, &tool_args);
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
@@ -2992,15 +3106,15 @@ pub(crate) async fn run_tool_call_loop(
                                 error_reason: Some(denied),
                                 duration: Duration::ZERO,
                             },
+                            signature.clone(),
                         ));
                         continue;
                     }
                 }
             }
 
-            let signature = tool_call_signature(&tool_name, &tool_args);
             let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
-            if !dedup_exempt && !seen_tool_signatures.insert(signature) {
+            if !dedup_exempt && !seen_tool_signatures.insert(signature.clone()) {
                 let duplicate = format!(
                     "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
                 );
@@ -3033,6 +3147,7 @@ pub(crate) async fn run_tool_call_loop(
                         error_reason: Some(duplicate),
                         duration: Duration::ZERO,
                     },
+                    signature.clone(),
                 ));
                 continue;
             }
@@ -3065,6 +3180,7 @@ pub(crate) async fn run_tool_call_loop(
             }
 
             executable_indices.push(idx);
+            executable_signatures.push(signature);
             executable_calls.push(ParsedToolCall {
                 name: tool_name,
                 arguments: tool_args,
@@ -3092,9 +3208,10 @@ pub(crate) async fn run_tool_call_loop(
             .await?
         };
 
-        for ((idx, call), outcome) in executable_indices
+        for (((idx, call), signature), outcome) in executable_indices
             .iter()
             .zip(executable_calls.iter())
+            .zip(executable_signatures.iter())
             .zip(executed_outcomes.into_iter())
         {
             runtime_trace::record_event(
@@ -3143,10 +3260,73 @@ pub(crate) async fn run_tool_call_loop(
                 let _ = tx.send(progress_msg).await;
             }
 
-            ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+            ordered_results[*idx] = Some((
+                call.name.clone(),
+                call.tool_call_id.clone(),
+                outcome,
+                signature.clone(),
+            ));
         }
 
-        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+        for (tool_name, tool_call_id, mut outcome, signature) in
+            ordered_results.into_iter().flatten()
+        {
+            let signature_cache_key = tool_signature_cache_key(&signature);
+
+            if guard_config.deduplicate_repeated_tool_results && !outcome.output.is_empty() {
+                let output_hash = hash_tool_result_content(&outcome.output);
+                if let Some(state) = tool_result_dedup_state.get_mut(&signature_cache_key) {
+                    if state.output_hash == output_hash {
+                        state.repeat_count += 1;
+                        let repeats = state.repeat_count + 1;
+                        let preview = compact_tool_result_preview(&outcome.output, 180);
+                        outcome.output = format!(
+                            "[tool-result-deduplicated] Tool `{tool_name}` returned unchanged output for {repeats} consecutive calls with identical arguments. Full repeated output is omitted to reduce context growth. Latest preview: {preview}"
+                        );
+                    } else {
+                        state.output_hash = output_hash;
+                        state.repeat_count = 0;
+                    }
+                } else {
+                    tool_result_dedup_state.insert(
+                        signature_cache_key.clone(),
+                        ToolResultDedupState {
+                            output_hash,
+                            repeat_count: 0,
+                        },
+                    );
+                    tool_result_dedup_order.push_back(signature_cache_key.clone());
+                    if guard_config.tool_result_dedup_max_entries > 0 {
+                        while tool_result_dedup_order.len()
+                            > guard_config.tool_result_dedup_max_entries
+                        {
+                            if let Some(evicted) = tool_result_dedup_order.pop_front() {
+                                tool_result_dedup_state.remove(&evicted);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if guard_config.tool_error_repeat_guard_threshold > 0 {
+                if outcome.success {
+                    repeated_tool_error_counts.remove(&signature_cache_key);
+                } else {
+                    let repeat = repeated_tool_error_counts
+                        .entry(signature_cache_key)
+                        .and_modify(|count| *count += 1)
+                        .or_insert(1);
+                    if !tools_disabled_due_to_repeat_errors
+                        && *repeat >= guard_config.tool_error_repeat_guard_threshold
+                    {
+                        tools_disabled_due_to_repeat_errors = true;
+                        repeat_error_guard_notice = Some(format!(
+                            "Tool `{tool_name}` failed {repeat} times with identical arguments in this turn. Tool execution is now disabled for the remainder of this turn. Answer directly without tools."
+                        ));
+                    }
+                }
+            }
+
             individual_results.push((tool_call_id, outcome.output.clone()));
             let _ = writeln!(
                 tool_results,
@@ -3187,6 +3367,23 @@ pub(crate) async fn run_tool_call_loop(
                 });
                 history.push(ChatMessage::tool(tool_msg.to_string()));
             }
+        }
+
+        if let Some(guard_notice) = repeat_error_guard_notice.take() {
+            runtime_trace::record_event(
+                "tool_error_repeat_guard_triggered",
+                Some(channel_name),
+                Some(provider_name),
+                Some(model),
+                Some(&turn_id),
+                Some(false),
+                Some(&guard_notice),
+                serde_json::json!({
+                    "iteration": iteration + 1,
+                    "threshold": guard_config.tool_error_repeat_guard_threshold,
+                }),
+            );
+            history.push(ChatMessage::user(format!("[Tool guard]\n{guard_notice}")));
         }
     }
 
@@ -3624,6 +3821,11 @@ pub async fn run(
         None
     };
     let channel_name = if interactive { "cli" } else { "daemon" };
+    let tool_loop_guard_config = ToolLoopGuardConfig {
+        deduplicate_repeated_tool_results: config.agent.deduplicate_repeated_tool_results,
+        tool_result_dedup_max_entries: config.agent.tool_result_dedup_max_entries,
+        tool_error_repeat_guard_threshold: config.agent.tool_error_repeat_guard_threshold,
+    };
     let memory_session_id = session_state_file
         .as_deref()
         .and_then(memory_session_id_from_state_file);
@@ -3683,7 +3885,7 @@ pub async fn run(
         #[allow(unused_assignments)]
         let mut response = String::new();
         loop {
-            match run_tool_call_loop(
+            match run_tool_call_loop_with_guard_config(
                 provider.as_ref(),
                 &mut history,
                 &tools_registry,
@@ -3704,6 +3906,7 @@ pub async fn run(
                 &config.agent.tool_call_dedup_exempt,
                 activated_handle.as_ref(),
                 Some(model_switch_callback.clone()),
+                tool_loop_guard_config,
             )
             .await
             {
@@ -3910,7 +4113,7 @@ pub async fn run(
             );
 
             let response = loop {
-                match run_tool_call_loop(
+                match run_tool_call_loop_with_guard_config(
                     provider.as_ref(),
                     &mut history,
                     &tools_registry,
@@ -3931,6 +4134,7 @@ pub async fn run(
                     &config.agent.tool_call_dedup_exempt,
                     activated_handle.as_ref(),
                     Some(model_switch_callback.clone()),
+                    tool_loop_guard_config,
                 )
                 .await
                 {
@@ -5464,6 +5668,200 @@ mod tests {
             1,
             "non-exempt tool should still be deduped"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_compacts_repeated_tool_results_when_enabled() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run repeated polling calls"),
+        ];
+        let observer = NoopObserver;
+        let exempt = vec!["count_tool".to_string()];
+        let guard_config = ToolLoopGuardConfig {
+            deduplicate_repeated_tool_results: true,
+            tool_result_dedup_max_entries: 128,
+            tool_error_repeat_guard_threshold: 0,
+        };
+
+        let result = run_tool_call_loop_with_guard_config(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            &exempt,
+            None,
+            None,
+            guard_config,
+        )
+        .await
+        .expect("loop should complete with repeated-result compaction");
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        let has_compacted_marker = history.iter().any(|msg| {
+            msg.role == "user"
+                && msg.content.starts_with("[Tool results]")
+                && msg.content.contains("[tool-result-deduplicated]")
+        });
+        assert!(
+            has_compacted_marker,
+            "expected compact marker for repeated unchanged tool output"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_keeps_repeated_tool_results_when_compaction_disabled() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run repeated polling calls"),
+        ];
+        let observer = NoopObserver;
+        let exempt = vec!["count_tool".to_string()];
+        let guard_config = ToolLoopGuardConfig {
+            deduplicate_repeated_tool_results: false,
+            tool_result_dedup_max_entries: 128,
+            tool_error_repeat_guard_threshold: 0,
+        };
+
+        let result = run_tool_call_loop_with_guard_config(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            &exempt,
+            None,
+            None,
+            guard_config,
+        )
+        .await
+        .expect("loop should complete with repeated-result compaction disabled");
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 2);
+        let has_compacted_marker = history.iter().any(|msg| {
+            msg.role == "user"
+                && msg.content.starts_with("[Tool results]")
+                && msg.content.contains("[tool-result-deduplicated]")
+        });
+        assert!(
+            !has_compacted_marker,
+            "compact marker should not appear when feature is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_error_repeat_guard_disables_tools_for_turn() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"unknown_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            r#"<tool_call>
+{"name":"unknown_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "final answer without tools",
+        ]);
+
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("try unknown tool until it fails"),
+        ];
+        let observer = NoopObserver;
+        let exempt = vec!["unknown_tool".to_string()];
+        let guard_config = ToolLoopGuardConfig {
+            deduplicate_repeated_tool_results: false,
+            tool_result_dedup_max_entries: 0,
+            tool_error_repeat_guard_threshold: 2,
+        };
+
+        let result = run_tool_call_loop_with_guard_config(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            6,
+            None,
+            None,
+            None,
+            &[],
+            &exempt,
+            None,
+            None,
+            guard_config,
+        )
+        .await
+        .expect("loop should recover after repeat-error guard");
+
+        assert_eq!(result, "final answer without tools");
+        let guard_note_present = history
+            .iter()
+            .any(|msg| msg.role == "user" && msg.content.starts_with("[Tool guard]"));
+        assert!(guard_note_present, "expected tool guard notice in history");
     }
 
     #[tokio::test]

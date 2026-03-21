@@ -1165,6 +1165,18 @@ pub struct AgentConfig {
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
+    /// Compress repeated tool outputs (same tool + args + unchanged result) into a short marker.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub deduplicate_repeated_tool_results: bool,
+    /// Maximum entries stored in repeated-result dedup state. Default: `1024`.
+    /// Set to `0` to disable pruning.
+    #[serde(default = "default_agent_tool_result_dedup_max_entries")]
+    pub tool_result_dedup_max_entries: usize,
+    /// Guard threshold for repeated tool errors on the same call signature. Default: `8`.
+    /// Set to `0` to disable the guard.
+    #[serde(default = "default_agent_tool_error_repeat_guard_threshold")]
+    pub tool_error_repeat_guard_threshold: usize,
     /// Per-turn MCP tool schema filtering groups.
     ///
     /// When non-empty, only MCP tools matched by an active group are included in the
@@ -1190,6 +1202,14 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_agent_tool_result_dedup_max_entries() -> usize {
+    1024
+}
+
+fn default_agent_tool_error_repeat_guard_threshold() -> usize {
+    8
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -1200,6 +1220,9 @@ impl Default for AgentConfig {
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
+            deduplicate_repeated_tool_results: default_true(),
+            tool_result_dedup_max_entries: default_agent_tool_result_dedup_max_entries(),
+            tool_error_repeat_guard_threshold: default_agent_tool_error_repeat_guard_threshold(),
             tool_filter_groups: Vec::new(),
         }
     }
@@ -9194,6 +9217,9 @@ reasoning_effort = "turbo"
         assert_eq!(cfg.max_history_messages, 50);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
+        assert!(cfg.deduplicate_repeated_tool_results);
+        assert_eq!(cfg.tool_result_dedup_max_entries, 1024);
+        assert_eq!(cfg.tool_error_repeat_guard_threshold, 8);
     }
 
     #[test]
@@ -9206,6 +9232,9 @@ max_tool_iterations = 20
 max_history_messages = 80
 parallel_tools = true
 tool_dispatcher = "xml"
+deduplicate_repeated_tool_results = false
+tool_result_dedup_max_entries = 256
+tool_error_repeat_guard_threshold = 3
 "#;
         let parsed = parse_test_config(raw);
         assert!(parsed.agent.compact_context);
@@ -9213,6 +9242,9 @@ tool_dispatcher = "xml"
         assert_eq!(parsed.agent.max_history_messages, 80);
         assert!(parsed.agent.parallel_tools);
         assert_eq!(parsed.agent.tool_dispatcher, "xml");
+        assert!(!parsed.agent.deduplicate_repeated_tool_results);
+        assert_eq!(parsed.agent.tool_result_dedup_max_entries, 256);
+        assert_eq!(parsed.agent.tool_error_repeat_guard_threshold, 3);
     }
 
     #[tokio::test]
