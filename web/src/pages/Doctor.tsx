@@ -69,10 +69,10 @@ export default function Doctor() {
 
   const grouped =
     results?.reduce<Record<string, DiagResult[]>>((acc, item) => {
-    const key = item.category;
-    if (!acc[key]) acc[key] = [];
-    acc[key].push(item);
-    return acc;
+      const key = item.category;
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(item);
+      return acc;
     }, {}) ?? {};
 
   return (
