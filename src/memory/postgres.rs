@@ -134,6 +134,7 @@ impl PostgresMemory {
             timestamp: timestamp.to_rfc3339(),
             session_id: row.get(5),
             score: row.try_get(6).ok(),
+            scope: None,
         })
     }
 }
