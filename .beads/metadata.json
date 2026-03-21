@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "zeroclaw",
+  "project_id": "a66c92ae-5eff-4831-8f92-e43c9f76170d"
+}

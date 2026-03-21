@@ -49,3 +49,6 @@ lcov.info
 
 # Wrangler cache
 .wrangler/
+
+# Dolt database files (added by bd init)
+.dolt/
