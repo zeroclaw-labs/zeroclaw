@@ -190,17 +190,57 @@ Re-run `dev/setup-room-cron.sh` with the new room IDs after updating config,
 or manually update the crontab entries that pass room IDs to
 `services/cron-bot-triage.sh` and `services/cron-bot-status.sh`.
 
+## Completed Migration — Room IDs (2026-03-21)
+
+| Room | ID |
+|---|---|
+| Projects (space) | `!nFlSl4DaeJTzN9BqCu:matrix.local` |
+| zeroclaw | `!CPRc16eM6QMuL9abWG:matrix.local` |
+| ticket | `!X1XgHoUL25F78XOIhF:matrix.local` |
+| imagellm | `!02619LQD86gO6qfort:matrix.local` |
+| musicllm | `!jdMlvJGiAd5jCpdt4C:matrix.local` |
+| habla-spanish | `!4sylDf25axCSW2WCYV:matrix.local` |
+| continuwuity | `!hl0zTF1fpA9PhyYVvD:matrix.local` |
+| general | `!J3acXh1AHwP7ExFVRH:matrix.local` |
+
+Server: Debian 12 / Proxmox VM at `192.168.10.37`, continuwuity via Docker
+(`~/continuwuity/docker-compose.yml`). All four users registered.
+
+## macOS SSH Tunnel (required)
+
+macOS's tokio async DNS/socket layer returns `EHOSTUNREACH` (os error 65) when
+connecting to LAN IPs that Python's blocking sockets reach fine. Root cause:
+tokio doesn't use the mDNS resolver and the routing via bridge interfaces
+(Parallels/VMware) conflicts with the `192.168.10.x` subnet route.
+
+**Workaround:** SSH tunnel the Matrix port through localhost. A launchd agent
+keeps it alive across reboots:
+
+```xml
+<!-- ~/Library/LaunchAgents/local.matrix-tunnel.plist -->
+<!-- ssh -N -L 7167:localhost:6167 matrix.local -->
+```
+
+Load/reload: `launchctl load ~/Library/LaunchAgents/local.matrix-tunnel.plist`
+
+The `homeserver` in `config.toml` is set to `http://localhost:7167`. The
+`cron-bot.json` homeserver uses the direct IP `http://matrix.local:6167`
+because the shell scripts use Python's blocking resolver which works fine.
+
+**If the tunnel drops:** `launchctl kickstart -k gui/$(id -u)/local.matrix-tunnel`
+
 ## Migration Checklist
 
-- [ ] Install/run continuwuity on `matrix.local`
-- [ ] Register users: `dustin`, `zeroclaw`, `cron-bot`, `zc-test`
-- [ ] Create a Projects space; create one room per project; note room IDs
-- [ ] Update `~/.zeroclaw/config.toml` (all four sections above)
-- [ ] Update `~/.zeroclaw/cron-bot.json`
-- [ ] Re-run `dev/setup-room-cron.sh` to update crontab
+- [x] Install/run continuwuity on `matrix.local` (Docker, port 6167)
+- [x] Register users: `dustin`, `zeroclaw`, `cron-bot`, `zc-test`
+- [x] Create Projects space + 7 project rooms; room IDs noted above
+- [x] Update `~/.zeroclaw/config.toml` (all four sections)
+- [x] Update `~/.zeroclaw/cron-bot.json`
+- [x] Set up SSH tunnel launchd agent (`local.matrix-tunnel`)
+- [x] `zeroclaw daemon` — Matrix connects, 7 rooms active
+- [ ] Re-run `dev/setup-room-cron.sh` to update crontab with new room IDs
 - [ ] Add Stop hook to `~/.claude/settings.json`
 - [ ] Write `~/.claude/hooks/notify-matrix.sh` with new room IDs
-- [ ] `zeroclaw daemon` — verify Matrix connects and lists expected rooms
 - [ ] Send `idle` in each room — verify tmux targets resolve correctly
 - [ ] Send `cron` in a room — verify workspace and job listing work
 - [ ] Trigger a cron-bot triage run manually to verify credentials
@@ -208,7 +248,6 @@ or manually update the crontab entries that pass room IDs to
 ## Helper: add tmux target after migration
 
 ```bash
-# After updating config with new room IDs:
 ./dev/add-tmux-target.sh '!<new-room-id>:matrix.local' 'main:projectname'
 ./dev/add-tmux-target.sh --list   # verify
 ```

@@ -52,10 +52,7 @@ pub async fn classify_with_model(
         Ok(Ok(response)) => {
             let hint = response.trim().to_lowercase();
             if available_hints.iter().any(|h| h == &hint) {
-                tracing::info!(
-                    hint = hint.as_str(),
-                    "Model-based classification"
-                );
+                tracing::info!(hint = hint.as_str(), "Model-based classification");
                 return Some(hint);
             }
             tracing::warn!(

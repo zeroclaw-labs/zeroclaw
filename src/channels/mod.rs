@@ -1579,8 +1579,10 @@ async fn classify_tmux_target(target: &str) -> &'static str {
         let cmd = cmd.as_str();
         if !cmd.is_empty() && !shell_commands.contains(&cmd) {
             // A non-shell process is running (e.g. claude binary, node, cargo).
-            // Capture pane content to determine if it's actually doing work or just
-            // sitting idle at a prompt (e.g. Claude Code awaiting input).
+            // Three-way classification:
+            //   1. Explicit active signals (spinner, "Esc to interrupt") → active
+            //   2. Claude Code idle prompt (❯) visible → idle
+            //   3. Neither visible → active (signals likely scrolled off-screen)
             if let Ok(out) = tokio::process::Command::new("tmux")
                 .args(["capture-pane", "-p", "-t", target])
                 .output()
@@ -1588,7 +1590,18 @@ async fn classify_tmux_target(target: &str) -> &'static str {
             {
                 if out.status.success() {
                     let content = String::from_utf8_lossy(&out.stdout);
-                    return classify_tmux_pane_content(&content);
+                    let classified = classify_tmux_pane_content(&content);
+                    if classified == "active" || classified == "question" {
+                        return classified;
+                    }
+                    // classify_tmux_pane_content returned "idle" — only trust that
+                    // if the Claude Code ❯ prompt appears immediately before the ────
+                    // status-bar separator. A ❯ anywhere else in the content is likely
+                    // a shell prompt from scroll history while Claude Code is still running.
+                    if claude_code_at_idle_prompt(&content) {
+                        return "idle";
+                    }
+                    return "active";
                 }
             }
             // Could not capture — assume active since a process is running.
@@ -1609,6 +1622,27 @@ async fn classify_tmux_target(target: &str) -> &'static str {
         Ok(_) => "unavailable",
         Err(_) => "unavailable",
     }
+}
+
+/// Returns true only if the Claude Code `❯` input prompt is the line immediately
+/// before the `────` status-bar separator. A `❯` elsewhere in the visible content
+/// is likely a shell prompt sitting in scroll history while the process is active.
+fn claude_code_at_idle_prompt(pane: &str) -> bool {
+    let lines: Vec<&str> = pane.lines().collect();
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with('─') && t.len() > 10 {
+            // Check the line immediately before the separator.
+            if i > 0 && lines[i - 1].trim() == "❯" {
+                return true;
+            }
+            // Allow a single blank line between ❯ and the separator.
+            if i > 1 && lines[i - 1].trim().is_empty() && lines[i - 2].trim() == "❯" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Classify raw tmux pane content into one of: "active", "question", "idle".
@@ -1702,11 +1736,17 @@ async fn handle_idle_command_if_needed(
     }
 
     // Sort: questions first, then active, then idle, then unavailable.
-    captures.sort_by_key(|(_, _, state)| match *state {
-        "question" => 0,
-        "active" => 1,
-        "idle" => 2,
-        _ => 3,
+    // Secondary sort by target name for consistent ordering.
+    captures.sort_by(|(_, a_target, a_state), (_, b_target, b_state)| {
+        let state_rank = |s: &str| match s {
+            "question" => 0,
+            "active" => 1,
+            "idle" => 2,
+            _ => 3,
+        };
+        state_rank(a_state)
+            .cmp(&state_rank(b_state))
+            .then_with(|| a_target.cmp(b_target))
     });
 
     let mut lines = vec!["**Tmux Status** — all rooms\n".to_string()];

@@ -261,7 +261,11 @@ impl ClaudeCodeProvider {
             .map_err(|e| anyhow::anyhow!("tmux paste-buffer failed: {}", e))?;
         if !paste.status.success() {
             let stderr = String::from_utf8_lossy(&paste.stderr);
-            anyhow::bail!("tmux paste-buffer failed for '{}': {}", target, stderr.trim());
+            anyhow::bail!(
+                "tmux paste-buffer failed for '{}': {}",
+                target,
+                stderr.trim()
+            );
         }
 
         // Press Enter to submit
@@ -288,9 +292,7 @@ impl ClaudeCodeProvider {
         let trimmed = line.trim();
         // Full-width separator lines (────) — only match lines that are purely ─ chars
         // and long enough to be a UI separator (not a table border which mixes │┼├ etc.)
-        if trimmed.len() > 40
-            && trimmed.chars().all(|c| c == '\u{2500}')
-        {
+        if trimmed.len() > 40 && trimmed.chars().all(|c| c == '\u{2500}') {
             return true;
         }
         // Status bar lines (context %, timer, model info)
@@ -346,9 +348,12 @@ impl ClaudeCodeProvider {
             if let Some(rest) = trimmed.strip_prefix('\u{23FA}') {
                 let content = rest.trim();
                 // Skip tool call lines like "Bash(command)"
-                if content.starts_with("Bash(") || content.starts_with("Read(")
-                    || content.starts_with("Write(") || content.starts_with("Edit(")
-                    || content.starts_with("Glob(") || content.starts_with("Grep(")
+                if content.starts_with("Bash(")
+                    || content.starts_with("Read(")
+                    || content.starts_with("Write(")
+                    || content.starts_with("Edit(")
+                    || content.starts_with("Glob(")
+                    || content.starts_with("Grep(")
                     || content.starts_with("Web Search(")
                     || content.starts_with("Searched for")
                 {
@@ -1022,8 +1027,7 @@ impl Provider for ClaudeCodeProvider {
 
         // Check if this message has a tmux target directive.
         // If so, send only the directives + raw user message (no system prompt/history).
-        let has_tmux = system
-            .map_or(false, |s| s.contains("[ZEROCLAW_TMUX_TARGET:"));
+        let has_tmux = system.map_or(false, |s| s.contains("[ZEROCLAW_TMUX_TARGET:"));
         if has_tmux {
             // Extract just the directives from the system prompt and pair with user message.
             let sys = system.unwrap_or("");

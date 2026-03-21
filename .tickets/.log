@@ -59,3 +59,33 @@
 2026-03-20T19:05:26Z need-zero-token-2193 stage triage→done
 2026-03-20T19:19:49Z proactive-automated-ticket-2343 stage triage→done
 2026-03-20T19:19:49Z matrix-room-history-6fdb stage triage→done
+2026-03-20T19:55:08Z shoe-2342-eed3 created
+2026-03-20T20:52:11Z test-room-bot-ff79 created
+2026-03-20T20:57:18Z room-bot-cron-5482 created
+2026-03-20T22:00:30Z room-bot-cron-5482 stage triage→done
+2026-03-20T22:00:31Z shoe-2342-eed3 stage triage→done
+2026-03-20T22:00:31Z test-room-bot-ff79 stage triage→done
+2026-03-20T23:56:39Z restart-run-within-1d9c created
+2026-03-20T23:58:22Z restart-run-within-1d9c stage triage→implement
+2026-03-21T00:06:18Z restart-run-within-1d9c stage implement→done
+2026-03-21T02:21:02Z zero-token-idle-8486 created
+2026-03-21T03:40:46Z zero-token-idle-8486 stage triage→implement
+2026-03-21T03:47:53Z zero-token-idle-8486 stage implement→done
+2026-03-21T04:20:00Z research-downloads-zero-ada4 created
+2026-03-21T04:29:17Z move-matrix-new-b12f stage triage→implement
+2026-03-21T04:29:17Z move-matrix-new-b12f stage implement→test
+2026-03-21T05:10:40Z research-downloads-zero-ada4 stage triage→implement
+2026-03-21T05:13:56Z add-post-edit-fcd7 created
+2026-03-21T05:14:02Z audit-trim-claude-5627 created
+2026-03-21T05:14:08Z formalize-daemon-deploy-53cd created
+2026-03-21T05:14:14Z add-campaign-file-6def created
+2026-03-21T05:14:20Z audit-skills-identity-3b63 created
+2026-03-21T05:14:23Z add-post-edit-fcd7 stage triage→implement
+2026-03-21T05:17:03Z add-post-edit-fcd7 stage implement→done
+2026-03-21T06:00:30Z formalize-daemon-deploy-53cd stage triage→implement
+2026-03-21T06:00:30Z formalize-daemon-deploy-53cd stage implement→test
+2026-03-21T06:00:31Z formalize-daemon-deploy-53cd stage test→verify
+2026-03-21T06:00:31Z audit-trim-claude-5627 stage triage→implement
+2026-03-21T06:00:31Z add-campaign-file-6def stage triage→implement
+2026-03-21T08:00:23Z audit-skills-identity-3b63 stage triage→implement
+2026-03-21T12:00:28Z formalize-daemon-deploy-53cd stage verify→implement
