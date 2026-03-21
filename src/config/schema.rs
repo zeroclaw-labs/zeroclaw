@@ -387,6 +387,10 @@ pub struct Config {
     /// Gemini CLI tool configuration (`[gemini_cli]`).
     #[serde(default)]
     pub gemini_cli: GeminiCliConfig,
+
+    /// OpenCode CLI tool configuration (`[opencode_cli]`).
+    #[serde(default)]
+    pub opencode_cli: OpenCodeCliConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -3104,6 +3108,48 @@ impl Default for GeminiCliConfig {
             enabled: false,
             timeout_secs: default_gemini_cli_timeout_secs(),
             max_output_bytes: default_gemini_cli_max_output_bytes(),
+            env_passthrough: Vec::new(),
+        }
+    }
+}
+
+// ── OpenCode CLI ───────────────────────────────────────────────
+
+/// OpenCode CLI tool configuration (`[opencode_cli]` section).
+///
+/// Delegates coding tasks to the `opencode run` CLI. Authentication uses the
+/// binary's own session by default — no API key needed unless
+/// `env_passthrough` includes provider-specific keys.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenCodeCliConfig {
+    /// Enable the `opencode_cli` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_opencode_cli_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_opencode_cli_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the opencode subprocess
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+fn default_opencode_cli_timeout_secs() -> u64 {
+    600
+}
+
+fn default_opencode_cli_max_output_bytes() -> usize {
+    2_097_152
+}
+
+impl Default for OpenCodeCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_opencode_cli_timeout_secs(),
+            max_output_bytes: default_opencode_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
         }
     }
@@ -6909,6 +6955,7 @@ impl Default for Config {
             claude_code: ClaudeCodeConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
+            opencode_cli: OpenCodeCliConfig::default(),
         }
     }
 }
@@ -9833,6 +9880,7 @@ default_temperature = 0.7
             claude_code: ClaudeCodeConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
+            opencode_cli: OpenCodeCliConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -10216,6 +10264,7 @@ default_temperature = 0.7
             claude_code: ClaudeCodeConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
+            opencode_cli: OpenCodeCliConfig::default(),
         };
 
         config.save().await.unwrap();
