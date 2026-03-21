@@ -5107,7 +5107,6 @@ mod tests {
 
     #[test]
     fn telegram_manager_some_when_valid_config() {
-        std::env::remove_var("GROQ_API_KEY");
         let mut config = crate::config::TranscriptionConfig::default();
         config.enabled = true;
         config.api_key = Some("fake-test-key".to_string()); // Groq registers; no network call
@@ -5118,9 +5117,13 @@ mod tests {
 
     #[test]
     fn telegram_manager_none_on_init_failure() {
-        std::env::remove_var("GROQ_API_KEY");
         let mut config = crate::config::TranscriptionConfig::default();
-        config.enabled = true; // safety net fires: enabled + no key → Groq absent → bail
+        config.enabled = true;
+        // Use an unregistered provider name to trigger init failure without mutating env.
+        // This proves the config-validation path (unknown provider → bail). The
+        // missing-credentials path (valid provider, absent API key) is tested at the
+        // TranscriptionManager layer in transcription.rs where env handling belongs.
+        config.default_provider = "nonexistent_provider".to_string();
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
             .with_transcription(config);
         // Both fields must be None: an invalid config must not leave a partial state where
