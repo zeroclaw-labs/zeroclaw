@@ -392,6 +392,14 @@ pub struct Config {
     #[serde(default)]
     pub claude_code: ClaudeCodeConfig,
 
+    /// Codex CLI tool configuration (`[codex_cli]`).
+    #[serde(default)]
+    pub codex_cli: CodexCliConfig,
+
+    /// Gemini CLI tool configuration (`[gemini_cli]`).
+    #[serde(default)]
+    pub gemini_cli: GeminiCliConfig,
+
     /// Standard Operating Procedures engine configuration (`[sop]`).
     #[serde(default)]
     pub sop: SopConfig,
@@ -3295,6 +3303,90 @@ impl Default for ClaudeCodeConfig {
             allowed_tools: default_claude_code_allowed_tools(),
             system_prompt: None,
             max_output_bytes: default_claude_code_max_output_bytes(),
+            env_passthrough: Vec::new(),
+        }
+    }
+}
+
+// ── Codex CLI ───────────────────────────────────────────────────
+
+/// Codex CLI tool configuration (`[codex_cli]` section).
+///
+/// Delegates coding tasks to the `codex -q` CLI. Authentication uses the
+/// binary's own session by default — no API key needed unless
+/// `env_passthrough` includes `OPENAI_API_KEY`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CodexCliConfig {
+    /// Enable the `codex_cli` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_codex_cli_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_codex_cli_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the codex subprocess (e.g. OPENAI_API_KEY)
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+fn default_codex_cli_timeout_secs() -> u64 {
+    600
+}
+
+fn default_codex_cli_max_output_bytes() -> usize {
+    2_097_152
+}
+
+impl Default for CodexCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_codex_cli_timeout_secs(),
+            max_output_bytes: default_codex_cli_max_output_bytes(),
+            env_passthrough: Vec::new(),
+        }
+    }
+}
+
+// ── Gemini CLI ──────────────────────────────────────────────────
+
+/// Gemini CLI tool configuration (`[gemini_cli]` section).
+///
+/// Delegates coding tasks to the `gemini -p` CLI. Authentication uses the
+/// binary's own session by default — no API key needed unless
+/// `env_passthrough` includes `GOOGLE_API_KEY`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GeminiCliConfig {
+    /// Enable the `gemini_cli` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_gemini_cli_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_gemini_cli_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the gemini subprocess (e.g. GOOGLE_API_KEY)
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+fn default_gemini_cli_timeout_secs() -> u64 {
+    600
+}
+
+fn default_gemini_cli_max_output_bytes() -> usize {
+    2_097_152
+}
+
+impl Default for GeminiCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_gemini_cli_timeout_secs(),
+            max_output_bytes: default_gemini_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
         }
     }
@@ -7344,6 +7436,8 @@ impl Default for Config {
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
+            codex_cli: CodexCliConfig::default(),
+            gemini_cli: GeminiCliConfig::default(),
             sop: SopConfig::default(),
         }
     }
@@ -10399,6 +10493,8 @@ default_temperature = 0.7
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
+            codex_cli: CodexCliConfig::default(),
+            gemini_cli: GeminiCliConfig::default(),
             sop: SopConfig::default(),
         };
 
@@ -10918,6 +11014,8 @@ default_temperature = 0.7
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
+            codex_cli: CodexCliConfig::default(),
+            gemini_cli: GeminiCliConfig::default(),
             sop: SopConfig::default(),
         };
 
