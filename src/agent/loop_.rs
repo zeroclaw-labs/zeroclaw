@@ -5643,10 +5643,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_skips_oversized_image_payload() {
-        // Use EchoProvider since VisionProvider expects image markers,
-        // but oversized images are now gracefully skipped (no markers remain).
-        let provider = EchoProvider;
+    async fn run_tool_call_loop_rejects_image_for_non_vision_provider() {
+        // Non-vision providers reject image markers before prepare_messages
+        // gets a chance to skip oversized images. This is correct: the pre-check
+        // guards against sending [IMAGE:] markers to providers that can't handle them.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
 
         let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
         let mut history = vec![ChatMessage::user(format!(
@@ -5662,8 +5666,7 @@ mod tests {
             vision_mcp_fallback: None,
         };
 
-        // Oversized images are now gracefully skipped instead of rejected.
-        let result = run_tool_call_loop(
+        let err = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -5687,13 +5690,11 @@ mod tests {
             None,
             None,
         )
-        .await;
+        .await
+        .expect_err("non-vision provider must reject image markers");
 
-        let response = result.expect("should succeed with skipped image");
-        assert!(
-            response.contains("image(s) could not be loaded"),
-            "response should mention skipped image: {response}"
-        );
+        assert!(err.to_string().contains("does not support vision"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
