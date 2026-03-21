@@ -843,8 +843,41 @@ pub async fn transcribe_audio(
     // are reported before missing-key errors (preserves original behavior).
     validate_audio(&audio_data, file_name)?;
 
-    let groq = GroqProvider::from_config(config)?;
-    groq.transcribe(&audio_data, file_name).await
+    match config.default_provider.as_str() {
+        "groq" => {
+            let groq = GroqProvider::from_config(config)?;
+            groq.transcribe(&audio_data, file_name).await
+        }
+        "openai" => {
+            let openai_cfg = config.openai.as_ref().context(
+                "Default transcription provider 'openai' is not configured. Add [transcription.openai]",
+            )?;
+            let openai = OpenAiWhisperProvider::from_config(openai_cfg)?;
+            openai.transcribe(&audio_data, file_name).await
+        }
+        "deepgram" => {
+            let deepgram_cfg = config.deepgram.as_ref().context(
+                "Default transcription provider 'deepgram' is not configured. Add [transcription.deepgram]",
+            )?;
+            let deepgram = DeepgramProvider::from_config(deepgram_cfg)?;
+            deepgram.transcribe(&audio_data, file_name).await
+        }
+        "assemblyai" => {
+            let assemblyai_cfg = config.assemblyai.as_ref().context(
+                "Default transcription provider 'assemblyai' is not configured. Add [transcription.assemblyai]",
+            )?;
+            let assemblyai = AssemblyAiProvider::from_config(assemblyai_cfg)?;
+            assemblyai.transcribe(&audio_data, file_name).await
+        }
+        "google" => {
+            let google_cfg = config.google.as_ref().context(
+                "Default transcription provider 'google' is not configured. Add [transcription.google]",
+            )?;
+            let google = GoogleSttProvider::from_config(google_cfg)?;
+            google.transcribe(&audio_data, file_name).await
+        }
+        other => bail!("Unsupported transcription provider '{other}'"),
+    }
 }
 
 #[cfg(test)]
@@ -899,6 +932,25 @@ mod tests {
         assert!(
             err.to_string().contains("Unsupported audio format"),
             "expected unsupported-format error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_default_provider_uses_openai_config() {
+        let data = vec![0u8; 100];
+        let mut config = TranscriptionConfig::default();
+        config.default_provider = "openai".to_string();
+        config.openai = Some(crate::config::OpenAiSttConfig {
+            api_key: None,
+            model: "gpt-4o-mini-transcribe".to_string(),
+        });
+
+        let err = transcribe_audio(data, "test.ogg", &config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("[transcription.openai].api_key"),
+            "expected openai-specific missing-key error, got: {err}"
         );
     }
 

@@ -9,14 +9,15 @@ pub use schema::{
     AgentConfig, AssemblyAiSttConfig, AuditConfig, AutonomyConfig, BackupConfig,
     BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
     ClassificationRule, CloudOpsConfig, ComposioConfig, Config, ConversationalAiConfig, CostConfig,
-    CronConfig, DataRetentionConfig, DeepgramSttConfig, DelegateAgentConfig, DiscordConfig,
-    DockerRuntimeConfig, EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig, EstopConfig,
-    FeishuConfig, GatewayConfig, GoogleSttConfig, GoogleTtsConfig, GoogleWorkspaceConfig,
-    HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig,
-    IMessageConfig, IdentityConfig, ImageProviderDalleConfig, ImageProviderFluxConfig,
-    ImageProviderImagenConfig, ImageProviderStabilityConfig, KnowledgeConfig, LarkConfig,
-    LinkedInConfig, LinkedInContentConfig, LinkedInImageConfig, LocalWhisperConfig, MatrixConfig,
-    McpConfig, McpServerConfig, McpTransport, MemoryConfig, Microsoft365Config, ModelRouteConfig,
+    CronConfig, DataRetentionConfig, DeepgramSttConfig, DelegateAgentConfig, DelegateToolConfig,
+    DiscordConfig, DockerRuntimeConfig, EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig,
+    EstopConfig, FeishuConfig, GatewayConfig, GoogleSttConfig, GoogleTtsConfig,
+    GoogleWorkspaceAllowedOperation, GoogleWorkspaceConfig, HardwareConfig, HardwareTransport,
+    HeartbeatConfig, HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
+    ImageProviderDalleConfig, ImageProviderFluxConfig, ImageProviderImagenConfig,
+    ImageProviderStabilityConfig, JiraConfig, KnowledgeConfig, LarkConfig, LinkedInConfig,
+    LinkedInContentConfig, LinkedInImageConfig, LocalWhisperConfig, MatrixConfig, McpConfig,
+    McpServerConfig, McpTransport, MemoryConfig, Microsoft365Config, ModelRouteConfig,
     MultimodalConfig, NextcloudTalkConfig, NodeTransportConfig, NodesConfig, NotionConfig,
     ObservabilityConfig, OpenAiSttConfig, OpenAiTtsConfig, OpenVpnTunnelConfig, OtpConfig,
     OtpMethod, PeripheralBoardConfig, PeripheralsConfig, PluginsConfig, ProjectIntelConfig,
@@ -25,8 +26,9 @@ pub use schema::{
     SecretsConfig, SecurityConfig, SecurityOpsConfig, SkillCreationConfig, SkillsConfig,
     SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
     StorageProviderSection, StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig,
-    ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig, WorkspaceConfig,
+    TextBrowserConfig, ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig,
+    TunnelConfig, VerifiableIntentConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    WorkspaceConfig, DEFAULT_GWS_SERVICES,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
@@ -63,6 +65,7 @@ mod tests {
             guild_id: Some("123".into()),
             allowed_users: vec![],
             listen_to_bots: false,
+            interrupt_on_new_message: false,
             mention_only: false,
         };
 

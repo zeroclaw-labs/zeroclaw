@@ -76,7 +76,7 @@ Operational note for container users:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `compact_context` | `false` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
+| `compact_context` | `true` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
 | `max_tool_iterations` | `10` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
@@ -349,6 +349,63 @@ Notes:
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
 - Local/private targets are still blocked even when `"*"` is configured.
 
+## `[google_workspace]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable the `google_workspace` tool |
+| `credentials_path` | unset | Path to Google service account or OAuth credentials JSON |
+| `default_account` | unset | Default Google account passed as `--account` to `gws` |
+| `allowed_services` | (built-in list) | Services the agent may access: `drive`, `gmail`, `calendar`, `sheets`, `docs`, `slides`, `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events` |
+| `rate_limit_per_minute` | `60` | Maximum `gws` calls per minute |
+| `timeout_secs` | `30` | Per-call execution timeout before kill |
+| `audit_log` | `false` | Emit an `INFO` log line for every `gws` call |
+
+### `[[google_workspace.allowed_operations]]`
+
+When this array is non-empty, only exact matches pass. An entry matches a call when
+`service`, `resource`, `sub_resource`, and `method` all agree. When the array is
+empty (the default), all combinations within `allowed_services` are available.
+
+| Key | Required | Purpose |
+|---|---|---|
+| `service` | yes | Service identifier (must match an entry in `allowed_services`) |
+| `resource` | yes | Top-level resource name (`users` for Gmail, `files` for Drive, `events` for Calendar) |
+| `sub_resource` | no | Sub-resource for 4-segment gws commands. Gmail operations use `gws gmail users <sub_resource> <method>`, so Gmail entries need `sub_resource` to match at runtime. Drive, Calendar, and most other services use 3-segment commands and omit it. |
+| `methods` | yes | One or more method names allowed on that resource/sub_resource |
+
+Gmail uses `gws gmail users <sub_resource> <method>` for all operations. A Gmail
+entry without `sub_resource` will never match at runtime. Drive and Calendar use
+3-segment commands and omit `sub_resource`.
+
+```toml
+[google_workspace]
+enabled = true
+default_account = "owner@company.com"
+allowed_services = ["gmail"]
+audit_log = true
+
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "users"
+sub_resource = "messages"
+methods = ["list", "get"]
+
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "users"
+sub_resource = "drafts"
+methods = ["list", "get", "create", "update"]
+```
+
+Notes:
+
+- Requires `gws` to be installed and authenticated (`gws auth login`). Install: `npm install -g @googleworkspace/cli`.
+- `credentials_path` sets `GOOGLE_APPLICATION_CREDENTIALS` before each call.
+- `allowed_services` defaults to the built-in list if omitted or empty.
+- Validation rejects duplicate `(service, resource)` pairs and duplicate methods within a single entry.
+- See `docs/superpowers/specs/2026-03-19-google-workspace-operation-allowlist.md` for the full policy model and verified workflow examples.
+
 ## `[gateway]`
 
 | Key | Default | Purpose |
@@ -405,6 +462,30 @@ allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 Notes:
 
 - Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
+
+### `[memory.mem0]`
+
+Mem0 (OpenMemory) backend — connects to a self-hosted mem0 server for vector-based memory with LLM-powered fact extraction. Requires feature flag `memory-mem0` at build time and `backend = "mem0"` in config.
+
+| Key | Default | Env var | Purpose |
+|---|---|---|---|
+| `url` | `http://localhost:8765` | `MEM0_URL` | OpenMemory server URL |
+| `user_id` | `zeroclaw` | `MEM0_USER_ID` | User ID for scoping memories |
+| `app_name` | `zeroclaw` | `MEM0_APP_NAME` | Application name registered in mem0 |
+| `infer` | `true` | — | Use LLM to extract facts from stored text (`true`) or store raw (`false`) |
+| `extraction_prompt` | unset | `MEM0_EXTRACTION_PROMPT` | Custom prompt for LLM fact extraction (e.g. for non-English content) |
+
+```toml
+[memory]
+backend = "mem0"
+
+[memory.mem0]
+url = "http://192.168.0.171:8765"
+user_id = "zeroclaw-bot"
+extraction_prompt = "Extract facts in the original language..."
+```
+
+Server deployment scripts are in `deploy/mem0/`.
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 

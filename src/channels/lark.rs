@@ -217,10 +217,86 @@ const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 
+/// Max byte size for a single interactive card's markdown content.
+/// Lark card payloads have a ~30 KB limit; leave margin for JSON envelope.
+const LARK_CARD_MARKDOWN_MAX_BYTES: usize = 28_000;
+
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
 fn should_refresh_last_recv(msg: &WsMsg) -> bool {
     matches!(msg, WsMsg::Binary(_) | WsMsg::Ping(_) | WsMsg::Pong(_))
+}
+
+/// Build an interactive card JSON string with a single markdown element.
+/// Uses Card JSON 2.0 structure so that headings, tables, blockquotes,
+/// and inline code render correctly.
+fn build_card_content(markdown: &str) -> String {
+    serde_json::json!({
+        "schema": "2.0",
+        "body": {
+            "elements": [{
+                "tag": "markdown",
+                "content": markdown
+            }]
+        }
+    })
+    .to_string()
+}
+
+/// Build the full message body for sending an interactive card message.
+fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::Value {
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": "interactive",
+        "content": build_card_content(markdown),
+    })
+}
+
+/// Split markdown content into chunks that fit within the card size limit.
+/// Splits on line boundaries to avoid breaking markdown syntax.
+fn split_markdown_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
+    if text.len() <= max_bytes {
+        return vec![text];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+
+    while start < text.len() {
+        if start + max_bytes >= text.len() {
+            chunks.push(&text[start..]);
+            break;
+        }
+
+        let end = start + max_bytes;
+        let search_region = &text[start..end];
+        let split_at = search_region
+            .rfind('\n')
+            .map(|pos| start + pos + 1)
+            .unwrap_or(end);
+
+        let split_at = if text.is_char_boundary(split_at) {
+            split_at
+        } else {
+            (start..split_at)
+                .rev()
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(start)
+        };
+
+        if split_at <= start {
+            let forced = (end..=text.len())
+                .find(|&i| text.is_char_boundary(i))
+                .unwrap_or(text.len());
+            chunks.push(&text[start..forced]);
+            start = forced;
+        } else {
+            chunks.push(&text[start..split_at]);
+            start = split_at;
+        }
+    }
+
+    chunks
 }
 
 #[derive(Debug, Clone)]
@@ -823,6 +899,7 @@ impl LarkChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                        interruption_scope_id: None,
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -1120,6 +1197,7 @@ impl LarkChannel {
             channel: self.channel_name().to_string(),
             timestamp,
             thread_ts: None,
+            interruption_scope_id: None,
         });
 
         messages
@@ -1136,33 +1214,31 @@ impl Channel for LarkChannel {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let content = serde_json::json!({ "text": message.content }).to_string();
-        let body = serde_json::json!({
-            "receive_id": message.recipient,
-            "msg_type": "text",
-            "content": content,
-        });
+        let chunks = split_markdown_chunks(&message.content, LARK_CARD_MARKDOWN_MAX_BYTES);
+        for chunk in &chunks {
+            let body = build_interactive_card_body(&message.recipient, chunk);
 
-        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+            let (status, response) = self.send_text_once(&url, &token, &body).await?;
 
-        if should_refresh_lark_tenant_token(status, &response) {
-            // Token expired/invalid, invalidate and retry once.
-            self.invalidate_token().await;
-            let new_token = self.get_tenant_access_token().await?;
-            let (retry_status, retry_response) =
-                self.send_text_once(&url, &new_token, &body).await?;
+            if should_refresh_lark_tenant_token(status, &response) {
+                // Token expired/invalid, invalidate and retry once.
+                self.invalidate_token().await;
+                let new_token = self.get_tenant_access_token().await?;
+                let (retry_status, retry_response) =
+                    self.send_text_once(&url, &new_token, &body).await?;
 
-            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
-                );
+                if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+                    anyhow::bail!(
+                        "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                    );
+                }
+
+                ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+            } else {
+                ensure_lark_send_success(status, &response, "without token refresh")?;
             }
-
-            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
-            return Ok(());
         }
 
-        ensure_lark_send_success(status, &response, "without token refresh")?;
         Ok(())
     }
 
@@ -2413,5 +2489,67 @@ mod tests {
         });
         let selected = random_lark_ack_reaction(Some(&payload), "hello");
         assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
+    }
+
+    #[test]
+    fn build_interactive_card_body_produces_correct_structure() {
+        let body = build_interactive_card_body("oc_chat123", "**Hello** world");
+        assert_eq!(body["receive_id"], "oc_chat123");
+        assert_eq!(body["msg_type"], "interactive");
+
+        let content: serde_json::Value =
+            serde_json::from_str(body["content"].as_str().unwrap()).unwrap();
+        assert_eq!(content["schema"], "2.0");
+        let elements = content["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 1);
+        assert_eq!(elements[0]["tag"], "markdown");
+        assert_eq!(elements[0]["content"], "**Hello** world");
+    }
+
+    #[test]
+    fn build_card_content_produces_valid_json() {
+        let content = build_card_content("# Title\n\n**Bold** text");
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["schema"], "2.0");
+        assert_eq!(parsed["body"]["elements"][0]["tag"], "markdown");
+        assert_eq!(
+            parsed["body"]["elements"][0]["content"],
+            "# Title\n\n**Bold** text"
+        );
+    }
+
+    #[test]
+    fn split_markdown_chunks_single_chunk_for_small_content() {
+        let text = "Hello world";
+        let chunks = split_markdown_chunks(text, LARK_CARD_MARKDOWN_MAX_BYTES);
+        assert_eq!(chunks, vec!["Hello world"]);
+    }
+
+    #[test]
+    fn split_markdown_chunks_splits_on_newline_boundaries() {
+        let line = "abcdefghij\n"; // 11 bytes per line
+        let text = line.repeat(10); // 110 bytes total
+        let chunks = split_markdown_chunks(&text, 33); // ~3 lines per chunk
+        assert_eq!(chunks.len(), 4);
+        for chunk in &chunks[..3] {
+            assert!(chunk.len() <= 33);
+            assert!(chunk.ends_with('\n'));
+        }
+    }
+
+    #[test]
+    fn split_markdown_chunks_handles_no_newlines() {
+        let text = "a".repeat(100);
+        let chunks = split_markdown_chunks(&text, 30);
+        assert!(chunks.len() > 1);
+        let reassembled: String = chunks.concat();
+        assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn split_markdown_chunks_exact_boundary() {
+        let text = "abc";
+        let chunks = split_markdown_chunks(text, 3);
+        assert_eq!(chunks, vec!["abc"]);
     }
 }

@@ -134,15 +134,27 @@ jobs:
             exit 1
           fi
 
+          # Set up SSH key — normalize line endings and ensure trailing newline
           mkdir -p ~/.ssh
-          echo "$AUR_SSH_KEY" > ~/.ssh/aur
+          chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" | tr -d '\r' > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
-          cat >> ~/.ssh/config <<SSH_CONFIG
+
+          cat > ~/.ssh/config <<'SSH_CONFIG'
           Host aur.archlinux.org
             IdentityFile ~/.ssh/aur
             User aur
             StrictHostKeyChecking accept-new
           SSH_CONFIG
+          chmod 600 ~/.ssh/config
+
+          # Verify key is valid and print fingerprint for debugging
+          echo "::group::SSH key diagnostics"
+          ssh-keygen -l -f ~/.ssh/aur || { echo "::error::AUR_SSH_KEY is not a valid SSH private key"; exit 1; }
+          echo "::endgroup::"
+
+          # Test SSH connectivity before attempting clone
+          ssh -T -o BatchMode=yes -o ConnectTimeout=10 aur@aur.archlinux.org 2>&1 || true
 
           tmp_dir="$(mktemp -d)"
           git clone ssh://aur@aur.archlinux.org/zeroclaw.git "$tmp_dir/aur"

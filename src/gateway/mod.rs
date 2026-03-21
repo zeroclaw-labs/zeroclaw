@@ -50,8 +50,21 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
+/// Default request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Read gateway request timeout from `ZEROCLAW_GATEWAY_TIMEOUT_SECS` env var
+/// at runtime, falling back to [`REQUEST_TIMEOUT_SECS`].
+///
+/// Agentic workloads with tool use (web search, MCP tools, sub-agent
+/// delegation) regularly exceed 30 seconds. This allows operators to
+/// increase the timeout without recompiling.
+pub fn gateway_request_timeout_secs() -> u64 {
+    std::env::var("ZEROCLAW_GATEWAY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(REQUEST_TIMEOUT_SECS)
+}
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 /// Fallback max distinct client keys tracked in gateway rate limiter.
@@ -766,6 +779,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/tools", get(api::handle_api_tools))
         .route("/api/cron", get(api::handle_api_cron_list))
         .route("/api/cron", post(api::handle_api_cron_add))
+        .route(
+            "/api/cron/settings",
+            get(api::handle_api_cron_settings_get).patch(api::handle_api_cron_settings_patch),
+        )
         .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
         .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
         .route("/api/integrations", get(api::handle_api_integrations))
@@ -817,7 +834,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .layer(RequestBodyLimitLayer::new(MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            Duration::from_secs(gateway_request_timeout_secs()),
         ))
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback));
@@ -1846,8 +1863,15 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
+    fn security_timeout_default_is_30_seconds() {
         assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn gateway_timeout_falls_back_to_default() {
+        // When env var is not set, should return the default constant
+        std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS");
+        assert_eq!(gateway_request_timeout_secs(), 30);
     }
 
     #[test]
@@ -2169,6 +2193,7 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            interruption_scope_id: None,
         };
 
         let key = whatsapp_memory_key(&msg);

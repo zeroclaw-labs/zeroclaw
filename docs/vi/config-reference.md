@@ -65,7 +65,7 @@ Lưu ý cho người dùng container:
 
 | Khóa | Mặc định | Mục đích |
 |---|---|---|
-| `compact_context` | `false` | Khi bật: bootstrap_max_chars=6000, rag_chunk_limit=2. Dùng cho model 13B trở xuống |
+| `compact_context` | `true` | Khi bật: bootstrap_max_chars=6000, rag_chunk_limit=2. Dùng cho model 13B trở xuống |
 | `max_tool_iterations` | `10` | Số vòng lặp tool-call tối đa mỗi tin nhắn trên CLI, gateway và channels |
 | `max_history_messages` | `50` | Số tin nhắn lịch sử tối đa giữ lại mỗi phiên |
 | `parallel_tools` | `false` | Bật thực thi tool song song trong một lượt |
@@ -252,6 +252,45 @@ Lưu ý:
 - Mặc định từ chối tất cả: nếu `allowed_domains` rỗng, mọi yêu cầu HTTP bị từ chối.
 - Dùng khớp tên miền chính xác hoặc subdomain (ví dụ `"api.example.com"`, `"example.com"`).
 
+## `[google_workspace]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable the `google_workspace` tool |
+| `credentials_path` | unset | Path to Google service account or OAuth credentials JSON |
+| `default_account` | unset | Default Google account passed as `--account` to `gws` |
+| `allowed_services` | (built-in list) | Services the agent may access: `drive`, `gmail`, `calendar`, `sheets`, `docs`, `slides`, `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events` |
+| `rate_limit_per_minute` | `60` | Maximum `gws` calls per minute |
+| `timeout_secs` | `30` | Per-call execution timeout before kill |
+| `audit_log` | `false` | Emit an `INFO` log line for every `gws` call |
+
+### `[[google_workspace.allowed_operations]]`
+
+When non-empty, only exact matches pass. An entry matches a call when `service`,
+`resource`, `sub_resource`, and `method` all agree. When empty (the default), all
+combinations within `allowed_services` are available.
+
+| Key | Required | Purpose |
+|---|---|---|
+| `service` | yes | Service identifier (must match an entry in `allowed_services`) |
+| `resource` | yes | Top-level resource name (`users` for Gmail, `files` for Drive, `events` for Calendar) |
+| `sub_resource` | no | Sub-resource for 4-segment gws commands. Gmail operations use `gws gmail users <sub_resource> <method>`, so Gmail entries need `sub_resource` to match at runtime. Drive, Calendar, and most other services omit it. |
+| `methods` | yes | One or more method names allowed on that resource/sub_resource |
+
+```toml
+[google_workspace]
+enabled = true
+default_account = "owner@company.com"
+allowed_services = ["gmail"]
+audit_log = true
+
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "users"
+sub_resource = "drafts"
+methods = ["list", "get", "create", "update"]
+```
+
 ## `[gateway]`
 
 | Khóa | Mặc định | Mục đích |
@@ -297,6 +336,30 @@ Lưu ý:
 Lưu ý:
 
 - Chèn ngữ cảnh memory bỏ qua khóa auto-save `assistant_resp*` kiểu cũ để tránh tóm tắt do model tạo bị coi là sự thật.
+
+### `[memory.mem0]`
+
+Backend Mem0 (OpenMemory) — kết nối đến server mem0 tự host, cung cấp bộ nhớ vector với trích xuất sự kiện bằng LLM. Cần feature flag `memory-mem0` khi build và `backend = "mem0"` trong config.
+
+| Khóa | Mặc định | Biến môi trường | Mục đích |
+|---|---|---|---|
+| `url` | `http://localhost:8765` | `MEM0_URL` | URL server OpenMemory |
+| `user_id` | `zeroclaw` | `MEM0_USER_ID` | User ID để phân vùng memory |
+| `app_name` | `zeroclaw` | `MEM0_APP_NAME` | Tên ứng dụng đăng ký trong mem0 |
+| `infer` | `true` | — | Dùng LLM trích xuất sự kiện từ text (`true`) hoặc lưu nguyên (`false`) |
+| `extraction_prompt` | chưa đặt | `MEM0_EXTRACTION_PROMPT` | Prompt tùy chỉnh cho trích xuất sự kiện LLM (vd: cho nội dung không phải tiếng Anh) |
+
+```toml
+[memory]
+backend = "mem0"
+
+[memory.mem0]
+url = "http://192.168.0.171:8765"
+user_id = "zeroclaw-bot"
+extraction_prompt = "Trích xuất sự kiện bằng ngôn ngữ gốc..."
+```
+
+Script triển khai server nằm trong `deploy/mem0/`.
 
 ## `[[model_routes]]` và `[[embedding_routes]]`
 

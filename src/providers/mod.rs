@@ -67,6 +67,7 @@ const QWEN_CN_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v
 const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
+const BAILIAN_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
 const QWEN_OAUTH_TOKEN_ENV: &str = "QWEN_OAUTH_TOKEN";
@@ -148,6 +149,10 @@ pub(crate) fn is_qwen_us_alias(name: &str) -> bool {
 
 pub(crate) fn is_qwen_oauth_alias(name: &str) -> bool {
     matches!(name, "qwen-code" | "qwen-oauth" | "qwen_oauth")
+}
+
+pub(crate) fn is_bailian_alias(name: &str) -> bool {
+    matches!(name, "bailian" | "aliyun-bailian" | "aliyun")
 }
 
 pub(crate) fn is_qwen_alias(name: &str) -> bool {
@@ -616,6 +621,8 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("qianfan")
     } else if is_doubao_alias(name) {
         Some("doubao")
+    } else if is_bailian_alias(name) {
+        Some("bailian")
     } else {
         None
     }
@@ -891,6 +898,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
             vec!["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"]
         }
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
+        name if is_bailian_alias(name) => vec!["BAILIAN_API_KEY", "DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
@@ -900,6 +908,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        "avian" => vec!["AVIAN_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1119,13 +1128,10 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => {
-            let mut p = openrouter::OpenRouterProvider::new(key);
-            if let Some(t) = options.provider_timeout_secs {
-                p = p.with_timeout_secs(t);
-            }
-            Ok(Box::new(p))
-        }
+        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(
+            key,
+            options.provider_timeout_secs,
+        ))),
         "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
@@ -1163,9 +1169,12 @@ fn create_provider_with_url_and_options(
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
         // ── OpenAI-compatible providers ──────────────────────
-        "venice" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
-        ))),
+        "venice" => Ok(compat(
+            OpenAiCompatibleProvider::new(
+                "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
+            )
+            .without_native_tools(),
+        )),
         "vercel" | "vercel-ai" => Ok(compat(OpenAiCompatibleProvider::new(
             "Vercel AI Gateway",
             VERCEL_AI_GATEWAY_BASE_URL,
@@ -1265,6 +1274,16 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
+        name if is_bailian_alias(name) => Ok(Box::new(
+            OpenAiCompatibleProvider::new_with_user_agent_and_vision(
+                "Bailian",
+                BAILIAN_BASE_URL,
+                key,
+                AuthStyle::Bearer,
+                "openclaw",
+                true,
+            )
+        )),
         name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
             "Qwen",
             qwen_base_url(name).expect("checked in guard"),
@@ -1476,6 +1495,9 @@ fn create_provider_with_url_and_options(
         ))),
         "hunyuan" | "tencent" => Ok(compat(OpenAiCompatibleProvider::new(
             "Tencent Hunyuan", "https://api.hunyuan.cloud.tencent.com/v1", key, AuthStyle::Bearer,
+        ))),
+        "avian" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Avian", "https://api.avian.io/v1", key, AuthStyle::Bearer,
         ))),
 
         // ── Cloud AI endpoints ───────────────────────────────
@@ -1898,6 +1920,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "bailian",
+            display_name: "Bailian (Aliyun)",
+            aliases: &["aliyun-bailian", "aliyun"],
+            local: false,
+        },
+        ProviderInfo {
             name: "groq",
             display_name: "Groq",
             aliases: &[],
@@ -2141,6 +2169,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             aliases: &["ovh"],
             local: false,
         },
+        ProviderInfo {
+            name: "avian",
+            display_name: "Avian",
+            aliases: &[],
+            local: false,
+        },
     ]
 }
 
@@ -2373,6 +2407,12 @@ mod tests {
         assert_eq!(canonical_china_provider_name("baidu"), Some("qianfan"));
         assert_eq!(canonical_china_provider_name("doubao"), Some("doubao"));
         assert_eq!(canonical_china_provider_name("volcengine"), Some("doubao"));
+        assert_eq!(canonical_china_provider_name("bailian"), Some("bailian"));
+        assert_eq!(
+            canonical_china_provider_name("aliyun-bailian"),
+            Some("bailian")
+        );
+        assert_eq!(canonical_china_provider_name("aliyun"), Some("bailian"));
         assert_eq!(canonical_china_provider_name("openai"), None);
     }
 
@@ -2460,7 +2500,11 @@ mod tests {
 
     #[test]
     fn factory_venice() {
-        assert!(create_provider("venice", Some("vn-key")).is_ok());
+        let provider = create_provider("venice", Some("vn-key")).unwrap();
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "Venice should use prompt-guided tools, not native tool calling"
+        );
     }
 
     #[test]
@@ -2823,6 +2867,11 @@ mod tests {
         assert!(create_provider("astrai", Some("sk-astrai-test")).is_ok());
     }
 
+    #[test]
+    fn factory_avian() {
+        assert!(create_provider("avian", Some("sk-avian-test")).is_ok());
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -3147,6 +3196,7 @@ mod tests {
             "kilocli",
             "nvidia",
             "astrai",
+            "avian",
             "ovhcloud",
         ];
         for name in providers {

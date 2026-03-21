@@ -31,6 +31,7 @@ hardware_memory_map = "Return the memory map (flash and RAM address ranges) for 
 hardware_memory_read = "Read actual memory/register values from Nucleo via USB. Use when: user asks to 'read register values', 'read memory at address', 'dump memory', 'lower memory 0-126', or 'give address and value'. Returns hex dump. Requires Nucleo connected via USB and probe feature. Params: address (hex, e.g. 0x20000000 for RAM start), length (bytes, default 128)."
 http_request = "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. Security constraints: allowlist-only domains, no local/private hosts, configurable timeout and response size limits."
 image_info = "Read image file metadata (format, dimensions, size) and optionally return base64-encoded data."
+jira = "Interact with Jira: get tickets with configurable detail level, search issues with JQL, and add comments with mention and formatting support."
 knowledge = "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats."
 linkedin = "Manage LinkedIn: create posts, list your posts, comment, react, delete posts, view engagement, get profile info, and read the configured content strategy. Requires LINKEDIN_* credentials in .env file."
 memory_forget = "Remove a memory by key. Use to delete outdated facts or sensitive data. Returns whether the memory was found and removed."

@@ -172,11 +172,41 @@ export default function AgentChat() {
   };
 
   const handleCopy = useCallback((msgId: string, content: string) => {
-    navigator.clipboard.writeText(content).then(() => {
+    const onSuccess = () => {
       setCopiedId(msgId);
       setTimeout(() => setCopiedId((prev) => (prev === msgId ? null : prev)), 2000);
-    });
+    };
+
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(content).then(onSuccess).catch(() => {
+        // Fallback for insecure contexts (HTTP)
+        fallbackCopy(content) && onSuccess();
+      });
+    } else {
+      fallbackCopy(content) && onSuccess();
+    }
   }, []);
+
+  /**
+   * Fallback copy using a temporary textarea for HTTP contexts
+   * where navigator.clipboard is unavailable.
+   */
+  function fallbackCopy(text: string): boolean {
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.appendChild(textarea);
+    textarea.select();
+    try {
+      document.execCommand('copy');
+      return true;
+    } catch {
+      return false;
+    } finally {
+      document.body.removeChild(textarea);
+    }
+  }
 
   return (
     <div className="flex flex-col h-[calc(100vh-3.5rem)]">
