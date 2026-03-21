@@ -27,6 +27,7 @@ COPY Cargo.toml Cargo.lock ./
 # Previously we used sed to drop `crates/robot-kit`, which made the manifest disagree
 # with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
 COPY crates/robot-kit/ crates/robot-kit/
+COPY crates/aardvark-sys/ crates/aardvark-sys/
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
 RUN mkdir -p src benches \
     && echo "fn main() {}" > src/main.rs \
