@@ -49,8 +49,13 @@ export default function Memory() {
     fetchEntries();
   }, []);
 
-  const handleSearch = () => { fetchEntries(search, categoryFilter); };
-  const handleKeyDown = (e: React.KeyboardEvent) => { if (e.key === 'Enter') handleSearch(); };
+  const handleSearch = () => {
+    fetchEntries(search, categoryFilter);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') handleSearch();
+  };
   const categories = Array.from(new Set(entries.map((e) => e.category))).sort();
 
   const handleAdd = async () => {

@@ -77,7 +77,9 @@ export default function Logs() {
     };
     client.connect();
     sseRef.current = client;
-    return () => { client.disconnect(); };
+    return () => {
+      client.disconnect();
+    };
   }, []);
 
   // Auto-scroll to bottom

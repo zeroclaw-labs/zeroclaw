@@ -23,6 +23,7 @@ interface LocaleContextType {
   locale: string;
   setAppLocale: (locale: string) => void;
 }
+
 export const LocaleContext = createContext<LocaleContextType>({
   locale: 'en',
   setAppLocale: () => {},
@@ -39,7 +40,10 @@ interface ErrorBoundaryState {
   error: Error | null;
 }
 
-export class ErrorBoundary extends Component<{ children: ReactNode }, ErrorBoundaryState> {
+export class ErrorBoundary extends Component<
+  { children: ReactNode },
+  ErrorBoundaryState
+> {
   constructor(props: { children: ReactNode }) {
     super(props);
     this.state = { error: null };
@@ -101,7 +105,9 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
       .catch(() => {
         // Admin endpoint not reachable (non-localhost) — user must check terminal
       })
-      .finally(() => { if (!cancelled) setCodeLoading(false); });
+      .finally(() => {
+        if (!cancelled) setCodeLoading(false);
+      });
     return () => { cancelled = true; };
   }, []);
 
@@ -159,9 +165,10 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
           {error && (
             <p className="text-sm mb-4 text-center animate-fade-in" style={{ color: 'var(--color-status-error)' }}>{error}</p>
           )}
-          <button type="submit"
-                  disabled={loading || code.length < 6}
-                  className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide"
+          <button
+            type="submit"
+            disabled={loading || code.length < 6}
+            className="btn-electric w-full py-3.5 text-sm font-semibold tracking-wide"
           >
             {loading ? (
               <span className="flex items-center justify-center gap-2">
@@ -188,7 +195,9 @@ function AppContent() {
 
   // Listen for 401 events to force logout
   useEffect(() => {
-    const handler = () => { logout(); };
+    const handler = () => {
+      logout();
+    };
     window.addEventListener('zeroclaw-unauthorized', handler);
     return () => window.removeEventListener('zeroclaw-unauthorized', handler);
   }, [logout]);
