@@ -3939,7 +3939,16 @@ pub struct AutonomyConfig {
 }
 
 fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into()]
+    vec![
+        "file_read".into(),
+        "memory_recall".into(),
+        "web_search_tool".into(),
+        "web_fetch".into(),
+        "calculator".into(),
+        "glob_search".into(),
+        "content_search".into(),
+        "image_info".into(),
+    ]
 }
 
 fn default_always_ask() -> Vec<String> {
@@ -5103,6 +5112,36 @@ impl ChannelConfig for SignalConfig {
     }
 }
 
+/// WhatsApp Web usage mode.
+///
+/// `Personal` treats the account as a personal phone — the bot only responds to
+/// incoming messages that pass the DM/group/self-chat policy filters.
+/// `Business` (default) responds to all incoming messages, subject only to the
+/// `allowed_numbers` allowlist.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WhatsAppWebMode {
+    /// Respond to all messages passing the allowlist (default).
+    #[default]
+    Business,
+    /// Apply per-chat-type policies (dm_policy, group_policy, self_chat_mode).
+    Personal,
+}
+
+/// Policy for a particular WhatsApp chat type (DMs or groups) when
+/// `mode = "personal"`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum WhatsAppChatPolicy {
+    /// Only respond to senders on the `allowed_numbers` list (default).
+    #[default]
+    Allowlist,
+    /// Ignore all messages in this chat type.
+    Ignore,
+    /// Respond to every message regardless of allowlist.
+    All,
+}
+
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
@@ -5139,6 +5178,23 @@ pub struct WhatsAppConfig {
     /// Allowed phone numbers (E.164 format: +1234567890) or "*" for all
     #[serde(default)]
     pub allowed_numbers: Vec<String>,
+    /// Usage mode for WhatsApp Web: "business" (default) or "personal".
+    /// In personal mode the bot applies dm_policy, group_policy, and
+    /// self_chat_mode to decide which chats to respond in.
+    #[serde(default)]
+    pub mode: WhatsAppWebMode,
+    /// Policy for direct messages when mode = "personal".
+    /// "allowlist" (default) | "ignore" | "all".
+    #[serde(default)]
+    pub dm_policy: WhatsAppChatPolicy,
+    /// Policy for group chats when mode = "personal".
+    /// "allowlist" (default) | "ignore" | "all".
+    #[serde(default)]
+    pub group_policy: WhatsAppChatPolicy,
+    /// When true and mode = "personal", always respond to messages in the
+    /// user's own self-chat (Notes to Self). Defaults to false.
+    #[serde(default)]
+    pub self_chat_mode: bool,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -6541,14 +6597,23 @@ async fn load_persisted_workspace_dirs(
 }
 
 pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Result<()> {
-    let default_config_dir = default_config_dir()?;
-    let state_path = active_workspace_state_path(&default_config_dir);
+    persist_active_workspace_config_dir_in(config_dir, &default_config_dir()?).await
+}
 
-    // Guard: never persist a temp-directory path as the active workspace.
-    // This prevents transient test runs or one-off invocations from hijacking
-    // the daemon's config resolution.
-    #[cfg(not(test))]
-    if is_temp_directory(config_dir) {
+/// Inner implementation that accepts the default config directory explicitly,
+/// so callers (including tests) control where the marker is written without
+/// manipulating process-wide environment variables.
+async fn persist_active_workspace_config_dir_in(
+    config_dir: &Path,
+    default_config_dir: &Path,
+) -> Result<()> {
+    let state_path = active_workspace_state_path(default_config_dir);
+
+    // Guard: refuse to write a temp-directory config_dir into a non-temp
+    // default location. This prevents transient test runs or one-off
+    // invocations from hijacking the real user's daemon config resolution.
+    // When both paths are temp (e.g. in tests), the write is harmless.
+    if is_temp_directory(config_dir) && !is_temp_directory(default_config_dir) {
         tracing::warn!(
             path = %config_dir.display(),
             "Refusing to persist temp directory as active workspace marker"
@@ -6602,7 +6667,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
         );
     }
 
-    sync_directory(&default_config_dir).await?;
+    sync_directory(default_config_dir).await?;
     Ok(())
 }
 
@@ -10256,6 +10321,10 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1234567890".into(), "+9876543210".into()],
+            mode: WhatsAppWebMode::default(),
+            dm_policy: WhatsAppChatPolicy::default(),
+            group_policy: WhatsAppChatPolicy::default(),
+            self_chat_mode: false,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -10276,6 +10345,10 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            mode: WhatsAppWebMode::default(),
+            dm_policy: WhatsAppChatPolicy::default(),
+            group_policy: WhatsAppChatPolicy::default(),
+            self_chat_mode: false,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -10301,6 +10374,10 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["*".into()],
+            mode: WhatsAppWebMode::default(),
+            dm_policy: WhatsAppChatPolicy::default(),
+            group_policy: WhatsAppChatPolicy::default(),
+            self_chat_mode: false,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -10318,6 +10395,10 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec!["+1".into()],
+            mode: WhatsAppWebMode::default(),
+            dm_policy: WhatsAppChatPolicy::default(),
+            group_policy: WhatsAppChatPolicy::default(),
+            self_chat_mode: false,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -10334,6 +10415,10 @@ channel_id = "C123"
             pair_phone: None,
             pair_code: None,
             allowed_numbers: vec![],
+            mode: WhatsAppWebMode::default(),
+            dm_policy: WhatsAppChatPolicy::default(),
+            group_policy: WhatsAppChatPolicy::default(),
+            self_chat_mode: false,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -10360,6 +10445,10 @@ channel_id = "C123"
                 pair_phone: None,
                 pair_code: None,
                 allowed_numbers: vec!["+1".into()],
+                mode: WhatsAppWebMode::default(),
+                dm_policy: WhatsAppChatPolicy::default(),
+                group_policy: WhatsAppChatPolicy::default(),
+                self_chat_mode: false,
             }),
             linq: None,
             wati: None,
@@ -11386,6 +11475,7 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let temp_default_dir = temp_home.join(".zeroclaw");
         let custom_config_dir = temp_home.join("profiles").join("agent-alpha");
 
         fs::create_dir_all(&custom_config_dir).await.unwrap();
@@ -11396,13 +11486,18 @@ default_model = "legacy-model"
         .await
         .unwrap();
 
+        // Write the marker using the explicit default dir (no HOME manipulation
+        // needed for the persist call itself).
+        persist_active_workspace_config_dir_in(&custom_config_dir, &temp_default_dir)
+            .await
+            .unwrap();
+
+        // Config::load_or_init still reads HOME to find the marker, so we
+        // must override HOME here. The persist above already wrote to the
+        // correct temp location, so no stale marker can leak.
         let original_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &temp_home);
         std::env::remove_var("ZEROCLAW_WORKSPACE");
-
-        persist_active_workspace_config_dir(&custom_config_dir)
-            .await
-            .unwrap();
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
 
@@ -11423,6 +11518,7 @@ default_model = "legacy-model"
         let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let temp_default_dir = temp_home.join(".zeroclaw");
         let marker_config_dir = temp_home.join("profiles").join("persisted-profile");
         let env_workspace_dir = temp_home.join("env-workspace");
 
@@ -11434,11 +11530,13 @@ default_model = "legacy-model"
         .await
         .unwrap();
 
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        persist_active_workspace_config_dir(&marker_config_dir)
+        // Write marker via explicit default dir, then set HOME for load_or_init.
+        persist_active_workspace_config_dir_in(&marker_config_dir, &temp_default_dir)
             .await
             .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &temp_home);
         std::env::set_var("ZEROCLAW_WORKSPACE", &env_workspace_dir);
 
         let config = Box::pin(Config::load_or_init()).await.unwrap();
@@ -11457,31 +11555,24 @@ default_model = "legacy-model"
 
     #[test]
     async fn persist_active_workspace_marker_is_cleared_for_default_config_dir() {
-        let _env_guard = env_override_lock().await;
         let temp_home =
             std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
         let default_config_dir = temp_home.join(".zeroclaw");
         let custom_config_dir = temp_home.join("profiles").join("custom-profile");
         let marker_path = default_config_dir.join(ACTIVE_WORKSPACE_STATE_FILE);
 
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-
-        persist_active_workspace_config_dir(&custom_config_dir)
+        // Use the _in variant directly -- no HOME manipulation needed since
+        // this test only exercises persist/clear logic, not Config::load_or_init.
+        persist_active_workspace_config_dir_in(&custom_config_dir, &default_config_dir)
             .await
             .unwrap();
         assert!(marker_path.exists());
 
-        persist_active_workspace_config_dir(&default_config_dir)
+        persist_active_workspace_config_dir_in(&default_config_dir, &default_config_dir)
             .await
             .unwrap();
         assert!(!marker_path.exists());
 
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_dir_all(temp_home).await;
     }
 

@@ -300,7 +300,7 @@ React 19 + Vite 6 + Tailwind CSS 4 web dashboard served directly from the Gatewa
 
 - **Core:** shell, file read/write/edit, git operations, glob search, content search
 - **Web:** browser control, web fetch, web search, screenshot, image info, PDF read
-- **Integrations:** Jira, Notion, Google Workspace, Microsoft 365, LinkedIn, Composio, Pushover
+- **Integrations:** Jira, Notion, Google Workspace, Microsoft 365, LinkedIn, Composio, Pushover, Weather (wttr.in)
 - **MCP:** Model Context Protocol tool wrapper + deferred tool sets
 - **Scheduling:** cron add/remove/update/run, schedule tool
 - **Memory:** recall, store, forget, knowledge, project intel

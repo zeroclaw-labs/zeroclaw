@@ -78,6 +78,14 @@ pub struct CronAddBody {
     pub delete_after_run: Option<bool>,
 }
 
+#[derive(Deserialize)]
+pub struct CronPatchBody {
+    pub name: Option<String>,
+    pub schedule: Option<String>,
+    pub command: Option<String>,
+    pub prompt: Option<String>,
+}
+
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/status — system status overview
@@ -228,27 +236,7 @@ pub async fn handle_api_cron_list(
 
     let config = state.config.lock().clone();
     match crate::cron::list_jobs(&config) {
-        Ok(jobs) => {
-            let jobs_json: Vec<serde_json::Value> = jobs
-                .iter()
-                .map(|job| {
-                    serde_json::json!({
-                        "id": job.id,
-                        "name": job.name,
-                        "job_type": job.job_type,
-                        "command": job.command,
-                        "prompt": job.prompt,
-                        "schedule": job.schedule,
-                        "next_run": job.next_run.to_rfc3339(),
-                        "last_run": job.last_run.map(|t| t.to_rfc3339()),
-                        "last_status": job.last_status,
-                        "enabled": job.enabled,
-                        "delivery": job.delivery,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({"jobs": jobs_json})).into_response()
-        }
+        Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to list cron jobs: {e}")})),
@@ -344,20 +332,7 @@ pub async fn handle_api_cron_add(
     };
 
     match result {
-        Ok(job) => Json(serde_json::json!({
-            "status": "ok",
-            "job": {
-                "id": job.id,
-                "name": job.name,
-                "job_type": job.job_type,
-                "command": job.command,
-                "prompt": job.prompt,
-                "schedule": job.schedule,
-                "enabled": job.enabled,
-                "delivery": job.delivery,
-            }
-        }))
-        .into_response(),
+        Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
@@ -410,6 +385,66 @@ pub async fn handle_api_cron_runs(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to list cron runs: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PATCH /api/cron/:id — update an existing cron job
+pub async fn handle_api_cron_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CronPatchBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    // Build the schedule from the provided expression string (if any).
+    let schedule = match body.schedule {
+        Some(expr) if !expr.trim().is_empty() => Some(crate::cron::Schedule::Cron {
+            expr: expr.trim().to_string(),
+            tz: None,
+        }),
+        _ => None,
+    };
+
+    // Route the edited text to the correct field based on the job's stored type.
+    // The frontend sends a single textarea value; for agent jobs it is the prompt,
+    // for shell jobs it is the command.
+    let existing = match crate::cron::get_job(&config, &id) {
+        Ok(j) => j,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let is_agent = matches!(existing.job_type, crate::cron::JobType::Agent);
+    let (patch_command, patch_prompt) = if is_agent {
+        (None, body.command.or(body.prompt))
+    } else {
+        (body.command.or(body.prompt), None)
+    };
+
+    let patch = crate::cron::CronJobPatch {
+        name: body.name,
+        schedule,
+        command: patch_command,
+        prompt: patch_prompt,
+        ..crate::cron::CronJobPatch::default()
+    };
+
+    match crate::cron::update_shell_job_with_approval(&config, &id, patch, false) {
+        Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to update cron job: {e}")})),
         )
             .into_response(),
     }
