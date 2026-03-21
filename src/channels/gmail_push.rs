@@ -648,8 +648,14 @@ fn decode_body(body: Option<&MessageBody>) -> Option<String> {
         b.data.as_ref().and_then(|data| {
             // Gmail API uses URL-safe base64 without padding
             let standard = data.replace('-', "+").replace('_', "/");
+            // Restore padding stripped by Gmail API
+            let padded = match standard.len() % 4 {
+                2 => format!("{standard}=="),
+                3 => format!("{standard}="),
+                _ => standard,
+            };
             BASE64
-                .decode(&standard)
+                .decode(&padded)
                 .ok()
                 .and_then(|bytes| String::from_utf8(bytes).ok())
         })
