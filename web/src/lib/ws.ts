@@ -1,5 +1,6 @@
 import type { WsMessage } from '../types/api';
 import { getToken } from './auth';
+import { basePath } from './basePath';
 import { generateUUID } from './uuid';
 
 export type WsMessageHandler = (msg: WsMessage) => void;
@@ -69,7 +70,7 @@ export class WebSocketClient {
     const params = new URLSearchParams();
     if (token) params.set('token', token);
     params.set('session_id', sessionId);
-    const url = `${this.baseUrl}/ws/chat?${params.toString()}`;
+    const url = `${this.baseUrl}${basePath}/ws/chat?${params.toString()}`;
 
     const protocols: string[] = ['zeroclaw.v1'];
     if (token) protocols.push(`bearer.${token}`);

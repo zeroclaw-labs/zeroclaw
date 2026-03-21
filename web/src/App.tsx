@@ -16,6 +16,7 @@ import Pairing from './pages/Pairing';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
+import { basePath } from './lib/basePath';
 import { getAdminPairCode } from './lib/api';
 
 // Locale context
@@ -131,7 +132,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
         <div className="text-center mb-8">
           <img
-            src="/_app/zeroclaw-trans.png"
+            src={`${basePath}/_app/zeroclaw-trans.png`}
             alt="ZeroClaw"
             className="h-20 w-20 rounded-2xl object-cover mx-auto mb-4 animate-float"
             onError={(e) => { e.currentTarget.style.display = 'none'; }}
