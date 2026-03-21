@@ -1,5 +1,8 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
+use crate::config::schema::ModelPricing;
 use crate::config::Config;
+use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
+use crate::cost::CostTracker;
 use crate::i18n::ToolDescriptions;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::multimodal;
@@ -22,6 +25,108 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+// ── Cost tracking via task-local ──
+
+/// Context for cost tracking within the tool call loop.
+/// Scoped via `tokio::task_local!` at call sites (channels, gateway).
+#[derive(Clone)]
+pub(crate) struct ToolLoopCostTrackingContext {
+    pub tracker: Arc<CostTracker>,
+    pub prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+}
+
+impl ToolLoopCostTrackingContext {
+    pub(crate) fn new(
+        tracker: Arc<CostTracker>,
+        prices: Arc<std::collections::HashMap<String, ModelPricing>>,
+    ) -> Self {
+        Self { tracker, prices }
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
+}
+
+/// 3-tier model pricing lookup:
+/// 1. Direct model name
+/// 2. Qualified `provider/model`
+/// 3. Suffix after last `/`
+fn lookup_model_pricing<'a>(
+    prices: &'a std::collections::HashMap<String, ModelPricing>,
+    provider_name: &str,
+    model: &str,
+) -> Option<&'a ModelPricing> {
+    prices
+        .get(model)
+        .or_else(|| prices.get(&format!("{provider_name}/{model}")))
+        .or_else(|| {
+            model
+                .rsplit_once('/')
+                .and_then(|(_, suffix)| prices.get(suffix))
+        })
+}
+
+/// Record token usage from an LLM response via the task-local cost tracker.
+/// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
+fn record_tool_loop_cost_usage(
+    provider_name: &str,
+    model: &str,
+    usage: &crate::providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    let input_tokens = usage.input_tokens.unwrap_or(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0);
+    let total_tokens = input_tokens.saturating_add(output_tokens);
+    if total_tokens == 0 {
+        return None;
+    }
+
+    let ctx = TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()?;
+    let pricing = lookup_model_pricing(&ctx.prices, provider_name, model);
+    let cost_usage = CostTokenUsage::new(
+        model,
+        input_tokens,
+        output_tokens,
+        pricing.map_or(0.0, |entry| entry.input),
+        pricing.map_or(0.0, |entry| entry.output),
+    );
+
+    if pricing.is_none() {
+        tracing::debug!(
+            provider = provider_name,
+            model,
+            "Cost tracking recorded token usage with zero pricing (no pricing entry found)"
+        );
+    }
+
+    if let Err(error) = ctx.tracker.record_usage(cost_usage.clone()) {
+        tracing::warn!(
+            provider = provider_name,
+            model,
+            "Failed to record cost tracking usage: {error}"
+        );
+    }
+
+    Some((cost_usage.total_tokens, cost_usage.cost_usd))
+}
+
+/// Check budget before an LLM call. Returns `None` when no cost tracking
+/// context is scoped (tests, delegate, CLI without cost config).
+pub(crate) fn check_tool_loop_budget() -> Option<BudgetCheck> {
+    TOOL_LOOP_COST_TRACKING_CONTEXT
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .map(|ctx| {
+            ctx.tracker
+                .check_budget(0.0)
+                .unwrap_or(BudgetCheck::Allowed)
+        })
+}
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
@@ -2642,6 +2747,19 @@ pub(crate) async fn run_tool_call_loop(
             hooks.fire_llm_input(history, model).await;
         }
 
+        // Budget enforcement — block if limit exceeded (no-op when not scoped)
+        if let Some(BudgetCheck::Exceeded {
+            current_usd,
+            limit_usd,
+            period,
+        }) = check_tool_loop_budget()
+        {
+            return Err(anyhow::anyhow!(
+                "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
+                current_usd, limit_usd, period
+            ));
+        }
+
         // Unified path via Provider::chat so provider-specific native tool logic
         // (OpenAI/Anthropic/OpenRouter/compatible adapters) is honored.
         let request_tools = if use_native_tools {
@@ -2686,6 +2804,12 @@ pub(crate) async fn run_tool_call_loop(
                         input_tokens: resp_input_tokens,
                         output_tokens: resp_output_tokens,
                     });
+
+                    // Record cost via task-local tracker (no-op when not scoped)
+                    let _ = resp
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
 
                     let response_text = resp.text_or_empty().to_string();
                     // First try native structured tool calls (OpenAI-format).
@@ -7661,5 +7785,213 @@ Let me check the result."#;
         let allowed: Vec<String> = vec![];
         let result = filter_by_allowed_tools(specs, Some(&allowed));
         assert!(result.is_empty());
+    }
+
+    // ── Cost tracking tests ──
+
+    #[tokio::test]
+    async fn cost_tracking_records_usage_when_scoped() {
+        use super::{
+            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+        };
+        use crate::config::schema::ModelPricing;
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(1_000),
+                    output_tokens: Some(200),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut cost_config = crate::config::CostConfig {
+            enabled: true,
+            ..crate::config::CostConfig::default()
+        };
+        cost_config.prices = HashMap::from([(
+            "mock-model".to_string(),
+            ModelPricing {
+                input: 3.0,
+                output: 15.0,
+            },
+        )]);
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(cost_config.prices.clone()),
+        );
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &[],
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "test",
+                    None,
+                    &crate::config::MultimodalConfig::default(),
+                    2,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("tool loop should succeed");
+
+        assert_eq!(result, "done");
+        let summary = tracker.get_summary().unwrap();
+        assert_eq!(summary.request_count, 1);
+        assert_eq!(summary.total_tokens, 1_200);
+        assert!(summary.session_cost_usd > 0.0);
+    }
+
+    #[tokio::test]
+    async fn cost_tracking_enforces_budget() {
+        use super::{
+            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+        };
+        use crate::config::schema::ModelPricing;
+        use crate::cost::CostTracker;
+        use crate::observability::noop::NoopObserver;
+        use std::collections::HashMap;
+
+        let provider = ScriptedProvider::from_text_responses(vec!["should not reach this"]);
+        let observer = NoopObserver;
+        let workspace = tempfile::TempDir::new().unwrap();
+        let cost_config = crate::config::CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.001, // very low limit
+            ..crate::config::CostConfig::default()
+        };
+        let tracker = Arc::new(CostTracker::new(cost_config.clone(), workspace.path()).unwrap());
+        // Record a usage that already exceeds the limit
+        tracker
+            .record_usage(crate::cost::types::TokenUsage::new(
+                "mock-model",
+                100_000,
+                50_000,
+                1.0,
+                1.0,
+            ))
+            .unwrap();
+
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "mock-model".to_string(),
+                ModelPricing {
+                    input: 1.0,
+                    output: 1.0,
+                },
+            )])),
+        );
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let err = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(
+                Some(ctx),
+                run_tool_call_loop(
+                    &provider,
+                    &mut history,
+                    &[],
+                    &observer,
+                    "mock-provider",
+                    "mock-model",
+                    0.0,
+                    true,
+                    None,
+                    "test",
+                    None,
+                    &crate::config::MultimodalConfig::default(),
+                    2,
+                    None,
+                    None,
+                    None,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect_err("should fail with budget exceeded");
+
+        assert!(
+            err.to_string().contains("Budget exceeded"),
+            "error should mention budget: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cost_tracking_is_noop_without_scope() {
+        use super::run_tool_call_loop;
+        use crate::observability::noop::NoopObserver;
+
+        // No TOOL_LOOP_COST_TRACKING_CONTEXT scoped — should run fine
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(crate::providers::traits::TokenUsage {
+                    input_tokens: Some(500),
+                    output_tokens: Some(100),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            }]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+        let observer = NoopObserver;
+        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &[],
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "test",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            2,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .await
+        .expect("should succeed without cost scope");
+
+        assert_eq!(result, "ok");
     }
 }
