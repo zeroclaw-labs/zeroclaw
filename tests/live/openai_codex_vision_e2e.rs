@@ -155,6 +155,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         provider_timeout_secs: None,
         extra_headers: std::collections::HashMap::new(),
         api_path: None,
+        extra_request_body: std::collections::HashMap::new(),
     };
 
     let provider = zeroclaw::providers::create_provider_with_options("openai-codex", None, &opts)?;

@@ -726,6 +726,7 @@ pub fn all_tools_with_runtime(
         provider_timeout_secs: Some(root_config.provider_timeout_secs),
         extra_headers: root_config.extra_headers.clone(),
         api_path: root_config.api_path.clone(),
+        extra_request_body: root_config.extra_request_body.clone(),
     };
 
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {

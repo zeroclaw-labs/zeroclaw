@@ -697,6 +697,9 @@ pub struct ProviderRuntimeOptions {
     /// Custom API path suffix for OpenAI-compatible providers
     /// (e.g. "/v2/generate" instead of the default "/chat/completions").
     pub api_path: Option<String>,
+    /// Extra fields to include in every LLM provider request body.
+    /// Useful for provider-specific parameters (e.g. `enable_thinking: false`).
+    pub extra_request_body: std::collections::HashMap<String, serde_json::Value>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -711,6 +714,7 @@ impl Default for ProviderRuntimeOptions {
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
+            extra_request_body: std::collections::HashMap::new(),
         }
     }
 }
@@ -728,6 +732,7 @@ pub fn provider_runtime_options_from_config(
         provider_timeout_secs: Some(config.provider_timeout_secs),
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
+        extra_request_body: config.extra_request_body.clone(),
     }
 }
 
@@ -1067,6 +1072,7 @@ fn create_provider_with_url_and_options(
         let reasoning_effort = options.reasoning_effort.clone();
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
+        let extra_request_body = options.extra_request_body.clone();
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
             let mut p = p;
             if let Some(t) = timeout {
@@ -1080,6 +1086,9 @@ fn create_provider_with_url_and_options(
             }
             if api_path.is_some() {
                 p = p.with_api_path(api_path.clone());
+            }
+            if !extra_request_body.is_empty() {
+                p = p.with_extra_request_body(extra_request_body.clone());
             }
             Box::new(p)
         }
