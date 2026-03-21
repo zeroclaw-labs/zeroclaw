@@ -330,6 +330,7 @@ pub struct TelegramChannel {
     /// Override for local Bot API servers or testing.
     api_base: String,
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
@@ -375,6 +376,7 @@ impl TelegramChannel {
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
+            transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
@@ -424,6 +426,16 @@ impl TelegramChannel {
     /// Configure voice transcription.
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
         if config.enabled {
+            match super::transcription::TranscriptionManager::new(&config) {
+                Ok(m) => {
+                    self.transcription_manager = Some(Arc::new(m));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "transcription manager init failed, voice transcription disabled: {e}"
+                    );
+                }
+            }
             self.transcription = Some(config);
         }
         self
@@ -1211,6 +1223,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
+        let manager = self.transcription_manager.as_deref()?;
+
         // Download and transcribe
         let file_path = match self.get_file_path(&file_id).await {
             Ok(p) => p,
@@ -1234,14 +1248,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text =
-            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Voice transcription failed: {e}");
-                    return None;
-                }
-            };
+        let text = match manager.transcribe(&audio_data, &file_name).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Voice transcription failed: {e}");
+                return None;
+            }
+        };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");
@@ -5073,5 +5086,34 @@ mod tests {
         let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
         let content = format!("{attr}{photo_content}");
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
+    }
+
+    // ── TranscriptionManager wiring ──────────────────────────────
+
+    #[test]
+    fn telegram_manager_none_when_transcription_not_configured() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn telegram_manager_some_when_valid_config() {
+        std::env::remove_var("GROQ_API_KEY");
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true;
+        config.api_key = Some("fake-test-key".to_string()); // Groq registers; no network call
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
+            .with_transcription(config);
+        assert!(ch.transcription_manager.is_some());
+    }
+
+    #[test]
+    fn telegram_manager_none_on_init_failure() {
+        std::env::remove_var("GROQ_API_KEY");
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true; // safety net fires: enabled + no key → Groq absent → bail
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
+            .with_transcription(config);
+        assert!(ch.transcription_manager.is_none());
     }
 }
