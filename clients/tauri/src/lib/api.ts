@@ -368,7 +368,9 @@ export class MoAClient {
 
   async getAgentInfo(): Promise<AgentInfo> {
     try {
-      const res = await fetch(`${this.serverUrl}/api/agent/info`);
+      const res = await this.fetchWithFallback("/api/agent/info", {
+        method: "GET",
+      });
       if (!res.ok) return this.fallbackAgentInfo();
       const data = await res.json();
       const channels_detail = data.channels_detail ?? [];
@@ -481,17 +483,61 @@ export class MoAClient {
     return this.gatewayAlive;
   }
 
-  /** Quick health probe against the local gateway (5s timeout). */
+  /**
+   * Try fetching from local gateway first; if it fails, try relay.
+   * Returns the Response from whichever succeeded.
+   */
+  private async fetchWithFallback(
+    path: string,
+    init: RequestInit,
+  ): Promise<Response> {
+    // If local gateway is known to be down, go straight to relay
+    if (!this.gatewayAlive) {
+      return fetch(`${this.relayUrl}${path}`, init);
+    }
+
+    try {
+      const res = await fetch(`${this.serverUrl}${path}`, init);
+      return res;
+    } catch {
+      // Local gateway unreachable — try relay
+      this.gatewayAlive = false;
+      return fetch(`${this.relayUrl}${path}`, init);
+    }
+  }
+
+  /** Quick health probe against the local gateway (5s timeout).
+   *  If local is down, also checks relay so gateway operations can continue. */
   async checkGatewayHealth(): Promise<boolean> {
+    // Try local first
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
+      const timeout = setTimeout(() => controller.abort(), 3000);
       const res = await fetch(`${this.serverUrl}/health`, {
         method: "GET",
         signal: controller.signal,
       });
       clearTimeout(timeout);
-      this.gatewayAlive = res.ok;
+      if (res.ok) {
+        this.gatewayAlive = true;
+        return true;
+      }
+    } catch {
+      // Local unreachable — continue to relay check
+    }
+
+    // Local is down — check if relay is reachable
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      const res = await fetch(`${this.relayUrl}/health`, {
+        method: "GET",
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+      // Relay is reachable but local is not — mark gateway alive=false
+      // so fetchWithFallback uses relay
+      this.gatewayAlive = false;
       return res.ok;
     } catch {
       this.gatewayAlive = false;
@@ -532,20 +578,39 @@ export class MoAClient {
 
   private async sendHeartbeat(): Promise<void> {
     if (!this.token) return;
+    const heartbeatBody = JSON.stringify({ device_id: this.deviceId });
+    const headers = {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${this.token}`,
+    };
+
+    // Try local gateway first
     try {
       await fetch(`${this.serverUrl}/api/auth/heartbeat`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.token}`,
-        },
-        body: JSON.stringify({ device_id: this.deviceId }),
+        headers,
+        body: heartbeatBody,
       });
       this.gatewayAlive = true;
       this.heartbeatFailCount = 0;
+      return;
     } catch {
-      // Only mark gateway as down after 2 consecutive failures to avoid
-      // transient hiccups (e.g. gateway momentarily busy) breaking API key saves.
+      // Local failed — try relay
+    }
+
+    // Local unreachable — try relay heartbeat
+    try {
+      await fetch(`${this.relayUrl}/api/auth/heartbeat`, {
+        method: "POST",
+        headers,
+        body: heartbeatBody,
+      });
+      // Relay works but local is down
+      this.heartbeatFailCount += 1;
+      if (this.heartbeatFailCount >= 2) {
+        this.gatewayAlive = false;
+      }
+    } catch {
       this.heartbeatFailCount += 1;
       if (this.heartbeatFailCount >= 2) {
         this.gatewayAlive = false;
@@ -771,28 +836,31 @@ export class MoAClient {
   // ── Health ─────────────────────────────────────────────────────
 
   async healthCheck(): Promise<HealthResponse> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
+    // Try local gateway first, then relay
+    const urls = this.gatewayAlive
+      ? [this.serverUrl, this.relayUrl]
+      : [this.relayUrl, this.serverUrl];
 
-    try {
-      const res = await fetch(`${this.serverUrl}/health`, {
-        method: "GET",
-        signal: controller.signal,
-      });
-
-      if (!res.ok) {
-        throw new Error(`Health check failed (${res.status})`);
+    for (const url of urls) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      try {
+        const res = await fetch(`${url}/health`, {
+          method: "GET",
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        if (res.ok) {
+          // Update gateway liveness based on which URL succeeded
+          this.gatewayAlive = (url === this.serverUrl);
+          return await res.json();
+        }
+      } catch {
+        clearTimeout(timeout);
+        // Continue to next URL
       }
-
-      return await res.json();
-    } catch (err) {
-      if (err instanceof DOMException && err.name === "AbortError") {
-        throw new Error("Health check timed out");
-      }
-      throw err;
-    } finally {
-      clearTimeout(timeout);
     }
+    throw new Error("Health check failed: both local and relay unreachable");
   }
 
   // ── Sync commands (Tauri backend only) ──────────────────────────
@@ -853,39 +921,29 @@ export class MoAClient {
   // When no key is set, MoA falls back to operator keys via relay.
 
   async saveApiKeyToAgent(provider: string, key: string): Promise<void> {
-    await this.requireGateway();
+    // Save API key to whichever gateway is reachable (local or relay).
+    // The gateway stores it encrypted (ChaCha20-Poly1305) in config.toml
+    // so it persists across restarts without needing per-request key.
+    const requestInit: RequestInit = {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+      },
+      body: JSON.stringify({ provider, api_key: key }),
+    };
 
-    const doSave = async (): Promise<void> => {
-      const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${this.token}`,
-        },
-        body: JSON.stringify({ provider, api_key: key }),
-      });
+    try {
+      const res = await this.fetchWithFallback("/api/config/api-key", requestInit);
       if (!res.ok) {
         const data = await res.json().catch(() => ({ error: "Save failed" }));
         throw new Error(data.error || `Save failed (${res.status})`);
       }
-    };
-
-    try {
-      await doSave();
     } catch (err) {
+      // If both local and relay fail, still not fatal — key in localStorage
+      // will be sent per-request as fallback
       if (err instanceof TypeError && err.message === "Failed to fetch") {
-        // Retry once after a short delay — gateway may be momentarily busy
-        await new Promise((r) => setTimeout(r, 1000));
-        try {
-          await doSave();
-          return;
-        } catch (retryErr) {
-          if (retryErr instanceof TypeError && retryErr.message === "Failed to fetch") {
-            this.gatewayAlive = false;
-            throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
-          }
-          throw retryErr;
-        }
+        return;
       }
       throw err;
     }
@@ -894,19 +952,15 @@ export class MoAClient {
   /** Save an API key for a specific tool (e.g. composio, web_search_tool, web_fetch).
    *
    *  Uses the existing /api/config/api-key endpoint with a "tool:<name>" provider
-   *  prefix, which the server routes to the tool-api-key handler internally.
-   *  This avoids CORS / 404 issues with the dedicated tool-api-key endpoint
-   *  that older server binaries may not serve. */
+   *  prefix, which the server routes to the tool-api-key handler internally. */
   async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
-    // Reuse the proven /api/config/api-key endpoint with "tool:" prefix
-    await this.requireGateway();
-
-    const doSave = async (): Promise<void> => {
-      const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
+    // Save tool API key to gateway (encrypted in config.toml)
+    try {
+      const res = await this.fetchWithFallback("/api/config/api-key", {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${this.token}`,
+          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
         },
         body: JSON.stringify({ provider: `tool:${tool}`, api_key: apiKey }),
       });
@@ -914,26 +968,10 @@ export class MoAClient {
         const data = await res.json().catch(() => ({ error: "Save failed" }));
         throw new Error(data.error || `Save failed (${res.status})`);
       }
-    };
-
-    try {
-      await doSave();
     } catch (err) {
-      if (err instanceof TypeError && err.message === "Failed to fetch") {
-        // Retry once after a short delay — gateway may be momentarily busy
-        await new Promise((r) => setTimeout(r, 1000));
-        try {
-          await doSave();
-        } catch (retryErr) {
-          if (retryErr instanceof TypeError && retryErr.message === "Failed to fetch") {
-            this.gatewayAlive = false;
-            throw new Error("MoA 에이전트를 먼저 실행시켜주세요");
-          }
-          throw retryErr;
-        }
-        return; // retry succeeded — skip to localStorage update below
+      if (!(err instanceof TypeError && err.message === "Failed to fetch")) {
+        throw err;
       }
-      throw err;
     }
 
     // Store locally for UI state
