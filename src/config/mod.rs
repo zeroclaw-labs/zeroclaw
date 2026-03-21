@@ -12,8 +12,9 @@ pub use schema::{
     CronConfig, DataRetentionConfig, DeepgramSttConfig, DelegateAgentConfig, DelegateToolConfig,
     DiscordConfig, DockerRuntimeConfig, EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig,
     EstopConfig, FeishuConfig, GatewayConfig, GoogleSttConfig, GoogleTtsConfig,
-    GoogleWorkspaceConfig, HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig,
-    HttpRequestConfig, IMessageConfig, IdentityConfig, ImageGenerationConfig,
+    GoogleWorkspaceAllowedOperation, GoogleWorkspaceConfig, HardwareConfig, HardwareTransport,
+    HeartbeatConfig, HooksConfig, HttpRequestConfig, IMessageConfig, IdentityConfig,
+    ImageGenerationConfig,
     ImageProviderDalleConfig, ImageProviderFluxConfig, ImageProviderImagenConfig,
     ImageProviderStabilityConfig, JiraConfig, KnowledgeConfig, LarkConfig, LinkedInConfig,
     LinkedInContentConfig, LinkedInImageConfig, MatrixConfig, McpConfig, McpServerConfig,
@@ -26,8 +27,8 @@ pub use schema::{
     SecurityOpsConfig, SkillCreationConfig, SkillsConfig, SkillsPromptInjectionMode, SlackConfig,
     StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, SwarmConfig,
     SwarmStrategy, TelegramConfig, TextBrowserConfig, ToolFilterGroup, ToolFilterGroupMode,
-    TranscriptionConfig, TtsConfig, TunnelConfig, VerboseMode, WebFetchConfig, WebSearchConfig,
-    WebhookConfig, WorkspaceConfig,
+    TranscriptionConfig, TtsConfig, TunnelConfig, VerboseMode, VerifiableIntentConfig,
+    WebFetchConfig, WebSearchConfig, WebhookConfig, WorkspaceConfig, DEFAULT_GWS_SERVICES,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {

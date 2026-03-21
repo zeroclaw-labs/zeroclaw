@@ -324,47 +324,6 @@ ls -lh target/release/zeroclaw
 - CI/CD: бета (авто при push) → стабильный (ручной запуск) → Docker, crates.io, Scoop, AUR, Homebrew, твит.
 - Предсобранные бинарные файлы для Linux (x86_64, aarch64, armv7), macOS (x86_64, aarch64), Windows (x86_64).
 
-## Как это работает (кратко)
-
-```
-WhatsApp / Telegram / Slack / Discord / Signal / iMessage / Matrix / IRC / Email
-Bluesky / Nostr / Mattermost / DingTalk / Lark / QQ / Reddit / MQTT / WebSocket
-               │
-               ▼
-┌───────────────────────────────┐
-│            Gateway            │
-│       (control plane)         │
-│    http://127.0.0.1:42617     │
-├───────────────────────────────┤
-│  Web Dashboard (React 19)     │
-│  REST API + WebSocket + SSE   │
-│  Pairing + Rate Limiting      │
-└──────────────┬────────────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│ Agent  │ │  Cron  │ │ Hands  │
-│  Loop  │ │Scheduler│ │ Swarm  │
-└───┬────┘ └───┬────┘ └───┬────┘
-    │          │          │
-    └──────────┼──────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│Provider│ │ Tools  │ │ Memory │
-│ (LLM)  │ │ (70+)  │ │(md/sql)│
-└────────┘ └────────┘ └────────┘
-    │          │
-    ▼          ▼
-┌────────┐ ┌────────────┐
-│Security│ │ Peripherals│
-│ Policy │ │(ESP32/STM32)│
-└────────┘ └────────────┘
-```
 
 ## Конфигурация
 

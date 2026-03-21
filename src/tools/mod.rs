@@ -81,7 +81,9 @@ pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
 pub mod traits;
+pub mod verifiable_intent;
 pub mod web_fetch;
+mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod workspace_tool;
 
@@ -150,6 +152,7 @@ pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use verifiable_intent::VerifiableIntentTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
@@ -420,6 +423,8 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
             root_config.web_search.provider.clone(),
             root_config.web_search.brave_api_key.clone(),
+            root_config.web_search.gemini_api_key.clone(),
+            root_config.web_search.gemini_model.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
             root_config.config_path.clone(),
@@ -513,6 +518,7 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
             security.clone(),
             root_config.google_workspace.allowed_services.clone(),
+            root_config.google_workspace.allowed_operations.clone(),
             root_config.google_workspace.credentials_path.clone(),
             root_config.google_workspace.default_account.clone(),
             root_config.google_workspace.rate_limit_per_minute,
@@ -740,6 +746,18 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(WorkspaceTool::new(
             Arc::new(tokio::sync::RwLock::new(ws_manager)),
             security.clone(),
+        )));
+    }
+
+    // Verifiable Intent tool (opt-in via config)
+    if root_config.verifiable_intent.enabled {
+        let strictness = match root_config.verifiable_intent.strictness.as_str() {
+            "permissive" => crate::verifiable_intent::StrictnessMode::Permissive,
+            _ => crate::verifiable_intent::StrictnessMode::Strict,
+        };
+        tool_arcs.push(Arc::new(VerifiableIntentTool::new(
+            security.clone(),
+            strictness,
         )));
     }
 

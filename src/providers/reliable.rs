@@ -541,6 +541,25 @@ impl Provider for ReliableProvider {
                                     );
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
+                                // Nothing to truncate (system prompt alone exceeds
+                                // the model's context window) — bail immediately
+                                // instead of wasting retry attempts.
+                                let error_detail = compact_error_detail(&e);
+                                push_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "non_retryable",
+                                    &error_detail,
+                                );
+                                anyhow::bail!(
+                                    "Request exceeds model context window and cannot be reduced further. \
+                                     Try using a model with a larger context window, reducing the number \
+                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
+                                    failures.join("\n")
+                                );
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -676,6 +695,25 @@ impl Provider for ReliableProvider {
                                     );
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
+                                // Nothing to truncate (system prompt alone exceeds
+                                // the model's context window) — bail immediately
+                                // instead of wasting retry attempts.
+                                let error_detail = compact_error_detail(&e);
+                                push_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "non_retryable",
+                                    &error_detail,
+                                );
+                                anyhow::bail!(
+                                    "Request exceeds model context window and cannot be reduced further. \
+                                     Try using a model with a larger context window, reducing the number \
+                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
+                                    failures.join("\n")
+                                );
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -798,6 +836,25 @@ impl Provider for ReliableProvider {
                                     );
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
+                                // Nothing to truncate (system prompt alone exceeds
+                                // the model's context window) — bail immediately
+                                // instead of wasting retry attempts.
+                                let error_detail = compact_error_detail(&e);
+                                push_failure(
+                                    &mut failures,
+                                    provider_name,
+                                    current_model,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "non_retryable",
+                                    &error_detail,
+                                );
+                                anyhow::bail!(
+                                    "Request exceeds model context window and cannot be reduced further. \
+                                     Try using a model with a larger context window, reducing the number \
+                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
+                                    failures.join("\n")
+                                );
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -2264,6 +2321,44 @@ mod tests {
         assert_eq!(result, "recovered after truncation");
         // Should have been called twice: once with full messages, once with truncated
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn context_overflow_with_no_history_to_truncate_bails_immediately() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = ContextOverflowMock {
+            calls: Arc::clone(&calls),
+            fail_until_attempt: 999, // always fail
+            message_counts: parking_lot::Mutex::new(Vec::new()),
+        };
+
+        let provider = ReliableProvider::new(
+            vec![("local".into(), Box::new(mock) as Box<dyn Provider>)],
+            3,
+            1,
+        );
+
+        // Only system + one user message — nothing to truncate
+        let messages = vec![
+            ChatMessage::system("huge system prompt that exceeds context window"),
+            ChatMessage::user("hello"),
+        ];
+
+        let result = provider
+            .chat_with_history(&messages, "local-model", 0.0)
+            .await;
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("cannot be reduced further"),
+            "Should bail with actionable message, got: {err_msg}"
+        );
+        // Should only be called once — no useless retries
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Should not retry when truncation is impossible"
+        );
     }
 
     // ── Tool schema error detection tests ───────────────────────────────

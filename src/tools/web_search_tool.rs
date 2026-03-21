@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use super::web_search_provider_routing::{resolve_web_search_provider, WebSearchProviderRoute};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
@@ -6,16 +7,22 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
+/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key),
+/// Gemini (requires Google AI Studio API key, uses Google Search grounding).
 ///
-/// The Brave API key is resolved lazily at execution time: if the boot-time key
+/// API keys are resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
-/// `[web_search] brave_api_key` field, and uses the result. This ensures that
-/// keys set or rotated after boot, and encrypted keys, are correctly picked up.
+/// key field, and uses the result. This ensures that keys set or rotated after
+/// boot, and encrypted keys, are correctly picked up.
 pub struct WebSearchTool {
+    /// Provider selector as configured by user. Routed via provider aliases at runtime.
     provider: String,
     /// Boot-time key snapshot (may be `None` if not yet configured at startup).
     boot_brave_api_key: Option<String>,
+    /// Boot-time Gemini API key snapshot.
+    boot_gemini_api_key: Option<String>,
+    /// Gemini model for search grounding.
+    gemini_model: String,
     max_results: usize,
     timeout_secs: u64,
     /// Path to `config.toml` for lazy re-read of keys at execution time.
@@ -34,6 +41,8 @@ impl WebSearchTool {
         Self {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
+            boot_gemini_api_key: None,
+            gemini_model: "gemini-2.5-flash".into(),
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path: PathBuf::new(),
@@ -42,13 +51,11 @@ impl WebSearchTool {
     }
 
     /// Create a `WebSearchTool` with config-reload and decryption support.
-    ///
-    /// `config_path` is the path to `config.toml` so the tool can re-read the
-    /// Brave API key at execution time. `secrets_encrypt` controls whether the
-    /// key is decrypted via `SecretStore`.
     pub fn new_with_config(
         provider: String,
         brave_api_key: Option<String>,
+        gemini_api_key: Option<String>,
+        gemini_model: String,
         max_results: usize,
         timeout_secs: u64,
         config_path: PathBuf,
@@ -57,6 +64,8 @@ impl WebSearchTool {
         Self {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
+            boot_gemini_api_key: gemini_api_key,
+            gemini_model,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
@@ -246,6 +255,130 @@ impl WebSearchTool {
 
         Ok(lines.join("\n"))
     }
+
+    /// Resolve the Gemini API key, preferring the boot-time value but falling
+    /// back to a fresh config read + decryption when absent.
+    fn resolve_gemini_api_key(&self) -> anyhow::Result<String> {
+        if let Some(ref key) = self.boot_gemini_api_key {
+            if !key.is_empty() && !crate::security::SecretStore::is_encrypted(key) {
+                return Ok(key.clone());
+            }
+        }
+        self.reload_gemini_api_key()
+    }
+
+    fn reload_gemini_api_key(&self) -> anyhow::Result<String> {
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read config file {} for Gemini API key: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        let config: crate::config::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse config file {} for Gemini API key: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        let raw_key = config
+            .web_search
+            .gemini_api_key
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Gemini API key not configured"))?;
+
+        if crate::security::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("Gemini API key not configured (decrypted value is empty)");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_key)
+        }
+    }
+
+    /// Search using Gemini with Google Search grounding.
+    async fn search_gemini(&self, query: &str) -> anyhow::Result<String> {
+        let api_key = self.resolve_gemini_api_key()?;
+
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+            self.gemini_model, api_key
+        );
+
+        let body = json!({
+            "contents": [{"parts": [{"text": query}]}],
+            "tools": [{"google_search": {}}]
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .build()?;
+
+        let response = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Gemini search failed with status {}: {}", status, body_text);
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        self.parse_gemini_results(&json, query)
+    }
+
+    fn parse_gemini_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let mut lines = vec![format!("Search results for: {} (via Gemini Google Search)", query)];
+
+        // Extract the text answer from candidates
+        if let Some(text) = json
+            .pointer("/candidates/0/content/parts/0/text")
+            .and_then(|t| t.as_str())
+        {
+            lines.push(String::new());
+            lines.push(text.to_string());
+        }
+
+        // Extract grounding sources from groundingMetadata
+        if let Some(chunks) = json
+            .pointer("/candidates/0/groundingMetadata/groundingChunks")
+            .and_then(|c| c.as_array())
+        {
+            if !chunks.is_empty() {
+                lines.push(String::new());
+                lines.push("Sources:".to_string());
+                for (i, chunk) in chunks.iter().take(self.max_results).enumerate() {
+                    if let Some(web) = chunk.get("web") {
+                        let title = web.get("title").and_then(|t| t.as_str()).unwrap_or("");
+                        let uri = web.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                        lines.push(format!("{}. {}", i + 1, title));
+                        if !uri.is_empty() {
+                            lines.push(format!("   {}", uri));
+                        }
+                    }
+                }
+            }
+        }
+
+        if lines.len() <= 1 {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        Ok(lines.join("\n"))
+    }
 }
 
 fn decode_ddg_redirect_url(raw_url: &str) -> String {
@@ -300,13 +433,19 @@ impl Tool for WebSearchTool {
 
         tracing::info!("Searching web for: {}", query);
 
-        let result = match self.provider.as_str() {
-            "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
-            "brave" => self.search_brave(query).await?,
-            _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
-                self.provider
-            ),
+        let resolution = resolve_web_search_provider(&self.provider);
+        if resolution.used_fallback {
+            tracing::warn!(
+                "Unknown web search provider '{}'; falling back to '{}'",
+                self.provider,
+                resolution.canonical_provider
+            );
+        }
+
+        let result = match resolution.route {
+            WebSearchProviderRoute::DuckDuckGo => self.search_duckduckgo(query).await?,
+            WebSearchProviderRoute::Brave => self.search_brave(query).await?,
+            WebSearchProviderRoute::Gemini => self.search_gemini(query).await?,
         };
 
         Ok(ToolResult {
@@ -437,7 +576,7 @@ mod tests {
 
         // No boot key -- forces reload from config
         let tool =
-            WebSearchTool::new_with_config("brave".to_string(), None, 5, 15, config_path, false);
+            WebSearchTool::new_with_config("brave".to_string(), None, None, "gemini-2.5-flash".into(), 5, 15, config_path, false);
         let key = tool.resolve_brave_api_key().unwrap();
         assert_eq!(key, "fresh-key-from-disk");
     }
@@ -459,6 +598,8 @@ mod tests {
         let tool = WebSearchTool::new_with_config(
             "brave".to_string(),
             Some(encrypted),
+            None,
+            "gemini-2.5-flash".into(),
             5,
             15,
             config_path,
@@ -479,6 +620,8 @@ mod tests {
         let tool = WebSearchTool::new_with_config(
             "brave".to_string(),
             None,
+            None,
+            "gemini-2.5-flash".into(),
             5,
             15,
             config_path.clone(),
