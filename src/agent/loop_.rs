@@ -2430,6 +2430,14 @@ fn should_execute_tools_in_parallel(
         return false;
     }
 
+    // tool_search activates deferred MCP tools into ActivatedToolSet.
+    // Running tool_search in parallel with the tools it activates causes a
+    // race condition where the tool lookup happens before activation completes.
+    // Force sequential execution whenever tool_search is in the batch.
+    if tool_calls.iter().any(|call| call.name == "tool_search") {
+        return false;
+    }
+
     if let Some(mgr) = approval {
         if tool_calls.iter().any(|call| mgr.needs_approval(&call.name)) {
             // Approval-gated calls must keep sequential handling so the caller can

@@ -68,7 +68,14 @@ pub struct CronRunsQuery {
 pub struct CronAddBody {
     pub name: Option<String>,
     pub schedule: String,
-    pub command: String,
+    pub command: Option<String>,
+    pub job_type: Option<String>,
+    pub prompt: Option<String>,
+    pub delivery: Option<crate::cron::DeliveryConfig>,
+    pub session_target: Option<String>,
+    pub model: Option<String>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub delete_after_run: Option<bool>,
 }
 
 // ── Handlers ────────────────────────────────────────────────────
@@ -228,11 +235,15 @@ pub async fn handle_api_cron_list(
                     serde_json::json!({
                         "id": job.id,
                         "name": job.name,
+                        "job_type": job.job_type,
                         "command": job.command,
+                        "prompt": job.prompt,
+                        "schedule": job.schedule,
                         "next_run": job.next_run.to_rfc3339(),
                         "last_run": job.last_run.map(|t| t.to_rfc3339()),
                         "last_status": job.last_status,
                         "enabled": job.enabled,
+                        "delivery": job.delivery,
                     })
                 })
                 .collect();
@@ -256,26 +267,94 @@ pub async fn handle_api_cron_add(
         return e.into_response();
     }
 
+    let CronAddBody {
+        name,
+        schedule,
+        command,
+        job_type,
+        prompt,
+        delivery,
+        session_target,
+        model,
+        allowed_tools,
+        delete_after_run,
+    } = body;
+
     let config = state.config.lock().clone();
     let schedule = crate::cron::Schedule::Cron {
-        expr: body.schedule,
+        expr: schedule,
         tz: None,
     };
+    if let Err(e) = crate::cron::validate_delivery_config(delivery.as_ref()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
+        )
+            .into_response();
+    }
 
-    match crate::cron::add_shell_job_with_approval(
-        &config,
-        body.name,
-        schedule,
-        &body.command,
-        false,
-    ) {
+    // Determine job type: explicit field, or infer "agent" when prompt is provided.
+    let is_agent =
+        matches!(job_type.as_deref(), Some("agent")) || (job_type.is_none() && prompt.is_some());
+
+    let result = if is_agent {
+        let prompt = match prompt.as_deref() {
+            Some(p) if !p.trim().is_empty() => p,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Missing 'prompt' for agent job"})),
+                )
+                    .into_response();
+            }
+        };
+
+        let session_target = session_target
+            .as_deref()
+            .map(crate::cron::SessionTarget::parse)
+            .unwrap_or_default();
+
+        let default_delete = matches!(schedule, crate::cron::Schedule::At { .. });
+        let delete_after_run = delete_after_run.unwrap_or(default_delete);
+
+        crate::cron::add_agent_job(
+            &config,
+            name,
+            schedule,
+            prompt,
+            session_target,
+            model,
+            delivery,
+            delete_after_run,
+            allowed_tools,
+        )
+    } else {
+        let command = match command.as_deref() {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Missing 'command' for shell job"})),
+                )
+                    .into_response();
+            }
+        };
+
+        crate::cron::add_shell_job_with_approval(&config, name, schedule, command, delivery, false)
+    };
+
+    match result {
         Ok(job) => Json(serde_json::json!({
             "status": "ok",
             "job": {
                 "id": job.id,
                 "name": job.name,
+                "job_type": job.job_type,
                 "command": job.command,
+                "prompt": job.prompt,
+                "schedule": job.schedule,
                 "enabled": job.enabled,
+                "delivery": job.delivery,
             }
         }))
         .into_response(),
@@ -1208,6 +1287,125 @@ pub async fn handle_api_session_delete(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gateway::{nodes, AppState, GatewayRateLimiter, IdempotencyStore};
+    use crate::memory::{Memory, MemoryCategory, MemoryEntry};
+    use crate::providers::Provider;
+    use crate::security::pairing::PairingGuard;
+    use async_trait::async_trait;
+    use axum::response::IntoResponse;
+    use http_body_util::BodyExt;
+    use parking_lot::Mutex;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct MockMemory;
+
+    #[async_trait]
+    impl Memory for MockMemory {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    struct MockProvider;
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    fn test_state(config: crate::config::Config) -> AppState {
+        AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider: Arc::new(MockProvider),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
+        }
+    }
+
+    async fn response_json(response: axum::response::Response) -> serde_json::Value {
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        serde_json::from_slice(&body).expect("valid json response")
+    }
 
     #[test]
     fn masking_keeps_toml_valid_and_preserves_api_keys_type() {
@@ -1620,5 +1818,175 @@ mod tests {
             .embedding_routes
             .iter()
             .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
+    }
+
+    #[tokio::test]
+    async fn cron_api_shell_roundtrip_includes_delivery() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = crate::config::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..crate::config::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let add_response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo hello",
+                    "delivery": {
+                        "mode": "announce",
+                        "channel": "discord",
+                        "to": "1234567890",
+                        "best_effort": true
+                    }
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        let add_json = response_json(add_response).await;
+        assert_eq!(add_json["status"], "ok");
+        assert_eq!(add_json["job"]["delivery"]["mode"], "announce");
+        assert_eq!(add_json["job"]["delivery"]["channel"], "discord");
+        assert_eq!(add_json["job"]["delivery"]["to"], "1234567890");
+
+        let list_response = handle_api_cron_list(State(state), HeaderMap::new())
+            .await
+            .into_response();
+        let list_json = response_json(list_response).await;
+        let jobs = list_json["jobs"].as_array().expect("jobs array");
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["delivery"]["mode"], "announce");
+        assert_eq!(jobs[0]["delivery"]["channel"], "discord");
+        assert_eq!(jobs[0]["delivery"]["to"], "1234567890");
+    }
+
+    #[tokio::test]
+    async fn cron_api_accepts_agent_jobs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = crate::config::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..crate::config::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "agent-job",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "command": "ignored shell command",
+                    "prompt": "summarize the latest logs"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "ok");
+
+        let config = state.config.lock().clone();
+        let jobs = crate::cron::list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, crate::cron::JobType::Agent);
+        assert_eq!(jobs[0].prompt.as_deref(), Some("summarize the latest logs"));
+    }
+
+    #[tokio::test]
+    async fn cron_api_rejects_announce_delivery_without_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = crate::config::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..crate::config::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "invalid-delivery-job",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo hello",
+                    "delivery": {
+                        "mode": "announce",
+                        "channel": "discord"
+                    }
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("delivery.to is required"));
+
+        let config = state.config.lock().clone();
+        assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cron_api_rejects_announce_delivery_with_unsupported_channel() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = crate::config::Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..crate::config::Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let state = test_state(config);
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "invalid-delivery-job",
+                    "schedule": "*/5 * * * *",
+                    "command": "echo hello",
+                    "delivery": {
+                        "mode": "announce",
+                        "channel": "email",
+                        "to": "alerts@example.com"
+                    }
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsupported delivery channel"));
+
+        let config = state.config.lock().clone();
+        assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
     }
 }

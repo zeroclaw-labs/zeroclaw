@@ -45,6 +45,39 @@ pub(crate) fn validate_shell_command_with_security(
         .map_err(|reason| anyhow!("blocked by security policy: {reason}"))
 }
 
+pub(crate) fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()> {
+    let Some(delivery) = delivery else {
+        return Ok(());
+    };
+
+    if delivery.mode.eq_ignore_ascii_case("none") {
+        return Ok(());
+    }
+    if !delivery.mode.eq_ignore_ascii_case("announce") {
+        bail!("unsupported delivery mode: {}", delivery.mode);
+    }
+
+    let channel = delivery.channel.as_deref().map(str::trim);
+    let Some(channel) = channel.filter(|value| !value.is_empty()) else {
+        bail!("delivery.channel is required for announce mode");
+    };
+    match channel.to_ascii_lowercase().as_str() {
+        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" => {}
+        other => bail!("unsupported delivery channel: {other}"),
+    }
+
+    let has_target = delivery
+        .to
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_target {
+        bail!("delivery.to is required for announce mode");
+    }
+
+    Ok(())
+}
+
 /// Create a validated shell job, enforcing security policy before persistence.
 ///
 /// All entrypoints that create shell cron jobs should route through this
@@ -54,10 +87,12 @@ pub fn add_shell_job_with_approval(
     name: Option<String>,
     schedule: Schedule,
     command: &str,
+    delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
     validate_shell_command(config, command, approved)?;
-    store::add_shell_job(config, name, schedule, command)
+    validate_delivery_config(delivery.as_ref())?;
+    store::add_shell_job(config, name, schedule, command, delivery)
 }
 
 /// Update a shell job's command with security validation.
@@ -95,7 +130,7 @@ pub fn add_once_at_validated(
     approved: bool,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job_with_approval(config, None, schedule, command, approved)
+    add_shell_job_with_approval(config, None, schedule, command, None, approved)
 }
 
 // Convenience wrappers for CLI paths (default approved=false).
@@ -106,7 +141,7 @@ pub(crate) fn add_shell_job(
     schedule: Schedule,
     command: &str,
 ) -> Result<CronJob> {
-    add_shell_job_with_approval(config, name, schedule, command, false)
+    add_shell_job_with_approval(config, name, schedule, command, None, false)
 }
 
 pub(crate) fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
@@ -680,6 +715,7 @@ mod tests {
                 tz: None,
             },
             "touch cron-medium-risk",
+            None,
             true,
         );
         assert!(approved.is_ok(), "{approved:?}");
@@ -812,6 +848,7 @@ mod tests {
                 tz: None,
             },
             "curl https://example.com",
+            None,
             false,
         );
         assert!(result.is_err());

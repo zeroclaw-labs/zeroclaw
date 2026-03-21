@@ -296,6 +296,7 @@ struct InterruptOnNewMessageConfig {
     slack: bool,
     discord: bool,
     mattermost: bool,
+    matrix: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -305,6 +306,7 @@ impl InterruptOnNewMessageConfig {
             "slack" => self.slack,
             "discord" => self.discord,
             "mattermost" => self.mattermost,
+            "matrix" => self.matrix,
             _ => false,
         }
     }
@@ -577,7 +579,7 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
         "whatsapp" => Some(
             "When responding on WhatsApp:\n\
              - Be concise and conversational.\n\
-             - To mention/tag someone in a group, write @<phone_number> (e.g. @85251159218). \
+             - To mention/tag someone in a group, write @<phone_number> (e.g. @85288888888). \
                ONLY use real phone numbers from the [From: +<phone>] sender field. \
                NEVER use numbers from [Replying to ...] headers — those may be internal \
                WhatsApp IDs (LIDs), not real phone numbers.\n\
@@ -590,6 +592,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
                Any text outside the [IMAGE:...] marker becomes the image caption.\n\
              - When you see [Replying to ...], the user is replying to a previous message. \
                The number after 'Replying to' is an internal ID, not a phone number.",
+        "qq" => Some(
+            "When responding on QQ:\n\
+             - Use Markdown formatting\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
+             - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         _ => None,
     }
@@ -2240,30 +2250,63 @@ async fn process_channel_message(
         );
     }
 
-    // Only enrich with memory context when there is no prior conversation
-    // history. Follow-up turns already include context from previous messages.
-    if !had_prior_history {
-        let memory_context = build_memory_context(
+    // ── Dual-scope memory recall ──────────────────────────────────
+    // Always recall before each LLM call (not just first turn).
+    // For group chats: merge sender-scope + group-scope memories.
+    // For DMs: sender-scope only.
+    let is_group_chat =
+        msg.reply_target.contains("@g.us") || msg.reply_target.starts_with("group:");
+
+    let mem_recall_start = Instant::now();
+    let sender_memory_fut = build_memory_context(
+        ctx.memory.as_ref(),
+        &msg.content,
+        ctx.min_relevance_score,
+        Some(&msg.sender),
+    );
+
+    let (sender_memory, group_memory) = if is_group_chat {
+        let group_memory_fut = build_memory_context(
             ctx.memory.as_ref(),
             &msg.content,
             ctx.min_relevance_score,
             Some(&history_key),
-        )
-        .await;
-        if let Some(last_turn) = prior_turns.last_mut() {
-            if last_turn.role == "user" && !memory_context.is_empty() {
-                last_turn.content = format!("{memory_context}{}", msg.content);
-            }
-        }
-    }
+        );
+        tokio::join!(sender_memory_fut, group_memory_fut)
+    } else {
+        (sender_memory_fut.await, String::new())
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let mem_recall_ms = mem_recall_start.elapsed().as_millis() as u64;
+    tracing::info!(
+        mem_recall_ms,
+        sender_empty = sender_memory.is_empty(),
+        group_empty = group_memory.is_empty(),
+        "⏱ Memory recall completed"
+    );
 
+    // Merge sender + group memories, avoiding duplicates
+    let memory_context = if group_memory.is_empty() {
+        sender_memory
+    } else if sender_memory.is_empty() {
+        group_memory
+    } else {
+        format!("{sender_memory}\n{group_memory}")
+    };
+
+    // Use refreshed system prompt for new sessions (master's /new support),
+    // and inject memory into system prompt (not user message) so it
+    // doesn't pollute session history and is re-fetched each turn.
     let base_system_prompt = if had_prior_history {
         ctx.system_prompt.as_str().to_string()
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let system_prompt =
+    let mut system_prompt =
         build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
+    if !memory_context.is_empty() {
+        let _ = write!(system_prompt, "\n\n{memory_context}");
+    }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -2397,6 +2440,10 @@ async fn process_channel_message(
 
     let timeout_budget_secs =
         channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let llm_call_start = Instant::now();
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
+    tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
     let llm_result = tokio::select! {
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
@@ -2446,6 +2493,12 @@ async fn process_channel_message(
     if let Some(handle) = notify_task {
         let _ = handle.await;
     }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let llm_call_ms = llm_call_start.elapsed().as_millis() as u64;
+    #[allow(clippy::cast_possible_truncation)]
+    let total_ms = started_at.elapsed().as_millis() as u64;
+    tracing::info!(llm_call_ms, total_ms, "⏱ LLM call completed");
 
     if let Some(token) = typing_cancellation.as_ref() {
         token.cancel();
@@ -2555,6 +2608,7 @@ async fn process_channel_message(
             } else {
                 sanitized_response
             };
+
             runtime_trace::record_event(
                 "channel_message_outbound",
                 Some(msg.channel.as_str()),
@@ -2631,7 +2685,7 @@ async fn process_channel_message(
                     }
                 } else if let Err(e) = channel
                     .send(
-                        &SendMessage::new(delivered_response, &msg.reply_target)
+                        &SendMessage::new(&delivered_response, &msg.reply_target)
                             .in_thread(msg.thread_ts.clone()),
                     )
                     .await
@@ -3904,11 +3958,14 @@ fn collect_configured_channels(
     if let Some(ref qq) = config.channels_config.qq {
         channels.push(ConfiguredChannel {
             display_name: "QQ",
-            channel: Arc::new(QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                qq.allowed_users.clone(),
-            )),
+            channel: Arc::new(
+                QQChannel::new(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    qq.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 
@@ -4467,6 +4524,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .mattermost
         .as_ref()
         .is_some_and(|mm| mm.interrupt_on_new_message);
+    let interrupt_on_new_message_matrix = config
+        .channels_config
+        .matrix
+        .as_ref()
+        .is_some_and(|mx| mx.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -4497,6 +4559,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             slack: interrupt_on_new_message_slack,
             discord: interrupt_on_new_message_discord,
             mattermost: interrupt_on_new_message_mattermost,
+            matrix: interrupt_on_new_message_matrix,
         },
         multimodal: config.multimodal.clone(),
         hooks: if config.hooks.enabled {
@@ -4816,6 +4879,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -4931,6 +4995,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5002,6 +5067,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5092,6 +5158,7 @@ mod tests {
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5636,6 +5703,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5717,6 +5785,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -5812,6 +5881,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5892,6 +5962,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -5982,6 +6053,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6094,6 +6166,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6186,6 +6259,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6293,6 +6367,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6385,6 +6460,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6467,6 +6543,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6660,6 +6737,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6763,6 +6841,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -6881,6 +6960,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: true,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -6996,6 +7076,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7093,6 +7174,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7173,6 +7255,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7946,6 +8029,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8079,6 +8163,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8251,6 +8336,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8292,10 +8378,12 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
+        // Memory context is injected into the system prompt, not the user message.
+        assert_eq!(calls[0][0].0, "system");
+        assert!(calls[0][0].1.contains("[Memory context]"));
+        assert!(calls[0][0].1.contains("Age is 45"));
         assert_eq!(calls[0][1].0, "user");
-        assert!(calls[0][1].1.contains("[Memory context]"));
-        assert!(calls[0][1].1.contains("Age is 45"));
-        assert!(calls[0][1].1.contains("hello"));
+        assert_eq!(calls[0][1].1, "hello");
 
         let histories = runtime_ctx
             .conversation_histories
@@ -8357,6 +8445,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -8928,6 +9017,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9015,6 +9105,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9179,6 +9270,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9291,6 +9383,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9395,6 +9488,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9520,6 +9614,7 @@ This is an example JSON object for profile settings."#;
                 slack: false,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -9652,6 +9747,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: true,
+            matrix: false,
         };
         assert!(cfg.enabled_for_channel("mattermost"));
     }
@@ -9663,6 +9759,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: false,
+            matrix: false,
         };
         assert!(!cfg.enabled_for_channel("mattermost"));
     }
@@ -9674,6 +9771,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: true,
             mattermost: false,
+            matrix: false,
         };
         assert!(cfg.enabled_for_channel("discord"));
     }
@@ -9685,6 +9783,7 @@ This is an example JSON object for profile settings."#;
             slack: false,
             discord: false,
             mattermost: false,
+            matrix: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
     }
@@ -9780,6 +9879,7 @@ This is an example JSON object for profile settings."#;
                 slack: true,
                 discord: false,
                 mattermost: false,
+                matrix: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,

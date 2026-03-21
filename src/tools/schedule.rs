@@ -315,6 +315,7 @@ impl ScheduleTool {
                     tz: None,
                 },
                 command,
+                None,
                 approved,
             ) {
                 Ok(job) => job,

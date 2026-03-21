@@ -324,47 +324,6 @@ Panel web React 19 + Vite 6 + Tailwind CSS 4 servido directamente desde el Gatew
 - CI/CD: beta (automático al hacer push) → stable (dispatch manual) → Docker, crates.io, Scoop, AUR, Homebrew, tweet.
 - Binarios preconstruidos para Linux (x86_64, aarch64, armv7), macOS (x86_64, aarch64), Windows (x86_64).
 
-## Cómo funciona (resumen)
-
-```
-WhatsApp / Telegram / Slack / Discord / Signal / iMessage / Matrix / IRC / Email
-Bluesky / Nostr / Mattermost / DingTalk / Lark / QQ / Reddit / MQTT / WebSocket
-               │
-               ▼
-┌───────────────────────────────┐
-│            Gateway            │
-│       (plano de control)      │
-│    http://127.0.0.1:42617     │
-├───────────────────────────────┤
-│  Panel Web (React 19)         │
-│  REST API + WebSocket + SSE   │
-│  Emparejamiento + Limitación  │
-└──────────────┬────────────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│ Agent  │ │  Cron  │ │ Hands  │
-│  Loop  │ │Scheduler│ │ Swarm  │
-└───┬────┘ └───┬────┘ └───┬────┘
-    │          │          │
-    └──────────┼──────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│Provider│ │ Tools  │ │ Memory │
-│ (LLM)  │ │ (70+)  │ │(md/sql)│
-└────────┘ └────────┘ └────────┘
-    │          │
-    ▼          ▼
-┌────────┐ ┌────────────┐
-│Security│ │ Peripherals│
-│ Policy │ │(ESP32/STM32)│
-└────────┘ └────────────┘
-```
 
 ## Configuración
 
