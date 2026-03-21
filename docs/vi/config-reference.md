@@ -324,6 +324,10 @@ extraction_prompt = "Trích xuất sự kiện bằng ngôn ngữ gốc..."
 
 Script triển khai server nằm trong `deploy/mem0/`.
 
+> **Quan trọng:** Vector store qdrant của mem0 **phải** được cấu hình `on_disk: True` trong script server, nếu không dữ liệu sẽ bị xóa mỗi lần khởi động lại. Script deploy đã bao gồm cài đặt này mặc định.
+
+Khi tự động lưu tin nhắn kênh, các mục mem0 sẽ tự động nhận nhãn metadata `scope` (`"personal"` hoặc `"group"`) dựa trên ngữ cảnh phiên. Web UI hiển thị và lọc theo scope khi có dữ liệu.
+
 ## `[[model_routes]]` và `[[embedding_routes]]`
 
 Route hint giúp tên tích hợp ổn định khi model ID thay đổi.

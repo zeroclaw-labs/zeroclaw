@@ -2855,6 +2855,14 @@ async fn process_channel_message(
         (None, None)
     };
 
+    // Persistent message channel for verbose tool result summaries.
+    let (verbose_msg_tx, verbose_msg_rx) = if ctx.verbose_mode == crate::config::VerboseMode::Off {
+        (None, None)
+    } else {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        (Some(tx), Some(rx))
+    };
+
     let draft_message_id = if use_draft_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
@@ -2976,6 +2984,25 @@ async fn process_channel_message(
         None
     };
 
+    // Verbose message consumer: sends persistent messages via channel.send()
+    // so they survive draft clearing (unlike on_delta messages).
+    let verbose_msg_handle = if let Some(mut rx) = verbose_msg_rx {
+        let channel = target_channel.clone();
+        let reply_target = msg.reply_target.clone();
+        let thread_ts = msg.thread_ts.clone();
+        Some(tokio::spawn(async move {
+            while let Some(text) = rx.recv().await {
+                if let Some(ref ch) = channel {
+                    let _ = ch
+                        .send(&SendMessage::new(&text, &reply_target).in_thread(thread_ts.clone()))
+                        .await;
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // React with 👀 to acknowledge the incoming message
     if ctx.ack_reactions {
         if let Some(channel) = target_channel.as_ref() {
@@ -3074,6 +3101,7 @@ async fn process_channel_message(
                 Some(cancellation_token.clone()),
                 delta_tx,
                 ctx.verbose_mode,
+                verbose_msg_tx,
                 ctx.hooks.as_deref(),
                 if msg.channel == "cli"
                     || ctx.autonomy_level == AutonomyLevel::Full
@@ -3093,6 +3121,9 @@ async fn process_channel_message(
         let _ = handle.await;
     }
     if let Some(handle) = segment_updater {
+        let _ = handle.await;
+    }
+    if let Some(handle) = verbose_msg_handle {
         let _ = handle.await;
     }
 
@@ -7437,6 +7468,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: "2026-02-20T00:00:00Z".to_string(),
                 session_id: None,
                 score: Some(0.9),
+                scope: None,
             }])
         }
 

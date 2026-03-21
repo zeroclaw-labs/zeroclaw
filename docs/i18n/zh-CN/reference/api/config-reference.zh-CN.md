@@ -398,6 +398,10 @@ extraction_prompt = "用原始语言提取事实..."
 
 服务器部署脚本位于 `deploy/mem0/`。
 
+> **重要：** mem0 qdrant 向量存储**必须**在服务器脚本中配置 `on_disk: True`，否则每次重启数据都会被删除。部署脚本已默认包含此设置。
+
+自动保存频道消息时，mem0 条目会根据会话上下文自动获得 `scope` 元数据标签（`"personal"` 或 `"group"`）。Web UI 在有 scope 数据时会显示并支持筛选。
+
 ## `[[model_routes]]` 和 `[[embedding_routes]]`
 
 使用路由提示，以便集成可以在模型 ID 演变时保持稳定的名称。

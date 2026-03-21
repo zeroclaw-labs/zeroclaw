@@ -433,6 +433,10 @@ extraction_prompt = "Extract facts in the original language..."
 
 Server deployment scripts are in `deploy/mem0/`.
 
+> **Important:** The mem0 qdrant vector store **must** be configured with `on_disk: True` in the server script, otherwise data is deleted on every restart. The deploy script includes this by default.
+
+When auto-saving channel messages, mem0 entries automatically receive a `scope` metadata label (`"personal"` or `"group"`) derived from the session context. The web UI displays and filters by scope when available.
+
 ## `[[model_routes]]` and `[[embedding_routes]]`
 
 Use route hints so integrations can keep stable names while model IDs evolve.
