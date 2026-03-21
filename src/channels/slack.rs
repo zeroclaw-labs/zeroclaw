@@ -2163,9 +2163,8 @@ impl SlackChannel {
             .is_some_and(|ext| Self::AUDIO_EXTENSIONS.contains(&ext))
     }
 
-    /// Download an audio file attachment and transcribe it using the configured
-    /// transcription provider. Returns `None` if transcription is not configured
-    /// or if the download/transcription fails.
+    /// Download an audio file attachment and transcribe it via TranscriptionManager.
+    /// Returns `None` if transcription is not configured or if download/transcription fails.
     async fn try_transcribe_audio_file(&self, file: &serde_json::Value) -> Option<String> {
         let manager = self.transcription_manager.as_deref()?;
 
@@ -2177,16 +2176,16 @@ impl SlackChannel {
         let status = resp.status();
         if !status.is_success() {
             tracing::warn!(
-                "Slack voice file download failed for {} ({status})",
+                "Slack audio download failed for {} ({status})",
                 redacted_url
             );
             return None;
         }
 
         let audio_data = match resp.bytes().await {
-            Ok(bytes) => bytes.to_vec(),
+            Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!("Slack voice file read failed for {}: {e}", redacted_url);
+                tracing::warn!("Slack audio read failed for {}: {e}", redacted_url);
                 return None;
             }
         };
