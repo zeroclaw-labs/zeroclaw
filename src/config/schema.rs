@@ -4913,6 +4913,9 @@ pub struct ChannelsConfig {
     pub reddit: Option<RedditConfig>,
     /// Bluesky channel configuration (AT Protocol).
     pub bluesky: Option<BlueskyConfig>,
+    /// Voice wake word detection channel configuration.
+    #[cfg(feature = "voice-wake")]
+    pub voice_wake: Option<VoiceWakeConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -5036,6 +5039,11 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
+            #[cfg(feature = "voice-wake")]
+            (
+                Box::new(ConfigWrapper::new(self.voice_wake.as_ref())),
+                self.voice_wake.is_some(),
+            ),
         ]
     }
 
@@ -5087,6 +5095,8 @@ impl Default for ChannelsConfig {
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            #[cfg(feature = "voice-wake")]
+            voice_wake: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
@@ -6335,6 +6345,74 @@ impl ChannelConfig for BlueskyConfig {
     }
     fn desc() -> &'static str {
         "AT Protocol"
+    }
+}
+
+/// Voice wake word detection channel configuration.
+///
+/// Listens on the default microphone for a configurable wake word,
+/// then captures the following utterance and transcribes it via the
+/// existing transcription API.
+#[cfg(feature = "voice-wake")]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct VoiceWakeConfig {
+    /// Wake word phrase to listen for (case-insensitive substring match).
+    /// Default: `"hey zeroclaw"`.
+    #[serde(default = "default_voice_wake_word")]
+    pub wake_word: String,
+    /// Silence timeout in milliseconds — how long to wait after the last
+    /// energy spike before finalizing a capture window. Default: `2000`.
+    #[serde(default = "default_voice_wake_silence_timeout_ms")]
+    pub silence_timeout_ms: u32,
+    /// RMS energy threshold for voice activity detection. Samples below
+    /// this level are treated as silence. Default: `0.01`.
+    #[serde(default = "default_voice_wake_energy_threshold")]
+    pub energy_threshold: f32,
+    /// Maximum capture duration in seconds before forcing transcription.
+    /// Default: `30`.
+    #[serde(default = "default_voice_wake_max_capture_secs")]
+    pub max_capture_secs: u32,
+}
+
+#[cfg(feature = "voice-wake")]
+fn default_voice_wake_word() -> String {
+    "hey zeroclaw".into()
+}
+
+#[cfg(feature = "voice-wake")]
+fn default_voice_wake_silence_timeout_ms() -> u32 {
+    2000
+}
+
+#[cfg(feature = "voice-wake")]
+fn default_voice_wake_energy_threshold() -> f32 {
+    0.01
+}
+
+#[cfg(feature = "voice-wake")]
+fn default_voice_wake_max_capture_secs() -> u32 {
+    30
+}
+
+#[cfg(feature = "voice-wake")]
+impl Default for VoiceWakeConfig {
+    fn default() -> Self {
+        Self {
+            wake_word: default_voice_wake_word(),
+            silence_timeout_ms: default_voice_wake_silence_timeout_ms(),
+            energy_threshold: default_voice_wake_energy_threshold(),
+            max_capture_secs: default_voice_wake_max_capture_secs(),
+        }
+    }
+}
+
+#[cfg(feature = "voice-wake")]
+impl ChannelConfig for VoiceWakeConfig {
+    fn name() -> &'static str {
+        "VoiceWake"
+    }
+    fn desc() -> &'static str {
+        "voice wake word detection"
     }
 }
 
@@ -9690,6 +9768,8 @@ default_temperature = 0.7
                 clawdtalk: None,
                 reddit: None,
                 bluesky: None,
+                #[cfg(feature = "voice-wake")]
+                voice_wake: None,
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -10534,6 +10614,8 @@ allowed_users = ["@ops:matrix.org"]
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            #[cfg(feature = "voice-wake")]
+            voice_wake: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -10853,6 +10935,8 @@ channel_id = "C123"
             clawdtalk: None,
             reddit: None,
             bluesky: None,
+            #[cfg(feature = "voice-wake")]
+            voice_wake: None,
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,

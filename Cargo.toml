@@ -199,6 +199,9 @@ pdf-extract = { version = "0.10", optional = true }
 # WASM plugin runtime (extism)
 extism = { version = "1.20", optional = true }
 
+# Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
+cpal = { version = "0.15", optional = true }
+
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
 
@@ -252,6 +255,8 @@ rag-pdf = ["dep:pdf-extract"]
 skill-creation = []
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
+# voice-wake = Voice wake word detection via microphone (cpal)
+voice-wake = ["dep:cpal"]
 # WASM plugin system (extism-based)
 plugins-wasm = ["dep:extism"]
 

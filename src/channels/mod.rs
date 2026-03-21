@@ -45,6 +45,8 @@ pub mod traits;
 pub mod transcription;
 pub mod tts;
 pub mod twitter;
+#[cfg(feature = "voice-wake")]
+pub mod voice_wake;
 pub mod wati;
 pub mod webhook;
 pub mod wecom;
@@ -82,6 +84,8 @@ pub use traits::{Channel, SendMessage};
 #[allow(unused_imports)]
 pub use tts::{TtsManager, TtsProvider};
 pub use twitter::TwitterChannel;
+#[cfg(feature = "voice-wake")]
+pub use voice_wake::VoiceWakeChannel;
 pub use wati::WatiChannel;
 pub use webhook::WebhookChannel;
 pub use wecom::WeComChannel;
@@ -4110,6 +4114,17 @@ fn collect_configured_channels(
             channel: Arc::new(BlueskyChannel::new(
                 bs.handle.clone(),
                 bs.app_password.clone(),
+            )),
+        });
+    }
+
+    #[cfg(feature = "voice-wake")]
+    if let Some(ref vw) = config.channels_config.voice_wake {
+        channels.push(ConfiguredChannel {
+            display_name: "VoiceWake",
+            channel: Arc::new(VoiceWakeChannel::new(
+                vw.clone(),
+                config.transcription.clone(),
             )),
         });
     }
