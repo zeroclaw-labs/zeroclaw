@@ -6620,7 +6620,7 @@ async fn persist_active_workspace_config_dir_in(
         );
     }
 
-    sync_directory(&default_config_dir).await?;
+    sync_directory(default_config_dir).await?;
     Ok(())
 }
 
