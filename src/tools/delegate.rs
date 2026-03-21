@@ -431,6 +431,7 @@ impl DelegateTool {
                 None,
                 None,
                 crate::config::VerboseMode::Off,
+                None, // on_verbose_message
                 None,
                 &[],
                 &[],

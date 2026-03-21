@@ -2289,6 +2289,7 @@ pub(crate) async fn agent_turn(
         None,
         None,
         crate::config::VerboseMode::Off,
+        None, // on_verbose_message
         None,
         excluded_tools,
         dedup_exempt_tools,
@@ -2668,6 +2669,7 @@ pub(crate) async fn run_tool_call_loop(
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     verbose_mode: crate::config::VerboseMode,
+    on_verbose_message: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
@@ -3518,11 +3520,9 @@ pub(crate) async fn run_tool_call_loop(
             };
             // ── Verbose: forward tool result summary to channel ───
             if verbose_mode != crate::config::VerboseMode::Off {
-                if let Some(ref tx) = on_delta {
+                if let Some(ref mtx) = on_verbose_message {
                     let summary = truncate_with_ellipsis(&output, 500);
-                    let _ = tx
-                        .send(format!("\u{1f4cb} `{tool_name}` result:\n{summary}\n"))
-                        .await;
+                    let _ = mtx.send(format!("\u{1f4cb} `{tool_name}` result:\n{summary}\n"));
                 }
             }
 
@@ -4064,6 +4064,7 @@ pub async fn run(
                 None,
                 None,
                 config.agent.verbose_mode,
+                None, // on_verbose_message
                 None,
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
@@ -4315,6 +4316,7 @@ pub async fn run(
                     None,
                     None,
                     config.agent.verbose_mode,
+                    None, // on_verbose_message
                     None,
                     &excluded_tools,
                     &config.agent.tool_call_dedup_exempt,
@@ -5625,6 +5627,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
@@ -5640,15 +5643,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_rejects_oversized_image_payload() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
-            calls: Arc::clone(&calls),
-        };
+    async fn run_tool_call_loop_skips_oversized_image_payload() {
+        // Use EchoProvider since VisionProvider expects image markers,
+        // but oversized images are now gracefully skipped (no markers remain).
+        let provider = EchoProvider;
 
         let oversized_payload = STANDARD.encode(vec![0_u8; (1024 * 1024) + 1]);
         let mut history = vec![ChatMessage::user(format!(
-            "[IMAGE:data:image/png;base64,{oversized_payload}]"
+            "describe this [IMAGE:data:image/png;base64,{oversized_payload}]"
         ))];
 
         let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
@@ -5660,7 +5662,8 @@ mod tests {
             vision_mcp_fallback: None,
         };
 
-        let err = run_tool_call_loop(
+        // Oversized images are now gracefully skipped instead of rejected.
+        let result = run_tool_call_loop(
             &provider,
             &mut history,
             &tools_registry,
@@ -5677,19 +5680,20 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
             None,
             None,
         )
-        .await
-        .expect_err("oversized payload must fail");
+        .await;
 
-        assert!(err
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let response = result.expect("should succeed with skipped image");
+        assert!(
+            response.contains("image(s) could not be loaded"),
+            "response should mention skipped image: {response}"
+        );
     }
 
     #[tokio::test]
@@ -5722,6 +5726,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
@@ -5853,6 +5858,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
@@ -5924,6 +5930,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
@@ -5987,6 +5994,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
@@ -6045,6 +6053,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
@@ -6115,6 +6124,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
@@ -6176,6 +6186,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &exempt,
@@ -6257,6 +6268,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &exempt,
@@ -6315,6 +6327,7 @@ mod tests {
             None,
             None,
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
@@ -6397,6 +6410,7 @@ mod tests {
             None,
             Some(tx),
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
@@ -8383,6 +8397,7 @@ Let me check the result."#;
             None,
             Some(tx),
             crate::config::VerboseMode::Off,
+            None, // on_verbose_message
             None,
             &[],
             &[],
