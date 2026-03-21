@@ -3939,7 +3939,16 @@ pub struct AutonomyConfig {
 }
 
 fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into()]
+    vec![
+        "file_read".into(),
+        "memory_recall".into(),
+        "web_search_tool".into(),
+        "web_fetch".into(),
+        "calculator".into(),
+        "glob_search".into(),
+        "content_search".into(),
+        "image_info".into(),
+    ]
 }
 
 fn default_always_ask() -> Vec<String> {
@@ -5489,10 +5498,6 @@ fn default_otp_gated_actions() -> Vec<String> {
         "browser".to_string(),
         "memory_forget".to_string(),
     ]
-}
-
-fn default_otp_challenge_max_attempts() -> u32 {
-    3
 }
 
 impl Default for OtpConfig {
