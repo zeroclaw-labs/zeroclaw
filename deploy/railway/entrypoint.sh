@@ -27,6 +27,7 @@ default_temperature = 0.7
 
 [gateway]
 allow_public_bind = true
+require_pairing = false
 
 [auth]
 enabled = true

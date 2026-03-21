@@ -8911,6 +8911,11 @@ impl Config {
             self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
+        // Require pairing: ZEROCLAW_REQUIRE_PAIRING
+        if let Ok(val) = std::env::var("ZEROCLAW_REQUIRE_PAIRING") {
+            self.gateway.require_pairing = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
         // Auth allow registration: ZEROCLAW_AUTH_ALLOW_REGISTRATION
         if let Ok(val) = std::env::var("ZEROCLAW_AUTH_ALLOW_REGISTRATION") {
             self.auth.allow_registration = val == "1" || val.eq_ignore_ascii_case("true");
