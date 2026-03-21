@@ -103,6 +103,19 @@ impl OpenAiCompatibleProvider {
         )
     }
 
+    /// Vision-enabled OpenAI-compatible provider without `/v1/responses` fallback.
+    /// Use for gateways that only expose tool calls via chat completions (no `/v1/responses`).
+    pub fn new_with_vision_no_responses_fallback(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+    ) -> Self {
+        Self::new_with_options(
+            name, base_url, credential, auth_style, true, false, None, false,
+        )
+    }
+
     /// Create a provider with a custom User-Agent header.
     ///
     /// Some providers (for example Kimi Code) require a specific User-Agent
@@ -465,6 +478,9 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    /// OpenAI-style completion status (`stop`, `tool_calls`, …).
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Remove `<think>...</think>` blocks from model output.
@@ -1579,31 +1595,9 @@ impl Provider for OpenAiCompatibleProvider {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let text = choice.message.effective_content_optional();
-        let reasoning_content = choice.message.reasoning_content;
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|tc| {
-                let function = tc.function?;
-                let name = function.name?;
-                let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
-                Some(ProviderToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name,
-                    arguments,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok(ProviderChatResponse {
-            text,
-            tool_calls,
-            usage,
-            reasoning_content,
-        })
+        let mut result = Self::parse_native_response(choice.message);
+        result.usage = usage;
+        Ok(result)
     }
 
     async fn chat(

@@ -204,3 +204,26 @@ default_provider = "custom:https://gateway.cloud-provider.com/v1"
 api_key = "gateway-api-key"
 default_model = "gpt-4"
 ```
+
+## Maintainer notes: `OpenAiCompatibleProvider` (`src/providers/compatible.rs`)
+
+These details matter when you register a new OpenAI-compatible endpoint in `src/providers/mod.rs` or debug tool calling against a proxy.
+
+### Gateways without `/v1/responses`
+
+Some stacks only implement `/v1/chat/completions` (tool calls included in the chat response). For those, the provider must **not** try the OpenAI-style `/v1/responses` fallback.
+
+- Use `OpenAiCompatibleProvider::new_no_responses_fallback` when the endpoint is text-only (no multimodal).
+- Use `OpenAiCompatibleProvider::new_with_vision_no_responses_fallback` when the endpoint supports vision/multimodal **and** still has no usable `/v1/responses` route.
+
+This mirrors the existing split between `new` / `new_with_vision` and the `supports_responses_fallback` flag inside `new_with_options`.
+
+### Native tool parsing (`parse_native_response`)
+
+Responses from `/v1/chat/completions` are parsed with a shared helper so every code path behaves the same:
+
+- **Tool call IDs** — If the API returns an `id` on each tool call, it is preserved. Minting a new random ID on every response breaks tool-result round-trips for models and gateways that expect stable ids.
+- **Alternate JSON shapes** — Some proxies use non-standard fields (for example top-level `name` / `arguments`, or a `parameters` object instead of a string). The `ToolCall` helpers normalize those before building `ProviderToolCall` values.
+- **Malformed argument JSON** — Invalid JSON in `arguments` is logged and replaced with `{}` so downstream code always sees parseable JSON.
+
+Non-streaming choice objects may include `finish_reason` (`stop`, `tool_calls`, etc.); it is deserialized for a complete OpenAI-shaped payload even when the runtime does not branch on it yet.
