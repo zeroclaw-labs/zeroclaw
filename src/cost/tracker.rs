@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Cost tracker for API usage monitoring and budget enforcement.
 pub struct CostTracker {
@@ -172,6 +172,35 @@ impl CostTracker {
     pub fn get_monthly_cost(&self, year: i32, month: u32) -> Result<f64> {
         let storage = self.lock_storage();
         storage.get_cost_for_month(year, month)
+    }
+}
+
+// ── Process-global singleton ────────────────────────────────────────
+// Both the gateway and the channels supervisor share a single CostTracker
+// so that budget enforcement is consistent across all paths.
+
+static GLOBAL_COST_TRACKER: OnceLock<Option<Arc<CostTracker>>> = OnceLock::new();
+
+impl CostTracker {
+    /// Return the process-global `CostTracker`, creating it on first call.
+    /// Subsequent calls (from gateway or channels, whichever starts second)
+    /// receive the same `Arc`.  Returns `None` when cost tracking is disabled
+    /// or initialisation fails.
+    pub fn get_or_init_global(config: CostConfig, workspace_dir: &Path) -> Option<Arc<Self>> {
+        GLOBAL_COST_TRACKER
+            .get_or_init(|| {
+                if !config.enabled {
+                    return None;
+                }
+                match Self::new(config, workspace_dir) {
+                    Ok(ct) => Some(Arc::new(ct)),
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize global cost tracker: {e}");
+                        None
+                    }
+                }
+            })
+            .clone()
     }
 }
 

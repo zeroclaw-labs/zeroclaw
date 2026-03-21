@@ -80,17 +80,10 @@ fn resolve_transcription_api_key(config: &TranscriptionConfig) -> Result<String>
     );
 }
 
-/// Validate audio data and resolve MIME type from file name.
+/// Resolve MIME type and normalize filename from extension.
 ///
-/// Returns `(normalized_filename, mime_type)` on success.
-fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'static str)> {
-    if audio_data.len() > MAX_AUDIO_BYTES {
-        bail!(
-            "Audio file too large ({} bytes, max {MAX_AUDIO_BYTES})",
-            audio_data.len()
-        );
-    }
-
+/// No size check — callers enforce their own limits.
+fn resolve_audio_format(file_name: &str) -> Result<(String, &'static str)> {
     let normalized_name = normalize_audio_filename(file_name);
     let extension = normalized_name
         .rsplit_once('.')
@@ -98,11 +91,24 @@ fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'stati
         .unwrap_or("");
     let mime = mime_for_audio(extension).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unsupported audio format '.{extension}' — accepted: flac, mp3, mp4, mpeg, mpga, m4a, ogg, opus, wav, webm"
+            "Unsupported audio format '.{extension}' — \
+             accepted: flac, mp3, mp4, mpeg, mpga, m4a, ogg, opus, wav, webm"
         )
     })?;
-
     Ok((normalized_name, mime))
+}
+
+/// Validate audio data and resolve MIME type from file name.
+///
+/// Enforces the 25 MB cloud API cap. Returns `(normalized_filename, mime_type)` on success.
+fn validate_audio(audio_data: &[u8], file_name: &str) -> Result<(String, &'static str)> {
+    if audio_data.len() > MAX_AUDIO_BYTES {
+        bail!(
+            "Audio file too large ({} bytes, max {MAX_AUDIO_BYTES})",
+            audio_data.len()
+        );
+    }
+    resolve_audio_format(file_name)
 }
 
 // ── TranscriptionProvider trait ─────────────────────────────────
@@ -586,20 +592,119 @@ impl TranscriptionProvider for GoogleSttProvider {
     }
 }
 
+// ── LocalWhisperProvider ────────────────────────────────────────
+
+/// Self-hosted faster-whisper-compatible STT provider.
+///
+/// POSTs audio as `multipart/form-data` (field name `file`) to a configurable
+/// HTTP endpoint (e.g. faster-whisper on GEX44 over WireGuard). The endpoint
+/// must return `{"text": "..."}`. No cloud API key required. Size limit is
+/// configurable — not constrained by the 25 MB cloud API cap.
+pub struct LocalWhisperProvider {
+    url: String,
+    bearer_token: String,
+    max_audio_bytes: usize,
+    timeout_secs: u64,
+}
+
+impl LocalWhisperProvider {
+    /// Build from config. Fails if `url` or `bearer_token` is empty, if `url`
+    /// is not a valid HTTP/HTTPS URL (scheme must be `http` or `https`), if
+    /// `max_audio_bytes` is zero, or if `timeout_secs` is zero.
+    pub fn from_config(config: &crate::config::LocalWhisperConfig) -> Result<Self> {
+        let url = config.url.trim().to_string();
+        anyhow::ensure!(!url.is_empty(), "local_whisper: `url` must not be empty");
+        let parsed = url
+            .parse::<reqwest::Url>()
+            .with_context(|| format!("local_whisper: invalid `url`: {url:?}"))?;
+        anyhow::ensure!(
+            matches!(parsed.scheme(), "http" | "https"),
+            "local_whisper: `url` must use http or https scheme, got {:?}",
+            parsed.scheme()
+        );
+
+        let bearer_token = config.bearer_token.trim().to_string();
+        anyhow::ensure!(
+            !bearer_token.is_empty(),
+            "local_whisper: `bearer_token` must not be empty"
+        );
+
+        anyhow::ensure!(
+            config.max_audio_bytes > 0,
+            "local_whisper: `max_audio_bytes` must be greater than zero"
+        );
+
+        anyhow::ensure!(
+            config.timeout_secs > 0,
+            "local_whisper: `timeout_secs` must be greater than zero"
+        );
+
+        Ok(Self {
+            url,
+            bearer_token,
+            max_audio_bytes: config.max_audio_bytes,
+            timeout_secs: config.timeout_secs,
+        })
+    }
+}
+
+#[async_trait]
+impl TranscriptionProvider for LocalWhisperProvider {
+    fn name(&self) -> &str {
+        "local_whisper"
+    }
+
+    async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
+        if audio_data.len() > self.max_audio_bytes {
+            bail!(
+                "Audio file too large ({} bytes, local_whisper max {})",
+                audio_data.len(),
+                self.max_audio_bytes
+            );
+        }
+
+        let (normalized_name, mime) = resolve_audio_format(file_name)?;
+
+        let client = crate::config::build_runtime_proxy_client("transcription.local_whisper");
+
+        // to_vec() clones the buffer for the multipart payload; peak memory per
+        // call is ~2× max_audio_bytes. TODO: replace with streaming upload once
+        // reqwest supports body streaming in multipart parts.
+        let file_part = Part::bytes(audio_data.to_vec())
+            .file_name(normalized_name)
+            .mime_str(mime)?;
+
+        let resp = client
+            .post(&self.url)
+            .bearer_auth(&self.bearer_token)
+            .multipart(Form::new().part("file", file_part))
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .context("Failed to send audio to local Whisper endpoint")?;
+
+        parse_whisper_response(resp).await
+    }
+}
+
 // ── Shared response parsing ─────────────────────────────────────
 
-/// Parse a standard Whisper-compatible JSON response (`{ "text": "..." }`).
+/// Parse a faster-whisper-compatible JSON response (`{ "text": "..." }`).
+///
+/// Checks HTTP status before attempting JSON parsing so that non-JSON error
+/// bodies (plain text, HTML, empty 5xx) produce a readable status error
+/// rather than a confusing "Failed to parse transcription response".
 async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
     let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        bail!("Transcription API error ({}): {}", status, body.trim());
+    }
+
     let body: serde_json::Value = resp
         .json()
         .await
         .context("Failed to parse transcription response")?;
-
-    if !status.is_success() {
-        let error_msg = body["error"]["message"].as_str().unwrap_or("unknown error");
-        bail!("Transcription API error ({}): {}", status, error_msg);
-    }
 
     let text = body["text"]
         .as_str()
@@ -654,6 +759,17 @@ impl TranscriptionManager {
         if let Some(ref google_cfg) = config.google {
             if let Ok(p) = GoogleSttProvider::from_config(google_cfg) {
                 providers.insert("google".to_string(), Box::new(p));
+            }
+        }
+
+        if let Some(ref local_cfg) = config.local_whisper {
+            match LocalWhisperProvider::from_config(local_cfg) {
+                Ok(p) => {
+                    providers.insert("local_whisper".to_string(), Box::new(p));
+                }
+                Err(e) => {
+                    tracing::warn!("local_whisper config invalid, provider skipped: {e}");
+                }
             }
         }
 
@@ -727,8 +843,41 @@ pub async fn transcribe_audio(
     // are reported before missing-key errors (preserves original behavior).
     validate_audio(&audio_data, file_name)?;
 
-    let groq = GroqProvider::from_config(config)?;
-    groq.transcribe(&audio_data, file_name).await
+    match config.default_provider.as_str() {
+        "groq" => {
+            let groq = GroqProvider::from_config(config)?;
+            groq.transcribe(&audio_data, file_name).await
+        }
+        "openai" => {
+            let openai_cfg = config.openai.as_ref().context(
+                "Default transcription provider 'openai' is not configured. Add [transcription.openai]",
+            )?;
+            let openai = OpenAiWhisperProvider::from_config(openai_cfg)?;
+            openai.transcribe(&audio_data, file_name).await
+        }
+        "deepgram" => {
+            let deepgram_cfg = config.deepgram.as_ref().context(
+                "Default transcription provider 'deepgram' is not configured. Add [transcription.deepgram]",
+            )?;
+            let deepgram = DeepgramProvider::from_config(deepgram_cfg)?;
+            deepgram.transcribe(&audio_data, file_name).await
+        }
+        "assemblyai" => {
+            let assemblyai_cfg = config.assemblyai.as_ref().context(
+                "Default transcription provider 'assemblyai' is not configured. Add [transcription.assemblyai]",
+            )?;
+            let assemblyai = AssemblyAiProvider::from_config(assemblyai_cfg)?;
+            assemblyai.transcribe(&audio_data, file_name).await
+        }
+        "google" => {
+            let google_cfg = config.google.as_ref().context(
+                "Default transcription provider 'google' is not configured. Add [transcription.google]",
+            )?;
+            let google = GoogleSttProvider::from_config(google_cfg)?;
+            google.transcribe(&audio_data, file_name).await
+        }
+        other => bail!("Unsupported transcription provider '{other}'"),
+    }
 }
 
 #[cfg(test)]
@@ -783,6 +932,25 @@ mod tests {
         assert!(
             err.to_string().contains("Unsupported audio format"),
             "expected unsupported-format error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_default_provider_uses_openai_config() {
+        let data = vec![0u8; 100];
+        let mut config = TranscriptionConfig::default();
+        config.default_provider = "openai".to_string();
+        config.openai = Some(crate::config::OpenAiSttConfig {
+            api_key: None,
+            model: "gpt-4o-mini-transcribe".to_string(),
+        });
+
+        let err = transcribe_audio(data, "test.ogg", &config)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("[transcription.openai].api_key"),
+            "expected openai-specific missing-key error, got: {err}"
         );
     }
 
@@ -984,5 +1152,260 @@ mod tests {
         assert!(config.deepgram.is_none());
         assert!(config.assemblyai.is_none());
         assert!(config.google.is_none());
+        assert!(config.local_whisper.is_none());
+    }
+
+    // ── LocalWhisperProvider tests (TDD — added below as red/green cycles) ──
+
+    fn local_whisper_config(url: &str) -> crate::config::LocalWhisperConfig {
+        crate::config::LocalWhisperConfig {
+            url: url.to_string(),
+            bearer_token: "test-token".to_string(),
+            max_audio_bytes: 10 * 1024 * 1024,
+            timeout_secs: 30,
+        }
+    }
+
+    #[test]
+    fn local_whisper_rejects_empty_url() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.url = String::new();
+        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        assert!(
+            err.to_string().contains("`url` must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_whisper_rejects_invalid_url() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.url = "not-a-url".to_string();
+        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        assert!(err.to_string().contains("invalid `url`"), "got: {err}");
+    }
+
+    #[test]
+    fn local_whisper_rejects_non_http_url() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.url = "ftp://10.10.0.1:8001/v1/transcribe".to_string();
+        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        assert!(err.to_string().contains("http or https"), "got: {err}");
+    }
+
+    #[test]
+    fn local_whisper_rejects_empty_bearer_token() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.bearer_token = String::new();
+        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        assert!(
+            err.to_string().contains("`bearer_token` must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_whisper_rejects_zero_max_audio_bytes() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.max_audio_bytes = 0;
+        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("`max_audio_bytes` must be greater than zero"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_whisper_rejects_zero_timeout() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.timeout_secs = 0;
+        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("`timeout_secs` must be greater than zero"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_whisper_registered_when_config_present() {
+        let mut config = TranscriptionConfig::default();
+        config.local_whisper = Some(local_whisper_config("http://127.0.0.1:9999/v1/transcribe"));
+        config.default_provider = "local_whisper".to_string();
+
+        let manager = TranscriptionManager::new(&config).unwrap();
+        assert!(
+            manager.available_providers().contains(&"local_whisper"),
+            "expected local_whisper in {:?}",
+            manager.available_providers()
+        );
+    }
+
+    #[test]
+    fn local_whisper_misconfigured_section_fails_manager_construction() {
+        // A misconfigured local_whisper section logs a warning and skips
+        // registration. When local_whisper is also the default_provider and
+        // transcription is enabled, the safety net in TranscriptionManager
+        // surfaces the error: "not configured".
+        let mut config = TranscriptionConfig::default();
+        let mut bad_cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        bad_cfg.bearer_token = String::new();
+        config.local_whisper = Some(bad_cfg);
+        config.enabled = true;
+        config.default_provider = "local_whisper".to_string();
+
+        let err = TranscriptionManager::new(&config).err().unwrap();
+        assert!(
+            err.to_string().contains("not configured"),
+            "expected 'not configured' from manager safety net, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_audio_still_enforces_25mb_cap() {
+        // Regression: extracting resolve_audio_format() must not weaken validate_audio().
+        let at_limit = vec![0u8; MAX_AUDIO_BYTES];
+        assert!(validate_audio(&at_limit, "test.ogg").is_ok());
+        let over_limit = vec![0u8; MAX_AUDIO_BYTES + 1];
+        let err = validate_audio(&over_limit, "test.ogg").unwrap_err();
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn local_whisper_rejects_oversized_audio() {
+        let cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let big = vec![0u8; cfg.max_audio_bytes + 1];
+        let err = provider.transcribe(&big, "voice.ogg").await.unwrap_err();
+        assert!(err.to_string().contains("too large"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn local_whisper_rejects_unsupported_format() {
+        let cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+        let data = vec![0u8; 100];
+        let err = provider.transcribe(&data, "voice.aiff").await.unwrap_err();
+        assert!(
+            err.to_string().contains("Unsupported audio format"),
+            "got: {err}"
+        );
+    }
+
+    // ── LocalWhisperProvider HTTP mock tests ────────────────────
+
+    #[tokio::test]
+    async fn local_whisper_returns_text_from_response() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .and(header_exists("authorization"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "hello world"})),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
+        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+
+        let result = provider
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap();
+        assert_eq!(result, "hello world");
+    }
+
+    #[tokio::test]
+    async fn local_whisper_sends_bearer_auth_header() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "auth ok"})),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
+        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+
+        let result = provider
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap();
+        assert_eq!(result, "auth ok");
+    }
+
+    #[tokio::test]
+    async fn local_whisper_propagates_http_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(503).set_body_json(
+                    serde_json::json!({"error": {"message": "service unavailable"}}),
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
+        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+
+        let err = provider
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("503") || err.to_string().contains("service unavailable"),
+            "expected HTTP error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_whisper_propagates_non_json_http_error() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(502)
+                    .set_body_string("Bad Gateway")
+                    .insert_header("content-type", "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let cfg = local_whisper_config(&format!("{}/v1/transcribe", server.uri()));
+        let provider = LocalWhisperProvider::from_config(&cfg).unwrap();
+
+        let err = provider
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("502"), "got: {err}");
+        assert!(
+            err.to_string().contains("Bad Gateway"),
+            "expected plain-text body in error, got: {err}"
+        );
     }
 }

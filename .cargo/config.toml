@@ -2,7 +2,7 @@
 rustflags = ["-C", "link-arg=-static"]
 
 [target.aarch64-unknown-linux-musl]
-rustflags = ["-C", "link-arg=-static"]
+rustflags = ["-C", "link-arg=-static", "-C", "link-arg=-Wl,-z,stack-size=8388608"]
 
 # Android targets (NDK toolchain)
 [target.armv7-linux-androideabi]
@@ -10,6 +10,7 @@ linker = "armv7a-linux-androideabi21-clang"
 
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android21-clang"
+rustflags = ["-C", "link-arg=-Wl,-z,stack-size=8388608"]
 
 # riscv64gc-unknown-linux-musl target, produces a static binary with musl, but requires a custom linker and flags
 [target.riscv64gc-unknown-linux-musl]
@@ -19,3 +20,4 @@ rustflags = [
   "-C", "link-arg=-no-pie",
 ]
 linker = "riscv64-linux-musl-gcc"
+

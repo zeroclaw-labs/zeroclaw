@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use postgres::{Client, NoTls, Row};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
@@ -138,6 +139,30 @@ impl PostgresMemory {
     }
 }
 
+/// Run a blocking closure on a plain OS thread to avoid nested Tokio runtime
+/// panics. The sync `postgres` crate internally calls `Runtime::block_on()`,
+/// which conflicts with `tokio::task::spawn_blocking` threads that are still
+/// associated with the Tokio runtime's blocking pool. Plain OS threads have no
+/// runtime context, so the nested `block_on` succeeds.
+async fn run_on_os_thread<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+
+    std::thread::Builder::new()
+        .name("postgres-memory-op".to_string())
+        .spawn(move || {
+            let result = f();
+            let _ = tx.send(result);
+        })
+        .context("failed to spawn PostgreSQL operation thread")?;
+
+    rx.await
+        .map_err(|_| anyhow::anyhow!("PostgreSQL operation thread terminated unexpectedly"))?
+}
+
 fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("{field_name} must not be empty");
@@ -185,7 +210,7 @@ impl Memory for PostgresMemory {
         let category = Self::category_to_str(&category);
         let sid = session_id.map(str::to_string);
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
             let mut client = client.lock();
             let stmt = format!(
@@ -206,7 +231,7 @@ impl Memory for PostgresMemory {
             client.execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])?;
             Ok(())
         })
-        .await?
+        .await
     }
 
     async fn recall(
@@ -220,7 +245,7 @@ impl Memory for PostgresMemory {
         let query = query.trim().to_string();
         let sid = session_id.map(str::to_string);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
@@ -245,7 +270,7 @@ impl Memory for PostgresMemory {
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
         })
-        .await?
+        .await
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
@@ -253,7 +278,7 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
 
-        tokio::task::spawn_blocking(move || -> Result<Option<MemoryEntry>> {
+        run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
@@ -267,7 +292,7 @@ impl Memory for PostgresMemory {
             let row = client.query_opt(&stmt, &[&key])?;
             row.as_ref().map(Self::row_to_entry).transpose()
         })
-        .await?
+        .await
     }
 
     async fn list(
@@ -280,7 +305,7 @@ impl Memory for PostgresMemory {
         let category = category.map(Self::category_to_str);
         let sid = session_id.map(str::to_string);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
@@ -299,7 +324,7 @@ impl Memory for PostgresMemory {
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
         })
-        .await?
+        .await
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
@@ -307,20 +332,20 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
 
-        tokio::task::spawn_blocking(move || -> Result<bool> {
+        run_on_os_thread(move || -> Result<bool> {
             let mut client = client.lock();
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
             let deleted = client.execute(&stmt, &[&key])?;
             Ok(deleted > 0)
         })
-        .await?
+        .await
     }
 
     async fn count(&self) -> Result<usize> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<usize> {
+        run_on_os_thread(move || -> Result<usize> {
             let mut client = client.lock();
             let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
             let count: i64 = client.query_one(&stmt, &[])?.get(0);
@@ -328,12 +353,12 @@ impl Memory for PostgresMemory {
                 usize::try_from(count).context("PostgreSQL returned a negative memory count")?;
             Ok(count)
         })
-        .await?
+        .await
     }
 
     async fn health_check(&self) -> bool {
         let client = self.client.clone();
-        tokio::task::spawn_blocking(move || client.lock().simple_query("SELECT 1").is_ok())
+        run_on_os_thread(move || Ok(client.lock().simple_query("SELECT 1").is_ok()))
             .await
             .unwrap_or(false)
     }

@@ -1,10 +1,10 @@
 [workspace]
-members = [".", "crates/robot-kit"]
+members = [".", "crates/robot-kit", "crates/aardvark-sys"]
 resolver = "2"
 
 [package]
 name = "zeroclawlabs"
-version = "0.5.2"
+version = "0.5.4"
 edition = "2021"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
@@ -89,9 +89,15 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
+# Zip extraction for ClawhHub / OpenClaw registry installers
+zip = { version = "8.1", default-features = false, features = ["deflate"] }
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
+
+# Aardvark I2C/SPI/GPIO USB adapter (Total Phase) — stub when SDK absent
+aardvark-sys = { path = "crates/aardvark-sys" }
 
 # UUID generation
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
@@ -191,7 +197,7 @@ probe-rs = { version = "0.31", optional = true }
 pdf-extract = { version = "0.10", optional = true }
 
 # WASM plugin runtime (extism)
-extism = { version = "1.9", optional = true }
+extism = { version = "1.20", optional = true }
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
@@ -222,6 +228,8 @@ channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
 memory-postgres = ["dep:postgres"]
+# memory-mem0 = Mem0 (OpenMemory) memory backend via REST API
+memory-mem0 = []
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]

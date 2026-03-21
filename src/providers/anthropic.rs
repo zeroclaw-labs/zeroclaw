@@ -52,6 +52,8 @@ struct NativeChatRequest<'a> {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -200,9 +202,38 @@ impl AnthropicProvider {
         if Self::is_setup_token(credential) {
             request
                 .header("Authorization", format!("Bearer {credential}"))
-                .header("anthropic-beta", "oauth-2025-04-20")
+                .header(
+                    "anthropic-beta",
+                    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                )
+                .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
             request.header("x-api-key", credential)
+        }
+    }
+
+    /// For OAuth tokens, Anthropic requires the system prompt to start with the
+    /// Claude Code identity prefix. This prepends it to any existing system prompt.
+    fn apply_oauth_system_prompt(system: Option<SystemPrompt>) -> Option<SystemPrompt> {
+        let prefix = SystemBlock {
+            block_type: "text".to_string(),
+            text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        };
+        match system {
+            Some(SystemPrompt::Blocks(mut blocks)) => {
+                blocks.insert(0, prefix);
+                Some(SystemPrompt::Blocks(blocks))
+            }
+            Some(SystemPrompt::String(s)) => Some(SystemPrompt::Blocks(vec![
+                prefix,
+                SystemBlock {
+                    block_type: "text".to_string(),
+                    text: s,
+                    cache_control: Some(CacheControl::ephemeral()),
+                },
+            ])),
+            None => Some(SystemPrompt::Blocks(vec![prefix])),
         }
     }
 
@@ -537,15 +568,27 @@ impl Provider for AnthropicProvider {
             )
         })?;
 
-        let request = ChatRequest {
+        let system = system_prompt.map(|s| SystemPrompt::String(s.to_string()));
+        let system = if Self::is_setup_token(credential) {
+            Self::apply_oauth_system_prompt(system)
+        } else {
+            system
+        };
+
+        let request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: 4096,
-            system: system_prompt.map(ToString::to_string),
-            messages: vec![Message {
+            system,
+            messages: vec![NativeMessage {
                 role: "user".to_string(),
-                content: message.to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: message.to_string(),
+                    cache_control: None,
+                }],
             }],
             temperature,
+            tools: None,
+            tool_choice: None,
         };
 
         let mut request = self
@@ -563,8 +606,11 @@ impl Provider for AnthropicProvider {
             return Err(super::api_error("Anthropic", response).await);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
-        Self::parse_text_response(chat_response)
+        let chat_response: NativeChatResponse = response.json().await?;
+        let parsed = Self::parse_native_response(chat_response);
+        parsed
+            .text
+            .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
     }
 
     async fn chat(
@@ -586,13 +632,33 @@ impl Provider for AnthropicProvider {
             Self::apply_cache_to_last_message(&mut messages);
         }
 
+        // Check for tool_choice override from the agent loop (e.g. "any"
+        // to force tool use for hardware requests).
+        let tool_choice_override = crate::agent::loop_::TOOL_CHOICE_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let native_tools = Self::convert_tools(request.tools);
+        let tool_choice = if native_tools.is_some() {
+            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+        } else {
+            None
+        };
+
+        // For OAuth tokens, prepend Claude Code identity to system prompt
+        let system_prompt = if Self::is_setup_token(credential) {
+            Self::apply_oauth_system_prompt(system_prompt)
+        } else {
+            system_prompt
+        };
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: 4096,
             system: system_prompt,
             messages,
             temperature,
-            tools: Self::convert_tools(request.tools),
+            tools: native_tools,
+            tool_choice,
         };
 
         let req = self
@@ -785,7 +851,14 @@ mod tests {
                 .headers()
                 .get("anthropic-beta")
                 .and_then(|v| v.to_str().ok()),
-            Some("oauth-2025-04-20")
+            Some("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("anthropic-dangerous-direct-browser-access")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
         );
         assert!(request.headers().get("x-api-key").is_none());
     }
@@ -1275,6 +1348,7 @@ mod tests {
             }],
             temperature: 0.7,
             tools: None,
+            tool_choice: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();

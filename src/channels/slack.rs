@@ -30,6 +30,10 @@ pub struct SlackChannel {
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
     workspace_dir: Option<PathBuf>,
+    /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
+    active_assistant_thread: Mutex<HashMap<String, String>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -44,10 +48,48 @@ const SLACK_ATTACHMENT_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
 const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
 const SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS: usize = 12_000;
+const SLACK_MARKDOWN_BLOCK_MAX_CHARS: usize = 12_000;
 const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
 const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
+
+/// Extract the Slack message timestamp from a ZeroClaw message ID.
+///
+/// Message IDs follow the format `slack_{channel_id}_{ts}` where `ts`
+/// contains a dot (e.g. `"1234567890.123456"`). If the format is
+/// unrecognised the raw `message_id` is returned as-is.
+fn extract_slack_ts(message_id: &str) -> &str {
+    message_id
+        .strip_prefix("slack_")
+        .and_then(|rest| {
+            rest.find('.').map(|dot_pos| {
+                let underscore = rest[..dot_pos].rfind('_').unwrap_or(0);
+                &rest[underscore + 1..]
+            })
+        })
+        .unwrap_or(message_id)
+}
+
+/// Map a Unicode emoji to its Slack short-name.
+///
+/// The orchestration layer passes Unicode characters (e.g. `"\u{1F440}"`).
+/// Slack's reactions API expects colon-free short-names (`"eyes"`).
+fn unicode_emoji_to_slack_name(emoji: &str) -> &str {
+    match emoji {
+        "\u{1F440}" => "eyes",                        // 👀
+        "\u{2705}" => "white_check_mark",             // ✅
+        "\u{26A0}\u{FE0F}" | "\u{26A0}" => "warning", // ⚠️
+        "\u{274C}" => "x",                            // ❌
+        "\u{1F44D}" => "thumbsup",                    // 👍
+        "\u{1F44E}" => "thumbsdown",                  // 👎
+        "\u{2B50}" => "star",                         // ⭐
+        "\u{1F389}" => "tada",                        // 🎉
+        "\u{1F914}" => "thinking_face",               // 🤔
+        "\u{1F525}" => "fire",                        // 🔥
+        _ => emoji.trim_matches(':'),
+    }
+}
 const SLACK_ATTACHMENT_RENDER_CONCURRENCY: usize = 3;
 const SLACK_POLL_ACTIVE_THREAD_MAX: usize = 50;
 const SLACK_POLL_THREAD_EXPIRE_SECS: u64 = 24 * 60 * 60;
@@ -81,6 +123,8 @@ impl SlackChannel {
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
+            active_assistant_thread: Mutex::new(HashMap::new()),
+            proxy_url: None,
         }
     }
 
@@ -108,8 +152,19 @@ impl SlackChannel {
         self
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client_with_timeouts("channel.slack", 30, 10)
+        crate::config::build_channel_proxy_client_with_timeouts(
+            "channel.slack",
+            self.proxy_url.as_deref(),
+            30,
+            10,
+        )
     }
 
     /// Check if a Slack user ID is in the allowlist.
@@ -162,6 +217,17 @@ impl SlackChannel {
         msg.get("thread_ts")
             .and_then(|t| t.as_str())
             .or(if ts.is_empty() { None } else { Some(ts) })
+            .map(str::to_string)
+    }
+
+    /// Like `inbound_thread_ts`, but only returns a value when Slack's own
+    /// `thread_ts` field is present (genuine thread reply). Does **not** fall
+    /// back to the message's `ts`, so top-level messages get `None`. Used when
+    /// `thread_replies=false` so that all top-level messages from the same user
+    /// share a single conversation session key.
+    fn inbound_thread_ts_genuine_only(msg: &serde_json::Value) -> Option<String> {
+        msg.get("thread_ts")
+            .and_then(|t| t.as_str())
             .map(str::to_string)
     }
 
@@ -753,12 +819,13 @@ impl SlackChannel {
     }
 
     fn slack_media_http_client_no_redirect(&self) -> anyhow::Result<reqwest::Client> {
-        let builder = crate::config::apply_runtime_proxy_to_builder(
+        let builder = crate::config::apply_channel_proxy_to_builder(
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10)),
             "channel.slack",
+            self.proxy_url.as_deref(),
         );
         builder
             .build()
@@ -1736,7 +1803,34 @@ impl SlackChannel {
                 else {
                     continue;
                 };
-                if event.get("type").and_then(|v| v.as_str()) != Some("message") {
+                let event_type = event
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+
+                // Track assistant thread context for Assistants API status indicators.
+                if event_type == "assistant_thread_started"
+                    || event_type == "assistant_thread_context_changed"
+                {
+                    if let Some(thread) = event.get("assistant_thread") {
+                        let ch = thread
+                            .get("channel_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let tts = thread
+                            .get("thread_ts")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if !ch.is_empty() && !tts.is_empty() {
+                            if let Ok(mut map) = self.active_assistant_thread.lock() {
+                                map.insert(ch.to_string(), tts.to_string());
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if event_type != "message" {
                     continue;
                 }
                 let subtype = event.get("subtype").and_then(|v| v.as_str());
@@ -1808,9 +1902,20 @@ impl SlackChannel {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    thread_ts: Self::inbound_thread_ts(event, ts),
+                    thread_ts: if self.thread_replies {
+                        Self::inbound_thread_ts(event, ts)
+                    } else {
+                        Self::inbound_thread_ts_genuine_only(event)
+                    },
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                 };
+
+                // Track thread context so start_typing can set assistant status.
+                if let Some(ref tts) = channel_msg.thread_ts {
+                    if let Ok(mut map) = self.active_assistant_thread.lock() {
+                        map.insert(channel_id.clone(), tts.clone());
+                    }
+                }
 
                 if tx.send(channel_msg).await.is_err() {
                     return Ok(());
@@ -2183,6 +2288,14 @@ impl Channel for SlackChannel {
             "text": message.content
         });
 
+        // Use Slack's native markdown block for rich formatting when content fits.
+        if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": message.content
+            }]);
+        }
+
         if let Some(ts) = self.outbound_thread_ts(message) {
             body["thread_ts"] = serde_json::json!(ts);
         }
@@ -2214,6 +2327,96 @@ impl Channel for SlackChannel {
                 .and_then(|e| e.as_str())
                 .unwrap_or("unknown");
             anyhow::bail!("Slack chat.postMessage failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let ts = extract_slack_ts(message_id);
+        let name = unicode_emoji_to_slack_name(emoji);
+
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "timestamp": ts,
+            "name": name
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/reactions.add")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&text);
+            anyhow::bail!("Slack reactions.add failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            if err != "already_reacted" {
+                anyhow::bail!("Slack reactions.add failed: {err}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let ts = extract_slack_ts(message_id);
+        let name = unicode_emoji_to_slack_name(emoji);
+
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "timestamp": ts,
+            "name": name
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/reactions.remove")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&text);
+            anyhow::bail!("Slack reactions.remove failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            if err != "no_reaction" {
+                anyhow::bail!("Slack reactions.remove failed: {err}");
+            }
         }
 
         Ok(())
@@ -2373,7 +2576,11 @@ impl Channel for SlackChannel {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
-                            thread_ts: Self::inbound_thread_ts(msg, ts),
+                            thread_ts: if self.thread_replies {
+                                Self::inbound_thread_ts(msg, ts)
+                            } else {
+                                Self::inbound_thread_ts_genuine_only(msg)
+                            },
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                         };
 
@@ -2492,6 +2699,49 @@ impl Channel for SlackChannel {
             true
         };
         Self::evaluate_health(bot_ok, socket_mode_enabled, socket_mode_ok)
+    }
+
+    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let thread_ts = {
+            let map = self
+                .active_assistant_thread
+                .lock()
+                .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            match map.get(recipient) {
+                Some(ts) => ts.clone(),
+                None => return Ok(()),
+            }
+        };
+
+        let body = serde_json::json!({
+            "channel_id": recipient,
+            "thread_ts": thread_ts,
+            "status": "is thinking...",
+        });
+
+        // Gracefully ignore errors — non-assistant contexts will return errors.
+        if let Ok(resp) = self
+            .http_client()
+            .post("https://slack.com/api/assistant.threads.setStatus")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+        {
+            if !resp.status().is_success() {
+                tracing::debug!(
+                    "assistant.threads.setStatus returned {}; ignoring",
+                    resp.status()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Status auto-clears when the bot sends a message via chat.postMessage.
+        Ok(())
     }
 }
 
@@ -3278,6 +3528,48 @@ mod tests {
     }
 
     #[test]
+    fn extract_slack_ts_from_standard_message_id() {
+        assert_eq!(
+            extract_slack_ts("slack_C1234567890_1234567890.123456"),
+            "1234567890.123456"
+        );
+    }
+
+    #[test]
+    fn extract_slack_ts_from_raw_ts_passthrough() {
+        assert_eq!(extract_slack_ts("1234567890.123456"), "1234567890.123456");
+    }
+
+    #[test]
+    fn extract_slack_ts_from_unprefixed_id() {
+        assert_eq!(extract_slack_ts("unknown_format"), "unknown_format");
+    }
+
+    #[test]
+    fn unicode_emoji_maps_to_slack_eyes() {
+        assert_eq!(unicode_emoji_to_slack_name("\u{1F440}"), "eyes");
+    }
+
+    #[test]
+    fn unicode_emoji_maps_to_slack_check_mark() {
+        assert_eq!(unicode_emoji_to_slack_name("\u{2705}"), "white_check_mark");
+    }
+
+    #[test]
+    fn unicode_emoji_maps_to_slack_warning() {
+        assert_eq!(unicode_emoji_to_slack_name("\u{26A0}\u{FE0F}"), "warning");
+        assert_eq!(unicode_emoji_to_slack_name("\u{26A0}"), "warning");
+    }
+
+    #[test]
+    fn unicode_emoji_colon_wrapped_passthrough() {
+        assert_eq!(
+            unicode_emoji_to_slack_name(":custom_emoji:"),
+            "custom_emoji"
+        );
+    }
+
+    #[test]
     fn inbound_thread_ts_on_thread_reply_uses_thread_ts() {
         let reply = serde_json::json!({
             "ts": "200.000",
@@ -3286,5 +3578,166 @@ mod tests {
         });
         let thread_ts = SlackChannel::inbound_thread_ts(&reply, "200.000");
         assert_eq!(thread_ts.as_deref(), Some("100.000"));
+    }
+
+    #[test]
+    fn inbound_thread_ts_genuine_only_returns_none_for_top_level() {
+        // Top-level messages don't have thread_ts in Slack's API.
+        let msg = serde_json::json!({
+            "ts": "100.000",
+            "text": "hello"
+        });
+        assert_eq!(SlackChannel::inbound_thread_ts_genuine_only(&msg), None);
+    }
+
+    #[test]
+    fn inbound_thread_ts_genuine_only_returns_thread_ts_for_replies() {
+        // Thread replies have thread_ts pointing to the parent message.
+        let reply = serde_json::json!({
+            "ts": "200.000",
+            "thread_ts": "100.000",
+            "text": "a reply"
+        });
+        assert_eq!(
+            SlackChannel::inbound_thread_ts_genuine_only(&reply).as_deref(),
+            Some("100.000")
+        );
+    }
+
+    #[test]
+    fn session_key_stable_without_thread_replies() {
+        // When thread_replies=false, top-level messages from the same user should
+        // produce the same conversation_history_key (thread_ts=None).
+        use crate::channels::traits::ChannelMessage;
+
+        let make_msg = |ts: &str| ChannelMessage {
+            id: format!("slack_C123_{ts}"),
+            sender: "U_alice".into(),
+            reply_target: "C123".into(),
+            content: "text".into(),
+            channel: "slack".into(),
+            timestamp: 0,
+            thread_ts: None, // thread_replies=false → no fallback to ts
+            interruption_scope_id: None,
+        };
+
+        let msg1 = make_msg("100.000");
+        let msg2 = make_msg("200.000");
+
+        let key1 = super::super::conversation_history_key(&msg1);
+        let key2 = super::super::conversation_history_key(&msg2);
+        assert_eq!(key1, key2, "session key should be stable across messages");
+    }
+
+    #[test]
+    fn session_key_varies_with_thread_replies() {
+        // When thread_replies=true, top-level messages get thread_ts=Some(ts),
+        // giving each its own session key (thread isolation).
+        use crate::channels::traits::ChannelMessage;
+
+        let make_msg = |ts: &str| ChannelMessage {
+            id: format!("slack_C123_{ts}"),
+            sender: "U_alice".into(),
+            reply_target: "C123".into(),
+            content: "text".into(),
+            channel: "slack".into(),
+            timestamp: 0,
+            thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
+            interruption_scope_id: None,
+        };
+
+        let msg1 = make_msg("100.000");
+        let msg2 = make_msg("200.000");
+
+        let key1 = super::super::conversation_history_key(&msg1);
+        let key2 = super::super::conversation_history_key(&msg2);
+        assert_ne!(key1, key2, "session key should differ per thread");
+    }
+
+    #[test]
+    fn slack_send_uses_markdown_blocks() {
+        let msg = SendMessage::new("**bold** and _italic_", "C123");
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+
+        // Build the same JSON body that send() would construct.
+        let mut body = serde_json::json!({
+            "channel": msg.recipient,
+            "text": msg.content
+        });
+        if msg.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": msg.content
+            }]);
+        }
+
+        // Verify blocks are present with correct structure.
+        let blocks = body["blocks"]
+            .as_array()
+            .expect("blocks should be an array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "markdown");
+        assert_eq!(blocks[0]["text"], msg.content);
+        // text field kept as plaintext fallback.
+        assert_eq!(body["text"], msg.content);
+        // Suppress unused variable warning.
+        let _ = ch.name();
+    }
+
+    #[test]
+    fn slack_send_skips_markdown_blocks_for_long_content() {
+        let long_content = "x".repeat(SLACK_MARKDOWN_BLOCK_MAX_CHARS + 1);
+        let msg = SendMessage::new(long_content.clone(), "C123");
+
+        let mut body = serde_json::json!({
+            "channel": msg.recipient,
+            "text": msg.content
+        });
+        if msg.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": msg.content
+            }]);
+        }
+
+        assert!(
+            body.get("blocks").is_none(),
+            "blocks should not be set for oversized content"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_typing_requires_thread_context() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        // No thread_ts tracked for "C999" — start_typing should be a no-op (Ok).
+        let result = ch.start_typing("C999").await;
+        assert!(
+            result.is_ok(),
+            "start_typing should succeed as no-op without thread context"
+        );
+    }
+
+    #[test]
+    fn assistant_thread_tracking() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+
+        // Initially empty.
+        {
+            let map = ch.active_assistant_thread.lock().unwrap();
+            assert!(map.is_empty());
+        }
+
+        // Simulate storing a thread_ts (as listen_socket_mode would).
+        {
+            let mut map = ch.active_assistant_thread.lock().unwrap();
+            map.insert("C123".to_string(), "1741234567.000100".to_string());
+        }
+
+        // Verify retrieval.
+        {
+            let map = ch.active_assistant_thread.lock().unwrap();
+            assert_eq!(map.get("C123"), Some(&"1741234567.000100".to_string()),);
+            assert_eq!(map.get("C999"), None);
+        }
     }
 }

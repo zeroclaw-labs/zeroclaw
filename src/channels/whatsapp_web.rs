@@ -58,6 +58,14 @@ pub struct WhatsAppWebChannel {
     pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
+    /// Usage mode (business vs personal policy filtering)
+    mode: crate::config::WhatsAppWebMode,
+    /// DM policy when mode = personal
+    dm_policy: crate::config::WhatsAppChatPolicy,
+    /// Group policy when mode = personal
+    group_policy: crate::config::WhatsAppChatPolicy,
+    /// Whether to always respond in self-chat when mode = personal
+    self_chat_mode: bool,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -86,18 +94,30 @@ impl WhatsAppWebChannel {
     /// * `pair_phone` - Optional phone number for pair code linking (format: "15551234567")
     /// * `pair_code` - Optional custom pair code (leave empty for auto-generated)
     /// * `allowed_numbers` - Phone numbers allowed to interact (E.164 format) or "*" for all
+    /// * `mode` - Usage mode (business or personal)
+    /// * `dm_policy` - DM policy when mode = personal
+    /// * `group_policy` - Group policy when mode = personal
+    /// * `self_chat_mode` - Whether to always respond in self-chat when mode = personal
     #[cfg(feature = "whatsapp-web")]
     pub fn new(
         session_path: String,
         pair_phone: Option<String>,
         pair_code: Option<String>,
         allowed_numbers: Vec<String>,
+        mode: crate::config::WhatsAppWebMode,
+        dm_policy: crate::config::WhatsAppChatPolicy,
+        group_policy: crate::config::WhatsAppChatPolicy,
+        self_chat_mode: bool,
     ) -> Self {
         Self {
             session_path,
             pair_phone,
             pair_code,
             allowed_numbers,
+            mode,
+            dm_policy,
+            group_policy,
+            self_chat_mode,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
@@ -624,9 +644,11 @@ impl Channel for WhatsAppWebChannel {
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
             let transcription_config = self.transcription.clone();
-
-            let transcription_config = self.transcription.clone();
             let voice_chats = self.voice_chats.clone();
+            let wa_mode = self.mode.clone();
+            let wa_dm_policy = self.dm_policy.clone();
+            let wa_group_policy = self.group_policy.clone();
+            let wa_self_chat_mode = self.self_chat_mode;
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -640,6 +662,9 @@ impl Channel for WhatsAppWebChannel {
                     let session_revoked = session_revoked_clone.clone();
                     let transcription_config = transcription_config.clone();
                     let voice_chats = voice_chats.clone();
+                    let wa_mode = wa_mode.clone();
+                    let wa_dm_policy = wa_dm_policy.clone();
+                    let wa_group_policy = wa_group_policy.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -675,6 +700,61 @@ impl Channel for WhatsAppWebChannel {
                                         return;
                                     }
                                 };
+
+                                // ── Personal-mode chat-type policy filtering ──
+                                if wa_mode == crate::config::WhatsAppWebMode::Personal {
+                                    let is_group = chat.contains("@g.us");
+                                    // Self-chat: the chat JID user part matches
+                                    // the sender's user part (message to "Notes
+                                    // to Self").
+                                    let sender_user = sender_jid.user();
+                                    let chat_user = chat
+                                        .split_once('@')
+                                        .map(|(u, _)| u)
+                                        .unwrap_or(&chat);
+                                    let is_self_chat = !is_group && sender_user == chat_user;
+
+                                    if is_self_chat {
+                                        if !wa_self_chat_mode {
+                                            tracing::debug!(
+                                                "WhatsApp Web: ignoring self-chat message (self_chat_mode=false)"
+                                            );
+                                            return;
+                                        }
+                                        // self_chat_mode=true: always process, skip further policy checks
+                                    } else if is_group {
+                                        match wa_group_policy {
+                                            crate::config::WhatsAppChatPolicy::Ignore => {
+                                                tracing::debug!(
+                                                    "WhatsApp Web: ignoring group message (group_policy=ignore)"
+                                                );
+                                                return;
+                                            }
+                                            crate::config::WhatsAppChatPolicy::All => {
+                                                // allow unconditionally
+                                            }
+                                            crate::config::WhatsAppChatPolicy::Allowlist => {
+                                                // already filtered by allowed_numbers above
+                                            }
+                                        }
+                                    } else {
+                                        // DM (non-self)
+                                        match wa_dm_policy {
+                                            crate::config::WhatsAppChatPolicy::Ignore => {
+                                                tracing::debug!(
+                                                    "WhatsApp Web: ignoring DM (dm_policy=ignore)"
+                                                );
+                                                return;
+                                            }
+                                            crate::config::WhatsAppChatPolicy::All => {
+                                                // allow unconditionally
+                                            }
+                                            crate::config::WhatsAppChatPolicy::Allowlist => {
+                                                // already filtered by allowed_numbers above
+                                            }
+                                        }
+                                    }
+                                }
 
                                 // Attempt voice note transcription (ptt = push-to-talk = voice note)
                                 let voice_text = if let Some(ref audio) = msg.audio_message {
@@ -979,6 +1059,10 @@ impl WhatsAppWebChannel {
         _pair_phone: Option<String>,
         _pair_code: Option<String>,
         _allowed_numbers: Vec<String>,
+        _mode: crate::config::WhatsAppWebMode,
+        _dm_policy: crate::config::WhatsAppChatPolicy,
+        _group_policy: crate::config::WhatsAppChatPolicy,
+        _self_chat_mode: bool,
     ) -> Self {
         Self { _private: () }
     }
@@ -1045,6 +1129,10 @@ mod tests {
             None,
             None,
             vec!["+1234567890".into()],
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
         )
     }
 
@@ -1066,7 +1154,16 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_allowed_wildcard() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()]);
+        let ch = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            None,
+            None,
+            vec!["*".into()],
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
+        );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
     }
@@ -1074,7 +1171,16 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![]);
+        let ch = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            None,
+            None,
+            vec![],
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
+        );
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
     }

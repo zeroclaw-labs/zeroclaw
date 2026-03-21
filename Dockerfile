@@ -23,9 +23,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-# Remove robot-kit from workspace members — it is excluded by .dockerignore
-# and is not needed for the Docker build (hardware-only crate).
-RUN sed -i 's/members = \[".", "crates\/robot-kit"\]/members = ["."]/' Cargo.toml
+# Include every workspace member: Cargo.lock is generated for the full workspace.
+# Previously we used sed to drop `crates/robot-kit`, which made the manifest disagree
+# with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
+COPY crates/robot-kit/ crates/robot-kit/
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
 RUN mkdir -p src benches \
     && echo "fn main() {}" > src/main.rs \
@@ -60,7 +61,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     fi && \
     cp target/release/zeroclaw /app/zeroclaw && \
     strip /app/zeroclaw
-RUN size=$(stat -c%s /app/zeroclaw 2>/dev/null || stat -f%z /app/zeroclaw) && \
+RUN size=$(stat -c%s /app/zeroclaw) && \
     if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes), likely dummy build artifact" && exit 1; fi
 
 # Prepare runtime directory structure and default config inline (no extra stage)

@@ -672,7 +672,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Weather",
             description: "Forecasts & conditions",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |_| IntegrationStatus::Active,
         },
         IntegrationEntry {
             name: "Canvas",
@@ -841,6 +841,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
+            proxy_url: None,
         });
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
@@ -890,6 +891,7 @@ mod tests {
             device_id: None,
             room_id: "!r:m".into(),
             allowed_users: vec![],
+            interrupt_on_new_message: false,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
@@ -994,7 +996,7 @@ mod tests {
     fn shell_and_filesystem_always_active() {
         let config = Config::default();
         let entries = all_integrations();
-        for name in ["Shell", "File System"] {
+        for name in ["Shell", "File System", "Weather"] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
             assert!(
                 matches!((entry.status_fn)(&config), IntegrationStatus::Active),

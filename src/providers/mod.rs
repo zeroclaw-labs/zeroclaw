@@ -908,6 +908,8 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
         "astrai" => vec!["ASTRAI_API_KEY"],
+        "avian" => vec!["AVIAN_API_KEY"],
+        "deepmyst" | "deep-myst" => vec!["DEEPMYST_API_KEY"],
         "llamacpp" | "llama.cpp" => vec!["LLAMACPP_API_KEY"],
         "sglang" => vec!["SGLANG_API_KEY"],
         "vllm" => vec!["VLLM_API_KEY"],
@@ -1494,6 +1496,12 @@ fn create_provider_with_url_and_options(
         ))),
         "hunyuan" | "tencent" => Ok(compat(OpenAiCompatibleProvider::new(
             "Tencent Hunyuan", "https://api.hunyuan.cloud.tencent.com/v1", key, AuthStyle::Bearer,
+        ))),
+        "avian" => Ok(compat(OpenAiCompatibleProvider::new(
+            "Avian", "https://api.avian.io/v1", key, AuthStyle::Bearer,
+        ))),
+        "deepmyst" | "deep-myst" => Ok(compat(OpenAiCompatibleProvider::new(
+            "DeepMyst", "https://api.deepmyst.com/v1", key, AuthStyle::Bearer,
         ))),
 
         // ── Cloud AI endpoints ───────────────────────────────
@@ -2163,6 +2171,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             name: "ovhcloud",
             display_name: "OVHcloud AI Endpoints",
             aliases: &["ovh"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "avian",
+            display_name: "Avian",
+            aliases: &[],
             local: false,
         },
     ]
@@ -2857,6 +2871,25 @@ mod tests {
         assert!(create_provider("astrai", Some("sk-astrai-test")).is_ok());
     }
 
+    #[test]
+    fn factory_avian() {
+        assert!(create_provider("avian", Some("sk-avian-test")).is_ok());
+    }
+
+    #[test]
+    fn factory_deepmyst() {
+        assert!(create_provider("deepmyst", Some("key")).is_ok());
+        assert!(create_provider("deep-myst", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn resolve_provider_credential_deepmyst_env() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("DEEPMYST_API_KEY", Some("dm-test-key"));
+        let resolved = resolve_provider_credential("deepmyst", None);
+        assert_eq!(resolved, Some("dm-test-key".to_string()));
+    }
+
     // ── Custom / BYOP provider ─────────────────────────────
 
     #[test]
@@ -3181,6 +3214,7 @@ mod tests {
             "kilocli",
             "nvidia",
             "astrai",
+            "avian",
             "ovhcloud",
         ];
         for name in providers {
