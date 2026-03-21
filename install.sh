@@ -575,13 +575,18 @@ MSG
       printf 'int main(){return 0;}\n' > "$_xcode_test_file"
       if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
         rm -f "$_xcode_test_file"
-        warn "The C compiler failed. This usually means the Xcode/CLT license"
-        warn "has not been accepted. Run:"
-        warn "  sudo xcodebuild -license accept"
-        warn "then re-run this installer."
-        exit 1
+        warn "Xcode/CLT license has not been accepted. Attempting to accept it now..."
+        if run_privileged xcodebuild -license accept; then
+          step_ok "Xcode license accepted"
+        else
+          error "Could not accept Xcode license. Run manually:"
+          error "  sudo xcodebuild -license accept"
+          error "then re-run this installer."
+          exit 1
+        fi
+      else
+        rm -f "$_xcode_test_file"
       fi
-      rm -f "$_xcode_test_file"
       if ! have_cmd git; then
         warn "git is not available. Install git (e.g., Homebrew) and re-run bootstrap."
       fi
@@ -1189,12 +1194,27 @@ else
     printf 'int main(){return 0;}\n' > "$_xcode_test_file"
     if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
       rm -f "$_xcode_test_file"
-      error "The C compiler failed (Xcode/CLT license not accepted)."
-      error "Run:  sudo xcodebuild -license accept"
-      error "then re-run this installer."
-      exit 1
+      warn "Xcode/CLT license has not been accepted. Attempting to accept it now..."
+      if run_privileged xcodebuild -license accept; then
+        step_ok "Xcode license accepted"
+        # Re-test compilation to confirm it's fixed.
+        _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
+        printf 'int main(){return 0;}\n' > "$_xcode_test_file"
+        if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
+          rm -f "$_xcode_test_file"
+          error "C compiler still failing after license accept. Check your Xcode/CLT installation."
+          exit 1
+        fi
+        rm -f "$_xcode_test_file"
+      else
+        error "Could not accept Xcode license. Run manually:"
+        error "  sudo xcodebuild -license accept"
+        error "then re-run this installer."
+        exit 1
+      fi
+    else
+      rm -f "$_xcode_test_file"
     fi
-    rm -f "$_xcode_test_file"
   fi
 
   if [[ "$INSTALL_RUST" == true ]]; then
