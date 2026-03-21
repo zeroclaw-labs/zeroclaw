@@ -35,7 +35,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use dialoguer::{Input, Password};
+use dialoguer::Password;
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -75,6 +75,7 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod cli_input;
 mod commands;
 mod rag {
     pub use zeroclaw::rag::*;
@@ -1805,7 +1806,9 @@ fn read_auth_input(prompt: &str) -> Result<String> {
 }
 
 fn read_plain_input(prompt: &str) -> Result<String> {
-    let input: String = Input::new().with_prompt(prompt).interact_text()?;
+    let input: String = cli_input::Input::new()
+        .with_prompt(prompt)
+        .interact_text()?;
     Ok(input.trim().to_string())
 }
 
