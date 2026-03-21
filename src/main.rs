@@ -604,6 +604,10 @@ enum AuthCommands {
         /// Use OAuth device-code flow
         #[arg(long)]
         device_code: bool,
+        /// Import an existing auth.json file instead of starting a new login flow.
+        /// Currently supports only `openai-codex`; Codex defaults to `~/.codex/auth.json`.
+        #[arg(long, value_name = "PATH", conflicts_with = "device_code")]
+        import: Option<PathBuf>,
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
@@ -1823,6 +1827,54 @@ fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
     account_id
 }
 
+async fn import_openai_codex_auth_profile(
+    auth_service: &auth::AuthService,
+    profile: &str,
+    import_path: &std::path::Path,
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct CodexAuthTokens {
+        access_token: String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        id_token: Option<String>,
+        #[serde(default)]
+        account_id: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct CodexAuthFile {
+        tokens: CodexAuthTokens,
+    }
+
+    let raw = std::fs::read_to_string(import_path)
+        .with_context(|| format!("Failed to read import file {}", import_path.display()))?;
+    let imported: CodexAuthFile = serde_json::from_str(&raw)
+        .with_context(|| format!("Failed to parse import file {}", import_path.display()))?;
+    let expires_at = auth::openai_oauth::extract_expiry_from_jwt(&imported.tokens.access_token);
+
+    let token_set = auth::profiles::TokenSet {
+        access_token: imported.tokens.access_token,
+        refresh_token: imported.tokens.refresh_token,
+        id_token: imported.tokens.id_token,
+        expires_at,
+        token_type: Some("Bearer".to_string()),
+        scope: None,
+    };
+
+    let account_id = imported
+        .tokens
+        .account_id
+        .or_else(|| extract_openai_account_id_for_profile(&token_set.access_token));
+
+    auth_service
+        .store_openai_tokens(profile, token_set, account_id, true)
+        .await?;
+
+    Ok(())
+}
+
 fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
     match profile
         .token_set
@@ -1851,8 +1903,12 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             provider,
             profile,
             device_code,
+            import,
         } => {
             let provider = auth::normalize_provider(&provider)?;
+            if import.is_some() && provider != "openai-codex" {
+                bail!("`auth login --import` currently supports only --provider openai-codex");
+            }
             let client = reqwest::Client::new();
 
             match provider.as_str() {
@@ -1943,6 +1999,14 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     Ok(())
                 }
                 "openai-codex" => {
+                    if let Some(import_path) = import.as_deref() {
+                        import_openai_codex_auth_profile(&auth_service, &profile, import_path)
+                            .await?;
+                        println!("Imported auth profile from {}", import_path.display());
+                        println!("Active profile for openai-codex: {profile}");
+                        return Ok(());
+                    }
+
                     // OpenAI Codex OAuth flow
                     if device_code {
                         match auth::openai_oauth::start_device_code_flow(&client).await {
