@@ -259,6 +259,27 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 voice-wake = ["dep:cpal"]
 # WASM plugin system (extism-based)
 plugins-wasm = ["dep:extism"]
+# Meta-feature for CI: all features except those requiring system C libraries
+# not available on standard CI runners (e.g., voice-wake needs libasound2-dev).
+ci-all = [
+    "channel-nostr",
+    "hardware",
+    "channel-matrix",
+    "channel-lark",
+    "memory-postgres",
+    "memory-mem0",
+    "observability-prometheus",
+    "observability-otel",
+    "peripheral-rpi",
+    "browser-native",
+    "sandbox-landlock",
+    "sandbox-bubblewrap",
+    "probe",
+    "rag-pdf",
+    "skill-creation",
+    "whatsapp-web",
+    "plugins-wasm",
+]
 
 [profile.release]
 opt-level = "z"      # Optimize for size
