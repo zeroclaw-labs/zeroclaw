@@ -78,33 +78,6 @@ impl SopAuditLogger {
         Ok(())
     }
 
-    /// Log a gate evaluation decision record.
-    #[cfg(feature = "ampersona-gates")]
-    pub async fn log_gate_decision(
-        &self,
-        record: &ampersona_engine::gates::decision::GateDecisionRecord,
-    ) -> Result<()> {
-        let timestamp_ms = chrono::Utc::now().timestamp_millis();
-        let key = format!("sop_gate_decision_{}_{timestamp_ms}", record.gate_id);
-        let content = serde_json::to_string_pretty(record)?;
-        self.memory.store(&key, &content, category(), None).await?;
-        info!(
-            gate_id = %record.gate_id,
-            decision = %record.decision,
-            "SOP audit: gate decision logged"
-        );
-        Ok(())
-    }
-
-    /// Persist (upsert) the current gate phase state.
-    #[cfg(feature = "ampersona-gates")]
-    pub async fn log_phase_state(&self, state: &ampersona_core::state::PhaseState) -> Result<()> {
-        let key = "sop_phase_state";
-        let content = serde_json::to_string_pretty(state)?;
-        self.memory.store(key, &content, category(), None).await?;
-        Ok(())
-    }
-
     /// Retrieve a stored run by ID (if it exists in memory).
     pub async fn get_run(&self, run_id: &str) -> Result<Option<SopRun>> {
         let key = run_key(run_id);
