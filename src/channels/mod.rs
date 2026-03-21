@@ -6388,7 +6388,11 @@ mod tests {
             parse_runtime_command("slack", "/approvals"),
             Some(ChannelRuntimeCommand::ListApprovals)
         );
-        assert_eq!(parse_runtime_command("slack", "/models"), None);
+        // /models is now supported on all channels (not just telegram/discord)
+        assert_eq!(
+            parse_runtime_command("slack", "/models"),
+            Some(ChannelRuntimeCommand::ShowProviders)
+        );
     }
 
     #[test]
