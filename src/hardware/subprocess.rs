@@ -407,7 +407,7 @@ mod tests {
         // Simpler: write a temp script.
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("tool.sh");
-        std::fs::write(&script_path, format!("#!/bin/sh\necho '{}'\n", result_json)).unwrap();
+        std::fs::write(&script_path, format!("#!/bin/sh\ncat > /dev/null\necho '{}'\n", result_json)).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
