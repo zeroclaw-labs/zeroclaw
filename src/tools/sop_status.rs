@@ -255,10 +255,13 @@ mod tests {
                 body: "Do it".into(),
                 suggested_tools: vec![],
                 requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
             }],
             cooldown_secs: 0,
             max_concurrent: 2,
             location: None,
+            deterministic: false,
         }
     }
 
@@ -377,6 +380,7 @@ mod tests {
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
             }],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         collector.record_run_complete(&run);
 
@@ -412,6 +416,7 @@ mod tests {
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
             }],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         collector.record_run_complete(&run);
 
