@@ -10,6 +10,7 @@ import {
   ChevronDown,
   ChevronRight,
   RefreshCw,
+  Pencil,
 } from 'lucide-react';
 import type { CronJob, CronRun } from '@/types/api';
 import {
@@ -19,6 +20,7 @@ import {
   getCronRuns,
   getCronSettings,
   patchCronSettings,
+  patchCronJob,
 } from '@/lib/api';
 import type { CronSettings } from '@/lib/api';
 import { t } from '@/lib/i18n';
@@ -148,18 +150,43 @@ export default function Cron() {
   const [jobs, setJobs] = useState<CronJob[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [showForm, setShowForm] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [expandedJob, setExpandedJob] = useState<string | null>(null);
   const [settings, setSettings] = useState<CronSettings | null>(null);
   const [togglingCatchUp, setTogglingCatchUp] = useState(false);
 
-  // Form state
+  // Unified modal: null = closed, 'add' = adding, CronJob = editing
+  const [modalJob, setModalJob] = useState<CronJob | 'add' | null>(null);
+
+  // Shared form state for both add and edit
   const [formName, setFormName] = useState('');
   const [formSchedule, setFormSchedule] = useState('');
   const [formCommand, setFormCommand] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  const isEditing = modalJob !== null && modalJob !== 'add';
+
+  const openAddModal = () => {
+    setFormName('');
+    setFormSchedule('');
+    setFormCommand('');
+    setFormError(null);
+    setModalJob('add');
+  };
+
+  const openEditModal = (job: CronJob) => {
+    setFormName(job.name ?? '');
+    setFormSchedule(job.expression);
+    setFormCommand(job.prompt ?? job.command);
+    setFormError(null);
+    setModalJob(job);
+  };
+
+  const closeModal = () => {
+    setModalJob(null);
+    setFormError(null);
+  };
 
   const fetchJobs = () => {
     setLoading(true);
@@ -193,7 +220,7 @@ export default function Cron() {
     fetchSettings();
   }, []);
 
-  const handleAdd = async () => {
+  const handleSubmit = async () => {
     if (!formSchedule.trim() || !formCommand.trim()) {
       setFormError(t('cron.validation_error'));
       return;
@@ -201,18 +228,28 @@ export default function Cron() {
     setSubmitting(true);
     setFormError(null);
     try {
-      const job = await addCronJob({
-        name: formName.trim() || undefined,
-        schedule: formSchedule.trim(),
-        command: formCommand.trim(),
-      });
-      setJobs((prev) => [...prev, job]);
-      setShowForm(false);
-      setFormName('');
-      setFormSchedule('');
-      setFormCommand('');
+      if (isEditing) {
+        const updated = await patchCronJob((modalJob as CronJob).id, {
+          name: formName.trim() || undefined,
+          schedule: formSchedule.trim(),
+          command: formCommand.trim(),
+        });
+        setJobs((prev) => prev.map((j) => (j.id === updated.id ? updated : j)));
+      } else {
+        const job = await addCronJob({
+          name: formName.trim() || undefined,
+          schedule: formSchedule.trim(),
+          command: formCommand.trim(),
+        });
+        setJobs((prev) => [...prev, job]);
+      }
+      closeModal();
     } catch (err: unknown) {
-      setFormError(err instanceof Error ? err.message : t('cron.add_error'));
+      setFormError(
+        err instanceof Error
+          ? err.message
+          : t(isEditing ? 'cron.edit_error' : 'cron.add_error'),
+      );
     } finally {
       setSubmitting(false);
     }
@@ -272,7 +309,7 @@ export default function Cron() {
           </h2>
         </div>
         <button
-          onClick={() => setShowForm(true)}
+          onClick={openAddModal}
           className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
         >
           <Plus className="h-4 w-4" />
@@ -311,17 +348,16 @@ export default function Cron() {
         </div>
       )}
 
-      {/* Add Job Form Modal */}
-      {showForm && (
+      {/* Unified Add / Edit Modal */}
+      {modalJob !== null && (
         <div className="fixed inset-0 modal-backdrop flex items-center justify-center z-50">
           <div className="glass-card p-6 w-full max-w-md mx-4 animate-fade-in-scale">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-semibold text-white">{t('cron.add_modal_title')}</h3>
+              <h3 className="text-lg font-semibold text-white">
+                {isEditing ? t('cron.edit_modal_title') : t('cron.add_modal_title')}
+              </h3>
               <button
-                onClick={() => {
-                  setShowForm(false);
-                  setFormError(null);
-                }}
+                onClick={closeModal}
                 className="text-[#556080] hover:text-white transition-colors duration-300"
               >
                 <X className="h-5 w-5" />
@@ -363,32 +399,31 @@ export default function Cron() {
                 <label className="block text-xs font-semibold text-[#8892a8] mb-1.5 uppercase tracking-wider">
                   {t('cron.command_required')} <span className="text-[#ff4466]">*</span>
                 </label>
-                <input
-                  type="text"
+                <textarea
                   value={formCommand}
                   onChange={(e) => setFormCommand(e.target.value)}
                   placeholder="e.g. cleanup --older-than 7d"
-                  className="input-electric w-full px-3 py-2.5 text-sm"
+                  rows={4}
+                  className="input-electric w-full px-3 py-2.5 text-sm resize-y"
                 />
               </div>
             </div>
 
             <div className="flex justify-end gap-3 mt-6">
               <button
-                onClick={() => {
-                  setShowForm(false);
-                  setFormError(null);
-                }}
+                onClick={closeModal}
                 className="px-4 py-2 text-sm font-medium text-[#8892a8] hover:text-white border border-[#1a1a3e] rounded-xl hover:bg-[#0080ff08] transition-all duration-300"
               >
                 {t('cron.cancel')}
               </button>
               <button
-                onClick={handleAdd}
+                onClick={handleSubmit}
                 disabled={submitting}
                 className="btn-electric px-4 py-2 text-sm font-medium"
               >
-                {submitting ? t('cron.adding') : t('cron.add_job')}
+                {submitting
+                  ? t(isEditing ? 'cron.saving' : 'cron.adding')
+                  : t(isEditing ? 'cron.save' : 'cron.add_job')}
               </button>
             </div>
           </div>
@@ -441,7 +476,7 @@ export default function Cron() {
                       {job.name ?? '-'}
                     </td>
                     <td className="px-4 py-3 text-[#8892a8] font-mono text-xs max-w-[200px] truncate">
-                      {job.command}
+                      {job.prompt ?? job.command}
                     </td>
                     <td className="px-4 py-3 text-[#556080] text-xs">
                       {formatDate(job.next_run)}
@@ -467,30 +502,39 @@ export default function Cron() {
                       </span>
                     </td>
                     <td className="px-4 py-3 text-right">
-                      {confirmDelete === job.id ? (
-                        <div className="flex items-center justify-end gap-2 animate-fade-in">
-                          <span className="text-xs text-[#ff4466]">{t('cron.confirm_delete')}</span>
-                          <button
-                            onClick={() => handleDelete(job.id)}
-                            className="text-[#ff4466] hover:text-[#ff6680] text-xs font-medium"
-                          >
-                            {t('cron.yes')}
-                          </button>
-                          <button
-                            onClick={() => setConfirmDelete(null)}
-                            className="text-[#556080] hover:text-white text-xs font-medium"
-                          >
-                            {t('cron.no')}
-                          </button>
-                        </div>
-                      ) : (
+                      <div className="flex items-center justify-end gap-2">
                         <button
-                          onClick={() => setConfirmDelete(job.id)}
-                          className="text-[#334060] hover:text-[#ff4466] transition-all duration-300"
+                          onClick={() => openEditModal(job)}
+                          className="text-[#334060] hover:text-[#0080ff] transition-all duration-300"
+                          title={t('cron.edit')}
                         >
-                          <Trash2 className="h-4 w-4" />
+                          <Pencil className="h-4 w-4" />
                         </button>
-                      )}
+                        {confirmDelete === job.id ? (
+                          <div className="flex items-center justify-end gap-2 animate-fade-in">
+                            <span className="text-xs text-[#ff4466]">{t('cron.confirm_delete')}</span>
+                            <button
+                              onClick={() => handleDelete(job.id)}
+                              className="text-[#ff4466] hover:text-[#ff6680] text-xs font-medium"
+                            >
+                              {t('cron.yes')}
+                            </button>
+                            <button
+                              onClick={() => setConfirmDelete(null)}
+                              className="text-[#556080] hover:text-white text-xs font-medium"
+                            >
+                              {t('cron.no')}
+                            </button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => setConfirmDelete(job.id)}
+                            className="text-[#334060] hover:text-[#ff4466] transition-all duration-300"
+                          >
+                            <Trash2 className="h-4 w-4" />
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                   {expandedJob === job.id && (

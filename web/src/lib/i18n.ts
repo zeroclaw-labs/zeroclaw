@@ -113,6 +113,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.recent_runs': '最近运行',
     'cron.yes': '是',
     'cron.no': '否',
+    'cron.edit': '编辑',
+    'cron.edit_modal_title': '编辑 Cron 任务',
+    'cron.edit_error': '更新任务失败',
+    'cron.saving': '保存中...',
+    'cron.save': '保存',
 
     // Integrations
     'integrations.title': '集成',
@@ -415,6 +420,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.recent_runs': 'Recent Runs',
     'cron.yes': 'Yes',
     'cron.no': 'No',
+    'cron.edit': 'Edit',
+    'cron.edit_modal_title': 'Edit Cron Job',
+    'cron.edit_error': 'Failed to update job',
+    'cron.saving': 'Saving...',
+    'cron.save': 'Save',
 
     // Integrations
     'integrations.title': 'Integrations',
@@ -739,6 +749,11 @@ const translations: Record<Locale, Record<string, string>> = {
     'cron.recent_runs': 'Son Çalıştırmalar',
     'cron.yes': 'Evet',
     'cron.no': 'Hayır',
+    'cron.edit': 'Düzenle',
+    'cron.edit_modal_title': 'Cron Görevini Düzenle',
+    'cron.edit_error': 'Görev güncellenemedi',
+    'cron.saving': 'Kaydediliyor...',
+    'cron.save': 'Kaydet',
 
     // Integrations
     'integrations.title': 'Entegrasyonlar',

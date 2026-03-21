@@ -843,7 +843,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/cron/settings",
             get(api::handle_api_cron_settings_get).patch(api::handle_api_cron_settings_patch),
         )
-        .route("/api/cron/{id}", delete(api::handle_api_cron_delete))
+        .route(
+            "/api/cron/{id}",
+            delete(api::handle_api_cron_delete).patch(api::handle_api_cron_patch),
+        )
         .route("/api/cron/{id}/runs", get(api::handle_api_cron_runs))
         .route("/api/integrations", get(api::handle_api_integrations))
         .route(
