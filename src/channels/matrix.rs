@@ -42,6 +42,8 @@ pub struct MatrixChannel {
     http_client: Client,
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
     voice_mode: Arc<AtomicBool>,
+    transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -215,7 +217,24 @@ impl MatrixChannel {
             http_client: Client::new(),
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
             voice_mode: Arc::new(AtomicBool::new(false)),
+            transcription: None,
+            transcription_manager: None,
         }
+    }
+
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(Arc::new(m));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
+        }
+        self.transcription = Some(config);
+        self
     }
 
     fn encode_path_segment(value: &str) -> String {
@@ -592,6 +611,81 @@ impl MatrixChannel {
             );
         }
     }
+
+    async fn try_transcribe_audio(
+        body: String,
+        manager: Option<&super::transcription::TranscriptionManager>,
+        voice_mode: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> String {
+        if !body.starts_with("[audio:") {
+            return body;
+        }
+        let Some(path_start) = body.find("saved to ") else {
+            return body;
+        };
+        let audio_path = body[path_start + 9..].to_string();
+
+        if let Some(mgr) = manager {
+            let filename = std::path::Path::new(&audio_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("audio")
+                .to_string();
+            match tokio::fs::read(&audio_path).await {
+                Ok(bytes) => match mgr.transcribe(&bytes, &filename).await {
+                    Ok(text) if !text.is_empty() => {
+                        voice_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return format!("[Voice message]: {}", text);
+                    }
+                    _ => return body,
+                },
+                Err(_) => return body,
+            }
+        }
+
+        // Fallback: whisper-cpp subprocess path (original E2EE media transcription path)
+        let wav_path = format!("{}.16k.wav", audio_path);
+        let convert_ok = tokio::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i",
+                &audio_path,
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-f",
+                "wav",
+                &wav_path,
+            ])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .await
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if convert_ok {
+            let transcription = tokio::process::Command::new("whisper-cpp")
+                .args([
+                    "-m",
+                    "/tmp/ggml-base.en.bin",
+                    "-f",
+                    &wav_path,
+                    "--no-timestamps",
+                    "-nt",
+                ])
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty());
+            if let Some(text) = transcription {
+                voice_mode.store(true, std::sync::atomic::Ordering::Relaxed);
+                return format!("[Voice message]: {}", text);
+            }
+        }
+        body
+    }
 }
 
 #[async_trait]
@@ -763,6 +857,7 @@ impl Channel for MatrixChannel {
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
+        let transcription_manager_for_handler = self.transcription_manager.clone();
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -774,6 +869,7 @@ impl Channel for MatrixChannel {
             let homeserver = homeserver_for_handler.clone();
             let access_token = access_token_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
+            let transcription_manager = transcription_manager_for_handler.clone();
 
             async move {
                 if !MatrixChannel::room_matches_target(
@@ -874,59 +970,9 @@ impl Channel for MatrixChannel {
                 };
 
                 // Voice transcription: if this was an audio message, transcribe it
-                let body = if body.starts_with("[audio:") {
-                    if let Some(path_start) = body.find("saved to ") {
-                        let audio_path = body[path_start + 9..].to_string();
-                        let wav_path = format!("{}.16k.wav", audio_path);
-                        let convert_ok = tokio::process::Command::new("ffmpeg")
-                            .args([
-                                "-y",
-                                "-i",
-                                &audio_path,
-                                "-ar",
-                                "16000",
-                                "-ac",
-                                "1",
-                                "-f",
-                                "wav",
-                                &wav_path,
-                            ])
-                            .stderr(std::process::Stdio::null())
-                            .output()
-                            .await
-                            .map(|o| o.status.success())
-                            .unwrap_or(false);
-                        if convert_ok {
-                            let transcription = tokio::process::Command::new("whisper-cpp")
-                                .args([
-                                    "-m",
-                                    "/tmp/ggml-base.en.bin",
-                                    "-f",
-                                    &wav_path,
-                                    "--no-timestamps",
-                                    "-nt",
-                                ])
-                                .output()
-                                .await
-                                .ok()
-                                .filter(|o| o.status.success())
-                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                                .filter(|s| !s.is_empty());
-                            if let Some(text) = transcription {
-                                voice_mode.store(true, Ordering::Relaxed);
-                                format!("[Voice message]: {}", text)
-                            } else {
-                                body
-                            }
-                        } else {
-                            body
-                        }
-                    } else {
-                        body
-                    }
-                } else {
-                    body
-                };
+                let body =
+                    Self::try_transcribe_audio(body, transcription_manager.as_deref(), &voice_mode)
+                        .await;
 
                 if !MatrixChannel::has_non_empty_body(&body) {
                     return;
@@ -1642,6 +1688,198 @@ mod tests {
         assert!(err
             .to_string()
             .contains("must start with '!' (room ID) or '#' (room alias)"));
+    }
+
+    // ── TranscriptionManager integration tests ──
+
+    #[test]
+    fn matrix_manager_none_when_not_configured() {
+        let ch = make_channel();
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn matrix_manager_some_when_valid_config() {
+        let ch = MatrixChannel::new(
+            "https://matrix.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+        )
+        .with_transcription(crate::config::TranscriptionConfig {
+            enabled: false,
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        });
+        assert!(ch.transcription_manager.is_some());
+    }
+
+    #[test]
+    fn matrix_manager_none_and_warn_on_init_failure() {
+        std::env::remove_var("GROQ_API_KEY");
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::remove_var("TRANSCRIPTION_API_KEY");
+
+        let ch = MatrixChannel::new(
+            "https://matrix.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+        )
+        .with_transcription(crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "groq".to_string(),
+            api_key: Some("".to_string()),
+            ..Default::default()
+        });
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[tokio::test]
+    async fn matrix_try_transcribe_audio_passthrough_non_audio_body() {
+        let voice_mode = Arc::new(AtomicBool::new(false));
+        let result =
+            MatrixChannel::try_transcribe_audio("hello world".to_string(), None, &voice_mode).await;
+        assert_eq!(result, "hello world");
+        assert!(!voice_mode.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn matrix_try_transcribe_audio_passthrough_no_saved_to_marker() {
+        let voice_mode = Arc::new(AtomicBool::new(false));
+        let result = MatrixChannel::try_transcribe_audio(
+            "[audio: voice.ogg]".to_string(),
+            None,
+            &voice_mode,
+        )
+        .await;
+        assert_eq!(result, "[audio: voice.ogg]");
+        assert!(!voice_mode.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn matrix_try_transcribe_audio_manager_none_skips_manager_path() {
+        let voice_mode = Arc::new(AtomicBool::new(false));
+        let result = MatrixChannel::try_transcribe_audio(
+            "[audio: voice.ogg] — saved to /tmp/nonexistent.ogg".to_string(),
+            None,
+            &voice_mode,
+        )
+        .await;
+        // Subprocess path fails gracefully in unit test (ffmpeg/whisper-cpp not present)
+        assert_eq!(result, "[audio: voice.ogg] — saved to /tmp/nonexistent.ogg");
+        assert!(!voice_mode.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn matrix_try_transcribe_audio_manager_read_failure_returns_body() {
+        let config = crate::config::TranscriptionConfig {
+            enabled: false,
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let manager = super::super::transcription::TranscriptionManager::new(&config).unwrap();
+
+        let voice_mode = Arc::new(AtomicBool::new(false));
+        let result = MatrixChannel::try_transcribe_audio(
+            "[audio: voice.ogg] — saved to /tmp/does-not-exist.ogg".to_string(),
+            Some(&manager),
+            &voice_mode,
+        )
+        .await;
+        assert_eq!(
+            result,
+            "[audio: voice.ogg] — saved to /tmp/does-not-exist.ogg"
+        );
+        assert!(!voice_mode.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn matrix_try_transcribe_audio_routes_through_manager() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .and(header_exists("authorization"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "test transcript"})),
+            )
+            .mount(&server)
+            .await;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let audio_path = tempdir.path().join("voice.ogg");
+        tokio::fs::write(&audio_path, b"fake-audio-data")
+            .await
+            .unwrap();
+
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "local_whisper".to_string(),
+            local_whisper: Some(crate::config::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", server.uri()),
+                bearer_token: "test-token".to_string(),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }),
+            ..Default::default()
+        };
+
+        let manager = super::super::transcription::TranscriptionManager::new(&config).unwrap();
+
+        let voice_mode = Arc::new(AtomicBool::new(false));
+        let body = format!("[audio: voice.ogg] — saved to {}", audio_path.display());
+        let result = MatrixChannel::try_transcribe_audio(body, Some(&manager), &voice_mode).await;
+
+        assert_eq!(result, "[Voice message]: test transcript");
+        assert!(voice_mode.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn matrix_try_transcribe_audio_manager_empty_response_returns_body() {
+        use wiremock::matchers::{header_exists, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .and(header_exists("authorization"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": ""})))
+            .mount(&server)
+            .await;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let audio_path = tempdir.path().join("voice.ogg");
+        tokio::fs::write(&audio_path, b"fake-audio-data")
+            .await
+            .unwrap();
+
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "local_whisper".to_string(),
+            local_whisper: Some(crate::config::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", server.uri()),
+                bearer_token: "test-token".to_string(),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }),
+            ..Default::default()
+        };
+
+        let manager = super::super::transcription::TranscriptionManager::new(&config).unwrap();
+
+        let voice_mode = Arc::new(AtomicBool::new(false));
+        let body = format!("[audio: voice.ogg] — saved to {}", audio_path.display());
+        let result =
+            MatrixChannel::try_transcribe_audio(body.clone(), Some(&manager), &voice_mode).await;
+
+        assert_eq!(result, body);
+        assert!(!voice_mode.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

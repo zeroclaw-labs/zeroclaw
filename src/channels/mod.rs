@@ -3881,16 +3881,19 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_full(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-                mx.allowed_rooms.clone(),
-                mx.user_id.clone(),
-                mx.device_id.clone(),
-                config.config_path.parent().map(|path| path.to_path_buf()),
-            )),
+            channel: Arc::new(
+                MatrixChannel::new_full(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                    mx.allowed_rooms.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|path| path.to_path_buf()),
+                )
+                .with_transcription(config.transcription.clone()),
+            ),
         });
     }
 
@@ -9016,6 +9019,44 @@ This is an example JSON object for profile settings."#;
         assert!(channels
             .iter()
             .any(|entry| entry.channel.name() == "mattermost"));
+    }
+
+    #[test]
+    #[cfg(feature = "channel-matrix")]
+    fn matrix_channel_factory_wires_transcription_manager() {
+        // This test verifies that the Matrix factory path in collect_configured_channels()
+        // calls .with_transcription(config.transcription.clone()). Since the Channel trait
+        // does not expose downcasting to verify internal fields at runtime, this test
+        // confirms the factory creates a Matrix channel when configured. The actual wiring
+        // of transcription_manager is verified by unit tests in matrix.rs that directly
+        // test the with_transcription() builder method.
+        let mut config = Config::default();
+        config.channels_config.matrix = Some(crate::config::schema::MatrixConfig {
+            homeserver: "https://matrix.org".to_string(),
+            access_token: "test-token".to_string(),
+            room_id: "!room:matrix.org".to_string(),
+            allowed_users: vec!["@user:matrix.org".to_string()],
+            user_id: None,
+            device_id: None,
+        });
+        config.transcription = crate::config::TranscriptionConfig {
+            enabled: false,
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+
+        let channels = collect_configured_channels(&config, "test");
+
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.channel.name() == "matrix"),
+            "Matrix channel must be present when configured"
+        );
+        assert!(
+            channels.iter().any(|entry| entry.display_name == "Matrix"),
+            "Matrix channel must have correct display name"
+        );
     }
 
     struct AlwaysFailChannel {
