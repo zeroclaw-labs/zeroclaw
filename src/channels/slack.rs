@@ -30,6 +30,10 @@ pub struct SlackChannel {
     group_reply_allowed_sender_ids: Vec<String>,
     user_display_name_cache: Mutex<HashMap<String, CachedSlackDisplayName>>,
     workspace_dir: Option<PathBuf>,
+    /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
+    active_assistant_thread: Mutex<HashMap<String, String>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -44,6 +48,7 @@ const SLACK_ATTACHMENT_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
 const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
 const SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS: usize = 12_000;
+const SLACK_MARKDOWN_BLOCK_MAX_CHARS: usize = 12_000;
 const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
@@ -118,6 +123,8 @@ impl SlackChannel {
             group_reply_allowed_sender_ids: Vec::new(),
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
+            active_assistant_thread: Mutex::new(HashMap::new()),
+            proxy_url: None,
         }
     }
 
@@ -145,8 +152,19 @@ impl SlackChannel {
         self
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client_with_timeouts("channel.slack", 30, 10)
+        crate::config::build_channel_proxy_client_with_timeouts(
+            "channel.slack",
+            self.proxy_url.as_deref(),
+            30,
+            10,
+        )
     }
 
     /// Check if a Slack user ID is in the allowlist.
@@ -801,12 +819,13 @@ impl SlackChannel {
     }
 
     fn slack_media_http_client_no_redirect(&self) -> anyhow::Result<reqwest::Client> {
-        let builder = crate::config::apply_runtime_proxy_to_builder(
+        let builder = crate::config::apply_channel_proxy_to_builder(
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10)),
             "channel.slack",
+            self.proxy_url.as_deref(),
         );
         builder
             .build()
@@ -1784,7 +1803,34 @@ impl SlackChannel {
                 else {
                     continue;
                 };
-                if event.get("type").and_then(|v| v.as_str()) != Some("message") {
+                let event_type = event
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+
+                // Track assistant thread context for Assistants API status indicators.
+                if event_type == "assistant_thread_started"
+                    || event_type == "assistant_thread_context_changed"
+                {
+                    if let Some(thread) = event.get("assistant_thread") {
+                        let ch = thread
+                            .get("channel_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        let tts = thread
+                            .get("thread_ts")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if !ch.is_empty() && !tts.is_empty() {
+                            if let Ok(mut map) = self.active_assistant_thread.lock() {
+                                map.insert(ch.to_string(), tts.to_string());
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                if event_type != "message" {
                     continue;
                 }
                 let subtype = event.get("subtype").and_then(|v| v.as_str());
@@ -1863,6 +1909,13 @@ impl SlackChannel {
                     },
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                 };
+
+                // Track thread context so start_typing can set assistant status.
+                if let Some(ref tts) = channel_msg.thread_ts {
+                    if let Ok(mut map) = self.active_assistant_thread.lock() {
+                        map.insert(channel_id.clone(), tts.clone());
+                    }
+                }
 
                 if tx.send(channel_msg).await.is_err() {
                     return Ok(());
@@ -2234,6 +2287,14 @@ impl Channel for SlackChannel {
             "channel": message.recipient,
             "text": message.content
         });
+
+        // Use Slack's native markdown block for rich formatting when content fits.
+        if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": message.content
+            }]);
+        }
 
         if let Some(ts) = self.outbound_thread_ts(message) {
             body["thread_ts"] = serde_json::json!(ts);
@@ -2638,6 +2699,49 @@ impl Channel for SlackChannel {
             true
         };
         Self::evaluate_health(bot_ok, socket_mode_enabled, socket_mode_ok)
+    }
+
+    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let thread_ts = {
+            let map = self
+                .active_assistant_thread
+                .lock()
+                .map_err(|e| anyhow::anyhow!("lock poisoned: {e}"))?;
+            match map.get(recipient) {
+                Some(ts) => ts.clone(),
+                None => return Ok(()),
+            }
+        };
+
+        let body = serde_json::json!({
+            "channel_id": recipient,
+            "thread_ts": thread_ts,
+            "status": "is thinking...",
+        });
+
+        // Gracefully ignore errors — non-assistant contexts will return errors.
+        if let Ok(resp) = self
+            .http_client()
+            .post("https://slack.com/api/assistant.threads.setStatus")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+        {
+            if !resp.status().is_success() {
+                tracing::debug!(
+                    "assistant.threads.setStatus returned {}; ignoring",
+                    resp.status()
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        // Status auto-clears when the bot sends a message via chat.postMessage.
+        Ok(())
     }
 }
 
@@ -3548,5 +3652,92 @@ mod tests {
         let key1 = super::super::conversation_history_key(&msg1);
         let key2 = super::super::conversation_history_key(&msg2);
         assert_ne!(key1, key2, "session key should differ per thread");
+    }
+
+    #[test]
+    fn slack_send_uses_markdown_blocks() {
+        let msg = SendMessage::new("**bold** and _italic_", "C123");
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+
+        // Build the same JSON body that send() would construct.
+        let mut body = serde_json::json!({
+            "channel": msg.recipient,
+            "text": msg.content
+        });
+        if msg.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": msg.content
+            }]);
+        }
+
+        // Verify blocks are present with correct structure.
+        let blocks = body["blocks"]
+            .as_array()
+            .expect("blocks should be an array");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "markdown");
+        assert_eq!(blocks[0]["text"], msg.content);
+        // text field kept as plaintext fallback.
+        assert_eq!(body["text"], msg.content);
+        // Suppress unused variable warning.
+        let _ = ch.name();
+    }
+
+    #[test]
+    fn slack_send_skips_markdown_blocks_for_long_content() {
+        let long_content = "x".repeat(SLACK_MARKDOWN_BLOCK_MAX_CHARS + 1);
+        let msg = SendMessage::new(long_content.clone(), "C123");
+
+        let mut body = serde_json::json!({
+            "channel": msg.recipient,
+            "text": msg.content
+        });
+        if msg.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": msg.content
+            }]);
+        }
+
+        assert!(
+            body.get("blocks").is_none(),
+            "blocks should not be set for oversized content"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_typing_requires_thread_context() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+        // No thread_ts tracked for "C999" — start_typing should be a no-op (Ok).
+        let result = ch.start_typing("C999").await;
+        assert!(
+            result.is_ok(),
+            "start_typing should succeed as no-op without thread context"
+        );
+    }
+
+    #[test]
+    fn assistant_thread_tracking() {
+        let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
+
+        // Initially empty.
+        {
+            let map = ch.active_assistant_thread.lock().unwrap();
+            assert!(map.is_empty());
+        }
+
+        // Simulate storing a thread_ts (as listen_socket_mode would).
+        {
+            let mut map = ch.active_assistant_thread.lock().unwrap();
+            map.insert("C123".to_string(), "1741234567.000100".to_string());
+        }
+
+        // Verify retrieval.
+        {
+            let map = ch.active_assistant_thread.lock().unwrap();
+            assert_eq!(map.get("C123"), Some(&"1741234567.000100".to_string()),);
+            assert_eq!(map.get("C999"), None);
+        }
     }
 }

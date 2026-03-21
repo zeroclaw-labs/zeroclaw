@@ -18,9 +18,7 @@ export default function Config() {
 
   useEffect(() => {
     getConfig()
-      .then((data) => {
-        setConfig(typeof data === 'string' ? data : JSON.stringify(data, null, 2));
-      })
+      .then((data) => { setConfig(typeof data === 'string' ? data : JSON.stringify(data, null, 2)); })
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false));
   }, []);
@@ -49,7 +47,7 @@ export default function Config() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="h-8 w-8 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin" />
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
       </div>
     );
   }
@@ -59,27 +57,22 @@ export default function Config() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Settings className="h-5 w-5 text-[#0080ff]" />
-          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">{t('config.configuration_title')}</h2>
+          <Settings className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+          <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('config.configuration_title')}</h2>
         </div>
-        <button
-          onClick={handleSave}
-          disabled={saving}
-          className="btn-electric flex items-center gap-2 text-sm px-4 py-2"
-        >
-          <Save className="h-4 w-4" />
-          {saving ? t('config.saving') : t('config.save')}
+        <button onClick={handleSave} disabled={saving} className="btn-electric flex items-center gap-2 text-sm px-4 py-2">
+          <Save className="h-4 w-4" />{saving ? t('config.saving') : t('config.save')}
         </button>
       </div>
 
       {/* Sensitive fields note */}
-      <div className="flex items-start gap-3 rounded-xl p-4 border border-[#ffaa0020]" style={{ background: 'rgba(255,170,0,0.05)' }}>
-        <ShieldAlert className="h-5 w-5 text-[#ffaa00] flex-shrink-0 mt-0.5" />
+      <div className="flex items-start gap-3 rounded-2xl p-4 border" style={{ borderColor: 'rgba(255, 170, 0, 0.2)', background: 'rgba(255, 170, 0, 0.05)' }}>
+        <ShieldAlert className="h-5 w-5 flex-shrink-0 mt-0.5" style={{ color: 'var(--color-status-warning)' }} />
         <div>
-          <p className="text-sm text-[#ffaa00] font-medium">
+          <p className="text-sm font-medium" style={{ color: 'var(--color-status-warning)' }}>
             {t('config.sensitive_title')}
           </p>
-          <p className="text-sm text-[#ffaa0080] mt-0.5">
+          <p className="text-sm mt-0.5" style={{ color: 'rgba(255, 170, 0, 0.7)' }}>
             {t('config.sensitive_hint')}
           </p>
         </div>
@@ -87,27 +80,27 @@ export default function Config() {
 
       {/* Success message */}
       {success && (
-        <div className="flex items-center gap-2 rounded-xl p-3 border border-[#00e68a30] animate-fade-in" style={{ background: 'rgba(0,230,138,0.06)' }}>
-          <CheckCircle className="h-4 w-4 text-[#00e68a] flex-shrink-0" />
-          <span className="text-sm text-[#00e68a]">{success}</span>
+        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in" style={{ borderColor: 'rgba(0, 230, 138, 0.2)', background: 'rgba(0, 230, 138, 0.06)' }}>
+          <CheckCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-success)' }} />
+          <span className="text-sm" style={{ color: 'var(--color-status-success)' }}>{success}</span>
         </div>
       )}
 
       {/* Error message */}
       {error && (
-        <div className="flex items-center gap-2 rounded-xl p-3 border border-[#ff446630] animate-fade-in" style={{ background: 'rgba(255,68,102,0.06)' }}>
-          <AlertTriangle className="h-4 w-4 text-[#ff4466] flex-shrink-0" />
-          <span className="text-sm text-[#ff6680]">{error}</span>
+        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in" style={{ borderColor: 'rgba(239, 68, 68, 0.2)', background: 'rgba(239, 68, 68, 0.06)' }}>
+          <AlertTriangle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-error)' }} />
+          <span className="text-sm" style={{ color: 'var(--color-status-error)' }}>{error}</span>
         </div>
       )}
 
       {/* Config Editor */}
-      <div className="glass-card overflow-hidden">
-        <div className="flex items-center justify-between px-4 py-2.5 border-b border-[#1a1a3e]" style={{ background: 'rgba(0,128,255,0.03)' }}>
-          <span className="text-[10px] text-[#334060] font-semibold uppercase tracking-wider">
+      <div className="card overflow-hidden rounded-2xl">
+        <div className="flex items-center justify-between px-4 py-2.5 border-b" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-accent-glow)' }}>
+          <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-muted)' }}>
             {t('config.toml_label')}
           </span>
-          <span className="text-[10px] text-[#334060]">
+          <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
             {config.split('\n').length} {t('config.lines')}
           </span>
         </div>
@@ -115,8 +108,8 @@ export default function Config() {
           value={config}
           onChange={(e) => setConfig(e.target.value)}
           spellCheck={false}
-          className="w-full min-h-[500px] text-[#8892a8] font-mono text-sm p-4 resize-y focus:outline-none focus:ring-2 focus:ring-[#0080ff40] focus:ring-inset"
-          style={{ background: 'rgba(5,5,16,0.8)', tabSize: 4 }}
+          className="w-full min-h-[500px] text-sm p-4 resize-y focus:outline-none font-mono"
+          style={{ background: 'var(--pc-bg-base)', color: 'var(--pc-text-secondary)', tabSize: 4 }}
         />
       </div>
     </div>

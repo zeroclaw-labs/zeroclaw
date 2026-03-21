@@ -50,6 +50,10 @@ fn require_auth(
 pub struct MemoryQuery {
     pub query: Option<String>,
     pub category: Option<String>,
+    /// Filter memories created at or after (RFC 3339 / ISO 8601)
+    pub since: Option<String>,
+    /// Filter memories created at or before (RFC 3339 / ISO 8601)
+    pub until: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +80,14 @@ pub struct CronAddBody {
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub delete_after_run: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct CronPatchBody {
+    pub name: Option<String>,
+    pub schedule: Option<String>,
+    pub command: Option<String>,
+    pub prompt: Option<String>,
 }
 
 // ── Handlers ────────────────────────────────────────────────────
@@ -228,27 +240,7 @@ pub async fn handle_api_cron_list(
 
     let config = state.config.lock().clone();
     match crate::cron::list_jobs(&config) {
-        Ok(jobs) => {
-            let jobs_json: Vec<serde_json::Value> = jobs
-                .iter()
-                .map(|job| {
-                    serde_json::json!({
-                        "id": job.id,
-                        "name": job.name,
-                        "job_type": job.job_type,
-                        "command": job.command,
-                        "prompt": job.prompt,
-                        "schedule": job.schedule,
-                        "next_run": job.next_run.to_rfc3339(),
-                        "last_run": job.last_run.map(|t| t.to_rfc3339()),
-                        "last_status": job.last_status,
-                        "enabled": job.enabled,
-                        "delivery": job.delivery,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({"jobs": jobs_json})).into_response()
-        }
+        Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to list cron jobs: {e}")})),
@@ -344,20 +336,7 @@ pub async fn handle_api_cron_add(
     };
 
     match result {
-        Ok(job) => Json(serde_json::json!({
-            "status": "ok",
-            "job": {
-                "id": job.id,
-                "name": job.name,
-                "job_type": job.job_type,
-                "command": job.command,
-                "prompt": job.prompt,
-                "schedule": job.schedule,
-                "enabled": job.enabled,
-                "delivery": job.delivery,
-            }
-        }))
-        .into_response(),
+        Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
@@ -410,6 +389,66 @@ pub async fn handle_api_cron_runs(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to list cron runs: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PATCH /api/cron/:id — update an existing cron job
+pub async fn handle_api_cron_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CronPatchBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    // Build the schedule from the provided expression string (if any).
+    let schedule = match body.schedule {
+        Some(expr) if !expr.trim().is_empty() => Some(crate::cron::Schedule::Cron {
+            expr: expr.trim().to_string(),
+            tz: None,
+        }),
+        _ => None,
+    };
+
+    // Route the edited text to the correct field based on the job's stored type.
+    // The frontend sends a single textarea value; for agent jobs it is the prompt,
+    // for shell jobs it is the command.
+    let existing = match crate::cron::get_job(&config, &id) {
+        Ok(j) => j,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let is_agent = matches!(existing.job_type, crate::cron::JobType::Agent);
+    let (patch_command, patch_prompt) = if is_agent {
+        (None, body.command.or(body.prompt))
+    } else {
+        (body.command.or(body.prompt), None)
+    };
+
+    let patch = crate::cron::CronJobPatch {
+        name: body.name,
+        schedule,
+        command: patch_command,
+        prompt: patch_prompt,
+        ..crate::cron::CronJobPatch::default()
+    };
+
+    match crate::cron::update_shell_job_with_approval(&config, &id, patch, false) {
+        Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to update cron job: {e}")})),
         )
             .into_response(),
     }
@@ -598,9 +637,12 @@ pub async fn handle_api_memory_list(
         return e.into_response();
     }
 
-    if let Some(ref query) = params.query {
-        // Search mode
-        match state.mem.recall(query, 50, None).await {
+    // Use recall when query or time range is provided
+    if params.query.is_some() || params.since.is_some() || params.until.is_some() {
+        let query = params.query.as_deref().unwrap_or("");
+        let since = params.since.as_deref();
+        let until = params.until.as_deref();
+        match state.mem.recall(query, 50, None, since, until).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1321,6 +1363,8 @@ mod tests {
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -1394,6 +1438,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            path_prefix: String::new(),
         }
     }
 
@@ -1422,6 +1467,7 @@ mod tests {
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
             allowed_numbers: vec![],
+            proxy_url: None,
         });
         cfg.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_aabbcc".to_string(),
@@ -1431,6 +1477,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),
@@ -1556,6 +1603,7 @@ mod tests {
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
             allowed_numbers: vec![],
+            proxy_url: None,
         });
         current.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_current".to_string(),
@@ -1565,6 +1613,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),

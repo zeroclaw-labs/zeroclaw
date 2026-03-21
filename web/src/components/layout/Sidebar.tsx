@@ -1,4 +1,5 @@
 import { NavLink } from 'react-router-dom';
+import { basePath } from '../../lib/basePath';
 import {
   LayoutDashboard,
   MessageSquare,
@@ -28,18 +29,22 @@ const navItems = [
 
 export default function Sidebar() {
   return (
-    <aside className="fixed top-0 left-0 h-screen w-60 flex flex-col" style={{ background: 'linear-gradient(180deg, #080818 0%, #050510 100%)' }}>
-      {/* Glow line on right edge */}
-      <div className="sidebar-glow-line" />
-
+    <aside className="fixed top-0 left-0 h-screen w-60 flex flex-col border-r" style={{ background: 'var(--pc-bg-base)', borderColor: 'var(--pc-border)' }}>
       {/* Logo / Title */}
-      <div className="flex items-center gap-3 px-4 py-4 border-b border-[#1a1a3e]/50">
-        <img
-          src="/_app/zeroclaw-trans.png"
-          alt="ZeroClaw"
-          className="h-10 w-10 rounded-xl object-cover animate-pulse-glow"
-        />
-        <span className="text-lg font-bold text-gradient-blue tracking-wide">
+      <div className="flex items-center gap-3 px-4 py-4 border-b h-14" style={{ borderColor: 'var(--pc-border)' }}>
+        <div className="relative shrink-0">
+          <div className="absolute -inset-1.5 rounded-xl" style={{ background: 'linear-gradient(135deg, rgba(var(--pc-accent-rgb), 0.15), rgba(var(--pc-accent-rgb), 0.05))' }} />
+          <img
+            src={`${basePath}/_app/zeroclaw-trans.png`}
+            alt="ZeroClaw"
+            className="relative h-9 w-9 rounded-xl object-cover"
+            onError={(e) => {
+              const img = e.currentTarget;
+              img.style.display = 'none';
+            }}
+          />
+        </div>
+        <span className="text-sm font-semibold tracking-wide" style={{ color: 'var(--pc-text-primary)' }}>
           ZeroClaw
         </span>
       </div>
@@ -53,24 +58,24 @@ export default function Sidebar() {
             end={to === '/'}
             className={({ isActive }) =>
               [
-                'flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm font-medium transition-all duration-300 animate-slide-in-left group',
+                'flex items-center gap-3 px-3 py-2.5 rounded-2xl text-sm font-medium transition-all group',
                 isActive
-                  ? 'text-white shadow-[0_0_15px_rgba(0,128,255,0.2)]'
-                  : 'text-[#556080] hover:text-white hover:bg-[#0080ff08]',
+                  ? 'text-[var(--pc-accent-light)]'
+                  : 'text-[var(--pc-text-muted)] hover:text-[var(--pc-text-secondary)] hover:bg-[var(--pc-hover)]',
               ].join(' ')
             }
             style={({ isActive }) => ({
               animationDelay: `${idx * 40}ms`,
-              ...(isActive ? { background: 'linear-gradient(135deg, rgba(0,128,255,0.15), rgba(0,128,255,0.05))' } : {}),
+              ...(isActive ? {
+                background: 'var(--pc-accent-glow)',
+                border: '1px solid var(--pc-accent-dim)',
+              } : {}),
             })}
           >
             {({ isActive }) => (
               <>
-                <Icon className={`h-5 w-5 flex-shrink-0 transition-colors duration-300 ${isActive ? 'text-[#0080ff]' : 'group-hover:text-[#0080ff80]'}`} />
+                <Icon className={`h-5 w-5 flex-shrink-0 transition-colors ${isActive ? 'text-[var(--pc-accent)]' : 'group-hover:text-[var(--pc-accent)]'}`} />
                 <span>{t(labelKey)}</span>
-                {isActive && (
-                  <div className="ml-auto h-1.5 w-1.5 rounded-full bg-[#0080ff] glow-dot" />
-                )}
               </>
             )}
           </NavLink>
@@ -78,8 +83,8 @@ export default function Sidebar() {
       </nav>
 
       {/* Footer */}
-      <div className="px-5 py-4 border-t border-[#1a1a3e]/50">
-        <p className="text-[10px] text-[#334060] tracking-wider uppercase">ZeroClaw Runtime</p>
+      <div className="px-5 py-4 border-t text-[10px] uppercase tracking-wider" style={{ borderColor: 'var(--pc-border)', color: 'var(--pc-text-faint)' }}>
+        ZeroClaw Runtime
       </div>
     </aside>
   );

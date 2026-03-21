@@ -263,7 +263,7 @@ fn bench_memory_operations(c: &mut Criterion) {
     c.bench_function("memory_recall_top10", |b| {
         b.iter(|| {
             rt.block_on(async {
-                mem.recall(black_box("zeroclaw agent"), 10, None)
+                mem.recall(black_box("zeroclaw agent"), 10, None, None, None)
                     .await
                     .unwrap()
             })

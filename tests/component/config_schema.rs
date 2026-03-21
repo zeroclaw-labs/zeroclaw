@@ -100,6 +100,10 @@ fn gateway_config_defaults_are_secure() {
         !gw.trust_forwarded_headers,
         "forwarded headers should be untrusted by default"
     );
+    assert!(
+        gw.path_prefix.is_none(),
+        "path_prefix should default to None"
+    );
 }
 
 #[test]
@@ -124,6 +128,7 @@ fn gateway_config_toml_roundtrip() {
         host: "0.0.0.0".into(),
         require_pairing: false,
         pair_rate_limit_per_minute: 5,
+        path_prefix: Some("/zeroclaw".into()),
         ..Default::default()
     };
 
@@ -134,6 +139,7 @@ fn gateway_config_toml_roundtrip() {
     assert_eq!(parsed.host, "0.0.0.0");
     assert!(!parsed.require_pairing);
     assert_eq!(parsed.pair_rate_limit_per_minute, 5);
+    assert_eq!(parsed.path_prefix.as_deref(), Some("/zeroclaw"));
 }
 
 #[test]
@@ -161,6 +167,93 @@ port = 9090
     assert_eq!(parsed.gateway.host, "127.0.0.1");
     assert!(parsed.gateway.require_pairing);
     assert_eq!(parsed.gateway.pair_rate_limit_per_minute, 10);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GatewayConfig path_prefix validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn gateway_path_prefix_rejects_missing_leading_slash() {
+    let mut config = Config::default();
+    config.gateway.path_prefix = Some("zeroclaw".into());
+    let err = config.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("must start with '/'"),
+        "expected leading-slash error, got: {err}"
+    );
+}
+
+#[test]
+fn gateway_path_prefix_rejects_trailing_slash() {
+    let mut config = Config::default();
+    config.gateway.path_prefix = Some("/zeroclaw/".into());
+    let err = config.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("must not end with '/'"),
+        "expected trailing-slash error, got: {err}"
+    );
+}
+
+#[test]
+fn gateway_path_prefix_rejects_bare_slash() {
+    let mut config = Config::default();
+    config.gateway.path_prefix = Some("/".into());
+    let err = config.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("must not end with '/'"),
+        "expected bare-slash error, got: {err}"
+    );
+}
+
+#[test]
+fn gateway_path_prefix_accepts_valid_prefixes() {
+    for prefix in ["/zeroclaw", "/apps/zeroclaw", "/api/hassio_ingress/abc123"] {
+        let mut config = Config::default();
+        config.gateway.path_prefix = Some(prefix.into());
+        config
+            .validate()
+            .unwrap_or_else(|e| panic!("prefix {prefix:?} should be valid, got: {e}"));
+    }
+}
+
+#[test]
+fn gateway_path_prefix_rejects_unsafe_characters() {
+    for prefix in [
+        "/zero claw",
+        "/zero<claw",
+        "/zero>claw",
+        "/zero\"claw",
+        "/zero?query",
+        "/zero#frag",
+    ] {
+        let mut config = Config::default();
+        config.gateway.path_prefix = Some(prefix.into());
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("invalid character"),
+            "prefix {prefix:?} should be rejected, got: {err}"
+        );
+    }
+    // Leading/trailing whitespace is rejected by the starts_with('/') or
+    // invalid-character check — either way it must not pass validation.
+    for prefix in [" /zeroclaw ", " /zeroclaw"] {
+        let mut config = Config::default();
+        config.gateway.path_prefix = Some(prefix.into());
+        assert!(
+            config.validate().is_err(),
+            "whitespace-padded prefix {prefix:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn gateway_path_prefix_accepts_none() {
+    let config = Config::default();
+    assert!(config.gateway.path_prefix.is_none());
+    config
+        .validate()
+        .expect("absent path_prefix should be valid");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

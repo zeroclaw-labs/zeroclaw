@@ -646,6 +646,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
+            proxy_url: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -657,6 +658,7 @@ mod tests {
             client_id: "client_id".into(),
             client_secret: "client_secret".into(),
             allowed_users: vec!["*".into()],
+            proxy_url: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -672,6 +674,7 @@ mod tests {
             thread_replies: Some(true),
             mention_only: Some(false),
             interrupt_on_new_message: false,
+            proxy_url: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -683,6 +686,7 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            proxy_url: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -695,6 +699,7 @@ mod tests {
             app_token: "app-token".into(),
             webhook_secret: None,
             allowed_users: vec!["*".into()],
+            proxy_url: None,
         });
         assert!(has_supervised_channels(&config));
     }
@@ -761,6 +766,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
+            proxy_url: None,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
@@ -778,6 +784,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
+            proxy_url: None,
         });
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
