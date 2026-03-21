@@ -313,6 +313,29 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.inactive': '非活跃',
     'dashboard.no_components': '没有组件报告',
     'dashboard.restarts': '重启次数',
+
+    // Settings
+    'settings.title': '设置',
+    'settings.tab.appearance': '外观',
+    'settings.tab.typography': '排版',
+    'settings.appearance': '外观设置',
+    'settings.typography': '字体设置',
+    'settings.fontUi': '界面字体',
+    'settings.fontMono': '代码字体',
+    'settings.fontSize': '界面字号',
+    'settings.fontMonoSize': '代码字号',
+    'settings.preview': '预览',
+    'settings.previewText': '界面字体预览文本',
+    'settings.fontNote': '字体设置需要刷新页面后生效',
+    'settings.language': '界面语言',
+
+    // Theme
+    'theme.mode': '主题模式',
+    'theme.accent': '强调色',
+    'theme.system': '跟随系统',
+    'theme.dark': '深色',
+    'theme.light': '浅色',
+    'theme.oled': '纯黑',
   },
 
   en: {
@@ -620,6 +643,29 @@ const translations: Record<Locale, Record<string, string>> = {
     'dashboard.inactive': 'Inactive',
     'dashboard.no_components': 'No components reporting',
     'dashboard.restarts': 'Restarts',
+
+    // Settings
+    'settings.title': 'Settings',
+    'settings.tab.appearance': 'Appearance',
+    'settings.tab.typography': 'Typography',
+    'settings.appearance': 'Appearance',
+    'settings.typography': 'Typography',
+    'settings.fontUi': 'UI Font',
+    'settings.fontMono': 'Code Font',
+    'settings.fontSize': 'UI Font Size',
+    'settings.fontMonoSize': 'Code Font Size',
+    'settings.preview': 'Preview',
+    'settings.previewText': 'The quick brown fox jumps over the lazy dog.',
+    'settings.fontNote': 'Font changes apply on page reload.',
+    'settings.language': 'Language',
+
+    // Theme
+    'theme.mode': 'Theme Mode',
+    'theme.accent': 'Accent Color',
+    'theme.system': 'System',
+    'theme.dark': 'Dark',
+    'theme.light': 'Light',
+    'theme.oled': 'OLED Black',
   },
 
   tr: {
@@ -927,6 +973,29 @@ const translations: Record<Locale, Record<string, string>> = {
     'health.pid': 'İşlem Kimliği',
     'health.uptime': 'Çalışma Süresi',
     'health.updated_at': 'Son Güncelleme',
+
+    // Settings
+    'settings.title': 'Ayarlar',
+    'settings.tab.appearance': 'Görünüm',
+    'settings.tab.typography': 'Tipografi',
+    'settings.appearance': 'Görünüm',
+    'settings.typography': 'Tipografi',
+    'settings.fontUi': 'Arayüz Yazı Tipi',
+    'settings.fontMono': 'Kod Yazı Tipi',
+    'settings.fontSize': 'Arayüz Boyutu',
+    'settings.fontMonoSize': 'Kod Boyutu',
+    'settings.preview': 'Önizleme',
+    'settings.previewText': 'Tembel köpek üzerinde hızlı kahverengi tilki zıplar.',
+    'settings.fontNote': 'Yazı tipi değişiklikleri sayfa yeniden yüklendikten sonra geçerli olur.',
+    'settings.language': 'Dil',
+
+    // Theme
+    'theme.mode': 'Tema Modu',
+    'theme.accent': 'Vurgu Rengi',
+    'theme.system': 'Sistem',
+    'theme.dark': 'Koyu',
+    'theme.light': 'Açık',
+    'theme.oled': 'OLED Siyah',
   },
 };
 
