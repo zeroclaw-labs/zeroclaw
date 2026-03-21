@@ -46,7 +46,7 @@ const MODEL_GROUPS: ModelGroup[] = [
     models: [
       { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", tier: "Premium" },
       { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", tier: "Standard" },
-      { id: "gemini-2.0-flash-lite", label: "Gemini 2.0 Flash Lite", tier: "Fast" },
+      { id: "gemini-3.1-flash-lite-preview", label: "Gemini 3.1 Flash Lite", tier: "Fast" },
     ],
   },
 ];
@@ -310,18 +310,18 @@ export function Sidebar({
   // Determine which model groups to show
   const visibleModelGroups = useMemo(() => {
     if (availableProviders.size === 0) {
-      // No keys set: show only Gemini 2.0 Flash Lite as default free tier
+      // No keys set: show only Gemini 3.1 Flash Lite as default free tier
       return [{
         provider: "gemini",
         keyName: "gemini",
-        models: [{ id: "gemini-2.0-flash-lite", label: "Gemini 2.0 Flash Lite", tier: "Fast" as const }],
+        models: [{ id: "gemini-3.1-flash-lite-preview", label: "Gemini 3.1 Flash Lite", tier: "Fast" as const }],
       }];
     }
     return MODEL_GROUPS.filter((g) => availableProviders.has(g.keyName));
   }, [availableProviders]);
 
   // Tool API key dropdown state
-  const [_showToolKeyDropdown, setShowToolKeyDropdown] = useState(false);
+  const [, setShowToolKeyDropdown] = useState(false);
   const [selectedToolForKey, setSelectedToolForKey] = useState<string>("");
   const [toolKeyInput, setToolKeyInput] = useState("");
   const [toolKeySaving, setToolKeySaving] = useState(false);

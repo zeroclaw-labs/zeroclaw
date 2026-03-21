@@ -452,6 +452,17 @@ export async function getRemoteDevices(loginToken: string): Promise<UserDevice[]
   return (data.devices || data || []) as UserDevice[];
 }
 
+// Get user's devices using the current session token (for chat device selector)
+export async function getMyDevices(): Promise<UserDevice[]> {
+  try {
+    const data = await apiFetch<{ devices?: UserDevice[] } | UserDevice[]>('/api/auth/devices');
+    if (Array.isArray(data)) return data;
+    return data.devices || [];
+  } catch {
+    return [];
+  }
+}
+
 // Kakao OAuth
 export interface KakaoAuthResponse {
   status: string;

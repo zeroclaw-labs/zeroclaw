@@ -3,10 +3,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Send, Bot, User, AlertCircle, ArrowLeft, Settings, LogOut, Mic, MicOff, Volume2, VolumeX } from 'lucide-react';
+import { Send, Bot, User, AlertCircle, ArrowLeft, Settings, LogOut, Mic, MicOff, Monitor, ChevronDown } from 'lucide-react';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 import { getToken, clearToken, isAuthenticated } from '@/lib/auth';
+import { getMyDevices, type UserDevice } from '@/lib/gateway-api';
 
 interface ChatMessage {
   id: string;
@@ -85,6 +86,11 @@ export default function ChatPage() {
   const voiceModeRef = useRef(false);
   const chatLangRef = useRef(chatLang);
 
+  // Device selection state
+  const [devices, setDevices] = useState<UserDevice[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+  const [showDeviceMenu, setShowDeviceMenu] = useState(false);
+
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -98,6 +104,27 @@ export default function ChatPage() {
     }
     setAuthChecked(true);
   }, [router]);
+
+  // Fetch user devices
+  useEffect(() => {
+    if (!authChecked) return;
+    let cancelled = false;
+    const fetchDevices = async () => {
+      const devs = await getMyDevices();
+      if (!cancelled) setDevices(devs);
+    };
+    fetchDevices();
+    const interval = setInterval(fetchDevices, 10000);
+    return () => { cancelled = true; clearInterval(interval); };
+  }, [authChecked]);
+
+  // Close device menu on outside click
+  useEffect(() => {
+    if (!showDeviceMenu) return;
+    const handler = () => setShowDeviceMenu(false);
+    document.addEventListener('click', handler);
+    return () => document.removeEventListener('click', handler);
+  }, [showDeviceMenu]);
 
   // Keep refs in sync
   useEffect(() => { voiceModeRef.current = voiceMode; }, [voiceMode]);
@@ -231,7 +258,9 @@ export default function ChatPage() {
     if (detected !== chatLang) setChatLang(detected);
     setMessages((prev) => [...prev, { id: makeMessageId(), role: 'user', content: trimmed, timestamp: new Date() }]);
     try {
-      wsRef.current.sendMessage(trimmed);
+      const extra: Record<string, string> = {};
+      if (selectedDeviceId) extra.target_device_id = selectedDeviceId;
+      wsRef.current.sendMessage(trimmed, extra);
       setTyping(true);
       pendingContentRef.current = '';
     } catch {
@@ -292,6 +321,46 @@ export default function ChatPage() {
           </div>
         </div>
         <div className="flex items-center gap-2">
+          {/* Device selector */}
+          {devices.length > 0 && (
+            <div className="relative" onClick={(e) => e.stopPropagation()}>
+              <button
+                onClick={() => setShowDeviceMenu((v) => !v)}
+                className="flex items-center gap-1.5 h-8 px-2.5 rounded-lg text-dark-400 hover:bg-dark-800 hover:text-dark-200 transition-all text-xs border border-dark-700/50"
+              >
+                <Monitor className="h-3.5 w-3.5" />
+                <span className="max-w-[100px] truncate">
+                  {selectedDeviceId
+                    ? devices.find((d) => d.device_id === selectedDeviceId)?.device_name ?? 'Device'
+                    : 'Auto'}
+                </span>
+                <ChevronDown className="h-3 w-3" />
+              </button>
+              {showDeviceMenu && (
+                <div className="absolute right-0 top-full mt-1 w-56 bg-dark-800 border border-dark-700 rounded-xl shadow-2xl z-50 py-1 overflow-hidden">
+                  <button
+                    onClick={() => { setSelectedDeviceId(null); setShowDeviceMenu(false); }}
+                    className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2 hover:bg-dark-700 transition-colors ${!selectedDeviceId ? 'text-primary-400 bg-primary-500/10' : 'text-dark-300'}`}
+                  >
+                    <span className="w-1.5 h-1.5 rounded-full bg-primary-400" />
+                    Auto (best available)
+                  </button>
+                  {devices.map((dev) => (
+                    <button
+                      key={dev.device_id}
+                      onClick={() => { setSelectedDeviceId(dev.device_id); setShowDeviceMenu(false); }}
+                      className={`w-full text-left px-3 py-2 text-xs flex items-center gap-2 hover:bg-dark-700 transition-colors ${selectedDeviceId === dev.device_id ? 'text-primary-400 bg-primary-500/10' : 'text-dark-300'}`}
+                    >
+                      <span className={`w-1.5 h-1.5 rounded-full ${dev.is_online ? 'bg-green-400' : 'bg-dark-500'}`} />
+                      <span className="flex-1 truncate">{dev.device_name}</span>
+                      {dev.platform && <span className="text-dark-500 text-[10px]">{dev.platform}</span>}
+                      {!dev.is_online && <span className="text-dark-500 text-[10px]">offline</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
           <Link
             href="/workspace/dashboard"
             className="flex h-8 w-8 items-center justify-center rounded-lg text-dark-400 hover:bg-dark-800 hover:text-dark-200 transition-all"

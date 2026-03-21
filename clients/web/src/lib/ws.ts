@@ -82,11 +82,11 @@ export class WebSocketClient {
     };
   }
 
-  sendMessage(content: string): void {
+  sendMessage(content: string, extra?: Record<string, string>): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('WebSocket is not connected');
     }
-    this.ws.send(JSON.stringify({ type: 'message', content }));
+    this.ws.send(JSON.stringify({ type: 'message', content, ...extra }));
   }
 
   disconnect(): void {

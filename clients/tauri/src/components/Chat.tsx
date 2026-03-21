@@ -317,7 +317,7 @@ export function Chat({
         setIsLoading(false);
       }
     },
-    [onSendMessage],
+    [onSendMessage, chatLang],
   );
 
   const handleOcrConsent = useCallback(
