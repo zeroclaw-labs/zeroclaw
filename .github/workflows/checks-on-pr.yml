@@ -37,6 +37,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Clippy (whatsapp-web feature)
+        run: cargo clippy --all-targets --features whatsapp-web -- -D warnings
+
   test:
     name: Test
     runs-on: ubuntu-latest
