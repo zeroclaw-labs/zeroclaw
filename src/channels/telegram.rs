@@ -5157,9 +5157,10 @@ mod tests {
             .as_ref()
             .expect("manager must be initialized for local_whisper config");
 
-        // Directly verifying that manager.transcribe() reaches the local_whisper endpoint,
-        // not the Groq shim. A regression that reverts the call site to transcribe_audio()
-        // would fail here because Groq with no API key cannot serve this request.
+        // Verifies that manager.transcribe() reaches the local_whisper endpoint.
+        // This tests the manager object directly, not the channel method. A call-site
+        // regression in try_parse_voice_message() would not be caught here — a full
+        // integration test through that path would require mocking the Telegram Bot API.
         let result = manager
             .transcribe(b"fake audio", "voice.ogg")
             .await
