@@ -669,7 +669,8 @@ pub fn all_tools_with_runtime(
         )
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone())
-        .with_delegate_config(root_config.delegate.clone());
+        .with_delegate_config(root_config.delegate.clone())
+        .with_workspace_dir(workspace_dir.to_path_buf());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };
@@ -1000,6 +1001,7 @@ mod tests {
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
 

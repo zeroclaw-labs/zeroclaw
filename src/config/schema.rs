@@ -515,6 +515,10 @@ pub struct DelegateAgentConfig {
     /// When `None`, falls back to `[delegate].agentic_timeout_secs` (default: 300).
     #[serde(default)]
     pub agentic_timeout_secs: Option<u64>,
+    /// Optional skills directory path (relative to workspace root) for scoped skill loading.
+    /// When unset or empty, the sub-agent falls back to the default workspace `skills/` directory.
+    #[serde(default)]
+    pub skills_directory: Option<String>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -9837,6 +9841,7 @@ tool_dispatcher = "xml"
                 max_iterations: 10,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
 
