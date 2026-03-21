@@ -1297,20 +1297,17 @@ fn create_provider_with_url_and_options(
             )
         )),
         name if is_qwen_coding_alias(name) => {
-            // Alibaba Coding Plan uses Anthropic Messages API format,
-            // not OpenAI Chat Completions.
             let base_url = if is_qwen_coding_cn_alias(name) {
                 QWEN_CODING_CN_BASE_URL
             } else {
                 QWEN_CODING_INTL_BASE_URL
             };
-            // The base URL includes /v1 but AnthropicProvider appends /v1/messages,
-            // so we need to strip /v1 and use /apps/anthropic as the base.
-            let anthropic_base = base_url.trim_end_matches("/v1");
-            let anthropic_url = format!("{}/apps/anthropic", anthropic_base);
-            Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
+                "Qwen Coding",
+                base_url,
                 key,
-                Some(&anthropic_url),
+                AuthStyle::Bearer,
+                true,
             )))
         }
         name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
