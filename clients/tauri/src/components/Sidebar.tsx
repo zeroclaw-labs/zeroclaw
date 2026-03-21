@@ -415,7 +415,24 @@ export function Sidebar({
     setShowToolsPopup(true);
   }, []);
 
-  const onlineDevices = devices.filter((d) => d.is_online);
+  // Deduplicate devices: keep the most recently seen entry for each unique name+platform
+  const dedupedDevices = useMemo(() => {
+    const map = new Map<string, typeof devices[0]>();
+    for (const d of devices) {
+      const key = `${d.device_name}|${d.platform ?? ""}`;
+      const existing = map.get(key);
+      if (!existing || d.last_seen > existing.last_seen) {
+        // Merge online status: if any duplicate is online, mark as online
+        const mergedOnline = d.is_online || (existing?.is_online ?? false);
+        map.set(key, { ...d, is_online: mergedOnline });
+      } else if (d.is_online && !existing.is_online) {
+        map.set(key, { ...existing, is_online: true });
+      }
+    }
+    return Array.from(map.values());
+  }, [devices]);
+
+  const onlineDevices = dedupedDevices.filter((d) => d.is_online);
 
   // Sort chats by updatedAt descending and compute date groups
   const sortedChats = useMemo(() => {
@@ -469,10 +486,10 @@ export function Sidebar({
             </button>
             {expandedSections.devices && (
               <div className="sidebar-section-content">
-                {devices.length === 0 ? (
+                {dedupedDevices.length === 0 ? (
                   <div className="sidebar-section-empty">{t("sidebar_no_devices", locale)}</div>
                 ) : (
-                  devices.map((device) => (
+                  dedupedDevices.map((device) => (
                     <div key={device.device_id} className="sidebar-info-item">
                       <div className={`sidebar-status-dot ${device.is_online ? "online" : ""}`} />
                       <span className="sidebar-info-label">{device.device_name}</span>
@@ -520,6 +537,11 @@ export function Sidebar({
                           className={`sidebar-model-item ${selectedModel === model.id ? "active" : ""}`}
                           onClick={() => handleSelectModel(group.provider, model.id)}
                         >
+                          {selectedModel === model.id && (
+                            <svg className="sidebar-model-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                              <polyline points="20 6 9 17 4 12" />
+                            </svg>
+                          )}
                           <span>{model.label}</span>
                           <span className={`sidebar-model-tier ${model.tier.toLowerCase()}`}>
                             {model.tier}

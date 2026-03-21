@@ -635,6 +635,7 @@ function App() {
               setPage("interpreter");
               if (window.innerWidth <= 768) setSidebarOpen(false);
             }}
+            onNewChat={handleNewChat}
             onToggleSidebar={() => setSidebarOpen((p) => !p)}
             sidebarOpen={sidebarOpen}
           />

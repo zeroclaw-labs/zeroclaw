@@ -105,6 +105,7 @@ interface ChatProps {
   onRetry: (messages: ChatMessage[]) => void;
   onOpenSettings: () => void;
   onOpenInterpreter?: () => void;
+  onNewChat?: () => void;
   onToggleSidebar: () => void;
   sidebarOpen: boolean;
   currentDeviceName?: string;
@@ -119,6 +120,7 @@ export function Chat({
   onRetry,
   onOpenSettings,
   onOpenInterpreter: _onOpenInterpreter,
+  onNewChat,
   onToggleSidebar,
   sidebarOpen,
   currentDeviceName = "",
@@ -479,6 +481,18 @@ export function Chat({
                 : t("new_chat", locale)))
             : t("app_title", locale)}
         </span>
+        {onNewChat && (
+          <button
+            className="chat-header-new-chat"
+            onClick={onNewChat}
+            title={locale === "ko" ? "새 대화" : "New Chat"}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+            </svg>
+          </button>
+        )}
         {(currentDeviceName || currentModel) && (
           <div className="chat-header-info">
             {currentDeviceName && <span className="chat-header-device">{"\uD83D\uDCF1"} {currentDeviceName}</span>}

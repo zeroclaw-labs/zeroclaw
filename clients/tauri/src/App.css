@@ -948,8 +948,16 @@ html, body {
 }
 
 .sidebar-model-item.active {
-  background: rgba(59, 130, 246, 0.15);
+  background: rgba(59, 130, 246, 0.2);
   color: #60a5fa;
+  font-weight: 600;
+  border-left: 3px solid #60a5fa;
+  padding-left: 5px;
+}
+
+.sidebar-model-check {
+  color: #34d399;
+  flex-shrink: 0;
 }
 
 .sidebar-model-tier {
@@ -1048,6 +1056,26 @@ html, body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.chat-header-new-chat {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: none;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 6px;
+  flex-shrink: 0;
+  transition: all var(--transition-fast);
+}
+
+.chat-header-new-chat:hover {
+  background: var(--color-bg-hover);
+  color: var(--color-text-primary);
+  border-color: rgba(255, 255, 255, 0.3);
 }
 
 .chat-header-info {
