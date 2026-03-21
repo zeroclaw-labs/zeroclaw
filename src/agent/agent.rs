@@ -330,7 +330,7 @@ impl Agent {
         }
     }
 
-    pub fn from_config(config: &Config) -> Result<Self> {
+    pub async fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> =
             Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn runtime::RuntimeAdapter> =
@@ -359,7 +359,7 @@ impl Agent {
             None
         };
 
-        let (tools, _delegate_handle) = tools::all_tools_with_runtime(
+        let (mut tools, delegate_handle) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -374,6 +374,66 @@ impl Agent {
             config.api_key.as_deref(),
             config,
         );
+
+        // ── Wire MCP tools (non-fatal) ─────────────────────────────
+        // Replicates the same MCP initialization logic used in the CLI
+        // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
+        // path also has access to MCP tools.
+        if config.mcp.enabled && !config.mcp.servers.is_empty() {
+            tracing::info!(
+                "Initializing MCP client — {} server(s) configured",
+                config.mcp.servers.len()
+            );
+            match tools::McpRegistry::connect_all(&config.mcp.servers).await {
+                Ok(registry) => {
+                    let registry = std::sync::Arc::new(registry);
+                    if config.mcp.deferred_loading {
+                        let deferred_set = tools::DeferredMcpToolSet::from_registry(
+                            std::sync::Arc::clone(&registry),
+                        )
+                        .await;
+                        tracing::info!(
+                            "MCP deferred: {} tool stub(s) from {} server(s)",
+                            deferred_set.len(),
+                            registry.server_count()
+                        );
+                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
+                            tools::ActivatedToolSet::new(),
+                        ));
+                        tools.push(Box::new(tools::ToolSearchTool::new(
+                            deferred_set,
+                            activated,
+                        )));
+                    } else {
+                        let names = registry.tool_names();
+                        let mut registered = 0usize;
+                        for name in names {
+                            if let Some(def) = registry.get_tool_def(&name).await {
+                                let wrapper: std::sync::Arc<dyn tools::Tool> =
+                                    std::sync::Arc::new(tools::McpToolWrapper::new(
+                                        name,
+                                        def,
+                                        std::sync::Arc::clone(&registry),
+                                    ));
+                                if let Some(ref handle) = delegate_handle {
+                                    handle.write().push(std::sync::Arc::clone(&wrapper));
+                                }
+                                tools.push(Box::new(tools::ArcToolRef(wrapper)));
+                                registered += 1;
+                            }
+                        }
+                        tracing::info!(
+                            "MCP: {} tool(s) registered from {} server(s)",
+                            registered,
+                            registry.server_count()
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("MCP registry failed to initialize: {e:#}");
+                }
+            }
+        }
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
@@ -786,7 +846,7 @@ pub async fn run(
     }
     effective_config.default_temperature = temperature;
 
-    let mut agent = Agent::from_config(&effective_config)?;
+    let mut agent = Agent::from_config(&effective_config).await?;
 
     let provider_name = effective_config
         .default_provider
@@ -1130,7 +1190,9 @@ mod tests {
             .extra_headers
             .insert("X-Title".to_string(), "zeroclaw-web".to_string());
 
-        let mut agent = Agent::from_config(&config).expect("agent from config");
+        let mut agent = Agent::from_config(&config)
+            .await
+            .expect("agent from config");
         let response = agent.turn("hello").await.expect("agent turn");
 
         assert_eq!(response, "hello from mock");
