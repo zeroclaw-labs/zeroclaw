@@ -4,7 +4,6 @@ use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
@@ -227,38 +226,13 @@ impl Tool for ClaudeCodeTool {
         }
 
         cmd.current_dir(&work_dir);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-
-        // Execute with timeout — spawn explicitly so we can kill the child on
-        // timeout instead of just dropping the future (which may leave the
-        // process running as a zombie).
+        // Execute with timeout — use kill_on_drop(true) so the child process
+        // is automatically killed when the future is dropped on timeout,
+        // preventing zombie processes.
         let timeout = Duration::from_secs(self.config.timeout_secs);
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let err_msg = e.to_string();
-                if err_msg.contains("No such file or directory")
-                    || err_msg.contains("not found")
-                    || err_msg.contains("cannot find")
-                {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(
-                            "Claude Code CLI ('claude') not found in PATH. Install with: npm install -g @anthropic-ai/claude-code".into(),
-                        ),
-                    });
-                }
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to execute claude: {e}")),
-                });
-            }
-        };
+        cmd.kill_on_drop(true);
 
-        let result = tokio::time::timeout(timeout, child.wait_with_output()).await;
+        let result = tokio::time::timeout(timeout, cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -320,14 +294,25 @@ impl Tool for ClaudeCodeTool {
                     })
                 }
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute claude: {e}")),
-            }),
+            Ok(Err(e)) => {
+                let err_msg = e.to_string();
+                let msg = if err_msg.contains("No such file or directory")
+                    || err_msg.contains("not found")
+                    || err_msg.contains("cannot find")
+                {
+                    "Claude Code CLI ('claude') not found in PATH. Install with: npm install -g @anthropic-ai/claude-code".into()
+                } else {
+                    format!("Failed to execute claude: {e}")
+                };
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(msg),
+                })
+            }
             Err(_) => {
-                // Timeout — explicitly kill the child process
-                let _ = child.kill().await;
+                // Timeout — kill_on_drop(true) ensures the child is killed
+                // when the future is dropped.
                 Ok(ToolResult {
                     success: false,
                     output: String::new(),
