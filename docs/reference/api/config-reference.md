@@ -425,6 +425,12 @@ Notes:
 | `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+| `path_prefix` | _(none)_ | URL path prefix for reverse-proxy deployments (e.g. `"/zeroclaw"`) |
+
+When deploying behind a reverse proxy that maps ZeroClaw to a sub-path,
+set `path_prefix` to that sub-path (e.g. `"/zeroclaw"`). All gateway
+routes will be served under this prefix. The value must start with `/`
+and must not end with `/`.
 
 ## `[autonomy]`
 
