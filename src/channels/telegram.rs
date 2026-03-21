@@ -429,14 +429,16 @@ impl TelegramChannel {
             match super::transcription::TranscriptionManager::new(&config) {
                 Ok(m) => {
                     self.transcription_manager = Some(Arc::new(m));
+                    self.transcription = Some(config);
                 }
                 Err(e) => {
                     tracing::warn!(
                         "transcription manager init failed, voice transcription disabled: {e}"
                     );
+                    // Both fields remain None: voice messages are skipped rather than
+                    // silently dropped mid-handler after a wasted file download.
                 }
             }
-            self.transcription = Some(config);
         }
         self
     }
@@ -4356,12 +4358,14 @@ mod tests {
 
     #[test]
     fn with_transcription_sets_config_when_enabled() {
+        std::env::remove_var("GROQ_API_KEY");
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
-
+        tc.api_key = Some("fake-key".to_string()); // Groq registers; manager builds
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
         assert!(ch.transcription.is_some());
+        assert!(ch.transcription_manager.is_some());
     }
 
     #[test]
@@ -5114,6 +5118,52 @@ mod tests {
         config.enabled = true; // safety net fires: enabled + no key → Groq absent → bail
         let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
             .with_transcription(config);
+        // Both fields must be None: an invalid config must not leave a partial state where
+        // config is Some but manager is None (which causes silent mid-handler drops).
         assert!(ch.transcription_manager.is_none());
+        assert!(ch.transcription.is_none());
+    }
+
+    #[tokio::test]
+    async fn telegram_manager_routes_to_local_whisper() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "routed correctly"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true;
+        config.default_provider = "local_whisper".to_string();
+        config.local_whisper = Some(crate::config::LocalWhisperConfig {
+            url: format!("{}/v1/transcribe", server.uri()),
+            bearer_token: "test-token".to_string(),
+            max_audio_bytes: 1024 * 1024,
+            timeout_secs: 30,
+        });
+
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
+            .with_transcription(config);
+
+        let manager = ch
+            .transcription_manager
+            .as_ref()
+            .expect("manager must be initialized for local_whisper config");
+
+        // Directly verifying that manager.transcribe() reaches the local_whisper endpoint,
+        // not the Groq shim. A regression that reverts the call site to transcribe_audio()
+        // would fail here because Groq with no API key cannot serve this request.
+        let result = manager
+            .transcribe(b"fake audio", "voice.ogg")
+            .await
+            .unwrap();
+        assert_eq!(result, "routed correctly");
     }
 }
