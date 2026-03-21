@@ -8,6 +8,9 @@ use std::sync::Arc;
 
 const JIRA_SEARCH_PAGE_SIZE: u32 = 100;
 const MAX_ERROR_BODY_CHARS: usize = 500;
+const CONFLUENCE_PAGE_MAX_CHARS: usize = 10_000;
+const CONFLUENCE_CHILDREN_MAX: usize = 250;
+const CONFLUENCE_SPACE_PAGE_MAX: usize = 1_000;
 
 /// Controls how much data is returned by `get_ticket`.
 #[derive(Default)]
@@ -423,6 +426,223 @@ impl JiraTool {
         })
     }
 
+    async fn confluence_get_space(&self, space_key: &str) -> anyhow::Result<ToolResult> {
+        validate_space_key(space_key)?;
+        let url = format!("{}/wiki/rest/api/content", self.base_url);
+        let limit_str = CONFLUENCE_SPACE_PAGE_MAX.to_string();
+
+        let resp = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .query(&[
+                ("spaceKey", space_key),
+                ("type", "page"),
+                ("limit", &limit_str),
+                ("expand", "ancestors"),
+            ])
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Confluence get_space request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Confluence get_space failed ({status}): {}",
+                crate::util::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        let raw: Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Confluence get_space response: {e}"))?;
+
+        let pages = raw["results"].as_array().cloned().unwrap_or_default();
+        let total = pages.len();
+        let truncated = total >= CONFLUENCE_SPACE_PAGE_MAX;
+
+        let mut id_to_title: HashMap<String, String> = HashMap::new();
+        let mut parent_to_children: HashMap<String, Vec<String>> = HashMap::new();
+        let mut roots: Vec<String> = Vec::new();
+
+        for p in &pages {
+            let pid = p["id"].as_str().unwrap_or("").to_string();
+            let title = p["title"].as_str().unwrap_or("").to_string();
+            id_to_title.insert(pid.clone(), title);
+            let ancestors = p["ancestors"].as_array();
+            if let Some(ancs) = ancestors {
+                if let Some(parent) = ancs.last() {
+                    let parent_id = parent["id"].as_str().unwrap_or("").to_string();
+                    parent_to_children.entry(parent_id).or_default().push(pid);
+                } else {
+                    roots.push(pid);
+                }
+            } else {
+                roots.push(pid);
+            }
+        }
+
+        let tree: Vec<Value> = roots
+            .iter()
+            .map(|r| build_confluence_tree(r, &id_to_title, &parent_to_children))
+            .collect();
+
+        let output = json!({
+            "space_key": space_key,
+            "total": total,
+            "truncated": truncated,
+            "pages": tree,
+        });
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            error: None,
+        })
+    }
+
+    async fn confluence_get_page(&self, page_id: &str) -> anyhow::Result<ToolResult> {
+        validate_page_id(page_id)?;
+        let url = format!("{}/wiki/rest/api/content/{}", self.base_url, page_id);
+        let children_limit_str = CONFLUENCE_CHILDREN_MAX.to_string();
+
+        let resp = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .query(&[
+                ("expand", "body.view,ancestors,children.page,space"),
+                ("children.page.limit", &children_limit_str),
+            ])
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Confluence get_page request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Confluence get_page failed ({status}): {}",
+                crate::util::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        let raw: Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Confluence get_page response: {e}"))?;
+
+        let html = raw["body"]["view"]["value"].as_str().unwrap_or("");
+        let text = nanohtml2text::html2text(html);
+        let truncated = text.len() > CONFLUENCE_PAGE_MAX_CHARS;
+        let content = if truncated {
+            crate::util::truncate_with_ellipsis(&text, CONFLUENCE_PAGE_MAX_CHARS).to_string()
+        } else {
+            text
+        };
+
+        let parent = raw["ancestors"]
+            .as_array()
+            .and_then(|a| a.last())
+            .map(|p| json!({ "id": p["id"], "title": p["title"] }));
+
+        let children: Vec<Value> = raw["children"]["page"]["results"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|c| json!({ "id": c["id"], "title": c["title"] }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let children_truncated = children.len() >= CONFLUENCE_CHILDREN_MAX;
+
+        let output = json!({
+            "id": raw["id"],
+            "title": raw["title"],
+            "space_key": raw["space"]["key"],
+            "parent": parent,
+            "children": children,
+            "children_truncated": children_truncated,
+            "content": content,
+            "truncated": truncated,
+        });
+
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            error: None,
+        })
+    }
+
+    async fn confluence_search(
+        &self,
+        query: &str,
+        max_results: Option<u32>,
+    ) -> anyhow::Result<ToolResult> {
+        let max_results = max_results.unwrap_or(25).clamp(1, 50);
+        let escaped = query.replace('"', "\\\"");
+        let cql = format!(
+            "(title ~ \"{escaped}\" OR text ~ \"{escaped}\") AND type = page"
+        );
+        let limit_str = max_results.to_string();
+        let url = format!("{}/wiki/rest/api/content/search", self.base_url);
+
+        let resp = self
+            .http
+            .get(&url)
+            .basic_auth(&self.email, Some(&self.api_token))
+            .query(&[
+                ("cql", cql.as_str()),
+                ("limit", &limit_str),
+                ("expand", "space"),
+            ])
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Confluence search request failed: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Confluence search failed ({status}): {}",
+                crate::util::truncate_with_ellipsis(&text, MAX_ERROR_BODY_CHARS)
+            );
+        }
+
+        let raw: Value = resp
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Confluence search response: {e}"))?;
+
+        let results: Vec<Value> = raw["results"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|r| {
+                        json!({
+                            "id": r["id"],
+                            "title": r["title"],
+                            "type": r["type"],
+                            "space_key": r["space"]["key"],
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let output = json!(results);
+        Ok(ToolResult {
+            success: true,
+            output: serde_json::to_string_pretty(&output).unwrap_or_else(|_| output.to_string()),
+            error: None,
+        })
+    }
+
     async fn resolve_email(&self, email: &str) -> Option<(String, String)> {
         let url = format!("{}/rest/api/3/user/search", self.base_url);
         let result = self
@@ -459,7 +679,7 @@ impl Tool for JiraTool {
     }
 
     fn description(&self) -> &str {
-        "Interact with Jira: get tickets with configurable detail level, search issues with JQL, add comments with mention and formatting support."
+        "Interact with Jira and Confluence (Atlassian). Jira: get tickets with configurable detail level, search issues with JQL, add comments with mention and formatting support. Confluence: list all pages in a space as a tree, read a page with its parent and child navigation links, search pages by title and body text."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -468,8 +688,11 @@ impl Tool for JiraTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get_ticket", "search_tickets", "comment_ticket", "list_projects", "myself"],
-                    "description": "The Jira action to perform. Enabled actions are configured in [jira].allowed_actions. Use 'myself' to verify that credentials are valid and the Jira connection is working."
+                    "enum": [
+                        "get_ticket", "search_tickets", "comment_ticket", "list_projects", "myself",
+                        "confluence_get_space", "confluence_get_page", "confluence_search"
+                    ],
+                    "description": "The action to perform. Jira actions: 'get_ticket' — fetch a ticket by key; 'search_tickets' — search with JQL; 'comment_ticket' — post a comment; 'list_projects' — list all projects; 'myself' — verify credentials. Confluence actions: 'confluence_get_space' — list all pages in a space as a tree; 'confluence_get_page' — read a page with parent and child links; 'confluence_search' — fuzzy search pages by title and body. All actions must be enabled in [jira].allowed_actions."
                 },
                 "issue_key": {
                     "type": "string",
@@ -486,12 +709,24 @@ impl Tool for JiraTool {
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum number of issues to return for search_tickets. Defaults to 25, capped at 999.",
+                    "description": "Maximum number of results to return. For search_tickets: defaults to 25, capped at 999. For confluence_search: defaults to 25, capped at 50.",
                     "default": 25
                 },
                 "comment": {
                     "type": "string",
                     "description": "Comment body for comment_ticket. Supports a limited markdown-like syntax converted to Atlassian Document Format (ADF). Mention a user with @user@domain.com — the leading @ is required (a bare email without @ prefix is treated as plain text). Bold with **text**. Bullet list items with a leading '- '. Newlines become line breaks. Everything else is plain text. Example: 'Hi @john@company.com, this is **important**.\n- Check the logs\n- Rerun the pipeline'"
+                },
+                "space_key": {
+                    "type": "string",
+                    "description": "Confluence space key, e.g. 'ENGINEERING' or 'DP'. Required for confluence_get_space."
+                },
+                "page_id": {
+                    "type": "string",
+                    "description": "Confluence page ID (numeric string), e.g. '5403115521'. Required for confluence_get_page. Obtain IDs from confluence_get_space or confluence_search."
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search term for confluence_search. Matched against both page titles and body text (fuzzy). Example: 'MLT Planning'."
                 }
             },
             "required": ["action"]
@@ -514,13 +749,22 @@ impl Tool for JiraTool {
         // clear "unknown action" error rather than a misleading "not enabled" one.
         if !matches!(
             action,
-            "get_ticket" | "search_tickets" | "comment_ticket" | "list_projects" | "myself"
+            "get_ticket"
+                | "search_tickets"
+                | "comment_ticket"
+                | "list_projects"
+                | "myself"
+                | "confluence_get_space"
+                | "confluence_get_page"
+                | "confluence_search"
         ) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, comment_ticket, list_projects, myself"
+                    "Unknown action: '{action}'. Valid actions: get_ticket, search_tickets, \
+                     comment_ticket, list_projects, myself, confluence_get_space, \
+                     confluence_get_page, confluence_search"
                 )),
             });
         }
@@ -538,7 +782,13 @@ impl Tool for JiraTool {
         }
 
         let operation = match action {
-            "get_ticket" | "search_tickets" | "list_projects" | "myself" => ToolOperation::Read,
+            "get_ticket"
+            | "search_tickets"
+            | "list_projects"
+            | "myself"
+            | "confluence_get_space"
+            | "confluence_get_page"
+            | "confluence_search" => ToolOperation::Read,
             "comment_ticket" => ToolOperation::Act,
             _ => unreachable!(),
         };
@@ -615,6 +865,55 @@ impl Tool for JiraTool {
                 };
                 self.comment_ticket(issue_key, comment).await
             }
+            "confluence_get_space" => {
+                let space_key = match args.get("space_key").and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "confluence_get_space requires space_key parameter".into(),
+                            ),
+                        })
+                    }
+                };
+                self.confluence_get_space(space_key).await
+            }
+            "confluence_get_page" => {
+                let page_id = match args.get("page_id").and_then(|v| v.as_str()) {
+                    Some(k) => k,
+                    None => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "confluence_get_page requires page_id parameter".into(),
+                            ),
+                        })
+                    }
+                };
+                self.confluence_get_page(page_id).await
+            }
+            "confluence_search" => {
+                let query = match args.get("query").and_then(|v| v.as_str()) {
+                    Some(q) if !q.trim().is_empty() => q,
+                    _ => {
+                        return Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(
+                                "confluence_search requires a non-empty query parameter".into(),
+                            ),
+                        })
+                    }
+                };
+                let max_results = args
+                    .get("max_results")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+                self.confluence_search(query, max_results).await
+            }
             _ => unreachable!(),
         };
 
@@ -647,6 +946,33 @@ fn validate_issue_key(key: &str) -> anyhow::Result<()> {
         anyhow::bail!(
             "Invalid issue key '{key}'. Expected format: PROJECT-123 (e.g. PROJ-42, proj-42)"
         )
+    }
+}
+
+/// Validates that `space_key` contains only safe characters to prevent injection.
+/// Allows alphanumeric, underscore, hyphen, and tilde (used in personal space keys).
+fn validate_space_key(key: &str) -> anyhow::Result<()> {
+    let valid = !key.is_empty()
+        && key.len() <= 255
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '~'));
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Invalid space key '{key}'. Expected alphanumeric characters (e.g. ENGINEERING, DP)"
+        )
+    }
+}
+
+/// Validates that `page_id` is a non-empty numeric string (Confluence page IDs are integers).
+fn validate_page_id(id: &str) -> anyhow::Result<()> {
+    let valid = !id.is_empty() && id.chars().all(|c| c.is_ascii_digit());
+    if valid {
+        Ok(())
+    } else {
+        anyhow::bail!("Invalid page ID '{id}'. Expected a numeric ID (e.g. 5403115521)")
     }
 }
 
@@ -948,6 +1274,26 @@ fn build_adf(text: &str, mentions: &HashMap<String, (String, String)>) -> Value 
     flush_list(&mut list_items, &mut content);
 
     json!({ "type": "doc", "version": 1, "content": content })
+}
+
+// ── Confluence helpers ────────────────────────────────────────────────────────
+
+/// Recursively builds a JSON tree node for a Confluence page and its descendants.
+fn build_confluence_tree(
+    node_id: &str,
+    id_to_title: &HashMap<String, String>,
+    parent_to_children: &HashMap<String, Vec<String>>,
+) -> Value {
+    let title = id_to_title.get(node_id).map(String::as_str).unwrap_or("");
+    let children: Vec<Value> = parent_to_children
+        .get(node_id)
+        .map(|kids| {
+            kids.iter()
+                .map(|k| build_confluence_tree(k, id_to_title, parent_to_children))
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({ "id": node_id, "title": title, "children": children })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -1519,5 +1865,189 @@ mod tests {
     fn shape_projects_empty_inputs() {
         let shaped = shape_projects(&[], &[]);
         assert_eq!(shaped.len(), 0);
+    }
+
+    // ── Confluence actions ─────────────────────────────────────────────────────
+
+    #[test]
+    fn parameters_schema_includes_confluence_actions() {
+        let schema = test_tool(vec!["confluence_get_space"]).parameters_schema();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+        assert!(action_strs.contains(&"confluence_get_space"));
+        assert!(action_strs.contains(&"confluence_get_page"));
+        assert!(action_strs.contains(&"confluence_search"));
+    }
+
+    #[tokio::test]
+    async fn execute_confluence_get_space_disallowed_returns_error() {
+        let result = test_tool(vec!["get_ticket"])
+            .execute(json!({"action": "confluence_get_space", "space_key": "PROJ"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("not enabled"));
+        assert!(err.contains("allowed_actions"));
+    }
+
+    #[tokio::test]
+    async fn execute_confluence_get_space_missing_space_key_returns_error() {
+        let result = test_tool(vec!["confluence_get_space"])
+            .execute(json!({"action": "confluence_get_space"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("space_key"));
+    }
+
+    #[tokio::test]
+    async fn execute_confluence_get_page_disallowed_returns_error() {
+        let result = test_tool(vec!["get_ticket"])
+            .execute(json!({"action": "confluence_get_page", "page_id": "12345"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("not enabled"));
+        assert!(err.contains("allowed_actions"));
+    }
+
+    #[tokio::test]
+    async fn execute_confluence_get_page_missing_page_id_returns_error() {
+        let result = test_tool(vec!["confluence_get_page"])
+            .execute(json!({"action": "confluence_get_page"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("page_id"));
+    }
+
+    #[tokio::test]
+    async fn execute_confluence_search_disallowed_returns_error() {
+        let result = test_tool(vec!["get_ticket"])
+            .execute(json!({"action": "confluence_search", "query": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("not enabled"));
+        assert!(err.contains("allowed_actions"));
+    }
+
+    #[tokio::test]
+    async fn execute_confluence_search_missing_query_returns_error() {
+        let result = test_tool(vec!["confluence_search"])
+            .execute(json!({"action": "confluence_search"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("query"));
+    }
+
+    #[tokio::test]
+    async fn execute_confluence_search_empty_query_returns_error() {
+        let result = test_tool(vec!["confluence_search"])
+            .execute(json!({"action": "confluence_search", "query": "  "}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_deref().unwrap().contains("query"));
+    }
+
+    #[tokio::test]
+    async fn execute_confluence_not_blocked_in_readonly_mode() {
+        // Confluence actions are Read operations — should not be blocked by ReadOnly policy.
+        // The call will fail at the HTTP level, so error must NOT mention "read-only".
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = JiraTool::new(
+            "https://127.0.0.1:1".into(),
+            "test@example.com".into(),
+            "token".into(),
+            vec!["confluence_search".into()],
+            security,
+            30,
+        );
+        let result = tool
+            .execute(json!({"action": "confluence_search", "query": "test"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(
+            !result.error.as_deref().unwrap_or("").contains("read-only"),
+            "confluence actions should not be blocked by read-only policy: {:?}",
+            result.error
+        );
+    }
+
+    // ── validate_space_key ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_space_key_accepts_valid_keys() {
+        assert!(validate_space_key("ENGINEERING").is_ok());
+        assert!(validate_space_key("DP").is_ok());
+        assert!(validate_space_key("DevOps").is_ok());
+        assert!(validate_space_key("MY_SPACE").is_ok());
+        assert!(validate_space_key("~personalspace").is_ok());
+    }
+
+    #[test]
+    fn validate_space_key_rejects_invalid_keys() {
+        assert!(validate_space_key("").is_err());
+        assert!(validate_space_key("has space").is_err());
+        assert!(validate_space_key("has/slash").is_err());
+        assert!(validate_space_key("../traversal").is_err());
+    }
+
+    // ── validate_page_id ───────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_page_id_accepts_numeric_ids() {
+        assert!(validate_page_id("5403115521").is_ok());
+        assert!(validate_page_id("1").is_ok());
+        assert!(validate_page_id("123456789").is_ok());
+    }
+
+    #[test]
+    fn validate_page_id_rejects_non_numeric() {
+        assert!(validate_page_id("").is_err());
+        assert!(validate_page_id("abc").is_err());
+        assert!(validate_page_id("123abc").is_err());
+        assert!(validate_page_id("12-34").is_err());
+    }
+
+    // ── build_confluence_tree ──────────────────────────────────────────────────
+
+    #[test]
+    fn build_confluence_tree_single_root_no_children() {
+        let mut id_to_title = HashMap::new();
+        id_to_title.insert("1".to_string(), "Root".to_string());
+        let parent_to_children = HashMap::new();
+        let tree = build_confluence_tree("1", &id_to_title, &parent_to_children);
+        assert_eq!(tree["id"], "1");
+        assert_eq!(tree["title"], "Root");
+        assert_eq!(tree["children"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn build_confluence_tree_with_nested_children() {
+        let mut id_to_title = HashMap::new();
+        id_to_title.insert("1".to_string(), "Root".to_string());
+        id_to_title.insert("2".to_string(), "Child".to_string());
+        id_to_title.insert("3".to_string(), "Grandchild".to_string());
+        let mut parent_to_children = HashMap::new();
+        parent_to_children.insert("1".to_string(), vec!["2".to_string()]);
+        parent_to_children.insert("2".to_string(), vec!["3".to_string()]);
+        let tree = build_confluence_tree("1", &id_to_title, &parent_to_children);
+        let children = tree["children"].as_array().unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0]["id"], "2");
+        let grandchildren = children[0]["children"].as_array().unwrap();
+        assert_eq!(grandchildren.len(), 1);
+        assert_eq!(grandchildren[0]["id"], "3");
+        assert_eq!(grandchildren[0]["title"], "Grandchild");
     }
 }

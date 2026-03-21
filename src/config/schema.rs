@@ -7980,12 +7980,16 @@ impl Config {
                 "comment_ticket",
                 "list_projects",
                 "myself",
+                "confluence_get_space",
+                "confluence_get_page",
+                "confluence_search",
             ];
             for action in &self.jira.allowed_actions {
                 if !valid_actions.contains(&action.as_str()) {
                     anyhow::bail!(
                         "jira.allowed_actions contains unknown action: '{}'. \
-                         Valid: get_ticket, search_tickets, comment_ticket, list_projects, myself",
+                         Valid: get_ticket, search_tickets, comment_ticket, list_projects, myself, \
+                         confluence_get_space, confluence_get_page, confluence_search",
                         action
                     );
                 }
