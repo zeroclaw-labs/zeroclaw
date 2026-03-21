@@ -199,6 +199,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         plugins: crate::config::PluginsConfig::default(),
         locale: None,
         verifiable_intent: crate::config::VerifiableIntentConfig::default(),
+        claude_code: crate::config::ClaudeCodeConfig::default(),
     };
 
     println!(
@@ -620,6 +621,7 @@ async fn run_quick_setup_with_home(
         plugins: crate::config::PluginsConfig::default(),
         locale: None,
         verifiable_intent: crate::config::VerifiableIntentConfig::default(),
+        claude_code: crate::config::ClaudeCodeConfig::default(),
     };
 
     config.save().await?;
