@@ -619,6 +619,15 @@ struct ToolResultDedupState {
     repeat_count: usize,
 }
 
+type ToolCallSignature = (String, String);
+type OrderedToolResult = (
+    String,
+    Option<String>,
+    ToolExecutionOutcome,
+    ToolCallSignature,
+    bool,
+);
+
 fn hash_tool_result_content(content: &str) -> u64 {
     use std::hash::{Hash, Hasher};
 
@@ -632,7 +641,7 @@ fn compact_tool_result_preview(content: &str, max_chars: usize) -> String {
     truncate_with_ellipsis(&normalized, max_chars)
 }
 
-fn tool_signature_cache_key(signature: &(String, String)) -> String {
+fn tool_signature_cache_key(signature: &ToolCallSignature) -> String {
     format!("{}\u{001F}{}", signature.0, signature.1)
 }
 
@@ -2980,14 +2989,8 @@ async fn run_tool_call_loop_with_guard_config(
         // tool executions concurrently for lower wall-clock latency.
         let mut tool_results = String::new();
         let mut individual_results: Vec<(Option<String>, String)> = Vec::new();
-        let mut ordered_results: Vec<
-            Option<(
-                String,
-                Option<String>,
-                ToolExecutionOutcome,
-                (String, String),
-            )>,
-        > = (0..tool_calls.len()).map(|_| None).collect();
+        let mut ordered_results: Vec<Option<OrderedToolResult>> =
+            (0..tool_calls.len()).map(|_| None).collect();
         let allow_parallel_execution = should_execute_tools_in_parallel(&tool_calls, approval);
         let mut executable_indices: Vec<usize> = Vec::new();
         let mut executable_calls: Vec<ParsedToolCall> = Vec::new();
@@ -3039,6 +3042,7 @@ async fn run_tool_call_loop_with_guard_config(
                                 duration: Duration::ZERO,
                             },
                             tool_call_signature(&tool_name, &tool_args),
+                            false,
                         ));
                         continue;
                     }
@@ -3107,6 +3111,7 @@ async fn run_tool_call_loop_with_guard_config(
                                 duration: Duration::ZERO,
                             },
                             signature.clone(),
+                            false,
                         ));
                         continue;
                     }
@@ -3148,6 +3153,7 @@ async fn run_tool_call_loop_with_guard_config(
                         duration: Duration::ZERO,
                     },
                     signature.clone(),
+                    false,
                 ));
                 continue;
             }
@@ -3265,10 +3271,11 @@ async fn run_tool_call_loop_with_guard_config(
                 call.tool_call_id.clone(),
                 outcome,
                 signature.clone(),
+                true,
             ));
         }
 
-        for (tool_name, tool_call_id, mut outcome, signature) in
+        for (tool_name, tool_call_id, mut outcome, signature, counts_for_error_guard) in
             ordered_results.into_iter().flatten()
         {
             let signature_cache_key = tool_signature_cache_key(&signature);
@@ -3308,7 +3315,7 @@ async fn run_tool_call_loop_with_guard_config(
                 }
             }
 
-            if guard_config.tool_error_repeat_guard_threshold > 0 {
+            if guard_config.tool_error_repeat_guard_threshold > 0 && counts_for_error_guard {
                 if outcome.success {
                     repeated_tool_error_counts.remove(&signature_cache_key);
                 } else {
