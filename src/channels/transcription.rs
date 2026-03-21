@@ -597,7 +597,7 @@ impl TranscriptionProvider for GoogleSttProvider {
 /// Self-hosted faster-whisper-compatible STT provider.
 ///
 /// POSTs audio as `multipart/form-data` (field name `file`) to a configurable
-/// HTTP endpoint (e.g. faster-whisper on GEX44 over WireGuard). The endpoint
+/// HTTP endpoint (e.g. `http://localhost:8000` or a private network host). The endpoint
 /// must return `{"text": "..."}`. No cloud API key required. Size limit is
 /// configurable — not constrained by the 25 MB cloud API cap.
 pub struct LocalWhisperProvider {
