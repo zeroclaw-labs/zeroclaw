@@ -24,6 +24,7 @@ pub mod claude_code;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
+pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
 pub mod cron_add;
@@ -37,6 +38,7 @@ pub mod delegate;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod gemini_cli;
 pub mod git_operations;
 pub mod glob_search;
 pub mod google_workspace;
@@ -96,6 +98,7 @@ pub use calculator::CalculatorTool;
 pub use claude_code::ClaudeCodeTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
+pub use codex_cli::CodexCliTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -109,6 +112,7 @@ pub use delegate::DelegateTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use gemini_cli::GeminiCliTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
 pub use google_workspace::GoogleWorkspaceTool;
@@ -535,6 +539,22 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(ClaudeCodeTool::new(
             security.clone(),
             root_config.claude_code.clone(),
+        )));
+    }
+
+    // Codex CLI delegation tool
+    if root_config.codex_cli.enabled {
+        tool_arcs.push(Arc::new(CodexCliTool::new(
+            security.clone(),
+            root_config.codex_cli.clone(),
+        )));
+    }
+
+    // Gemini CLI delegation tool
+    if root_config.gemini_cli.enabled {
+        tool_arcs.push(Arc::new(GeminiCliTool::new(
+            security.clone(),
+            root_config.gemini_cli.clone(),
         )));
     }
 

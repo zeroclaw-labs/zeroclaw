@@ -201,6 +201,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         locale: None,
         verifiable_intent: crate::config::VerifiableIntentConfig::default(),
         claude_code: crate::config::ClaudeCodeConfig::default(),
+        codex_cli: crate::config::CodexCliConfig::default(),
+        gemini_cli: crate::config::GeminiCliConfig::default(),
     };
 
     println!(
@@ -624,6 +626,8 @@ async fn run_quick_setup_with_home(
         locale: None,
         verifiable_intent: crate::config::VerifiableIntentConfig::default(),
         claude_code: crate::config::ClaudeCodeConfig::default(),
+        codex_cli: crate::config::CodexCliConfig::default(),
+        gemini_cli: crate::config::GeminiCliConfig::default(),
     };
 
     config.save().await?;
