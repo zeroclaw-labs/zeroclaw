@@ -597,12 +597,15 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // WATI channel (if configured)
     let wati_channel: Option<Arc<WatiChannel>> =
         config.channels_config.wati.as_ref().map(|wati_cfg| {
-            Arc::new(WatiChannel::new(
-                wati_cfg.api_token.clone(),
-                wati_cfg.api_url.clone(),
-                wati_cfg.tenant_id.clone(),
-                wati_cfg.allowed_numbers.clone(),
-            ))
+            Arc::new(
+                WatiChannel::new(
+                    wati_cfg.api_token.clone(),
+                    wati_cfg.api_url.clone(),
+                    wati_cfg.tenant_id.clone(),
+                    wati_cfg.allowed_numbers.clone(),
+                )
+                .with_transcription(config.transcription.clone()),
+            )
         });
 
     // Nextcloud Talk channel (if configured)
@@ -1670,8 +1673,19 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         );
     };
 
-    // Parse messages from the webhook payload
-    let messages = wati.parse_webhook_payload(&payload);
+    // Detect audio before the synchronous parse
+    let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+    let messages = if matches!(msg_type, "audio" | "voice") {
+        // Build a synthetic ChannelMessage from the audio transcript
+        if let Some(transcript) = wati.try_transcribe_audio(&payload).await {
+            wati.parse_audio_as_message(&payload, transcript)
+        } else {
+            vec![]
+        }
+    } else {
+        wati.parse_webhook_payload(&payload)
+    };
 
     if messages.is_empty() {
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
