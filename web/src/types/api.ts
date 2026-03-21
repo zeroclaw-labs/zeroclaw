@@ -73,6 +73,7 @@ export interface MemoryEntry {
   timestamp: string;
   session_id: string | null;
   score: number | null;
+  scope: string | null;
 }
 
 export interface CostSummary {

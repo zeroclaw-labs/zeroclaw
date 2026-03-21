@@ -58,6 +58,14 @@ export default function Memory() {
   };
 
   const categories = Array.from(new Set(entries.map((e) => e.category))).sort();
+  const scopes = Array.from(new Set(entries.map((e) => e.scope).filter(Boolean) as string[])).sort();
+  const hasScopes = scopes.length > 0;
+
+  const [scopeFilter, setScopeFilter] = useState('');
+
+  const filteredEntries = scopeFilter
+    ? entries.filter((e) => e.scope === scopeFilter)
+    : entries;
 
   const handleAdd = async () => {
     if (!formKey.trim() || !formContent.trim()) {
@@ -112,7 +120,7 @@ export default function Memory() {
         <div className="flex items-center gap-2">
           <Brain className="h-5 w-5 text-[#0080ff]" />
           <h2 className="text-sm font-semibold text-white uppercase tracking-wider">
-            {t('memory.memory_title')} ({entries.length})
+            {t('memory.memory_title')} ({filteredEntries.length})
           </h2>
         </div>
         <button
@@ -152,6 +160,23 @@ export default function Memory() {
             ))}
           </select>
         </div>
+        {hasScopes && (
+          <div className="relative">
+            <Filter className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-[#334060]" />
+            <select
+              value={scopeFilter}
+              onChange={(e) => setScopeFilter(e.target.value)}
+              className="input-electric pl-10 pr-8 py-2.5 text-sm appearance-none cursor-pointer"
+            >
+              <option value="">All Scopes</option>
+              {scopes.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
         <button
           onClick={handleSearch}
           className="btn-electric px-4 py-2.5 text-sm"
@@ -269,12 +294,13 @@ export default function Memory() {
                 <th className="text-left">{t('memory.key')}</th>
                 <th className="text-left">{t('memory.content')}</th>
                 <th className="text-left">{t('memory.category')}</th>
+                {hasScopes && <th className="text-left">Scope</th>}
                 <th className="text-left">{t('memory.timestamp')}</th>
                 <th className="text-right">{t('common.actions')}</th>
               </tr>
             </thead>
             <tbody>
-              {entries.map((entry) => (
+              {filteredEntries.map((entry) => (
                 <tr key={entry.id}>
                   <td className="px-4 py-3 text-white font-medium font-mono text-xs">
                     {entry.key}
@@ -289,6 +315,17 @@ export default function Memory() {
                       {entry.category}
                     </span>
                   </td>
+                  {hasScopes && (
+                    <td className="px-4 py-3">
+                      {entry.scope ? (
+                        <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[10px] font-semibold capitalize border ${entry.scope === 'group' ? 'border-[#3e1a3e] text-[#a888c8]' : 'border-[#1a3e2e] text-[#88a898]'}`} style={{ background: entry.scope === 'group' ? 'rgba(128,0,255,0.06)' : 'rgba(0,255,128,0.06)' }}>
+                          {entry.scope}
+                        </span>
+                      ) : (
+                        <span className="text-[#334060] text-xs">—</span>
+                      )}
+                    </td>
+                  )}
                   <td className="px-4 py-3 text-[#556080] text-xs whitespace-nowrap">
                     {formatDate(entry.timestamp)}
                   </td>

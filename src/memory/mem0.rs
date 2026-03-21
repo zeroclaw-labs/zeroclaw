@@ -44,6 +44,8 @@ struct Mem0Metadata<'a> {
     category: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scope: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -67,7 +69,7 @@ struct Mem0MemoryItem {
     memory: String,
     #[serde(default)]
     created_at: Option<serde_json::Value>,
-    #[serde(default, rename = "metadata_")]
+    #[serde(default, alias = "metadata_")]
     metadata: Option<Mem0ResponseMetadata>,
     #[serde(alias = "relevance_score", default)]
     score: Option<f64>,
@@ -81,6 +83,8 @@ struct Mem0ResponseMetadata {
     category: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -210,6 +214,7 @@ impl Mem0Memory {
             timestamp,
             session_id: meta.session_id,
             score: item.score,
+            scope: meta.scope,
         }
     }
 
@@ -330,6 +335,15 @@ impl Memory for Mem0Memory {
     ) -> anyhow::Result<()> {
         let cat_str = category.to_string();
         let effective_user = self.effective_user_id(session_id);
+        // Derive scope from session_id pattern:
+        // group identifiers contain "@g.us" or start with "group:"
+        let scope_label = session_id.map(|sid| {
+            if sid.contains("@g.us") || sid.starts_with("group:") {
+                "group"
+            } else {
+                "personal"
+            }
+        });
         let body = AddMemoryRequest {
             user_id: effective_user,
             text: content,
@@ -337,6 +351,7 @@ impl Memory for Mem0Memory {
                 key,
                 category: &cat_str,
                 session_id,
+                scope: scope_label,
             }),
             infer: self.infer,
             app: Some(&self.app_name),
@@ -524,6 +539,7 @@ mod tests {
                 key: Some("k1".into()),
                 category: Some("core".into()),
                 session_id: None,
+                scope: None,
             }),
             score: Some(0.95),
         };
@@ -578,6 +594,7 @@ mod tests {
                 key: Some("k".into()),
                 category: Some("project_notes".into()),
                 session_id: Some("s1".into()),
+                scope: None,
             }),
             score: None,
         };

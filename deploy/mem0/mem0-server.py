@@ -81,6 +81,7 @@ config = {
             "collection_name": MEM0_VECTOR_COLLECTION,
             "embedding_model_dims": MEM0_EMBEDDER_DIMS,
             "path": MEM0_VECTOR_PATH,
+            "on_disk": True,
         },
     },
     "custom_fact_extraction_prompt": CUSTOM_EXTRACTION_PROMPT,
@@ -164,7 +165,7 @@ def _parse_mem0_results(raw_results) -> list:
             "id": item.get("id", str(uuid.uuid4())),
             "memory": item.get("memory", item.get("text", "")),
             "created_at": item.get("created_at", datetime.now(timezone.utc).isoformat()),
-            "metadata_": item.get("metadata", {}),
+            "metadata": item.get("metadata", {}),
         })
     return items
 

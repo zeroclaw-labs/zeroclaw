@@ -576,6 +576,7 @@ impl Memory for SqliteMemory {
                             timestamp: ts,
                             session_id: sid,
                             score: Some(f64::from(scored.final_score)),
+                            scope: None,
                         };
                         if let Some(filter_sid) = session_ref {
                             if entry.session_id.as_deref() != Some(filter_sid) {
@@ -632,6 +633,7 @@ impl Memory for SqliteMemory {
                             timestamp: row.get(4)?,
                             session_id: row.get(5)?,
                             score: Some(1.0),
+                            scope: None,
                         })
                     })?;
                     for row in rows {
@@ -671,6 +673,7 @@ impl Memory for SqliteMemory {
                     timestamp: row.get(4)?,
                     session_id: row.get(5)?,
                     score: None,
+                    scope: None,
                 })
             })?;
 
@@ -707,6 +710,7 @@ impl Memory for SqliteMemory {
                     timestamp: row.get(4)?,
                     session_id: row.get(5)?,
                     score: None,
+                    scope: None,
                 })
             };
 
