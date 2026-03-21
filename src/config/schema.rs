@@ -1155,6 +1155,22 @@ pub struct GoogleSttConfig {
     pub language_code: String,
 }
 
+/// Controls how much intermediate detail (tool results, thinking) is
+/// streamed back to the channel during the agent loop.
+///
+/// - `off` — only the final answer is sent (default, current behaviour).
+/// - `on`  — tool result summaries are forwarded after each tool call.
+/// - `full` — tool results are forwarded **and** intermediate thinking text
+///   produced before tool calls is kept visible instead of being cleared.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerboseMode {
+    #[default]
+    Off,
+    On,
+    Full,
+}
+
 /// Agent orchestration configuration (`[agent]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentConfig {
@@ -1228,6 +1244,15 @@ pub struct AgentConfig {
     /// Default: `60`.
     #[serde(default = "default_emotion_classification_timeout")]
     pub emotion_classification_timeout_secs: u64,
+
+    /// Controls how much intermediate detail is streamed to the channel during
+    /// the agent tool-call loop.
+    /// - `"off"` — only the final answer is sent (default).
+    /// - `"on"`  — tool result summaries are forwarded after each tool call.
+    /// - `"full"` — tool results + intermediate thinking text are kept visible.
+    /// Toggle at runtime with `/verbose off|on|full`. Default: `"off"`.
+    #[serde(default)]
+    pub verbose_mode: VerboseMode,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1277,6 +1302,7 @@ impl Default for AgentConfig {
             sticker_negative_prompt: String::new(),
             emotion_image_backend: String::new(),
             emotion_classification_timeout_secs: default_emotion_classification_timeout(),
+            verbose_mode: VerboseMode::default(),
         }
     }
 }

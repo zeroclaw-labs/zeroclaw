@@ -2288,6 +2288,7 @@ pub(crate) async fn agent_turn(
         max_tool_iterations,
         None,
         None,
+        crate::config::VerboseMode::Off,
         None,
         excluded_tools,
         dedup_exempt_tools,
@@ -2666,6 +2667,7 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    verbose_mode: crate::config::VerboseMode,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
@@ -3169,7 +3171,11 @@ pub(crate) async fn run_tool_call_loop(
 
         // If we streamed in real-time but the response contains tool calls,
         // clear the segment buffer so partial content isn't sent to the user.
-        if streamed_this_iteration && !tool_calls.is_empty() {
+        // In `Full` verbose mode, keep the streamed thinking visible.
+        if streamed_this_iteration
+            && !tool_calls.is_empty()
+            && verbose_mode != crate::config::VerboseMode::Full
+        {
             if let Some(ref tx) = on_delta {
                 let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
             }
@@ -3510,6 +3516,16 @@ pub(crate) async fn run_tool_call_loop(
             } else {
                 output
             };
+            // ── Verbose: forward tool result summary to channel ───
+            if verbose_mode != crate::config::VerboseMode::Off {
+                if let Some(ref tx) = on_delta {
+                    let summary = truncate_with_ellipsis(&output, 500);
+                    let _ = tx
+                        .send(format!("\u{1f4cb} `{tool_name}` result:\n{summary}\n"))
+                        .await;
+                }
+            }
+
             individual_results.push((tool_call_id, output.clone()));
             let _ = writeln!(
                 tool_results,
@@ -4047,6 +4063,7 @@ pub async fn run(
                 config.agent.max_tool_iterations,
                 None,
                 None,
+                config.agent.verbose_mode,
                 None,
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
@@ -4297,6 +4314,7 @@ pub async fn run(
                     config.agent.max_tool_iterations,
                     None,
                     None,
+                    config.agent.verbose_mode,
                     None,
                     &excluded_tools,
                     &config.agent.tool_call_dedup_exempt,
@@ -5606,6 +5624,7 @@ mod tests {
             3,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -5657,6 +5676,7 @@ mod tests {
             3,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -5701,6 +5721,7 @@ mod tests {
             3,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -5831,6 +5852,7 @@ mod tests {
             4,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -5901,6 +5923,7 @@ mod tests {
             4,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -5963,6 +5986,7 @@ mod tests {
             4,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -6020,6 +6044,7 @@ mod tests {
             4,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -6089,6 +6114,7 @@ mod tests {
             4,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -6149,6 +6175,7 @@ mod tests {
             4,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &exempt,
@@ -6229,6 +6256,7 @@ mod tests {
             4,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &exempt,
@@ -6286,6 +6314,7 @@ mod tests {
             4,
             None,
             None,
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -6367,6 +6396,7 @@ mod tests {
             4,
             None,
             Some(tx),
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],
@@ -8352,6 +8382,7 @@ Let me check the result."#;
             4,
             None,
             Some(tx),
+            crate::config::VerboseMode::Off,
             None,
             &[],
             &[],

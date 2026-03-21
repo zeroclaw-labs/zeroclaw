@@ -354,6 +354,7 @@ struct ChannelRuntimeContext {
     query_classification: crate::config::QueryClassificationConfig,
     ack_reactions: bool,
     show_tool_calls: bool,
+    verbose_mode: crate::config::VerboseMode,
     session_store: Option<Arc<dyn SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
@@ -3072,6 +3073,7 @@ async fn process_channel_message(
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
+                ctx.verbose_mode,
                 ctx.hooks.as_deref(),
                 if msg.channel == "cli"
                     || ctx.autonomy_level == AutonomyLevel::Full
@@ -5317,6 +5319,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels_config.ack_reactions,
         show_tool_calls: config.channels_config.show_tool_calls,
+        verbose_mode: config.agent.verbose_mode,
         session_store: create_channel_session_backend(&config),
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
@@ -5598,6 +5601,7 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -5715,6 +5719,7 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -5788,6 +5793,7 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -5881,6 +5887,7 @@ mod tests {
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: Some(backend),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -6453,6 +6460,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -6536,6 +6544,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -6633,6 +6642,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -6715,6 +6725,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -6807,6 +6818,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -6921,6 +6933,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -7015,6 +7028,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -7124,6 +7138,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -7218,6 +7233,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -7302,6 +7318,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -7497,6 +7514,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -7602,6 +7620,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -7715,6 +7734,7 @@ BTC is currently around $65,000 based on latest tool output."#
             },
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -7839,6 +7859,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -7938,6 +7959,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -8020,6 +8042,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -8806,6 +8829,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -8941,6 +8965,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -9128,6 +9153,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: Some(backend),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -9217,6 +9243,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -9328,6 +9355,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -9901,6 +9929,7 @@ This is an example JSON object for profile settings."#;
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -9990,6 +10019,7 @@ This is an example JSON object for profile settings."#;
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -10156,6 +10186,7 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -10270,6 +10301,7 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -10376,6 +10408,7 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -10486,6 +10519,7 @@ This is an example JSON object for profile settings."#;
             },
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -10620,6 +10654,7 @@ This is an example JSON object for profile settings."#;
             query_classification: classification_config,
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -10882,6 +10917,7 @@ This is an example JSON object for profile settings."#;
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            verbose_mode: crate::config::VerboseMode::Off,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
