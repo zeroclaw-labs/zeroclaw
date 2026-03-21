@@ -34,7 +34,10 @@ use wa_rs_core::store::traits::DeviceInfo;
 #[cfg(feature = "whatsapp-web")]
 use wa_rs_core::store::traits::DeviceStore as DeviceStoreTrait;
 #[cfg(feature = "whatsapp-web")]
-use wa_rs_core::store::traits::*;
+use wa_rs_core::store::traits::{
+    AppStateSyncKey, AppSyncStore, DeviceListRecord, LidPnMappingEntry, ProtocolStore, SignalStore,
+    TcTokenEntry,
+};
 #[cfg(feature = "whatsapp-web")]
 use wa_rs_core::store::Device as CoreDevice;
 
@@ -1121,8 +1124,8 @@ impl DeviceStoreTrait for RusqliteStore {
                 device.app_version_secondary,
                 device.app_version_tertiary,
                 device.app_version_last_fetched_ms,
-                device.edge_routing_info.as_ref().map(|v| v.clone()),
-                device.props_hash.as_ref().map(|v| v.clone()),
+                device.edge_routing_info.clone(),
+                device.props_hash.clone(),
             ],
         ))
     }
