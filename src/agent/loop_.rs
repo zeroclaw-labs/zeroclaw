@@ -223,6 +223,10 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+/// Shown when the model returns no displayable assistant text so channel APIs (e.g. Telegram)
+/// that reject empty message bodies still deliver user-visible feedback.
+pub(crate) const EMPTY_MODEL_REPLY_PLACEHOLDER: &str = "I didn't receive any text from the model (empty response). Please try again, or check your provider or gateway if this persists.";
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -2804,6 +2808,18 @@ pub(crate) async fn run_tool_call_loop(
             !native_tool_calls.is_empty(),
         );
         let display_text = strip_tool_result_blocks(&display_text);
+        let display_text = if tool_calls.is_empty() && display_text.trim().is_empty() {
+            tracing::warn!(
+                channel = %channel_name,
+                iteration = iteration + 1,
+                provider = %provider_name,
+                model = %model,
+                "final LLM reply has no displayable text; substituting user-visible placeholder"
+            );
+            EMPTY_MODEL_REPLY_PLACEHOLDER.to_string()
+        } else {
+            display_text
+        };
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {

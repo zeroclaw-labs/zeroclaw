@@ -507,10 +507,51 @@ fn strip_think_tags(s: &str) -> String {
     result.trim().to_string()
 }
 
+/// OpenAI chat completions may return `message.content` as a string, null, or a JSON array of
+/// parts such as `[{"type":"text","text":"..."}]`. Many gateways preserve the array shape even
+/// for plain text, which would not deserialize into `String`.
+fn openai_assistant_content_plaintext(content: Option<&serde_json::Value>) -> Option<String> {
+    let value = content?;
+    match value {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        serde_json::Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                let Some(obj) = part.as_object() else {
+                    continue;
+                };
+                let text = obj
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ResponseMessage {
     #[serde(default)]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return their output
     /// in `reasoning_content` instead of `content`. Used as automatic fallback.
     #[serde(default)]
@@ -526,8 +567,8 @@ impl ResponseMessage {
     /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
     /// inline in `content` instead of using a separate field.
     fn effective_content(&self) -> String {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
+        if let Some(raw) = openai_assistant_content_plaintext(self.content.as_ref()) {
+            let stripped = strip_think_tags(&raw);
             if !stripped.is_empty() {
                 return stripped;
             }
@@ -541,8 +582,8 @@ impl ResponseMessage {
     }
 
     fn effective_content_optional(&self) -> Option<String> {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
+        if let Some(raw) = openai_assistant_content_plaintext(self.content.as_ref()) {
+            let stripped = strip_think_tags(&raw);
             if !stripped.is_empty() {
                 return Some(stripped);
             }
@@ -1935,9 +1976,17 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            resp.choices[0].message.content,
-            Some("Hello from Venice!".to_string())
+            openai_assistant_content_plaintext(resp.choices[0].message.content.as_ref()).as_deref(),
+            Some("Hello from Venice!")
         );
+    }
+
+    #[test]
+    fn response_deserializes_content_as_openai_text_parts_array() {
+        let json =
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"Hello array"}]}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].message.effective_content(), "Hello array");
     }
 
     #[test]
@@ -2846,7 +2895,10 @@ mod tests {
 
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.content.as_deref(), Some("I'll check both."));
+        assert_eq!(
+            openai_assistant_content_plaintext(msg.content.as_ref()).as_deref(),
+            Some("I'll check both.")
+        );
         let tool_calls = msg.tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(
@@ -2888,7 +2940,10 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"Just text, no tools."}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.content.as_deref(), Some("Just text, no tools."));
+        assert_eq!(
+            openai_assistant_content_plaintext(msg.content.as_ref()).as_deref(),
+            Some("Just text, no tools.")
+        );
         assert!(msg.tool_calls.is_none());
     }
 
@@ -3080,7 +3135,7 @@ mod tests {
     #[test]
     fn parse_native_response_captures_reasoning_content() {
         let message = ResponseMessage {
-            content: Some("answer".to_string()),
+            content: Some(serde_json::json!("answer")),
             reasoning_content: Some("thinking step".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: Some("call_1".to_string()),
@@ -3104,7 +3159,7 @@ mod tests {
     #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
         let message = ResponseMessage {
-            content: Some("hello".to_string()),
+            content: Some(serde_json::json!("hello")),
             reasoning_content: None,
             tool_calls: None,
         };

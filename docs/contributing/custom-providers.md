@@ -227,3 +227,7 @@ Responses from `/v1/chat/completions` are parsed with a shared helper so every c
 - **Malformed argument JSON** — Invalid JSON in `arguments` is logged and replaced with `{}` so downstream code always sees parseable JSON.
 
 Non-streaming choice objects may include `finish_reason` (`stop`, `tool_calls`, etc.); it is deserialized for a complete OpenAI-shaped payload even when the runtime does not branch on it yet.
+
+### `message.content` shape (string vs array)
+
+The OpenAI API allows assistant `content` as either a string or an array of typed parts (for example `[{"type":"text","text":"..."}]`). Custom gateways sometimes emit the array form even for plain text. The compatible provider accepts both and concatenates `text` fields from array parts so the agent does not see an empty reply when the gateway omits a string `content` field.
