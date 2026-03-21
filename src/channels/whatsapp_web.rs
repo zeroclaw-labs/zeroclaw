@@ -142,12 +142,20 @@ impl WhatsAppWebChannel {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "transcription manager init failed, voice transcription disabled: {e}"
+                        error = %e,
+                        "transcription manager init failed, voice transcription disabled"
                     );
-                    // Both fields remain None: voice messages are skipped rather than
+                    // Both fields cleared: voice messages are skipped rather than
                     // silently dropped mid-handler after a wasted download attempt.
+                    self.transcription_manager = None;
+                    self.transcription = None;
                 }
             }
+        } else {
+            // Explicitly clear so a second call with enabled=false overrides a prior
+            // successful call with enabled=true.
+            self.transcription_manager = None;
+            self.transcription = None;
         }
         self
     }
@@ -1465,5 +1473,32 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "routed correctly");
+    }
+
+    // ── with_transcription idempotence / overwrite ───────────────────────────
+
+    #[cfg(feature = "whatsapp-web")]
+    #[test]
+    fn whatsapp_web_with_transcription_called_twice_second_wins() {
+        // First call: enabled=true with a valid key → manager builds.
+        let mut first = crate::config::TranscriptionConfig::default();
+        first.enabled = true;
+        first.api_key = Some("first-key".to_string());
+        first.default_provider = "groq".to_string();
+
+        // Second call: enabled=false → both fields must be cleared.
+        let mut second = crate::config::TranscriptionConfig::default();
+        second.enabled = false;
+
+        let ch = make_channel().with_transcription(first).with_transcription(second);
+
+        assert!(
+            ch.transcription.is_none(),
+            "second call with enabled=false must clear transcription"
+        );
+        assert!(
+            ch.transcription_manager.is_none(),
+            "second call with enabled=false must clear transcription_manager"
+        );
     }
 }

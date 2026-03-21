@@ -433,12 +433,20 @@ impl TelegramChannel {
                 }
                 Err(e) => {
                     tracing::warn!(
-                        "transcription manager init failed, voice transcription disabled: {e}"
+                        error = %e,
+                        "transcription manager init failed, voice transcription disabled"
                     );
-                    // Both fields remain None: voice messages are skipped rather than
+                    // Both fields cleared: voice messages are skipped rather than
                     // silently dropped mid-handler after a wasted file download.
+                    self.transcription_manager = None;
+                    self.transcription = None;
                 }
             }
+        } else {
+            // Explicitly clear so a second call with enabled=false overrides a prior
+            // successful call with enabled=true.
+            self.transcription_manager = None;
+            self.transcription = None;
         }
         self
     }
@@ -960,10 +968,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
     /// Download a file from the Telegram CDN.
     async fn download_file(&self, file_path: &str) -> anyhow::Result<Vec<u8>> {
-        let url = format!(
-            "https://api.telegram.org/file/bot{}/{file_path}",
-            self.bot_token
-        );
+        let url = format!("{}/file/bot{}/{file_path}", self.api_base, self.bot_token);
         let resp = self
             .http_client()
             .get(&url)
@@ -1180,6 +1185,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// or the message exceeds duration limits.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let config = self.transcription.as_ref()?;
+        let manager = self.transcription_manager.as_deref()?;
         let message = update.get("message")?;
 
         let (file_id, duration) = Self::parse_voice_metadata(message)?;
@@ -1224,8 +1230,6 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             chat_id.clone()
         };
-
-        let manager = self.transcription_manager.as_deref()?;
 
         // Download and transcribe
         let file_path = match self.get_file_path(&file_id).await {
@@ -4467,7 +4471,8 @@ mod tests {
             audio_data.len()
         );
 
-        // 2. Call transcribe_audio() — real Groq Whisper API
+        // 2. Call transcribe_audio() — tests the shim directly (production Telegram path
+        //    now goes through TranscriptionManager; shim remains until PR 15 removes it)
         let config = crate::config::TranscriptionConfig {
             enabled: true,
             ..Default::default()
@@ -5166,5 +5171,147 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "routed correctly");
+    }
+
+    // ── with_transcription idempotence / overwrite ───────────────────────────
+
+    #[test]
+    fn telegram_with_transcription_called_twice_second_wins() {
+        // First call: enabled=true with a valid key → manager builds.
+        let mut first = crate::config::TranscriptionConfig::default();
+        first.enabled = true;
+        first.api_key = Some("first-key".to_string());
+        first.default_provider = "groq".to_string();
+
+        // Second call: enabled=false → both fields must be cleared.
+        let mut second = crate::config::TranscriptionConfig::default();
+        second.enabled = false;
+
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
+            .with_transcription(first)
+            .with_transcription(second);
+
+        assert!(
+            ch.transcription.is_none(),
+            "second call with enabled=false must clear transcription"
+        );
+        assert!(
+            ch.transcription_manager.is_none(),
+            "second call with enabled=false must clear transcription_manager"
+        );
+    }
+
+    // ── Duration boundary test ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn telegram_voice_skips_when_duration_exceeds_limit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Transcription endpoint — should NOT be reached
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "should not reach"})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true;
+        config.default_provider = "local_whisper".to_string();
+        config.max_duration_secs = 10;
+        config.local_whisper = Some(crate::config::LocalWhisperConfig {
+            url: format!("{}/v1/transcribe", server.uri()),
+            bearer_token: "tok".to_string(),
+            max_audio_bytes: 1024 * 1024,
+            timeout_secs: 30,
+        });
+
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
+            .with_api_base(server.uri())
+            .with_transcription(config);
+
+        // Duration 11 > limit 10 — must return None without touching the transcription endpoint.
+        let update = serde_json::json!({
+            "message": {
+                "from": { "id": 1, "username": "u", "is_bot": false },
+                "chat": { "id": 42 },
+                "message_id": 1,
+                "voice": { "file_id": "fid", "duration": 11 }
+            }
+        });
+
+        let result = ch.try_parse_voice_message(&update).await;
+        assert!(result.is_none(), "voice message exceeding duration limit must be skipped");
+    }
+
+    #[tokio::test]
+    async fn telegram_voice_passes_when_duration_equals_limit() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tg_server = MockServer::start().await;
+        let stt_server = MockServer::start().await;
+
+        // Telegram getFile
+        Mock::given(method("GET"))
+            .and(path("/bottoken/getFile"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"result": {"file_path": "voice/file.ogg"}})),
+            )
+            .mount(&tg_server)
+            .await;
+
+        // Telegram file download
+        Mock::given(method("GET"))
+            .and(path("/file/bottoken/voice/file.ogg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake audio".to_vec()))
+            .mount(&tg_server)
+            .await;
+
+        // Transcription endpoint
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "boundary ok"})),
+            )
+            .mount(&stt_server)
+            .await;
+
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true;
+        config.default_provider = "local_whisper".to_string();
+        config.max_duration_secs = 10;
+        config.local_whisper = Some(crate::config::LocalWhisperConfig {
+            url: format!("{}/v1/transcribe", stt_server.uri()),
+            bearer_token: "tok".to_string(),
+            max_audio_bytes: 1024 * 1024,
+            timeout_secs: 30,
+        });
+
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false)
+            .with_api_base(tg_server.uri())
+            .with_transcription(config);
+
+        // Duration 10 == limit 10 — check is `>`, so this must NOT be skipped.
+        let update = serde_json::json!({
+            "message": {
+                "from": { "id": 1, "username": "u", "is_bot": false },
+                "chat": { "id": 42 },
+                "message_id": 1,
+                "voice": { "file_id": "fid", "duration": 10 }
+            }
+        });
+
+        let result = ch.try_parse_voice_message(&update).await;
+        assert!(
+            result.is_some(),
+            "voice message at exactly the duration limit must not be skipped (check is >, not >=)"
+        );
+        let msg = result.unwrap();
+        assert_eq!(msg.content, "boundary ok");
     }
 }
