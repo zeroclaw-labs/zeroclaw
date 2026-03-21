@@ -1278,6 +1278,83 @@ const TICKET_SUBCOMMANDS: &[&str] = &[
     "closed", "create", "help", "tree", "dep", "edit",
 ];
 
+fn is_restart_command(content: &str) -> bool {
+    let lower = content.trim().to_lowercase();
+    lower == "restart" || lower == "!restart" || lower == "/restart"
+}
+
+async fn handle_restart_command_if_needed(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    if !is_restart_command(&msg.content) {
+        return false;
+    }
+
+    let Some(channel) = target_channel else {
+        return true;
+    };
+
+    // Send confirmation before the process is killed.
+    let _ = channel
+        .send(
+            &SendMessage::new(
+                "♻️ Restarting daemon — back in a moment.",
+                &msg.reply_target,
+            )
+            .in_thread(msg.thread_ts.clone()),
+        )
+        .await;
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("zeroclaw"));
+    let config_dir = std::env::var("ZEROCLAW_CONFIG_DIR").unwrap_or_default();
+    let workspace = ctx.workspace_dir.as_os_str().to_owned();
+
+    tokio::spawn(async move {
+        // Give the send a moment to flush before we kill ourselves.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let restart_script = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|root| root.join("services/restart.sh"))
+            .filter(|p| p.exists());
+
+        let mut cmd = if let Some(script) = restart_script {
+            let mut c = tokio::process::Command::new("bash");
+            c.arg(script);
+            c
+        } else {
+            // Fallback: inline restart without the script
+            let mut c = tokio::process::Command::new("bash");
+            c.arg("-c").arg(format!(
+                "sleep 2 && pkill -f 'zeroclaw daemon' || true && sleep 1 && exec '{}'  daemon",
+                exe.display()
+            ));
+            c
+        };
+
+        cmd.env("ZEROCLAW_BIN", &exe);
+        if !config_dir.is_empty() {
+            cmd.env("ZEROCLAW_CONFIG_DIR", &config_dir);
+        } else {
+            // Derive config dir from workspace_dir (parent of workspace)
+            if let Some(parent) = std::path::Path::new(&workspace).parent() {
+                cmd.env("ZEROCLAW_CONFIG_DIR", parent);
+            }
+        }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let _ = cmd.spawn();
+    });
+
+    true
+}
+
 fn is_cron_command(content: &str) -> bool {
     let lower = content.trim().to_lowercase();
     lower == "cron" || lower == "cron all" || lower == "cron --all" || lower.starts_with("cron ")
@@ -2588,6 +2665,9 @@ async fn process_channel_message(
     if handle_ticket_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
+    if handle_restart_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        return;
+    }
     if handle_cron_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
@@ -2618,7 +2698,17 @@ async fn process_channel_message(
     }
 
     // ── Query classification: override route when a rule matches ──
-    let classification_hint = if let (Some(ref cls_provider), Some(ref cls_model)) = (
+    // Skip classification for tmux-routed messages — destination is predetermined.
+    let is_tmux_prefixed = {
+        let lower = msg.content.to_lowercase();
+        lower.starts_with(">> ") || lower.starts_with("tmux ")
+    };
+    let has_tmux_target = is_tmux_prefixed
+        && (ctx.channel_tmux_targets.contains_key(room_id)
+            || ctx.channel_tmux_targets.contains_key(&msg.channel));
+    let classification_hint = if has_tmux_target {
+        None
+    } else if let (Some(ref cls_provider), Some(ref cls_model)) = (
         ctx.query_classification.classifier_provider.as_ref(),
         ctx.query_classification.classifier_model.as_ref(),
     ) {

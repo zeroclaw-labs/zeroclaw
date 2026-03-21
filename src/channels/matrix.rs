@@ -344,6 +344,7 @@ impl MatrixChannel {
             "**Zero-token commands** _(no LLM, instant)_",
             "",
             "**usage** — Claude Code quota bars with reset dates",
+            "**restart** — restart the zeroclaw daemon (zero-token)",
             "**cron** — list cron jobs for this room (checks tmux for pending questions)",
             "**cron all** — list cron jobs for all rooms",
             "**peek** `[N]` — last N lines of this room's tmux pane (default 20)",
