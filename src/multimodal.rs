@@ -597,22 +597,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_remote_url_when_disabled() {
+    async fn prepare_messages_skips_remote_url_when_disabled() {
         let messages = vec![ChatMessage::user(
             "Look [IMAGE:https://example.com/img.png]".to_string(),
         )];
 
-        let error = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+        let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
             .await
-            .expect_err("should reject remote image URL when fetch is disabled");
+            .expect("should succeed with skipped image note");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal remote image fetch is disabled"));
+        // The image should be skipped and a note appended
+        assert!(result.messages[0]
+            .content
+            .contains("image(s) could not be loaded"));
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_oversized_local_image() {
+    async fn prepare_messages_skips_oversized_local_image() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("big.png");
 
@@ -630,13 +631,13 @@ mod tests {
             vision_mcp_fallback: None,
         };
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let result = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect_err("should reject oversized local image");
+            .expect("should succeed with skipped image note");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
+        assert!(result.messages[0]
+            .content
+            .contains("image(s) could not be loaded"));
     }
 
     #[test]
