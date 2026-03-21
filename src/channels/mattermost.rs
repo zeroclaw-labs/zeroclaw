@@ -17,6 +17,8 @@ pub struct MattermostChannel {
     mention_only: bool,
     /// Handle for the background typing-indicator loop (aborted on stop_typing).
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 impl MattermostChannel {
@@ -38,11 +40,18 @@ impl MattermostChannel {
             thread_replies,
             mention_only,
             typing_handle: Mutex::new(None),
+            proxy_url: None,
         }
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.mattermost")
+        crate::config::build_channel_proxy_client("channel.mattermost", self.proxy_url.as_deref())
     }
 
     /// Check if a user ID is in the allowlist.

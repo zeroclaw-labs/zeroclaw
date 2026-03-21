@@ -32,6 +32,8 @@ pub struct SlackChannel {
     workspace_dir: Option<PathBuf>,
     /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
     active_assistant_thread: Mutex<HashMap<String, String>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -122,6 +124,7 @@ impl SlackChannel {
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
             active_assistant_thread: Mutex::new(HashMap::new()),
+            proxy_url: None,
         }
     }
 
@@ -149,8 +152,19 @@ impl SlackChannel {
         self
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client_with_timeouts("channel.slack", 30, 10)
+        crate::config::build_channel_proxy_client_with_timeouts(
+            "channel.slack",
+            self.proxy_url.as_deref(),
+            30,
+            10,
+        )
     }
 
     /// Check if a Slack user ID is in the allowlist.
@@ -805,12 +819,13 @@ impl SlackChannel {
     }
 
     fn slack_media_http_client_no_redirect(&self) -> anyhow::Result<reqwest::Client> {
-        let builder = crate::config::apply_runtime_proxy_to_builder(
+        let builder = crate::config::apply_channel_proxy_to_builder(
             reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(30))
                 .connect_timeout(Duration::from_secs(10)),
             "channel.slack",
+            self.proxy_url.as_deref(),
         );
         builder
             .build()
