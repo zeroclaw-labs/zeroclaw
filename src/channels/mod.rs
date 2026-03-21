@@ -1518,7 +1518,7 @@ async fn build_memory_context(
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
+    if let Ok(entries) = mem.recall(user_msg, 5, session_id, None, None).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
@@ -6619,6 +6619,8 @@ BTC is currently around $65,000 based on latest tool output."#
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -6671,6 +6673,8 @@ BTC is currently around $65,000 based on latest tool output."#
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<crate::memory::MemoryEntry>> {
             Ok(vec![crate::memory::MemoryEntry {
                 id: "entry-1".to_string(),
@@ -7925,7 +7929,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert_eq!(mem.count().await.unwrap(), 2);
 
-        let recalled = mem.recall("45", 5, None).await.unwrap();
+        let recalled = mem.recall("45", 5, None, None, None).await.unwrap();
         assert!(recalled.iter().any(|entry| entry.content.contains("45")));
     }
 

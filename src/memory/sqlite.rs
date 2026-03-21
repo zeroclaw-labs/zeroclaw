@@ -428,6 +428,74 @@ impl SqliteMemory {
 
         Ok(count)
     }
+
+    /// List memories by time range (used when query is empty).
+    async fn recall_by_time_only(
+        &self,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let sid = session_id.map(String::from);
+        let since_owned = since.map(String::from);
+        let until_owned = until.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
+
+            let mut sql =
+                "SELECT id, key, content, category, created_at, session_id FROM memories \
+                           WHERE 1=1"
+                    .to_string();
+            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            let mut idx = 1;
+
+            if let Some(sid) = sid.as_deref() {
+                let _ = write!(sql, " AND session_id = ?{idx}");
+                param_values.push(Box::new(sid.to_string()));
+                idx += 1;
+            }
+            if let Some(s) = since_ref {
+                let _ = write!(sql, " AND created_at >= ?{idx}");
+                param_values.push(Box::new(s.to_string()));
+                idx += 1;
+            }
+            if let Some(u) = until_ref {
+                let _ = write!(sql, " AND created_at <= ?{idx}");
+                param_values.push(Box::new(u.to_string()));
+                idx += 1;
+            }
+            let _ = write!(sql, " ORDER BY updated_at DESC LIMIT ?{idx}");
+            #[allow(clippy::cast_possible_wrap)]
+            param_values.push(Box::new(limit as i64));
+
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                param_values.iter().map(AsRef::as_ref).collect();
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                })
+            })?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
+    }
 }
 
 #[async_trait]
@@ -481,9 +549,14 @@ impl Memory for SqliteMemory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>> {
+        // Time-only query: list by time range when no keywords
         if query.trim().is_empty() {
-            return Ok(Vec::new());
+            return self
+                .recall_by_time_only(limit, session_id, since, until)
+                .await;
         }
 
         // Compute query embedding (async, before blocking work)
@@ -492,12 +565,16 @@ impl Memory for SqliteMemory {
         let conn = self.conn.clone();
         let query = query.to_string();
         let sid = session_id.map(String::from);
+        let since_owned = since.map(String::from);
+        let until_owned = until.map(String::from);
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
             let session_ref = sid.as_deref();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
 
             // FTS5 BM25 keyword search
             let keyword_results = Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default();
@@ -568,6 +645,16 @@ impl Memory for SqliteMemory {
 
                 for scored in &merged {
                     if let Some((key, content, cat, ts, sid)) = entry_map.remove(&scored.id) {
+                        if let Some(s) = since_ref {
+                            if ts.as_str() < s {
+                                continue;
+                            }
+                        }
+                        if let Some(u) = until_ref {
+                            if ts.as_str() > u {
+                                continue;
+                            }
+                        }
                         let entry = MemoryEntry {
                             id: scored.id.clone(),
                             key,
@@ -588,8 +675,6 @@ impl Memory for SqliteMemory {
             }
 
             // If hybrid returned nothing, fall back to LIKE search.
-            // Cap keyword count so we don't create too many SQL shapes,
-            // which helps prepared-statement cache efficiency.
             if results.is_empty() {
                 const MAX_LIKE_KEYWORDS: usize = 8;
                 let keywords: Vec<String> = query
@@ -606,18 +691,33 @@ impl Memory for SqliteMemory {
                         })
                         .collect();
                     let where_clause = conditions.join(" OR ");
+                    let mut param_idx = keywords.len() * 2 + 1;
+                    let mut time_conditions = String::new();
+                    if since_ref.is_some() {
+                        let _ = write!(time_conditions, " AND created_at >= ?{param_idx}");
+                        param_idx += 1;
+                    }
+                    if until_ref.is_some() {
+                        let _ = write!(time_conditions, " AND created_at <= ?{param_idx}");
+                        param_idx += 1;
+                    }
                     let sql = format!(
                         "SELECT id, key, content, category, created_at, session_id FROM memories
-                         WHERE {where_clause}
+                         WHERE {where_clause}{time_conditions}
                          ORDER BY updated_at DESC
-                         LIMIT ?{}",
-                        keywords.len() * 2 + 1
+                         LIMIT ?{param_idx}"
                     );
                     let mut stmt = conn.prepare(&sql)?;
                     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
                     for kw in &keywords {
                         param_values.push(Box::new(kw.clone()));
                         param_values.push(Box::new(kw.clone()));
+                    }
+                    if let Some(s) = since_ref {
+                        param_values.push(Box::new(s.to_string()));
+                    }
+                    if let Some(u) = until_ref {
+                        param_values.push(Box::new(u.to_string()));
                     }
                     #[allow(clippy::cast_possible_wrap)]
                     param_values.push(Box::new(limit as i64));
@@ -852,7 +952,7 @@ mod tests {
         .await
         .unwrap();
 
-        let results = mem.recall("Rust", 10, None).await.unwrap();
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
         assert!(results
             .iter()
@@ -869,7 +969,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("fast safe", 10, None).await.unwrap();
+        let results = mem.recall("fast safe", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty());
         // Entry with both keywords should score higher
         assert!(results[0].content.contains("safe") && results[0].content.contains("fast"));
@@ -881,7 +981,10 @@ mod tests {
         mem.store("a", "Rust rocks", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("javascript", 10, None).await.unwrap();
+        let results = mem
+            .recall("javascript", 10, None, None, None)
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1024,7 +1127,7 @@ mod tests {
         .await
         .unwrap();
 
-        let results = mem.recall("Rust", 10, None).await.unwrap();
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert!(results.len() >= 2);
         // All results should contain "Rust"
         for r in &results {
@@ -1049,30 +1152,34 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("quick dog", 10, None).await.unwrap();
+        let results = mem.recall("quick dog", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty());
         // "The quick dog runs fast" matches both terms
         assert!(results[0].content.contains("quick"));
     }
 
     #[tokio::test]
-    async fn recall_empty_query_returns_empty() {
+    async fn recall_empty_query_returns_recent_entries() {
         let (_tmp, mem) = temp_sqlite();
         mem.store("a", "data", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("", 10, None).await.unwrap();
-        assert!(results.is_empty());
+        // Empty query = time-only mode: returns recent entries
+        let results = mem.recall("", 10, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "a");
     }
 
     #[tokio::test]
-    async fn recall_whitespace_query_returns_empty() {
+    async fn recall_whitespace_query_returns_recent_entries() {
         let (_tmp, mem) = temp_sqlite();
         mem.store("a", "data", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("   ", 10, None).await.unwrap();
-        assert!(results.is_empty());
+        // Whitespace-only query = time-only mode: returns recent entries
+        let results = mem.recall("   ", 10, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "a");
     }
 
     // ── Embedding cache tests ────────────────────────────────────
@@ -1283,7 +1390,7 @@ mod tests {
         assert_eq!(count, 0);
 
         // FTS should still work after rebuild
-        let results = mem.recall("reindex", 10, None).await.unwrap();
+        let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -1303,7 +1410,10 @@ mod tests {
             .unwrap();
         }
 
-        let results = mem.recall("common keyword", 5, None).await.unwrap();
+        let results = mem
+            .recall("common keyword", 5, None, None, None)
+            .await
+            .unwrap();
         assert!(results.len() <= 5);
     }
 
@@ -1316,7 +1426,7 @@ mod tests {
             .await
             .unwrap();
 
-        let results = mem.recall("scored", 10, None).await.unwrap();
+        let results = mem.recall("scored", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty());
         for r in &results {
             assert!(r.score.is_some(), "Expected score on result: {:?}", r.key);
@@ -1332,7 +1442,7 @@ mod tests {
             .await
             .unwrap();
         // Quotes in query should not crash FTS5
-        let results = mem.recall("\"hello\"", 10, None).await.unwrap();
+        let results = mem.recall("\"hello\"", 10, None, None, None).await.unwrap();
         // May or may not match depending on FTS5 escaping, but must not error
         assert!(results.len() <= 10);
     }
@@ -1343,7 +1453,7 @@ mod tests {
         mem.store("a1", "wildcard test content", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("wild*", 10, None).await.unwrap();
+        let results = mem.recall("wild*", 10, None, None, None).await.unwrap();
         assert!(results.len() <= 10);
     }
 
@@ -1353,7 +1463,10 @@ mod tests {
         mem.store("p1", "function call test", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("function()", 10, None).await.unwrap();
+        let results = mem
+            .recall("function()", 10, None, None, None)
+            .await
+            .unwrap();
         assert!(results.len() <= 10);
     }
 
@@ -1365,7 +1478,7 @@ mod tests {
             .unwrap();
         // Should not crash or leak data
         let results = mem
-            .recall("'; DROP TABLE memories; --", 10, None)
+            .recall("'; DROP TABLE memories; --", 10, None, None, None)
             .await
             .unwrap();
         assert!(results.len() <= 10);
@@ -1441,7 +1554,7 @@ mod tests {
             .await
             .unwrap();
         // Single char may not match FTS5 but LIKE fallback should work
-        let results = mem.recall("x", 10, None).await.unwrap();
+        let results = mem.recall("x", 10, None, None, None).await.unwrap();
         // Should not crash; may or may not find results
         assert!(results.len() <= 10);
     }
@@ -1452,7 +1565,7 @@ mod tests {
         mem.store("a", "some content", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("some", 0, None).await.unwrap();
+        let results = mem.recall("some", 0, None, None, None).await.unwrap();
         assert!(results.is_empty());
     }
 
@@ -1465,7 +1578,10 @@ mod tests {
         mem.store("b", "matching content beta", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("matching content", 1, None).await.unwrap();
+        let results = mem
+            .recall("matching content", 1, None, None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1481,7 +1597,7 @@ mod tests {
         .await
         .unwrap();
         // "rust" appears in key but not content — LIKE fallback checks key too
-        let results = mem.recall("rust", 10, None).await.unwrap();
+        let results = mem.recall("rust", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty(), "Should match by key");
     }
 
@@ -1491,7 +1607,7 @@ mod tests {
         mem.store("jp", "日本語のテスト", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let results = mem.recall("日本語", 10, None).await.unwrap();
+        let results = mem.recall("日本語", 10, None, None, None).await.unwrap();
         assert!(!results.is_empty());
     }
 
@@ -1541,7 +1657,10 @@ mod tests {
         .await
         .unwrap();
         mem.forget("ghost").await.unwrap();
-        let results = mem.recall("phantom memory", 10, None).await.unwrap();
+        let results = mem
+            .recall("phantom memory", 10, None, None, None)
+            .await
+            .unwrap();
         assert!(
             results.is_empty(),
             "Deleted memory should not appear in recall"
@@ -1582,7 +1701,7 @@ mod tests {
         let count = mem.reindex().await.unwrap();
         assert_eq!(count, 0); // Noop embedder → nothing to re-embed
                               // Data should still be intact
-        let results = mem.recall("reindex", 10, None).await.unwrap();
+        let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1686,7 +1805,10 @@ mod tests {
             .unwrap();
 
         // Recall with session-a filter returns only session-a entry
-        let results = mem.recall("fact", 10, Some("sess-a")).await.unwrap();
+        let results = mem
+            .recall("fact", 10, Some("sess-a"), None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "k1");
         assert_eq!(results[0].session_id.as_deref(), Some("sess-a"));
@@ -1706,7 +1828,7 @@ mod tests {
             .unwrap();
 
         // Recall without session filter returns all matching entries
-        let results = mem.recall("fact", 10, None).await.unwrap();
+        let results = mem.recall("fact", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 3);
     }
 
@@ -1723,11 +1845,17 @@ mod tests {
         .unwrap();
 
         // Session B cannot see session A data
-        let results = mem.recall("secret", 10, Some("sess-b")).await.unwrap();
+        let results = mem
+            .recall("secret", 10, Some("sess-b"), None, None)
+            .await
+            .unwrap();
         assert!(results.is_empty());
 
         // Session A can see its own data
-        let results = mem.recall("secret", 10, Some("sess-a")).await.unwrap();
+        let results = mem
+            .recall("secret", 10, Some("sess-a"), None, None)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
     }
 
@@ -1778,7 +1906,10 @@ mod tests {
         // Second open: migration runs again but is idempotent
         {
             let mem = SqliteMemory::new(tmp.path()).unwrap();
-            let results = mem.recall("reopen", 10, Some("sess-x")).await.unwrap();
+            let results = mem
+                .recall("reopen", 10, Some("sess-x"), None, None)
+                .await
+                .unwrap();
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].key, "k1");
             assert_eq!(results[0].session_id.as_deref(), Some("sess-x"));

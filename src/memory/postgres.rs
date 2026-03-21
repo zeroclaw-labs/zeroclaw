@@ -239,14 +239,30 @@ impl Memory for PostgresMemory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let query = query.trim().to_string();
         let sid = session_id.map(str::to_string);
+        let since_owned = since.map(str::to_string);
+        let until_owned = until.map(str::to_string);
 
         run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
+
+            let time_filter: String = match (since_ref, until_ref) {
+                (Some(_), Some(_)) => {
+                    " AND created_at >= $4::TIMESTAMPTZ AND created_at <= $5::TIMESTAMPTZ".into()
+                }
+                (Some(_), None) => " AND created_at >= $4::TIMESTAMPTZ".into(),
+                (None, Some(_)) => " AND created_at <= $4::TIMESTAMPTZ".into(),
+                (None, None) => String::new(),
+            };
+
             let stmt = format!(
                 "
                 SELECT id, key, content, category, created_at, session_id,
@@ -257,6 +273,7 @@ impl Memory for PostgresMemory {
                 FROM {qualified_table}
                 WHERE ($2::TEXT IS NULL OR session_id = $2)
                   AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
+                  {time_filter}
                 ORDER BY score DESC, updated_at DESC
                 LIMIT $3
                 "
@@ -265,7 +282,12 @@ impl Memory for PostgresMemory {
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = client.query(&stmt, &[&query, &sid, &limit_i64])?;
+            let rows = match (since_ref, until_ref) {
+                (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &s, &u])?,
+                (Some(s), None) => client.query(&stmt, &[&query, &sid, &limit_i64, &s])?,
+                (None, Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &u])?,
+                (None, None) => client.query(&stmt, &[&query, &sid, &limit_i64])?,
+            };
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()

@@ -96,11 +96,15 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<()>;
 
     /// Recall memories matching a query (keyword search), optionally scoped to a session
+    /// and time range. Time bounds use RFC 3339 / ISO 8601 format
+    /// (e.g. "2025-03-01T00:00:00Z"); inclusive (created_at >= since, created_at <= until).
     async fn recall(
         &self,
         query: &str,
         limit: usize,
         session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
     /// Get a specific memory by key
