@@ -1578,8 +1578,9 @@ async fn classify_tmux_target(target: &str) -> &'static str {
     if let Some(ref cmd) = current_cmd {
         let cmd = cmd.as_str();
         if !cmd.is_empty() && !shell_commands.contains(&cmd) {
-            // A non-shell process is running (e.g. claude, node, cargo, python3).
-            // Capture pane content to distinguish "question" from "active".
+            // A non-shell process is running (e.g. claude binary, node, cargo).
+            // Capture pane content to determine if it's actually doing work or just
+            // sitting idle at a prompt (e.g. Claude Code awaiting input).
             if let Ok(out) = tokio::process::Command::new("tmux")
                 .args(["capture-pane", "-p", "-t", target])
                 .output()
@@ -1587,12 +1588,10 @@ async fn classify_tmux_target(target: &str) -> &'static str {
             {
                 if out.status.success() {
                     let content = String::from_utf8_lossy(&out.stdout);
-                    let classified = classify_tmux_pane_content(&content);
-                    if classified == "question" {
-                        return "question";
-                    }
+                    return classify_tmux_pane_content(&content);
                 }
             }
+            // Could not capture — assume active since a process is running.
             return "active";
         }
     }

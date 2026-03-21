@@ -66,10 +66,21 @@ if [[ -n "$tmux_target" ]]; then
     done
 
     if [[ -n "$pane_cmd" && "$is_shell" == "false" ]]; then
-        # Non-shell process running — check content only for question detection
-        tmux_state="$(echo "$pane" | python3 -c "
+        # Non-shell process running (e.g. claude binary at idle prompt, or actively working).
+        # Run the full content classifier — a claude session sitting at '❯' should be idle.
+        tmux_state="$(echo "$pane" | grep -v '^\s*$' | tail -30 | python3 -c "
 import sys, re
 raw = sys.stdin.read(); lower = raw.lower()
+spinner_chars = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+if any(c in raw for c in spinner_chars):
+    print('active'); sys.exit()
+active_patterns = [
+    r'^\s*●\s+(running|thinking|reading|writing|searching|fetching|executing)',
+    r'\besc to interrupt\b', r'auto-accept edits on',
+]
+for p in active_patterns:
+    if re.search(p, lower, re.MULTILINE):
+        print('active'); sys.exit()
 question_patterns = [
     r'\[y/n\]', r'\[yes/no\]', r'\[y/n/s\]', r'\(y/n\)',
     r'do you want.*\?', r'would you like.*\?', r'should i .*\?', r'allow.*\?\s*\$',
@@ -77,8 +88,8 @@ question_patterns = [
 for p in question_patterns:
     if re.search(p, lower):
         print('question'); sys.exit()
-print('active')
-" 2>/dev/null || echo "active")"
+print('idle')
+" 2>/dev/null || echo "idle")"
     else
         # Shell is running — fall back to content-based detection
         tmux_state="$(echo "$pane" | grep -v '^\s*$' | tail -20 | python3 -c "
