@@ -420,42 +420,118 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
 /// Load a skill from a SKILL.md file (simpler format)
 fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
-    let name = dir
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let (metadata, body) = parse_frontmatter(&content);
+
+    let name = metadata.get("name").cloned().unwrap_or_else(|| {
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string()
+    });
+
+    let description = metadata
+        .get("description")
+        .cloned()
+        .unwrap_or_else(|| extract_description(&body));
 
     Ok(Skill {
         name,
-        description: extract_description(&content),
-        version: "0.1.0".to_string(),
-        author: None,
-        tags: Vec::new(),
+        description,
+        version: metadata
+            .get("version")
+            .cloned()
+            .unwrap_or_else(|| "0.1.0".to_string()),
+        author: metadata.get("author").cloned(),
+        tags: metadata
+            .get("tags")
+            .map(|t| {
+                t.trim_matches(|c| c == '[' || c == ']')
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
         tools: Vec::new(),
-        prompts: vec![content],
+        prompts: vec![body],
         location: Some(path.to_path_buf()),
     })
 }
 
 fn load_open_skill_md(path: &Path) -> Result<Skill> {
     let content = std::fs::read_to_string(path)?;
-    let name = path
-        .file_stem()
-        .and_then(|n| n.to_str())
-        .unwrap_or("open-skill")
-        .to_string();
+    let (metadata, body) = parse_frontmatter(&content);
+
+    let name = metadata.get("name").cloned().unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|n| n.to_str())
+            .unwrap_or("open-skill")
+            .to_string()
+    });
+
+    let description = metadata
+        .get("description")
+        .cloned()
+        .unwrap_or_else(|| extract_description(&body));
 
     Ok(Skill {
         name,
-        description: extract_description(&content),
-        version: "open-skills".to_string(),
-        author: Some("besoeasy/open-skills".to_string()),
-        tags: vec!["open-skills".to_string()],
+        description,
+        version: metadata
+            .get("version")
+            .cloned()
+            .unwrap_or_else(|| "open-skills".to_string()),
+        author: metadata
+            .get("author")
+            .cloned()
+            .or_else(|| Some("besoeasy/open-skills".to_string())),
+        tags: {
+            let mut tags = metadata
+                .get("tags")
+                .map(|t| {
+                    t.trim_matches(|c| c == '[' || c == ']')
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if !tags.contains(&"open-skills".to_string()) {
+                tags.push("open-skills".to_string());
+            }
+            tags
+        },
         tools: Vec::new(),
-        prompts: vec![content],
+        prompts: vec![body],
         location: Some(path.to_path_buf()),
     })
+}
+
+fn parse_frontmatter(content: &str) -> (HashMap<String, String>, String) {
+    let mut metadata = HashMap::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    if lines.first().map(|l| l.trim()) == Some("---") {
+        let mut end_idx = None;
+        for (i, line) in lines.iter().enumerate().skip(1) {
+            if line.trim() == "---" {
+                end_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = end_idx {
+            for line in &lines[1..idx] {
+                if let Some((key, value)) = line.split_once(':') {
+                    metadata.insert(key.trim().to_string(), value.trim().to_string());
+                }
+            }
+            let body = lines[idx + 1..].join("\n");
+            return (metadata, body.trim().to_string());
+        }
+    }
+
+    (metadata, content.trim().to_string())
 }
 
 fn extract_description(content: &str) -> String {
@@ -1114,6 +1190,57 @@ command = "echo hello"
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
         assert!(!prompt.contains("<tools>"));
+    }
+
+    #[test]
+    fn md_skill_with_frontmatter_description_bug() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let skill_dir = skills_dir.join("frontmatter-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: test\ndescription: Actual Description\n---\n# Instructions\n",
+        )
+        .unwrap();
+
+        let skills = load_skills(dir.path());
+        assert_eq!(skills.len(), 1);
+        // This SHOULD be "Actual Description" but currently fails because it returns "---"
+        assert_eq!(skills[0].description, "Actual Description");
+    }
+
+    #[test]
+    fn md_skill_with_frontmatter_full_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let skill_dir = skills_dir.join("full-md");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            r#"---
+name: custom-name
+description: Custom Description
+version: 1.2.3
+author: Jane Doe
+tags: [ai, rust, test]
+---
+# Content
+Instruction 1"#,
+        )
+        .unwrap();
+
+        let skills = load_skills(dir.path());
+        assert_eq!(skills.len(), 1);
+        let s = &skills[0];
+        assert_eq!(s.name, "custom-name");
+        assert_eq!(s.description, "Custom Description");
+        assert_eq!(s.version, "1.2.3");
+        assert_eq!(s.author.as_deref(), Some("Jane Doe"));
+        assert_eq!(s.tags, vec!["ai", "rust", "test"]);
+        assert_eq!(s.prompts[0].trim(), "# Content\nInstruction 1");
     }
 
     #[test]

@@ -528,22 +528,39 @@ fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
     reply_target: &str,
+    model_name: &str,
 ) -> String {
     let mut prompt = base_prompt.to_string();
+
+    const GUIDANCE_HEADER: &str = "## Model Specific Guidance\n\n";
+    if let Some(start) = prompt.find(GUIDANCE_HEADER) {
+        let header_len = GUIDANCE_HEADER.len();
+        let rest = &prompt[start + header_len..];
+        let section_end = rest
+            .find("\n## ")
+            .map(|i| start + header_len + i)
+            .unwrap_or(prompt.len());
+        prompt.replace_range(start..section_end, "");
+    }
+
+    if model_name.to_lowercase().contains("grok") {
+        prompt.push_str(crate::agent::prompt::GROK_GUIDANCE);
+        prompt.push('\n');
+    }
 
     // Refresh the stale datetime in the cached system prompt
     {
         let now = chrono::Local::now();
         let fresh = format!(
-            "## Current Date & Time\n\n{} ({})\n",
+            "## Current Date & Time\n{} ({})\n\n",
             now.format("%Y-%m-%d %H:%M:%S"),
             now.format("%Z"),
         );
-        if let Some(start) = prompt.find("## Current Date & Time\n\n") {
+        if let Some(start) = prompt.find("## Current Date & Time\n") {
             // Find the end of this section (next "## " heading or end of string)
             let rest = &prompt[start + 24..]; // skip past "## Current Date & Time\n\n"
             let section_end = rest
-                .find("\n## ")
+                .find("\n\n## ")
                 .map(|i| start + 24 + i)
                 .unwrap_or(prompt.len());
             prompt.replace_range(start..section_end, fresh.trim_end());
@@ -1945,7 +1962,7 @@ async fn process_channel_message(
     }
 
     let system_prompt =
-        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target);
+        build_channel_system_prompt(ctx.system_prompt.as_str(), &msg.channel, &msg.reply_target, &route.model);
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     let use_streaming = target_channel
@@ -2768,7 +2785,7 @@ pub fn build_system_prompt_with_mode(
     let now = chrono::Local::now();
     let _ = writeln!(
         prompt,
-        "## Current Date & Time\n\n{} ({})\n",
+        "## Current Date & Time\n{} ({})\n\n",
         now.format("%Y-%m-%d %H:%M:%S"),
         now.format("%Z")
     );

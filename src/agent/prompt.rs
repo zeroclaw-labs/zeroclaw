@@ -65,6 +65,8 @@ impl SystemPromptBuilder {
     }
 }
 
+pub const GROK_GUIDANCE: &str = "## Model Specific Guidance\n\n- **Tool Calls**: When generating tool calls (especially shell commands), DO NOT HTML-encode special characters. Use raw characters like `&`, `<`, `>`, and `\"` directly. For example, use `&` instead of `&amp;`.\n";
+
 pub struct IdentitySection;
 pub struct ToolsSection;
 pub struct SafetySection;
@@ -203,7 +205,7 @@ impl PromptSection for DateTimeSection {
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         let now = Local::now();
         Ok(format!(
-            "## Current Date & Time\n\n{} ({})",
+            "## Current Date & Time\n{} ({})",
             now.format("%Y-%m-%d %H:%M:%S"),
             now.format("%Z")
         ))
@@ -234,8 +236,7 @@ impl PromptSection for ModelGuidanceSection {
         let mut guidance = String::new();
 
         if ctx.model_name.to_lowercase().contains("grok") {
-            guidance.push_str("## Model Specific Guidance\n\n");
-            guidance.push_str("- **Tool Calls**: When generating tool calls (especially shell commands), DO NOT HTML-encode special characters. Use raw characters like `&`, `<`, `>`, and `\"` directly. For example, use `&` instead of `&amp;`.\n");
+            guidance.push_str(GROK_GUIDANCE);
         }
 
         Ok(guidance)
@@ -461,9 +462,9 @@ mod tests {
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
-        assert!(rendered.starts_with("## Current Date & Time\n\n"));
+        assert!(rendered.starts_with("## Current Date & Time\n"));
 
-        let payload = rendered.trim_start_matches("## Current Date & Time\n\n");
+        let payload = rendered.trim_start_matches("## Current Date & Time\n");
         assert!(payload.chars().any(|c| c.is_ascii_digit()));
         assert!(payload.contains(" ("));
         assert!(payload.ends_with(')'));
