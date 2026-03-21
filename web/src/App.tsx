@@ -163,7 +163,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
             autoFocus
           />
           {error && (
-            <p className="text-sm mb-4 text-center animate-fade-in" style={{ color: 'var(--color-status-error)' }}>{error}</p>
+            <p aria-live="polite" className="text-sm mb-4 text-center animate-fade-in" style={{ color: 'var(--color-status-error)' }}>{error}</p>
           )}
           <button
             type="submit"
