@@ -916,61 +916,52 @@ export class MoAClient {
   }
 
   // ── API Key Management ──────────────────────────────────────
-  // Save API keys to the local MoA agent config.
-  // When user provides their own keys, MoA uses them directly.
-  // When no key is set, MoA falls back to operator keys via relay.
+  // ★ SECURITY PRINCIPLE: User's API keys NEVER leave the local device.
+  //   - Stored in localStorage (user's browser/Tauri app)
+  //   - Stored in local config.toml via Tauri bridge (user's device)
+  //   - Sent per-request in chat body for one-time use (like a password)
+  //   - NEVER saved to relay/Railway server (operator's infrastructure)
 
   async saveApiKeyToAgent(provider: string, key: string): Promise<void> {
-    // Save API key to whichever gateway is reachable (local or relay).
-    // The gateway stores it encrypted (ChaCha20-Poly1305) in config.toml
-    // so it persists across restarts without needing per-request key.
-    const requestInit: RequestInit = {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
-      },
-      body: JSON.stringify({ provider, api_key: key }),
-    };
+    // Save API key to LOCAL gateway only. Never send to relay/Railway.
+    // If no local gateway is running, the key stays in localStorage
+    // and is sent per-request in the chat body.
+    if (!this.gatewayAlive) return;
 
     try {
-      const res = await this.fetchWithFallback("/api/config/api-key", requestInit);
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({ error: "Save failed" }));
-        throw new Error(data.error || `Save failed (${res.status})`);
-      }
-    } catch (err) {
-      // If both local and relay fail, still not fatal — key in localStorage
-      // will be sent per-request as fallback
-      if (err instanceof TypeError && err.message === "Failed to fetch") {
-        return;
-      }
-      throw err;
-    }
-  }
-
-  /** Save an API key for a specific tool (e.g. composio, web_search_tool, web_fetch).
-   *
-   *  Uses the existing /api/config/api-key endpoint with a "tool:<name>" provider
-   *  prefix, which the server routes to the tool-api-key handler internally. */
-  async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
-    // Save tool API key to gateway (encrypted in config.toml)
-    try {
-      const res = await this.fetchWithFallback("/api/config/api-key", {
+      const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
           ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
         },
-        body: JSON.stringify({ provider: `tool:${tool}`, api_key: apiKey }),
+        body: JSON.stringify({ provider, api_key: key }),
       });
       if (!res.ok) {
-        const data = await res.json().catch(() => ({ error: "Save failed" }));
-        throw new Error(data.error || `Save failed (${res.status})`);
+        // Non-critical — key lives in localStorage
       }
-    } catch (err) {
-      if (!(err instanceof TypeError && err.message === "Failed to fetch")) {
-        throw err;
+    } catch {
+      // Local gateway unreachable — key is safe in localStorage
+    }
+  }
+
+  /** Save an API key for a specific tool. LOCAL gateway only — never relay. */
+  async saveToolApiKey(tool: string, apiKey: string): Promise<void> {
+    if (this.gatewayAlive) {
+      try {
+        const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+          },
+          body: JSON.stringify({ provider: `tool:${tool}`, api_key: apiKey }),
+        });
+        if (!res.ok) {
+          // Non-critical
+        }
+      } catch {
+        // Local gateway unreachable
       }
     }
 
