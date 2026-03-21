@@ -7,4 +7,6 @@ ignore = [
     "RUSTSEC-2026-0006",  # wasmtime f64.copysign segfault on x86-64
     "RUSTSEC-2026-0020",  # WASI guest-controlled resource exhaustion
     "RUSTSEC-2026-0021",  # WASI http fields panic
+    # instant crate unmaintained — transitive dep via nostr; no upstream fix
+    "RUSTSEC-2024-0384",
 ]

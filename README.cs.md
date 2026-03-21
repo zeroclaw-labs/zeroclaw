@@ -324,47 +324,6 @@ Webový panel React 19 + Vite 6 + Tailwind CSS 4 servírovaný přímo z Gateway
 - CI/CD: beta (auto na push) → stable (ruční dispatch) → Docker, crates.io, Scoop, AUR, Homebrew, tweet.
 - Předpřipravené binárky pro Linux (x86_64, aarch64, armv7), macOS (x86_64, aarch64), Windows (x86_64).
 
-## Jak to funguje (krátce)
-
-```
-WhatsApp / Telegram / Slack / Discord / Signal / iMessage / Matrix / IRC / Email
-Bluesky / Nostr / Mattermost / DingTalk / Lark / QQ / Reddit / MQTT / WebSocket
-               │
-               ▼
-┌───────────────────────────────┐
-│            Gateway            │
-│       (control plane)         │
-│    http://127.0.0.1:42617     │
-├───────────────────────────────┤
-│  Web Dashboard (React 19)     │
-│  REST API + WebSocket + SSE   │
-│  Pairing + Rate Limiting      │
-└──────────────┬────────────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│ Agent  │ │  Cron  │ │ Hands  │
-│  Loop  │ │Scheduler│ │ Swarm  │
-└───┬────┘ └───┬────┘ └───┬────┘
-    │          │          │
-    └──────────┼──────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│Provider│ │ Tools  │ │ Memory │
-│ (LLM)  │ │ (70+)  │ │(md/sql)│
-└────────┘ └────────┘ └────────┘
-    │          │
-    ▼          ▼
-┌────────┐ ┌────────────┐
-│Security│ │ Peripherals│
-│ Policy │ │(ESP32/STM32)│
-└────────┘ └────────────┘
-```
 
 ## Konfigurace
 

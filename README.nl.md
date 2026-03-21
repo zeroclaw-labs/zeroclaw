@@ -324,47 +324,6 @@ React 19 + Vite 6 + Tailwind CSS 4 webdashboard geserveerd direct vanuit de Gate
 - CI/CD: beta (auto bij push) → stable (handmatige dispatch) → Docker, crates.io, Scoop, AUR, Homebrew, tweet.
 - Voorgebouwde binaries voor Linux (x86_64, aarch64, armv7), macOS (x86_64, aarch64), Windows (x86_64).
 
-## Hoe het werkt (kort)
-
-```
-WhatsApp / Telegram / Slack / Discord / Signal / iMessage / Matrix / IRC / Email
-Bluesky / Nostr / Mattermost / DingTalk / Lark / QQ / Reddit / MQTT / WebSocket
-               │
-               ▼
-┌───────────────────────────────┐
-│            Gateway            │
-│       (control plane)         │
-│    http://127.0.0.1:42617     │
-├───────────────────────────────┤
-│  Web Dashboard (React 19)     │
-│  REST API + WebSocket + SSE   │
-│  Pairing + Rate Limiting      │
-└──────────────┬────────────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│ Agent  │ │  Cron  │ │ Hands  │
-│  Loop  │ │Scheduler│ │ Swarm  │
-└───┬────┘ └───┬────┘ └───┬────┘
-    │          │          │
-    └──────────┼──────────┘
-               │
-    ┌──────────┼──────────┐
-    │          │          │
-    ▼          ▼          ▼
-┌────────┐ ┌────────┐ ┌────────┐
-│Provider│ │ Tools  │ │ Memory │
-│ (LLM)  │ │ (70+)  │ │(md/sql)│
-└────────┘ └────────┘ └────────┘
-    │          │
-    ▼          ▼
-┌────────┐ ┌────────────┐
-│Security│ │ Peripherals│
-│ Policy │ │(ESP32/STM32)│
-└────────┘ └────────────┘
-```
 
 ## Configuratie
 
