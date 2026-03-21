@@ -9353,7 +9353,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
-    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -13755,12 +13754,12 @@ require_otp_to_resume = true
     async fn ensure_bootstrap_files_creates_missing_files() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("workspace");
-        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let _: () = tokio::fs::create_dir_all(&ws).await.unwrap();
 
         ensure_bootstrap_files(&ws).await.unwrap();
 
-        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
-        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+        let soul: String = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        let identity: String = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
             .await
             .unwrap();
         assert!(soul.contains("SOUL.md"));
@@ -13771,21 +13770,21 @@ require_otp_to_resume = true
     async fn ensure_bootstrap_files_does_not_overwrite_existing() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("workspace");
-        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let _: () = tokio::fs::create_dir_all(&ws).await.unwrap();
 
         let custom = "# My custom SOUL";
-        tokio::fs::write(ws.join("SOUL.md"), custom).await.unwrap();
+        let _: () = tokio::fs::write(ws.join("SOUL.md"), custom).await.unwrap();
 
         ensure_bootstrap_files(&ws).await.unwrap();
 
-        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        let soul: String = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
         assert_eq!(
             soul, custom,
             "ensure_bootstrap_files must not overwrite existing files"
         );
 
         // IDENTITY.md should still be created since it was missing
-        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+        let identity: String = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
             .await
             .unwrap();
         assert!(identity.contains("IDENTITY.md"));
