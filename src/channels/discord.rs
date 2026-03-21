@@ -316,8 +316,6 @@ async fn send_discord_message_with_files(
     Ok(())
 }
 
-const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
 /// Discord's maximum message length for regular messages.
 ///
 /// Discord rejects longer payloads with `50035 Invalid Form Body`.
@@ -452,43 +450,7 @@ fn normalize_incoming_content(
     Some(normalized)
 }
 
-/// Minimal base64 decode (no extra dep) — only needs to decode the user ID portion
-#[allow(clippy::cast_possible_truncation)]
-fn base64_decode(input: &str) -> Option<String> {
-    let padded = match input.len() % 4 {
-        2 => format!("{input}=="),
-        3 => format!("{input}="),
-        _ => input.to_string(),
-    };
-
-    let mut bytes = Vec::new();
-    let chars: Vec<u8> = padded.bytes().collect();
-
-    for chunk in chars.chunks(4) {
-        if chunk.len() < 4 {
-            break;
-        }
-
-        let mut v = [0usize; 4];
-        for (i, &b) in chunk.iter().enumerate() {
-            if b == b'=' {
-                v[i] = 0;
-            } else {
-                v[i] = BASE64_ALPHABET.iter().position(|&a| a == b)?;
-            }
-        }
-
-        bytes.push(((v[0] << 2) | (v[1] >> 4)) as u8);
-        if chunk[2] != b'=' {
-            bytes.push((((v[1] & 0xF) << 4) | (v[2] >> 2)) as u8);
-        }
-        if chunk[3] != b'=' {
-            bytes.push((((v[2] & 0x3) << 6) | v[3]) as u8);
-        }
-    }
-
-    String::from_utf8(bytes).ok()
-}
+use super::discord_utils::base64_decode;
 
 #[async_trait]
 impl Channel for DiscordChannel {
@@ -921,13 +883,6 @@ mod tests {
     }
 
     #[test]
-    fn base64_decode_bot_id() {
-        // "MTIzNDU2" decodes to "123456"
-        let decoded = base64_decode("MTIzNDU2");
-        assert_eq!(decoded, Some("123456".to_string()));
-    }
-
-    #[test]
     fn bot_user_id_extraction() {
         // Token format: base64(user_id).timestamp.hmac
         let token = "MTIzNDU2.fake.hmac";
@@ -997,18 +952,6 @@ mod tests {
         assert!(ch.is_user_allowed("ABC"));
         assert!(!ch.is_user_allowed("abc"));
         assert!(!ch.is_user_allowed("Abc"));
-    }
-
-    #[test]
-    fn base64_decode_empty_string() {
-        let decoded = base64_decode("");
-        assert_eq!(decoded, Some(String::new()));
-    }
-
-    #[test]
-    fn base64_decode_invalid_chars() {
-        let decoded = base64_decode("!!!!");
-        assert!(decoded.is_none());
     }
 
     #[test]

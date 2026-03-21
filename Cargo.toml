@@ -122,6 +122,9 @@ serde-big-array = { version = "0.5", optional = true }
 # Fast mutexes that don't poison on panic
 parking_lot = "0.12"
 
+# Scope guards
+scopeguard = "1.2"
+
 # Async traits
 async-trait = "0.1"
 
@@ -285,7 +288,6 @@ panic = "abort"
 tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
-scopeguard = "1.2"
 
 [[test]]
 name = "component"
