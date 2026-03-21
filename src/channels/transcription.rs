@@ -39,47 +39,6 @@ fn normalize_audio_filename(file_name: &str) -> String {
     }
 }
 
-/// Resolve the API key for voice transcription.
-///
-/// Priority order:
-/// 1. Explicit `config.api_key` (if set and non-empty).
-/// 2. Provider-specific env var based on `api_url`:
-///    - URL contains "openai.com" -> `OPENAI_API_KEY`
-///    - URL contains "groq.com"   -> `GROQ_API_KEY`
-/// 3. Fallback chain: `TRANSCRIPTION_API_KEY` -> `GROQ_API_KEY` -> `OPENAI_API_KEY`.
-fn resolve_transcription_api_key(config: &TranscriptionConfig) -> Result<String> {
-    // 1. Explicit config key
-    if let Some(ref key) = config.api_key {
-        let trimmed = key.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
-    }
-
-    // 2. Provider-specific env var based on API URL
-    if config.api_url.contains("openai.com") {
-        if let Ok(key) = std::env::var("OPENAI_API_KEY") {
-            return Ok(key);
-        }
-    } else if config.api_url.contains("groq.com") {
-        if let Ok(key) = std::env::var("GROQ_API_KEY") {
-            return Ok(key);
-        }
-    }
-
-    // 3. Fallback chain
-    for var in ["TRANSCRIPTION_API_KEY", "GROQ_API_KEY", "OPENAI_API_KEY"] {
-        if let Ok(key) = std::env::var(var) {
-            return Ok(key);
-        }
-    }
-
-    bail!(
-        "No API key found for voice transcription — set one of: \
-         transcription.api_key in config, TRANSCRIPTION_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY"
-    );
-}
-
 /// Resolve MIME type and normalize filename from extension.
 ///
 /// No size check — callers enforce their own limits.
@@ -818,141 +777,9 @@ impl TranscriptionManager {
     }
 }
 
-// ── Backward-compatible convenience function ────────────────────
-
-/// Transcribe audio bytes via a Whisper-compatible transcription API.
-///
-/// Returns the transcribed text on success.
-///
-/// This is the backward-compatible entry point that preserves the original
-/// function signature. It uses the Groq provider directly, matching the
-/// original single-provider behavior.
-///
-/// Credential resolution order:
-/// 1. `config.transcription.api_key`
-/// 2. `GROQ_API_KEY` environment variable (backward compatibility)
-///
-/// The caller is responsible for enforcing duration limits *before* downloading
-/// the file; this function enforces the byte-size cap.
-pub async fn transcribe_audio(
-    audio_data: Vec<u8>,
-    file_name: &str,
-    config: &TranscriptionConfig,
-) -> Result<String> {
-    // Validate audio before resolving credentials so that size/format errors
-    // are reported before missing-key errors (preserves original behavior).
-    validate_audio(&audio_data, file_name)?;
-
-    match config.default_provider.as_str() {
-        "groq" => {
-            let groq = GroqProvider::from_config(config)?;
-            groq.transcribe(&audio_data, file_name).await
-        }
-        "openai" => {
-            let openai_cfg = config.openai.as_ref().context(
-                "Default transcription provider 'openai' is not configured. Add [transcription.openai]",
-            )?;
-            let openai = OpenAiWhisperProvider::from_config(openai_cfg)?;
-            openai.transcribe(&audio_data, file_name).await
-        }
-        "deepgram" => {
-            let deepgram_cfg = config.deepgram.as_ref().context(
-                "Default transcription provider 'deepgram' is not configured. Add [transcription.deepgram]",
-            )?;
-            let deepgram = DeepgramProvider::from_config(deepgram_cfg)?;
-            deepgram.transcribe(&audio_data, file_name).await
-        }
-        "assemblyai" => {
-            let assemblyai_cfg = config.assemblyai.as_ref().context(
-                "Default transcription provider 'assemblyai' is not configured. Add [transcription.assemblyai]",
-            )?;
-            let assemblyai = AssemblyAiProvider::from_config(assemblyai_cfg)?;
-            assemblyai.transcribe(&audio_data, file_name).await
-        }
-        "google" => {
-            let google_cfg = config.google.as_ref().context(
-                "Default transcription provider 'google' is not configured. Add [transcription.google]",
-            )?;
-            let google = GoogleSttProvider::from_config(google_cfg)?;
-            google.transcribe(&audio_data, file_name).await
-        }
-        other => bail!("Unsupported transcription provider '{other}'"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn rejects_oversized_audio() {
-        let big = vec![0u8; MAX_AUDIO_BYTES + 1];
-        let config = TranscriptionConfig::default();
-
-        let err = transcribe_audio(big, "test.ogg", &config)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("too large"),
-            "expected size error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rejects_missing_api_key() {
-        // Ensure all candidate keys are absent for this test.
-        std::env::remove_var("GROQ_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("TRANSCRIPTION_API_KEY");
-
-        let data = vec![0u8; 100];
-        let config = TranscriptionConfig::default();
-
-        let err = transcribe_audio(data, "test.ogg", &config)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("transcription API key"),
-            "expected missing-key error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn uses_config_api_key_without_groq_env() {
-        std::env::remove_var("GROQ_API_KEY");
-
-        let data = vec![0u8; 100];
-        let mut config = TranscriptionConfig::default();
-        config.api_key = Some("transcription-key".to_string());
-
-        // Keep invalid extension so we fail before network, but after key resolution.
-        let err = transcribe_audio(data, "recording.aac", &config)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("Unsupported audio format"),
-            "expected unsupported-format error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn openai_default_provider_uses_openai_config() {
-        let data = vec![0u8; 100];
-        let mut config = TranscriptionConfig::default();
-        config.default_provider = "openai".to_string();
-        config.openai = Some(crate::config::OpenAiSttConfig {
-            api_key: None,
-            model: "gpt-4o-mini-transcribe".to_string(),
-        });
-
-        let err = transcribe_audio(data, "test.ogg", &config)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("[transcription.openai].api_key"),
-            "expected openai-specific missing-key error, got: {err}"
-        );
-    }
 
     #[test]
     fn mime_for_audio_maps_accepted_formats() {
@@ -1009,25 +836,6 @@ mod tests {
     #[test]
     fn normalize_audio_filename_no_extension() {
         assert_eq!(normalize_audio_filename("voice"), "voice");
-    }
-
-    #[tokio::test]
-    async fn rejects_unsupported_audio_format() {
-        let data = vec![0u8; 100];
-        let config = TranscriptionConfig::default();
-
-        let err = transcribe_audio(data, "recording.aac", &config)
-            .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Unsupported audio format"),
-            "expected unsupported-format error, got: {msg}"
-        );
-        assert!(
-            msg.contains(".aac"),
-            "error should mention the rejected extension, got: {msg}"
-        );
     }
 
     // ── TranscriptionManager tests ──────────────────────────────

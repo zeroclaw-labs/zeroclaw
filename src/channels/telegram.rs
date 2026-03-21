@@ -4470,16 +4470,17 @@ mod tests {
             audio_data.len()
         );
 
-        // 2. Call transcribe_audio() — tests the shim directly (production Telegram path
-        //    now goes through TranscriptionManager; shim remains until transcribe_audio() is removed)
+        // 2. Call TranscriptionManager — tests the same path as production Telegram
         let config = crate::config::TranscriptionConfig {
             enabled: true,
             ..Default::default()
         };
-        let transcript: String =
-            crate::channels::transcription::transcribe_audio(audio_data, "hello.mp3", &config)
-                .await
-                .expect("transcribe_audio should succeed with valid GROQ_API_KEY");
+        let manager = crate::channels::transcription::TranscriptionManager::new(&config)
+            .expect("TranscriptionManager should build with valid GROQ_API_KEY");
+        let transcript: String = manager
+            .transcribe(&audio_data, "hello.mp3")
+            .await
+            .expect("TranscriptionManager should succeed with valid GROQ_API_KEY");
 
         // 3. Verify Whisper actually recognized "hello"
         assert!(
