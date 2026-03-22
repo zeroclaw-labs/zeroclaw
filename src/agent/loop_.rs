@@ -2555,128 +2555,65 @@ pub async fn run(
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
-        (
-            "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
-        ),
-        (
-            "file_read",
-            "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough.",
-        ),
-        (
-            "file_write",
-            "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
-        ),
-        (
-            "memory_store",
-            "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
-        ),
-        (
-            "memory_observe",
-            "Store observation memory. Use when: capturing patterns/signals that should remain searchable over long horizons.",
-        ),
-        (
-            "memory_recall",
-            "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context.",
-        ),
-        (
-            "memory_forget",
-            "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
-        ),
+        // ── Core tools (always available) ──
+        ("shell", "Execute terminal commands. Use for: running builds, tests, diagnostics, system commands."),
+        ("file_read", "Read file contents. Use for: inspecting project files, configs, logs."),
+        ("file_write", "Write/create file contents. Use for: creating new files, overwriting existing."),
+        ("file_edit", "Edit existing files with targeted replacements. Use for: modifying specific parts of a file without rewriting the whole file."),
+        ("apply_patch", "Apply a unified diff patch to files. Use for: multi-file edits in one operation."),
+        ("glob_search", "Find files by glob pattern (e.g. **/*.rs, src/**/*.ts). Use for: locating files by name/extension/path pattern."),
+        ("content_search", "Search file contents by regex pattern. Use for: finding specific code, text, or patterns across files."),
+        ("workspace_folder", "Grant access to a folder on the user's computer. MUST call before accessing files outside default workspace."),
+        ("memory_store", "Save to persistent memory. Use for: storing user preferences, decisions, important context."),
+        ("memory_observe", "Store observation memory. Use for: capturing patterns/signals for long-term recall."),
+        ("memory_recall", "Search memory by query. Use for: retrieving prior decisions, preferences, historical context."),
+        ("memory_forget", "Delete a memory entry. Use for: removing incorrect/stale information."),
+        // ── Web tools (free, no API key required) ──
+        ("web_search", "Search the web (DuckDuckGo free, or Perplexity/Brave with API key). Use for: finding information, news, answers. Always try web_search FIRST for any information query."),
+        ("web_fetch", "Fetch and extract text from a web page URL. 5-minute timeout for slow pages. Use for: reading articles, documentation, getting full page content after web_search."),
+        ("http_request", "Make HTTP requests (GET/POST/PUT/DELETE). Use for: calling APIs, checking URLs, downloading data."),
+        // ── Document tools (free) ──
+        ("document_process", "Convert documents to readable format: HWP/HWPX, DOC/DOCX, XLS/XLSX, PPT/PPTX, PDF. Use classify_only=true first for image PDFs (OCR costs credits)."),
+        ("pdf_read", "Read PDF file contents directly. Use for: extracting text from digital PDFs."),
+        ("docx_read", "Read DOCX file contents. Use for: extracting text from Word documents."),
+        ("xlsx_read", "Read XLSX spreadsheet contents. Use for: extracting data from Excel files."),
+        ("pptx_read", "Read PPTX presentation contents. Use for: extracting text/slides from PowerPoint files."),
+        // ── Git tools ──
+        ("git_operations", "Git repository operations (status, diff, commit, log, branch, etc.). Use for: version control tasks."),
+        // ── Screenshot & image tools ──
+        ("screenshot", "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG."),
+        ("image_info", "Read image metadata (format, dimensions, size) and optionally base64-encode it."),
+        // ── Scheduling tools ──
+        ("cron_add", "Create a cron job. Supports schedule kinds: cron, at, every; job types: shell or agent."),
+        ("cron_list", "List all cron jobs with schedule, status, and metadata."),
+        ("cron_remove", "Remove a cron job by job_id."),
+        ("cron_update", "Patch a cron job settings."),
+        ("cron_run", "Force-run a cron job immediately."),
+        ("cron_runs", "Show recent run history for a cron job."),
+        ("schedule", "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays."),
+        // ── Configuration tools ──
+        ("model_routing_config", "Configure default model, scenario routing, and delegate agents."),
+        ("web_search_config", "Configure web search providers/keys/fallbacks at runtime."),
+        ("web_access_config", "Configure shared URL access policy (first-visit approval, allowlist/blocklist, approved domains)."),
     ];
-    tool_descs.push((
-        "cron_add",
-        "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
-    ));
-    tool_descs.push((
-        "cron_list",
-        "List all cron jobs with schedule, status, and metadata.",
-    ));
-    tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
-    tool_descs.push((
-        "cron_update",
-        "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
-    ));
-    tool_descs.push((
-        "cron_run",
-        "Force-run a cron job immediately and record a run history entry.",
-    ));
-    tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
-    tool_descs.push((
-        "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
-    ));
-    tool_descs.push((
-        "image_info",
-        "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
-    ));
     if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in system browser (allowlist-only, no scraping)",
-        ));
-        tool_descs.push((
-            "browser",
-            "Automate browser actions (open/click/type/scroll/screenshot) with backend-aware safety checks.",
-        ));
+        tool_descs.push(("browser_open", "Open approved HTTPS URLs in system browser."));
+        tool_descs.push(("browser", "Automate browser interactions (open/click/type/scroll/screenshot). Use for: complex web tasks requiring click, scroll, form fill, JS-rendered pages."));
     }
     if config.composio.enabled {
-        tool_descs.push((
-            "composio",
-            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
-        ));
+        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth."));
     }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
-    tool_descs.push((
-        "model_routing_config",
-        "Configure default model, scenario routing, and delegate agents. Use for natural-language requests like: 'set conversation to kimi and coding to gpt-5.3-codex'.",
-    ));
-    tool_descs.push((
-        "web_search_config",
-        "Configure web search providers/keys/fallbacks at runtime.",
-    ));
-    tool_descs.push((
-        "web_access_config",
-        "Configure shared URL access policy (first-visit approval, allowlist/blocklist, approved domains).",
-    ));
     if !config.agents.is_empty() {
-        tool_descs.push((
-            "delegate",
-            "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
-        ));
+        tool_descs.push(("delegate", "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work."));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
-        tool_descs.push((
-            "gpio_read",
-            "Read GPIO pin value (0 or 1) on connected hardware (STM32, Arduino). Use when: checking sensor/button state, LED status.",
-        ));
-        tool_descs.push((
-            "gpio_write",
-            "Set GPIO pin high (1) or low (0) on connected hardware. Use when: turning LED on/off, controlling actuators.",
-        ));
-        tool_descs.push((
-            "arduino_upload",
-            "Upload agent-generated Arduino sketch. Use when: user asks for 'make a heart', 'blink pattern', or custom LED behavior on Arduino. You write the full .ino code; ZeroClaw compiles and uploads it. Pin 13 = built-in LED on Uno.",
-        ));
-        tool_descs.push((
-            "hardware_memory_map",
-            "Return flash and RAM address ranges for connected hardware. Use when: user asks for 'upper and lower memory addresses', 'memory map', or 'readable addresses'.",
-        ));
-        tool_descs.push((
-            "hardware_board_info",
-            "Return full board info (chip, architecture, memory map) for connected hardware. Use when: user asks for 'board info', 'what board do I have', 'connected hardware', 'chip info', or 'what hardware'.",
-        ));
-        tool_descs.push((
-            "hardware_memory_read",
-            "Read actual memory/register values from Nucleo via USB. Use when: user asks to 'read register values', 'read memory', 'dump lower memory 0-126', 'give address and value'. Params: address (hex, default 0x20000000), length (bytes, default 128).",
-        ));
-        tool_descs.push((
-            "hardware_capabilities",
-            "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
-        ));
+        tool_descs.push(("gpio_read", "Read GPIO pin value (0 or 1) on connected hardware (STM32, Arduino)."));
+        tool_descs.push(("gpio_write", "Set GPIO pin high (1) or low (0) on connected hardware."));
+        tool_descs.push(("arduino_upload", "Upload agent-generated Arduino sketch. You write full .ino code; ZeroClaw compiles and uploads it. Pin 13 = built-in LED on Uno."));
+        tool_descs.push(("hardware_memory_map", "Return flash and RAM address ranges for connected hardware."));
+        tool_descs.push(("hardware_board_info", "Return full board info (chip, architecture, memory map) for connected hardware."));
+        tool_descs.push(("hardware_memory_read", "Read actual memory/register values from Nucleo via USB."));
+        tool_descs.push(("hardware_capabilities", "Query connected hardware for reported GPIO pins and LED pin."));
     }
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -3221,34 +3158,56 @@ pub async fn process_message_with_session(
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
-        ("shell", "Execute terminal commands."),
-        ("file_read", "Read file contents."),
-        ("file_write", "Write file contents."),
-        ("memory_store", "Save to memory."),
-        ("memory_observe", "Store observation memory."),
-        ("memory_recall", "Search memory."),
-        ("memory_forget", "Delete a memory entry."),
-        (
-            "model_routing_config",
-            "Configure default model, scenario routing, and delegate agents.",
-        ),
-        (
-            "web_search_config",
-            "Configure web search providers/keys/fallbacks.",
-        ),
-        (
-            "web_access_config",
-            "Configure shared URL access policy for network tools.",
-        ),
-        ("screenshot", "Capture a screenshot."),
-        ("image_info", "Read image metadata."),
+        // ── Core tools (always available) ──
+        ("shell", "Execute terminal commands. Use for: running builds, tests, diagnostics, system commands."),
+        ("file_read", "Read file contents. Use for: inspecting project files, configs, logs."),
+        ("file_write", "Write/create file contents. Use for: creating new files, overwriting existing."),
+        ("file_edit", "Edit existing files with targeted replacements. Use for: modifying specific parts of a file without rewriting the whole file."),
+        ("apply_patch", "Apply a unified diff patch to files. Use for: multi-file edits in one operation."),
+        ("glob_search", "Find files by glob pattern (e.g. **/*.rs, src/**/*.ts). Use for: locating files by name/extension/path pattern."),
+        ("content_search", "Search file contents by regex pattern. Use for: finding specific code, text, or patterns across files."),
+        ("workspace_folder", "Grant access to a folder on the user's computer. MUST call before accessing files outside default workspace."),
+        ("memory_store", "Save to persistent memory. Use for: storing user preferences, decisions, important context."),
+        ("memory_observe", "Store observation memory. Use for: capturing patterns/signals for long-term recall."),
+        ("memory_recall", "Search memory by query. Use for: retrieving prior decisions, preferences, historical context."),
+        ("memory_forget", "Delete a memory entry. Use for: removing incorrect/stale information."),
+        // ── Web tools (free, no API key required) ──
+        ("web_search", "Search the web (DuckDuckGo free, or Perplexity/Brave with API key). Use for: finding information, news, answers. Always try web_search FIRST for any information query."),
+        ("web_fetch", "Fetch and extract text from a web page URL. 5-minute timeout for slow pages. Use for: reading articles, documentation, getting full page content after web_search."),
+        ("http_request", "Make HTTP requests (GET/POST/PUT/DELETE). Use for: calling APIs, checking URLs, downloading data."),
+        // ── Document tools (free) ──
+        ("document_process", "Convert documents to readable format: HWP/HWPX, DOC/DOCX, XLS/XLSX, PPT/PPTX, PDF. Use classify_only=true first for image PDFs (OCR costs credits)."),
+        ("pdf_read", "Read PDF file contents directly. Use for: extracting text from digital PDFs."),
+        ("docx_read", "Read DOCX file contents. Use for: extracting text from Word documents."),
+        ("xlsx_read", "Read XLSX spreadsheet contents. Use for: extracting data from Excel files."),
+        ("pptx_read", "Read PPTX presentation contents. Use for: extracting text/slides from PowerPoint files."),
+        // ── Git tools ──
+        ("git_operations", "Git repository operations (status, diff, commit, log, branch, etc.). Use for: version control tasks."),
+        // ── Screenshot & image tools ──
+        ("screenshot", "Capture a screenshot of the current screen."),
+        ("image_info", "Read image metadata (format, dimensions, size) and optionally base64-encode it."),
+        // ── Scheduling tools ──
+        ("cron_add", "Create a cron job. Supports schedule kinds: cron, at, every; job types: shell or agent."),
+        ("cron_list", "List all cron jobs with schedule, status, and metadata."),
+        ("cron_remove", "Remove a cron job by job_id."),
+        ("cron_update", "Patch a cron job settings."),
+        ("cron_run", "Force-run a cron job immediately."),
+        ("cron_runs", "Show recent run history for a cron job."),
+        ("schedule", "Manage scheduled tasks (create/list/get/cancel/pause/resume)."),
+        // ── Configuration tools ──
+        ("model_routing_config", "Configure default model, scenario routing, and delegate agents."),
+        ("web_search_config", "Configure web search providers/keys/fallbacks at runtime."),
+        ("web_access_config", "Configure shared URL access policy for network tools."),
     ];
     if config.browser.enabled {
         tool_descs.push(("browser_open", "Open approved URLs in browser."));
-        tool_descs.push(("browser", "Automate browser interactions."));
+        tool_descs.push(("browser", "Automate browser interactions (open/click/type/scroll/screenshot). Use for: complex web tasks requiring click, scroll, form fill, JS-rendered pages."));
     }
     if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.)."));
+    }
+    if !config.agents.is_empty() {
+        tool_descs.push(("delegate", "Delegate a sub-task to a specialized agent."));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
         tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
@@ -3258,23 +3217,23 @@ pub async fn process_message_with_session(
         ));
         tool_descs.push((
             "arduino_upload",
-            "Upload Arduino sketch. Use for 'make a heart', custom patterns. You write full .ino code; ZeroClaw uploads it.",
+            "Upload Arduino sketch. You write full .ino code; ZeroClaw uploads it.",
         ));
         tool_descs.push((
             "hardware_memory_map",
-            "Return flash and RAM address ranges. Use when user asks for memory addresses or memory map.",
+            "Return flash and RAM address ranges for connected hardware.",
         ));
         tool_descs.push((
             "hardware_board_info",
-            "Return full board info (chip, architecture, memory map). Use when user asks for board info, what board, connected hardware, or chip info.",
+            "Return full board info (chip, architecture, memory map) for connected hardware.",
         ));
         tool_descs.push((
             "hardware_memory_read",
-            "Read actual memory/register values from Nucleo. Use when user asks to read registers, read memory, dump lower memory 0-126, or give address and value.",
+            "Read actual memory/register values from Nucleo via USB.",
         ));
         tool_descs.push((
             "hardware_capabilities",
-            "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
+            "Query connected hardware for reported GPIO pins and LED pin.",
         ));
     }
     let bootstrap_max_chars = if config.agent.compact_context {

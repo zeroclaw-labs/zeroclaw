@@ -92,6 +92,9 @@ export class MoAClient {
   private deviceId: string;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
+  // Available tools fetched from gateway on login/connect
+  private availableTools: ToolInfo[] = [];
+
   constructor() {
     this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || DEFAULT_LOCAL_GATEWAY_URL;
     this.relayUrl = localStorage.getItem(STORAGE_KEY_RELAY) || DEFAULT_RELAY_SERVER_URL;
@@ -658,16 +661,28 @@ export class MoAClient {
     baseUrl: string,
     body: Record<string, unknown>,
   ): Promise<Response | null> {
+    // 5-minute timeout for chat requests — the agent loop may run tools
+    // (web search, browser, shell, etc.) which take significant time.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000);
     try {
-      return await fetch(`${baseUrl}/api/chat`, {
+      const res = await fetch(`${baseUrl}/api/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${this.token}`,
         },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
+      return res;
     } catch (err) {
+      clearTimeout(timeout);
+      if (err instanceof DOMException && err.name === "AbortError") {
+        // Timed out after 5 minutes — treat as network failure
+        return null;
+      }
       if (err instanceof TypeError && err.message === "Failed to fetch") {
         // Network-level failure (connection refused, DNS, timeout, etc.)
         return null;
@@ -976,6 +991,49 @@ export class MoAClient {
   /** Check if a tool has an API key configured (local cache check) */
   hasToolApiKey(tool: string): boolean {
     return localStorage.getItem(`zeroclaw_tool_api_key_${tool}`) === "configured";
+  }
+
+  // ── Tool Discovery ──────────────────────────────────────────────
+  // Fetch available tools from the gateway so LLM knows what it can use.
+  // Called after login and when gateway connection is (re)established.
+
+  async fetchAvailableTools(): Promise<ToolInfo[]> {
+    // Try local gateway first, then relay
+    const urls = this.gatewayAlive
+      ? [this.serverUrl, this.relayUrl]
+      : [this.relayUrl, this.serverUrl];
+
+    for (const baseUrl of urls) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        const res = await fetch(`${baseUrl}/api/tools`, {
+          headers: {
+            ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+          },
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        if (res.ok) {
+          const data = await res.json();
+          const tools: ToolInfo[] = (data.tools || []).map(
+            (t: { name: string; description: string }) => ({
+              name: t.name,
+              description: t.description,
+            }),
+          );
+          this.availableTools = tools;
+          return tools;
+        }
+      } catch {
+        // Try next URL
+      }
+    }
+    return this.availableTools; // return cached if both fail
+  }
+
+  getAvailableTools(): ToolInfo[] {
+    return this.availableTools;
   }
 
   /**

@@ -165,6 +165,8 @@ function App() {
       const [devices, agentInfo] = await Promise.all([
         apiClient.getDevices().catch(() => [] as DeviceInfo[]),
         apiClient.getAgentInfo(),
+        // Pre-fetch available tools so LLM knows what it can use
+        apiClient.fetchAvailableTools().catch(() => []),
       ]);
       setSidebarDevices(devices);
       setSidebarChannels(agentInfo.channels);
