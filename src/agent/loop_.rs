@@ -2707,16 +2707,53 @@ pub(crate) async fn run_tool_call_loop(
         let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
-            return Err(ProviderCapabilityError {
-                provider: provider_name.to_string(),
-                capability: "vision".to_string(),
-                message: format!(
-                    "received {image_marker_count} image marker(s), but this provider does not support vision input"
-                ),
+
+        // ── Vision provider routing ──────────────────────────
+        // When the default provider lacks vision support but a dedicated
+        // vision_provider is configured, create it on demand and use it
+        // for this iteration.  Otherwise, preserve the original error.
+        let vision_provider_box: Option<Box<dyn Provider>> = if image_marker_count > 0
+            && !provider.supports_vision()
+        {
+            if let Some(ref vp) = multimodal_config.vision_provider {
+                let vp_instance = providers::create_provider(vp, None)
+                    .map_err(|e| anyhow::anyhow!("failed to create vision provider '{vp}': {e}"))?;
+                if !vp_instance.supports_vision() {
+                    return Err(ProviderCapabilityError {
+                        provider: vp.clone(),
+                        capability: "vision".to_string(),
+                        message: format!(
+                            "configured vision_provider '{vp}' does not support vision input"
+                        ),
+                    }
+                    .into());
+                }
+                Some(vp_instance)
+            } else {
+                return Err(ProviderCapabilityError {
+                        provider: provider_name.to_string(),
+                        capability: "vision".to_string(),
+                        message: format!(
+                            "received {image_marker_count} image marker(s), but this provider does not support vision input"
+                        ),
+                    }
+                    .into());
             }
-            .into());
-        }
+        } else {
+            None
+        };
+
+        let (active_provider, active_provider_name, active_model): (&dyn Provider, &str, &str) =
+            if let Some(ref vp_box) = vision_provider_box {
+                let vp_name = multimodal_config
+                    .vision_provider
+                    .as_deref()
+                    .unwrap_or(provider_name);
+                let vm = multimodal_config.vision_model.as_deref().unwrap_or(model);
+                (vp_box.as_ref(), vp_name, vm)
+            } else {
+                (provider, provider_name, model)
+            };
 
         let prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
@@ -2732,15 +2769,15 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         observer.record_event(&ObserverEvent::LlmRequest {
-            provider: provider_name.to_string(),
-            model: model.to_string(),
+            provider: active_provider_name.to_string(),
+            model: active_model.to_string(),
             messages_count: history.len(),
         });
         runtime_trace::record_event(
             "llm_request",
             Some(channel_name),
-            Some(provider_name),
-            Some(model),
+            Some(active_provider_name),
+            Some(active_model),
             Some(&turn_id),
             None,
             None,
@@ -2778,12 +2815,12 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-        let chat_future = provider.chat(
+        let chat_future = active_provider.chat(
             ChatRequest {
                 messages: &prepared_messages.messages,
                 tools: request_tools,
             },
-            model,
+            active_model,
             temperature,
         );
 
@@ -2836,8 +2873,8 @@ pub(crate) async fn run_tool_call_loop(
                         .unwrap_or((None, None));
 
                     observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
+                        provider: active_provider_name.to_string(),
+                        model: active_model.to_string(),
                         duration: llm_started_at.elapsed(),
                         success: true,
                         error_message: None,
@@ -2846,10 +2883,9 @@ pub(crate) async fn run_tool_call_loop(
                     });
 
                     // Record cost via task-local tracker (no-op when not scoped)
-                    let _ = resp
-                        .usage
-                        .as_ref()
-                        .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
+                    let _ = resp.usage.as_ref().and_then(|usage| {
+                        record_tool_loop_cost_usage(active_provider_name, active_model, usage)
+                    });
 
                     let response_text = resp.text_or_empty().to_string();
                     // First try native structured tool calls (OpenAI-format).
@@ -2872,8 +2908,8 @@ pub(crate) async fn run_tool_call_loop(
                         runtime_trace::record_event(
                             "tool_call_parse_issue",
                             Some(channel_name),
-                            Some(provider_name),
-                            Some(model),
+                            Some(active_provider_name),
+                            Some(active_model),
                             Some(&turn_id),
                             Some(false),
                             Some(&parse_issue),
@@ -2890,8 +2926,8 @@ pub(crate) async fn run_tool_call_loop(
                     runtime_trace::record_event(
                         "llm_response",
                         Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
+                        Some(active_provider_name),
+                        Some(active_model),
                         Some(&turn_id),
                         Some(true),
                         None,
@@ -2940,8 +2976,8 @@ pub(crate) async fn run_tool_call_loop(
                 Err(e) => {
                     let safe_error = crate::providers::sanitize_api_error(&e.to_string());
                     observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
+                        provider: active_provider_name.to_string(),
+                        model: active_model.to_string(),
                         duration: llm_started_at.elapsed(),
                         success: false,
                         error_message: Some(safe_error.clone()),
@@ -2951,8 +2987,8 @@ pub(crate) async fn run_tool_call_loop(
                     runtime_trace::record_event(
                         "llm_response",
                         Some(channel_name),
-                        Some(provider_name),
-                        Some(model),
+                        Some(active_provider_name),
+                        Some(active_model),
                         Some(&turn_id),
                         Some(false),
                         Some(&safe_error),
@@ -5094,6 +5130,7 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let err = run_tool_call_loop(
@@ -5169,6 +5206,313 @@ mod tests {
 
         assert_eq!(result, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// When `vision_provider` is not set and the default provider lacks vision
+    /// support, the original `ProviderCapabilityError` should be returned.
+    #[tokio::test]
+    async fn run_tool_call_loop_no_vision_provider_config_preserves_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "check [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect_err("should fail without vision_provider config");
+
+        assert!(err.to_string().contains("capability=vision"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// When `vision_provider` is set but the provider factory cannot resolve
+    /// the name, a descriptive error should be returned (not the generic
+    /// capability error).
+    #[tokio::test]
+    async fn run_tool_call_loop_vision_provider_creation_failure() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "inspect [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model: Some("some-model".to_string()),
+            ..Default::default()
+        };
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect_err("should fail when vision provider cannot be created");
+
+        assert!(
+            err.to_string().contains("failed to create vision provider"),
+            "expected creation failure error, got: {}",
+            err
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Messages without image markers should use the default provider even
+    /// when `vision_provider` is configured.
+    #[tokio::test]
+    async fn run_tool_call_loop_no_images_uses_default_provider() {
+        let provider = ScriptedProvider::from_text_responses(vec!["hello world"]);
+
+        let mut history = vec![ChatMessage::user("just text, no images".to_string())];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model: Some("some-model".to_string()),
+            ..Default::default()
+        };
+
+        // Even though vision_provider points to a nonexistent provider, this
+        // should succeed because there are no image markers to trigger routing.
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "scripted",
+            "scripted-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("text-only messages should succeed with default provider");
+
+        assert_eq!(result, "hello world");
+    }
+
+    /// When `vision_provider` is set but `vision_model` is not, the default
+    /// model should be used as fallback for the vision provider.
+    #[tokio::test]
+    async fn run_tool_call_loop_vision_provider_without_model_falls_back() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "look [IMAGE:data:image/png;base64,iVBORw0KGgo=]".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        // vision_provider set but vision_model is None — the code should
+        // fall back to the default model. Since the provider name is invalid,
+        // we just verify the error path references the correct provider.
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model: None,
+            ..Default::default()
+        };
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect_err("should fail due to nonexistent vision provider");
+
+        // Verify the routing was attempted (not the generic capability error).
+        assert!(
+            err.to_string().contains("failed to create vision provider"),
+            "expected creation failure, got: {}",
+            err
+        );
+    }
+
+    /// Empty `[IMAGE:]` markers (which are preserved as literal text by the
+    /// parser) should not trigger vision provider routing.
+    #[tokio::test]
+    async fn run_tool_call_loop_empty_image_markers_use_default_provider() {
+        let provider = ScriptedProvider::from_text_responses(vec!["handled"]);
+
+        let mut history = vec![ChatMessage::user(
+            "empty marker [IMAGE:] should be ignored".to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            ..Default::default()
+        };
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "scripted",
+            "scripted-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("empty image markers should not trigger vision routing");
+
+        assert_eq!(result, "handled");
+    }
+
+    /// Multiple image markers should still trigger vision routing when
+    /// vision_provider is configured.
+    #[tokio::test]
+    async fn run_tool_call_loop_multiple_images_trigger_vision_routing() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = NonVisionProvider {
+            calls: Arc::clone(&calls),
+        };
+
+        let mut history = vec![ChatMessage::user(
+            "two images [IMAGE:data:image/png;base64,aQ==] and [IMAGE:data:image/png;base64,bQ==]"
+                .to_string(),
+        )];
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+
+        let multimodal = crate::config::MultimodalConfig {
+            vision_provider: Some("nonexistent-provider-xyz".to_string()),
+            vision_model: Some("llava:7b".to_string()),
+            ..Default::default()
+        };
+
+        let err = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            None,
+            &multimodal,
+            3,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect_err("should attempt vision provider creation for multiple images");
+
+        assert!(
+            err.to_string().contains("failed to create vision provider"),
+            "expected creation failure for multiple images, got: {}",
+            err
+        );
     }
 
     #[test]

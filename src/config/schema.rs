@@ -1413,6 +1413,15 @@ pub struct MultimodalConfig {
     /// Allow fetching remote image URLs (http/https). Disabled by default.
     #[serde(default)]
     pub allow_remote_fetch: bool,
+    /// Provider name to use for vision/image messages (e.g. `"ollama"`).
+    /// When set, messages containing `[IMAGE:]` markers are routed to this
+    /// provider instead of the default text provider.
+    #[serde(default)]
+    pub vision_provider: Option<String>,
+    /// Model to use when routing to the vision provider (e.g. `"llava:7b"`).
+    /// Only used when `vision_provider` is set.
+    #[serde(default)]
+    pub vision_model: Option<String>,
 }
 
 fn default_multimodal_max_images() -> usize {
@@ -1438,6 +1447,8 @@ impl Default for MultimodalConfig {
             max_images: default_multimodal_max_images(),
             max_image_size_mb: default_multimodal_max_image_size_mb(),
             allow_remote_fetch: false,
+            vision_provider: None,
+            vision_model: None,
         }
     }
 }
