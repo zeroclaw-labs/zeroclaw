@@ -4347,6 +4347,7 @@ pub async fn run(
             if thinking_params.system_prompt_prefix.is_some() {
                 if let Some(sys_msg) = history.first_mut() {
                     if sys_msg.role == "system" {
+                        sys_msg.content.clone_from(&base_base_system_prompt);
                         sys_msg.content.clone_from(&base_system_prompt);
                     }
                 }
