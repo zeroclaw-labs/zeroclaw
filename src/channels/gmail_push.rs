@@ -56,6 +56,11 @@ pub struct GmailPushConfig {
     /// If empty, watch registration is skipped (useful when using external subscription management).
     #[serde(default)]
     pub webhook_url: String,
+    /// Shared secret for webhook authentication. If set, incoming webhook
+    /// requests must include `Authorization: Bearer <secret>`.
+    /// Falls back to `GMAIL_PUSH_WEBHOOK_SECRET` env var.
+    #[serde(default)]
+    pub webhook_secret: String,
 }
 
 fn default_label_filter() -> Vec<String> {
@@ -80,6 +85,7 @@ impl Default for GmailPushConfig {
             oauth_token: String::new(),
             allowed_senders: Vec::new(),
             webhook_url: String::new(),
+            webhook_secret: String::new(),
         }
     }
 }
@@ -231,12 +237,24 @@ pub struct GmailPushChannel {
 
 impl GmailPushChannel {
     pub fn new(config: GmailPushConfig) -> Self {
+        let http = Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client");
         Self {
             config,
-            http: Client::new(),
+            http,
             last_history_id: Arc::new(Mutex::new(0)),
             tx: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Resolve the webhook secret from config or environment.
+    pub fn resolve_webhook_secret(&self) -> String {
+        if !self.config.webhook_secret.is_empty() {
+            return self.config.webhook_secret.clone();
+        }
+        std::env::var("GMAIL_PUSH_WEBHOOK_SECRET").unwrap_or_default()
     }
 
     /// Resolve the OAuth token from config or environment.
@@ -291,6 +309,18 @@ impl GmailPushChannel {
 
     /// Fetch new messages since the given `start_history_id` using the History API.
     pub async fn fetch_history(&self, start_history_id: u64) -> Result<Vec<String>> {
+        let mut last_id = self.last_history_id.lock().await;
+        self.fetch_history_inner(start_history_id, &mut last_id)
+            .await
+    }
+
+    /// Inner history fetch that takes an already-locked history ID reference.
+    /// This allows callers that already hold the lock to avoid deadlock.
+    async fn fetch_history_inner(
+        &self,
+        start_history_id: u64,
+        last_id: &mut u64,
+    ) -> Result<Vec<String>> {
         let token = self.resolve_oauth_token();
         if token.is_empty() {
             return Err(anyhow!("Gmail OAuth token is not configured"));
@@ -327,11 +357,8 @@ impl GmailPushChannel {
             }
 
             // Update tracked history ID
-            if history_resp.history_id > 0 {
-                let mut last_id = self.last_history_id.lock().await;
-                if history_resp.history_id > *last_id {
-                    *last_id = history_resp.history_id;
-                }
+            if history_resp.history_id > 0 && history_resp.history_id > *last_id {
+                *last_id = history_resp.history_id;
             }
 
             match history_resp.next_page_token {
@@ -390,14 +417,12 @@ impl GmailPushChannel {
             notification.email_address, notification.history_id
         );
 
-        let start_id = {
-            let last_id = self.last_history_id.lock().await;
-            *last_id
-        };
+        // Hold the lock across read-fetch-update to prevent duplicate
+        // processing when concurrent webhook notifications arrive.
+        let mut last_id = self.last_history_id.lock().await;
 
-        if start_id == 0 {
+        if *last_id == 0 {
             // First notification — just record the history ID.
-            let mut last_id = self.last_history_id.lock().await;
             *last_id = notification.history_id;
             info!(
                 "Gmail push: first notification, seeding historyId={}",
@@ -406,7 +431,11 @@ impl GmailPushChannel {
             return Ok(());
         }
 
-        let message_ids = self.fetch_history(start_id).await?;
+        let start_id = *last_id;
+        let message_ids = self.fetch_history_inner(start_id, &mut last_id).await?;
+        // Explicitly drop the lock before doing network-heavy message fetching.
+        drop(last_id);
+
         if message_ids.is_empty() {
             debug!("Gmail push: no new messages in history");
             return Ok(());
@@ -417,10 +446,17 @@ impl GmailPushChannel {
             message_ids.len()
         );
 
-        let tx_guard = self.tx.lock().await;
-        let Some(ref tx) = *tx_guard else {
-            warn!("Gmail push: no listener registered, dropping messages");
-            return Ok(());
+        // Clone the sender and drop the mutex immediately to avoid holding it
+        // across network calls.
+        let tx = {
+            let tx_guard = self.tx.lock().await;
+            match tx_guard.clone() {
+                Some(tx) => tx,
+                None => {
+                    warn!("Gmail push: no listener registered, dropping messages");
+                    return Ok(());
+                }
+            }
         };
 
         for msg_id in message_ids {
@@ -489,9 +525,12 @@ impl Channel for GmailPushChannel {
         }
 
         let subject = message.subject.as_deref().unwrap_or("ZeroClaw Message");
+        // Sanitize headers to prevent CRLF injection attacks.
+        let safe_recipient = sanitize_header_value(&message.recipient);
+        let safe_subject = sanitize_header_value(subject);
         let rfc2822 = format!(
             "To: {}\r\nSubject: {}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}",
-            message.recipient, subject, message.content
+            safe_recipient, safe_subject, message.content
         );
         let encoded = BASE64.encode(rfc2822.as_bytes());
         // Gmail API uses URL-safe base64 with no padding
@@ -593,11 +632,21 @@ pub fn extract_header(msg: &GmailMessage, name: &str) -> Option<String> {
 /// Extract the plain email address from a `From` header value like `"Name <email@example.com>"`.
 pub fn extract_email_from_header(from: &str) -> String {
     if let Some(start) = from.find('<') {
-        if let Some(end) = from.find('>') {
-            return from[start + 1..end].to_string();
+        // Use rfind to find the matching '>' after '<', preventing panic
+        // when malformed headers have '>' before '<'.
+        if let Some(end) = from.rfind('>') {
+            if end > start + 1 {
+                return from[start + 1..end].to_string();
+            }
         }
     }
     from.trim().to_string()
+}
+
+/// Sanitize a string for use in an RFC 2822 header value.
+/// Removes CR and LF characters to prevent header injection attacks.
+pub fn sanitize_header_value(value: &str) -> String {
+    value.chars().filter(|c| *c != '\r' && *c != '\n').collect()
 }
 
 /// Extract the plain-text body from a Gmail message.
@@ -791,6 +840,38 @@ mod tests {
         assert_eq!(
             extract_email_from_header("\"Doe, John\" <john@example.com>"),
             "john@example.com"
+        );
+    }
+
+    #[test]
+    fn extract_email_malformed_angle_brackets() {
+        // '>' before '<' with no proper closing — falls back to full trimmed string
+        assert_eq!(
+            extract_email_from_header("attacker> <victim@example.com"),
+            "attacker> <victim@example.com"
+        );
+        // Properly closed after the second '<'
+        assert_eq!(
+            extract_email_from_header("attacker> <victim@example.com>"),
+            "victim@example.com"
+        );
+        // No closing '>' at all
+        assert_eq!(extract_email_from_header("Name <broken"), "Name <broken");
+    }
+
+    #[test]
+    fn sanitize_header_strips_crlf() {
+        assert_eq!(
+            sanitize_header_value("normal@example.com"),
+            "normal@example.com"
+        );
+        assert_eq!(
+            sanitize_header_value("evil@example.com\r\nBcc: spy@evil.com"),
+            "evil@example.comBcc: spy@evil.com"
+        );
+        assert_eq!(
+            sanitize_header_value("inject\nSubject: fake"),
+            "injectSubject: fake"
         );
     }
 
@@ -1016,6 +1097,7 @@ mod tests {
             oauth_token: "test-token".into(),
             allowed_senders: vec!["@example.com".into()],
             webhook_url: "https://example.com/webhook/gmail".into(),
+            webhook_secret: "my-secret".into(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: GmailPushConfig = serde_json::from_str(&json).unwrap();

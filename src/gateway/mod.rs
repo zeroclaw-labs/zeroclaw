@@ -1824,9 +1824,14 @@ async fn handle_nextcloud_talk_webhook(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// Maximum request body size for the Gmail webhook endpoint (1 MB).
+/// Google Pub/Sub messages are typically under 10 KB.
+const GMAIL_WEBHOOK_MAX_BODY: usize = 1024 * 1024;
+
 /// POST /webhook/gmail — incoming Gmail Pub/Sub push notification
 async fn handle_gmail_push_webhook(
     State(state): State<AppState>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let Some(ref gmail_push) = state.gmail_push else {
@@ -1835,6 +1840,32 @@ async fn handle_gmail_push_webhook(
             Json(serde_json::json!({"error": "Gmail push not configured"})),
         );
     };
+
+    // Enforce body size limit.
+    if body.len() > GMAIL_WEBHOOK_MAX_BODY {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Request body too large"})),
+        );
+    }
+
+    // Authenticate the webhook request using a shared secret.
+    let secret = gmail_push.resolve_webhook_secret();
+    if !secret.is_empty() {
+        let provided = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|auth| auth.strip_prefix("Bearer "))
+            .unwrap_or("");
+
+        if provided != secret {
+            tracing::warn!("Gmail push webhook: unauthorized request");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            );
+        }
+    }
 
     let body_str = String::from_utf8_lossy(&body);
     let envelope: crate::channels::gmail_push::PubSubEnvelope =
