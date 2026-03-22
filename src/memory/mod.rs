@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod cli;
 pub mod conflict;
 pub mod consolidation;
+pub mod decay;
 pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
