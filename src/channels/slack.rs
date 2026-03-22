@@ -570,7 +570,6 @@ impl SlackChannel {
             .await
             .unwrap_or_else(|| raw_file.clone());
 
-
         // Voice / audio transcription: if transcription is configured and the
         // file looks like an audio attachment, download and transcribe it.
         if Self::is_audio_file(&file) {
@@ -1469,7 +1468,6 @@ impl SlackChannel {
             .is_some_and(|ext| Self::mime_from_extension(ext).is_some())
     }
 
-
     /// Audio file extensions accepted for voice transcription.
     const AUDIO_EXTENSIONS: &[&str] = &[
         "flac", "mp3", "mpeg", "mpga", "mp4", "m4a", "ogg", "oga", "opus", "wav", "webm",
@@ -1530,10 +1528,7 @@ impl SlackChannel {
         let audio_data = match resp.bytes().await {
             Ok(bytes) => bytes.to_vec(),
             Err(e) => {
-                tracing::warn!(
-                    "Slack voice file read failed for {}: {e}",
-                    redacted_url
-                );
+                tracing::warn!("Slack voice file read failed for {}: {e}", redacted_url);
                 return None;
             }
         };
@@ -1549,12 +1544,8 @@ impl SlackChannel {
             format!("voice.{mime_ext}")
         };
 
-        match super::transcription::transcribe_audio(
-            audio_data,
-            &transcription_filename,
-            config,
-        )
-        .await
+        match super::transcription::transcribe_audio(audio_data, &transcription_filename, config)
+            .await
         {
             Ok(text) => {
                 let trimmed = text.trim();

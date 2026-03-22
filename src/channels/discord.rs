@@ -847,7 +847,7 @@ impl Channel for DiscordChannel {
                                     text_parts = voice_text;
                                 } else {
                                     text_parts = format!("{text_parts}
-{voice_text}");
+            {voice_text}");
                                 }
                             }
                         }
