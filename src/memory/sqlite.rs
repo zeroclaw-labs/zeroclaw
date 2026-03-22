@@ -46,6 +46,31 @@ impl SqliteMemory {
         )
     }
 
+    /// Like `new`, but stores data in `{db_name}.db` instead of `brain.db`.
+    pub fn new_named(workspace_dir: &Path, db_name: &str) -> anyhow::Result<Self> {
+        let db_path = workspace_dir.join("memory").join(format!("{db_name}.db"));
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Self::open_connection(&db_path, None)?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA synchronous  = NORMAL;
+             PRAGMA mmap_size    = 8388608;
+             PRAGMA cache_size   = -2000;
+             PRAGMA temp_store   = MEMORY;",
+        )?;
+        Self::init_schema(&conn)?;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            db_path,
+            embedder: Arc::new(super::embeddings::NoopEmbedding),
+            vector_weight: 0.7,
+            keyword_weight: 0.3,
+            cache_max: 10_000,
+        })
+    }
+
     /// Build SQLite memory with optional open timeout.
     ///
     /// If `open_timeout_secs` is `Some(n)`, opening the database is limited to `n` seconds

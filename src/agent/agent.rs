@@ -359,7 +359,7 @@ impl Agent {
             None
         };
 
-        let (mut tools, delegate_handle) = tools::all_tools_with_runtime(
+        let (mut tools, delegate_handle, _reaction_handle) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -373,6 +373,7 @@ impl Agent {
             &config.agents,
             config.api_key.as_deref(),
             config,
+            None,
         );
 
         // ── Wire MCP tools (non-fatal) ─────────────────────────────
