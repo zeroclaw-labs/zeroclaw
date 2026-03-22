@@ -3901,6 +3901,10 @@ pub async fn run(
 
     let mut final_output = String::new();
 
+    // Save the base system prompt before any thinking modifications so
+    // the interactive loop can restore it between turns.
+    let base_system_prompt = system_prompt.clone();
+
     if let Some(msg) = message {
         // ── Parse thinking directive from user message ─────────
         let (thinking_directive, effective_msg) =
@@ -4334,7 +4338,7 @@ pub async fn run(
             if thinking_params.system_prompt_prefix.is_some() {
                 if let Some(sys_msg) = history.first_mut() {
                     if sys_msg.role == "system" {
-                        sys_msg.content.clone_from(&system_prompt);
+                        sys_msg.content.clone_from(&base_system_prompt);
                     }
                 }
             }
