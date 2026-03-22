@@ -762,11 +762,9 @@ impl Channel for WhatsAppWebChannel {
                                                 );
                                                 return;
                                             }
-                                            crate::config::WhatsAppChatPolicy::All => {
-                                                // allow unconditionally
-                                            }
-                                            crate::config::WhatsAppChatPolicy::Allowlist => {
-                                                // already filtered by allowed_numbers above
+                                            crate::config::WhatsAppChatPolicy::All
+                                            | crate::config::WhatsAppChatPolicy::Allowlist => {
+                                                // allow unconditionally (Allowlist already filtered above)
                                             }
                                         }
                                     } else {
@@ -778,11 +776,9 @@ impl Channel for WhatsAppWebChannel {
                                                 );
                                                 return;
                                             }
-                                            crate::config::WhatsAppChatPolicy::All => {
-                                                // allow unconditionally
-                                            }
-                                            crate::config::WhatsAppChatPolicy::Allowlist => {
-                                                // already filtered by allowed_numbers above
+                                            crate::config::WhatsAppChatPolicy::All
+                                            | crate::config::WhatsAppChatPolicy::Allowlist => {
+                                                // allow unconditionally (Allowlist already filtered above)
                                             }
                                         }
                                     }
@@ -1460,7 +1456,7 @@ mod tests {
         config.default_provider = "local_whisper".to_string();
         config.local_whisper = Some(crate::config::LocalWhisperConfig {
             url: format!("{}/v1/transcribe", server.uri()),
-            bearer_token: "test-token".to_string(),
+            bearer_token: Some("test-token".to_string()),
             max_audio_bytes: 1024 * 1024,
             timeout_secs: 30,
         });

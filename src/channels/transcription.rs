@@ -456,8 +456,6 @@ impl TranscriptionProvider for AssemblyAiProvider {
         let poll_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(180);
 
         while tokio::time::Instant::now() < poll_deadline {
-            tokio::time::sleep(poll_interval).await;
-
             let poll_resp = client
                 .get(&poll_url)
                 .header("Authorization", &self.api_key)
@@ -493,7 +491,9 @@ impl TranscriptionProvider for AssemblyAiProvider {
                         .unwrap_or("unknown transcription error");
                     bail!("AssemblyAI transcription failed: {}", error_msg);
                 }
-                _ => {}
+                _ => {
+                    tokio::time::sleep(poll_interval).await;
+                }
             }
         }
 
@@ -635,16 +635,17 @@ impl LocalWhisperProvider {
             parsed.scheme()
         );
 
-        let bearer_token = config
-            .bearer_token
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        anyhow::ensure!(
-            !bearer_token.is_empty(),
-            "local_whisper: `bearer_token` must not be empty"
-        );
+        let bearer_token = match config.bearer_token.as_deref() {
+            None => anyhow::bail!("local_whisper: `bearer_token` must be set"),
+            Some(v) => {
+                let trimmed = v.trim().to_string();
+                anyhow::ensure!(
+                    !trimmed.is_empty(),
+                    "local_whisper: `bearer_token` must not be empty"
+                );
+                trimmed
+            }
+        };
 
         anyhow::ensure!(
             config.max_audio_bytes > 0,
@@ -737,6 +738,7 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 pub struct TranscriptionManager {
     providers: HashMap<String, Box<dyn TranscriptionProvider>>,
     default_provider: String,
+    enabled: bool,
 }
 
 impl TranscriptionManager {
@@ -803,6 +805,7 @@ impl TranscriptionManager {
         Ok(Self {
             providers,
             default_provider,
+            enabled: config.enabled,
         })
     }
 
@@ -819,6 +822,10 @@ impl TranscriptionManager {
         file_name: &str,
         provider: &str,
     ) -> Result<String> {
+        if !self.enabled {
+            bail!("Transcription is disabled (enabled = false in config)");
+        }
+
         let p = self.providers.get(provider).ok_or_else(|| {
             let available: Vec<&str> = self.providers.keys().map(|k| k.as_str()).collect();
             anyhow::anyhow!(
@@ -924,6 +931,7 @@ mod tests {
 
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
+        assert_eq!(config.default_provider, "groq");
 
         let err = transcribe_audio(data, "test.ogg", &config)
             .await
@@ -1054,10 +1062,27 @@ mod tests {
         std::env::remove_var("GROQ_API_KEY");
 
         let config = TranscriptionConfig::default();
+        assert!(!config.enabled);
         let manager = TranscriptionManager::new(&config).unwrap();
         assert_eq!(manager.default_provider, "groq");
+        assert!(!manager.enabled);
         // Groq won't be registered without a key.
         assert!(manager.providers.is_empty());
+    }
+
+    #[test]
+    fn manager_rejects_enabled_with_missing_default_provider() {
+        std::env::remove_var("GROQ_API_KEY");
+
+        let mut config = TranscriptionConfig::default();
+        config.enabled = true;
+        let result = TranscriptionManager::new(&config);
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(
+            err.to_string().contains("not configured"),
+            "expected 'not configured' error, got: {err}"
+        );
     }
 
     #[test]
@@ -1095,10 +1120,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manager_transcribe_rejects_disabled() {
+        std::env::remove_var("GROQ_API_KEY");
+
+        let config = TranscriptionConfig::default();
+        let manager = TranscriptionManager::new(&config).unwrap();
+        let err = manager
+            .transcribe(&[0u8; 100], "test.ogg")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("disabled"),
+            "expected disabled error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn manager_rejects_unconfigured_provider() {
         std::env::remove_var("GROQ_API_KEY");
 
         let mut config = TranscriptionConfig::default();
+        config.enabled = true;
         config.api_key = Some("test-groq-key".to_string());
 
         let manager = TranscriptionManager::new(&config).unwrap();
@@ -1177,7 +1219,7 @@ mod tests {
     fn local_whisper_config(url: &str) -> crate::config::LocalWhisperConfig {
         crate::config::LocalWhisperConfig {
             url: url.to_string(),
-            bearer_token: "test-token".to_string(),
+            bearer_token: Some("test-token".to_string()),
             max_audio_bytes: 10 * 1024 * 1024,
             timeout_secs: 30,
         }
@@ -1213,10 +1255,21 @@ mod tests {
     #[test]
     fn local_whisper_rejects_empty_bearer_token() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        cfg.bearer_token = String::new();
+        cfg.bearer_token = Some(String::new());
         let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
         assert!(
             err.to_string().contains("`bearer_token` must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_whisper_rejects_none_bearer_token() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.bearer_token = None;
+        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        assert!(
+            err.to_string().contains("`bearer_token` must be set"),
             "got: {err}"
         );
     }
@@ -1267,7 +1320,7 @@ mod tests {
         // surfaces the error: "not configured".
         let mut config = TranscriptionConfig::default();
         let mut bad_cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        bad_cfg.bearer_token = String::new();
+        bad_cfg.bearer_token = Some(String::new());
         config.local_whisper = Some(bad_cfg);
         config.enabled = true;
         config.default_provider = "local_whisper".to_string();
