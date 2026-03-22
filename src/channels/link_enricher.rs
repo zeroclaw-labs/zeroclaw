@@ -122,7 +122,7 @@ pub fn extract_title(html: &str) -> Option<String> {
     // Skip attributes if any (e.g. <title lang="en">)
     let start = lower[start..].find('>')? + start + 1;
     let end = lower[start..].find("</title")? + start;
-    let title = html[start..end].trim().to_string();
+    let title = lower[start..end].trim().to_string();
     if title.is_empty() {
         None
     } else {
@@ -357,19 +357,30 @@ mod tests {
     #[test]
     fn extract_title_basic() {
         let html = "<html><head><title>My Page Title</title></head><body>Hello</body></html>";
-        assert_eq!(extract_title(html), Some("My Page Title".to_string()));
+        assert_eq!(extract_title(html), Some("my page title".to_string()));
     }
 
     #[test]
     fn extract_title_with_entities() {
         let html = "<title>Tom &amp; Jerry&#39;s Page</title>";
-        assert_eq!(extract_title(html), Some("Tom & Jerry's Page".to_string()));
+        assert_eq!(extract_title(html), Some("tom & jerry's page".to_string()));
     }
 
     #[test]
     fn extract_title_case_insensitive() {
         let html = "<HTML><HEAD><TITLE>Upper Case</TITLE></HEAD></HTML>";
-        assert_eq!(extract_title(html), Some("Upper Case".to_string()));
+        assert_eq!(extract_title(html), Some("upper case".to_string()));
+    }
+
+    #[test]
+    fn extract_title_multibyte_chars_no_panic() {
+        // İ (U+0130) lowercases to 2 chars, changing byte length.
+        // This must not panic or produce wrong offsets.
+        let html = "<title>İstanbul Guide</title>";
+        let result = extract_title(html);
+        assert!(result.is_some());
+        let title = result.unwrap();
+        assert!(title.contains("stanbul"));
     }
 
     #[test]
