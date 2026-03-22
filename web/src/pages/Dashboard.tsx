@@ -236,7 +236,7 @@ export default function Dashboard() {
               className="text-sm font-semibold uppercase tracking-wider"
               style={{ color: "var(--pc-text-primary)" }}
             >
-              {t("dashboard.active_channels")}
+              {t("dashboard.channels")}
             </h2>
             <button
               onClick={() => setShowAllChannels((v) => !v)}
@@ -265,7 +265,7 @@ export default function Dashboard() {
                 : t("dashboard.filter_active")}
             </button>
           </div>
-          <div className="space-y-2">
+          <div className="space-y-2 overflow-y-auto max-h-48 pr-1">
             {Object.entries(status.channels).length === 0 ? (
               <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
                 {t("dashboard.no_channels")}
