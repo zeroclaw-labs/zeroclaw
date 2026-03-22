@@ -433,10 +433,7 @@ mod tests {
     async fn history_rejects_empty_session_id() {
         let (_tmp, backend) = test_backend();
         let tool = SessionsHistoryTool::new(backend, test_security());
-        let result = tool
-            .execute(json!({"session_id": "   "}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"session_id": "   "})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Invalid"));
     }

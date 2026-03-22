@@ -566,10 +566,7 @@ pub fn all_tools_with_runtime(
             backend.clone(),
             security.clone(),
         )));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(
-            backend,
-            security.clone(),
-        )));
+        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
     }
 
     // LinkedIn integration (config-gated)
