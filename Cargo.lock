@@ -9533,6 +9533,7 @@ name = "zeroclawlabs"
 version = "0.5.6"
 dependencies = [
  "aardvark-sys",
+ "aes",
  "anyhow",
  "async-imap",
  "async-trait",
@@ -9549,6 +9550,7 @@ dependencies = [
  "cron",
  "dialoguer",
  "directories",
+ "ecb",
  "extism",
  "fantoccini",
  "futures-util",
@@ -9564,6 +9566,7 @@ dependencies = [
  "libc",
  "mail-parser",
  "matrix-sdk",
+ "md5",
  "mime_guess",
  "nanohtml2text",
  "nostr-sdk",
