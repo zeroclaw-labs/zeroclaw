@@ -3565,7 +3565,7 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle, _reaction_handle) = tools::all_tools_with_runtime(
+    let (mut tools_registry, delegate_handle, _reaction_handle, _channel_map_handle) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -4402,7 +4402,7 @@ pub async fn process_message(
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle_pm, _reaction_handle_pm) =
+    let (mut tools_registry, delegate_handle_pm, _reaction_handle_pm, _channel_map_handle_pm) =
         tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
