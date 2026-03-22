@@ -3686,13 +3686,16 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .discord
                 .as_ref()
                 .context("Discord channel is not configured")?;
-            Ok(Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )))
+            Ok(Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                )
+                .with_transcription(config.transcription.clone()),
+            ))
         }
         "slack" => {
             let sl = config
@@ -3708,7 +3711,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     Vec::new(),
                     sl.allowed_users.clone(),
                 )
-                .with_workspace_dir(config.workspace_dir.clone()),
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_transcription(config.transcription.clone()),
             ))
         }
         other => anyhow::bail!("Unknown channel '{other}'. Supported: telegram, discord, slack"),
@@ -3794,7 +3798,8 @@ fn collect_configured_channels(
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
-                .with_proxy_url(dc.proxy_url.clone()),
+                .with_proxy_url(dc.proxy_url.clone())
+                .with_transcription(config.transcription.clone()),
             ),
         });
     }
@@ -3838,7 +3843,8 @@ fn collect_configured_channels(
                 .with_thread_replies(sl.thread_replies.unwrap_or(true))
                 .with_group_reply_policy(sl.mention_only, Vec::new())
                 .with_workspace_dir(config.workspace_dir.clone())
-                .with_proxy_url(sl.proxy_url.clone()),
+                .with_proxy_url(sl.proxy_url.clone())
+                .with_transcription(config.transcription.clone()),
             ),
         });
     }
