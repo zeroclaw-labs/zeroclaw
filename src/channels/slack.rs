@@ -34,6 +34,9 @@ pub struct SlackChannel {
     active_assistant_thread: Mutex<HashMap<String, String>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Voice transcription config — when set, audio file attachments are
+    /// downloaded, transcribed, and their text inlined into the message.
+    transcription: Option<crate::config::TranscriptionConfig>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -125,6 +128,7 @@ impl SlackChannel {
             workspace_dir: None,
             active_assistant_thread: Mutex::new(HashMap::new()),
             proxy_url: None,
+            transcription: None,
         }
     }
 
@@ -155,6 +159,14 @@ impl SlackChannel {
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    /// Configure voice transcription for audio file attachments.
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
         self
     }
 
@@ -558,6 +570,14 @@ impl SlackChannel {
             .await
             .unwrap_or_else(|| raw_file.clone());
 
+
+        // Voice / audio transcription: if transcription is configured and the
+        // file looks like an audio attachment, download and transcribe it.
+        if Self::is_audio_file(&file) {
+            if let Some(transcribed) = self.try_transcribe_audio_file(&file).await {
+                return Some(transcribed);
+            }
+        }
         if Self::is_image_file(&file) {
             if let Some(marker) = self.fetch_image_marker(&file).await {
                 return Some(marker);
@@ -1447,6 +1467,114 @@ impl SlackChannel {
         Self::file_extension(&Self::slack_file_name(file))
             .as_deref()
             .is_some_and(|ext| Self::mime_from_extension(ext).is_some())
+    }
+
+
+    /// Audio file extensions accepted for voice transcription.
+    const AUDIO_EXTENSIONS: &[&str] = &[
+        "flac", "mp3", "mpeg", "mpga", "mp4", "m4a", "ogg", "oga", "opus", "wav", "webm",
+    ];
+
+    /// Check whether a Slack file object looks like an audio attachment
+    /// (voice memo, audio message, or uploaded audio file).
+    fn is_audio_file(file: &serde_json::Value) -> bool {
+        // Slack voice messages use subtype "slack_audio"
+        if let Some(subtype) = file.get("subtype").and_then(|v| v.as_str()) {
+            if subtype == "slack_audio" {
+                return true;
+            }
+        }
+
+        if Self::slack_file_mime(file)
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("audio/"))
+        {
+            return true;
+        }
+
+        if let Some(ft) = file
+            .get("filetype")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_ascii_lowercase())
+        {
+            if Self::AUDIO_EXTENSIONS.contains(&ft.as_str()) {
+                return true;
+            }
+        }
+
+        Self::file_extension(&Self::slack_file_name(file))
+            .as_deref()
+            .is_some_and(|ext| Self::AUDIO_EXTENSIONS.contains(&ext))
+    }
+
+    /// Download an audio file attachment and transcribe it using the configured
+    /// transcription provider. Returns `None` if transcription is not configured
+    /// or if the download/transcription fails.
+    async fn try_transcribe_audio_file(&self, file: &serde_json::Value) -> Option<String> {
+        let config = self.transcription.as_ref()?;
+
+        let url = Self::slack_file_download_url(file)?;
+        let file_name = Self::slack_file_name(file);
+        let redacted_url = Self::redact_raw_slack_url(url);
+
+        let resp = self.fetch_slack_private_file(url).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!(
+                "Slack voice file download failed for {} ({status})",
+                redacted_url
+            );
+            return None;
+        }
+
+        let audio_data = match resp.bytes().await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(e) => {
+                tracing::warn!(
+                    "Slack voice file read failed for {}: {e}",
+                    redacted_url
+                );
+                return None;
+            }
+        };
+
+        // Determine a filename with extension for the transcription API.
+        let transcription_filename = if Self::file_extension(&file_name).is_some() {
+            file_name.clone()
+        } else {
+            // Fall back to extension from mimetype or default to .ogg
+            let mime_ext = Self::slack_file_mime(file)
+                .and_then(|mime| mime.rsplit('/').next().map(|s| s.to_string()))
+                .unwrap_or_else(|| "ogg".to_string());
+            format!("voice.{mime_ext}")
+        };
+
+        match super::transcription::transcribe_audio(
+            audio_data,
+            &transcription_filename,
+            config,
+        )
+        .await
+        {
+            Ok(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    tracing::info!("Slack voice transcription returned empty text, skipping");
+                    None
+                } else {
+                    tracing::info!(
+                        "Slack: transcribed voice file {} ({} chars)",
+                        file_name,
+                        trimmed.len()
+                    );
+                    Some(format!("[Voice] {trimmed}"))
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Slack voice transcription failed for {}: {e}", file_name);
+                Some(Self::format_attachment_summary(file))
+            }
+        }
     }
 
     async fn download_text_snippet(&self, file: &serde_json::Value) -> Option<String> {
