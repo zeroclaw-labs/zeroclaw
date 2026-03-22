@@ -5497,6 +5497,10 @@ pub struct MatrixConfig {
     pub room_id: String,
     /// Allowed Matrix user IDs. Empty = deny all.
     pub allowed_users: Vec<String>,
+    /// Allowed Matrix room IDs or aliases. Empty = allow all rooms.
+    /// Supports canonical room IDs (`!abc:server`) and aliases (`#room:server`).
+    #[serde(default)]
+    pub allowed_rooms: Vec<String>,
     /// Whether to interrupt an in-flight agent response when a new message arrives.
     #[serde(default)]
     pub interrupt_on_new_message: bool,
@@ -10815,6 +10819,7 @@ default_temperature = 0.7
             device_id: Some("DEVICE123".into()),
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
+            allowed_rooms: vec![],
             interrupt_on_new_message: false,
         };
         let json = serde_json::to_string(&mc).unwrap();
@@ -10836,6 +10841,7 @@ default_temperature = 0.7
             device_id: None,
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
+            allowed_rooms: vec![],
             interrupt_on_new_message: false,
         };
         let toml_str = toml::to_string(&mc).unwrap();
@@ -10929,6 +10935,7 @@ allowed_users = ["@ops:matrix.org"]
                 device_id: None,
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
+                allowed_rooms: vec![],
                 interrupt_on_new_message: false,
             }),
             signal: None,
