@@ -3259,6 +3259,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     });
     prompt.push('\n');
+    if let Some(autonomy_config) = autonomy_config {
+        append_autonomy_constraints_once(&mut prompt, autonomy_config, workspace_dir);
+    }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -3380,6 +3383,82 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     } else {
         prompt
     }
+}
+
+pub fn autonomy_constraints_prompt(
+    autonomy: &crate::config::AutonomyConfig,
+    workspace_dir: &std::path::Path,
+) -> String {
+    use std::fmt::Write;
+
+    let autonomy_level = match autonomy.level {
+        crate::security::AutonomyLevel::ReadOnly => "read-only",
+        crate::security::AutonomyLevel::Supervised => "supervised",
+        crate::security::AutonomyLevel::Full => "full",
+    };
+
+    let mut prompt = String::from("## Autonomy Constraints\n\n");
+    let _ = writeln!(prompt, "- Current autonomy level: `{autonomy_level}`.");
+
+    if autonomy.workspace_only {
+        let _ = writeln!(
+            prompt,
+            "- File access is confined to the workspace `{}` unless a path resolves inside `allowed_roots`.",
+            workspace_dir.display()
+        );
+    } else {
+        prompt.push_str(
+            "- File access may go outside the workspace, but forbidden paths still remain blocked.\n",
+        );
+    }
+
+    if autonomy.allowed_roots.is_empty() {
+        prompt.push_str("- No extra `allowed_roots` are configured.\n");
+    } else {
+        let _ = writeln!(
+            prompt,
+            "- Extra `allowed_roots`: {}.",
+            autonomy.allowed_roots.join(", ")
+        );
+    }
+
+    match autonomy.level {
+        crate::security::AutonomyLevel::ReadOnly => {
+            prompt.push_str(
+                "- Do not attempt write operations, mutations, or side-effecting commands.\n",
+            );
+        }
+        crate::security::AutonomyLevel::Supervised => {
+            prompt.push_str("- Risky actions may require approval; ask or wait for approval instead of pretending the action already happened.\n");
+        }
+        crate::security::AutonomyLevel::Full => {
+            prompt.push_str(
+                "- You may act autonomously, but still stay within command/path/rate limits.\n",
+            );
+        }
+    }
+
+    if !autonomy.non_cli_excluded_tools.is_empty() {
+        let _ = writeln!(
+            prompt,
+            "- The following tools are unavailable on non-CLI channels: {}.",
+            autonomy.non_cli_excluded_tools.join(", ")
+        );
+    }
+
+    prompt.push('\n');
+    prompt
+}
+
+pub fn append_autonomy_constraints_once(
+    prompt: &mut String,
+    autonomy: &crate::config::AutonomyConfig,
+    workspace_dir: &std::path::Path,
+) {
+    if prompt.contains("## Autonomy Constraints") {
+        return;
+    }
+    prompt.push_str(&autonomy_constraints_prompt(autonomy, workspace_dir));
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
@@ -7881,6 +7960,22 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("Never pretend you are waiting for a human approval"),
             "full autonomy should not simulate interactive approval flows"
         );
+        assert_eq!(
+            prompt.matches("## Autonomy Constraints").count(),
+            1,
+            "autonomy constraints should only be injected once"
+        );
+    }
+
+    #[test]
+    fn autonomy_constraints_prompt_describes_workspace_scope() {
+        let config = crate::config::AutonomyConfig::default();
+        let prompt = autonomy_constraints_prompt(&config, std::path::Path::new("/workspace"));
+
+        assert!(prompt.contains("## Autonomy Constraints"));
+        assert!(prompt.contains("supervised"));
+        assert!(prompt.contains("allowed_roots"));
+        assert!(prompt.contains("/workspace"));
     }
 
     #[test]
