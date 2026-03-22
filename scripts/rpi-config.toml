@@ -494,6 +494,7 @@ user_agent = "ZeroClaw/1.0"
 [web_search]
 enabled = false
 provider = "duckduckgo"
+# searxng_url = "http://localhost:8080"   # Required when provider = "searxng" (JSON format must be enabled)
 fallback_providers = []
 retries_per_provider = 0
 retry_backoff_ms = 250

@@ -2275,6 +2275,9 @@ pub struct WebSearchConfig {
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// SearXNG instance URL (required if provider is "searxng")
+    #[serde(default)]
+    pub searxng_url: Option<String>,
     /// Maximum results per search (1-10)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
@@ -2301,6 +2304,7 @@ impl Default for WebSearchConfig {
             enabled: false,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            searxng_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
         }
