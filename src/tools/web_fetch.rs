@@ -1178,4 +1178,186 @@ mod tests {
             .unwrap_or("");
         assert!(markdown.is_empty());
     }
+
+    // ── Boundary test: FIRECRAWL_MIN_BODY_LEN (100 chars) ────────────
+
+    #[test]
+    fn fallback_triggers_at_exactly_99_chars() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let result = ToolResult {
+            success: true,
+            output: "A".repeat(99),
+            error: None,
+        };
+        assert!(
+            tool.should_fallback_to_firecrawl(&result),
+            "99-char body (below threshold) should trigger fallback"
+        );
+    }
+
+    #[test]
+    fn fallback_skipped_at_exactly_100_chars() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let result = ToolResult {
+            success: true,
+            output: "A".repeat(100),
+            error: None,
+        };
+        assert!(
+            !tool.should_fallback_to_firecrawl(&result),
+            "100-char body (at threshold) should NOT trigger fallback"
+        );
+    }
+
+    // ── Item 1: missing API key env var falls back gracefully ─────────
+
+    #[tokio::test]
+    async fn firecrawl_missing_api_key_returns_error() {
+        // Ensure the env var is unset for this test
+        std::env::remove_var("FIRECRAWL_TEST_MISSING_KEY");
+
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            api_key_env: "FIRECRAWL_TEST_MISSING_KEY".into(),
+            ..FirecrawlConfig::default()
+        });
+
+        let result = tool.fetch_via_firecrawl("https://example.com").await;
+        assert!(
+            result.is_err(),
+            "fetch_via_firecrawl should return Err when API key env var is missing"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("FIRECRAWL_TEST_MISSING_KEY"),
+            "Error should mention the missing env var name, got: {err_msg}"
+        );
+    }
+
+    // ── Item 2: double-failure returns original standard result ───────
+
+    #[tokio::test]
+    async fn execute_double_failure_returns_original_result() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+
+        // Standard fetch returns 403 (failure)
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        // Ensure Firecrawl API key env is missing so fallback also fails
+        std::env::remove_var("FIRECRAWL_DOUBLE_FAIL_KEY");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let tool = WebFetchTool::new(
+            security,
+            vec!["*".into()],
+            vec![],
+            500_000,
+            30,
+            FirecrawlConfig {
+                enabled: true,
+                api_key_env: "FIRECRAWL_DOUBLE_FAIL_KEY".into(),
+                api_url: format!("http://{addr}"),
+                ..FirecrawlConfig::default()
+            },
+        );
+
+        let result = tool
+            .execute(json!({"url": format!("http://{addr}/page")}))
+            .await
+            .unwrap();
+
+        // Should return the original 403 error, not a Firecrawl error
+        assert!(!result.success);
+        assert!(
+            result.error.as_deref().unwrap_or("").contains("403"),
+            "Expected original HTTP 403 error, got: {:?}",
+            result.error
+        );
+    }
+
+    // ── Item 3: end-to-end fallback orchestration in execute() ───────
+
+    #[tokio::test]
+    async fn execute_falls_back_to_firecrawl_on_short_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Standard-fetch server: returns a very short body (JS-only placeholder)
+        let standard_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<html><body>Loading...</body></html>")
+                    .insert_header("content-type", "text/html"),
+            )
+            .mount(&standard_server)
+            .await;
+
+        // Firecrawl server: returns rich markdown content
+        let firecrawl_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/scrape"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "data": {
+                    "markdown": "# Real Content\n\nThis is the full page content extracted by Firecrawl, with enough text to be clearly above the minimum body length threshold."
+                }
+            })))
+            .mount(&firecrawl_server)
+            .await;
+
+        // Set up API key env var for this test
+        std::env::set_var("FIRECRAWL_E2E_TEST_KEY", "test-key-12345");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        let standard_addr = standard_server.address();
+        let firecrawl_addr = firecrawl_server.address();
+        let tool = WebFetchTool::new(
+            security,
+            vec!["*".into()],
+            vec![],
+            500_000,
+            30,
+            FirecrawlConfig {
+                enabled: true,
+                api_key_env: "FIRECRAWL_E2E_TEST_KEY".into(),
+                api_url: format!("http://{firecrawl_addr}"),
+                ..FirecrawlConfig::default()
+            },
+        );
+
+        let result = tool
+            .execute(json!({"url": format!("http://{standard_addr}/page")}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected successful Firecrawl fallback");
+        assert!(
+            result.output.contains("Real Content"),
+            "Expected Firecrawl markdown content, got: {}",
+            result.output
+        );
+
+        // Clean up env var
+        std::env::remove_var("FIRECRAWL_E2E_TEST_KEY");
+    }
 }

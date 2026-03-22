@@ -2240,6 +2240,9 @@ pub struct WebFetchConfig {
 pub enum FirecrawlMode {
     #[default]
     Scrape,
+    /// Reserved for future multi-page crawl support. Accepted in config
+    /// deserialization to avoid breaking existing files, but not yet
+    /// implemented — `fetch_via_firecrawl` always uses the `/scrape` endpoint.
     Crawl,
 }
 
