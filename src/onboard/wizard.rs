@@ -4193,6 +4193,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     device_id: detected_device_id,
                     room_id,
                     allowed_users,
+                    allowed_rooms: vec![],
                     interrupt_on_new_message: false,
                 });
             }

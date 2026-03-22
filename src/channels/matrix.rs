@@ -8,6 +8,7 @@ use matrix_sdk::{
         events::reaction::ReactionEventContent,
         events::receipt::ReceiptThread,
         events::relation::{Annotation, Thread},
+        events::room::member::StrippedRoomMemberEvent,
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
         },
@@ -32,6 +33,7 @@ pub struct MatrixChannel {
     access_token: String,
     room_id: String,
     allowed_users: Vec<String>,
+    allowed_rooms: Vec<String>,
     session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
     zeroclaw_dir: Option<PathBuf>,
@@ -48,6 +50,7 @@ impl std::fmt::Debug for MatrixChannel {
             .field("homeserver", &self.homeserver)
             .field("room_id", &self.room_id)
             .field("allowed_users", &self.allowed_users)
+            .field("allowed_rooms", &self.allowed_rooms)
             .finish_non_exhaustive()
     }
 }
@@ -121,7 +124,16 @@ impl MatrixChannel {
         room_id: String,
         allowed_users: Vec<String>,
     ) -> Self {
-        Self::new_with_session_hint(homeserver, access_token, room_id, allowed_users, None, None)
+        Self::new_full(
+            homeserver,
+            access_token,
+            room_id,
+            allowed_users,
+            vec![],
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn new_with_session_hint(
@@ -132,11 +144,12 @@ impl MatrixChannel {
         owner_hint: Option<String>,
         device_id_hint: Option<String>,
     ) -> Self {
-        Self::new_with_session_hint_and_zeroclaw_dir(
+        Self::new_full(
             homeserver,
             access_token,
             room_id,
             allowed_users,
+            vec![],
             owner_hint,
             device_id_hint,
             None,
@@ -152,6 +165,28 @@ impl MatrixChannel {
         device_id_hint: Option<String>,
         zeroclaw_dir: Option<PathBuf>,
     ) -> Self {
+        Self::new_full(
+            homeserver,
+            access_token,
+            room_id,
+            allowed_users,
+            vec![],
+            owner_hint,
+            device_id_hint,
+            zeroclaw_dir,
+        )
+    }
+
+    pub fn new_full(
+        homeserver: String,
+        access_token: String,
+        room_id: String,
+        allowed_users: Vec<String>,
+        allowed_rooms: Vec<String>,
+        owner_hint: Option<String>,
+        device_id_hint: Option<String>,
+        zeroclaw_dir: Option<PathBuf>,
+    ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
         let access_token = access_token.trim().to_string();
         let room_id = room_id.trim().to_string();
@@ -160,12 +195,18 @@ impl MatrixChannel {
             .map(|user| user.trim().to_string())
             .filter(|user| !user.is_empty())
             .collect();
+        let allowed_rooms = allowed_rooms
+            .into_iter()
+            .map(|room| room.trim().to_string())
+            .filter(|room| !room.is_empty())
+            .collect();
 
         Self {
             homeserver,
             access_token,
             room_id,
             allowed_users,
+            allowed_rooms,
             session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
             zeroclaw_dir,
@@ -218,6 +259,21 @@ impl MatrixChannel {
         }
 
         allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
+    }
+
+    /// Check whether a room (by its canonical ID) is in the allowed_rooms list.
+    /// If allowed_rooms is empty, all rooms are allowed.
+    fn is_room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
+        if allowed_rooms.is_empty() {
+            return true;
+        }
+        allowed_rooms
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(room_id))
+    }
+
+    fn is_room_allowed(&self, room_id: &str) -> bool {
+        Self::is_room_allowed_static(&self.allowed_rooms, room_id)
     }
 
     fn is_supported_message_type(msgtype: &str) -> bool {
@@ -702,6 +758,7 @@ impl Channel for MatrixChannel {
         let target_room_for_handler = target_room.clone();
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
+        let allowed_rooms_for_handler = self.allowed_rooms.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
@@ -712,6 +769,7 @@ impl Channel for MatrixChannel {
             let target_room = target_room_for_handler.clone();
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
+            let allowed_rooms = allowed_rooms_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
             let homeserver = homeserver_for_handler.clone();
             let access_token = access_token_for_handler.clone();
@@ -722,6 +780,15 @@ impl Channel for MatrixChannel {
                     target_room.as_str(),
                     room.room_id().as_str(),
                 ) {
+                    return;
+                }
+
+                // Room allowlist: skip messages from rooms not in the configured list
+                if !MatrixChannel::is_room_allowed_static(&allowed_rooms, room.room_id().as_ref()) {
+                    tracing::debug!(
+                        "Matrix: ignoring message from room {} (not in allowed_rooms)",
+                        room.room_id()
+                    );
                     return;
                 }
 
@@ -910,6 +977,45 @@ impl Channel for MatrixChannel {
                 };
 
                 let _ = tx.send(msg).await;
+            }
+        });
+
+        // Invite handler: auto-accept invites for allowed rooms, auto-reject others
+        let allowed_rooms_for_invite = self.allowed_rooms.clone();
+        client.add_event_handler(move |event: StrippedRoomMemberEvent, room: Room| {
+            let allowed_rooms = allowed_rooms_for_invite.clone();
+            async move {
+                // Only process invite events targeting us
+                if event.content.membership
+                    != matrix_sdk::ruma::events::room::member::MembershipState::Invite
+                {
+                    return;
+                }
+
+                let room_id_str = room.room_id().to_string();
+
+                if MatrixChannel::is_room_allowed_static(&allowed_rooms, &room_id_str) {
+                    // Room is allowed (or no allowlist configured): auto-accept
+                    tracing::info!(
+                        "Matrix: auto-accepting invite for allowed room {}",
+                        room_id_str
+                    );
+                    if let Err(error) = room.join().await {
+                        tracing::warn!("Matrix: failed to auto-join room {}: {error}", room_id_str);
+                    }
+                } else {
+                    // Room is NOT in allowlist: auto-reject
+                    tracing::info!(
+                        "Matrix: auto-rejecting invite for room {} (not in allowed_rooms)",
+                        room_id_str
+                    );
+                    if let Err(error) = room.leave().await {
+                        tracing::warn!(
+                            "Matrix: failed to reject invite for room {}: {error}",
+                            room_id_str
+                        );
+                    }
+                }
             }
         });
 
@@ -1570,5 +1676,80 @@ mod tests {
         let json = r#"{"next_batch":"s0"}"#;
         let resp: SyncResponse = serde_json::from_str(json).unwrap();
         assert!(resp.rooms.join.is_empty());
+    }
+
+    #[test]
+    fn empty_allowed_rooms_permits_all() {
+        let ch = make_channel();
+        assert!(ch.is_room_allowed("!any:matrix.org"));
+        assert!(ch.is_room_allowed("!other:evil.org"));
+    }
+
+    #[test]
+    fn allowed_rooms_filters_by_id() {
+        let ch = MatrixChannel::new_full(
+            "https://m.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec!["@user:m".to_string()],
+            vec!["!allowed:matrix.org".to_string()],
+            None,
+            None,
+            None,
+        );
+        assert!(ch.is_room_allowed("!allowed:matrix.org"));
+        assert!(!ch.is_room_allowed("!forbidden:matrix.org"));
+    }
+
+    #[test]
+    fn allowed_rooms_supports_aliases() {
+        let ch = MatrixChannel::new_full(
+            "https://m.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec!["@user:m".to_string()],
+            vec![
+                "#ops:matrix.org".to_string(),
+                "!direct:matrix.org".to_string(),
+            ],
+            None,
+            None,
+            None,
+        );
+        assert!(ch.is_room_allowed("!direct:matrix.org"));
+        assert!(ch.is_room_allowed("#ops:matrix.org"));
+        assert!(!ch.is_room_allowed("!other:matrix.org"));
+    }
+
+    #[test]
+    fn allowed_rooms_case_insensitive() {
+        let ch = MatrixChannel::new_full(
+            "https://m.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+            vec!["!Room:Matrix.org".to_string()],
+            None,
+            None,
+            None,
+        );
+        assert!(ch.is_room_allowed("!room:matrix.org"));
+        assert!(ch.is_room_allowed("!ROOM:MATRIX.ORG"));
+    }
+
+    #[test]
+    fn allowed_rooms_trims_whitespace() {
+        let ch = MatrixChannel::new_full(
+            "https://m.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+            vec!["  !room:matrix.org  ".to_string(), "   ".to_string()],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(ch.allowed_rooms.len(), 1);
+        assert!(ch.is_room_allowed("!room:matrix.org"));
     }
 }

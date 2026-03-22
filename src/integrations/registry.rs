@@ -891,6 +891,7 @@ mod tests {
             device_id: None,
             room_id: "!r:m".into(),
             allowed_users: vec![],
+            allowed_rooms: vec![],
             interrupt_on_new_message: false,
         });
         let entries = all_integrations();
