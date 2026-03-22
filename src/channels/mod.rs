@@ -3805,6 +3805,18 @@ or tune thresholds in config.",
         ChatMessage::user(&persisted_user_content),
     );
 
+    // Save user turn to short-term conversation store (individual row, not JSON blob).
+    if let Some(ref sess) = session {
+        let _ = sess
+            .append_turn(
+                "user",
+                &persisted_user_content,
+                Some(msg.channel.as_str()),
+                Some(msg.sender.as_str()),
+            )
+            .await;
+    }
+
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
         .conversation_histories
@@ -3865,6 +3877,40 @@ or tune thresholds in config.",
         active_provider.supports_native_tools(),
     ));
     let mut history = vec![ChatMessage::system(system_prompt)];
+
+    // Inject recent cross-session conversation turns as short-term memory.
+    // This gives the LLM awareness of recent conversations from past sessions
+    // (e.g., yesterday's chat) even if the current session is fresh.
+    if let Some(ref sess) = session {
+        if prior_turns.len() <= 2 {
+            // Only inject cross-session context when current session is thin
+            // (new session or very few turns). Avoids duplication with active session.
+            match sess
+                .recent_turns_for_sender(
+                    msg.sender.as_str(),
+                    30,          // up to 30 recent turns from past sessions
+                    7 * 86400,   // within last 7 days
+                )
+                .await
+            {
+                Ok(recent_turns) if !recent_turns.is_empty() => {
+                    // Wrap cross-session turns in a context marker so the LLM
+                    // knows these are from prior conversations, not the current one.
+                    let summary: String = recent_turns
+                        .iter()
+                        .map(|t| format!("[{}]: {}", t.role, truncate_with_ellipsis(&t.content, 300)))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let context_msg = format!(
+                        "[Recent conversation history from past sessions]\n{summary}\n[End of past context]"
+                    );
+                    history.push(ChatMessage::system(context_msg));
+                }
+                _ => {}
+            }
+        }
+    }
+
     history.extend(prior_turns);
     let _ = trim_channel_prompt_history(&mut history);
     let use_streaming = target_channel
@@ -4248,6 +4294,15 @@ or tune thresholds in config.",
                         tracing::warn!("Failed to persist session history: {err}");
                     }
                 }
+                // Save assistant turn to short-term conversation store.
+                let _ = sess
+                    .append_turn(
+                        "assistant",
+                        &delivered_response,
+                        Some(msg.channel.as_str()),
+                        Some(msg.sender.as_str()),
+                    )
+                    .await;
             }
 
             // Save structured conversation turn (Q&A pair) to long-term memory.
