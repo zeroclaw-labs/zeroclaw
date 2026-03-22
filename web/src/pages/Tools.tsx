@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Terminal,
   Package,
+  ChevronsUpDown,
 } from 'lucide-react';
 import type { ToolSpec, CliTool } from '@/types/api';
 import { getTools, getCliTools } from '@/lib/api';
