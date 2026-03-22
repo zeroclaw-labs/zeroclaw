@@ -1905,10 +1905,7 @@ mod tests {
         assert_eq!(all_todo.len(), 3);
 
         // Respects limit
-        let limited = mem
-            .list_by_prefix(None, "todo:", 1)
-            .await
-            .unwrap();
+        let limited = mem.list_by_prefix(None, "todo:", 1).await.unwrap();
         assert_eq!(limited.len(), 1);
     }
 
@@ -1928,6 +1925,78 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "a%b:1");
+    }
+
+    #[tokio::test]
+    async fn list_by_prefix_escapes_underscores() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a_b:1", "underscore key", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("axb:2", "should not match", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem
+            .list_by_prefix(Some(&MemoryCategory::Core), "a_b:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "a_b:1");
+    }
+
+    #[tokio::test]
+    async fn list_by_prefix_empty_prefix_returns_all_in_category() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("x:1", "one", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("y:2", "two", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Empty prefix with category should return all entries in that category
+        let results = mem
+            .list_by_prefix(Some(&MemoryCategory::Core), "", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_by_prefix_category_and_limit_combined() {
+        let (_tmp, mem) = temp_sqlite();
+        for i in 0..5 {
+            mem.store(
+                &format!("todo:active:{i}"),
+                &format!("task {i}"),
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let results = mem
+            .list_by_prefix(Some(&MemoryCategory::Core), "todo:active:", 3)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|e| e.key.starts_with("todo:active:")));
+    }
+
+    #[tokio::test]
+    async fn list_by_prefix_no_matches() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("todo:active:1", "task", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem
+            .list_by_prefix(Some(&MemoryCategory::Core), "nonexistent:", 100)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
     }
 
     // ── Session isolation ─────────────────────────────────────────

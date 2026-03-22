@@ -373,3 +373,55 @@ async fn sqlite_memory_list_by_category() {
     let daily_entries = mem.list(Some(&MemoryCategory::Daily), None).await.unwrap();
     assert_eq!(daily_entries.len(), 1, "should have 1 Daily entry");
 }
+
+#[tokio::test]
+async fn sqlite_memory_list_by_prefix_with_category() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+    mem.store("todo:active:1", "buy milk", MemoryCategory::Core, None)
+        .await
+        .unwrap();
+    mem.store("todo:active:2", "clean house", MemoryCategory::Core, None)
+        .await
+        .unwrap();
+    mem.store("todo:done:3", "wash car", MemoryCategory::Core, None)
+        .await
+        .unwrap();
+    mem.store("todo:active:4", "daily active", MemoryCategory::Daily, None)
+        .await
+        .unwrap();
+
+    // With category: only Core entries matching prefix
+    let results = mem
+        .list_by_prefix(Some(&MemoryCategory::Core), "todo:active:", 100)
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 2, "should find 2 active Core tasks");
+    assert!(results.iter().all(|e| e.key.starts_with("todo:active:")));
+    assert!(results.iter().all(|e| e.category == MemoryCategory::Core));
+}
+
+#[tokio::test]
+async fn sqlite_memory_list_by_prefix_without_category() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+    mem.store("todo:active:1", "task a", MemoryCategory::Core, None)
+        .await
+        .unwrap();
+    mem.store("todo:active:2", "task b", MemoryCategory::Daily, None)
+        .await
+        .unwrap();
+    mem.store("health:food:1", "food log", MemoryCategory::Daily, None)
+        .await
+        .unwrap();
+
+    // Without category: all entries matching prefix across all categories
+    let results = mem.list_by_prefix(None, "todo:active:", 100).await.unwrap();
+    assert_eq!(
+        results.len(),
+        2,
+        "should find 2 active tasks across categories"
+    );
+}

@@ -48,14 +48,15 @@ impl Tool for MemoryListTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let category = args.get("category").and_then(|v| v.as_str()).map(|s| {
-            match s {
+        let category = args
+            .get("category")
+            .and_then(|v| v.as_str())
+            .map(|s| match s {
                 "core" => MemoryCategory::Core,
                 "daily" => MemoryCategory::Daily,
                 "conversation" => MemoryCategory::Conversation,
                 other => MemoryCategory::Custom(other.to_string()),
-            }
-        });
+            });
 
         let prefix = args.get("prefix").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -68,16 +69,18 @@ impl Tool for MemoryListTool {
         // Use list_by_prefix when a prefix is provided (pushes LIKE into SQL),
         // fall back to plain list otherwise.
         let result = if prefix.is_empty() {
-            self.memory.list(category.as_ref(), None).await.map(|entries| {
-                entries.into_iter().take(limit).collect::<Vec<_>>()
-            })
+            self.memory
+                .list(category.as_ref(), None)
+                .await
+                .map(|entries| entries.into_iter().take(limit).collect::<Vec<_>>())
         } else {
-            self.memory.list_by_prefix(category.as_ref(), prefix, limit).await
+            self.memory
+                .list_by_prefix(category.as_ref(), prefix, limit)
+                .await
         };
 
         match result {
             Ok(filtered) => {
-
                 if filtered.is_empty() {
                     return Ok(ToolResult {
                         success: true,
@@ -160,10 +163,7 @@ mod tests {
             .unwrap();
 
         let tool = MemoryListTool::new(mem);
-        let result = tool
-            .execute(json!({"category": "core"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"category": "core"})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("Found 1"));
         assert!(result.output.contains("core item"));
@@ -245,5 +245,101 @@ mod tests {
         assert!(schema["properties"]["category"].is_object());
         assert!(schema["properties"]["prefix"].is_object());
         assert!(schema["properties"]["limit"].is_object());
+    }
+
+    #[tokio::test]
+    async fn list_custom_category() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store(
+            "proj:a",
+            "alpha",
+            MemoryCategory::Custom("projects".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("proj:b", "beta", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryListTool::new(mem);
+        let result = tool.execute(json!({"category": "projects"})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Found 1"));
+        assert!(result.output.contains("alpha"));
+        assert!(!result.output.contains("beta"));
+    }
+
+    #[tokio::test]
+    async fn list_prefix_no_matches() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("todo:active:1", "task", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryListTool::new(mem);
+        let result = tool
+            .execute(json!({"prefix": "nonexistent:"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("No memories found"));
+    }
+
+    #[tokio::test]
+    async fn list_prefix_with_limit() {
+        let (_tmp, mem) = seeded_mem();
+        for i in 0..5 {
+            mem.store(
+                &format!("todo:active:{i}"),
+                &format!("task {i}"),
+                MemoryCategory::Core,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let tool = MemoryListTool::new(mem);
+        let result = tool
+            .execute(json!({"prefix": "todo:active:", "limit": 2}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("Found 2"));
+    }
+
+    #[tokio::test]
+    async fn output_format_contains_key_and_content() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store(
+            "todo:active:abc",
+            "Buy groceries",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let tool = MemoryListTool::new(mem);
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(result.success);
+        // Output should contain key, content, and category
+        assert!(result.output.contains("todo:active:abc"));
+        assert!(result.output.contains("Buy groceries"));
+        assert!(result.output.contains("core"));
+    }
+
+    #[tokio::test]
+    async fn list_limit_zero_returns_empty() {
+        let (_tmp, mem) = seeded_mem();
+        mem.store("k:1", "item", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let tool = MemoryListTool::new(mem);
+        let result = tool.execute(json!({"limit": 0})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("No memories found"));
     }
 }
