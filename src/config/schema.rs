@@ -3887,12 +3887,16 @@ pub struct MemoryConfig {
     /// Retrieval stages to execute in order. Valid: "cache", "fts", "vector".
     #[serde(default = "default_retrieval_stages")]
     pub retrieval_stages: Vec<String>,
-    /// Enable LLM reranking when candidate count exceeds threshold.
+    /// Enable reranking when candidate count exceeds threshold.
     #[serde(default)]
     pub rerank_enabled: bool,
     /// Minimum candidate count to trigger reranking.
     #[serde(default = "default_rerank_threshold")]
     pub rerank_threshold: usize,
+    /// Reranker server URL (e.g. "http://localhost:8787").
+    /// When set, uses an external cross-encoder reranker server.
+    #[serde(default)]
+    pub rerank_url: Option<String>,
     /// FTS score above which to early-return without vector search (0.0–1.0).
     #[serde(default = "default_fts_early_return_score")]
     pub fts_early_return_score: f64,
@@ -4043,6 +4047,7 @@ impl Default for MemoryConfig {
             retrieval_stages: default_retrieval_stages(),
             rerank_enabled: false,
             rerank_threshold: default_rerank_threshold(),
+            rerank_url: None,
             fts_early_return_score: default_fts_early_return_score(),
             default_namespace: default_namespace(),
             conflict_threshold: default_conflict_threshold(),

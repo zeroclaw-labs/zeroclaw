@@ -4,8 +4,10 @@
 //! - **Stage 1 (Hot cache):** In-memory LRU of recent recall results.
 //! - **Stage 2 (FTS):** FTS5 keyword search with optional early-return.
 //! - **Stage 3 (Vector):** Vector similarity search + hybrid merge.
+//! - **Stage 4 (Rerank):** Optional cross-encoder reranking via external server.
 //!
-//! Configurable via `[memory]` settings: `retrieval_stages`, `fts_early_return_score`.
+//! Configurable via `[memory]` settings: `retrieval_stages`, `fts_early_return_score`,
+//! `rerank_enabled`, `rerank_threshold`, `rerank_url`.
 
 use super::traits::{Memory, MemoryEntry};
 use parking_lot::Mutex;
@@ -30,6 +32,12 @@ pub struct RetrievalConfig {
     pub cache_max_entries: usize,
     /// TTL for cached results.
     pub cache_ttl: Duration,
+    /// Enable cross-encoder reranking.
+    pub rerank_enabled: bool,
+    /// Minimum candidate count to trigger reranking.
+    pub rerank_threshold: usize,
+    /// Reranker server URL (e.g. "http://localhost:8787").
+    pub rerank_url: Option<String>,
 }
 
 impl Default for RetrievalConfig {
@@ -39,6 +47,9 @@ impl Default for RetrievalConfig {
             fts_early_return_score: 0.85,
             cache_max_entries: 256,
             cache_ttl: Duration::from_secs(300),
+            rerank_enabled: false,
+            rerank_threshold: 5,
+            rerank_url: None,
         }
     }
 }
@@ -110,6 +121,105 @@ impl RetrievalPipeline {
         );
     }
 
+    /// Call external reranker server to reorder results by relevance.
+    ///
+    /// Falls back to original order on any error.
+    async fn rerank_results(
+        &self,
+        query: &str,
+        results: Vec<MemoryEntry>,
+    ) -> Vec<MemoryEntry> {
+        let url = match &self.config.rerank_url {
+            Some(u) if !u.is_empty() => u.clone(),
+            _ => return results,
+        };
+
+        if results.len() < self.config.rerank_threshold {
+            return results;
+        }
+
+        let documents: Vec<String> = results
+            .iter()
+            .map(|e| format!("{}: {}", e.key, e.content))
+            .collect();
+
+        let body = serde_json::json!({
+            "query": query,
+            "documents": documents,
+        });
+
+        let client = crate::config::build_runtime_proxy_client("memory.reranker");
+        let rerank_endpoint = format!("{}/rerank", url.trim_end_matches('/'));
+
+        let resp = match client
+            .post(&rerank_endpoint)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("reranker request failed: {e}");
+                return results;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!("reranker returned {status}: {text}");
+            return results;
+        }
+
+        #[derive(serde::Deserialize)]
+        struct RerankResult {
+            index: usize,
+            score: f64,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct RerankResponse {
+            results: Vec<RerankResult>,
+        }
+
+        let reranked: RerankResponse = match resp.json().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("reranker response parse failed: {e}");
+                return results;
+            }
+        };
+
+        tracing::debug!(
+            "reranker returned {} scored results",
+            reranked.results.len()
+        );
+
+        // Reorder entries by reranker scores
+        let mut reordered: Vec<MemoryEntry> = Vec::with_capacity(reranked.results.len());
+        for rr in &reranked.results {
+            if rr.index < results.len() {
+                let mut entry = results[rr.index].clone();
+                entry.score = Some(rr.score);
+                reordered.push(entry);
+            }
+        }
+
+        // Append any entries the reranker didn't return (shouldn't happen,
+        // but be defensive)
+        let reranked_indices: std::collections::HashSet<usize> =
+            reranked.results.iter().map(|r| r.index).collect();
+        for (i, entry) in results.into_iter().enumerate() {
+            if !reranked_indices.contains(&i) {
+                reordered.push(entry);
+            }
+        }
+
+        reordered
+    }
+
     /// Execute the multi-stage retrieval pipeline.
     pub async fn recall(
         &self,
@@ -157,6 +267,13 @@ impl RetrievalPipeline {
                                 }
                             }
                         }
+
+                        // Apply reranking if enabled
+                        let results = if self.config.rerank_enabled {
+                            self.rerank_results(query, results).await
+                        } else {
+                            results
+                        };
 
                         self.store_in_cache(ck, results.clone());
                         return Ok(results);
@@ -263,5 +380,13 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].content, "cached content");
+    }
+
+    #[test]
+    fn rerank_config_defaults() {
+        let config = RetrievalConfig::default();
+        assert!(!config.rerank_enabled);
+        assert_eq!(config.rerank_threshold, 5);
+        assert!(config.rerank_url.is_none());
     }
 }
