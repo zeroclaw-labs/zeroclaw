@@ -7,10 +7,28 @@
 
 use super::traits::{Tool, ToolResult};
 use crate::channels::session_backend::SessionBackend;
+use crate::security::policy::ToolOperation;
+use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
 use std::sync::Arc;
+
+/// Validate that a session ID is non-empty and contains at least one
+/// alphanumeric character (prevents blank keys after sanitization).
+fn validate_session_id(session_id: &str) -> Result<(), ToolResult> {
+    let trimmed = session_id.trim();
+    if trimmed.is_empty() || !trimmed.chars().any(|c| c.is_alphanumeric()) {
+        return Err(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(
+                "Invalid 'session_id': must be non-empty and contain at least one alphanumeric character.".into(),
+            ),
+        });
+    }
+    Ok(())
+}
 
 // ── SessionsListTool ────────────────────────────────────────────────
 
@@ -89,11 +107,12 @@ impl Tool for SessionsListTool {
 /// Reads the message history of a specific session by ID.
 pub struct SessionsHistoryTool {
     backend: Arc<dyn SessionBackend>,
+    security: Arc<SecurityPolicy>,
 }
 
 impl SessionsHistoryTool {
-    pub fn new(backend: Arc<dyn SessionBackend>) -> Self {
-        Self { backend }
+    pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
+        Self { backend, security }
     }
 }
 
@@ -125,10 +144,25 @@ impl Tool for SessionsHistoryTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Read, "sessions_history")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
+
+        if let Err(result) = validate_session_id(session_id) {
+            return Ok(result);
+        }
 
         #[allow(clippy::cast_possible_truncation)]
         let limit = args
@@ -173,11 +207,12 @@ impl Tool for SessionsHistoryTool {
 /// Sends a message to a specific session, enabling inter-agent communication.
 pub struct SessionsSendTool {
     backend: Arc<dyn SessionBackend>,
+    security: Arc<SecurityPolicy>,
 }
 
 impl SessionsSendTool {
-    pub fn new(backend: Arc<dyn SessionBackend>) -> Self {
-        Self { backend }
+    pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
+        Self { backend, security }
     }
 }
 
@@ -209,10 +244,25 @@ impl Tool for SessionsSendTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "sessions_send")
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(error),
+            });
+        }
+
         let session_id = args
             .get("session_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'session_id' parameter"))?;
+
+        if let Err(result) = validate_session_id(session_id) {
+            return Ok(result);
+        }
 
         let message = args
             .get("message")
@@ -250,6 +300,10 @@ mod tests {
     use crate::channels::session_store::SessionStore;
     use crate::providers::traits::ChatMessage;
     use tempfile::TempDir;
+
+    fn test_security() -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy::default())
+    }
 
     fn test_backend() -> (TempDir, Arc<dyn SessionBackend>) {
         let tmp = TempDir::new().unwrap();
@@ -328,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn history_empty_session() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsHistoryTool::new(backend);
+        let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool
             .execute(json!({"session_id": "nonexistent"}))
             .await
@@ -340,7 +394,7 @@ mod tests {
     #[tokio::test]
     async fn history_returns_messages() {
         let (_tmp, backend) = seeded_backend();
-        let tool = SessionsHistoryTool::new(backend);
+        let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool
             .execute(json!({"session_id": "telegram__alice"}))
             .await
@@ -354,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn history_respects_limit() {
         let (_tmp, backend) = seeded_backend();
-        let tool = SessionsHistoryTool::new(backend);
+        let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool
             .execute(json!({"session_id": "telegram__alice", "limit": 1}))
             .await
@@ -369,16 +423,28 @@ mod tests {
     #[tokio::test]
     async fn history_missing_session_id() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsHistoryTool::new(backend);
+        let tool = SessionsHistoryTool::new(backend, test_security());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("session_id"));
     }
 
+    #[tokio::test]
+    async fn history_rejects_empty_session_id() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsHistoryTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({"session_id": "   "}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Invalid"));
+    }
+
     #[test]
     fn history_tool_name_and_schema() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsHistoryTool::new(backend);
+        let tool = SessionsHistoryTool::new(backend, test_security());
         assert_eq!(tool.name(), "sessions_history");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["session_id"].is_object());
@@ -393,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn send_appends_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend.clone());
+        let tool = SessionsSendTool::new(backend.clone(), test_security());
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -414,7 +480,7 @@ mod tests {
     #[tokio::test]
     async fn send_to_existing_session() {
         let (_tmp, backend) = seeded_backend();
-        let tool = SessionsSendTool::new(backend.clone());
+        let tool = SessionsSendTool::new(backend.clone(), test_security());
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -432,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn send_rejects_empty_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend);
+        let tool = SessionsSendTool::new(backend, test_security());
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -445,9 +511,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_rejects_empty_session_id() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsSendTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({
+                "session_id": "",
+                "message": "hello"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Invalid"));
+    }
+
+    #[tokio::test]
+    async fn send_rejects_non_alphanumeric_session_id() {
+        let (_tmp, backend) = test_backend();
+        let tool = SessionsSendTool::new(backend, test_security());
+        let result = tool
+            .execute(json!({
+                "session_id": "///",
+                "message": "hello"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Invalid"));
+    }
+
+    #[tokio::test]
     async fn send_missing_session_id() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend);
+        let tool = SessionsSendTool::new(backend, test_security());
         let result = tool.execute(json!({"message": "hi"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("session_id"));
@@ -456,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn send_missing_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend);
+        let tool = SessionsSendTool::new(backend, test_security());
         let result = tool.execute(json!({"session_id": "telegram__alice"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("message"));
@@ -465,7 +561,7 @@ mod tests {
     #[test]
     fn send_tool_name_and_schema() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend);
+        let tool = SessionsSendTool::new(backend, test_security());
         assert_eq!(tool.name(), "sessions_send");
         let schema = tool.parameters_schema();
         assert!(schema["required"]

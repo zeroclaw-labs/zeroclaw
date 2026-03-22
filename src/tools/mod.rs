@@ -562,8 +562,14 @@ pub fn all_tools_with_runtime(
         let backend: Arc<dyn crate::channels::session_backend::SessionBackend> =
             Arc::new(session_store);
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsHistoryTool::new(backend.clone())));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(backend)));
+        tool_arcs.push(Arc::new(SessionsHistoryTool::new(
+            backend.clone(),
+            security.clone(),
+        )));
+        tool_arcs.push(Arc::new(SessionsSendTool::new(
+            backend,
+            security.clone(),
+        )));
     }
 
     // LinkedIn integration (config-gated)
