@@ -1,0 +1,77 @@
+name: Build Custom Image
+
+on:
+  push:
+    branches: [fix/gemini-cost-tracking]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,memory-postgres
+
+jobs:
+  build:
+    name: Build linux/amd64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.92.0
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build web dashboard
+        run: |
+          if [ -d web ] && [ -f web/package-lock.json ]; then
+            cd web && npm ci && npm run build
+          else
+            mkdir -p web/dist && echo '<!-- placeholder -->' > web/dist/index.html
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target x86_64-unknown-linux-gnu
+
+      - name: Prepare Docker context
+        run: |
+          mkdir -p docker-ctx/bin/amd64
+          cp target/x86_64-unknown-linux-gnu/release/zeroclaw docker-ctx/bin/amd64/
+
+          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/workspace
+          printf '%s\n' \
+            'workspace_dir = "/zeroclaw-data/workspace"' \
+            'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
+            'api_key = ""' \
+            'default_provider = "openrouter"' \
+            'default_model = "anthropic/claude-sonnet-4-20250514"' \
+            'default_temperature = 0.7' \
+            '' \
+            '[gateway]' \
+            'port = 42617' \
+            'host = "[::]"' \
+            'allow_public_bind = true' \
+            > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
+
+          cp Dockerfile.debian.ci docker-ctx/Dockerfile
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: docker-ctx
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/spectremercury/zeroclaw:cost-tracking-fix
+          platforms: linux/amd64
