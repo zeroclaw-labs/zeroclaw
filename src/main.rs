@@ -852,15 +852,13 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
-    let base_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let base_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let filter = if cli.log_llm {
-        base_filter
-            .add_directive(
-                "zeroclaw::providers::reliable=trace"
-                    .parse()
-                    .expect("valid directive"),
-            )
+        base_filter.add_directive(
+            "zeroclaw::providers::reliable=trace"
+                .parse()
+                .expect("valid directive"),
+        )
     } else {
         base_filter
     };
