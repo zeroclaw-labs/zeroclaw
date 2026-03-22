@@ -38,3 +38,46 @@ allowed_tools = ["read", "edit", "exec"]
 max_iterations = 15
 # Optional: use longer timeout for complex coding tasks
 agentic_timeout_secs = 600
+
+# ── Cron Configuration ────────────────────────────────────────
+[cron]
+# Enable the cron subsystem. Default: true
+enabled = true
+# Run all overdue jobs at scheduler startup. Default: true
+catch_up_on_startup = true
+# Maximum number of historical cron run records to retain. Default: 50
+max_run_history = 50
+
+# ── Declarative Cron Jobs ─────────────────────────────────────
+# Define cron jobs directly in config. These are synced to the database
+# at scheduler startup. Each job needs a stable `id` for merge semantics.
+
+# Shell job: runs a shell command on a cron schedule
+[[cron.jobs]]
+id = "daily-backup"
+name = "Daily Backup"
+job_type = "shell"
+command = "tar czf /tmp/backup.tar.gz /data"
+schedule = { kind = "cron", expr = "0 2 * * *" }
+
+# Agent job: runs an agent prompt on an interval
+[[cron.jobs]]
+id = "health-check"
+name = "Health Check"
+job_type = "agent"
+prompt = "Check server health: disk space, memory, CPU load"
+model = "anthropic/claude-sonnet-4"
+allowed_tools = ["shell", "file_read"]
+schedule = { kind = "every", every_ms = 300000 }
+
+# Cron job with timezone and delivery
+# [[cron.jobs]]
+# id = "morning-report"
+# name = "Morning Report"
+# job_type = "agent"
+# prompt = "Generate a daily summary of system metrics"
+# schedule = { kind = "cron", expr = "0 9 * * 1-5", tz = "America/New_York" }
+# [cron.jobs.delivery]
+# mode = "announce"
+# channel = "telegram"
+# to = "123456789"

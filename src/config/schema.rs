@@ -4808,6 +4808,92 @@ pub struct CronConfig {
     /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
+    /// Declarative cron job definitions (`[[cron.jobs]]`).
+    ///
+    /// Jobs declared here are synced into the database at scheduler startup.
+    /// They use `source = "declarative"` to distinguish them from jobs
+    /// created imperatively via CLI or API. Declarative config takes
+    /// precedence on each sync: if the config changes, the DB is updated
+    /// to match. Imperative jobs are never deleted by the sync process.
+    #[serde(default)]
+    pub jobs: Vec<CronJobDecl>,
+}
+
+/// A declarative cron job definition for the `[[cron.jobs]]` config array.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CronJobDecl {
+    /// Stable identifier used for merge semantics across syncs.
+    pub id: String,
+    /// Human-readable name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Job type: `"shell"` (default) or `"agent"`.
+    #[serde(default = "default_job_type_decl")]
+    pub job_type: String,
+    /// Schedule for the job.
+    pub schedule: CronScheduleDecl,
+    /// Shell command to run (required when `job_type = "shell"`).
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Agent prompt (required when `job_type = "agent"`).
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Whether the job is enabled. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Model override for agent jobs.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Allowlist of tool names for agent jobs.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    /// Session target: `"isolated"` (default) or `"main"`.
+    #[serde(default)]
+    pub session_target: Option<String>,
+    /// Delivery configuration.
+    #[serde(default)]
+    pub delivery: Option<DeliveryConfigDecl>,
+}
+
+/// Schedule variant for declarative cron jobs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum CronScheduleDecl {
+    /// Classic cron expression.
+    Cron {
+        expr: String,
+        #[serde(default)]
+        tz: Option<String>,
+    },
+    /// Interval in milliseconds.
+    Every { every_ms: u64 },
+    /// One-shot at an RFC 3339 timestamp.
+    At { at: String },
+}
+
+/// Delivery configuration for declarative cron jobs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DeliveryConfigDecl {
+    /// Delivery mode: `"none"` or `"announce"`.
+    #[serde(default = "default_delivery_mode")]
+    pub mode: String,
+    /// Channel name (e.g. `"telegram"`, `"discord"`).
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Target/recipient identifier.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Best-effort delivery. Default: `true`.
+    #[serde(default = "default_true")]
+    pub best_effort: bool,
+}
+
+fn default_job_type_decl() -> String {
+    "shell".to_string()
+}
+
+fn default_delivery_mode() -> String {
+    "none".to_string()
 }
 
 fn default_max_run_history() -> u32 {
@@ -4820,6 +4906,7 @@ impl Default for CronConfig {
             enabled: true,
             catch_up_on_startup: true,
             max_run_history: default_max_run_history(),
+            jobs: Vec::new(),
         }
     }
 }
@@ -9831,6 +9918,7 @@ recipient = "42"
             enabled: false,
             catch_up_on_startup: false,
             max_run_history: 100,
+            jobs: Vec::new(),
         };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: CronConfig = serde_json::from_str(&json).unwrap();
