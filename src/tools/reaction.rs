@@ -54,8 +54,8 @@ impl Tool for ReactionTool {
 
     fn description(&self) -> &str {
         "Add or remove an emoji reaction on a message in any active channel. \
-         Provide the channel name (e.g. 'discord', 'slack'), the platform message ID, \
-         and the emoji (Unicode character or platform shortcode)."
+         Provide the channel name (e.g. 'discord', 'slack'), the platform channel ID, \
+         the platform message ID, and the emoji (Unicode character or platform shortcode)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -65,6 +65,10 @@ impl Tool for ReactionTool {
                 "channel": {
                     "type": "string",
                     "description": "Name of the channel to react in (e.g. 'discord', 'slack', 'telegram')"
+                },
+                "channel_id": {
+                    "type": "string",
+                    "description": "Platform-specific channel/conversation identifier (e.g. Discord channel snowflake, Slack channel ID)"
                 },
                 "message_id": {
                     "type": "string",
@@ -80,7 +84,7 @@ impl Tool for ReactionTool {
                     "description": "Whether to add or remove the reaction (default: 'add')"
                 }
             },
-            "required": ["channel", "message_id", "emoji"]
+            "required": ["channel", "channel_id", "message_id", "emoji"]
         })
     }
 
@@ -101,6 +105,11 @@ impl Tool for ReactionTool {
             .get("channel")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'channel' parameter"))?;
+
+        let channel_id = args
+            .get("channel_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'channel_id' parameter"))?;
 
         let message_id = args
             .get("message_id")
@@ -151,10 +160,10 @@ impl Tool for ReactionTool {
         };
 
         let result = if action == "add" {
-            channel.add_reaction(channel_name, message_id, emoji).await
+            channel.add_reaction(channel_id, message_id, emoji).await
         } else {
             channel
-                .remove_reaction(channel_name, message_id, emoji)
+                .remove_reaction(channel_id, message_id, emoji)
                 .await
         };
 
@@ -190,6 +199,7 @@ mod tests {
     struct MockChannel {
         reaction_added: AtomicBool,
         reaction_removed: AtomicBool,
+        last_channel_id: parking_lot::Mutex<Option<String>>,
         fail_on_add: bool,
     }
 
@@ -198,6 +208,7 @@ mod tests {
             Self {
                 reaction_added: AtomicBool::new(false),
                 reaction_removed: AtomicBool::new(false),
+                last_channel_id: parking_lot::Mutex::new(None),
                 fail_on_add: false,
             }
         }
@@ -206,6 +217,7 @@ mod tests {
             Self {
                 reaction_added: AtomicBool::new(false),
                 reaction_removed: AtomicBool::new(false),
+                last_channel_id: parking_lot::Mutex::new(None),
                 fail_on_add: true,
             }
         }
@@ -230,23 +242,25 @@ mod tests {
 
         async fn add_reaction(
             &self,
-            _channel_id: &str,
+            channel_id: &str,
             _message_id: &str,
             _emoji: &str,
         ) -> anyhow::Result<()> {
             if self.fail_on_add {
                 return Err(anyhow::anyhow!("API error: rate limited"));
             }
+            *self.last_channel_id.lock() = Some(channel_id.to_string());
             self.reaction_added.store(true, Ordering::SeqCst);
             Ok(())
         }
 
         async fn remove_reaction(
             &self,
-            _channel_id: &str,
+            channel_id: &str,
             _message_id: &str,
             _emoji: &str,
         ) -> anyhow::Result<()> {
+            *self.last_channel_id.lock() = Some(channel_id.to_string());
             self.reaction_removed.store(true, Ordering::SeqCst);
             Ok(())
         }
@@ -270,11 +284,13 @@ mod tests {
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["channel"].is_object());
+        assert!(schema["properties"]["channel_id"].is_object());
         assert!(schema["properties"]["message_id"].is_object());
         assert!(schema["properties"]["emoji"].is_object());
         assert!(schema["properties"]["action"].is_object());
         let required = schema["required"].as_array().unwrap();
         assert!(required.iter().any(|v| v == "channel"));
+        assert!(required.iter().any(|v| v == "channel_id"));
         assert!(required.iter().any(|v| v == "message_id"));
         assert!(required.iter().any(|v| v == "emoji"));
         // action is optional (defaults to "add")
@@ -289,6 +305,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "channel": "discord",
+                "channel_id": "ch_001",
                 "message_id": "msg_123",
                 "emoji": "\u{2705}"
             }))
@@ -308,6 +325,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "channel": "slack",
+                "channel_id": "C0123SLACK",
                 "message_id": "msg_456",
                 "emoji": "\u{1F440}",
                 "action": "remove"
@@ -329,6 +347,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "channel": "nonexistent",
+                "channel_id": "ch_x",
                 "message_id": "msg_1",
                 "emoji": "\u{2705}"
             }))
@@ -351,6 +370,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "channel": "discord",
+                "channel_id": "ch_001",
                 "message_id": "msg_1",
                 "emoji": "\u{2705}",
                 "action": "toggle"
@@ -370,6 +390,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "channel": "discord",
+                "channel_id": "ch_001",
                 "message_id": "msg_1",
                 "emoji": "\u{2705}"
             }))
@@ -388,16 +409,20 @@ mod tests {
         )]);
 
         // Missing channel
-        let result = tool.execute(json!({"message_id": "1", "emoji": "x"})).await;
+        let result = tool.execute(json!({"channel_id": "c1", "message_id": "1", "emoji": "x"})).await;
+        assert!(result.is_err());
+
+        // Missing channel_id
+        let result = tool.execute(json!({"channel": "test", "message_id": "1", "emoji": "x"})).await;
         assert!(result.is_err());
 
         // Missing message_id
-        let result = tool.execute(json!({"channel": "a", "emoji": "x"})).await;
+        let result = tool.execute(json!({"channel": "a", "channel_id": "c1", "emoji": "x"})).await;
         assert!(result.is_err());
 
         // Missing emoji
         let result = tool
-            .execute(json!({"channel": "a", "message_id": "1"}))
+            .execute(json!({"channel": "a", "channel_id": "c1", "message_id": "1"}))
             .await;
         assert!(result.is_err());
     }
@@ -410,6 +435,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "channel": "discord",
+                "channel_id": "ch_001",
                 "message_id": "msg_1",
                 "emoji": "\u{2705}"
             }))
@@ -429,6 +455,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "channel": "test",
+                "channel_id": "ch_test",
                 "message_id": "msg_1",
                 "emoji": "\u{2705}"
             }))
@@ -441,6 +468,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_id_passed_to_trait_not_channel_name() {
+        let mock = Arc::new(MockChannel::new());
+        let mock_ch: Arc<dyn Channel> = Arc::clone(&mock) as Arc<dyn Channel>;
+        let tool = make_tool_with_channels(vec![("discord", mock_ch)]);
+
+        let result = tool
+            .execute(json!({
+                "channel": "discord",
+                "channel_id": "123456789",
+                "message_id": "msg_1",
+                "emoji": "\u{2705}"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        // The trait must receive the platform channel_id, not the channel name
+        assert_eq!(
+            mock.last_channel_id.lock().as_deref(),
+            Some("123456789"),
+            "add_reaction must receive channel_id, not channel name"
+        );
+    }
+
+    #[tokio::test]
     async fn channel_map_handle_allows_late_binding() {
         let tool = ReactionTool::new(Arc::new(SecurityPolicy::default()));
         let handle = tool.channel_map_handle();
@@ -449,6 +501,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "channel": "slack",
+                "channel_id": "C0123",
                 "message_id": "msg_1",
                 "emoji": "\u{2705}"
             }))
@@ -469,6 +522,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "channel": "slack",
+                "channel_id": "C0123",
                 "message_id": "msg_1",
                 "emoji": "\u{2705}"
             }))
