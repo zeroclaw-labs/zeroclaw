@@ -1106,20 +1106,19 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     // workspace-aware system context before model invocation.
     let system_prompt = {
         let config_guard = state.config.lock();
-        let mut prompt = crate::channels::build_system_prompt(
+        crate::channels::build_system_prompt_with_mode_and_autonomy(
             &config_guard.workspace_dir,
             &state.model,
             &[], // tools - empty for simple chat
             &[], // skills
             Some(&config_guard.identity),
             None, // bootstrap_max_chars - use default
-        );
-        crate::channels::append_autonomy_constraints_once(
-            &mut prompt,
-            &config_guard.autonomy,
-            &config_guard.workspace_dir,
-        );
-        prompt
+            Some(&config_guard.autonomy),
+            false,
+            config_guard.skills.prompt_injection_mode,
+            false,
+            0,
+        )
     };
 
     let mut messages = Vec::with_capacity(1 + user_messages.len());
@@ -2464,6 +2463,84 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".into())
         }
+    }
+
+    #[derive(Default)]
+    struct CaptureSystemPromptProvider {
+        last_system_prompt: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for CaptureSystemPromptProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            *self.last_system_prompt.lock() = system_prompt.map(std::string::ToString::to_string);
+            Ok("ok".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_gateway_chat_simple_uses_runtime_autonomy_config() {
+        let provider_impl = Arc::new(CaptureSystemPromptProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut config = Config::default();
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        config.autonomy.workspace_only = false;
+        config.autonomy.allowed_roots = vec!["/var/data".into()];
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            gmail_push: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+        };
+
+        run_gateway_chat_simple(&state, "hello").await.unwrap();
+        let prompt = provider_impl
+            .last_system_prompt
+            .lock()
+            .clone()
+            .expect("system prompt should be present");
+
+        assert!(prompt.contains("## Autonomy Constraints"));
+        assert!(prompt.contains("Current autonomy level: `read-only`."));
+        assert!(prompt.contains("/var/data"));
+        assert!(
+            !prompt.contains("Current autonomy level: `supervised`."),
+            "prompt should not fall back to synthetic default autonomy config"
+        );
     }
 
     #[derive(Default)]
