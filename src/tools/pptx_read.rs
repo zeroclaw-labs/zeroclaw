@@ -214,7 +214,7 @@ fn parse_slide_order_from_manifest<R: std::io::Read + std::io::Seek>(
     let mut presentation_reader = Reader::from_str(&presentation_xml);
     loop {
         match presentation_reader.read_event() {
-            Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event)) => {
+            Ok(Event::Start(ref event) | Event::Empty(ref event)) => {
                 if local_name(event.name().as_ref()) == b"sldId" {
                     for attr in event.attributes().flatten() {
                         let raw_key = attr.key.as_ref();
@@ -241,7 +241,7 @@ fn parse_slide_order_from_manifest<R: std::io::Read + std::io::Seek>(
     let mut rels_reader = Reader::from_str(&rels_xml);
     loop {
         match rels_reader.read_event() {
-            Ok(Event::Start(ref event)) | Ok(Event::Empty(ref event)) => {
+            Ok(Event::Start(ref event) | Event::Empty(ref event)) => {
                 if local_name(event.name().as_ref()) == b"Relationship" {
                     let mut rel_id = None;
                     let mut target = None;

@@ -42,10 +42,7 @@ pub enum FixInstruction {
         description: String,
     },
     /// Apply a unified diff patch.
-    ApplyPatch {
-        patch: String,
-        description: String,
-    },
+    ApplyPatch { patch: String, description: String },
     /// Requires LLM inference to generate the fix.
     LlmAssisted {
         prompt: String,
@@ -98,10 +95,7 @@ impl FixPlan {
 /// - Complex findings → `LlmAssisted` with structured prompt
 ///
 /// Findings below `min_severity` are deferred (not included).
-pub fn generate_fix_plan(
-    report: &ConsensusReport,
-    min_severity: Severity,
-) -> FixPlan {
+pub fn generate_fix_plan(report: &ConsensusReport, min_severity: Severity) -> FixPlan {
     if report.verdict == ReviewVerdict::Approve {
         return FixPlan {
             instructions: Vec::new(),
@@ -230,7 +224,7 @@ fn build_finding_fix_prompt(finding: &ReviewFinding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::traits::{ReviewFinding, ReviewReport, ReviewVerdict};
+    use crate::coding::traits::{ReviewFinding, ReviewVerdict};
 
     fn make_finding(
         severity: Severity,

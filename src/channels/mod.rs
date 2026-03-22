@@ -138,9 +138,12 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
-const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
-const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
-const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
+/// Long-term memory entries are ontology-structured summaries, so individual entries
+/// are compact. We load generously — relevance + recency + recent-recall ordering
+/// is handled by the Memory backend, so we don't need to artificially limit count.
+const MEMORY_CONTEXT_MAX_ENTRIES: usize = 50;
+const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 1_200;
+const MEMORY_CONTEXT_MAX_CHARS: usize = 20_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
 const CHANNEL_CONTEXT_TOKEN_ESTIMATE_LIMIT: usize = 90_000;
@@ -1025,7 +1028,7 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
         "change provider to ",
     ] {
         if let Some(rest) = lower.strip_prefix(prefix) {
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             if is_runtime_token(token) {
                 return resolve_provider_alias(token).or_else(|| Some(token.to_string()));
             }
@@ -1034,7 +1037,7 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
 
     // "use <provider>" — only if it matches a known provider alias
     if let Some(rest) = lower.strip_prefix("use ") {
-        let token = rest.trim().split_whitespace().next()?;
+        let token = rest.split_whitespace().next()?;
         if resolve_provider_alias(token).is_some() {
             return resolve_provider_alias(token);
         }
@@ -1070,7 +1073,7 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
         "sử dụng ",
     ] {
         if let Some(rest) = lower.strip_prefix(prefix) {
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             if is_runtime_token(token) {
                 return resolve_provider_alias(token).or_else(|| Some(token.to_string()));
             }
@@ -1089,11 +1092,10 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
         "प्रदाता बदलें ",
     ] {
         if let Some(rest) = original.strip_prefix(prefix) {
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             let token_lower = token.to_ascii_lowercase();
             if is_runtime_token(&token_lower) {
-                return resolve_provider_alias(&token_lower)
-                    .or_else(|| Some(token_lower));
+                return resolve_provider_alias(&token_lower).or_else(|| Some(token_lower));
             }
         }
     }
@@ -1104,15 +1106,25 @@ fn parse_natural_language_switch_provider(lower: &str, original: &str) -> Option
     // Chinese: "切换", (handled above as prefix)
     for suffix in &[
         // Korean
-        "로 변경", "로 바꿔줘", "로 바꿔", "로 전환",
-        "으로 변경", "으로 바꿔줘", "으로 바꿔", "으로 전환",
+        "로 변경",
+        "로 바꿔줘",
+        "로 바꿔",
+        "로 전환",
+        "으로 변경",
+        "으로 바꿔줘",
+        "으로 바꿔",
+        "으로 전환",
         // Japanese
-        "に変更", "に切り替えて", "に切替", "を使って",
+        "に変更",
+        "に切り替えて",
+        "に切替",
+        "を使って",
         // Hindi
-        " पर स्विच करें", " में बदलें",
+        " पर स्विच करें",
+        " में बदलें",
     ] {
         if let Some(rest) = original.strip_suffix(suffix) {
-            let token = rest.trim().split_whitespace().last()?;
+            let token = rest.split_whitespace().last()?;
             let token_lower = token.to_ascii_lowercase();
             if resolve_provider_alias(&token_lower).is_some() {
                 return resolve_provider_alias(&token_lower);
@@ -1158,7 +1170,7 @@ fn parse_natural_language_switch_model(lower: &str, original: &str) -> Option<St
         "dùng model ",
     ] {
         if let Some(rest) = lower.strip_prefix(prefix) {
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             if is_runtime_token(token) {
                 return Some(token.to_string());
             }
@@ -1168,19 +1180,30 @@ fn parse_natural_language_switch_model(lower: &str, original: &str) -> Option<St
     // Multi-language prefix patterns (original/Unicode)
     for prefix in &[
         // Korean
-        "모델을 ", "모델 ",
+        "모델을 ",
+        "모델 ",
         // Chinese
-        "模型切换到", "模型换成", "切换模型到", "换模型为",
+        "模型切换到",
+        "模型换成",
+        "切换模型到",
+        "换模型为",
         // Japanese
-        "モデルを", "モデル変更 ",
+        "モデルを",
+        "モデル変更 ",
         // Hindi
         "मॉडल बदलें ",
     ] {
         if let Some(rest) = original.strip_prefix(prefix) {
             // Try suffix-based extraction first (Korean/Japanese)
             for suffix in &[
-                "로 변경해줘", "로 변경", "로 바꿔줘", "로 바꿔", "로 전환",
-                "に変更", "に切り替え", "に変更して",
+                "로 변경해줘",
+                "로 변경",
+                "로 바꿔줘",
+                "로 바꿔",
+                "로 전환",
+                "に変更",
+                "に切り替え",
+                "に変更して",
             ] {
                 if let Some(model_part) = rest.strip_suffix(suffix) {
                     let token = model_part.trim();
@@ -1190,7 +1213,7 @@ fn parse_natural_language_switch_model(lower: &str, original: &str) -> Option<St
                 }
             }
             // Fallback: first token
-            let token = rest.trim().split_whitespace().next()?;
+            let token = rest.split_whitespace().next()?;
             let token_lower = token.to_ascii_lowercase();
             if is_runtime_token(&token_lower) {
                 return Some(token_lower);
@@ -2380,11 +2403,7 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
             ""
         };
         if provider.aliases.is_empty() {
-            let _ = writeln!(
-                response,
-                "- {}{active}{key_badge}",
-                provider.display_name
-            );
+            let _ = writeln!(response, "- {}{active}{key_badge}", provider.display_name);
         } else {
             let _ = writeln!(
                 response,
@@ -3137,7 +3156,7 @@ async fn build_memory_context(
 ) -> String {
     let mut context = String::new();
 
-    if let Ok(entries) = mem.recall(user_msg, 5, session_id).await {
+    if let Ok(entries) = mem.recall(user_msg, 50, session_id).await {
         let mut included = 0usize;
         let mut used_chars = 0usize;
 
@@ -3791,13 +3810,6 @@ or tune thresholds in config.",
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let had_prior_history = ctx
-        .conversation_histories
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&history_key)
-        .is_some_and(|turns| !turns.is_empty());
-
     // Inject per-message timestamp so the LLM always knows the current time,
     // even in multi-turn conversations where the system prompt may be stale.
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
@@ -3810,6 +3822,21 @@ or tune thresholds in config.",
         &history_key,
         ChatMessage::user(&persisted_user_content),
     );
+
+    // Save user turn to short-term conversation store (individual row, not JSON blob).
+    if let Some(ref sess) = session {
+        if let Err(err) = sess
+            .append_turn(
+                "user",
+                &persisted_user_content,
+                Some(msg.channel.as_str()),
+                Some(msg.sender.as_str()),
+            )
+            .await
+        {
+            tracing::warn!("Failed to persist user turn: {err}");
+        }
+    }
 
     // Build history from per-sender conversation cache.
     let prior_turns_raw = ctx
@@ -3831,10 +3858,11 @@ or tune thresholds in config.",
                 last_turn.content = timestamped_content.clone();
             }
 
-            // Only enrich with memory context when there is no prior
-            // conversation history. Follow-up turns already include context
-            // from previous messages.
-            if !had_prior_history {
+            // Enrich every user turn with relevant memory context so the LLM
+            // can reference long-term knowledge even in follow-up messages.
+            // Memory recall is cheap (cached FTS5 + vector) and prevents
+            // context loss when conversation history is compacted or trimmed.
+            {
                 let memory_context = build_memory_context(
                     ctx.memory.as_ref(),
                     &msg.content,
@@ -3870,6 +3898,42 @@ or tune thresholds in config.",
         active_provider.supports_native_tools(),
     ));
     let mut history = vec![ChatMessage::system(system_prompt)];
+
+    // Inject recent cross-session conversation turns as short-term memory.
+    // This gives the LLM awareness of recent conversations from past sessions
+    // (e.g., yesterday's chat) even if the current session is fresh.
+    if let Some(ref sess) = session {
+        if prior_turns.len() <= 4 {
+            // Only inject cross-session context when current session is thin
+            // (new session or very few turns). Avoids duplication with active session.
+            match sess
+                .recent_turns_for_sender(
+                    msg.sender.as_str(),
+                    300,        // up to 300 recent turns from past sessions
+                    30 * 86400, // within last 30 days
+                )
+                .await
+            {
+                Ok(recent_turns) if !recent_turns.is_empty() => {
+                    // Wrap cross-session turns in a context marker so the LLM
+                    // knows these are from prior conversations, not the current one.
+                    let summary: String = recent_turns
+                        .iter()
+                        .map(|t| {
+                            format!("[{}]: {}", t.role, truncate_with_ellipsis(&t.content, 500))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let context_msg = format!(
+                        "[Recent conversation history from past sessions]\n{summary}\n[End of past context]"
+                    );
+                    history.push(ChatMessage::system(context_msg));
+                }
+                _ => {}
+            }
+        }
+    }
+
     history.extend(prior_turns);
     let _ = trim_channel_prompt_history(&mut history);
     let use_streaming = target_channel
@@ -3964,17 +4028,25 @@ or tune thresholds in config.",
         None
     };
 
-    // React with 👀 to acknowledge the incoming message
-    if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel
-            .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
-            .await
-        {
-            tracing::debug!("Failed to add reaction: {e}");
+    // React with 👀 to acknowledge the incoming message (skip for silent/internal messages)
+    if !msg.silent {
+        if let Some(channel) = target_channel.as_ref() {
+            if let Err(e) = channel
+                .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+                .await
+            {
+                tracing::debug!("Failed to add reaction: {e}");
+            }
         }
     }
 
-    let typing_cancellation = target_channel.as_ref().map(|_| CancellationToken::new());
+    // Suppress typing indicators for silent (heartbeat/cron/internal) messages
+    // to prevent visible screen flickering on the user's device.
+    let typing_cancellation = if msg.silent {
+        None
+    } else {
+        target_channel.as_ref().map(|_| CancellationToken::new())
+    };
     let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
         (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
             Arc::clone(channel),
@@ -4237,17 +4309,62 @@ or tune thresholds in config.",
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
-            if ctx.auto_save_memory
-                && delivered_response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            {
-                let assistant_key = assistant_memory_key(&msg);
+
+            // Persist conversation history to session backend (SQLite/memory)
+            // so context survives restarts and is available for future turns.
+            if let Some(ref sess) = session {
+                let snapshot: Vec<ChatMessage> = ctx
+                    .conversation_histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&history_key)
+                    .cloned()
+                    .unwrap_or_default();
+                if !snapshot.is_empty() {
+                    if let Err(err) = sess.update_history(snapshot).await {
+                        tracing::warn!("Failed to persist session history: {err}");
+                    }
+                }
+                // Save assistant turn to short-term conversation store.
+                if let Err(err) = sess
+                    .append_turn(
+                        "assistant",
+                        &delivered_response,
+                        Some(msg.channel.as_str()),
+                        Some(msg.sender.as_str()),
+                    )
+                    .await
+                {
+                    tracing::warn!("Failed to persist assistant turn: {err}");
+                }
+            }
+
+            // Save structured conversation turn (Q&A pair) to long-term memory.
+            // This enables recall of full conversation context (who asked what,
+            // what was answered) even after session compaction or restart.
+            if ctx.auto_save_memory {
+                let now_ts = chrono::Local::now();
+                let turn_key = format!(
+                    "conv_turn_{}_{}_{}",
+                    msg.channel,
+                    msg.sender,
+                    now_ts.format("%Y%m%d_%H%M%S")
+                );
+                let structured_turn = format!(
+                    "[{}] Channel: {} | Sender: {}\nQ: {}\nA: {}",
+                    now_ts.format("%Y-%m-%d %H:%M:%S"),
+                    msg.channel,
+                    msg.sender,
+                    truncate_with_ellipsis(&msg.content, 500),
+                    truncate_with_ellipsis(&delivered_response, 1000),
+                );
                 let _ = ctx
                     .memory
                     .store(
-                        &assistant_key,
-                        &delivered_response,
-                        crate::memory::MemoryCategory::Conversation,
-                        None,
+                        &turn_key,
+                        &structured_turn,
+                        crate::memory::MemoryCategory::Core,
+                        Some(&history_key),
                     )
                     .await;
             }
@@ -5695,7 +5812,11 @@ fn collect_configured_channels(
     if let Some(ref kakao) = config.channels_config.kakao {
         channels.push(ConfiguredChannel {
             display_name: "KakaoTalk",
-            channel: Arc::new(KakaoTalkChannel::from_config(kakao, pairing_store.clone(), gateway_url.clone())),
+            channel: Arc::new(KakaoTalkChannel::from_config(
+                kakao,
+                pairing_store.clone(),
+                gateway_url.clone(),
+            )),
         });
     }
 
@@ -6072,15 +6193,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // Determine the gateway URL for channel auto-pair links.
     let channel_gateway_url = std::env::var("ZEROCLAW_PUBLIC_URL")
         .ok()
-        .or_else(|| {
-            Some(format!(
-                "http://localhost:{}",
-                config.gateway.port
-            ))
-        });
+        .or_else(|| Some(format!("http://localhost:{}", config.gateway.port)));
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
-    let mut configured_channels = collect_configured_channels(&config, "runtime startup", channel_pairing_store, channel_gateway_url);
+    let mut configured_channels = collect_configured_channels(
+        &config,
+        "runtime startup",
+        channel_pairing_store,
+        channel_gateway_url,
+    );
     let mut init_failures = Vec::new();
     if let Some(reason) =
         append_nostr_channel_if_available(&config, &mut configured_channels, "runtime startup")
@@ -6271,7 +6392,7 @@ mod tests {
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
     use crate::providers::{ChatMessage, Provider};
-    use crate::security::AutonomyLevel;
+
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -7364,6 +7485,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -7444,6 +7566,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -7511,6 +7634,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -7592,6 +7716,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "draft-streaming-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -7672,6 +7797,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "draft-streaming-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -7744,6 +7870,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -7811,6 +7938,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -7887,6 +8015,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8006,6 +8135,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8132,6 +8262,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8221,6 +8352,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8301,6 +8433,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     channel: "telegram".to_string(),
                     timestamp: 1,
                     thread_ts: None,
+                    silent: false,
                 },
                 CancellationToken::new(),
             )
@@ -8333,6 +8466,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8458,6 +8592,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8567,6 +8702,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8677,6 +8813,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8769,6 +8906,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8863,6 +9001,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -8966,6 +9105,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9000,6 +9140,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9122,6 +9263,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9214,6 +9356,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9248,6 +9391,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9364,6 +9508,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9484,6 +9629,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9584,6 +9730,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9613,6 +9760,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9703,6 +9851,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9731,6 +9880,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9823,6 +9973,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -9902,6 +10053,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -10001,6 +10153,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -10299,6 +10452,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -10367,6 +10521,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -10548,6 +10703,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            silent: false,
         })
         .await
         .unwrap();
@@ -10559,6 +10715,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            silent: false,
         })
         .await
         .unwrap();
@@ -10639,6 +10796,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             })
             .await
             .unwrap();
@@ -10651,6 +10809,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             })
             .await
             .unwrap();
@@ -10741,6 +10900,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             })
             .await
             .unwrap();
@@ -10753,6 +10913,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             })
             .await
             .unwrap();
@@ -10825,6 +10986,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -10894,6 +11056,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -11273,6 +11436,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            silent: false,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -11288,6 +11452,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            silent: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11297,6 +11462,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            silent: false,
         };
 
         assert_ne!(
@@ -11315,6 +11481,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            silent: false,
         };
 
         let user_key = conversation_memory_key(&msg);
@@ -11335,6 +11502,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "qq".into(),
             timestamp: 1,
             thread_ts: Some("msg-a".into()),
+            silent: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11344,6 +11512,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "qq".into(),
             timestamp: 2,
             thread_ts: Some("msg-b".into()),
+            silent: false,
         };
 
         assert_eq!(conversation_history_key(&msg1), "qq_user_open_1");
@@ -11363,6 +11532,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "napcat".into(),
             timestamp: 1,
             thread_ts: Some("msg-a".into()),
+            silent: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11372,6 +11542,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "napcat".into(),
             timestamp: 2,
             thread_ts: Some("msg-b".into()),
+            silent: false,
         };
 
         assert_eq!(conversation_history_key(&msg1), "napcat_user_1001");
@@ -11394,6 +11565,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            silent: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -11403,6 +11575,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            silent: false,
         };
 
         mem.store(
@@ -11525,6 +11698,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -11540,6 +11714,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -11621,6 +11796,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "qq".to_string(),
                 timestamp: 1,
                 thread_ts: Some("msg-1".to_string()),
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -11636,6 +11812,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "qq".to_string(),
                 timestamp: 2,
                 thread_ts: Some("msg-2".to_string()),
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -11716,6 +11893,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -11815,6 +11993,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -12634,6 +12813,7 @@ BTC is currently around $65,000 based on latest tool output."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -12709,6 +12889,7 @@ BTC is currently around $65,000 based on latest tool output."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )
@@ -12724,6 +12905,7 @@ BTC is currently around $65,000 based on latest tool output."#;
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                silent: false,
             },
             CancellationToken::new(),
         )

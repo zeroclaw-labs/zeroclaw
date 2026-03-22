@@ -347,12 +347,13 @@ mod tests {
         seed_default_types(&conn).unwrap();
 
         let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM ontology_object_types",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM ontology_object_types", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert!(count >= 10, "expected at least 10 object types, got {count}");
+        assert!(
+            count >= 10,
+            "expected at least 10 object types, got {count}"
+        );
     }
 }

@@ -179,21 +179,26 @@ pub async fn handle_llm_proxy(
             let response_text = chat_response.text.as_deref().unwrap_or("");
 
             // 5. Estimate usage and deduct credits
-            let (input_tokens, output_tokens) =
-                if let Some(ref usage) = chat_response.usage {
-                    (
-                        usage.input_tokens.unwrap_or(0) as i64,
-                        usage.output_tokens.unwrap_or(0) as i64,
-                    )
-                } else {
-                    // Fallback: estimate from text length
-                    let est_in = messages.iter().map(|m| m.content.len() as i64 / 4).sum::<i64>();
-                    let est_out = response_text.len() as i64 / 4;
-                    (est_in, est_out)
-                };
+            let (input_tokens, output_tokens) = if let Some(ref usage) = chat_response.usage {
+                (
+                    usage.input_tokens.unwrap_or(0) as i64,
+                    usage.output_tokens.unwrap_or(0) as i64,
+                )
+            } else {
+                // Fallback: estimate from text length
+                let est_in = messages
+                    .iter()
+                    .map(|m| m.content.len() as i64 / 4)
+                    .sum::<i64>();
+                let est_out = response_text.len() as i64 / 4;
+                (est_in, est_out)
+            };
 
-            let cost_usd =
-                crate::billing::tracker::CostTracker::estimate_cost(&model, input_tokens, output_tokens);
+            let cost_usd = crate::billing::tracker::CostTracker::estimate_cost(
+                &model,
+                input_tokens,
+                output_tokens,
+            );
             let base_credits = ((cost_usd / 0.007) * 1.0).ceil() as u32;
             let credits_to_deduct = base_credits.saturating_mul(2).max(1);
 
@@ -487,7 +492,13 @@ pub async fn handle_document_process_r2(
     // 6. Call Upstage Document Parse with operator key
     let client = reqwest::Client::new();
     // Derive MIME type from filename extension
-    let mime_type = match req.filename.rsplit('.').next().map(|e| e.to_lowercase()).as_deref() {
+    let mime_type = match req
+        .filename
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_lowercase())
+        .as_deref()
+    {
         Some("pdf") => "application/pdf",
         Some("doc") => "application/msword",
         Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -495,9 +506,9 @@ pub async fn handle_document_process_r2(
         Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         Some("ppt") => "application/vnd.ms-powerpoint",
         Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        Some("hwp") | Some("hwpx") => "application/x-hwp",
+        Some("hwp" | "hwpx") => "application/x-hwp",
         Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("jpg" | "jpeg") => "image/jpeg",
         _ => "application/octet-stream",
     };
     let form = reqwest::multipart::Form::new()
@@ -506,9 +517,7 @@ pub async fn handle_document_process_r2(
             reqwest::multipart::Part::bytes(file_data)
                 .file_name(req.filename.clone())
                 .mime_str(mime_type)
-                .unwrap_or_else(|_| {
-                    reqwest::multipart::Part::bytes(Vec::new())
-                }),
+                .unwrap_or_else(|_| reqwest::multipart::Part::bytes(Vec::new())),
         )
         .text("model", "document-parse")
         .text("ocr", "force")
@@ -541,7 +550,9 @@ pub async fn handle_document_process_r2(
         let _ = r2.delete_object(&req.object_key).await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Upstage API error (HTTP {status}): {body}")})),
+            Json(
+                serde_json::json!({"error": format!("Upstage API error (HTTP {status}): {body}")}),
+            ),
         );
     }
 
@@ -551,7 +562,9 @@ pub async fn handle_document_process_r2(
             let _ = r2.delete_object(&req.object_key).await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to parse Upstage response: {e}")})),
+                Json(
+                    serde_json::json!({"error": format!("Failed to parse Upstage response: {e}")}),
+                ),
             );
         }
     };
@@ -619,4 +632,3 @@ pub async fn handle_document_process_r2(
         })),
     )
 }
-

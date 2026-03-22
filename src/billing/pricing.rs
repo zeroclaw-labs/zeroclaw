@@ -53,227 +53,311 @@ impl PricingRegistry {
 
         // ── Anthropic (Claude) ─────────────────────────────────────
         // Source: Anthropic API pricing, Feb 2026
-        models.insert("claude-opus-4-6".into(), ModelPrice {
-            provider: "anthropic".into(),
-            display_name: "Claude Opus 4.6/4.5".into(),
-            input_per_million: 5.0,
-            output_per_million: 25.0,
-            note: Some("Top-tier reasoning/coding model".into()),
-        });
-        models.insert("claude-sonnet-4-20250514".into(), ModelPrice {
-            provider: "anthropic".into(),
-            display_name: "Claude Sonnet 4.6/4.5".into(),
-            input_per_million: 3.0,
-            output_per_million: 15.0,
-            note: Some("Balanced performance model".into()),
-        });
-        models.insert("claude-sonnet-4-5-20250929".into(), ModelPrice {
-            provider: "anthropic".into(),
-            display_name: "Claude Sonnet 4.5 (Sep 2025)".into(),
-            input_per_million: 3.0,
-            output_per_million: 15.0,
-            note: None,
-        });
-        models.insert("claude-haiku-4-5-20251001".into(), ModelPrice {
-            provider: "anthropic".into(),
-            display_name: "Claude Haiku 4.5".into(),
-            input_per_million: 1.0,
-            output_per_million: 5.0,
-            note: Some("Fast, cost-effective model".into()),
-        });
+        models.insert(
+            "claude-opus-4-6".into(),
+            ModelPrice {
+                provider: "anthropic".into(),
+                display_name: "Claude Opus 4.6/4.5".into(),
+                input_per_million: 5.0,
+                output_per_million: 25.0,
+                note: Some("Top-tier reasoning/coding model".into()),
+            },
+        );
+        models.insert(
+            "claude-sonnet-4-20250514".into(),
+            ModelPrice {
+                provider: "anthropic".into(),
+                display_name: "Claude Sonnet 4.6/4.5".into(),
+                input_per_million: 3.0,
+                output_per_million: 15.0,
+                note: Some("Balanced performance model".into()),
+            },
+        );
+        models.insert(
+            "claude-sonnet-4-5-20250929".into(),
+            ModelPrice {
+                provider: "anthropic".into(),
+                display_name: "Claude Sonnet 4.5 (Sep 2025)".into(),
+                input_per_million: 3.0,
+                output_per_million: 15.0,
+                note: None,
+            },
+        );
+        models.insert(
+            "claude-haiku-4-5-20251001".into(),
+            ModelPrice {
+                provider: "anthropic".into(),
+                display_name: "Claude Haiku 4.5".into(),
+                input_per_million: 1.0,
+                output_per_million: 5.0,
+                note: Some("Fast, cost-effective model".into()),
+            },
+        );
         // Anthropic prompt caching
-        models.insert("claude-cache-read".into(), ModelPrice {
-            provider: "anthropic".into(),
-            display_name: "Claude Cache Read".into(),
-            input_per_million: 0.30,
-            output_per_million: 0.0,
-            note: Some("Cached input token read cost".into()),
-        });
-        models.insert("claude-cache-write".into(), ModelPrice {
-            provider: "anthropic".into(),
-            display_name: "Claude Cache Write".into(),
-            input_per_million: 3.75,
-            output_per_million: 0.0,
-            note: Some("Cache creation write cost".into()),
-        });
+        models.insert(
+            "claude-cache-read".into(),
+            ModelPrice {
+                provider: "anthropic".into(),
+                display_name: "Claude Cache Read".into(),
+                input_per_million: 0.30,
+                output_per_million: 0.0,
+                note: Some("Cached input token read cost".into()),
+            },
+        );
+        models.insert(
+            "claude-cache-write".into(),
+            ModelPrice {
+                provider: "anthropic".into(),
+                display_name: "Claude Cache Write".into(),
+                input_per_million: 3.75,
+                output_per_million: 0.0,
+                note: Some("Cache creation write cost".into()),
+            },
+        );
 
         // ── OpenAI ─────────────────────────────────────────────────
         // Source: OpenAI API pricing page, Feb 2026
 
         // Flagship
-        models.insert("gpt-5.2".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "GPT-5.2".into(),
-            input_per_million: 1.75,
-            output_per_million: 14.0,
-            note: Some("Latest flagship (Feb 2026)".into()),
-        });
-        models.insert("gpt-5".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "GPT-5".into(),
-            input_per_million: 1.25,
-            output_per_million: 10.0,
-            note: None,
-        });
-        models.insert("gpt-5-mini".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "GPT-5 Mini".into(),
-            input_per_million: 0.25,
-            output_per_million: 2.0,
-            note: None,
-        });
-        models.insert("gpt-5-nano".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "GPT-5 Nano".into(),
-            input_per_million: 0.05,
-            output_per_million: 0.40,
-            note: None,
-        });
+        models.insert(
+            "gpt-5.2".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "GPT-5.2".into(),
+                input_per_million: 1.75,
+                output_per_million: 14.0,
+                note: Some("Latest flagship (Feb 2026)".into()),
+            },
+        );
+        models.insert(
+            "gpt-5".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "GPT-5".into(),
+                input_per_million: 1.25,
+                output_per_million: 10.0,
+                note: None,
+            },
+        );
+        models.insert(
+            "gpt-5-mini".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "GPT-5 Mini".into(),
+                input_per_million: 0.25,
+                output_per_million: 2.0,
+                note: None,
+            },
+        );
+        models.insert(
+            "gpt-5-nano".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "GPT-5 Nano".into(),
+                input_per_million: 0.05,
+                output_per_million: 0.40,
+                note: None,
+            },
+        );
 
         // GPT-4.1 family (1M context)
-        models.insert("gpt-4.1".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "GPT-4.1".into(),
-            input_per_million: 2.0,
-            output_per_million: 8.0,
-            note: Some("1M context window".into()),
-        });
-        models.insert("gpt-4.1-mini".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "GPT-4.1 Mini".into(),
-            input_per_million: 0.40,
-            output_per_million: 1.60,
-            note: Some("1M context, cost-effective".into()),
-        });
-        models.insert("gpt-4.1-nano".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "GPT-4.1 Nano".into(),
-            input_per_million: 0.10,
-            output_per_million: 0.40,
-            note: Some("Cheapest OpenAI model".into()),
-        });
+        models.insert(
+            "gpt-4.1".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "GPT-4.1".into(),
+                input_per_million: 2.0,
+                output_per_million: 8.0,
+                note: Some("1M context window".into()),
+            },
+        );
+        models.insert(
+            "gpt-4.1-mini".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "GPT-4.1 Mini".into(),
+                input_per_million: 0.40,
+                output_per_million: 1.60,
+                note: Some("1M context, cost-effective".into()),
+            },
+        );
+        models.insert(
+            "gpt-4.1-nano".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "GPT-4.1 Nano".into(),
+                input_per_million: 0.10,
+                output_per_million: 0.40,
+                note: Some("Cheapest OpenAI model".into()),
+            },
+        );
 
         // GPT-4o family
-        models.insert("gpt-4o".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "GPT-4o".into(),
-            input_per_million: 2.50,
-            output_per_million: 10.0,
-            note: Some("128K context".into()),
-        });
-        models.insert("gpt-4o-mini".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "GPT-4o Mini".into(),
-            input_per_million: 0.15,
-            output_per_million: 0.60,
-            note: Some("128K context, budget".into()),
-        });
+        models.insert(
+            "gpt-4o".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "GPT-4o".into(),
+                input_per_million: 2.50,
+                output_per_million: 10.0,
+                note: Some("128K context".into()),
+            },
+        );
+        models.insert(
+            "gpt-4o-mini".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "GPT-4o Mini".into(),
+                input_per_million: 0.15,
+                output_per_million: 0.60,
+                note: Some("128K context, budget".into()),
+            },
+        );
 
         // O-series reasoning models
-        models.insert("o3".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "o3".into(),
-            input_per_million: 2.0,
-            output_per_million: 8.0,
-            note: Some("Reasoning model; reasoning tokens billed as output".into()),
-        });
-        models.insert("o4-mini".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "o4-mini".into(),
-            input_per_million: 1.10,
-            output_per_million: 4.40,
-            note: Some("Budget reasoning model".into()),
-        });
-        models.insert("o1".into(), ModelPrice {
-            provider: "openai".into(),
-            display_name: "o1".into(),
-            input_per_million: 15.0,
-            output_per_million: 60.0,
-            note: Some("Legacy reasoning model".into()),
-        });
+        models.insert(
+            "o3".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "o3".into(),
+                input_per_million: 2.0,
+                output_per_million: 8.0,
+                note: Some("Reasoning model; reasoning tokens billed as output".into()),
+            },
+        );
+        models.insert(
+            "o4-mini".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "o4-mini".into(),
+                input_per_million: 1.10,
+                output_per_million: 4.40,
+                note: Some("Budget reasoning model".into()),
+            },
+        );
+        models.insert(
+            "o1".into(),
+            ModelPrice {
+                provider: "openai".into(),
+                display_name: "o1".into(),
+                input_per_million: 15.0,
+                output_per_million: 60.0,
+                note: Some("Legacy reasoning model".into()),
+            },
+        );
 
         // ── Google Gemini ──────────────────────────────────────────
         // Source: Google AI Studio pricing, Mar 2026
 
         // Gemini 3.1 (latest)
-        models.insert("gemini-3.1-pro-preview".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 3.1 Pro".into(),
-            input_per_million: 2.0,
-            output_per_million: 12.0,
-            note: Some(">200K context: $4.0 input, $18.0 output".into()),
-        });
-        models.insert("gemini-3.1-flash-lite-preview".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 3.1 Flash Lite".into(),
-            input_per_million: 0.25,
-            output_per_million: 1.50,
-            note: Some("Fast, most cost-effective Gemini".into()),
-        });
+        models.insert(
+            "gemini-3.1-pro-preview".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 3.1 Pro".into(),
+                input_per_million: 2.0,
+                output_per_million: 12.0,
+                note: Some(">200K context: $4.0 input, $18.0 output".into()),
+            },
+        );
+        models.insert(
+            "gemini-3.1-flash-lite-preview".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 3.1 Flash Lite".into(),
+                input_per_million: 0.25,
+                output_per_million: 1.50,
+                note: Some("Fast, most cost-effective Gemini".into()),
+            },
+        );
 
         // Gemini 3.0
-        models.insert("gemini-3-pro-preview".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 3 Pro".into(),
-            input_per_million: 2.0,
-            output_per_million: 12.0,
-            note: None,
-        });
-        models.insert("gemini-3-flash-preview".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 3 Flash".into(),
-            input_per_million: 0.50,
-            output_per_million: 3.0,
-            note: None,
-        });
+        models.insert(
+            "gemini-3-pro-preview".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 3 Pro".into(),
+                input_per_million: 2.0,
+                output_per_million: 12.0,
+                note: None,
+            },
+        );
+        models.insert(
+            "gemini-3-flash-preview".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 3 Flash".into(),
+                input_per_million: 0.50,
+                output_per_million: 3.0,
+                note: None,
+            },
+        );
 
         // Gemini 2.5
-        models.insert("gemini-2.5-pro".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 2.5 Pro".into(),
-            input_per_million: 1.25,
-            output_per_million: 10.0,
-            note: Some(">200K context: $2.50/$15.00".into()),
-        });
-        models.insert("gemini-2.5-flash".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 2.5 Flash".into(),
-            input_per_million: 0.30,
-            output_per_million: 2.50,
-            note: Some("Thinking mode output: $3.50/M".into()),
-        });
-        models.insert("gemini-2.5-flash-lite".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 2.5 Flash Lite".into(),
-            input_per_million: 0.10,
-            output_per_million: 0.40,
-            note: None,
-        });
+        models.insert(
+            "gemini-2.5-pro".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 2.5 Pro".into(),
+                input_per_million: 1.25,
+                output_per_million: 10.0,
+                note: Some(">200K context: $2.50/$15.00".into()),
+            },
+        );
+        models.insert(
+            "gemini-2.5-flash".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 2.5 Flash".into(),
+                input_per_million: 0.30,
+                output_per_million: 2.50,
+                note: Some("Thinking mode output: $3.50/M".into()),
+            },
+        );
+        models.insert(
+            "gemini-2.5-flash-lite".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 2.5 Flash Lite".into(),
+                input_per_million: 0.10,
+                output_per_million: 0.40,
+                note: None,
+            },
+        );
 
         // Gemini 2.0 (deprecated June 2026)
-        models.insert("gemini-2.0-flash".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 2.0 Flash".into(),
-            input_per_million: 0.10,
-            output_per_million: 0.40,
-            note: Some("Deprecated: shutdown June 2026".into()),
-        });
+        models.insert(
+            "gemini-2.0-flash".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 2.0 Flash".into(),
+                input_per_million: 0.10,
+                output_per_million: 0.40,
+                note: Some("Deprecated: shutdown June 2026".into()),
+            },
+        );
 
         // Gemini 1.5
-        models.insert("gemini-1.5-pro".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 1.5 Pro".into(),
-            input_per_million: 1.25,
-            output_per_million: 5.0,
-            note: None,
-        });
-        models.insert("gemini-1.5-flash".into(), ModelPrice {
-            provider: "gemini".into(),
-            display_name: "Gemini 1.5 Flash".into(),
-            input_per_million: 0.075,
-            output_per_million: 0.30,
-            note: None,
-        });
+        models.insert(
+            "gemini-1.5-pro".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 1.5 Pro".into(),
+                input_per_million: 1.25,
+                output_per_million: 5.0,
+                note: None,
+            },
+        );
+        models.insert(
+            "gemini-1.5-flash".into(),
+            ModelPrice {
+                provider: "gemini".into(),
+                display_name: "Gemini 1.5 Flash".into(),
+                input_per_million: 0.075,
+                output_per_million: 0.30,
+                note: None,
+            },
+        );
 
         Self { models }
     }

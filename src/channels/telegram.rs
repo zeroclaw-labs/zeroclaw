@@ -735,6 +735,7 @@ impl TelegramChannel {
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            silent: false,
         })
     }
 
@@ -980,7 +981,9 @@ impl TelegramChannel {
 
         let resp = self.http_client().post(&url).json(&body).send().await?;
 
-        if !resp.status().is_success() {
+        if resp.status().is_success() {
+            tracing::info!("Telegram bot commands registered successfully");
+        } else {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             // Only log Telegram's error_code and description, not the full body
@@ -997,8 +1000,6 @@ impl TelegramChannel {
                 })
                 .unwrap_or_else(|| "no parseable error detail".to_string());
             tracing::warn!("setMyCommands failed: status={status}, {detail}");
-        } else {
-            tracing::info!("Telegram bot commands registered successfully");
         }
 
         Ok(())
@@ -1635,6 +1636,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            silent: false,
         })
     }
 
@@ -1783,6 +1785,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            silent: false,
         })
     }
 
@@ -1942,6 +1945,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            silent: false,
         })
     }
 

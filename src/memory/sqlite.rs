@@ -273,8 +273,8 @@ impl SqliteMemory {
         let now_c = now.clone();
         let cached = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<f32>>> {
             let conn = conn.lock();
-            let mut stmt =
-                conn.prepare_cached("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
+            let mut stmt = conn
+                .prepare_cached("SELECT embedding FROM embedding_cache WHERE content_hash = ?1")?;
             let blob: Option<Vec<u8>> = stmt.query_row(params![hash_c], |row| row.get(0)).ok();
             if let Some(bytes) = blob {
                 conn.execute(
@@ -754,7 +754,8 @@ impl Memory for SqliteMemory {
                         "SELECT id, key, content, category, created_at, session_id FROM memories
                          WHERE category = ?1 AND session_id = ?2 ORDER BY updated_at DESC LIMIT ?3",
                     )?;
-                    let rows = stmt.query_map(params![cat_str, sid, DEFAULT_LIST_LIMIT], row_mapper)?;
+                    let rows =
+                        stmt.query_map(params![cat_str, sid, DEFAULT_LIST_LIMIT], row_mapper)?;
                     for row in rows {
                         results.push(row?);
                     }

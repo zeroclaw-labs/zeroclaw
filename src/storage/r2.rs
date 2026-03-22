@@ -171,22 +171,18 @@ impl R2Config {
 
         // String to sign
         let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}"
-        );
+        let string_to_sign =
+            format!("AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{canonical_request_hash}");
 
         // Signing key
-        let signing_key =
-            derive_signing_key(&self.secret_access_key, &date_stamp, region, service);
+        let signing_key = derive_signing_key(&self.secret_access_key, &date_stamp, region, service);
 
         // Signature
         let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
 
         // Construct final URL (virtual-hosted style: bucket in hostname)
         let _ = content_type; // content_type is set by the client in the PUT header
-        format!(
-            "https://{host}/{object_key}?{canonical_querystring}&X-Amz-Signature={signature}"
-        )
+        format!("https://{host}/{object_key}?{canonical_querystring}&X-Amz-Signature={signature}")
     }
 }
 
@@ -195,18 +191,14 @@ impl R2Config {
 /// Format: `documents/{user_id}/{uuid}/{filename}`
 pub fn generate_object_key(user_id: &str, filename: &str) -> String {
     let uuid = uuid::Uuid::new_v4();
-    let safe_filename = filename
-        .replace('/', "_")
-        .replace('\\', "_")
-        .replace("..", "_");
+    let safe_filename = filename.replace(['/', '\\'], "_").replace("..", "_");
     format!("documents/{user_id}/{uuid}/{safe_filename}")
 }
 
 // ── AWS Signature V4 helpers ────────────────────────────────────
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
-    let mut mac =
-        HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(data);
     mac.finalize().into_bytes().to_vec()
 }

@@ -163,12 +163,12 @@ fn detect_user_provider_from_env() -> Option<String> {
 fn best_models_for_provider(provider: &str) -> (&'static str, &'static str) {
     match provider {
         "anthropic" => (
-            "claude-sonnet-4-20250514",     // fast + capable
-            "claude-opus-4-6",              // best reasoning/code
+            "claude-sonnet-4-20250514", // fast + capable
+            "claude-opus-4-6",          // best reasoning/code
         ),
         "openai" => (
-            "gpt-4.1",                      // fast + capable
-            "o3",                           // best reasoning
+            "gpt-4.1", // fast + capable
+            "o3",      // best reasoning
         ),
         "gemini" | "google" => (
             "gemini-3.1-flash-lite-preview", // fast + cheap
@@ -179,36 +179,36 @@ fn best_models_for_provider(provider: &str) -> (&'static str, &'static str) {
             "anthropic/claude-opus-4-6",
         ),
         "deepseek" => (
-            "deepseek-chat",                // fast chat
-            "deepseek-reasoner",            // deep thinking
+            "deepseek-chat",     // fast chat
+            "deepseek-reasoner", // deep thinking
         ),
         "xai" | "grok" => (
-            "grok-3-fast",                  // fast
-            "grok-3",                       // full reasoning
+            "grok-3-fast", // fast
+            "grok-3",      // full reasoning
         ),
         "groq" => (
-            "llama-3.3-70b-versatile",      // fast
-            "llama-3.3-70b-versatile",      // same (groq is speed-focused)
+            "llama-3.3-70b-versatile", // fast
+            "llama-3.3-70b-versatile", // same (groq is speed-focused)
         ),
         "mistral" => (
-            "mistral-medium-latest",        // fast
-            "mistral-large-latest",         // best reasoning
+            "mistral-medium-latest", // fast
+            "mistral-large-latest",  // best reasoning
         ),
         "perplexity" => (
-            "sonar",                        // fast search
-            "sonar-pro",                    // deep search
+            "sonar",     // fast search
+            "sonar-pro", // deep search
         ),
         "moonshot" => (
-            "kimi-k2.5",                    // fast
-            "kimi-k2.5",                    // same top model
+            "kimi-k2.5", // fast
+            "kimi-k2.5", // same top model
         ),
         "glm" | "zai" => (
-            "glm-4-flash",                  // fast + free
-            "glm-5",                        // best reasoning
+            "glm-4-flash", // fast + free
+            "glm-5",       // best reasoning
         ),
         "qwen" => (
-            "qwen-plus",                    // fast
-            "qwen-max",                     // best reasoning
+            "qwen-plus", // fast
+            "qwen-max",  // best reasoning
         ),
         _ => (
             "anthropic/claude-sonnet-4-20250514",
@@ -1106,7 +1106,7 @@ pub enum AgentSessionStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentSessionConfig {
     /// Session backend to use. Options: "memory", "sqlite", "none".
-    /// Default: "none" (no persistence).
+    /// Default: "sqlite" (persists conversation history across restarts).
     /// Set to "none" to disable session persistence entirely.
     #[serde(default = "default_agent_session_backend")]
     pub backend: AgentSessionBackend,
@@ -1140,7 +1140,7 @@ fn default_agent_tool_dispatcher() -> String {
 }
 
 fn default_agent_session_backend() -> AgentSessionBackend {
-    AgentSessionBackend::None
+    AgentSessionBackend::Sqlite
 }
 
 fn default_agent_session_strategy() -> AgentSessionStrategy {
@@ -1164,7 +1164,7 @@ fn default_loop_detection_ping_pong_cycles() -> usize {
 }
 
 fn default_loop_detection_failure_streak() -> usize {
-    3
+    5
 }
 
 fn default_safety_heartbeat_interval() -> usize {
@@ -1775,9 +1775,7 @@ pub fn resolve_provider_access_mode(config: &Config) -> ProviderAccessMode {
 ///
 /// These routes are injected when the user has no API key and no explicit model selection,
 /// so that the query classifier can route to the right model per task type.
-pub fn platform_default_model_routes(
-    platform: &PlatformRoutingConfig,
-) -> Vec<ModelRouteConfig> {
+pub fn platform_default_model_routes(platform: &PlatformRoutingConfig) -> Vec<ModelRouteConfig> {
     vec![
         ModelRouteConfig {
             hint: "chat".to_string(),
@@ -1826,20 +1824,44 @@ pub fn platform_default_classification_rules() -> QueryClassificationConfig {
             ClassificationRule {
                 hint: "coding".to_string(),
                 keywords: vec![
-                    "code".into(), "implement".into(), "function".into(),
-                    "debug".into(), "refactor".into(), "compile".into(),
-                    "build".into(), "deploy".into(), "api".into(),
-                    "bug".into(), "error".into(), "fix".into(),
-                    "class".into(), "module".into(), "test".into(),
-                    "코드".into(), "구현".into(), "함수".into(),
-                    "디버그".into(), "리팩터".into(), "빌드".into(),
-                    "배포".into(), "버그".into(), "에러".into(),
+                    "code".into(),
+                    "implement".into(),
+                    "function".into(),
+                    "debug".into(),
+                    "refactor".into(),
+                    "compile".into(),
+                    "build".into(),
+                    "deploy".into(),
+                    "api".into(),
+                    "bug".into(),
+                    "error".into(),
+                    "fix".into(),
+                    "class".into(),
+                    "module".into(),
+                    "test".into(),
+                    "코드".into(),
+                    "구현".into(),
+                    "함수".into(),
+                    "디버그".into(),
+                    "리팩터".into(),
+                    "빌드".into(),
+                    "배포".into(),
+                    "버그".into(),
+                    "에러".into(),
                 ],
                 patterns: vec![
-                    "```".into(), "fn ".into(), "def ".into(),
-                    "class ".into(), "import ".into(), "from ".into(),
-                    "const ".into(), "let ".into(), "var ".into(),
-                    "async ".into(), "pub ".into(), "struct ".into(),
+                    "```".into(),
+                    "fn ".into(),
+                    "def ".into(),
+                    "class ".into(),
+                    "import ".into(),
+                    "from ".into(),
+                    "const ".into(),
+                    "let ".into(),
+                    "var ".into(),
+                    "async ".into(),
+                    "pub ".into(),
+                    "struct ".into(),
                 ],
                 min_length: None,
                 max_length: None,
@@ -1849,8 +1871,11 @@ pub fn platform_default_classification_rules() -> QueryClassificationConfig {
             ClassificationRule {
                 hint: "code_review".to_string(),
                 keywords: vec![
-                    "review".into(), "코드 리뷰".into(), "code review".into(),
-                    "리뷰".into(), "검토".into(),
+                    "review".into(),
+                    "코드 리뷰".into(),
+                    "code review".into(),
+                    "리뷰".into(),
+                    "검토".into(),
                 ],
                 patterns: vec![],
                 min_length: None,
@@ -1861,13 +1886,27 @@ pub fn platform_default_classification_rules() -> QueryClassificationConfig {
             ClassificationRule {
                 hint: "reasoning".to_string(),
                 keywords: vec![
-                    "explain".into(), "analyze".into(), "design".into(),
-                    "architecture".into(), "document".into(), "write".into(),
-                    "draft".into(), "plan".into(), "strategy".into(),
-                    "compare".into(), "evaluate".into(), "report".into(),
-                    "설명".into(), "분석".into(), "설계".into(),
-                    "문서".into(), "작성".into(), "초안".into(),
-                    "계획".into(), "전략".into(), "비교".into(),
+                    "explain".into(),
+                    "analyze".into(),
+                    "design".into(),
+                    "architecture".into(),
+                    "document".into(),
+                    "write".into(),
+                    "draft".into(),
+                    "plan".into(),
+                    "strategy".into(),
+                    "compare".into(),
+                    "evaluate".into(),
+                    "report".into(),
+                    "설명".into(),
+                    "분석".into(),
+                    "설계".into(),
+                    "문서".into(),
+                    "작성".into(),
+                    "초안".into(),
+                    "계획".into(),
+                    "전략".into(),
+                    "비교".into(),
                     "보고서".into(),
                 ],
                 patterns: vec![],
@@ -1879,11 +1918,20 @@ pub fn platform_default_classification_rules() -> QueryClassificationConfig {
             ClassificationRule {
                 hint: "chat".to_string(),
                 keywords: vec![
-                    "hi".into(), "hello".into(), "hey".into(),
-                    "thanks".into(), "thank you".into(), "ok".into(),
-                    "yes".into(), "no".into(), "sure".into(),
-                    "안녕".into(), "감사".into(), "네".into(),
-                    "아니요".into(), "좋아".into(),
+                    "hi".into(),
+                    "hello".into(),
+                    "hey".into(),
+                    "thanks".into(),
+                    "thank you".into(),
+                    "ok".into(),
+                    "yes".into(),
+                    "no".into(),
+                    "sure".into(),
+                    "안녕".into(),
+                    "감사".into(),
+                    "네".into(),
+                    "아니요".into(),
+                    "좋아".into(),
                 ],
                 patterns: vec![],
                 min_length: None,
@@ -2613,11 +2661,11 @@ fn default_web_search_max_results() -> usize {
 }
 
 fn default_web_search_timeout_secs() -> u64 {
-    300 // 5 minutes — generous to avoid timeouts on slow search providers (DuckDuckGo, etc.)
+    30 // 30 seconds per provider request — prevents long hangs; fallback chain handles transient failures
 }
 
 fn default_web_search_retries_per_provider() -> u32 {
-    0
+    2
 }
 
 fn default_web_search_retry_backoff_ms() -> u64 {
@@ -2702,7 +2750,7 @@ impl Default for WebSearchConfig {
             perplexity_api_key: None,
             exa_api_key: None,
             jina_api_key: None,
-            fallback_providers: Vec::new(),
+            fallback_providers: vec!["jina".to_string()],
             retries_per_provider: default_web_search_retries_per_provider(),
             retry_backoff_ms: default_web_search_retry_backoff_ms(),
             domain_filter: Vec::new(),
@@ -5665,9 +5713,7 @@ fn redact_url_userinfo_for_debug(raw: &str) -> String {
 
     let auth_start = scheme_idx + 3;
     let rest = &raw[auth_start..];
-    let auth_end_rel = rest
-        .find(|c| c == '/' || c == '?' || c == '#')
-        .unwrap_or(rest.len());
+    let auth_end_rel = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..auth_end_rel];
 
     let Some(at) = authority.rfind('@') else {
@@ -7771,7 +7817,7 @@ impl Config {
             config.workspace_dir = workspace_dir;
             let store = crate::security::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
             decrypt_optional_secret(&store, &mut config.api_key, "config.api_key")?;
-            for (profile_name, profile) in config.model_providers.iter_mut() {
+            for (profile_name, profile) in &mut config.model_providers {
                 let secret_path = format!("config.model_providers.{profile_name}.api_key");
                 decrypt_optional_secret(&store, &mut profile.api_key, &secret_path)?;
             }
@@ -9105,7 +9151,11 @@ impl Config {
         let kakao_rest = std::env::var("ZEROCLAW_KAKAO_REST_API_KEY")
             .ok()
             .filter(|k| !k.is_empty())
-            .or_else(|| std::env::var("KAKAO_REST_API_KEY").ok().filter(|k| !k.is_empty()));
+            .or_else(|| {
+                std::env::var("KAKAO_REST_API_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+            });
         if let Some(key) = kakao_rest {
             let kk = self
                 .channels_config
@@ -9123,7 +9173,11 @@ impl Config {
         let kakao_admin = std::env::var("ZEROCLAW_KAKAO_ADMIN_KEY")
             .ok()
             .filter(|k| !k.is_empty())
-            .or_else(|| std::env::var("KAKAO_ADMIN_KEY").ok().filter(|k| !k.is_empty()));
+            .or_else(|| {
+                std::env::var("KAKAO_ADMIN_KEY")
+                    .ok()
+                    .filter(|k| !k.is_empty())
+            });
         if let Some(key) = kakao_admin {
             let kk = self
                 .channels_config
@@ -9654,10 +9708,10 @@ impl Config {
             let normalized = value.trim().to_ascii_lowercase();
             match normalized.as_str() {
                 "1" | "true" | "yes" | "on" => {
-                    self.security.url_access.require_first_visit_approval = true
+                    self.security.url_access.require_first_visit_approval = true;
                 }
                 "0" | "false" | "no" | "off" => {
-                    self.security.url_access.require_first_visit_approval = false
+                    self.security.url_access.require_first_visit_approval = false;
                 }
                 _ => {}
             }
@@ -9669,10 +9723,10 @@ impl Config {
             let normalized = value.trim().to_ascii_lowercase();
             match normalized.as_str() {
                 "1" | "true" | "yes" | "on" => {
-                    self.security.url_access.enforce_domain_allowlist = true
+                    self.security.url_access.enforce_domain_allowlist = true;
                 }
                 "0" | "false" | "no" | "off" => {
-                    self.security.url_access.enforce_domain_allowlist = false
+                    self.security.url_access.enforce_domain_allowlist = false;
                 }
                 _ => {}
             }
@@ -9847,7 +9901,13 @@ impl Config {
         // Phase 1: Collect explicit env-defined routes.
         {
             let known_hints = [
-                "DAILY", "DOCUMENT", "CODE", "REVIEW", "REASONING", "FAST", "SUMMARIZE",
+                "DAILY",
+                "DOCUMENT",
+                "CODE",
+                "REVIEW",
+                "REASONING",
+                "FAST",
+                "SUMMARIZE",
             ];
 
             let mut env_routes: Vec<ModelRouteConfig> = Vec::new();
@@ -9904,11 +9964,8 @@ impl Config {
         // - If no user key, inject platform-default tiered routes.
         {
             // Collect which hints are already defined to avoid borrow conflicts.
-            let existing_hints: std::collections::HashSet<String> = self
-                .model_routes
-                .iter()
-                .map(|r| r.hint.clone())
-                .collect();
+            let existing_hints: std::collections::HashSet<String> =
+                self.model_routes.iter().map(|r| r.hint.clone()).collect();
 
             let need = |hint: &str| !existing_hints.contains(hint);
 
@@ -9931,8 +9988,7 @@ impl Config {
             if let Some(ref user_prov) = user_provider {
                 // User chose a provider — inject fast (chat) and thinking
                 // (reasoning/code) routes using that provider's best models.
-                let (fast_model, thinking_model) =
-                    best_models_for_provider(user_prov);
+                let (fast_model, thinking_model) = best_models_for_provider(user_prov);
 
                 if need("fast") {
                     self.model_routes.push(ModelRouteConfig {
@@ -10021,10 +10077,7 @@ impl Config {
         // When enabled and no rules are defined, injects default tiered rules
         // matching the well-known hints (daily, document, code, review).
         if let Ok(val) = std::env::var("ZEROCLAW_QUERY_CLASSIFICATION_ENABLED") {
-            let enabled = matches!(
-                val.to_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            );
+            let enabled = matches!(val.to_lowercase().as_str(), "1" | "true" | "yes" | "on");
             self.query_classification.enabled = enabled;
 
             // Inject default classification rules only when enabled and no
@@ -10194,7 +10247,7 @@ impl Config {
         let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
 
         encrypt_optional_secret(&store, &mut config_to_save.api_key, "config.api_key")?;
-        for (profile_name, profile) in config_to_save.model_providers.iter_mut() {
+        for (profile_name, profile) in &mut config_to_save.model_providers {
             let secret_path = format!("config.model_providers.{profile_name}.api_key");
             encrypt_optional_secret(&store, &mut profile.api_key, &secret_path)?;
         }
@@ -10466,7 +10519,7 @@ mod tests {
         let cfg = HttpRequestConfig::default();
         assert_eq!(cfg.timeout_secs, 30);
         assert_eq!(cfg.max_response_size, 1_000_000);
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
         assert!(cfg.allowed_domains.is_empty());
         assert!(cfg.credential_profiles.is_empty());
     }
@@ -12624,14 +12677,14 @@ default_temperature = 0.7
         assert!(!c.composio.enabled);
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
-        assert!(!c.browser.enabled);
+        assert!(c.browser.enabled);
         assert!(c.browser.allowed_domains.is_empty());
     }
 
     #[test]
     async fn browser_config_default_disabled() {
         let b = BrowserConfig::default();
-        assert!(!b.enabled);
+        assert!(b.enabled);
         assert!(b.allowed_domains.is_empty());
         assert_eq!(b.backend, "agent_browser");
         assert!(b.auto_backend_priority.is_empty());
@@ -12719,7 +12772,7 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(!parsed.browser.enabled);
+        assert!(parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
     }
 
@@ -12727,8 +12780,8 @@ default_temperature = 0.7
     async fn web_search_config_default_extended_fields() {
         let ws = WebSearchConfig::default();
         assert_eq!(ws.provider, "duckduckgo");
-        assert!(ws.fallback_providers.is_empty());
-        assert_eq!(ws.retries_per_provider, 0);
+        assert_eq!(ws.fallback_providers, vec!["jina"]);
+        assert_eq!(ws.retries_per_provider, 2);
         assert_eq!(ws.retry_backoff_ms, 250);
         assert!(ws.domain_filter.is_empty());
         assert!(ws.language_filter.is_empty());
@@ -15430,7 +15483,15 @@ reserve_percent = 15
     // ── Model route env override tests ──────────────────────────
 
     fn clear_route_env_vars() {
-        for hint in ["DAILY", "DOCUMENT", "CODE", "REVIEW", "REASONING", "FAST", "SUMMARIZE"] {
+        for hint in [
+            "DAILY",
+            "DOCUMENT",
+            "CODE",
+            "REVIEW",
+            "REASONING",
+            "FAST",
+            "SUMMARIZE",
+        ] {
             std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_PROVIDER"));
             std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_MODEL"));
             std::env::remove_var(format!("ZEROCLAW_ROUTE_{hint}_MAX_TOKENS"));
@@ -15463,18 +15524,29 @@ reserve_percent = 15
 
         // Set explicit routes — these override auto-injected defaults.
         std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
-        std::env::set_var("ZEROCLAW_ROUTE_DAILY_MODEL", "gemini-3.1-flash-lite-preview");
+        std::env::set_var(
+            "ZEROCLAW_ROUTE_DAILY_MODEL",
+            "gemini-3.1-flash-lite-preview",
+        );
         std::env::set_var("ZEROCLAW_ROUTE_CODE_PROVIDER", "anthropic");
         std::env::set_var("ZEROCLAW_ROUTE_CODE_MODEL", "claude-4.6-opus");
 
         config.apply_env_overrides();
 
         // Explicit routes present with correct models.
-        let daily = config.model_routes.iter().find(|r| r.hint == "daily").unwrap();
+        let daily = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "daily")
+            .unwrap();
         assert_eq!(daily.provider, "google");
         assert_eq!(daily.model, "gemini-3.1-flash-lite-preview");
 
-        let code = config.model_routes.iter().find(|r| r.hint == "code").unwrap();
+        let code = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "code")
+            .unwrap();
         assert_eq!(code.provider, "anthropic");
         assert_eq!(code.model, "claude-4.6-opus");
 
@@ -15498,11 +15570,18 @@ reserve_percent = 15
         }];
 
         std::env::set_var("ZEROCLAW_ROUTE_DAILY_PROVIDER", "google");
-        std::env::set_var("ZEROCLAW_ROUTE_DAILY_MODEL", "gemini-3.1-flash-lite-preview");
+        std::env::set_var(
+            "ZEROCLAW_ROUTE_DAILY_MODEL",
+            "gemini-3.1-flash-lite-preview",
+        );
 
         config.apply_env_overrides();
 
-        let daily = config.model_routes.iter().find(|r| r.hint == "daily").unwrap();
+        let daily = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "daily")
+            .unwrap();
         assert_eq!(daily.provider, "google");
         assert_eq!(daily.model, "gemini-3.1-flash-lite-preview");
 
@@ -15524,7 +15603,11 @@ reserve_percent = 15
 
         config.apply_env_overrides();
 
-        let code = config.model_routes.iter().find(|r| r.hint == "code").unwrap();
+        let code = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "code")
+            .unwrap();
         assert_eq!(code.max_tokens, Some(8192));
         assert_eq!(code.api_key.as_deref(), Some("sk-test-route-key"));
 
@@ -15550,15 +15633,27 @@ reserve_percent = 15
         assert!(config.model_routes.iter().any(|r| r.hint == "review"));
 
         // daily should be gemini flash-lite.
-        let daily = config.model_routes.iter().find(|r| r.hint == "daily").unwrap();
+        let daily = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "daily")
+            .unwrap();
         assert_eq!(daily.model, "gemini-3.1-flash-lite-preview");
 
         // code should be claude-4.6-opus (platform default).
-        let code = config.model_routes.iter().find(|r| r.hint == "code").unwrap();
+        let code = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "code")
+            .unwrap();
         assert_eq!(code.model, "claude-4.6-opus");
 
         // review should be gpt-5.4 (platform default).
-        let review = config.model_routes.iter().find(|r| r.hint == "review").unwrap();
+        let review = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "review")
+            .unwrap();
         assert_eq!(review.model, "gpt-5.4");
 
         clear_route_env_vars();
@@ -15578,14 +15673,26 @@ reserve_percent = 15
         config.apply_env_overrides();
 
         // daily is still always Gemini flash-lite.
-        let daily = config.model_routes.iter().find(|r| r.hint == "daily").unwrap();
+        let daily = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "daily")
+            .unwrap();
         assert_eq!(daily.model, "gemini-3.1-flash-lite-preview");
 
         // fast and reasoning should use Anthropic models.
-        let fast = config.model_routes.iter().find(|r| r.hint == "fast").unwrap();
+        let fast = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "fast")
+            .unwrap();
         assert_eq!(fast.provider, "anthropic");
 
-        let reasoning = config.model_routes.iter().find(|r| r.hint == "reasoning").unwrap();
+        let reasoning = config
+            .model_routes
+            .iter()
+            .find(|r| r.hint == "reasoning")
+            .unwrap();
         assert_eq!(reasoning.provider, "anthropic");
 
         // No platform-default review route (user has their own provider).

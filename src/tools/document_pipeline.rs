@@ -25,9 +25,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 /// File extensions supported by the Hancom DocsConverter API.
-const HANCOM_EXTENSIONS: &[&str] = &[
-    "hwp", "hwpx", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-];
+const HANCOM_EXTENSIONS: &[&str] = &["hwp", "hwpx", "doc", "docx", "xls", "xlsx", "ppt", "pptx"];
 
 /// Maximum file size for document processing (500MB).
 const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;
@@ -75,8 +73,7 @@ fn is_digital_pdf(path: &Path) -> bool {
         Ok(doc) => {
             let page_ids: Vec<_> = {
                 let pages = doc.get_pages();
-                let mut ids: Vec<(u32, lopdf::ObjectId)> =
-                    pages.into_iter().collect();
+                let mut ids: Vec<(u32, lopdf::ObjectId)> = pages.into_iter().collect();
                 ids.sort_by_key(|(num, _)| *num);
                 ids.into_iter().map(|(_, id)| id).collect()
             };
@@ -664,9 +661,9 @@ impl Tool for DocumentPipelineTool {
         let path = Path::new(file_path);
 
         // Check file exists and size
-        let metadata = tokio::fs::metadata(path).await.map_err(|e| {
-            anyhow::anyhow!("File not found or inaccessible: {e}")
-        })?;
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("File not found or inaccessible: {e}"))?;
 
         if metadata.len() > MAX_FILE_SIZE {
             return Ok(ToolResult {
@@ -692,24 +689,13 @@ impl Tool for DocumentPipelineTool {
                     true,
                     Self::estimate_pdf_credits(metadata.len()),
                 ),
-                DocumentType::DigitalPdf => (
-                    "digital_pdf",
-                    "pdf-extract (local, free)",
-                    false,
-                    0u32,
-                ),
-                DocumentType::OfficeDocument(_ext) => (
-                    "office_document",
-                    "hancom_docs_converter",
-                    false,
-                    0u32,
-                ),
-                DocumentType::Unsupported(_ext) => (
-                    "unsupported",
-                    "none",
-                    false,
-                    0u32,
-                ),
+                DocumentType::DigitalPdf => {
+                    ("digital_pdf", "pdf-extract (local, free)", false, 0u32)
+                }
+                DocumentType::OfficeDocument(_ext) => {
+                    ("office_document", "hancom_docs_converter", false, 0u32)
+                }
+                DocumentType::Unsupported(_ext) => ("unsupported", "none", false, 0u32),
             };
 
             let ext_str = match &doc_type {
@@ -743,27 +729,16 @@ impl Tool for DocumentPipelineTool {
         let gemini_key = std::env::var("GEMINI_API_KEY").ok();
 
         let result = match doc_type {
-            DocumentType::DigitalPdf => {
-                self.process_digital_pdf(path, gemini_key.as_deref())
+            DocumentType::DigitalPdf => self.process_digital_pdf(path, gemini_key.as_deref()).await,
+            DocumentType::ImagePdf => {
+                self.process_image_pdf(path, upstage_key.as_deref(), gemini_key.as_deref())
                     .await
             }
-            DocumentType::ImagePdf => {
-                self.process_image_pdf(
-                    path,
-                    upstage_key.as_deref(),
-                    gemini_key.as_deref(),
-                )
-                .await
-            }
-            DocumentType::OfficeDocument(ext) => {
-                self.process_office_document(path, &ext).await
-            }
-            DocumentType::Unsupported(ext) => {
-                Err(anyhow::anyhow!(
-                    "Unsupported document format: .{ext}. \
+            DocumentType::OfficeDocument(ext) => self.process_office_document(path, &ext).await,
+            DocumentType::Unsupported(ext) => Err(anyhow::anyhow!(
+                "Unsupported document format: .{ext}. \
                      Supported: PDF, HWP, HWPX, DOC, DOCX, XLS, XLSX, PPT, PPTX"
-                ))
-            }
+            )),
         };
 
         match result {
@@ -773,7 +748,10 @@ impl Tool for DocumentPipelineTool {
                     let dir = Path::new(output_dir);
                     let _ = tokio::fs::create_dir_all(dir).await;
 
-                    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("output");
+                    let stem = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("output");
 
                     if !output.html.is_empty() {
                         let html_path = dir.join(format!("{stem}.html"));
@@ -905,12 +883,7 @@ fn html_to_markdown(html: &str) -> String {
         let pattern = format!("<h{level} ");
         while let Some(start) = md.find(&pattern) {
             if let Some(end) = md[start..].find('>') {
-                md = format!(
-                    "{}\n{} {}",
-                    &md[..start],
-                    prefix,
-                    &md[start + end + 1..]
-                );
+                md = format!("{}\n{} {}", &md[..start], prefix, &md[start + end + 1..]);
             } else {
                 break;
             }

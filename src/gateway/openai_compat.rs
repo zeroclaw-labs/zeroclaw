@@ -578,7 +578,10 @@ pub async fn handle_v1_models(
         }],
     };
 
-    (StatusCode::OK, Json(serde_json::to_value(&response).expect("ModelsResponse is Serialize")))
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&response).expect("ModelsResponse is Serialize")),
+    )
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -130,7 +130,7 @@ impl ChannelAckConfigTool {
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
-            None | Some("") | Some("direct") => Ok(AckReactionContextChatType::Direct),
+            None | Some("" | "direct") => Ok(AckReactionContextChatType::Direct),
             Some("group") => Ok(AckReactionContextChatType::Group),
             Some(other) => anyhow::bail!("Invalid chat_type '{other}'. Use direct|group"),
         }
@@ -215,10 +215,10 @@ impl ChannelAckConfigTool {
         Ok(parsed)
     }
 
-    fn channel_config_ref<'a>(
-        channels: &'a AckReactionChannelsConfig,
+    fn channel_config_ref(
+        channels: &AckReactionChannelsConfig,
         channel: AckChannel,
-    ) -> Option<&'a AckReactionConfig> {
+    ) -> Option<&AckReactionConfig> {
         match channel {
             AckChannel::Telegram => channels.telegram.as_ref(),
             AckChannel::Discord => channels.discord.as_ref(),
@@ -227,10 +227,10 @@ impl ChannelAckConfigTool {
         }
     }
 
-    fn channel_config_mut<'a>(
-        channels: &'a mut AckReactionChannelsConfig,
+    fn channel_config_mut(
+        channels: &mut AckReactionChannelsConfig,
         channel: AckChannel,
-    ) -> &'a mut Option<AckReactionConfig> {
+    ) -> &mut Option<AckReactionConfig> {
         match channel {
             AckChannel::Telegram => &mut channels.telegram,
             AckChannel::Discord => &mut channels.discord,

@@ -342,7 +342,7 @@ impl KakaoTalkChannel {
 
         let parts: Vec<&str> = trimmed[1..].splitn(2, ' ').collect();
         let command = parts.first()?.to_lowercase();
-        let args = parts.get(1).unwrap_or(&"").to_string();
+        let args = (*parts.get(1).unwrap_or(&"")).to_string();
 
         match command.as_str() {
             "status" => Some(RemoteCommand::Status),
@@ -561,6 +561,7 @@ async fn handle_webhook(
                 channel: "kakao".to_string(),
                 timestamp: current_epoch_secs(),
                 thread_ts: None,
+                silent: false,
             };
 
             if state.tx.send(channel_msg).await.is_err() {
@@ -601,6 +602,7 @@ async fn handle_webhook(
             channel: "kakao".to_string(),
             timestamp: current_epoch_secs(),
             thread_ts: None,
+            silent: false,
         };
 
         if state.tx.send(channel_msg).await.is_err() {
@@ -656,6 +658,7 @@ async fn handle_webhook(
             channel: "kakao".to_string(),
             timestamp: current_epoch_secs(),
             thread_ts: None,
+            silent: false,
         };
 
         if state.tx.send(channel_msg).await.is_err() {

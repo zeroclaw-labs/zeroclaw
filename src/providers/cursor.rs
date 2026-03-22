@@ -142,9 +142,9 @@ impl CursorProvider {
 
         let mut child = cmd.spawn().map_err(|err| {
             anyhow::anyhow!(
-                "Failed to spawn Cursor binary at {:?}: {err}. \
+                "Failed to spawn Cursor binary at {}: {err}. \
                  Ensure `cursor` is installed and in PATH, or set CURSOR_PATH.",
-                self.cursor_path
+                self.cursor_path.display()
             )
         })?;
 
@@ -163,9 +163,9 @@ impl CursorProvider {
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "Cursor request timed out after {:?} (binary: {:?})",
+                    "Cursor request timed out after {:?} (binary: {})",
                     CURSOR_REQUEST_TIMEOUT,
-                    self.cursor_path
+                    self.cursor_path.display()
                 )
             })?
             .map_err(|err| anyhow::anyhow!("Cursor process failed: {err}"))?;

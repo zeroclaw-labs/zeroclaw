@@ -146,6 +146,7 @@ fn build_channel_message(
         channel: "qq".to_string(),
         timestamp: current_unix_timestamp_secs(),
         thread_ts: (!msg_id.is_empty()).then(|| msg_id.to_string()),
+        silent: false,
     }
 }
 

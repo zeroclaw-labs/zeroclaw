@@ -96,7 +96,6 @@ pub enum DeltaOperation {
     Forget { key: String },
 
     // ── Ontology sync operations ───────────────────────────────────
-
     /// Ontology object created or updated.
     OntologyObjectUpsert {
         object_id: i64,
@@ -211,7 +210,9 @@ impl SyncEngine {
             return Ok(());
         }
         let conn = rusqlite::Connection::open(&self.db_path)?;
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
+        )?;
 
         // Wrap in a single transaction for atomicity and performance
         // (one fsync instead of N).
@@ -252,7 +253,9 @@ impl SyncEngine {
             return Ok(());
         }
         let conn = rusqlite::Connection::open(&self.db_path)?;
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;",
+        )?;
 
         // Load version vector
         let version_result: Result<String, _> = conn.query_row(

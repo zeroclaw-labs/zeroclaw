@@ -4,7 +4,7 @@
 //! which wraps a `rusqlite::Connection` behind a `parking_lot::Mutex` (matching
 //! the pattern used by `SqliteMemory`).
 
-use super::types::*;
+use super::types::{ActionStatus, ActorKind, OntologyAction, OntologyLink, OntologyObject};
 use chrono::Utc;
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -74,10 +74,7 @@ impl OntologyRepo {
     /// After this call, every CUD operation (create/update object, create
     /// link, insert action) will automatically record a delta in the sync
     /// journal keyed by `occurred_at` (real-world time).
-    pub fn set_sync(
-        &mut self,
-        sync: Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>,
-    ) {
+    pub fn set_sync(&mut self, sync: Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>) {
         self.sync = Some(sync);
     }
 
@@ -168,8 +165,10 @@ impl OntologyRepo {
     /// Resolve an object type name to its ID.
     pub fn object_type_id(&self, name: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached("SELECT id FROM ontology_object_types WHERE name = ?1")?;
-        let id = stmt.query_row(params![name], |r| r.get(0))
+        let mut stmt =
+            conn.prepare_cached("SELECT id FROM ontology_object_types WHERE name = ?1")?;
+        let id = stmt
+            .query_row(params![name], |r| r.get(0))
             .map_err(|e| anyhow::anyhow!("unknown object type '{}': {}", name, e))?;
         Ok(id)
     }
@@ -177,8 +176,10 @@ impl OntologyRepo {
     /// Resolve an object type ID to its name.
     pub fn object_type_name(&self, id: i64) -> anyhow::Result<String> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached("SELECT name FROM ontology_object_types WHERE id = ?1")?;
-        let name = stmt.query_row(params![id], |r| r.get(0))
+        let mut stmt =
+            conn.prepare_cached("SELECT name FROM ontology_object_types WHERE id = ?1")?;
+        let name = stmt
+            .query_row(params![id], |r| r.get(0))
             .map_err(|e| anyhow::anyhow!("unknown object type id {}: {}", id, e))?;
         Ok(name)
     }
@@ -187,7 +188,8 @@ impl OntologyRepo {
     pub fn link_type_id(&self, name: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached("SELECT id FROM ontology_link_types WHERE name = ?1")?;
-        let id = stmt.query_row(params![name], |r| r.get(0))
+        let id = stmt
+            .query_row(params![name], |r| r.get(0))
             .map_err(|e| anyhow::anyhow!("unknown link type '{}': {}", name, e))?;
         Ok(id)
     }
@@ -195,8 +197,10 @@ impl OntologyRepo {
     /// Resolve an action type name to its ID.
     pub fn action_type_id(&self, name: &str) -> anyhow::Result<i64> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached("SELECT id FROM ontology_action_types WHERE name = ?1")?;
-        let id = stmt.query_row(params![name], |r| r.get(0))
+        let mut stmt =
+            conn.prepare_cached("SELECT id FROM ontology_action_types WHERE name = ?1")?;
+        let id = stmt
+            .query_row(params![name], |r| r.get(0))
             .map_err(|e| anyhow::anyhow!("unknown action type '{}': {}", name, e))?;
         Ok(id)
     }
@@ -204,8 +208,10 @@ impl OntologyRepo {
     /// Resolve an action type ID to its name.
     pub fn action_type_name(&self, id: i64) -> anyhow::Result<String> {
         let conn = self.conn.lock();
-        let mut stmt = conn.prepare_cached("SELECT name FROM ontology_action_types WHERE id = ?1")?;
-        let name = stmt.query_row(params![id], |r| r.get(0))
+        let mut stmt =
+            conn.prepare_cached("SELECT name FROM ontology_action_types WHERE id = ?1")?;
+        let name = stmt
+            .query_row(params![id], |r| r.get(0))
             .map_err(|e| anyhow::anyhow!("unknown action type id {}: {}", id, e))?;
         Ok(name)
     }
@@ -464,7 +470,10 @@ impl OntologyRepo {
                        AND o.type_id = ?3
                      ORDER BY rank LIMIT ?4",
                 )?;
-                let rows = stmt.query_map(params![sanitized_query, owner_user_id, tid, limit as i64], row_mapper)?;
+                let rows = stmt.query_map(
+                    params![sanitized_query, owner_user_id, tid, limit as i64],
+                    row_mapper,
+                )?;
                 for row in rows {
                     results.push(row?);
                 }
@@ -477,7 +486,10 @@ impl OntologyRepo {
                        AND o.owner_user_id = ?2
                      ORDER BY rank LIMIT ?3",
                 )?;
-                let rows = stmt.query_map(params![sanitized_query, owner_user_id, limit as i64], row_mapper)?;
+                let rows = stmt.query_map(
+                    params![sanitized_query, owner_user_id, limit as i64],
+                    row_mapper,
+                )?;
                 for row in rows {
                     results.push(row?);
                 }
@@ -545,7 +557,11 @@ impl OntologyRepo {
     ///
     /// Joins through `ontology_objects` to ensure the caller can only see
     /// links where the *from* object belongs to them.
-    pub fn links_from(&self, object_id: i64, owner_user_id: &str) -> anyhow::Result<Vec<OntologyLink>> {
+    pub fn links_from(
+        &self,
+        object_id: i64,
+        owner_user_id: &str,
+    ) -> anyhow::Result<Vec<OntologyLink>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT l.id, l.link_type_id, l.from_object_id, l.to_object_id, l.properties, l.created_at
@@ -560,9 +576,7 @@ impl OntologyRepo {
                 link_type_id: r.get(1)?,
                 from_object_id: r.get(2)?,
                 to_object_id: r.get(3)?,
-                properties: r
-                    .get::<_, Option<String>>(4)?
-                    .map(|s| parse_json_col(s)),
+                properties: r.get::<_, Option<String>>(4)?.map(parse_json_col),
                 created_at: r.get(5)?,
             })
         })?;
@@ -570,7 +584,11 @@ impl OntologyRepo {
     }
 
     /// Get all links pointing to an object, scoped to the object's owner.
-    pub fn links_to(&self, object_id: i64, owner_user_id: &str) -> anyhow::Result<Vec<OntologyLink>> {
+    pub fn links_to(
+        &self,
+        object_id: i64,
+        owner_user_id: &str,
+    ) -> anyhow::Result<Vec<OntologyLink>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT l.id, l.link_type_id, l.from_object_id, l.to_object_id, l.properties, l.created_at
@@ -585,9 +603,7 @@ impl OntologyRepo {
                 link_type_id: r.get(1)?,
                 from_object_id: r.get(2)?,
                 to_object_id: r.get(3)?,
-                properties: r
-                    .get::<_, Option<String>>(4)?
-                    .map(|s| parse_json_col(s)),
+                properties: r.get::<_, Option<String>>(4)?.map(parse_json_col),
                 created_at: r.get(5)?,
             })
         })?;
@@ -642,7 +658,9 @@ impl OntologyRepo {
                 let utc_str = if ts.ends_with('Z') || ts.ends_with("UTC") {
                     ts.to_string()
                 } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                    dt.with_timezone(&Utc).format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+                    dt.with_timezone(&Utc)
+                        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                        .to_string()
                 } else {
                     Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
                 };
@@ -732,31 +750,57 @@ impl OntologyRepo {
         // Re-read the action to get full context for sync delta.
         if self.sync.is_some() {
             #[allow(clippy::type_complexity)]
-            let action_opt: Option<(String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = conn.query_row(
-                "SELECT at.name, a.actor_user_id, a.params, a.channel,
+            let action_opt: Option<(
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )> = conn
+                .query_row(
+                    "SELECT at.name, a.actor_user_id, a.params, a.channel,
                         a.occurred_at_utc, a.occurred_at_local, a.timezone,
                         a.occurred_at_home, a.home_timezone, a.location
                  FROM ontology_actions a
                  JOIN ontology_action_types at ON at.id = a.action_type_id
                  WHERE a.id = ?1",
-                params![action_id],
-                |r| Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, Option<String>>(6)?,
-                    r.get::<_, Option<String>>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                    r.get::<_, Option<String>>(9)?,
-                )),
-            ).ok();
+                    params![action_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                            r.get::<_, Option<String>>(8)?,
+                            r.get::<_, Option<String>>(9)?,
+                        ))
+                    },
+                )
+                .ok();
             drop(conn);
 
-            if let Some((type_name, actor, params_json, channel,
-                         utc, local, tz, home, home_tz, location)) = action_opt {
+            if let Some((
+                type_name,
+                actor,
+                params_json,
+                channel,
+                utc,
+                local,
+                tz,
+                home,
+                home_tz,
+                location,
+            )) = action_opt
+            {
                 let params_val: serde_json::Value =
                     serde_json::from_str(&params_json).unwrap_or_default();
                 self.sync_action(
@@ -839,10 +883,7 @@ impl OntologyRepo {
                 Box::new(ch.to_string()),
             ]
         } else {
-            vec![
-                Box::new(owner_user_id.to_string()),
-                Box::new(limit_val),
-            ]
+            vec![Box::new(owner_user_id.to_string()), Box::new(limit_val)]
         };
         let rows = stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |r| {
             Ok(OntologyAction {
@@ -856,7 +897,7 @@ impl OntologyRepo {
                     .map(|s| serde_json::from_str(&s).unwrap_or_default())
                     .unwrap_or_default(),
                 params: parse_json_col(r.get::<_, String>(6)?),
-                result: r.get::<_, Option<String>>(7)?.map(|s| parse_json_col(s)),
+                result: r.get::<_, Option<String>>(7)?.map(parse_json_col),
                 channel: r.get(8)?,
                 context_id: r.get(9)?,
                 occurred_at_utc: r.get(10)?,
@@ -1020,14 +1061,19 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].status, ActionStatus::Success);
         // occurred_at_utc should be the UTC equivalent of 14:30 KST (=05:30Z)
-        assert!(actions[0].occurred_at_utc.as_deref().unwrap().contains("05:30:00"));
+        assert!(actions[0]
+            .occurred_at_utc
+            .as_deref()
+            .unwrap()
+            .contains("05:30:00"));
         // occurred_at_home should be in Asia/Seoul (14:30 KST)
-        assert!(actions[0].occurred_at_home.as_deref().unwrap().contains("14:30:00"));
+        assert!(actions[0]
+            .occurred_at_home
+            .as_deref()
+            .unwrap()
+            .contains("14:30:00"));
         assert_eq!(actions[0].home_timezone.as_deref(), Some("Asia/Seoul"));
-        assert_eq!(
-            actions[0].location.as_deref(),
-            Some("서울 서초구 사무실")
-        );
+        assert_eq!(actions[0].location.as_deref(), Some("서울 서초구 사무실"));
     }
 
     #[test]
@@ -1064,10 +1110,6 @@ mod tests {
             .search_objects("u1", Some("Task"), "hotel", 10)
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0]
-            .title
-            .as_deref()
-            .unwrap()
-            .contains("Hotel"));
+        assert!(results[0].title.as_deref().unwrap().contains("Hotel"));
     }
 }

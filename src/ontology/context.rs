@@ -5,7 +5,7 @@
 //! over a "map of reality" instead of raw text chunks.
 
 use super::repo::OntologyRepo;
-use super::types::*;
+use super::types::{ActionSummary, ContextSnapshot, ContextSnapshotRequest};
 use std::sync::Arc;
 
 /// Builds context snapshots from the ontology for LLM consumption.
@@ -36,17 +36,17 @@ impl ContextBuilder {
             .into_iter()
             .next();
 
-        let recent_contacts =
-            self.repo
-                .list_objects_by_type(&req.owner_user_id, "Contact", 5)?;
+        let recent_contacts = self
+            .repo
+            .list_objects_by_type(&req.owner_user_id, "Contact", 5)?;
 
-        let recent_tasks =
-            self.repo
-                .list_objects_by_type(&req.owner_user_id, "Task", 10)?;
+        let recent_tasks = self
+            .repo
+            .list_objects_by_type(&req.owner_user_id, "Task", 10)?;
 
-        let recent_projects =
-            self.repo
-                .list_objects_by_type(&req.owner_user_id, "Project", 5)?;
+        let recent_projects = self
+            .repo
+            .list_objects_by_type(&req.owner_user_id, "Project", 5)?;
 
         // Fetch recent actions and build summaries.
         // Hard-cap at 50 regardless of caller input (schema documents max:50).
@@ -122,7 +122,8 @@ fn summarize_json(val: &serde_json::Value, max_keys: usize) -> serde_json::Value
                 // Truncate long string values.
                 let truncated = match v {
                     serde_json::Value::String(s) if s.len() > 100 => {
-                        let boundary = s.char_indices()
+                        let boundary = s
+                            .char_indices()
                             .take_while(|(i, _)| *i < 100)
                             .last()
                             .map(|(i, c)| i + c.len_utf8())

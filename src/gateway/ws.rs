@@ -549,7 +549,9 @@ async fn try_relay_to_local_device(
 
         {
             use super::remote::REMOTE_RESPONSE_CHANNELS;
-            REMOTE_RESPONSE_CHANNELS.lock().insert(probe_id.clone(), probe_tx);
+            REMOTE_RESPONSE_CHANNELS
+                .lock()
+                .insert(probe_id.clone(), probe_tx);
         }
 
         let probe_msg = super::remote::RoutedMessage {
@@ -562,7 +564,11 @@ async fn try_relay_to_local_device(
             msg_type: "check_key".to_string(),
         };
 
-        if let Err(_) = device_router.send_to_device(&device.device_id, probe_msg).await {
+        if device_router
+            .send_to_device(&device.device_id, probe_msg)
+            .await
+            .is_err()
+        {
             use super::remote::REMOTE_RESPONSE_CHANNELS;
             REMOTE_RESPONSE_CHANNELS.lock().remove(&probe_id);
             return DeviceRelayResult::NoDevice;
@@ -612,12 +618,13 @@ async fn try_relay_to_local_device(
     );
 
     let msg_id = uuid::Uuid::new_v4().to_string();
-    let (resp_tx, mut resp_rx) =
-        tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(64);
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(64);
 
     {
         use super::remote::REMOTE_RESPONSE_CHANNELS;
-        REMOTE_RESPONSE_CHANNELS.lock().insert(msg_id.clone(), resp_tx);
+        REMOTE_RESPONSE_CHANNELS
+            .lock()
+            .insert(msg_id.clone(), resp_tx);
     }
 
     let routed_msg = super::remote::RoutedMessage {
@@ -627,7 +634,10 @@ async fn try_relay_to_local_device(
         msg_type: "message".to_string(),
     };
 
-    if let Err(e) = device_router.send_to_device(&device.device_id, routed_msg).await {
+    if let Err(e) = device_router
+        .send_to_device(&device.device_id, routed_msg)
+        .await
+    {
         tracing::warn!(
             error = e.as_str(),
             device_id = device.device_id.as_str(),
@@ -641,8 +651,7 @@ async fn try_relay_to_local_device(
     }
 
     // Wait for device responses and forward to the web client
-    let timeout =
-        tokio::time::Duration::from_secs(super::remote::DEVICE_RESPONSE_TIMEOUT_SECS_PUB);
+    let timeout = tokio::time::Duration::from_secs(super::remote::DEVICE_RESPONSE_TIMEOUT_SECS_PUB);
     let deadline = tokio::time::Instant::now() + timeout;
     let mut got_response = false;
 
@@ -829,12 +838,13 @@ async fn try_relay_to_local_device_with_proxy(
     );
 
     let msg_id = uuid::Uuid::new_v4().to_string();
-    let (resp_tx, mut resp_rx) =
-        tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(64);
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<super::remote::RoutedMessage>(64);
 
     {
         use super::remote::REMOTE_RESPONSE_CHANNELS;
-        REMOTE_RESPONSE_CHANNELS.lock().insert(msg_id.clone(), resp_tx);
+        REMOTE_RESPONSE_CHANNELS
+            .lock()
+            .insert(msg_id.clone(), resp_tx);
     }
 
     // Send the hybrid relay message.
@@ -852,7 +862,10 @@ async fn try_relay_to_local_device_with_proxy(
         msg_type: "hybrid_relay".to_string(),
     };
 
-    if let Err(e) = device_router.send_to_device(&device.device_id, routed_msg).await {
+    if let Err(e) = device_router
+        .send_to_device(&device.device_id, routed_msg)
+        .await
+    {
         tracing::warn!(
             error = e.as_str(),
             "Failed to send hybrid relay message to device"
@@ -865,12 +878,7 @@ async fn try_relay_to_local_device_with_proxy(
     // Stream responses from the device back to the web client
     let mut got_response = false;
     loop {
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(120),
-            resp_rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(120), resp_rx.recv()).await {
             Ok(Some(resp)) => {
                 got_response = true;
                 let ws_msg = serde_json::json!({
@@ -971,7 +979,9 @@ async fn handle_socket(
         {
             let mut config_guard = state.config.lock();
 
-            if let Some(client_provider) = parsed["provider"].as_str().filter(|p| !p.trim().is_empty()) {
+            if let Some(client_provider) =
+                parsed["provider"].as_str().filter(|p| !p.trim().is_empty())
+            {
                 let backend_provider = match client_provider {
                     "claude" => "anthropic",
                     p => p,
@@ -1097,10 +1107,10 @@ async fn handle_socket(
             } else if let Some(stored_key) =
                 config_guard.provider_api_keys.get(&provider_name).cloned()
             {
-                if !stored_key.trim().is_empty() {
-                    config_guard.api_key = Some(stored_key);
-                } else {
+                if stored_key.trim().is_empty() {
                     config_guard.api_key = None;
+                } else {
+                    config_guard.api_key = Some(stored_key);
                 }
             } else {
                 config_guard.api_key = None;

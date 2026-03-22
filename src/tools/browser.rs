@@ -559,16 +559,13 @@ impl BrowserTool {
                             }
                         }
                         BrowserBackendKind::Playwright => {
-                            if Self::is_playwright_available_with_command(
-                                &self.playwright_command,
-                            )
-                            .await
+                            if Self::is_playwright_available_with_command(&self.playwright_command)
+                                .await
                             {
                                 return Ok(ResolvedBackend::Playwright);
                             }
-                            reasons.push(
-                                "playwright unavailable (Playwright not installed)".into(),
-                            );
+                            reasons
+                                .push("playwright unavailable (Playwright not installed)".into());
                         }
                         BrowserBackendKind::ComputerUse => match self.computer_use_available() {
                             Ok(true) => return Ok(ResolvedBackend::ComputerUse),
@@ -578,7 +575,7 @@ impl BrowserTool {
                             Err(err) => reasons.push(format!("computer_use invalid: {err}")),
                         },
                         BrowserBackendKind::Auto => {
-                            reasons.push("invalid auto backend priority entry: auto".into())
+                            reasons.push("invalid auto backend priority entry: auto".into());
                         }
                     }
                 }
@@ -884,10 +881,7 @@ impl BrowserTool {
         let bridge_script = Self::playwright_bridge_script();
 
         // Build the command payload from raw args, injecting headless config
-        let mut payload = raw_args
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
+        let mut payload = raw_args.as_object().cloned().unwrap_or_default();
         payload.insert(
             "headless".to_string(),
             Value::Bool(self.playwright_headless),
@@ -1265,9 +1259,7 @@ impl BrowserTool {
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
-            ResolvedBackend::Playwright => {
-                self.execute_playwright_action(action, raw_args).await
-            }
+            ResolvedBackend::Playwright => self.execute_playwright_action(action, raw_args).await,
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),

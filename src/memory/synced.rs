@@ -80,7 +80,9 @@ impl SyncedMemory {
                 DeltaOperation::OntologyObjectUpsert { .. }
                 | DeltaOperation::OntologyLinkCreate { .. }
                 | DeltaOperation::OntologyActionLog { .. } => {
-                    tracing::debug!("Skipping ontology delta in memory apply (handled by ontology layer)");
+                    tracing::debug!(
+                        "Skipping ontology delta in memory apply (handled by ontology layer)"
+                    );
                 }
             }
         }

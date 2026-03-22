@@ -114,17 +114,25 @@ impl Tool for WorkspaceFolderTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "Directory does not exist: {}",
-                    expanded.display()
-                )),
+                error: Some(format!("Directory does not exist: {}", expanded.display())),
             });
         }
 
         // Block obviously sensitive directories
         let sensitive = [
-            "/.ssh", "/.gnupg", "/.aws", "/.config/gcloud", "/etc", "/root",
-            "/usr", "/bin", "/sbin", "/boot", "/dev", "/proc", "/sys",
+            "/.ssh",
+            "/.gnupg",
+            "/.aws",
+            "/.config/gcloud",
+            "/etc",
+            "/root",
+            "/usr",
+            "/bin",
+            "/sbin",
+            "/boot",
+            "/dev",
+            "/proc",
+            "/sys",
         ];
         let path_str = expanded.to_string_lossy();
         for s in &sensitive {
@@ -211,10 +219,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_sensitive_directory() {
         let tool = WorkspaceFolderTool::new(test_security());
-        let result = tool
-            .execute(json!({"path": "/root/.ssh"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"path": "/root/.ssh"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("sensitive"));
     }

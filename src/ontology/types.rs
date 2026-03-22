@@ -101,7 +101,10 @@ impl ActionStatus {
             "error" => Self::Error,
             "rolled_back" => Self::RolledBack,
             other => {
-                tracing::warn!(value = other, "unrecognized ActionStatus, defaulting to Pending");
+                tracing::warn!(
+                    value = other,
+                    "unrecognized ActionStatus, defaulting to Pending"
+                );
                 Self::Pending
             }
         }

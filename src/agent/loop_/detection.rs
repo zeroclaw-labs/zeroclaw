@@ -36,7 +36,7 @@ impl Default for LoopDetectionConfig {
         Self {
             no_progress_threshold: 3,
             ping_pong_cycles: 2,
-            failure_streak_threshold: 3,
+            failure_streak_threshold: 5,
         }
     }
 }
@@ -121,6 +121,9 @@ impl LoopDetector {
                     DetectionVerdict::HardStop(msg)
                 } else {
                     self.warning_injected = true;
+                    // Reset failure counters so the LLM has a fair chance to
+                    // switch tools after receiving the warning prompt.
+                    self.consecutive_failures.clear();
                     DetectionVerdict::InjectWarning(format_warning(&msg))
                 }
             }
@@ -234,9 +237,11 @@ fn hash_output(output: &str) -> u64 {
 fn format_warning(reason: &str) -> String {
     format!(
         "IMPORTANT: A loop pattern has been detected in your tool usage. {reason}. \
-         You MUST change your approach — do NOT repeat the same call. Try these alternatives:\n\
-         (1) Use a DIFFERENT tool for the same goal (e.g., web_search → browser, browser → http_request, \
-             shell curl → browser download_url).\n\
+         You MUST change your approach — do NOT repeat the same failing tool. Try these alternatives:\n\
+         (1) Use a DIFFERENT tool for the same goal:\n\
+             - web_search_tool failed? → try 'web_fetch' with a known URL, 'shell' with curl, or 'browser' tool.\n\
+             - For weather: try 'web_fetch' with https://wttr.in/{{city}}?format=j1 or 'shell' curl.\n\
+             - For news/info: try 'web_fetch' with a specific news site URL.\n\
          (2) Try a DIFFERENT source or website for the same information.\n\
          (3) Try a DIFFERENT method (e.g., HTML scraping → JSON API, direct download → browser automation).\n\
          (4) Break the task into SMALLER sub-steps that are individually achievable.\n\
@@ -353,9 +358,11 @@ mod tests {
         det.record_call("shell", r#"{"cmd":"bad1"}"#, "error: not found 1", false);
         det.record_call("shell", r#"{"cmd":"bad2"}"#, "error: not found 2", false);
         det.record_call("shell", r#"{"cmd":"bad3"}"#, "error: not found 3", false);
+        det.record_call("shell", r#"{"cmd":"bad4"}"#, "error: not found 4", false);
+        det.record_call("shell", r#"{"cmd":"bad5"}"#, "error: not found 5", false);
         match det.check() {
             DetectionVerdict::InjectWarning(msg) => {
-                assert!(msg.contains("failed 3 consecutive"), "msg: {msg}");
+                assert!(msg.contains("failed 5 consecutive"), "msg: {msg}");
             }
             other => panic!("expected InjectWarning, got {other:?}"),
         }
@@ -365,11 +372,15 @@ mod tests {
     #[test]
     fn failure_streak_resets_on_success() {
         let mut det = LoopDetector::new(default_config());
-        det.record_call("shell", r#"{"cmd":"bad"}"#, "err", false);
-        det.record_call("shell", r#"{"cmd":"bad"}"#, "err", false);
+        det.record_call("shell", r#"{"cmd":"bad1"}"#, "err1", false);
+        det.record_call("shell", r#"{"cmd":"bad2"}"#, "err2", false);
+        det.record_call("shell", r#"{"cmd":"bad3"}"#, "err3", false);
+        det.record_call("shell", r#"{"cmd":"bad4"}"#, "err4", false);
         det.record_call("shell", r#"{"cmd":"good"}"#, "ok", true); // resets
-        det.record_call("shell", r#"{"cmd":"bad"}"#, "err", false);
-        det.record_call("shell", r#"{"cmd":"bad"}"#, "err", false);
+        det.record_call("shell", r#"{"cmd":"bad5"}"#, "err5", false);
+        det.record_call("shell", r#"{"cmd":"bad6"}"#, "err6", false);
+        det.record_call("shell", r#"{"cmd":"bad7"}"#, "err7", false);
+        det.record_call("shell", r#"{"cmd":"bad8"}"#, "err8", false);
         assert_eq!(det.check(), DetectionVerdict::Continue);
     }
 

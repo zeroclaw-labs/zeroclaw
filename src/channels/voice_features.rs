@@ -243,11 +243,7 @@ pub async fn transcribe_voice_message(
 
     let text = super::transcription::transcribe_audio(audio_data, file_name, config).await?;
 
-    tracing::info!(
-        channel,
-        chars = text.len(),
-        "Voice transcription completed"
-    );
+    tracing::info!(channel, chars = text.len(), "Voice transcription completed");
 
     Ok(text)
 }

@@ -57,7 +57,7 @@ fn extract_effect(text: &str) -> (String, Option<String>) {
             let effect_id = EFFECT_MAP
                 .iter()
                 .find(|(k, _)| *k == name.as_str())
-                .map(|(_, v)| v.to_string())
+                .map(|(_, v)| (*v).to_string())
                 .or_else(|| {
                     // Pass through full Apple effect IDs directly
                     if name.starts_with("com.apple.") {
@@ -519,6 +519,7 @@ impl BlueBubblesChannel {
             channel: "bluebubbles".to_string(),
             timestamp,
             thread_ts: None,
+            silent: false,
         });
 
         messages

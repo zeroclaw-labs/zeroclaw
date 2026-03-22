@@ -40,10 +40,7 @@ pub enum ProviderAccessMode {
 }
 
 /// Determine the provider access mode for a request.
-pub fn determine_access_mode(
-    user_has_key: bool,
-    user_selected_model: bool,
-) -> ProviderAccessMode {
+pub fn determine_access_mode(user_has_key: bool, user_selected_model: bool) -> ProviderAccessMode {
     if user_has_key {
         ProviderAccessMode::UserKey
     } else if user_selected_model {
@@ -110,10 +107,7 @@ pub const SIGNUP_BONUS_CREDITS: u32 = 500;
 /// Called once during user registration. The bonus is enough for
 /// initial exploration of general chat (Gemini 3.1 Flash Lite is very
 /// cost-effective) and a few coding/document tasks.
-pub fn grant_signup_bonus(
-    payment_manager: &PaymentManager,
-    user_id: &str,
-) -> anyhow::Result<u32> {
+pub fn grant_signup_bonus(payment_manager: &PaymentManager, user_id: &str) -> anyhow::Result<u32> {
     payment_manager.add_bonus_credits(user_id, SIGNUP_BONUS_CREDITS)?;
     tracing::info!(
         user_id,
@@ -275,8 +269,7 @@ pub fn record_usage(
         // Convert USD cost to credits: 1 credit ≈ ₩10 ≈ $0.007
         // Then multiply by 2.2× (2.0× operator margin + 10% VAT)
         let base_credits = (cost_usd / 0.007).ceil();
-        let credits_to_deduct = (base_credits * OPERATOR_KEY_CREDIT_MULTIPLIER)
-            .ceil() as u32;
+        let credits_to_deduct = (base_credits * OPERATOR_KEY_CREDIT_MULTIPLIER).ceil() as u32;
         let credits_to_deduct = credits_to_deduct.max(1); // Minimum 1 credit
 
         // Check balance and warn before deduction

@@ -492,86 +492,90 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Option<Arc<crate::sync::SyncCoordinator>>,
         Option<Arc<parking_lot::Mutex<crate::memory::sync::SyncEngine>>>,
     ) = if config.sync.enabled {
-            // Build base memory, then wrap with SyncedMemory for the coordinator
-            let base = memory::create_memory_with_storage(
-                &config.memory,
-                Some(&config.storage.provider.config),
-                &config.workspace_dir,
-                config.api_key.as_deref(),
-            )?;
-            let engine = crate::memory::sync::SyncEngine::new(&config.workspace_dir, true)?;
-            let engine = Arc::new(parking_lot::Mutex::new(engine));
-            let engine_for_ontology = Arc::clone(&engine);
-            let synced = Arc::new(crate::memory::synced::SyncedMemory::new(
-                Arc::from(base),
-                engine,
+        // Build base memory, then wrap with SyncedMemory for the coordinator
+        let base = memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?;
+        let engine = crate::memory::sync::SyncEngine::new(&config.workspace_dir, true)?;
+        let engine = Arc::new(parking_lot::Mutex::new(engine));
+        let engine_for_ontology = Arc::clone(&engine);
+        let synced = Arc::new(crate::memory::synced::SyncedMemory::new(
+            Arc::from(base),
+            engine,
+        ));
+        let coordinator = Arc::new(crate::sync::SyncCoordinator::new(
+            synced.clone(),
+            config.sync.batch_size,
+        ));
+        // Wire up RelayClient for cross-device sync via external relay server
+        if let Some(ref relay_url) = config.sync.relay_url {
+            let device_id = synced.device_id();
+            let relay = Arc::new(crate::sync::RelayClient::new(
+                relay_url.clone(),
+                device_id.clone(),
+                device_id.clone(), // user_id defaults to device_id
             ));
-            let coordinator = Arc::new(crate::sync::SyncCoordinator::new(
-                synced.clone(),
-                config.sync.batch_size,
-            ));
-            // Wire up RelayClient for cross-device sync via external relay server
-            if let Some(ref relay_url) = config.sync.relay_url {
-                let device_id = synced.device_id();
-                let relay = Arc::new(crate::sync::RelayClient::new(
-                    relay_url.clone(),
-                    device_id.clone(),
-                    device_id.clone(), // user_id defaults to device_id
-                ));
-                let relay_for_task = relay.clone();
-                let coord_for_task = coordinator.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = relay_for_task.connect().await {
-                        tracing::warn!("Relay connection failed (will retry on next message): {e}");
-                        return;
-                    }
-                    tracing::info!("Relay client connected, starting inbound delta loop");
-                    // Receive loop: relay entries → coordinator
-                    while let Some(entry) = relay_for_task.recv().await {
-                        let responses = coord_for_task
-                            .handle_message(
-                                &serde_json::json!({
-                                    "RelayNotify": {
-                                        "from_device_id": entry.sender_device_id,
-                                        "encrypted_payload": entry.encrypted_payload,
-                                        "nonce": entry.nonce,
-                                    }
-                                })
-                                .to_string(),
-                            )
-                            .await;
-                        // Forward any response messages back through relay
-                        for resp in responses {
-                            if let Ok(re) =
-                                serde_json::from_str::<crate::sync::relay::RelayEntry>(&resp)
-                            {
-                                let _ = relay_for_task.store(re).await;
-                            }
+            let relay_for_task = relay.clone();
+            let coord_for_task = coordinator.clone();
+            tokio::spawn(async move {
+                if let Err(e) = relay_for_task.connect().await {
+                    tracing::warn!("Relay connection failed (will retry on next message): {e}");
+                    return;
+                }
+                tracing::info!("Relay client connected, starting inbound delta loop");
+                // Receive loop: relay entries → coordinator
+                while let Some(entry) = relay_for_task.recv().await {
+                    let responses = coord_for_task
+                        .handle_message(
+                            &serde_json::json!({
+                                "RelayNotify": {
+                                    "from_device_id": entry.sender_device_id,
+                                    "encrypted_payload": entry.encrypted_payload,
+                                    "nonce": entry.nonce,
+                                }
+                            })
+                            .to_string(),
+                        )
+                        .await;
+                    // Forward any response messages back through relay
+                    for resp in responses {
+                        if let Ok(re) =
+                            serde_json::from_str::<crate::sync::relay::RelayEntry>(&resp)
+                        {
+                            let _ = relay_for_task.store(re).await;
                         }
                     }
-                    tracing::info!("Relay inbound loop ended");
-                });
-                tracing::info!(
-                    device_id = %synced.device_id(),
-                    relay_url = %relay_url,
-                    "Gateway memory initialized with sync + relay enabled"
-                );
-            } else {
-                tracing::info!(
-                    device_id = %synced.device_id(),
-                    "Gateway memory initialized with sync enabled (no relay)"
-                );
-            }
-            (synced as Arc<dyn Memory>, Some(coordinator), Some(engine_for_ontology))
+                }
+                tracing::info!("Relay inbound loop ended");
+            });
+            tracing::info!(
+                device_id = %synced.device_id(),
+                relay_url = %relay_url,
+                "Gateway memory initialized with sync + relay enabled"
+            );
         } else {
-            let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
-                &config.memory,
-                Some(&config.storage.provider.config),
-                &config.workspace_dir,
-                config.api_key.as_deref(),
-            )?);
-            (mem, None, None)
-        };
+            tracing::info!(
+                device_id = %synced.device_id(),
+                "Gateway memory initialized with sync enabled (no relay)"
+            );
+        }
+        (
+            synced as Arc<dyn Memory>,
+            Some(coordinator),
+            Some(engine_for_ontology),
+        )
+    } else {
+        let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
+            &config.memory,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+        )?);
+        (mem, None, None)
+    };
 
     // ── Clock drift check ─────────────────────────────────────────────
     // MoA uses occurred_at (real-world time) as the primary sort key for
@@ -658,19 +662,22 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Supabase client for cloud user management + credits
     let supabase = {
         match crate::integrations::supabase::SupabaseConfig::from_env() {
-            Some(sb_config) => match crate::integrations::supabase::SupabaseClient::new(sb_config)
-            {
-                Ok(client) => {
-                    tracing::info!("Supabase cloud backend initialized");
-                    Some(Arc::new(client))
+            Some(sb_config) => {
+                match crate::integrations::supabase::SupabaseClient::new(sb_config) {
+                    Ok(client) => {
+                        tracing::info!("Supabase cloud backend initialized");
+                        Some(Arc::new(client))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize Supabase client: {e}");
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to initialize Supabase client: {e}");
-                    None
-                }
-            },
+            }
             None => {
-                tracing::debug!("Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_KEY to enable)");
+                tracing::debug!(
+                    "Supabase not configured (set SUPABASE_URL + SUPABASE_SERVICE_KEY to enable)"
+                );
                 None
             }
         }
@@ -919,7 +926,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  GET  /ws/voice  — WebSocket simultaneous interpretation");
     }
     if config.auth.enabled {
-        println!("  POST /api/remote/login — remote device login (username + password + pairing code)");
+        println!(
+            "  POST /api/remote/login — remote device login (username + password + pairing code)"
+        );
         println!("  GET  /api/remote/devices — list user devices with online status");
         println!("  GET  /ws/remote — WebSocket remote device chat (from web browser)");
         println!("  GET  /ws/device-link — WebSocket device agent registration");
@@ -979,9 +988,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                         {
                             Ok(s) => Some(Arc::new(s)),
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to open channel pairing store: {e}"
-                                );
+                                tracing::warn!("Failed to open channel pairing store: {e}");
                                 None
                             }
                         };
@@ -1181,20 +1188,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/credits/purchase",
             post(api::handle_api_credits_purchase),
         )
-        .route(
-            "/api/credits/history",
-            get(api::handle_api_credits_history),
-        )
+        .route("/api/credits/history", get(api::handle_api_credits_history))
         .route("/api/credits/usage", get(api::handle_api_credits_usage))
         // ── Payment callbacks (Kakao Pay redirects) ──
-        .route(
-            "/api/payment/approve",
-            get(api::handle_api_payment_approve),
-        )
-        .route(
-            "/api/payment/cancel",
-            get(api::handle_api_payment_cancel),
-        )
+        .route("/api/payment/approve", get(api::handle_api_payment_approve))
+        .route("/api/payment/cancel", get(api::handle_api_payment_cancel))
         .route("/api/payment/fail", get(api::handle_api_payment_fail))
         // ── Checkout (Stripe + TossPayments) ──
         .route(
@@ -1209,16 +1207,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             "/api/checkout/success",
             get(api::handle_api_checkout_success),
         )
-        .route(
-            "/api/checkout/cancel",
-            get(api::handle_api_checkout_cancel),
-        )
+        .route("/api/checkout/cancel", get(api::handle_api_checkout_cancel))
         .route(
             "/api/checkout/webhook/stripe",
             post(api::handle_api_checkout_webhook_stripe),
         )
         // ── Admin: Model Pricing Management ──
-        .route("/api/admin/pricing", get(api::handle_api_admin_pricing_list))
+        .route(
+            "/api/admin/pricing",
+            get(api::handle_api_admin_pricing_list),
+        )
         .route(
             "/api/admin/pricing/estimate",
             post(api::handle_api_admin_pricing_estimate),
@@ -1235,13 +1233,28 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         // ── LLM proxy (hybrid architecture: keys stay on server) ──
         .route("/api/llm/proxy", post(llm_proxy::handle_llm_proxy))
         // ── Document processing ──
-        .route("/api/document/process", post(api::handle_api_document_process))
+        .route(
+            "/api/document/process",
+            post(api::handle_api_document_process),
+        )
         // ── R2-based document upload (secure image PDF flow) ──
-        .route("/api/document/upload-url", post(llm_proxy::handle_document_upload_url))
-        .route("/api/document/process-r2", post(llm_proxy::handle_document_process_r2))
+        .route(
+            "/api/document/upload-url",
+            post(llm_proxy::handle_document_upload_url),
+        )
+        .route(
+            "/api/document/process-r2",
+            post(llm_proxy::handle_document_process_r2),
+        )
         // ── Channel pairing API ──
-        .route("/api/channel-pairing/create", post(handle_channel_pairing_create))
-        .route("/api/channel-pairing/status", get(handle_channel_pairing_status))
+        .route(
+            "/api/channel-pairing/create",
+            post(handle_channel_pairing_create),
+        )
+        .route(
+            "/api/channel-pairing/status",
+            get(handle_channel_pairing_status),
+        )
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
@@ -1253,7 +1266,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/auth/login", post(auth_api::handle_auth_login))
         .route("/api/auth/logout", post(auth_api::handle_auth_logout))
         .route("/api/auth/devices", get(auth_api::handle_auth_devices_list))
-        .route("/api/auth/devices", post(auth_api::handle_auth_devices_register))
+        .route(
+            "/api/auth/devices",
+            post(auth_api::handle_auth_devices_register),
+        )
         .route(
             "/api/auth/devices/{device_id}/pairing-code",
             put(auth_api::handle_auth_device_set_pairing_code),
@@ -1263,23 +1279,29 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             post(auth_api::handle_auth_device_verify_pairing),
         )
         .route("/api/auth/heartbeat", post(auth_api::handle_auth_heartbeat))
-        .route("/api/auth/kakao/callback", post(auth_api::handle_auth_kakao_callback))
-        .route("/api/auth/kakao/redirect", get(auth_api::handle_auth_kakao_redirect))
+        .route(
+            "/api/auth/kakao/callback",
+            post(auth_api::handle_auth_kakao_callback),
+        )
+        .route(
+            "/api/auth/kakao/redirect",
+            get(auth_api::handle_auth_kakao_redirect),
+        )
         .route("/api/agent/info", get(auth_api::handle_agent_info))
         // ── Remote device access ──
         .route("/api/remote/login", post(remote::handle_remote_login))
         .route("/api/remote/devices", get(remote::handle_remote_devices))
         .route("/api/remote/logout", post(remote::handle_remote_logout))
-        .route("/api/remote/verify-email", post(remote::handle_remote_verify_email))
+        .route(
+            "/api/remote/verify-email",
+            post(remote::handle_remote_verify_email),
+        )
         .route("/api/remote/email", put(remote::handle_remote_set_email))
         .route("/ws/remote", get(remote::handle_ws_remote))
         .route("/ws/device-link", get(remote::handle_ws_device_link))
         // ── Channel auto-pairing web flow ──
         .route("/pair/auto/{token}", get(pair::handle_auto_pair_page))
-        .route(
-            "/pair/auto/{token}",
-            post(pair::handle_auto_pair_login),
-        )
+        .route("/pair/auto/{token}", post(pair::handle_auto_pair_login))
         .route("/pair/signup", get(pair::handle_pair_signup_page))
         .route("/pair/signup", post(pair::handle_pair_signup_submit))
         // ── Sync endpoints (cross-device memory sync) ──
@@ -1539,9 +1561,7 @@ fn try_consume_pairing_code(
     // Accept: UUID tokens (36 chars) or short codes (4-64 alphanumeric + dash).
     let trimmed = content.trim();
     let looks_like_code = (trimmed.len() >= 4 && trimmed.len() <= 64)
-        && trimmed
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-');
+        && trimmed.chars().all(|c| c.is_alphanumeric() || c == '-');
 
     if !looks_like_code {
         return None;
@@ -1680,8 +1700,7 @@ pub(super) async fn try_relay_channel_to_device(
 
     // 5. Send channel_relay message to device
     let msg_id = uuid::Uuid::new_v4().to_string();
-    let (resp_tx, mut resp_rx) =
-        tokio::sync::mpsc::channel::<remote::RoutedMessage>(64);
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::channel::<remote::RoutedMessage>(64);
 
     {
         remote::REMOTE_RESPONSE_CHANNELS
@@ -1704,7 +1723,11 @@ pub(super) async fn try_relay_channel_to_device(
         msg_type: "channel_relay".to_string(),
     };
 
-    if device_router.send_to_device(&device_id, routed_msg).await.is_err() {
+    if device_router
+        .send_to_device(&device_id, routed_msg)
+        .await
+        .is_err()
+    {
         remote::REMOTE_RESPONSE_CHANNELS.lock().remove(&msg_id);
         tracing::warn!(
             device_id = device_id.as_str(),
@@ -1718,12 +1741,7 @@ pub(super) async fn try_relay_channel_to_device(
     let mut got_response = false;
 
     loop {
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(120),
-            resp_rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(tokio::time::Duration::from_secs(120), resp_rx.recv()).await {
             Ok(Some(resp)) => {
                 got_response = true;
                 match resp.msg_type.as_str() {
@@ -1792,14 +1810,8 @@ pub(super) async fn process_channel_message(
     let sid = session_id.unwrap_or("");
 
     // Step 1: Try device relay (preserves local tool keys)
-    let device_response = try_relay_channel_to_device(
-        state,
-        channel_name,
-        sender_platform_uid,
-        content,
-        sid,
-    )
-    .await;
+    let device_response =
+        try_relay_channel_to_device(state, channel_name, sender_platform_uid, content, sid).await;
 
     if let Some(response) = device_response {
         return Ok(response);
@@ -1832,7 +1844,9 @@ pub(super) async fn run_gateway_chat_with_tools(
 
 /// Reload config from the on-disk TOML file without applying env-var overrides.
 /// Returns the raw parsed config for selective field merging.
-pub(super) fn reload_disk_config(current: &crate::config::Config) -> anyhow::Result<crate::config::Config> {
+pub(super) fn reload_disk_config(
+    current: &crate::config::Config,
+) -> anyhow::Result<crate::config::Config> {
     let contents = std::fs::read_to_string(&current.config_path)?;
     let mut parsed: crate::config::Config = toml::from_str(&contents)?;
     parsed.config_path = current.config_path.clone();
@@ -1992,10 +2006,7 @@ async fn handle_channel_pairing_status(
             }
         },
         None => {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({"channels": []})),
-            );
+            return (StatusCode::OK, Json(serde_json::json!({"channels": []})));
         }
     };
 
@@ -2828,8 +2839,14 @@ async fn handle_whatsapp_message(
 
         // ── Device-first relay: try local device, fallback to Railway ──
         match process_channel_message(
-            &state, "whatsapp", &msg.sender, &msg.content, Some(&session_id),
-        ).await {
+            &state,
+            "whatsapp",
+            &msg.sender,
+            &msg.content,
+            Some(&session_id),
+        )
+        .await
+        {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -2958,7 +2975,9 @@ async fn handle_linq_webhook(
         }
 
         // Call the LLM
-        match process_channel_message(&state, "linq", &msg.sender, &msg.content, Some(&session_id)).await {
+        match process_channel_message(&state, "linq", &msg.sender, &msg.content, Some(&session_id))
+            .await
+        {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -3223,7 +3242,8 @@ async fn handle_bluebubbles_webhook(
         let _ = bluebubbles.start_typing(&msg.reply_target).await;
         let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
 
-        match process_channel_message(&state, "bluebubbles", &msg.sender, &msg.content, None).await {
+        match process_channel_message(&state, "bluebubbles", &msg.sender, &msg.content, None).await
+        {
             Ok(response) => {
                 let _ = bluebubbles.stop_typing(&msg.reply_target).await;
                 let safe_response = sanitize_gateway_response(
@@ -3326,7 +3346,9 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         }
 
         // Call the LLM
-        match process_channel_message(&state, "wati", &msg.sender, &msg.content, Some(&session_id)).await {
+        match process_channel_message(&state, "wati", &msg.sender, &msg.content, Some(&session_id))
+            .await
+        {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -3442,7 +3464,15 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
-        match process_channel_message(&state, "nextcloud_talk", &msg.sender, &msg.content, Some(&session_id)).await {
+        match process_channel_message(
+            &state,
+            "nextcloud_talk",
+            &msg.sender,
+            &msg.content,
+            Some(&session_id),
+        )
+        .await
+        {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -3543,7 +3573,9 @@ async fn handle_qq_webhook(
                 .await;
         }
 
-        match process_channel_message(&state, "qq", &msg.sender, &msg.content, Some(&session_id)).await {
+        match process_channel_message(&state, "qq", &msg.sender, &msg.content, Some(&session_id))
+            .await
+        {
             Ok(response) => {
                 let leak_guard_cfg = gateway_outbound_leak_guard_snapshot(&state);
                 let safe_response = sanitize_gateway_response(
@@ -4111,6 +4143,7 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            silent: false,
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -4127,6 +4160,7 @@ mod tests {
             channel: "qq".into(),
             timestamp: 1,
             thread_ts: Some("msg-123".into()),
+            silent: false,
         };
 
         let key = qq_memory_key(&msg);

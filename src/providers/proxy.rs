@@ -11,7 +11,7 @@
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use super::traits::{ChatMessage, ChatResponse, Provider, ToolCall, TokenUsage};
+use super::traits::{ChatMessage, ChatResponse, Provider, TokenUsage, ToolCall};
 
 /// Provider that routes LLM requests through a remote proxy endpoint.
 ///
@@ -141,7 +141,10 @@ impl ProxyProvider {
             match status.as_u16() {
                 401 => bail!("Proxy token expired or invalid. Please reconnect."),
                 402 => bail!("Insufficient credits. Please add credits to continue."),
-                503 => bail!("No operator key configured for provider '{}'. Please contact the operator.", self.provider_name),
+                503 => bail!(
+                    "No operator key configured for provider '{}'. Please contact the operator.",
+                    self.provider_name
+                ),
                 _ => bail!("Proxy error ({}): {}", status, error_text),
             }
         }

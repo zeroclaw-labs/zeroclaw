@@ -50,6 +50,8 @@ pub enum VoiceEvent {
 }
 
 #[allow(unused_imports)]
+pub use conference::{ConferenceConfig, ConferenceManager, ConferenceRoom, ConferenceRoomSummary};
+#[allow(unused_imports)]
 pub use events::{ClientMessage, InterpretationMode, ServerMessage};
 #[allow(unused_imports)]
 pub use gemini_live::{ConnectionState, GeminiLiveSession, VadConfig, VadSensitivity};
@@ -64,5 +66,3 @@ pub use pipeline::{
 pub use simul::{CommittedSegment, SegmentationConfig, SegmentationEngine};
 #[allow(unused_imports)]
 pub use simul_session::{SimulSession, SimulSessionConfig};
-#[allow(unused_imports)]
-pub use conference::{ConferenceConfig, ConferenceManager, ConferenceRoom, ConferenceRoomSummary};

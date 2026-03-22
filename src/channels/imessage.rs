@@ -283,6 +283,7 @@ end tell"#
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: None,
+                            silent: false,
                         };
 
                         if tx.send(msg).await.is_err() {

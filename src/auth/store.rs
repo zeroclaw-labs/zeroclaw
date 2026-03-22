@@ -136,7 +136,12 @@ impl AuthStore {
             let _ = conn.execute_batch("ALTER TABLE devices ADD COLUMN fingerprint TEXT;");
         }
 
-        // Create fingerprint index after ensuring column exists (both fresh and migrated DBs)
+        // Create fingerprint unique index (per user) after ensuring column exists.
+        // This enforces deduplication at the database level even under concurrent access.
+        let _ = conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_user_fingerprint ON devices(user_id, fingerprint) WHERE fingerprint IS NOT NULL;",
+        );
+        // Legacy non-unique index kept for backward compatibility with existing DBs.
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_devices_fingerprint ON devices(fingerprint);",
         );
@@ -403,11 +408,7 @@ impl AuthStore {
     }
 
     /// Find a device by fingerprint for a given user.
-    pub fn find_device_by_fingerprint(
-        &self,
-        user_id: &str,
-        fingerprint: &str,
-    ) -> Option<String> {
+    pub fn find_device_by_fingerprint(&self, user_id: &str, fingerprint: &str) -> Option<String> {
         let conn = self.conn.lock();
         self.find_device_by_fingerprint_inner(&conn, user_id, fingerprint)
     }
@@ -643,11 +644,7 @@ impl AuthStore {
     ///
     /// Returns the platform_uid (e.g. Kakao ID) linked to this user on the
     /// given channel, if any.
-    pub fn get_channel_uid_for_user(
-        &self,
-        channel: &str,
-        user_id: &str,
-    ) -> Result<Option<String>> {
+    pub fn get_channel_uid_for_user(&self, channel: &str, user_id: &str) -> Result<Option<String>> {
         let conn = self.conn.lock();
         let row = conn.query_row(
             "SELECT platform_uid FROM channel_links WHERE channel = ?1 AND user_id = ?2",
@@ -914,13 +911,25 @@ mod tests {
 
         // Register device with fingerprint
         let id1 = store
-            .register_device(&user_id, "dev_1", "Phone", Some("android"), Some("fp_abc123"))
+            .register_device(
+                &user_id,
+                "dev_1",
+                "Phone",
+                Some("android"),
+                Some("fp_abc123"),
+            )
             .unwrap();
         assert_eq!(id1, "dev_1");
 
         // Register with a different device_id but same fingerprint → should reuse dev_1
         let id2 = store
-            .register_device(&user_id, "dev_new", "Phone Reinstalled", Some("android"), Some("fp_abc123"))
+            .register_device(
+                &user_id,
+                "dev_new",
+                "Phone Reinstalled",
+                Some("android"),
+                Some("fp_abc123"),
+            )
             .unwrap();
         assert_eq!(id2, "dev_1");
 

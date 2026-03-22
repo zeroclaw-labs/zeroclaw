@@ -347,10 +347,11 @@ impl ConferenceRoom {
 
         let mut sent = 0usize;
         for (id, state) in participants.iter() {
-            if *id != from_participant_id && state.status != ParticipantStatus::Disconnected {
-                if state.audio_tx.try_send(event.clone()).is_ok() {
-                    sent += 1;
-                }
+            if *id != from_participant_id
+                && state.status != ParticipantStatus::Disconnected
+                && state.audio_tx.try_send(event.clone()).is_ok()
+            {
+                sent += 1;
             }
         }
 
@@ -696,7 +697,7 @@ mod tests {
     async fn conference_manager_create_and_list() {
         let manager = ConferenceManager::new(10);
 
-        let room = manager.create_room(test_config()).await.unwrap();
+        let _room = manager.create_room(test_config()).await.unwrap();
         assert_eq!(manager.room_count().await, 1);
 
         let rooms = manager.list_rooms().await;

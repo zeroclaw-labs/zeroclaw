@@ -18,8 +18,8 @@ pub mod tracker;
 
 #[allow(unused_imports)]
 pub use checkout::{
-    AutoRechargeSettings, CheckoutProvider, CheckoutRequest, CheckoutResponse,
-    UsdCreditPackage, USD_PACKAGES,
+    AutoRechargeSettings, CheckoutProvider, CheckoutRequest, CheckoutResponse, UsdCreditPackage,
+    USD_PACKAGES,
 };
 #[allow(unused_imports)]
 pub use llm_router::{

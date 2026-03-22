@@ -43,7 +43,9 @@ pub use pipeline::{PipelineConfig, ReviewPipeline};
 #[allow(unused_imports)]
 pub use reviewers::{ClaudeReviewer, GeminiReviewer};
 #[allow(unused_imports)]
-pub use sandbox_bridge::{ReviewFixAction, ReviewFixPlan, SandboxReviewBridge, SandboxReviewBridgeConfig};
+pub use sandbox_bridge::{
+    ReviewFixAction, ReviewFixPlan, SandboxReviewBridge, SandboxReviewBridgeConfig,
+};
 #[allow(unused_imports)]
 pub use traits::{
     CodeReviewer, ConsensusReport, ReviewContext, ReviewFinding, ReviewReport, ReviewVerdict,

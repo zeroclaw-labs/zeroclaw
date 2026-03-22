@@ -151,14 +151,10 @@ pub async fn handle_auth_login(
     };
 
     // Register device if provided; fingerprint-based dedup may return an existing device_id
-    let resolved_device_id = if let (Some(ref did), Some(ref dname)) = (&body.device_id, &body.device_name) {
-        match auth_store.register_device(
-            &user.id,
-            did,
-            dname,
-            None,
-            body.fingerprint.as_deref(),
-        ) {
+    let resolved_device_id = if let (Some(ref did), Some(ref dname)) =
+        (&body.device_id, &body.device_name)
+    {
+        match auth_store.register_device(&user.id, did, dname, None, body.fingerprint.as_deref()) {
             Ok(actual_id) => Some(actual_id),
             Err(_) => Some(did.clone()),
         }
@@ -241,7 +237,11 @@ pub async fn handle_auth_devices_list(
     };
 
     let Some(auth_store) = state.auth_store.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Auth not configured"})),
+        )
+            .into_response();
     };
     let devices = auth_store
         .list_devices_with_status(&user_id, 300)
@@ -283,9 +283,19 @@ pub async fn handle_auth_devices_register(
     };
 
     let Some(auth_store) = state.auth_store.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Auth not configured"})),
+        )
+            .into_response();
     };
-    match auth_store.register_device(&user_id, &body.device_id, &body.device_name, body.platform.as_deref(), body.fingerprint.as_deref()) {
+    match auth_store.register_device(
+        &user_id,
+        &body.device_id,
+        &body.device_name,
+        body.platform.as_deref(),
+        body.fingerprint.as_deref(),
+    ) {
         Ok(actual_device_id) => {
             let mut resp = serde_json::json!({ "status": "ok" });
             // If fingerprint matched an existing device, return the resolved device_id
@@ -321,7 +331,11 @@ pub async fn handle_auth_device_set_pairing_code(
     };
 
     let Some(auth_store) = state.auth_store.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Auth not configured"})),
+        )
+            .into_response();
     };
     match auth_store.set_device_pairing_code(&user_id, &device_id, body.pairing_code.as_deref()) {
         Ok(()) => Json(serde_json::json!({ "status": "ok" })).into_response(),
@@ -352,7 +366,11 @@ pub async fn handle_auth_device_verify_pairing(
     };
 
     let Some(auth_store) = state.auth_store.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Auth not configured"})),
+        )
+            .into_response();
     };
     match auth_store.verify_device_pairing_code(&device_id, &body.pairing_code) {
         Ok(verified) => Json(serde_json::json!({ "verified": verified })).into_response(),
@@ -386,7 +404,11 @@ pub async fn handle_auth_heartbeat(
     };
 
     let Some(auth_store) = state.auth_store.as_ref() else {
-        return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Auth not configured"})),
+        )
+            .into_response();
     };
 
     // Resolve actual device via fingerprint if available (handles reinstall scenarios)
@@ -398,7 +420,9 @@ pub async fn handle_auth_heartbeat(
         body.device_id.clone()
     };
 
-    let _ = auth_store.touch_device(&actual_device_id);
+    if let Err(err) = auth_store.touch_device(&actual_device_id) {
+        tracing::warn!("Heartbeat: failed to touch device {actual_device_id}: {err}");
+    }
 
     let mut resp = serde_json::json!({ "status": "ok" });
     if actual_device_id != body.device_id {
@@ -433,8 +457,11 @@ pub async fn handle_auth_kakao_callback(
     let kakao_rest_key = match std::env::var("ZEROCLAW_KAKAO_REST_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
-        .or_else(|| std::env::var("KAKAO_REST_API_KEY").ok().filter(|k| !k.is_empty()))
-    {
+        .or_else(|| {
+            std::env::var("KAKAO_REST_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+        }) {
         Some(k) => k,
         None => {
             return (
@@ -448,7 +475,10 @@ pub async fn handle_auth_kakao_callback(
     // Exchange authorization code for access token
     let client = reqwest::Client::new();
     // Use ZEROCLAW_PUBLIC_URL env var if set, otherwise fall back to localhost
-    let redirect_uri = match std::env::var("ZEROCLAW_PUBLIC_URL").ok().filter(|u| !u.is_empty()) {
+    let redirect_uri = match std::env::var("ZEROCLAW_PUBLIC_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+    {
         Some(base) => format!("{base}/api/auth/kakao/redirect"),
         None => {
             let port = state.config.lock().gateway.port;
@@ -569,7 +599,10 @@ pub async fn handle_auth_kakao_callback(
     let _ = auth_store.ensure_channel_links_table();
 
     // Check if this Kakao ID is already linked to a user
-    let existing_user = auth_store.find_channel_link("kakao", &kakao_id).ok().flatten();
+    let existing_user = auth_store
+        .find_channel_link("kakao", &kakao_id)
+        .ok()
+        .flatten();
 
     let (user_id, username) = if let Some(user) = existing_user {
         (user.id, user.username)
@@ -596,7 +629,11 @@ pub async fn handle_auth_kakao_callback(
             Err(e) => {
                 // If username already exists (race condition), try to find the link again
                 if e.to_string().contains("already taken") {
-                    match auth_store.find_channel_link("kakao", &kakao_id).ok().flatten() {
+                    match auth_store
+                        .find_channel_link("kakao", &kakao_id)
+                        .ok()
+                        .flatten()
+                    {
                         Some(user) => (user.id, user.username),
                         None => {
                             return (

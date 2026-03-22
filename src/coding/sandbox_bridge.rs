@@ -201,7 +201,12 @@ impl SandboxReviewBridge {
         ));
 
         for (i, action) in plan.actions.iter().enumerate() {
-            prompt.push_str(&format!("### Finding {} — {} ({})\n\n", i + 1, action.category, action.severity.label()));
+            prompt.push_str(&format!(
+                "### Finding {} — {} ({})\n\n",
+                i + 1,
+                action.category,
+                action.severity.label()
+            ));
 
             if let Some(ref path) = action.file_path {
                 prompt.push_str(&format!("**File**: `{}`", path));
@@ -265,7 +270,7 @@ pub struct ReviewFixAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coding::traits::{ReviewFinding, ReviewReport, ReviewVerdict};
+    use crate::coding::traits::{ReviewFinding, ReviewVerdict};
 
     fn make_finding(severity: Severity, category: &str, suggestion: Option<&str>) -> ReviewFinding {
         ReviewFinding {
@@ -364,7 +369,11 @@ mod tests {
     fn build_review_fix_prompt_includes_all_findings() {
         let plan = make_plan(
             vec![
-                make_finding(Severity::Critical, "security", Some("Use parameterized queries")),
+                make_finding(
+                    Severity::Critical,
+                    "security",
+                    Some("Use parameterized queries"),
+                ),
                 make_finding(Severity::High, "efficiency", None),
             ],
             ReviewVerdict::RequestChanges,

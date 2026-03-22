@@ -119,7 +119,7 @@ impl Completer for SlashCommandCompleter {
                     .unwrap_or(&triggers[0]);
                 Pair {
                     display: format!("  {:<14}{desc:<64}", label),
-                    replacement: replacement.to_string(),
+                    replacement: (*replacement).to_string(),
                 }
             })
             .collect();
@@ -1708,11 +1708,14 @@ pub(crate) async fn run_tool_call_loop(
                     || looks_like_deferred_action_without_tool_call(&display_text));
             if missing_tool_call_followthrough {
                 missing_tool_call_retry_used = true;
-                missing_tool_call_retry_prompt = Some(if use_native_tools {
-                    MISSING_TOOL_CALL_RETRY_PROMPT_NATIVE
-                } else {
-                    MISSING_TOOL_CALL_RETRY_PROMPT_GUIDED
-                }.to_string());
+                missing_tool_call_retry_prompt = Some(
+                    if use_native_tools {
+                        MISSING_TOOL_CALL_RETRY_PROMPT_NATIVE
+                    } else {
+                        MISSING_TOOL_CALL_RETRY_PROMPT_GUIDED
+                    }
+                    .to_string(),
+                );
                 let retry_reason = if parse_issue_detected {
                     "parse_issue_detected"
                 } else {
@@ -2511,7 +2514,8 @@ pub async fn run(
     // before heavy setup (memory, tools, RAG) instead of failing silently at chat time.
     if !providers::has_provider_credential(provider_name, config.api_key.as_deref()) {
         // Bedrock uses AWS AKSK, not a single API key — skip this check for it.
-        if provider_name != "bedrock" && provider_name != "aws-bedrock" && provider_name != "ollama" {
+        if provider_name != "bedrock" && provider_name != "aws-bedrock" && provider_name != "ollama"
+        {
             anyhow::bail!(
                 "No API key found for provider '{provider_name}'. Options:\n\
                  1. Set the provider-specific env var (e.g. GEMINI_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY)\n\
@@ -2597,7 +2601,10 @@ pub async fn run(
         ("web_access_config", "Configure shared URL access policy (first-visit approval, allowlist/blocklist, approved domains)."),
     ];
     if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved HTTPS URLs in system browser."));
+        tool_descs.push((
+            "browser_open",
+            "Open approved HTTPS URLs in system browser.",
+        ));
         tool_descs.push(("browser", "Automate browser interactions (open/click/type/scroll/screenshot). Use for: complex web tasks requiring click, scroll, form fill, JS-rendered pages."));
     }
     if config.composio.enabled {
@@ -2607,13 +2614,31 @@ pub async fn run(
         tool_descs.push(("delegate", "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work."));
     }
     if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
-        tool_descs.push(("gpio_read", "Read GPIO pin value (0 or 1) on connected hardware (STM32, Arduino)."));
-        tool_descs.push(("gpio_write", "Set GPIO pin high (1) or low (0) on connected hardware."));
+        tool_descs.push((
+            "gpio_read",
+            "Read GPIO pin value (0 or 1) on connected hardware (STM32, Arduino).",
+        ));
+        tool_descs.push((
+            "gpio_write",
+            "Set GPIO pin high (1) or low (0) on connected hardware.",
+        ));
         tool_descs.push(("arduino_upload", "Upload agent-generated Arduino sketch. You write full .ino code; ZeroClaw compiles and uploads it. Pin 13 = built-in LED on Uno."));
-        tool_descs.push(("hardware_memory_map", "Return flash and RAM address ranges for connected hardware."));
-        tool_descs.push(("hardware_board_info", "Return full board info (chip, architecture, memory map) for connected hardware."));
-        tool_descs.push(("hardware_memory_read", "Read actual memory/register values from Nucleo via USB."));
-        tool_descs.push(("hardware_capabilities", "Query connected hardware for reported GPIO pins and LED pin."));
+        tool_descs.push((
+            "hardware_memory_map",
+            "Return flash and RAM address ranges for connected hardware.",
+        ));
+        tool_descs.push((
+            "hardware_board_info",
+            "Return full board info (chip, architecture, memory map) for connected hardware.",
+        ));
+        tool_descs.push((
+            "hardware_memory_read",
+            "Read actual memory/register values from Nucleo via USB.",
+        ));
+        tool_descs.push((
+            "hardware_capabilities",
+            "Query connected hardware for reported GPIO pins and LED pin.",
+        ));
     }
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -3204,7 +3229,10 @@ pub async fn process_message_with_session(
         tool_descs.push(("browser", "Automate browser interactions (open/click/type/scroll/screenshot). Use for: complex web tasks requiring click, scroll, form fill, JS-rendered pages."));
     }
     if config.composio.enabled {
-        tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.)."));
+        tool_descs.push((
+            "composio",
+            "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.).",
+        ));
     }
     if !config.agents.is_empty() {
         tool_descs.push(("delegate", "Delegate a sub-task to a specialized agent."));

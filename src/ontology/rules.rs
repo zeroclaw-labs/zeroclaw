@@ -17,7 +17,7 @@
 //!   the action.
 
 use super::repo::OntologyRepo;
-use super::types::*;
+use super::types::ExecuteActionRequest;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -64,20 +64,23 @@ impl RuleEngine {
     ) -> anyhow::Result<()> {
         if let Some(contact_id) = req.primary_object_id {
             for related_id in &req.related_object_ids {
-                if let Err(e) = self.repo.create_link("related_to", *related_id, contact_id, None) {
+                if let Err(e) = self
+                    .repo
+                    .create_link("related_to", *related_id, contact_id, None)
+                {
                     tracing::debug!(error = %e, "rule_send_message: create_link failed (non-fatal)");
                 }
             }
 
             // Ensure the contact is linked to the channel.
             if let Some(ch) = &req.channel {
-                let channel_id = self.repo.ensure_object(
-                    "Channel",
-                    ch,
-                    &json!({}),
-                    &req.owner_user_id,
-                )?;
-                if let Err(e) = self.repo.create_link("communicates_via", contact_id, channel_id, None) {
+                let channel_id =
+                    self.repo
+                        .ensure_object("Channel", ch, &json!({}), &req.owner_user_id)?;
+                if let Err(e) =
+                    self.repo
+                        .create_link("communicates_via", contact_id, channel_id, None)
+                {
                     tracing::debug!(error = %e, "rule_send_message: communicates_via link failed (non-fatal)");
                 }
             }
@@ -92,9 +95,7 @@ impl RuleEngine {
         req: &ExecuteActionRequest,
         result: &serde_json::Value,
     ) -> anyhow::Result<()> {
-        let task_id = result
-            .get("task_object_id")
-            .and_then(|v| v.as_i64());
+        let task_id = result.get("task_object_id").and_then(|v| v.as_i64());
 
         if let Some(task_id) = task_id {
             // Auto-link to context if present.
@@ -106,13 +107,13 @@ impl RuleEngine {
 
             // Auto-link to channel if present.
             if let Some(ch) = &req.channel {
-                let channel_id = self.repo.ensure_object(
-                    "Channel",
-                    ch,
-                    &json!({}),
-                    &req.owner_user_id,
-                )?;
-                if let Err(e) = self.repo.create_link("related_to", task_id, channel_id, None) {
+                let channel_id =
+                    self.repo
+                        .ensure_object("Channel", ch, &json!({}), &req.owner_user_id)?;
+                if let Err(e) = self
+                    .repo
+                    .create_link("related_to", task_id, channel_id, None)
+                {
                     tracing::debug!(error = %e, "rule_create_task: channel link failed (non-fatal)");
                 }
             }
@@ -132,10 +133,7 @@ impl RuleEngine {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
 
-        let output = result
-            .get("output")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let output = result.get("output").and_then(|v| v.as_str()).unwrap_or("");
 
         // Only create a Document if we got meaningful content.
         if output.len() > 50 {
@@ -152,7 +150,10 @@ impl RuleEngine {
 
             // Link the document to any related tasks/projects.
             for related_id in &req.related_object_ids {
-                if let Err(e) = self.repo.create_link("related_to", doc_id, *related_id, None) {
+                if let Err(e) = self
+                    .repo
+                    .create_link("related_to", doc_id, *related_id, None)
+                {
                     tracing::debug!(error = %e, "rule_fetch_resource: link failed (non-fatal)");
                 }
             }
@@ -177,8 +178,12 @@ impl RuleEngine {
                     if let Some(map) = obj.properties.as_object_mut() {
                         map.insert("summary".to_string(), json!(summary));
                     }
-                    self.repo
-                        .update_object_for_owner(doc_id, &req.owner_user_id, None, Some(&obj.properties))?;
+                    self.repo.update_object_for_owner(
+                        doc_id,
+                        &req.owner_user_id,
+                        None,
+                        Some(&obj.properties),
+                    )?;
                 }
             }
         }
@@ -187,12 +192,9 @@ impl RuleEngine {
 
     /// Rule: When a preference is saved, link it to the user.
     fn rule_save_preference(&self, req: &ExecuteActionRequest) -> anyhow::Result<()> {
-        let user_id_obj = self.repo.ensure_object(
-            "User",
-            &req.owner_user_id,
-            &json!({}),
-            &req.owner_user_id,
-        )?;
+        let user_id_obj =
+            self.repo
+                .ensure_object("User", &req.owner_user_id, &json!({}), &req.owner_user_id)?;
 
         let pref_key = req
             .params
@@ -200,14 +202,14 @@ impl RuleEngine {
             .and_then(|v| v.as_str())
             .unwrap_or("unnamed");
 
-        let pref_id = self.repo.ensure_object(
-            "Preference",
-            pref_key,
-            &json!({}),
-            &req.owner_user_id,
-        )?;
+        let pref_id =
+            self.repo
+                .ensure_object("Preference", pref_key, &json!({}), &req.owner_user_id)?;
 
-        if let Err(e) = self.repo.create_link("has_preference", user_id_obj, pref_id, None) {
+        if let Err(e) = self
+            .repo
+            .create_link("has_preference", user_id_obj, pref_id, None)
+        {
             tracing::debug!(error = %e, "rule_save_preference: has_preference link failed (non-fatal)");
         }
 
@@ -222,10 +224,7 @@ impl RuleEngine {
     ///
     /// Counts how many recent actions reference the primary_object as a Contact.
     /// If the threshold is met, the Contact's properties get an `importance: high` tag.
-    fn rule_auto_tag_important_client(
-        &self,
-        req: &ExecuteActionRequest,
-    ) -> anyhow::Result<()> {
+    fn rule_auto_tag_important_client(&self, req: &ExecuteActionRequest) -> anyhow::Result<()> {
         const IMPORTANCE_THRESHOLD: usize = 3;
 
         let contact_id = match req.primary_object_id {
@@ -234,7 +233,10 @@ impl RuleEngine {
         };
 
         // Only apply to Contact objects (owner-scoped lookup).
-        let obj = match self.repo.get_object_for_owner(contact_id, &req.owner_user_id)? {
+        let obj = match self
+            .repo
+            .get_object_for_owner(contact_id, &req.owner_user_id)?
+        {
             Some(o) => o,
             None => return Ok(()),
         };
@@ -262,8 +264,12 @@ impl RuleEngine {
             if let Some(map) = props.as_object_mut() {
                 map.insert("importance".to_string(), json!("high"));
             }
-            self.repo
-                .update_object_for_owner(contact_id, &req.owner_user_id, None, Some(&props))?;
+            self.repo.update_object_for_owner(
+                contact_id,
+                &req.owner_user_id,
+                None,
+                Some(&props),
+            )?;
             tracing::info!(
                 contact_id,
                 action_count,
@@ -279,10 +285,7 @@ impl RuleEngine {
     ///
     /// Uses a simple heuristic: extracts the first 2 words of each task title
     /// and groups tasks with matching prefixes.
-    fn rule_auto_group_tasks_into_project(
-        &self,
-        req: &ExecuteActionRequest,
-    ) -> anyhow::Result<()> {
+    fn rule_auto_group_tasks_into_project(&self, req: &ExecuteActionRequest) -> anyhow::Result<()> {
         const GROUP_THRESHOLD: usize = 3;
 
         // Only run on CreateTask actions.
@@ -325,7 +328,10 @@ impl RuleEngine {
 
         // Link all matching tasks to the project.
         for task in &matching_tasks {
-            if let Err(e) = self.repo.create_link("belongs_to", task.id, project_id, None) {
+            if let Err(e) = self
+                .repo
+                .create_link("belongs_to", task.id, project_id, None)
+            {
                 tracing::debug!(error = %e, task_id = task.id, "auto-group: belongs_to link failed (non-fatal)");
             }
         }
@@ -345,10 +351,7 @@ impl RuleEngine {
     /// property that records action type counts. This enables the LLM to
     /// tailor suggestions based on channel usage patterns (e.g. Kakao =
     /// communication-heavy, Desktop = code-heavy).
-    fn rule_channel_profiling(
-        &self,
-        req: &ExecuteActionRequest,
-    ) -> anyhow::Result<()> {
+    fn rule_channel_profiling(&self, req: &ExecuteActionRequest) -> anyhow::Result<()> {
         let channel_name = match &req.channel {
             Some(ch) if !ch.is_empty() => ch,
             _ => return Ok(()),
@@ -362,7 +365,10 @@ impl RuleEngine {
         )?;
 
         // Update the frequency counter for this action type (owner-scoped).
-        if let Some(mut obj) = self.repo.get_object_for_owner(channel_id, &req.owner_user_id)? {
+        if let Some(mut obj) = self
+            .repo
+            .get_object_for_owner(channel_id, &req.owner_user_id)?
+        {
             let freq = obj
                 .properties
                 .get("frequent_actions")
@@ -374,10 +380,7 @@ impl RuleEngine {
                 .get(&req.action_type_name)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            freq_map.insert(
-                req.action_type_name.clone(),
-                json!(current_count + 1),
-            );
+            freq_map.insert(req.action_type_name.clone(), json!(current_count + 1));
 
             if let Some(props_map) = obj.properties.as_object_mut() {
                 props_map.insert(
@@ -385,8 +388,12 @@ impl RuleEngine {
                     serde_json::Value::Object(freq_map),
                 );
             }
-            self.repo
-                .update_object_for_owner(channel_id, &req.owner_user_id, None, Some(&obj.properties))?;
+            self.repo.update_object_for_owner(
+                channel_id,
+                &req.owner_user_id,
+                None,
+                Some(&obj.properties),
+            )?;
         }
 
         Ok(())
@@ -396,15 +403,14 @@ impl RuleEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ontology::ActorKind;
     use parking_lot::Mutex;
     use rusqlite::Connection;
 
     fn test_rule_engine() -> (Arc<OntologyRepo>, RuleEngine) {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        let repo = Arc::new(
-            OntologyRepo::from_connection(Arc::new(Mutex::new(conn))).unwrap(),
-        );
+        let repo = Arc::new(OntologyRepo::from_connection(Arc::new(Mutex::new(conn))).unwrap());
         let engine = RuleEngine::new(Arc::clone(&repo));
         (repo, engine)
     }

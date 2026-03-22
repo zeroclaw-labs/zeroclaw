@@ -143,8 +143,8 @@ pub async fn handle_api_chat(
             .is_some();
 
         // Then try pairing auth
-        let pairing_ok = state.pairing.require_pairing()
-            && state.pairing.is_authenticated(bearer_token);
+        let pairing_ok =
+            state.pairing.require_pairing() && state.pairing.is_authenticated(bearer_token);
 
         // Then try webhook secret (verify X-Webhook-Secret header against stored hash)
         let webhook_ok = if let Some(ref secret_hash) = state.webhook_secret_hash {
@@ -276,10 +276,7 @@ pub async fn handle_api_chat(
     // 1. Client-provided api_key (from request body — user's own key)
     // 2. Server-side provider_api_keys map (from Settings / config)
     // 3. Environment variables (checked later by provider factory)
-    let provider_name = config
-        .default_provider
-        .as_deref()
-        .unwrap_or("gemini");
+    let provider_name = config.default_provider.as_deref().unwrap_or("gemini");
 
     let client_key = chat_body
         .api_key
@@ -290,11 +287,11 @@ pub async fn handle_api_chat(
     if let Some(key) = client_key {
         config.api_key = Some(key.to_string());
     } else if let Some(stored_key) = config.provider_api_keys.get(provider_name) {
-        if !stored_key.trim().is_empty() {
-            config.api_key = Some(stored_key.clone());
-        } else {
+        if stored_key.trim().is_empty() {
             // Clear stale key from a different provider
             config.api_key = None;
+        } else {
+            config.api_key = Some(stored_key.clone());
         }
     } else {
         // No key found for this provider — clear any previous
@@ -314,10 +311,7 @@ pub async fn handle_api_chat(
     // don't need a local LLM key. Set the proxy config and continue.
     let use_proxy = chat_body.proxy_url.is_some() && chat_body.proxy_token.is_some();
     if providers::provider_requires_credential(provider_name) {
-        let has_key = providers::has_provider_credential(
-            provider_name,
-            config.api_key.as_deref(),
-        );
+        let has_key = providers::has_provider_credential(provider_name, config.api_key.as_deref());
         if !has_key && !use_proxy {
             let env_hint = match provider_name {
                 "anthropic" => "ANTHROPIC_API_KEY",
@@ -764,10 +758,10 @@ pub async fn handle_v1_chat_completions_with_tools(
             .unwrap_or_else(|| "gemini".to_string());
 
         if let Some(stored_key) = config_guard.provider_api_keys.get(&provider_name).cloned() {
-            if !stored_key.trim().is_empty() {
-                config_guard.api_key = Some(stored_key);
-            } else {
+            if stored_key.trim().is_empty() {
                 config_guard.api_key = None;
+            } else {
+                config_guard.api_key = Some(stored_key);
             }
         } else {
             // No key for this provider — clear stale key from another provider

@@ -85,9 +85,7 @@ impl EmailVerifyService {
 
     /// Whether email verification is enabled and properly configured.
     pub fn is_enabled(&self) -> bool {
-        self.config.enabled
-            && self.config.smtp_host.is_some()
-            && self.config.from_email.is_some()
+        self.config.enabled && self.config.smtp_host.is_some() && self.config.from_email.is_some()
     }
 
     /// Generate and send a verification code to the user's email.
@@ -194,9 +192,7 @@ impl EmailVerifyService {
         // Check attempt limit
         if entry.failed_attempts >= entry.max_attempts {
             pending.remove(user_id);
-            bail!(
-                "Too many failed attempts. Please request a new code."
-            );
+            bail!("Too many failed attempts. Please request a new code.");
         }
 
         // Verify code hash (salted with user_id)
@@ -297,9 +293,7 @@ impl EmailVerifyService {
                 transport_builder.credentials(Credentials::new(user.to_string(), pass.to_string()));
         }
 
-        let transport = transport_builder
-            .port(self.config.smtp_port)
-            .build();
+        let transport = transport_builder.port(self.config.smtp_port).build();
 
         transport.send(&email)?;
 

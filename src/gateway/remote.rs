@@ -243,13 +243,13 @@ impl DeviceRouter {
             }
         }
 
-        let state = attempts.entry(client_key.to_string()).or_insert_with(|| {
-            LoginAttemptState {
+        let state = attempts
+            .entry(client_key.to_string())
+            .or_insert_with(|| LoginAttemptState {
                 failed_count: 0,
                 first_failure: now,
                 lockout_until: None,
-            }
-        });
+            });
 
         state.failed_count += 1;
         if state.failed_count >= MAX_LOGIN_ATTEMPTS {
@@ -447,12 +447,9 @@ pub async fn handle_remote_login(
         };
 
         // Send verification code
-        if let Err(e) = email_svc.send_verification_code(
-            &user.id,
-            &body.device_id,
-            &email,
-            &user.username,
-        ) {
+        if let Err(e) =
+            email_svc.send_verification_code(&user.id, &body.device_id, &email, &user.username)
+        {
             tracing::error!("Failed to send email verification: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -569,22 +566,20 @@ pub async fn handle_remote_devices(
     };
 
     // List devices with status
-    let devices = match auth_store.list_devices_with_status(
-        &session.user_id,
-        DEVICE_ONLINE_THRESHOLD_SECS,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("Failed to list devices: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": "Failed to list devices"
-                })),
-            )
-                .into_response();
-        }
-    };
+    let devices =
+        match auth_store.list_devices_with_status(&session.user_id, DEVICE_ONLINE_THRESHOLD_SECS) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::error!("Failed to list devices: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "Failed to list devices"
+                    })),
+                )
+                    .into_response();
+            }
+        };
 
     // Augment with real-time online status from router
     let device_list: Vec<serde_json::Value> = devices
@@ -682,7 +677,10 @@ pub async fn handle_ws_remote(
     let auth_store = match state.auth_store.as_ref() {
         Some(s) => s,
         None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Authentication service not enabled")
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Authentication service not enabled",
+            )
                 .into_response();
         }
     };
@@ -695,7 +693,8 @@ pub async fn handle_ws_remote(
     };
 
     // Authenticate session
-    let token = extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
+    let token =
+        extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
     let session = match auth_store.validate_session(&token) {
         Some(s) => s,
         None => {
@@ -711,7 +710,8 @@ pub async fn handle_ws_remote(
             match session.device_id {
                 Some(ref d) => d.clone(),
                 None => {
-                    return (StatusCode::BAD_REQUEST, "Missing device_id parameter").into_response();
+                    return (StatusCode::BAD_REQUEST, "Missing device_id parameter")
+                        .into_response();
                 }
             }
         }
@@ -726,7 +726,11 @@ pub async fn handle_ws_remote(
     };
 
     if !devices.iter().any(|d| d.device_id == device_id) {
-        return (StatusCode::FORBIDDEN, "Device does not belong to this account").into_response();
+        return (
+            StatusCode::FORBIDDEN,
+            "Device does not belong to this account",
+        )
+            .into_response();
     }
 
     // Check device is online
@@ -907,7 +911,10 @@ pub async fn handle_ws_device_link(
     let auth_store = match state.auth_store.as_ref() {
         Some(s) => s,
         None => {
-            return (StatusCode::SERVICE_UNAVAILABLE, "Authentication service not enabled")
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Authentication service not enabled",
+            )
                 .into_response();
         }
     };
@@ -920,7 +927,8 @@ pub async fn handle_ws_device_link(
     };
 
     // Authenticate
-    let token = extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
+    let token =
+        extract_ws_bearer_token(&headers, query_params.token.as_deref()).unwrap_or_default();
     let session = match auth_store.validate_session(&token) {
         Some(s) => s,
         None => {
@@ -946,7 +954,11 @@ pub async fn handle_ws_device_link(
     let device = match devices.iter().find(|d| d.device_id == device_id) {
         Some(d) => d.clone(),
         None => {
-            return (StatusCode::FORBIDDEN, "Device does not belong to this account").into_response();
+            return (
+                StatusCode::FORBIDDEN,
+                "Device does not belong to this account",
+            )
+                .into_response();
         }
     };
 
@@ -1110,7 +1122,6 @@ async fn handle_device_link_socket(
 pub static REMOTE_RESPONSE_CHANNELS: std::sync::LazyLock<
     Mutex<HashMap<String, mpsc::Sender<RoutedMessage>>>,
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
-
 
 // ── Email Verification Endpoint ───────────────────────────────
 

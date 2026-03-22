@@ -11,7 +11,7 @@
 
 use super::repo::OntologyRepo;
 use super::rules::RuleEngine;
-use super::types::*;
+use super::types::{ActorKind, ExecuteActionRequest};
 use crate::tools::traits::{Tool, ToolResult};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -24,10 +24,9 @@ use std::sync::Arc;
 /// reaching the shell tool.  Extend this set deliberately — each addition
 /// widens the attack surface.
 const RUNCOMMAND_ALLOWLIST: &[&str] = &[
-    "ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date",
-    "pwd", "whoami", "uname", "df", "du", "env", "printenv", "which",
-    "file", "stat", "id", "uptime", "free", "ps", "cargo", "rustc",
-    "git", "npm", "node", "python3", "python", "pip",
+    "ls", "cat", "head", "tail", "wc", "grep", "find", "echo", "date", "pwd", "whoami", "uname",
+    "df", "du", "env", "printenv", "which", "file", "stat", "id", "uptime", "free", "ps", "cargo",
+    "rustc", "git", "npm", "node", "python3", "python", "pip",
 ];
 
 /// Central action dispatcher that maps ontology action types to tool execution.
@@ -122,11 +121,10 @@ impl ActionDispatcher {
         //    Skipping on failure prevents rules from operating on invalid state.
         if action_succeeded {
             if let Ok(ref value) = result {
-                if let Err(rule_err) = self.rule_engine.apply_post_action_rules(
-                    &req.action_type_name,
-                    &req,
-                    value,
-                ) {
+                if let Err(rule_err) =
+                    self.rule_engine
+                        .apply_post_action_rules(&req.action_type_name, &req, value)
+                {
                     tracing::warn!(
                         action_type = %req.action_type_name,
                         error = %rule_err,
@@ -141,13 +139,9 @@ impl ActionDispatcher {
 
     /// Internal routing logic: maps action type names to tool calls or
     /// internal ontology operations.
-    async fn route_action(
-        &self,
-        req: &ExecuteActionRequest,
-    ) -> anyhow::Result<serde_json::Value> {
+    async fn route_action(&self, req: &ExecuteActionRequest) -> anyhow::Result<serde_json::Value> {
         match req.action_type_name.as_str() {
             // -- Internal ontology operations (no ZeroClaw tool needed) --
-
             "CreateTask" => self.handle_create_task(req),
             "UpdateTask" => self.handle_update_task(req),
             "ListTasks" => self.handle_list_tasks(req),
@@ -155,7 +149,6 @@ impl ActionDispatcher {
             "RecordDecision" => self.handle_record_decision(req),
 
             // -- ZeroClaw tool-backed actions --
-
             "SendMessage" => {
                 // Route to the appropriate channel tool based on params.channel.
                 let channel = req
@@ -259,8 +252,12 @@ impl ActionDispatcher {
             .ok_or_else(|| anyhow::anyhow!("UpdateTask requires primary_object_id"))?;
 
         // Verify owner before allowing update (horizontal privilege escalation guard).
-        self.repo
-            .update_object_for_owner(object_id, &req.owner_user_id, req.params.get("title").and_then(|v| v.as_str()), req.params.get("properties"))?;
+        self.repo.update_object_for_owner(
+            object_id,
+            &req.owner_user_id,
+            req.params.get("title").and_then(|v| v.as_str()),
+            req.params.get("properties"),
+        )?;
         Ok(json!({"success": true, "updated_object_id": object_id}))
     }
 
@@ -352,8 +349,12 @@ impl ActionDispatcher {
             }
             "EndSession" => {
                 if let Some(obj_id) = req.primary_object_id {
-                    self.repo
-                        .update_object_for_owner(obj_id, &req.owner_user_id, None, Some(&json!({"status": "ended"})))?;
+                    self.repo.update_object_for_owner(
+                        obj_id,
+                        &req.owner_user_id,
+                        None,
+                        Some(&json!({"status": "ended"})),
+                    )?;
                 }
                 Ok(json!({"success": true, "ended": true}))
             }
@@ -374,10 +375,7 @@ impl ActionDispatcher {
         tool_name: &str,
         params: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        let candidates = [
-            tool_name.to_string(),
-            tool_name.replace('-', "_"),
-        ];
+        let candidates = [tool_name.to_string(), tool_name.replace('-', "_")];
         for name in &candidates {
             if let Some(tool) = self.tools.get(name.as_str()) {
                 let result: ToolResult = tool.execute(params.clone()).await?;
@@ -391,10 +389,7 @@ impl ActionDispatcher {
 
         // Do NOT expose the tool registry in error messages — that leaks
         // internal capability surface to potentially untrusted callers.
-        anyhow::bail!(
-            "tool '{}' is not available for this action",
-            tool_name,
-        )
+        anyhow::bail!("tool '{}' is not available for this action", tool_name,)
     }
 
     /// Security-gated RunCommand handler.

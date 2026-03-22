@@ -35,7 +35,10 @@ impl GeminiReviewer {
     /// Create a new Gemini reviewer.
     pub fn new(api_key: String, model: String) -> Self {
         Self {
-            id: format!("gemini-{}", model.split('-').last().unwrap_or("reviewer")),
+            id: format!(
+                "gemini-{}",
+                model.split('-').next_back().unwrap_or("reviewer")
+            ),
             endpoint: format!(
                 "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
                 model
@@ -242,7 +245,7 @@ impl CodeReviewer for GeminiReviewer {
                 .map(GeminiFinding::into_review_finding)
                 .collect(),
             architecture_alignment: parsed.architecture_alignment,
-            duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            duration_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         })
     }
 }
@@ -428,7 +431,7 @@ impl CodeReviewer for ClaudeReviewer {
                 .map(GeminiFinding::into_review_finding)
                 .collect(),
             architecture_alignment: parsed.architecture_alignment,
-            duration_ms: start.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            duration_ms: start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         })
     }
 }

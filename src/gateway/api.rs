@@ -242,13 +242,9 @@ pub async fn handle_api_config_api_key_put(
     // Route "tool:<name>" requests to the tool-api-key handler
     if let Some(tool_name) = provider.strip_prefix("tool:") {
         let tool_body = serde_json::json!({ "tool": tool_name, "api_key": api_key });
-        return handle_api_config_tool_api_key_put(
-            State(state),
-            headers,
-            Json(tool_body),
-        )
-        .await
-        .into_response();
+        return handle_api_config_tool_api_key_put(State(state), headers, Json(tool_body))
+            .await
+            .into_response();
     }
 
     let mut config = state.config.lock().clone();
@@ -365,7 +361,11 @@ pub async fn handle_api_config_tool_api_key_put(
 
     let mut config = state.config.lock().clone();
 
-    let opt_key = if api_key.is_empty() { None } else { Some(api_key.clone()) };
+    let opt_key = if api_key.is_empty() {
+        None
+    } else {
+        Some(api_key.clone())
+    };
 
     // Route API key to the correct config section
     match tool.as_str() {
@@ -500,7 +500,13 @@ pub async fn handle_api_workspace_put(
         } else {
             // Clone the repository
             let output = match tokio::process::Command::new("git")
-                .args(["clone", "--depth", "1", url, &clone_target.to_string_lossy()])
+                .args([
+                    "clone",
+                    "--depth",
+                    "1",
+                    url,
+                    &clone_target.to_string_lossy(),
+                ])
                 .output()
                 .await
             {
@@ -628,7 +634,9 @@ pub async fn handle_api_workspace_folder_put(
 
     // Block sensitive directories
     let path_str = expanded.to_string_lossy();
-    let sensitive = ["/.ssh", "/.gnupg", "/.aws", "/etc", "/root", "/proc", "/sys"];
+    let sensitive = [
+        "/.ssh", "/.gnupg", "/.aws", "/etc", "/root", "/proc", "/sys",
+    ];
     for s in &sensitive {
         if path_str.contains(s) {
             return (
@@ -653,11 +661,7 @@ pub async fn handle_api_workspace_folder_put(
                 }
                 let name = entry.file_name().to_string_lossy().to_string();
                 let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-                items.push(if is_dir {
-                    format!("{name}/")
-                } else {
-                    name
-                });
+                items.push(if is_dir { format!("{name}/") } else { name });
             }
             items.sort();
             items
@@ -1637,7 +1641,10 @@ pub async fn handle_api_checkout_webhook_stripe(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let sig_header = match headers.get("stripe-signature").and_then(|v| v.to_str().ok()) {
+    let sig_header = match headers
+        .get("stripe-signature")
+        .and_then(|v| v.to_str().ok())
+    {
         Some(sig) => sig.to_string(),
         None => {
             return (
@@ -1674,10 +1681,7 @@ pub async fn handle_api_checkout_webhook_stripe(
         }
     };
 
-    let event_type = event
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match event_type {
         "checkout.session.completed" | "payment_intent.succeeded" => {
@@ -1873,9 +1877,10 @@ pub async fn handle_api_admin_pricing_estimate(
         return e.into_response();
     }
 
-    let raw_cost = state
-        .pricing_registry
-        .estimate_cost(&body.model, body.input_tokens, body.output_tokens);
+    let raw_cost =
+        state
+            .pricing_registry
+            .estimate_cost(&body.model, body.input_tokens, body.output_tokens);
     let platform = &state.config.lock().platform_routing;
     let credit_charge = platform.credit_charge(raw_cost);
     let multiplier = platform.credit_multiplier;
@@ -1941,7 +1946,9 @@ pub async fn handle_api_document_process(
                 Err(e) => {
                     return (
                         StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": format!("Failed to read file field: {e}")})),
+                        Json(
+                            serde_json::json!({"error": format!("Failed to read file field: {e}")}),
+                        ),
                     )
                         .into_response();
                 }
@@ -1996,8 +2003,8 @@ pub async fn handle_api_document_process(
                 // The tool output is a JSON string with html, markdown, doc_type, etc.
                 // Parse it and return the structured fields directly so the frontend
                 // can access result.html, result.markdown without an extra wrapper.
-                let parsed: serde_json::Value =
-                    serde_json::from_str(&result.output).unwrap_or_else(|_| {
+                let parsed: serde_json::Value = serde_json::from_str(&result.output)
+                    .unwrap_or_else(|_| {
                         serde_json::json!({
                             "markdown": result.output,
                             "html": "",

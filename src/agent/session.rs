@@ -96,6 +96,31 @@ impl Session {
     pub async fn update_history(&self, history: Vec<ChatMessage>) -> Result<()> {
         self.manager.set_history(&self.id, history).await
     }
+
+    /// Append a single turn to short-term conversation storage.
+    pub async fn append_turn(
+        &self,
+        role: &str,
+        content: &str,
+        channel: Option<&str>,
+        sender: Option<&str>,
+    ) -> Result<()> {
+        self.manager
+            .append_turn(&self.id, role, content, channel, sender)
+            .await
+    }
+
+    /// Load recent turns across sessions for a given sender (for context injection).
+    pub async fn recent_turns_for_sender(
+        &self,
+        sender: &str,
+        max_turns: usize,
+        max_age_secs: i64,
+    ) -> Result<Vec<ChatMessage>> {
+        self.manager
+            .recent_turns_for_sender(sender, max_turns, max_age_secs)
+            .await
+    }
 }
 
 #[async_trait]
@@ -108,6 +133,28 @@ pub trait SessionManager: Send + Sync {
     async fn set_history(&self, session_id: &str, history: Vec<ChatMessage>) -> Result<()>;
     async fn delete(&self, session_id: &str) -> Result<()>;
     async fn cleanup_expired(&self) -> Result<usize>;
+
+    /// Append a single conversation turn to short-term storage.
+    async fn append_turn(
+        &self,
+        _session_id: &str,
+        _role: &str,
+        _content: &str,
+        _channel: Option<&str>,
+        _sender: Option<&str>,
+    ) -> Result<()> {
+        Ok(()) // No-op default for backends without turn storage
+    }
+
+    /// Load recent turns for a sender across all sessions.
+    async fn recent_turns_for_sender(
+        &self,
+        _sender: &str,
+        _max_turns: usize,
+        _max_age_secs: i64,
+    ) -> Result<Vec<ChatMessage>> {
+        Ok(Vec::new()) // No-op default
+    }
 
     async fn get_or_create(&self, session_id: &str) -> Result<Session> {
         self.ensure_exists(session_id).await?;
@@ -280,6 +327,27 @@ impl SqliteSessionManager {
              ON agent_sessions(updated_at);",
         )?;
 
+        // ── Short-term conversation turns table ──────────────────────
+        // Stores individual messages for fine-grained cross-session recall.
+        // Supports ~10M tokens of conversation history (~30MB text).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS conversation_turns (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id  TEXT NOT NULL,
+                role        TEXT NOT NULL,
+                content     TEXT NOT NULL,
+                channel     TEXT,
+                sender      TEXT,
+                created_at  INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_conv_turns_session
+             ON conversation_turns(session_id, created_at);
+             CREATE INDEX IF NOT EXISTS idx_conv_turns_created
+             ON conversation_turns(created_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_conv_turns_sender
+             ON conversation_turns(sender, created_at DESC);",
+        )?;
+
         let mgr = Arc::new(Self {
             conn: Arc::new(Mutex::new(conn)),
             ttl,
@@ -301,8 +369,146 @@ impl SqliteSessionManager {
             loop {
                 ticker.tick().await;
                 let _ = mgr.cleanup_expired().await;
+                // Also purge old conversation turns (30-day default retention)
+                let _ = mgr.purge_old_turns(30 * 24 * 3600).await;
             }
         });
+    }
+
+    // ── Short-term conversation turns ──────────────────────────────
+    // Individual message storage for cross-session context recall.
+
+    /// Append a single conversation turn to the short-term store.
+    pub async fn append_turn(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        channel: Option<&str>,
+        sender: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+        let role = role.to_string();
+        let content = content.to_string();
+        let channel = channel.map(ToString::to_string);
+        let sender = sender.map(ToString::to_string);
+        let now = unix_seconds_now();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO conversation_turns (session_id, role, content, channel, sender, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![session_id, role, content, channel, sender, now],
+            )?;
+            Ok(())
+        })
+        .await
+        .context("SQLite blocking task panicked")?
+    }
+
+    /// Load recent conversation turns across all sessions for a given sender.
+    /// Returns turns ordered oldest-first (chronological) for context injection.
+    /// `max_turns` limits the result count; `max_age_secs` limits how far back to look.
+    pub async fn recent_turns_for_sender(
+        &self,
+        sender: &str,
+        max_turns: usize,
+        max_age_secs: i64,
+    ) -> Result<Vec<ChatMessage>> {
+        let conn = self.conn.clone();
+        let sender = sender.to_string();
+        let cutoff = unix_seconds_now() - max_age_secs;
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            // Subquery to get newest N turns, then reverse for chronological order.
+            let mut stmt = conn.prepare_cached(
+                "SELECT role, content FROM (
+                    SELECT role, content, created_at
+                    FROM conversation_turns
+                    WHERE sender = ?1 AND created_at >= ?2
+                    ORDER BY created_at DESC
+                    LIMIT ?3
+                 ) sub ORDER BY created_at ASC",
+            )?;
+            let turns = stmt
+                .query_map(params![sender, cutoff, max_turns as i64], |row| {
+                    let role: String = row.get(0)?;
+                    let content: String = row.get(1)?;
+                    Ok(ChatMessage { role, content })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(turns)
+        })
+        .await
+        .context("SQLite blocking task panicked")?
+    }
+
+    /// Load recent turns for the current session specifically.
+    pub async fn recent_turns_for_session(
+        &self,
+        session_id: &str,
+        max_turns: usize,
+    ) -> Result<Vec<ChatMessage>> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let mut stmt = conn.prepare_cached(
+                "SELECT role, content FROM (
+                    SELECT role, content, created_at
+                    FROM conversation_turns
+                    WHERE session_id = ?1
+                    ORDER BY created_at DESC
+                    LIMIT ?2
+                 ) sub ORDER BY created_at ASC",
+            )?;
+            let turns = stmt
+                .query_map(params![session_id, max_turns as i64], |row| {
+                    let role: String = row.get(0)?;
+                    let content: String = row.get(1)?;
+                    Ok(ChatMessage { role, content })
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(turns)
+        })
+        .await
+        .context("SQLite blocking task panicked")?
+    }
+
+    /// Purge turns older than `max_age_secs`. Called periodically by cleanup task.
+    pub async fn purge_old_turns(&self, max_age_secs: i64) -> Result<usize> {
+        let cutoff = unix_seconds_now() - max_age_secs;
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let removed = conn.execute(
+                "DELETE FROM conversation_turns WHERE created_at < ?1",
+                params![cutoff],
+            )?;
+            Ok(removed)
+        })
+        .await
+        .context("SQLite blocking task panicked")?
+    }
+
+    /// Count total tokens stored in conversation_turns (approximate: chars/3).
+    pub async fn turn_store_token_estimate(&self) -> Result<u64> {
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let total_chars: i64 = conn.query_row(
+                "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM conversation_turns",
+                [],
+                |row| row.get(0),
+            )?;
+            Ok((total_chars as u64) / 3)
+        })
+        .await
+        .context("SQLite blocking task panicked")?
     }
 
     #[cfg(test)]
@@ -356,8 +562,8 @@ impl SessionManager for SqliteSessionManager {
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
-            let mut stmt =
-                conn.prepare_cached("SELECT history_json FROM agent_sessions WHERE session_id = ?1")?;
+            let mut stmt = conn
+                .prepare_cached("SELECT history_json FROM agent_sessions WHERE session_id = ?1")?;
             let mut rows = stmt.query(params![session_id])?;
             if let Some(row) = rows.next()? {
                 let json: String = row.get(0)?;
@@ -429,6 +635,26 @@ impl SessionManager for SqliteSessionManager {
         })
         .await
         .context("SQLite blocking task panicked")?
+    }
+
+    async fn append_turn(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        channel: Option<&str>,
+        sender: Option<&str>,
+    ) -> Result<()> {
+        SqliteSessionManager::append_turn(self, session_id, role, content, channel, sender).await
+    }
+
+    async fn recent_turns_for_sender(
+        &self,
+        sender: &str,
+        max_turns: usize,
+        max_age_secs: i64,
+    ) -> Result<Vec<ChatMessage>> {
+        SqliteSessionManager::recent_turns_for_sender(self, sender, max_turns, max_age_secs).await
     }
 }
 

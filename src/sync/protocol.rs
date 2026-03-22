@@ -303,9 +303,7 @@ pub fn merge_deltas_lww(
                 link_type_name,
                 ..
             } => format!("onto_link_{link_type_name}_{from_object_id}_{to_object_id}"),
-            crate::memory::sync::DeltaOperation::OntologyActionLog { .. } => {
-                delta.id.clone()
-            }
+            crate::memory::sync::DeltaOperation::OntologyActionLog { .. } => delta.id.clone(),
         };
 
         match winners.get(&key) {

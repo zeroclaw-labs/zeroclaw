@@ -33,8 +33,8 @@ pub mod cron_runs;
 pub mod cron_update;
 pub mod delegate;
 pub mod delegate_coordination_status;
-pub mod docx_read;
 pub mod document_pipeline;
+pub mod docx_read;
 #[cfg(feature = "channel-lark")]
 pub mod feishu_doc;
 pub mod file_edit;
@@ -81,10 +81,10 @@ pub mod url_validation;
 pub mod wasm_module;
 pub mod wasm_tool;
 pub mod web_access_config;
-pub mod workspace_folder;
 pub mod web_fetch;
 pub mod web_search_config;
 pub mod web_search_tool;
+pub mod workspace_folder;
 pub mod xlsx_read;
 
 pub use apply_patch::ApplyPatchTool;
@@ -105,8 +105,8 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use delegate_coordination_status::DelegateCoordinationStatusTool;
-pub use docx_read::DocxReadTool;
 pub use document_pipeline::DocumentPipelineTool;
+pub use docx_read::DocxReadTool;
 #[cfg(feature = "channel-lark")]
 pub use feishu_doc::FeishuDocTool;
 pub use file_edit::FileEditTool;
@@ -122,10 +122,10 @@ pub use hardware_memory_map::HardwareMemoryMapTool;
 pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
-#[allow(unused_imports)]
-pub use media_gen::{ImageGenTool, MusicGenTool, VideoGenTool};
 pub use mcp_client::McpRegistry;
 pub use mcp_tool::McpToolWrapper;
+#[allow(unused_imports)]
+pub use media_gen::{ImageGenTool, MusicGenTool, VideoGenTool};
 pub use memory_forget::MemoryForgetTool;
 pub use memory_observe::MemoryObserveTool;
 pub use memory_recall::MemoryRecallTool;
@@ -530,7 +530,9 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(DocxReadTool::new(security.clone())));
 
     // Document processing pipeline (image PDF → Upstage OCR, digital PDF → local, office → Hancom)
-    tool_arcs.push(Arc::new(DocumentPipelineTool::new(security.as_ref().clone())));
+    tool_arcs.push(Arc::new(DocumentPipelineTool::new(
+        security.as_ref().clone(),
+    )));
 
     // PPTX text extraction
     tool_arcs.push(Arc::new(PptxReadTool::new(security.clone())));
@@ -701,11 +703,8 @@ pub fn all_tools_with_runtime(
     // high-level tools: get_context, search_objects, execute_action.
     {
         use crate::ontology::{
-            ContextBuilder, ActionDispatcher, OntologyRepo, RuleEngine,
-            tools::{
-                OntologyGetContextTool, OntologySearchObjectsTool,
-                OntologyExecuteActionTool,
-            },
+            tools::{OntologyExecuteActionTool, OntologyGetContextTool, OntologySearchObjectsTool},
+            ActionDispatcher, ContextBuilder, OntologyRepo, RuleEngine,
         };
 
         // Derive a stable owner_user_id. If AIEOS JSON is present, try to
@@ -725,7 +724,7 @@ pub fn all_tools_with_runtime(
             })
             .unwrap_or_else(|| "default_user".to_string());
 
-        if let Ok(mut onto_repo) = OntologyRepo::open(&workspace_dir) {
+        if let Ok(mut onto_repo) = OntologyRepo::open(workspace_dir) {
             // Wire sync engine into OntologyRepo so every CUD operation
             // automatically records a delta for cross-device replication.
             // occurred_at is the primary temporal anchor for sync ordering.
@@ -789,7 +788,7 @@ mod tests {
     fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         assert!(tools.iter().any(|tool| tool.name() == "apply_patch"));
     }
 

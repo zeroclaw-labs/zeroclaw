@@ -306,7 +306,6 @@ fn is_valid_luhn(digits: &str) -> bool {
         double = !double;
     }
 
-    #[allow(clippy::manual_is_multiple_of)]
     {
         sum % 10 == 0
     }

@@ -31,9 +31,9 @@
 //!   14:30 KST          16:00 KST          12:00 KST  ← display
 //! ```
 
-use chrono::{DateTime, Utc};
 #[cfg(test)]
 use chrono::TimeZone;
+use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use std::sync::RwLock;
 use std::time::Duration;
@@ -118,9 +118,7 @@ pub async fn check_clock_drift() -> Option<ClockCheckResult> {
         let local_after = Utc::now();
 
         let local_mid = local_before
-            + chrono::Duration::milliseconds(
-                (local_after - local_before).num_milliseconds() / 2,
-            );
+            + chrono::Duration::milliseconds((local_after - local_before).num_milliseconds() / 2);
 
         if let Some(date_header) = resp.headers().get("date") {
             if let Ok(date_str) = date_header.to_str() {
@@ -134,7 +132,7 @@ pub async fn check_clock_drift() -> Option<ClockCheckResult> {
                         remote_time: remote_utc,
                         drift,
                         is_drifted: drift > DRIFT_THRESHOLD,
-                        source: url.to_string(),
+                        source: (*url).to_string(),
                     });
                 }
             }
@@ -214,10 +212,7 @@ pub fn make_timestamp_triple(
 ///
 /// Useful for normalizing `occurred_at` values from different devices
 /// into the user's home timezone for consistent display.
-pub fn to_home_timezone(
-    iso_timestamp: &str,
-    home_tz_name: &str,
-) -> Option<String> {
+pub fn to_home_timezone(iso_timestamp: &str, home_tz_name: &str) -> Option<String> {
     let home_tz: Tz = home_tz_name.parse().ok()?;
 
     // Try parsing with timezone offset first
@@ -284,10 +279,10 @@ pub async fn check_and_log(home_tz: &str) -> Option<Duration> {
         "Device timezone: {}, Home timezone: {}{}",
         device_tz,
         home_tz,
-        if device_tz != home_tz {
-            format!(" (cross-timezone: events will be converted to {})", home_tz)
-        } else {
+        if device_tz == home_tz {
             String::new()
+        } else {
+            format!(" (cross-timezone: events will be converted to {})", home_tz)
         },
     );
 
@@ -329,9 +324,7 @@ pub async fn check_and_log(home_tz: &str) -> Option<Duration> {
             if let Ok(mut guard) = DEVICE_TIME_INFO.write() {
                 *guard = Some(info);
             }
-            tracing::debug!(
-                "Clock check skipped (offline?), timezone info recorded"
-            );
+            tracing::debug!("Clock check skipped (offline?), timezone info recorded");
             None
         }
     }

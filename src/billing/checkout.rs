@@ -40,21 +40,21 @@ pub const USD_PACKAGES: &[UsdCreditPackage] = &[
     UsdCreditPackage {
         id: "starter_10",
         name: "Starter",
-        price_cents: 1000,  // $10
+        price_cents: 1000, // $10
         credits: 1_500,
         price_krw: 14_000,
     },
     UsdCreditPackage {
         id: "standard_20",
         name: "Standard",
-        price_cents: 2000,  // $20
+        price_cents: 2000, // $20
         credits: 3_200,
         price_krw: 28_000,
     },
     UsdCreditPackage {
         id: "power_50",
         name: "Power",
-        price_cents: 5000,  // $50
+        price_cents: 5000, // $50
         credits: 8_500,
         price_krw: 69_000,
     },
@@ -130,8 +130,14 @@ pub async fn create_stripe_session(
 
     let mut params: Vec<(&str, String)> = vec![
         ("mode", mode.to_string()),
-        ("success_url", format!("{callback_base_url}/api/checkout/success?tx={transaction_id}&provider=stripe")),
-        ("cancel_url", format!("{callback_base_url}/api/checkout/cancel?tx={transaction_id}")),
+        (
+            "success_url",
+            format!("{callback_base_url}/api/checkout/success?tx={transaction_id}&provider=stripe"),
+        ),
+        (
+            "cancel_url",
+            format!("{callback_base_url}/api/checkout/cancel?tx={transaction_id}"),
+        ),
         ("client_reference_id", transaction_id.to_string()),
         ("metadata[user_id]", user_id.to_string()),
         ("metadata[package_id]", package.id.to_string()),
@@ -141,14 +147,26 @@ pub async fn create_stripe_session(
     if mode == "payment" {
         params.extend([
             ("line_items[0][price_data][currency]", "usd".to_string()),
-            ("line_items[0][price_data][unit_amount]", package.price_cents.to_string()),
-            ("line_items[0][price_data][product_data][name]", format!("MoA Credits — {} ({} credits)", package.name, package.credits)),
+            (
+                "line_items[0][price_data][unit_amount]",
+                package.price_cents.to_string(),
+            ),
+            (
+                "line_items[0][price_data][product_data][name]",
+                format!(
+                    "MoA Credits — {} ({} credits)",
+                    package.name, package.credits
+                ),
+            ),
             ("line_items[0][quantity]", "1".to_string()),
         ]);
     }
 
     if save_method {
-        params.push(("payment_intent_data[setup_future_usage]", "off_session".to_string()));
+        params.push((
+            "payment_intent_data[setup_future_usage]",
+            "off_session".to_string(),
+        ));
     }
 
     let response = client
@@ -160,17 +178,21 @@ pub async fn create_stripe_session(
         .map_err(|e| anyhow::anyhow!("Stripe API error: {e}"))?;
 
     let status = response.status();
-    let body: serde_json::Value = response.json().await
+    let body: serde_json::Value = response
+        .json()
+        .await
         .map_err(|e| anyhow::anyhow!("Stripe response parse error: {e}"))?;
 
     if !status.is_success() {
-        let msg = body.pointer("/error/message")
+        let msg = body
+            .pointer("/error/message")
             .and_then(|v| v.as_str())
             .unwrap_or("Unknown Stripe error");
         anyhow::bail!("Stripe error ({}): {}", status.as_u16(), msg);
     }
 
-    let checkout_url = body.get("url")
+    let checkout_url = body
+        .get("url")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Stripe response missing checkout URL"))?
         .to_string();
@@ -196,9 +218,11 @@ pub fn verify_stripe_signature(
         }
     }
 
-    let timestamp = parts.get("t")
+    let timestamp = parts
+        .get("t")
         .ok_or_else(|| anyhow::anyhow!("Missing timestamp in Stripe signature"))?;
-    let v1_sig = parts.get("v1")
+    let v1_sig = parts
+        .get("v1")
         .ok_or_else(|| anyhow::anyhow!("Missing v1 signature in Stripe signature"))?;
 
     // Compute expected signature: HMAC-SHA256(secret, "{timestamp}.{payload}")
@@ -261,17 +285,21 @@ pub async fn create_toss_session(
         .map_err(|e| anyhow::anyhow!("TossPayments API error: {e}"))?;
 
     let status = response.status();
-    let resp_body: serde_json::Value = response.json().await
+    let resp_body: serde_json::Value = response
+        .json()
+        .await
         .map_err(|e| anyhow::anyhow!("TossPayments response parse error: {e}"))?;
 
     if !status.is_success() {
-        let msg = resp_body.get("message")
+        let msg = resp_body
+            .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("Unknown TossPayments error");
         anyhow::bail!("TossPayments error ({}): {}", status.as_u16(), msg);
     }
 
-    let checkout_url = resp_body.get("checkout")
+    let checkout_url = resp_body
+        .get("checkout")
         .and_then(|v| v.get("url"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("TossPayments response missing checkout URL"))?
@@ -313,7 +341,8 @@ pub async fn confirm_toss_payment(
     let resp_body: serde_json::Value = response.json().await?;
 
     if !status.is_success() {
-        let msg = resp_body.get("message")
+        let msg = resp_body
+            .get("message")
             .and_then(|v| v.as_str())
             .unwrap_or("Confirmation failed");
         anyhow::bail!("TossPayments confirm error ({}): {}", status.as_u16(), msg);
@@ -346,10 +375,13 @@ pub async fn maybe_auto_recharge(
         return Ok(None);
     }
 
-    let package = find_usd_package(&settings.package_id)
-        .ok_or_else(|| anyhow::anyhow!("Auto-recharge package not found: {}", settings.package_id))?;
+    let package = find_usd_package(&settings.package_id).ok_or_else(|| {
+        anyhow::anyhow!("Auto-recharge package not found: {}", settings.package_id)
+    })?;
 
-    let saved_method = settings.saved_method_id.as_deref()
+    let saved_method = settings
+        .saved_method_id
+        .as_deref()
         .ok_or_else(|| anyhow::anyhow!("Auto-recharge enabled but no saved payment method"))?;
 
     let transaction_id = uuid::Uuid::new_v4().to_string();
@@ -381,9 +413,7 @@ pub async fn maybe_auto_recharge(
                 .await?;
 
             let body: serde_json::Value = response.json().await?;
-            let status_str = body.get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let status_str = body.get("status").and_then(|v| v.as_str()).unwrap_or("");
 
             if status_str == "succeeded" {
                 tracing::info!(
@@ -422,9 +452,7 @@ pub async fn maybe_auto_recharge(
                 .await?;
 
             let resp: serde_json::Value = response.json().await?;
-            let toss_status = resp.get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let toss_status = resp.get("status").and_then(|v| v.as_str()).unwrap_or("");
 
             if toss_status == "DONE" {
                 tracing::info!(

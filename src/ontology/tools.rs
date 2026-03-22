@@ -14,7 +14,7 @@
 use super::context::ContextBuilder;
 use super::dispatcher::ActionDispatcher;
 use super::repo::OntologyRepo;
-use super::types::*;
+use super::types::{ActorKind, ContextSnapshotRequest, ExecuteActionRequest};
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;
@@ -69,7 +69,10 @@ impl Tool for OntologyGetContextTool {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let req = ContextSnapshotRequest {
             owner_user_id: self.default_owner.clone(),
-            channel: args.get("channel").and_then(|v| v.as_str()).map(String::from),
+            channel: args
+                .get("channel")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             device_id: args
                 .get("device_id")
                 .and_then(|v| v.as_str())
@@ -83,8 +86,8 @@ impl Tool for OntologyGetContextTool {
 
         match self.context_builder.build(&req) {
             Ok(snapshot) => {
-                let output = serde_json::to_string_pretty(&snapshot)
-                    .unwrap_or_else(|_| "{}".to_string());
+                let output =
+                    serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
                 Ok(ToolResult {
                     success: true,
                     output,
@@ -153,14 +156,8 @@ impl Tool for OntologySearchObjectsTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let type_name = args.get("type").and_then(|v| v.as_str());
-        let query = args
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let limit = args
-            .get("limit")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(10) as usize;
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
         match self
             .repo
@@ -294,22 +291,13 @@ impl Tool for OntologyExecuteActionTool {
             action_type_name,
             owner_user_id: self.default_owner.clone(),
             actor_kind: Some(ActorKind::Agent),
-            primary_object_id: args
-                .get("primary_object_id")
-                .and_then(|v| v.as_i64()),
+            primary_object_id: args.get("primary_object_id").and_then(|v| v.as_i64()),
             related_object_ids: args
                 .get("related_object_ids")
                 .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_i64())
-                        .collect()
-                })
+                .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
                 .unwrap_or_default(),
-            params: args
-                .get("params")
-                .cloned()
-                .unwrap_or(json!({})),
+            params: args.get("params").cloned().unwrap_or(json!({})),
             channel: args
                 .get("channel")
                 .and_then(|v| v.as_str())
@@ -327,8 +315,8 @@ impl Tool for OntologyExecuteActionTool {
 
         match self.dispatcher.execute(req).await {
             Ok(result) => {
-                let output = serde_json::to_string_pretty(&result)
-                    .unwrap_or_else(|_| "{}".to_string());
+                let output =
+                    serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string());
                 Ok(ToolResult {
                     success: result
                         .get("success")
