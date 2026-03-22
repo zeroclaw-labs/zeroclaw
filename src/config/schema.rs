@@ -357,6 +357,10 @@ pub struct Config {
     #[serde(default)]
     pub linkedin: LinkedInConfig,
 
+    /// Standalone image generation tool configuration (`[image_gen]`).
+    #[serde(default)]
+    pub image_gen: ImageGenConfig,
+
     /// Plugin system configuration (`[plugins]`).
     #[serde(default)]
     pub plugins: PluginsConfig,
@@ -2970,6 +2974,46 @@ impl Default for ImageProviderFluxConfig {
         Self {
             api_key_env: default_flux_api_key_env(),
             model: default_flux_model(),
+        }
+    }
+}
+
+// ── Standalone Image Generation ─────────────────────────────────
+
+/// Standalone image generation tool configuration (`[image_gen]`).
+///
+/// When enabled, registers an `image_gen` tool that generates images via
+/// fal.ai's synchronous API (Flux / Nano Banana models) and saves them
+/// to the workspace `images/` directory.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ImageGenConfig {
+    /// Enable the standalone image generation tool. Default: false.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Default fal.ai model identifier.
+    #[serde(default = "default_image_gen_model")]
+    pub default_model: String,
+
+    /// Environment variable name holding the fal.ai API key.
+    #[serde(default = "default_image_gen_api_key_env")]
+    pub api_key_env: String,
+}
+
+fn default_image_gen_model() -> String {
+    "fal-ai/flux/schnell".into()
+}
+
+fn default_image_gen_api_key_env() -> String {
+    "FAL_API_KEY".into()
+}
+
+impl Default for ImageGenConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_model: default_image_gen_model(),
+            api_key_env: default_image_gen_api_key_env(),
         }
     }
 }
@@ -6822,6 +6866,7 @@ impl Default for Config {
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            image_gen: ImageGenConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -9286,7 +9331,6 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
-    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -9745,6 +9789,7 @@ default_temperature = 0.7
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            image_gen: ImageGenConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -10126,6 +10171,7 @@ default_temperature = 0.7
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
+            image_gen: ImageGenConfig::default(),
             plugins: PluginsConfig::default(),
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
@@ -13682,12 +13728,12 @@ require_otp_to_resume = true
     async fn ensure_bootstrap_files_creates_missing_files() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("workspace");
-        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let _: () = tokio::fs::create_dir_all(&ws).await.unwrap();
 
         ensure_bootstrap_files(&ws).await.unwrap();
 
-        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
-        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+        let soul: String = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        let identity: String = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
             .await
             .unwrap();
         assert!(soul.contains("SOUL.md"));
@@ -13698,21 +13744,21 @@ require_otp_to_resume = true
     async fn ensure_bootstrap_files_does_not_overwrite_existing() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path().join("workspace");
-        tokio::fs::create_dir_all(&ws).await.unwrap();
+        let _: () = tokio::fs::create_dir_all(&ws).await.unwrap();
 
         let custom = "# My custom SOUL";
-        tokio::fs::write(ws.join("SOUL.md"), custom).await.unwrap();
+        let _: () = tokio::fs::write(ws.join("SOUL.md"), custom).await.unwrap();
 
         ensure_bootstrap_files(&ws).await.unwrap();
 
-        let soul = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
+        let soul: String = tokio::fs::read_to_string(ws.join("SOUL.md")).await.unwrap();
         assert_eq!(
             soul, custom,
             "ensure_bootstrap_files must not overwrite existing files"
         );
 
         // IDENTITY.md should still be created since it was missing
-        let identity = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
+        let identity: String = tokio::fs::read_to_string(ws.join("IDENTITY.md"))
             .await
             .unwrap();
         assert!(identity.contains("IDENTITY.md"));
