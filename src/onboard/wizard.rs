@@ -76,7 +76,7 @@ enum InteractiveOnboardingMode {
     UpdateProviderOnly,
 }
 
-pub async fn run_wizard(force: bool) -> Result<Config> {
+pub async fn run_wizard(force: bool, interactive_override: bool) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
 
     println!(
@@ -93,7 +93,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
 
     print_step(1, 9, "Workspace Setup");
     let (workspace_dir, config_path) = setup_workspace().await?;
-    match resolve_interactive_onboarding_mode(&config_path, force)? {
+    let is_interactive_session = onboarding_session_is_interactive(interactive_override);
+    match resolve_interactive_onboarding_mode(&config_path, force, is_interactive_session)? {
         InteractiveOnboardingMode::FullOnboarding => {}
         InteractiveOnboardingMode::UpdateProviderOnly => {
             return Box::pin(run_provider_update_wizard(&workspace_dir, &config_path)).await;
@@ -542,7 +543,11 @@ async fn run_quick_setup_with_home(
     let (zeroclaw_dir, workspace_dir) = resolve_quick_setup_dirs_with_home(home);
     let config_path = zeroclaw_dir.join("config.toml");
 
-    ensure_onboard_overwrite_allowed(&config_path, force)?;
+    ensure_onboard_overwrite_allowed(
+        &config_path,
+        force,
+        onboarding_session_is_interactive(false),
+    )?;
     fs::create_dir_all(&workspace_dir)
         .await
         .context("Failed to create workspace directory")?;
@@ -2135,6 +2140,7 @@ fn print_bullet(text: &str) {
 fn resolve_interactive_onboarding_mode(
     config_path: &Path,
     force: bool,
+    is_interactive_session: bool,
 ) -> Result<InteractiveOnboardingMode> {
     if !config_path.exists() {
         return Ok(InteractiveOnboardingMode::FullOnboarding);
@@ -2149,7 +2155,7 @@ fn resolve_interactive_onboarding_mode(
         return Ok(InteractiveOnboardingMode::FullOnboarding);
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    if should_refuse_overwrite_without_force(force, is_interactive_session) {
         bail!(
             "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
             config_path.display()
@@ -2178,7 +2184,11 @@ fn resolve_interactive_onboarding_mode(
     }
 }
 
-fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<()> {
+fn ensure_onboard_overwrite_allowed(
+    config_path: &Path,
+    force: bool,
+    _interactive_session: bool,
+) -> Result<()> {
     if !config_path.exists() {
         return Ok(());
     }
@@ -2202,7 +2212,7 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
 
     #[cfg(not(test))]
     {
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        if should_refuse_overwrite_without_force(force, _interactive_session) {
             bail!(
                 "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
                 config_path.display()
@@ -2223,6 +2233,24 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
 
         Ok(())
     }
+}
+
+fn should_refuse_overwrite_without_force(force: bool, is_interactive_session: bool) -> bool {
+    !force && !is_interactive_session
+}
+
+fn onboarding_session_is_interactive(interactive_override: bool) -> bool {
+    onboarding_session_is_interactive_with_tty(
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        interactive_override,
+    )
+}
+
+fn onboarding_session_is_interactive_with_tty(
+    tty_detected: bool,
+    interactive_override: bool,
+) -> bool {
+    interactive_override || tty_detected
 }
 
 async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
@@ -6081,6 +6109,19 @@ mod tests {
         );
         assert!(config.api_key.is_none());
         assert!(config.api_url.is_none());
+    }
+
+    #[test]
+    fn interactive_override_handles_false_negative_tty_detection() {
+        assert!(onboarding_session_is_interactive_with_tty(false, true));
+        assert!(!onboarding_session_is_interactive_with_tty(false, false));
+    }
+
+    #[test]
+    fn non_interactive_overwrite_guard_respects_override_path() {
+        assert!(should_refuse_overwrite_without_force(false, false));
+        assert!(!should_refuse_overwrite_without_force(false, true));
+        assert!(!should_refuse_overwrite_without_force(true, false));
     }
 
     #[tokio::test]

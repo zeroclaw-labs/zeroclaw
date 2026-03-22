@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 21, 2026**.
+Last verified: **March 22, 2026**.
 
 ## Top-Level Commands
 
@@ -33,6 +33,7 @@ Last verified: **February 21, 2026**.
 ### `onboard`
 
 - `zeroclaw onboard`
+- `zeroclaw onboard --interactive`
 - `zeroclaw onboard --channels-only`
 - `zeroclaw onboard --force`
 - `zeroclaw onboard --reinit`
@@ -46,6 +47,8 @@ Last verified: **February 21, 2026**.
   - Full onboarding (overwrite `config.toml`)
   - Provider-only update (update provider/model/API key while preserving existing channels, tunnel, memory, hooks, and other settings)
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
+- Use `zeroclaw onboard --interactive` to force the full wizard when TTY auto-detection is a false negative (for example, certain wrapped terminals).
+- `--interactive` is mutually exclusive with quick-setup flags (`--api-key`, `--provider`, `--model`, `--memory`) and `--channels-only`.
 - Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
 - Use `zeroclaw onboard --reinit` to start fresh. This backs up your existing config directory with a timestamp suffix and creates a new configuration from scratch.
 

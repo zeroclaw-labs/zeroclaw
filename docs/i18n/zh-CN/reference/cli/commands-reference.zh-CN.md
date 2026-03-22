@@ -2,7 +2,7 @@
 
 本参考文档派生自当前 CLI 界面（`zeroclaw --help`）。
 
-最后验证时间：**2026年2月21日**。
+最后验证时间：**2026年3月22日**。
 
 ## 顶级命令
 
@@ -33,6 +33,7 @@
 ### `onboard`
 
 - `zeroclaw onboard`
+- `zeroclaw onboard --interactive`
 - `zeroclaw onboard --channels-only`
 - `zeroclaw onboard --force`
 - `zeroclaw onboard --reinit`
@@ -46,6 +47,8 @@
   - 完整引导（覆盖 `config.toml`）
   - 仅更新提供商（更新提供商/模型/API 密钥，同时保留现有渠道、隧道、内存、钩子和其他设置）
 - 在非交互式环境中，现有 `config.toml` 会导致安全拒绝，除非传递 `--force`。
+- 当 TTY 自动检测出现误判（例如某些被包装的终端）时，可使用 `zeroclaw onboard --interactive` 强制进入完整向导。
+- `--interactive` 与快速配置参数（`--api-key`、`--provider`、`--model`、`--memory`）及 `--channels-only` 互斥。
 - 当你只需要轮换渠道令牌/白名单时，使用 `zeroclaw onboard --channels-only`。
 - 使用 `zeroclaw onboard --reinit` 重新开始。这会备份现有配置目录并添加时间戳后缀，然后从头创建新配置。
 

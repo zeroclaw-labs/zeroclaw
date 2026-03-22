@@ -164,6 +164,13 @@ struct Cli {
 enum Commands {
     /// Initialize your workspace and configuration
     Onboard {
+        /// Force the full interactive wizard (use when TTY auto-detection is a false negative)
+        #[arg(
+            long,
+            conflicts_with_all = ["api_key", "provider", "model", "memory", "channels_only"]
+        )]
+        interactive: bool,
+
         /// Overwrite existing config without confirmation
         #[arg(long)]
         force: bool,
@@ -812,8 +819,10 @@ async fn main() -> Result<()> {
     // provider flags were given, it runs the full interactive wizard; otherwise
     // it runs the quick (scriptable) setup.  This means `curl … | bash` and
     // `zeroclaw onboard --api-key …` both take the fast path, while a bare
-    // `zeroclaw onboard` in a terminal launches the wizard.
+    // `zeroclaw onboard` in a terminal launches the wizard. `--interactive`
+    // can force the wizard when TTY detection is a false negative.
     if let Commands::Onboard {
+        interactive,
         force,
         reinit,
         channels_only,
@@ -823,6 +832,7 @@ async fn main() -> Result<()> {
         memory,
     } = &cli.command
     {
+        let interactive = *interactive;
         let force = *force;
         let reinit = *reinit;
         let channels_only = *channels_only;
@@ -889,11 +899,12 @@ async fn main() -> Result<()> {
         let has_provider_flags =
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let should_run_interactive_wizard = interactive || (is_tty && !has_provider_flags);
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
-        } else if is_tty && !has_provider_flags {
-            Box::pin(onboard::run_wizard(force)).await
+        } else if should_run_interactive_wizard {
+            Box::pin(onboard::run_wizard(force, interactive)).await
         } else {
             Box::pin(onboard::run_quick_setup(
                 api_key.as_deref(),
@@ -2470,9 +2481,34 @@ mod tests {
     }
 
     #[test]
-    fn onboard_cli_rejects_removed_interactive_flag() {
-        // --interactive was removed; onboard auto-detects TTY instead.
-        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    fn onboard_cli_accepts_interactive_override() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"])
+            .expect("onboard --interactive should parse");
+
+        match cli.command {
+            Commands::Onboard { interactive, .. } => assert!(interactive),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_rejects_interactive_with_quick_setup_flags() {
+        assert!(Cli::try_parse_from([
+            "zeroclaw",
+            "onboard",
+            "--interactive",
+            "--provider",
+            "openrouter",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn onboard_cli_rejects_interactive_with_channels_only() {
+        assert!(
+            Cli::try_parse_from(["zeroclaw", "onboard", "--interactive", "--channels-only"])
+                .is_err()
+        );
     }
 
     #[test]
