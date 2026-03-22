@@ -23,6 +23,10 @@ pub struct MemoryEntry {
     pub timestamp: String,
     pub session_id: Option<String>,
     pub score: Option<f64>,
+    /// Scope label for memory partitioning (e.g. "personal", "group").
+    /// Derived automatically by backends that support scoping (e.g. mem0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 impl std::fmt::Debug for MemoryEntry {
@@ -185,6 +189,7 @@ mod tests {
             timestamp: "2026-02-16T00:00:00Z".into(),
             session_id: Some("session-abc".into()),
             score: Some(0.98),
+            scope: Some("personal".into()),
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -196,5 +201,6 @@ mod tests {
         assert_eq!(parsed.category, MemoryCategory::Core);
         assert_eq!(parsed.session_id.as_deref(), Some("session-abc"));
         assert_eq!(parsed.score, Some(0.98));
+        assert_eq!(parsed.scope.as_deref(), Some("personal"));
     }
 }

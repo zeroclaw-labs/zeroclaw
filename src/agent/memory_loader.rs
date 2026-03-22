@@ -118,6 +118,7 @@ mod tests {
                 timestamp: "now".into(),
                 session_id: None,
                 score: None,
+                scope: None,
             }])
         }
 
@@ -226,6 +227,7 @@ mod tests {
                     timestamp: "now".into(),
                     session_id: None,
                     score: Some(0.95),
+                    scope: None,
                 },
                 MemoryEntry {
                     id: "2".into(),
@@ -235,6 +237,7 @@ mod tests {
                     timestamp: "now".into(),
                     session_id: None,
                     score: Some(0.9),
+                    scope: None,
                 },
             ]),
         };
