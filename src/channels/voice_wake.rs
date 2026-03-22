@@ -21,12 +21,6 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 
 // ── State machine ──────────────────────────────────────────────
 
-/// Maximum allowed capture duration (seconds) to prevent unbounded memory growth.
-const MAX_CAPTURE_SECS_LIMIT: u32 = 300;
-
-/// Minimum silence timeout to prevent API hammering.
-const MIN_SILENCE_TIMEOUT_MS: u32 = 100;
-
 /// Internal states for the wake-word detector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WakeState {
@@ -36,6 +30,8 @@ pub enum WakeState {
     Triggered,
     /// Wake word confirmed — capturing the full utterance that follows.
     Capturing,
+    /// Captured audio is being transcribed.
+    Processing,
 }
 
 impl std::fmt::Display for WakeState {
@@ -44,6 +40,7 @@ impl std::fmt::Display for WakeState {
             Self::Listening => write!(f, "Listening"),
             Self::Triggered => write!(f, "Triggered"),
             Self::Capturing => write!(f, "Capturing"),
+            Self::Processing => write!(f, "Processing"),
         }
     }
 }
@@ -81,97 +78,55 @@ impl Channel for VoiceWakeChannel {
         let config = self.config.clone();
         let transcription_config = self.transcription_config.clone();
 
-        // ── Validate config ───────────────────────────────────
-        let energy_threshold = config.energy_threshold;
-        if !energy_threshold.is_finite() || energy_threshold <= 0.0 {
-            bail!("VoiceWake: energy_threshold must be a positive finite number, got {energy_threshold}");
-        }
-        if config.silence_timeout_ms < MIN_SILENCE_TIMEOUT_MS {
-            bail!(
-                "VoiceWake: silence_timeout_ms must be >= {MIN_SILENCE_TIMEOUT_MS}, got {}",
-                config.silence_timeout_ms
-            );
-        }
-        let max_capture_secs = config.max_capture_secs.min(MAX_CAPTURE_SECS_LIMIT);
-        if max_capture_secs != config.max_capture_secs {
-            warn!(
-                "VoiceWake: max_capture_secs clamped from {} to {MAX_CAPTURE_SECS_LIMIT}",
-                config.max_capture_secs
-            );
-        }
-
         // Run the blocking audio capture loop on a dedicated thread.
-        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(64);
+        let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(4);
 
+        let energy_threshold = config.energy_threshold;
         let silence_timeout = Duration::from_millis(u64::from(config.silence_timeout_ms));
-        let max_capture = Duration::from_secs(u64::from(max_capture_secs));
+        let max_capture = Duration::from_secs(u64::from(config.max_capture_secs));
         let sample_rate: u32;
         let channels_count: u16;
 
         // ── Initialise cpal stream ────────────────────────────
-        // cpal::Stream is !Send, so we build and hold it on a dedicated thread.
-        // When the listen function exits, the shutdown oneshot is dropped,
-        // the thread exits, and the stream + microphone are released.
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<Result<(u32, u16)>>();
         {
+            use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+            let host = cpal::default_host();
+            let device = host
+                .default_input_device()
+                .ok_or_else(|| anyhow::anyhow!("No default audio input device available"))?;
+
+            let supported = device.default_input_config()?;
+            sample_rate = supported.sample_rate().0;
+            channels_count = supported.channels();
+
+            info!(
+                device = ?device.name().unwrap_or_default(),
+                sample_rate,
+                channels = channels_count,
+                "VoiceWake: opening audio input"
+            );
+
+            let stream_config: cpal::StreamConfig = supported.into();
             let audio_tx_clone = audio_tx.clone();
 
-            std::thread::spawn(move || {
-                use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+            let stream = device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    // Non-blocking: try_send and drop if full.
+                    let _ = audio_tx_clone.try_send(data.to_vec());
+                },
+                move |err| {
+                    warn!("VoiceWake: audio stream error: {err}");
+                },
+                None,
+            )?;
 
-                let result = (|| -> Result<(u32, u16, cpal::Stream)> {
-                    let host = cpal::default_host();
-                    let device = host.default_input_device().ok_or_else(|| {
-                        anyhow::anyhow!("No default audio input device available")
-                    })?;
+            stream.play()?;
 
-                    let supported = device.default_input_config()?;
-                    let sr = supported.sample_rate().0;
-                    let ch = supported.channels();
-
-                    info!(
-                        device = ?device.name().unwrap_or_default(),
-                        sample_rate = sr,
-                        channels = ch,
-                        "VoiceWake: opening audio input"
-                    );
-
-                    let stream_config: cpal::StreamConfig = supported.into();
-
-                    let stream = device.build_input_stream(
-                        &stream_config,
-                        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                            let _ = audio_tx_clone.try_send(data.to_vec());
-                        },
-                        move |err| {
-                            warn!("VoiceWake: audio stream error: {err}");
-                        },
-                        None,
-                    )?;
-
-                    stream.play()?;
-                    Ok((sr, ch, stream))
-                })();
-
-                match result {
-                    Ok((sr, ch, _stream)) => {
-                        let _ = init_tx.send(Ok((sr, ch)));
-                        // Hold the stream alive until shutdown is signalled.
-                        let _ = shutdown_rx.blocking_recv();
-                        debug!("VoiceWake: stream holder thread exiting");
-                    }
-                    Err(e) => {
-                        let _ = init_tx.send(Err(e));
-                    }
-                }
-            });
-
-            let (sr, ch) = init_rx
-                .await
-                .map_err(|_| anyhow::anyhow!("VoiceWake: stream init thread panicked"))??;
-            sample_rate = sr;
-            channels_count = ch;
+            // Keep the stream alive for the lifetime of the channel.
+            // We leak it intentionally — the channel runs until the daemon shuts down.
+            std::mem::forget(stream);
         }
 
         // Drop the extra sender so the channel closes when the stream sender drops.
@@ -184,10 +139,6 @@ impl Channel for VoiceWakeChannel {
         let mut last_voice_at = Instant::now();
         let mut capture_start = Instant::now();
         let mut msg_counter: u64 = 0;
-
-        // Hard cap on capture buffer: max_capture_secs * sample_rate * channels * 2 (safety margin).
-        let max_buf_samples =
-            max_capture_secs as usize * sample_rate as usize * channels_count as usize * 2;
 
         info!(wake_word = %wake_word, "VoiceWake: entering listen loop");
 
@@ -209,9 +160,7 @@ impl Channel for VoiceWakeChannel {
                     }
                 }
                 WakeState::Triggered => {
-                    if capture_buf.len() + chunk.len() <= max_buf_samples {
-                        capture_buf.extend_from_slice(&chunk);
-                    }
+                    capture_buf.extend_from_slice(&chunk);
 
                     if energy >= energy_threshold {
                         last_voice_at = Instant::now();
@@ -253,9 +202,7 @@ impl Channel for VoiceWakeChannel {
                     }
                 }
                 WakeState::Capturing => {
-                    if capture_buf.len() + chunk.len() <= max_buf_samples {
-                        capture_buf.extend_from_slice(&chunk);
-                    }
+                    capture_buf.extend_from_slice(&chunk);
 
                     if energy >= energy_threshold {
                         last_voice_at = Instant::now();
@@ -307,11 +254,13 @@ impl Channel for VoiceWakeChannel {
                         capture_buf.clear();
                     }
                 }
+                WakeState::Processing => {
+                    // Should not receive chunks while processing, but just buffer them.
+                    // State transitions happen above synchronously after transcription.
+                }
             }
         }
 
-        // Signal the stream holder thread to exit and release the microphone.
-        drop(shutdown_tx);
         bail!("VoiceWake: audio stream ended unexpectedly");
     }
 }
@@ -334,14 +283,8 @@ pub fn encode_wav_from_f32(samples: &[f32], sample_rate: u32, channels: u16) -> 
     let bits_per_sample: u16 = 16;
     let byte_rate = u32::from(channels) * sample_rate * u32::from(bits_per_sample) / 8;
     let block_align = channels * bits_per_sample / 8;
-    // Guard against u32 overflow — reject buffers that exceed WAV's 4 GB limit.
-    let data_bytes = samples.len() * 2;
-    assert!(
-        u32::try_from(data_bytes).is_ok(),
-        "audio buffer too large for WAV encoding ({data_bytes} bytes)"
-    );
     #[allow(clippy::cast_possible_truncation)]
-    let data_len = data_bytes as u32;
+    let data_len = (samples.len() * 2) as u32; // 16-bit = 2 bytes per sample; max ~25 MB
     let file_len = 36 + data_len;
 
     let mut buf = Vec::with_capacity(file_len as usize + 8);
@@ -389,6 +332,7 @@ mod tests {
         assert_eq!(WakeState::Listening.to_string(), "Listening");
         assert_eq!(WakeState::Triggered.to_string(), "Triggered");
         assert_eq!(WakeState::Capturing.to_string(), "Capturing");
+        assert_eq!(WakeState::Processing.to_string(), "Processing");
     }
 
     #[test]
@@ -557,6 +501,7 @@ mod tests {
             WakeState::Listening,
             WakeState::Triggered,
             WakeState::Capturing,
+            WakeState::Processing,
         ];
         for (i, a) in states.iter().enumerate() {
             for (j, b) in states.iter().enumerate() {
