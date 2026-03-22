@@ -25,28 +25,26 @@ agent-browser install --with-deps  # Linux (includes system deps)
 agent-browser install              # macOS/Windows
 ```
 
-### 2. Enable in ZeroClaw Config
+### 2. Verify ZeroClaw Config
 
-Edit `~/.zeroclaw/config.toml`:
+The browser tool is enabled by default. To verify or customize, edit
+`~/.zeroclaw/config.toml`:
 
 ```toml
 [browser]
-enabled = true
-allowed_domains = ["*"]
-backend = "agent_browser"
-native_headless = true
+enabled = true              # default: true
+allowed_domains = ["*"]     # default: ["*"] (all public hosts)
+backend = "agent_browser"   # default: "agent_browser"
+native_headless = true      # default: true
+```
 
-# Add to allowed commands
-allowed_commands = [
-    "agent-browser",
-    # ... other commands
-]
+To restrict domains or disable the browser tool:
 
-# Auto-approve for seamless operation
-auto_approve = [
-    "browser",
-    # ... other tools
-]
+```toml
+[browser]
+enabled = false                              # disable entirely
+# or restrict to specific domains:
+allowed_domains = ["example.com", "docs.example.com"]
 ```
 
 ### 3. Test
@@ -100,7 +98,7 @@ echo "  VNC Client: localhost:$VNC_PORT"
 echo "  Web Browser: http://localhost:$NOVNC_PORT/vnc.html"
 ```
 
-### Access
+### VNC Access
 
 - **VNC Client**: Connect to `localhost:5900`
 - **Web Browser**: Open `http://localhost:6080/vnc.html`
@@ -127,14 +125,14 @@ chmod +x ~/.chrome-remote-desktop-session
 
 ### Setup
 
-1. Visit https://remotedesktop.google.com/headless
+1. Visit <https://remotedesktop.google.com/headless>
 2. Copy the "Debian Linux" setup command
 3. Run it on your server
 4. Start the service: `systemctl --user start chrome-remote-desktop`
 
-### Access
+### Remote Access
 
-Go to https://remotedesktop.google.com/access from any device.
+Go to <https://remotedesktop.google.com/access> from any device.
 
 ## Testing
 

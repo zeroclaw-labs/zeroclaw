@@ -27,12 +27,14 @@ agent-browser install              # macOS/Windows
 ## Usage
 
 ### Navigate and snapshot
+
 ```bash
 agent-browser open https://example.com
 agent-browser snapshot -i
 ```
 
 ### Interact with elements
+
 ```bash
 agent-browser click @e1           # Click by ref
 agent-browser fill @e2 "text"     # Fill input
@@ -40,6 +42,7 @@ agent-browser press Enter         # Press key
 ```
 
 ### Extract data
+
 ```bash
 agent-browser get text @e1        # Get text content
 agent-browser get url             # Get current URL
@@ -47,6 +50,7 @@ agent-browser screenshot page.png # Take screenshot
 ```
 
 ### Session management
+
 ```bash
 agent-browser close               # Close browser
 ```
@@ -54,6 +58,7 @@ agent-browser close               # Close browser
 ## Common Workflows
 
 ### Login flow
+
 ```bash
 agent-browser open https://site.com/login
 agent-browser snapshot -i
@@ -64,6 +69,7 @@ agent-browser wait --text "Welcome"
 ```
 
 ### Scrape page content
+
 ```bash
 agent-browser open https://news.ycombinator.com
 agent-browser snapshot -i
@@ -71,6 +77,7 @@ agent-browser get text @e1
 ```
 
 ### Take screenshots
+
 ```bash
 agent-browser open https://google.com
 agent-browser screenshot --full page.png
@@ -85,32 +92,24 @@ agent-browser screenshot --full page.png
 
 ## Configuration
 
-Enable browser in your ZeroClaw config:
+The browser tool is enabled by default with `allowed_domains = ["*"]` and
+`backend = "agent_browser"`. To customize, edit `~/.zeroclaw/config.toml`:
 
 ```toml
 [browser]
-enabled = true
-allowed_domains = ["*"]
-backend = "agent_browser"
-native_headless = true
+enabled = true              # default: true
+allowed_domains = ["*"]     # default: ["*"] (all public hosts)
+backend = "agent_browser"   # default: "agent_browser"
+native_headless = true      # default: true
 ```
 
-Add `agent-browser` to allowed commands:
+To restrict domains or disable the browser tool:
 
 ```toml
-allowed_commands = [
-    "agent-browser",
-    # ... other commands
-]
-```
-
-Add to auto-approve for seamless operation:
-
-```toml
-auto_approve = [
-    "browser",
-    # ... other tools
-]
+[browser]
+enabled = false                              # disable entirely
+# or restrict to specific domains:
+allowed_domains = ["example.com", "docs.example.com"]
 ```
 
 ## Full Command Reference
@@ -120,4 +119,4 @@ Run `agent-browser --help` for all available commands.
 ## Related
 
 - [agent-browser GitHub](https://github.com/vercel-labs/agent-browser)
-- [VNC Setup Guide](../docs/browser-vnc-setup.md)
+- [VNC Setup Guide](../docs/browser-setup.md)
