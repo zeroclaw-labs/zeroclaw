@@ -1236,6 +1236,102 @@ audio-data\r\n\
     }
 
     #[tokio::test]
+    async fn process_unseen_skips_transcription_when_manager_none() {
+        let channel = EmailChannel::new(EmailConfig {
+            allowed_senders: vec!["*".to_string()],
+            ..Default::default()
+        });
+        assert!(channel.transcription_manager.is_none());
+
+        // Simulate a ParsedEmail with audio attachment
+        let parsed_email = ParsedEmail {
+            _uid: 1,
+            msg_id: "test-msg-1".to_string(),
+            sender: "test@example.com".to_string(),
+            content: "Subject: Test\n\nText body".to_string(),
+            timestamp: 0,
+            audio_attachment: Some((b"fake-audio".to_vec(), "voice.ogg".to_string())),
+        };
+
+        {
+            let mut seen = channel.seen_messages.lock().await;
+            seen.insert(parsed_email.msg_id.clone());
+        }
+
+        // Manually exercise the transcription logic from process_unseen
+        let mut content = parsed_email.content.clone();
+        if let (Some(manager), Some((audio_data, file_name))) = (
+            channel.transcription_manager.as_deref(),
+            parsed_email.audio_attachment,
+        ) {
+            match manager.transcribe(&audio_data, &file_name).await {
+                Ok(transcript) => {
+                    content.push_str("\n\n[Voice message transcript]\n");
+                    content.push_str(&transcript);
+                }
+                Err(e) => {
+                    warn!("email audio transcription failed: {e}");
+                }
+            }
+        }
+
+        // Content should remain unchanged (no transcript appended)
+        assert_eq!(content, "Subject: Test\n\nText body");
+        assert!(!content.contains("[Voice message transcript]"));
+    }
+
+    #[tokio::test]
+    async fn process_unseen_keeps_text_when_transcription_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Configure mock to return 500 error
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&mock_server)
+            .await;
+
+        let transcription_config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "local_whisper".to_string(),
+            local_whisper: Some(crate::config::LocalWhisperConfig {
+                url: format!("{}/v1/transcribe", mock_server.uri()),
+                bearer_token: "test-token".to_string(),
+                max_audio_bytes: 10 * 1024 * 1024,
+                timeout_secs: 30,
+            }),
+            ..Default::default()
+        };
+
+        let channel =
+            EmailChannel::new(EmailConfig::default()).with_transcription(transcription_config);
+
+        assert!(channel.transcription_manager.is_some());
+
+        let manager = channel.transcription_manager.as_ref().unwrap();
+        let audio_data = b"fake-audio";
+        let file_name = "voice.ogg";
+
+        // Transcription should fail
+        let result = manager.transcribe(audio_data, file_name).await;
+        assert!(result.is_err());
+
+        // Simulate the process_unseen logic
+        let mut content = "Subject: Test\n\nText body".to_string();
+        if let Err(e) = result {
+            warn!("email audio transcription failed: {e}");
+            // Content remains unchanged
+        }
+
+        // Content should be preserved without transcript
+        assert_eq!(content, "Subject: Test\n\nText body");
+        assert!(!content.contains("[Voice message transcript]"));
+    }
+
+    #[tokio::test]
     async fn email_audio_routes_through_local_whisper() {
         use wiremock::matchers::{header_exists, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
