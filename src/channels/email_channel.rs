@@ -125,7 +125,6 @@ type ImapSession = Session<TlsStream<TcpStream>>;
 pub struct EmailChannel {
     pub config: EmailConfig,
     seen_messages: Arc<Mutex<HashSet<String>>>,
-    transcription: Option<crate::config::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
 }
 
@@ -134,12 +133,14 @@ impl EmailChannel {
         Self {
             config,
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
-            transcription: None,
             transcription_manager: None,
         }
     }
 
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if !config.enabled {
+            return self;
+        }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
                 self.transcription_manager = Some(Arc::new(m));
@@ -148,7 +149,6 @@ impl EmailChannel {
                 warn!("transcription manager init failed, voice transcription disabled: {e}");
             }
         }
-        self.transcription = Some(config);
         self
     }
 
@@ -237,17 +237,24 @@ impl EmailChannel {
         for part in parsed.attachments() {
             let part: &mail_parser::MessagePart = part;
             if let Some(ct) = MimeHeaders::content_type(part) {
-                if ct.ctype() == "audio" {
+                if ct.ctype().eq_ignore_ascii_case("audio") {
                     if found.is_none() {
                         let file_name = MimeHeaders::attachment_name(part)
                             .map(|n| n.to_string())
+                            .filter(|n| !n.is_empty())
                             .unwrap_or_else(|| {
-                                let ext = match ct.subtype().unwrap_or("bin") {
+                                let ext = match ct
+                                    .subtype()
+                                    .unwrap_or("bin")
+                                    .to_ascii_lowercase()
+                                    .as_str()
+                                {
                                     "mpeg" => "mp3",
                                     "ogg" => "ogg",
                                     "mp4" => "mp4",
                                     "wav" | "x-wav" => "wav",
                                     "webm" => "webm",
+                                    "flac" => "flac",
                                     _ => "bin",
                                 };
                                 format!("voice.{ext}")
@@ -525,8 +532,16 @@ impl EmailChannel {
             ) {
                 match manager.transcribe(&audio_data, &file_name).await {
                     Ok(transcript) => {
-                        content.push_str("\n\n[Voice message transcript]\n");
-                        content.push_str(&transcript);
+                        if content.ends_with("(no readable content)") {
+                            // Audio-only email: replace placeholder with transcript
+                            let prefix_end = content.len() - "(no readable content)".len();
+                            content.truncate(prefix_end);
+                            content.push_str("[Voice message transcript]\n");
+                            content.push_str(&transcript);
+                        } else {
+                            content.push_str("\n\n[Voice message transcript]\n");
+                            content.push_str(&transcript);
+                        }
                     }
                     Err(e) => {
                         warn!("email audio transcription failed: {e}");
@@ -1078,8 +1093,14 @@ mod tests {
     #[test]
     fn email_manager_some_when_valid_config() {
         let config = crate::config::TranscriptionConfig {
-            enabled: false,
-            api_key: Some("test-key".to_string()),
+            enabled: true,
+            default_provider: "local_whisper".into(),
+            local_whisper: Some(crate::config::LocalWhisperConfig {
+                url: "http://localhost:8001/v1/transcribe".into(),
+                bearer_token: "test-token".into(),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 120,
+            }),
             ..Default::default()
         };
         let channel = EmailChannel::new(EmailConfig::default()).with_transcription(config);
@@ -1320,7 +1341,7 @@ audio-data\r\n\
         assert!(result.is_err());
 
         // Simulate the process_unseen logic
-        let mut content = "Subject: Test\n\nText body".to_string();
+        let content = "Subject: Test\n\nText body".to_string();
         if let Err(e) = result {
             warn!("email audio transcription failed: {e}");
             // Content remains unchanged
