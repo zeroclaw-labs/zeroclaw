@@ -15,13 +15,19 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Maximum content size per canvas frame (256 KB).
-const MAX_CONTENT_SIZE: usize = 256 * 1024;
+pub const MAX_CONTENT_SIZE: usize = 256 * 1024;
 
 /// Maximum number of history frames kept per canvas.
 const MAX_HISTORY_FRAMES: usize = 50;
 
 /// Broadcast channel capacity per canvas.
 const BROADCAST_CAPACITY: usize = 64;
+
+/// Maximum number of concurrent canvases to prevent memory exhaustion.
+const MAX_CANVAS_COUNT: usize = 100;
+
+/// Allowed content types for canvas frames via the REST API.
+pub const ALLOWED_CONTENT_TYPES: &[&str] = &["html", "svg", "markdown", "text"];
 
 /// A single canvas frame (one render).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +71,13 @@ impl CanvasStore {
     }
 
     /// Push a new frame to a canvas. Creates the canvas if it does not exist.
-    pub fn render(&self, canvas_id: &str, content_type: &str, content: &str) -> CanvasFrame {
+    /// Returns `None` if the maximum canvas count has been reached and this is a new canvas.
+    pub fn render(
+        &self,
+        canvas_id: &str,
+        content_type: &str,
+        content: &str,
+    ) -> Option<CanvasFrame> {
         let frame = CanvasFrame {
             frame_id: uuid::Uuid::new_v4().to_string(),
             content_type: content_type.to_string(),
@@ -74,6 +86,12 @@ impl CanvasStore {
         };
 
         let mut store = self.inner.write();
+
+        // Enforce canvas count limit for new canvases.
+        if !store.contains_key(canvas_id) && store.len() >= MAX_CANVAS_COUNT {
+            return None;
+        }
+
         let entry = store
             .entry(canvas_id.to_string())
             .or_insert_with(|| CanvasEntry {
@@ -92,7 +110,7 @@ impl CanvasStore {
         // Best-effort broadcast — ignore errors (no receivers is fine).
         let _ = entry.tx.send(frame.clone());
 
-        frame
+        Some(frame)
     }
 
     /// Get the current (most recent) frame for a canvas.
@@ -131,9 +149,16 @@ impl CanvasStore {
     }
 
     /// Subscribe to real-time updates for a canvas.
-    /// Creates the canvas entry if it does not exist.
-    pub fn subscribe(&self, canvas_id: &str) -> broadcast::Receiver<CanvasFrame> {
+    /// Creates the canvas entry if it does not exist (subject to canvas count limit).
+    /// Returns `None` if the canvas does not exist and the limit has been reached.
+    pub fn subscribe(&self, canvas_id: &str) -> Option<broadcast::Receiver<CanvasFrame>> {
         let mut store = self.inner.write();
+
+        // Enforce canvas count limit for new entries.
+        if !store.contains_key(canvas_id) && store.len() >= MAX_CANVAS_COUNT {
+            return None;
+        }
+
         let entry = store
             .entry(canvas_id.to_string())
             .or_insert_with(|| CanvasEntry {
@@ -141,7 +166,7 @@ impl CanvasStore {
                 history: Vec::new(),
                 tx: broadcast::channel(BROADCAST_CAPACITY).0,
             });
-        entry.tx.subscribe()
+        Some(entry.tx.subscribe())
     }
 
     /// List all canvas IDs that currently have content.
@@ -256,15 +281,24 @@ impl Tool for CanvasTool {
                     });
                 }
 
-                let frame = self.store.render(canvas_id, content_type, content);
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "Rendered {} content to canvas '{}' (frame: {})",
-                        content_type, canvas_id, frame.frame_id
-                    ),
-                    error: None,
-                })
+                match self.store.render(canvas_id, content_type, content) {
+                    Some(frame) => Ok(ToolResult {
+                        success: true,
+                        output: format!(
+                            "Rendered {} content to canvas '{}' (frame: {})",
+                            content_type, canvas_id, frame.frame_id
+                        ),
+                        error: None,
+                    }),
+                    None => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Maximum canvas count ({}) reached. Clear unused canvases first.",
+                            MAX_CANVAS_COUNT
+                        )),
+                    }),
+                }
             }
 
             "snapshot" => match self.store.snapshot(canvas_id) {
@@ -312,16 +346,25 @@ impl Tool for CanvasTool {
                 };
 
                 // Push a special eval frame so connected clients know to evaluate it.
-                let frame = self.store.render(canvas_id, "eval", expression);
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "Eval request sent to canvas '{}' (frame: {}). \
-                         Result will be available to connected viewers.",
-                        canvas_id, frame.frame_id
-                    ),
-                    error: None,
-                })
+                match self.store.render(canvas_id, "eval", expression) {
+                    Some(frame) => Ok(ToolResult {
+                        success: true,
+                        output: format!(
+                            "Eval request sent to canvas '{}' (frame: {}). \
+                             Result will be available to connected viewers.",
+                            canvas_id, frame.frame_id
+                        ),
+                        error: None,
+                    }),
+                    None => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Maximum canvas count ({}) reached. Clear unused canvases first.",
+                            MAX_CANVAS_COUNT
+                        )),
+                    }),
+                }
             }
 
             other => Ok(ToolResult {
@@ -343,7 +386,7 @@ mod tests {
     #[test]
     fn canvas_store_render_and_snapshot() {
         let store = CanvasStore::new();
-        let frame = store.render("test", "html", "<h1>Hello</h1>");
+        let frame = store.render("test", "html", "<h1>Hello</h1>").unwrap();
         assert_eq!(frame.content_type, "html");
         assert_eq!(frame.content, "<h1>Hello</h1>");
 
@@ -415,7 +458,7 @@ mod tests {
     #[test]
     fn canvas_store_subscribe_receives_updates() {
         let store = CanvasStore::new();
-        let mut rx = store.subscribe("test");
+        let mut rx = store.subscribe("test").unwrap();
         store.render("test", "html", "<p>live</p>");
 
         let frame = rx.try_recv().unwrap();
@@ -562,6 +605,21 @@ mod tests {
             .unwrap();
         assert!(result.success);
         assert!(store.snapshot("default").is_some());
+    }
+
+    #[test]
+    fn canvas_store_enforces_max_canvas_count() {
+        let store = CanvasStore::new();
+        // Create MAX_CANVAS_COUNT canvases
+        for i in 0..MAX_CANVAS_COUNT {
+            assert!(store
+                .render(&format!("canvas_{i}"), "html", "content")
+                .is_some());
+        }
+        // The next new canvas should be rejected
+        assert!(store.render("one_too_many", "html", "content").is_none());
+        // But rendering to an existing canvas should still work
+        assert!(store.render("canvas_0", "html", "updated").is_some());
     }
 
     #[tokio::test]

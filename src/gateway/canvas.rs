@@ -92,15 +92,53 @@ pub async fn handle_canvas_post(
     }
 
     let content_type = body.content_type.as_deref().unwrap_or("html");
-    let frame = state.canvas_store.render(&id, content_type, &body.content);
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "canvas_id": id,
-            "frame": frame,
-        })),
-    )
-        .into_response()
+
+    // Validate content_type against allowed set (prevent injecting "eval" frames via REST).
+    if !crate::tools::canvas::ALLOWED_CONTENT_TYPES.contains(&content_type) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Invalid content_type '{}'. Allowed: {:?}",
+                    content_type,
+                    crate::tools::canvas::ALLOWED_CONTENT_TYPES
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    // Enforce content size limit (same as tool-side validation).
+    if body.content.len() > crate::tools::canvas::MAX_CONTENT_SIZE {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Content exceeds maximum size of {} bytes",
+                    crate::tools::canvas::MAX_CONTENT_SIZE
+                )
+            })),
+        )
+            .into_response();
+    }
+
+    match state.canvas_store.render(&id, content_type, &body.content) {
+        Some(frame) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "canvas_id": id,
+                "frame": frame,
+            })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Maximum canvas count reached. Clear unused canvases first."
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// DELETE /api/canvas/:id — clear a canvas.
@@ -165,7 +203,17 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
     let (mut sender, mut receiver) = socket.split();
 
     // Subscribe to canvas updates
-    let mut rx = state.canvas_store.subscribe(&canvas_id);
+    let mut rx = match state.canvas_store.subscribe(&canvas_id) {
+        Some(rx) => rx,
+        None => {
+            let msg = serde_json::json!({
+                "type": "error",
+                "error": "Maximum canvas count reached",
+            });
+            let _ = sender.send(Message::Text(msg.to_string().into())).await;
+            return;
+        }
+    };
 
     // Send current state immediately if available
     if let Some(frame) = state.canvas_store.snapshot(&canvas_id) {
@@ -187,18 +235,32 @@ async fn handle_canvas_socket(socket: WebSocket, state: AppState, canvas_id: Str
     // Spawn a task that forwards broadcast updates to the WebSocket
     let canvas_id_clone = canvas_id.clone();
     let send_task = tokio::spawn(async move {
-        while let Ok(frame) = rx.recv().await {
-            let msg = serde_json::json!({
-                "type": "frame",
-                "canvas_id": canvas_id_clone,
-                "frame": frame,
-            });
-            if sender
-                .send(Message::Text(msg.to_string().into()))
-                .await
-                .is_err()
-            {
-                break;
+        loop {
+            match rx.recv().await {
+                Ok(frame) => {
+                    let msg = serde_json::json!({
+                        "type": "frame",
+                        "canvas_id": canvas_id_clone,
+                        "frame": frame,
+                    });
+                    if sender
+                        .send(Message::Text(msg.to_string().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Client fell behind — notify and continue rather than disconnecting.
+                    let msg = serde_json::json!({
+                        "type": "lagged",
+                        "canvas_id": canvas_id_clone,
+                        "missed_frames": n,
+                    });
+                    let _ = sender.send(Message::Text(msg.to_string().into())).await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
     });
