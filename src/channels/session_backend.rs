@@ -12,6 +12,8 @@ use chrono::{DateTime, Utc};
 pub struct SessionMetadata {
     /// Session key (e.g. `telegram_user123`).
     pub key: String,
+    /// Optional human-readable name (e.g. `eyrie-commander-briefing`).
+    pub name: Option<String>,
     /// When the session was first created.
     pub created_at: DateTime<Utc>,
     /// When the last message was appended.
@@ -54,6 +56,7 @@ pub trait SessionBackend: Send + Sync {
                 let messages = self.load(&key);
                 SessionMetadata {
                     key,
+                    name: None,
                     created_at: Utc::now(),
                     last_activity: Utc::now(),
                     message_count: messages.len(),
@@ -81,6 +84,11 @@ pub trait SessionBackend: Send + Sync {
     fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
         Ok(false)
     }
+
+    /// Set or update the human-readable name for a session.
+    fn set_session_name(&self, _session_key: &str, _name: &str) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +99,7 @@ mod tests {
     fn session_metadata_is_constructible() {
         let meta = SessionMetadata {
             key: "test".into(),
+            name: None,
             created_at: Utc::now(),
             last_activity: Utc::now(),
             message_count: 5,

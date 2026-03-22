@@ -1280,12 +1280,16 @@ pub async fn handle_api_sessions_list(
         .into_iter()
         .filter_map(|meta| {
             let session_id = meta.key.strip_prefix("gw_")?;
-            Some(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "session_id": session_id,
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
-            }))
+            });
+            if let Some(name) = meta.name {
+                entry["name"] = serde_json::Value::String(name);
+            }
+            Some(entry)
         })
         .collect();
 
@@ -1321,6 +1325,45 @@ pub async fn handle_api_session_delete(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PUT /api/sessions/{id} — rename a gateway session
+pub async fn handle_api_session_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let name = body["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name is required"})),
+        )
+            .into_response();
+    }
+
+    let session_key = format!("gw_{id}");
+    match backend.set_session_name(&session_key, name) {
+        Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
         )
             .into_response(),
     }

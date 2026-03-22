@@ -51,7 +51,8 @@ impl SqliteSessionBackend {
                 session_key  TEXT PRIMARY KEY,
                 created_at   TEXT NOT NULL,
                 last_activity TEXT NOT NULL,
-                message_count INTEGER NOT NULL DEFAULT 0
+                message_count INTEGER NOT NULL DEFAULT 0,
+                name         TEXT
              );
 
              CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
@@ -68,6 +69,18 @@ impl SqliteSessionBackend {
              END;",
         )
         .context("Failed to initialize session schema")?;
+
+        // Migration: add name column to existing databases
+        let has_name: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') WHERE name = 'name'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_name {
+            let _ = conn.execute("ALTER TABLE session_metadata ADD COLUMN name TEXT", []);
+        }
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -226,7 +239,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count
+            "SELECT session_key, created_at, last_activity, message_count, name
              FROM session_metadata ORDER BY last_activity DESC",
         ) {
             Ok(s) => s,
@@ -238,6 +251,7 @@ impl SessionBackend for SqliteSessionBackend {
             let created_str: String = row.get(1)?;
             let activity_str: String = row.get(2)?;
             let count: i64 = row.get(3)?;
+            let name: Option<String> = row.get(4)?;
 
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -249,6 +263,7 @@ impl SessionBackend for SqliteSessionBackend {
             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
             Ok(SessionMetadata {
                 key,
+                name,
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
@@ -321,6 +336,17 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(true)
     }
 
+    fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let name_val = if name.is_empty() { None } else { Some(name) };
+        conn.execute(
+            "UPDATE session_metadata SET name = ?1 WHERE session_key = ?2",
+            params![name_val, session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
     fn search(&self, query: &SessionQuery) -> Vec<SessionMetadata> {
         let Some(keyword) = &query.keyword else {
             return self.list_sessions_with_metadata();
@@ -357,14 +383,16 @@ impl SessionBackend for SqliteSessionBackend {
         keys.iter()
             .filter_map(|key| {
                 conn.query_row(
-                    "SELECT created_at, last_activity, message_count FROM session_metadata WHERE session_key = ?1",
+                    "SELECT created_at, last_activity, message_count, name FROM session_metadata WHERE session_key = ?1",
                     params![key],
                     |row| {
                         let created_str: String = row.get(0)?;
                         let activity_str: String = row.get(1)?;
                         let count: i64 = row.get(2)?;
+                        let name: Option<String> = row.get(3)?;
                         Ok(SessionMetadata {
                             key: key.clone(),
+                            name,
                             created_at: DateTime::parse_from_rfc3339(&created_str)
                                 .map(|dt| dt.with_timezone(&Utc))
                                 .unwrap_or_else(|_| Utc::now()),
@@ -554,5 +582,56 @@ mod tests {
         let msgs = backend.load("test_user");
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "hello");
+    }
+
+    #[test]
+    fn set_session_name_persists() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_name("s1", "My Session").unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta.len(), 1);
+        assert_eq!(meta[0].name.as_deref(), Some("My Session"));
+    }
+
+    #[test]
+    fn set_session_name_updates_existing() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_name("s1", "First").unwrap();
+        backend.set_session_name("s1", "Second").unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta[0].name.as_deref(), Some("Second"));
+    }
+
+    #[test]
+    fn sessions_without_name_return_none() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        assert_eq!(meta.len(), 1);
+        assert!(meta[0].name.is_none());
+    }
+
+    #[test]
+    fn empty_name_clears_to_none() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_name("s1", "Named").unwrap();
+        backend.set_session_name("s1", "").unwrap();
+
+        let meta = backend.list_sessions_with_metadata();
+        assert!(meta[0].name.is_none());
     }
 }
