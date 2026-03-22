@@ -228,6 +228,10 @@ impl MatrixChannel {
         !body.trim().is_empty()
     }
 
+    fn room_matches_target(target_room_id: &str, incoming_room_id: &str) -> bool {
+        target_room_id == incoming_room_id
+    }
+
     fn cache_event_id(
         event_id: &str,
         recent_order: &mut std::collections::VecDeque<String>,
@@ -705,7 +709,7 @@ impl Channel for MatrixChannel {
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
-            let _target_room = target_room_for_handler.clone();
+            let target_room = target_room_for_handler.clone();
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
@@ -714,9 +718,10 @@ impl Channel for MatrixChannel {
             let voice_mode = Arc::clone(&voice_mode_for_handler);
 
             async move {
-                if false
-                /* multi-room: room_id filter disabled */
-                {
+                if !MatrixChannel::room_matches_target(
+                    target_room.as_str(),
+                    room.room_id().as_str(),
+                ) {
                     return;
                 }
 
@@ -1293,6 +1298,22 @@ mod tests {
 
         assert_eq!(value["room"]["rooms"][0], "!room:matrix.org");
         assert_eq!(value["room"]["timeline"]["limit"], 1);
+    }
+
+    #[test]
+    fn room_scope_matches_configured_room() {
+        assert!(MatrixChannel::room_matches_target(
+            "!ops:matrix.org",
+            "!ops:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn room_scope_rejects_other_rooms() {
+        assert!(!MatrixChannel::room_matches_target(
+            "!ops:matrix.org",
+            "!other:matrix.org"
+        ));
     }
 
     #[test]
