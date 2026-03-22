@@ -92,6 +92,9 @@ export class MoAClient {
   private deviceId: string;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
 
+  // Available tools fetched from gateway on login/connect
+  private availableTools: ToolInfo[] = [];
+
   constructor() {
     this.serverUrl = localStorage.getItem(STORAGE_KEY_SERVER) || DEFAULT_LOCAL_GATEWAY_URL;
     this.relayUrl = localStorage.getItem(STORAGE_KEY_RELAY) || DEFAULT_RELAY_SERVER_URL;
@@ -299,6 +302,13 @@ export class MoAClient {
 
     const data = await res.json();
     return data.devices || [];
+  }
+
+  /** Register this device with its real platform name (e.g. "MoA windows Desktop"). */
+  async registerCurrentDevice(): Promise<void> {
+    const name = await this.getDeviceName();
+    const info = await getPlatformInfo();
+    return this.registerDevice(name, info?.os);
   }
 
   async registerDevice(deviceName: string, platform?: string): Promise<void> {
@@ -578,7 +588,11 @@ export class MoAClient {
 
   private async sendHeartbeat(): Promise<void> {
     if (!this.token) return;
-    const heartbeatBody = JSON.stringify({ device_id: this.deviceId });
+    const fingerprint = await getDeviceFingerprint();
+    const heartbeatBody = JSON.stringify({
+      device_id: this.deviceId,
+      fingerprint: fingerprint || undefined,
+    });
     const headers = {
       "Content-Type": "application/json",
       Authorization: `Bearer ${this.token}`,
@@ -586,13 +600,14 @@ export class MoAClient {
 
     // Try local gateway first
     try {
-      await fetch(`${this.serverUrl}/api/auth/heartbeat`, {
+      const res = await fetch(`${this.serverUrl}/api/auth/heartbeat`, {
         method: "POST",
         headers,
         body: heartbeatBody,
       });
       this.gatewayAlive = true;
       this.heartbeatFailCount = 0;
+      await this.handleHeartbeatDeviceResolution(res);
       return;
     } catch {
       // Local failed — try relay
@@ -600,11 +615,12 @@ export class MoAClient {
 
     // Local unreachable — try relay heartbeat
     try {
-      await fetch(`${this.relayUrl}/api/auth/heartbeat`, {
+      const res = await fetch(`${this.relayUrl}/api/auth/heartbeat`, {
         method: "POST",
         headers,
         body: heartbeatBody,
       });
+      await this.handleHeartbeatDeviceResolution(res);
       // Relay works but local is down
       this.heartbeatFailCount += 1;
       if (this.heartbeatFailCount >= 2) {
@@ -615,6 +631,19 @@ export class MoAClient {
       if (this.heartbeatFailCount >= 2) {
         this.gatewayAlive = false;
       }
+    }
+  }
+
+  /** If heartbeat response resolves a different device_id via fingerprint, adopt it. */
+  private async handleHeartbeatDeviceResolution(res: Response): Promise<void> {
+    try {
+      const data = await res.json();
+      if (data.resolved_device_id && data.resolved_device_id !== this.deviceId) {
+        this.deviceId = data.resolved_device_id;
+        localStorage.setItem(STORAGE_KEY_DEVICE_ID, data.resolved_device_id);
+      }
+    } catch {
+      // Non-JSON or parse error — ignore
     }
   }
 
@@ -658,16 +687,28 @@ export class MoAClient {
     baseUrl: string,
     body: Record<string, unknown>,
   ): Promise<Response | null> {
+    // 5-minute timeout for chat requests — the agent loop may run tools
+    // (web search, browser, shell, etc.) which take significant time.
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5 * 60 * 1000);
     try {
-      return await fetch(`${baseUrl}/api/chat`, {
+      const res = await fetch(`${baseUrl}/api/chat`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${this.token}`,
         },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
+      clearTimeout(timeout);
+      return res;
     } catch (err) {
+      clearTimeout(timeout);
+      if (err instanceof DOMException && err.name === "AbortError") {
+        // Timed out after 5 minutes — treat as network failure
+        return null;
+      }
       if (err instanceof TypeError && err.message === "Failed to fetch") {
         // Network-level failure (connection refused, DNS, timeout, etc.)
         return null;
@@ -978,6 +1019,49 @@ export class MoAClient {
     return localStorage.getItem(`zeroclaw_tool_api_key_${tool}`) === "configured";
   }
 
+  // ── Tool Discovery ──────────────────────────────────────────────
+  // Fetch available tools from the gateway so LLM knows what it can use.
+  // Called after login and when gateway connection is (re)established.
+
+  async fetchAvailableTools(): Promise<ToolInfo[]> {
+    // Try local gateway first, then relay
+    const urls = this.gatewayAlive
+      ? [this.serverUrl, this.relayUrl]
+      : [this.relayUrl, this.serverUrl];
+
+    for (const baseUrl of urls) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+        const res = await fetch(`${baseUrl}/api/tools`, {
+          headers: {
+            ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+          },
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        if (res.ok) {
+          const data = await res.json();
+          const tools: ToolInfo[] = (data.tools || []).map(
+            (t: { name: string; description: string }) => ({
+              name: t.name,
+              description: t.description,
+            }),
+          );
+          this.availableTools = tools;
+          return tools;
+        }
+      } catch {
+        // Try next URL
+      }
+    }
+    return this.availableTools; // return cached if both fail
+  }
+
+  getAvailableTools(): ToolInfo[] {
+    return this.availableTools;
+  }
+
   /**
    * Sync provider and model selection to the local MoA agent config.
    * This ensures the server uses the correct provider/model for chat requests
@@ -1018,15 +1102,20 @@ export class MoAClient {
     return this.workspacePath;
   }
 
-  /** Set the workspace directory on the local gateway. */
+  /** Set the workspace directory on the local gateway.
+   *  Also grants folder access (SecurityPolicy allowed_roots) automatically,
+   *  so all file tools (file_read, file_write, file_edit, etc.) work immediately. */
   async setWorkspaceDir(dirPath: string): Promise<string> {
     await this.requireGateway();
+    const headers = {
+      "Content-Type": "application/json",
+      ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+    };
+
+    // 1. Set workspace_dir in config
     const res = await fetch(`${this.serverUrl}/api/workspace`, {
       method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
+      headers,
       body: JSON.stringify({ path: dirPath }),
     });
     if (!res.ok) {
@@ -1036,18 +1125,34 @@ export class MoAClient {
     const data = await res.json();
     this.workspaceConnected = true;
     this.workspacePath = data.workspace_dir ?? dirPath;
+
+    // 2. Also grant folder access (SecurityPolicy allowed_roots)
+    //    This enables file_read/file_write/file_edit/glob_search etc.
+    //    The user clicking "폴더 연결" is implicit consent for folder access.
+    try {
+      await fetch(`${this.serverUrl}/api/workspace/folder`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ path: this.workspacePath }),
+      });
+    } catch {
+      // Non-critical — workspace is set, tools may still work within workspace_dir
+    }
+
     return this.workspacePath!;
   }
 
-  /** Clone a GitHub repo and set it as workspace. */
+  /** Clone a GitHub repo and set it as workspace.
+   *  Also grants folder access automatically after clone. */
   async connectGitHubRepo(repoUrl: string): Promise<string> {
     await this.requireGateway();
+    const headers = {
+      "Content-Type": "application/json",
+      ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+    };
     const res = await fetch(`${this.serverUrl}/api/workspace`, {
       method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.token}`,
-      },
+      headers,
       body: JSON.stringify({ git_url: repoUrl }),
     });
     if (!res.ok) {
@@ -1057,6 +1162,18 @@ export class MoAClient {
     const data = await res.json();
     this.workspaceConnected = true;
     this.workspacePath = data.workspace_dir ?? repoUrl;
+
+    // Grant folder access for cloned repo
+    try {
+      await fetch(`${this.serverUrl}/api/workspace/folder`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ path: this.workspacePath }),
+      });
+    } catch {
+      // Non-critical
+    }
+
     return this.workspacePath!;
   }
 

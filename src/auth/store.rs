@@ -64,6 +64,9 @@ pub struct DeviceWithStatus {
     pub last_seen: i64,
     pub is_online: bool,
     pub has_pairing_code: bool,
+    /// Hardware fingerprint (SHA-256 hash). Used internally for deduplication;
+    /// not displayed to users in the chat UI.
+    pub fingerprint: Option<String>,
 }
 
 /// SQLite-backed authentication store.
@@ -514,7 +517,7 @@ impl AuthStore {
         let cutoff = now - online_threshold_secs as i64;
 
         let mut stmt = conn.prepare_cached(
-            "SELECT device_id, user_id, device_name, platform, last_seen, pairing_code_hash
+            "SELECT device_id, user_id, device_name, platform, last_seen, pairing_code_hash, fingerprint
              FROM devices WHERE user_id = ?1 ORDER BY last_seen DESC",
         )?;
         let devices = stmt
@@ -529,6 +532,7 @@ impl AuthStore {
                     last_seen,
                     is_online: last_seen > cutoff,
                     has_pairing_code: pairing_code_hash.is_some(),
+                    fingerprint: row.get(6)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

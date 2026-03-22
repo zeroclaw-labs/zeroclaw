@@ -814,8 +814,24 @@ export function Chat({
             gap: "10px",
             fontSize: "13px",
           }}>
-            <div style={{ fontWeight: 600, marginBottom: "2px" }}>
-              {locale === "ko" ? "TTS 음성 설정" : "TTS Voice Settings"}
+            <div style={{ fontWeight: 600, marginBottom: "2px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <span>{locale === "ko" ? "TTS 음성 설정" : "TTS Voice Settings"}</span>
+              <button
+                type="button"
+                onClick={() => setShowTtsSettings(false)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "var(--text-secondary, #888)",
+                  cursor: "pointer",
+                  fontSize: "18px",
+                  lineHeight: 1,
+                  padding: "0 4px",
+                }}
+                title={locale === "ko" ? "닫기" : "Close"}
+              >
+                {"\u2715"}
+              </button>
             </div>
 
             {/* Speed / Rate */}

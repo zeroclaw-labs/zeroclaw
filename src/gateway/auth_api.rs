@@ -369,6 +369,10 @@ pub async fn handle_auth_device_verify_pairing(
 #[derive(Deserialize)]
 pub struct HeartbeatBody {
     pub device_id: String,
+    /// Optional fingerprint for device identity verification.
+    /// If provided and the server finds an existing device with this fingerprint,
+    /// the heartbeat is applied to that device (prevents stale device_id references).
+    pub fingerprint: Option<String>,
 }
 
 pub async fn handle_auth_heartbeat(
@@ -376,7 +380,7 @@ pub async fn handle_auth_heartbeat(
     headers: HeaderMap,
     Json(body): Json<HeartbeatBody>,
 ) -> impl IntoResponse {
-    let _ = match extract_session_user(&state, &headers) {
+    let user_id = match extract_session_user(&state, &headers) {
         Ok(id) => id,
         Err(resp) => return resp.into_response(),
     };
@@ -384,9 +388,23 @@ pub async fn handle_auth_heartbeat(
     let Some(auth_store) = state.auth_store.as_ref() else {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"error": "Auth not configured"}))).into_response();
     };
-    let _ = auth_store.touch_device(&body.device_id);
 
-    Json(serde_json::json!({ "status": "ok" })).into_response()
+    // Resolve actual device via fingerprint if available (handles reinstall scenarios)
+    let actual_device_id = if let Some(ref fp) = body.fingerprint {
+        auth_store
+            .find_device_by_fingerprint(&user_id, fp)
+            .unwrap_or_else(|| body.device_id.clone())
+    } else {
+        body.device_id.clone()
+    };
+
+    let _ = auth_store.touch_device(&actual_device_id);
+
+    let mut resp = serde_json::json!({ "status": "ok" });
+    if actual_device_id != body.device_id {
+        resp["resolved_device_id"] = serde_json::json!(actual_device_id);
+    }
+    Json(resp).into_response()
 }
 
 // ── POST /api/auth/kakao/callback ────────────────────────────────

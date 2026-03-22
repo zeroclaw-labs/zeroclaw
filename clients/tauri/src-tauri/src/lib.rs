@@ -429,6 +429,9 @@ fn get_platform_info() -> serde_json::Value {
 /// Generate a deterministic device fingerprint based on machine-specific info.
 /// This fingerprint survives app reinstalls, enabling the server to recognize
 /// the same physical device even when localStorage/app data is wiped.
+///
+/// Components: hostname + OS + arch + machine-id (platform-specific hardware identifier).
+/// The machine-id provides true per-device uniqueness even when hostname/OS/arch overlap.
 #[tauri::command]
 fn get_device_fingerprint() -> String {
     use sha2::{Digest, Sha256};
@@ -438,11 +441,68 @@ fn get_device_fingerprint() -> String {
         .unwrap_or_default();
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
+    let machine_id = read_machine_id();
 
     // Combine stable machine attributes into a single fingerprint
-    let raw = format!("moa-fp:{}:{}:{}", hostname, os, arch);
+    let raw = format!("zeroclaw-fp:{}:{}:{}:{}", hostname, os, arch, machine_id);
     let hash = Sha256::digest(raw.as_bytes());
     format!("{:x}", hash)
+}
+
+/// Read a platform-specific persistent machine identifier.
+/// - Linux: /etc/machine-id (systemd) or /var/lib/dbus/machine-id
+/// - macOS: IOPlatformSerialNumber via system_profiler
+/// - Windows: MachineGuid from registry
+/// Falls back to empty string if unavailable (fingerprint still works, just less unique).
+fn read_machine_id() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/etc/machine-id")
+            .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+            .ok()
+            .and_then(|out| {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                stdout
+                    .lines()
+                    .find(|l| l.contains("IOPlatformSerialNumber"))
+                    .and_then(|l| l.split('"').nth(3))
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                "/v",
+                "MachineGuid",
+            ])
+            .output()
+            .ok()
+            .and_then(|out| {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                stdout
+                    .lines()
+                    .find(|l| l.contains("MachineGuid"))
+                    .and_then(|l| l.split_whitespace().last())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_default()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        String::new()
+    }
 }
 
 // ── Sync Commands ────────────────────────────────────────────────

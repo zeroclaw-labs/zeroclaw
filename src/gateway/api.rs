@@ -538,6 +538,11 @@ pub async fn handle_api_workspace_put(
         config.workspace_dir = resolved_path.clone();
     }
 
+    // Auto-grant folder access so file tools work immediately.
+    // When the user clicks "폴더 연결" (Connect Folder), they implicitly
+    // consent to agent access — no separate approval needed.
+    state.security.add_allowed_root(&resolved_path);
+
     tracing::info!("Workspace updated to: {}", resolved_path.display());
 
     Json(serde_json::json!({
