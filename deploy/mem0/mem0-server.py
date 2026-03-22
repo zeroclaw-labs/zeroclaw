@@ -81,12 +81,49 @@ config = {
             "collection_name": MEM0_VECTOR_COLLECTION,
             "embedding_model_dims": MEM0_EMBEDDER_DIMS,
             "path": MEM0_VECTOR_PATH,
+            "on_disk": True,
         },
     },
     "custom_fact_extraction_prompt": CUSTOM_EXTRACTION_PROMPT,
 }
 
 m = Memory.from_config(config)
+
+
+def _patch_memory_metadata(mem_instance, memory_id: str, new_metadata: dict):
+    """Patch metadata on an existing memory entry via the vector store.
+
+    mem0's Memory.update() only accepts (id, data) with no metadata param,
+    so we reach into the underlying vector store to merge new metadata fields.
+    """
+    try:
+        existing = mem_instance.get(memory_id)
+    except Exception:
+        existing = None
+    if not existing or not isinstance(existing, dict):
+        return
+    old_meta = existing.get("metadata", {}) or {}
+    merged = {**old_meta, **new_metadata}
+    # Access the vector store's client to set_payload directly
+    vs = getattr(mem_instance, "vector_store", None)
+    client = getattr(vs, "client", None) if vs else None
+    collection = getattr(vs, "collection_name", MEM0_VECTOR_COLLECTION) if vs else MEM0_VECTOR_COLLECTION
+    if client is not None:
+        try:
+            from qdrant_client.models import PointIdsList
+            client.set_payload(
+                collection_name=collection,
+                payload={"metadata": merged},
+                points=PointIdsList(points=[memory_id]),
+            )
+            return
+        except Exception as e:
+            print(f"qdrant set_payload failed for {memory_id}: {e}")
+    # Fallback: use mem0's update with the same text to trigger metadata refresh
+    try:
+        mem_instance.update(memory_id, data=existing.get("memory", ""))
+    except Exception:
+        pass
 
 
 def rerank_results(query: str, items: list, top_k: int = 10) -> list:
@@ -115,13 +152,50 @@ class AddMemoryRequest(BaseModel):
     infer: bool = True
     app: Optional[str] = None
     custom_instructions: Optional[str] = None
+    # LLM overrides — passed from zeroclaw config to override server defaults
+    llm_model: Optional[str] = None
+    llm_api_key: Optional[str] = None
+    llm_base_url: Optional[str] = None
+
+
+def _get_memory_instance(req: AddMemoryRequest):
+    """Return a Memory instance, applying per-request LLM overrides if provided."""
+    if not req.llm_model and not req.llm_api_key and not req.llm_base_url:
+        return m  # use default singleton
+    # Build override config
+    override_config = json.loads(json.dumps(config))  # deep copy
+    if req.llm_model:
+        override_config["llm"]["config"]["model"] = req.llm_model
+    if req.llm_api_key:
+        override_config["llm"]["config"]["api_key"] = req.llm_api_key
+    if req.llm_base_url:
+        override_config["llm"]["config"]["openai_base_url"] = req.llm_base_url
+    return Memory.from_config(override_config)
 
 
 @app.post("/api/v1/memories/")
 async def add_memory(req: AddMemoryRequest):
     # Use client-supplied prompt, fall back to server default, then mem0 SDK default
     prompt = req.custom_instructions or CUSTOM_EXTRACTION_PROMPT
-    result = await asyncio.to_thread(m.add, req.text, user_id=req.user_id, metadata=req.metadata or {}, prompt=prompt)
+    mem_instance = _get_memory_instance(req)
+    result = await asyncio.to_thread(mem_instance.add, req.text, user_id=req.user_id, metadata=req.metadata or {}, prompt=prompt)
+
+    # mem0 SDK's ADD/UPDATE events don't propagate request metadata to the
+    # resulting entries. Post-patch affected entries via the vector store directly,
+    # since Memory.update() only accepts (memory_id, data) with no metadata param.
+    if req.metadata:
+        results = result.get("results", []) if isinstance(result, dict) else result if isinstance(result, list) else []
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            event = r.get("event", "")
+            mem_id = r.get("id")
+            if mem_id and event in ("ADD", "UPDATE"):
+                try:
+                    _patch_memory_metadata(mem_instance, mem_id, req.metadata)
+                except Exception as e:
+                    print(f"metadata patch failed for {mem_id}: {e}")
+
     return {"id": str(uuid.uuid4()), "status": "ok", "result": result}
 
 
@@ -158,13 +232,22 @@ async def add_procedural_memory(req: ProceduralMemoryRequest):
 def _parse_mem0_results(raw_results) -> list:
     raw = raw_results.get("results", raw_results) if isinstance(raw_results, dict) else raw_results
     items = []
+    # Fields that may be stored as top-level qdrant payload fields (via
+    # _patch_memory_metadata) but need to be surfaced under "metadata" in the
+    # API response so the Rust client can deserialize them.
+    SCOPE_FIELDS = ("scope", "scope_user", "scope_group", "key", "category", "session_id")
     for r in raw:
         item = r if isinstance(r, dict) else {"memory": str(r)}
+        meta = dict(item.get("metadata", {}) or {})
+        # Promote top-level scope fields into metadata dict if missing
+        for field in SCOPE_FIELDS:
+            if field in item and field not in meta:
+                meta[field] = item[field]
         items.append({
             "id": item.get("id", str(uuid.uuid4())),
             "memory": item.get("memory", item.get("text", "")),
             "created_at": item.get("created_at", datetime.now(timezone.utc).isoformat()),
-            "metadata_": item.get("metadata", {}),
+            "metadata": meta,
         })
     return items
 
