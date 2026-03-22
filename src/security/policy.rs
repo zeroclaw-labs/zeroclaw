@@ -97,7 +97,8 @@ pub struct SecurityPolicy {
 /// Default allowed commands for Unix platforms.
 #[cfg(not(target_os = "windows"))]
 fn default_allowed_commands() -> Vec<String> {
-    vec![
+    #[allow(unused_mut)]
+    let mut cmds = vec![
         "git".into(),
         "npm".into(),
         "cargo".into(),
@@ -111,7 +112,16 @@ fn default_allowed_commands() -> Vec<String> {
         "head".into(),
         "tail".into(),
         "date".into(),
-    ]
+        "df".into(),
+        "du".into(),
+        "uname".into(),
+        "uptime".into(),
+        "hostname".into(),
+    ];
+    // `free` is Linux-only; it does not exist on macOS or other BSDs.
+    #[cfg(target_os = "linux")]
+    cmds.push("free".into());
+    cmds
 }
 
 /// Default allowed commands for Windows platforms.
@@ -142,6 +152,11 @@ fn default_allowed_commands() -> Vec<String> {
         "wc".into(),
         "head".into(),
         "tail".into(),
+        "df".into(),
+        "du".into(),
+        "uname".into(),
+        "uptime".into(),
+        "hostname".into(),
     ]
 }
 
