@@ -51,14 +51,6 @@ impl DiscordChannel {
         self
     }
 
-    /// Configure voice transcription for audio attachments.
-    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
-        }
-        self
-    }
-
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_channel_proxy_client("channel.discord", self.proxy_url.as_deref())
     }
@@ -92,6 +84,8 @@ impl DiscordChannel {
     }
 }
 
+const MAX_DISCORD_AUDIO_BYTES: usize = 25 * 1024 * 1024;
+
 async fn try_transcribe_discord_audio(
     client: &reqwest::Client,
     url: &str,
@@ -115,6 +109,18 @@ async fn try_transcribe_discord_audio(
         }
     };
 
+    if let Some(content_length) = resp.content_length() {
+        if content_length > MAX_DISCORD_AUDIO_BYTES as u64 {
+            tracing::warn!(
+                filename,
+                size_bytes = content_length,
+                max_bytes = MAX_DISCORD_AUDIO_BYTES,
+                "discord: audio file too large, skipping"
+            );
+            return None;
+        }
+    }
+
     let audio_data = match resp.bytes().await {
         Ok(b) => b.to_vec(),
         Err(e) => {
@@ -122,6 +128,16 @@ async fn try_transcribe_discord_audio(
             return None;
         }
     };
+
+    if audio_data.len() > MAX_DISCORD_AUDIO_BYTES {
+        tracing::warn!(
+            filename,
+            size_bytes = audio_data.len(),
+            max_bytes = MAX_DISCORD_AUDIO_BYTES,
+            "discord: audio too large after download, skipping"
+        );
+        return None;
+    }
 
     match manager.transcribe(&audio_data, filename).await {
         Ok(transcript) => Some(transcript),
@@ -157,7 +173,8 @@ async fn process_attachments(
             tracing::warn!(name, "discord: attachment has no url, skipping");
             continue;
         };
-        if ct.starts_with("text/") {
+        let ct_lower = ct.to_ascii_lowercase();
+        if ct_lower.starts_with("text/") {
             match client.get(url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(text) = resp.text().await {
@@ -171,7 +188,7 @@ async fn process_attachments(
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
             }
-        } else if ct.starts_with("audio/") {
+        } else if ct_lower.starts_with("audio/") {
             if let Some(mgr) = manager {
                 match try_transcribe_discord_audio(client, url, name, ct, mgr).await {
                     Some(transcript) => {
@@ -201,88 +218,6 @@ async fn process_attachments(
         }
     }
     parts.join("\n---\n")
-}
-
-/// Audio file extensions accepted for voice transcription.
-const DISCORD_AUDIO_EXTENSIONS: &[&str] = &[
-    "flac", "mp3", "mpeg", "mpga", "mp4", "m4a", "ogg", "oga", "opus", "wav", "webm",
-];
-
-/// Check if a content type or filename indicates an audio file.
-fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
-    if content_type.starts_with("audio/") {
-        return true;
-    }
-    if let Some(ext) = filename.rsplit('.').next() {
-        return DISCORD_AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str());
-    }
-    false
-}
-
-/// Download and transcribe audio attachments from a Discord message.
-///
-/// Returns transcribed text blocks for any audio attachments found.
-/// Non-audio attachments and failures are silently skipped.
-async fn transcribe_discord_audio_attachments(
-    attachments: &[serde_json::Value],
-    client: &reqwest::Client,
-    config: &crate::config::TranscriptionConfig,
-) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for att in attachments {
-        let ct = att
-            .get("content_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let name = att
-            .get("filename")
-            .and_then(|v| v.as_str())
-            .unwrap_or("file");
-
-        if !is_discord_audio_attachment(ct, name) {
-            continue;
-        }
-
-        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
-            continue;
-        };
-
-        let audio_data = match client.get(url).send().await {
-            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
-                Ok(bytes) => bytes.to_vec(),
-                Err(e) => {
-                    tracing::warn!(name, error = %e, "discord: failed to read audio attachment bytes");
-                    continue;
-                }
-            },
-            Ok(resp) => {
-                tracing::warn!(name, status = %resp.status(), "discord: audio attachment download failed");
-                continue;
-            }
-            Err(e) => {
-                tracing::warn!(name, error = %e, "discord: audio attachment fetch error");
-                continue;
-            }
-        };
-
-        match super::transcription::transcribe_audio(audio_data, name, config).await {
-            Ok(text) => {
-                let trimmed = text.trim();
-                if !trimmed.is_empty() {
-                    tracing::info!(
-                        "Discord: transcribed audio attachment {} ({} chars)",
-                        name,
-                        trimmed.len()
-                    );
-                    parts.push(format!("[Voice] {trimmed}"));
-                }
-            }
-            Err(e) => {
-                tracing::warn!(name, error = %e, "discord: voice transcription failed");
-            }
-        }
-    }
-    parts.join("\n")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -899,10 +834,6 @@ impl Channel for DiscordChannel {
                     let effective_mention_only = self.mention_only && !is_dm;
                     let normalized_text =
                         normalize_incoming_content(content, effective_mention_only, &bot_user_id);
-
-                    if effective_mention_only && normalized_text.is_none() {
-                        continue;
-                    }
 
                     let attachment_text = {
                         let atts = d
