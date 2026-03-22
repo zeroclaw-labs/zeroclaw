@@ -293,7 +293,11 @@ pub fn register_skill_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -333,7 +337,11 @@ pub fn all_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio.
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
