@@ -162,9 +162,7 @@ impl Tool for ReactionTool {
         let result = if action == "add" {
             channel.add_reaction(channel_id, message_id, emoji).await
         } else {
-            channel
-                .remove_reaction(channel_id, message_id, emoji)
-                .await
+            channel.remove_reaction(channel_id, message_id, emoji).await
         };
 
         let past_tense = if action == "remove" {
@@ -409,15 +407,21 @@ mod tests {
         )]);
 
         // Missing channel
-        let result = tool.execute(json!({"channel_id": "c1", "message_id": "1", "emoji": "x"})).await;
+        let result = tool
+            .execute(json!({"channel_id": "c1", "message_id": "1", "emoji": "x"}))
+            .await;
         assert!(result.is_err());
 
         // Missing channel_id
-        let result = tool.execute(json!({"channel": "test", "message_id": "1", "emoji": "x"})).await;
+        let result = tool
+            .execute(json!({"channel": "test", "message_id": "1", "emoji": "x"}))
+            .await;
         assert!(result.is_err());
 
         // Missing message_id
-        let result = tool.execute(json!({"channel": "a", "channel_id": "c1", "emoji": "x"})).await;
+        let result = tool
+            .execute(json!({"channel": "a", "channel_id": "c1", "emoji": "x"}))
+            .await;
         assert!(result.is_err());
 
         // Missing emoji
