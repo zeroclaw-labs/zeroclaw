@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+
 /// Mattermost channel — polls channel posts via REST API v4.
 /// Mattermost is API-compatible with many Slack patterns but uses a dedicated v4 structure.
 pub struct MattermostChannel {
@@ -56,6 +58,9 @@ impl MattermostChannel {
     }
 
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if !config.enabled {
+            return self;
+        }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
                 self.transcription_manager = Some(Arc::new(m));
@@ -140,16 +145,44 @@ impl MattermostChannel {
             .and_then(|n| n.as_str())
             .unwrap_or("audio");
 
-        let bytes = self
+        let response = match self
             .http_client()
             .get(format!("{}/api/v4/files/{}", self.base_url, file_id))
             .bearer_auth(&self.bot_token)
             .send()
             .await
-            .ok()?
-            .bytes()
-            .await
-            .ok()?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Mattermost: audio download failed for {file_id}: {e}");
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                "Mattermost: audio download returned {}: {file_id}",
+                response.status()
+            );
+            return None;
+        }
+
+        if let Some(content_length) = response.content_length() {
+            if content_length > MAX_MATTERMOST_AUDIO_BYTES {
+                tracing::warn!(
+                    "Mattermost: audio file too large ({content_length} bytes): {file_id}"
+                );
+                return None;
+            }
+        }
+
+        let bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Mattermost: failed to read audio bytes for {file_id}: {e}");
+                return None;
+            }
+        };
 
         match manager.transcribe(&bytes, file_name).await {
             Ok(text) => Some(text),
@@ -444,7 +477,7 @@ fn is_audio_file(file: &serde_json::Value) -> bool {
     let ext = file.get("extension").and_then(|e| e.as_str()).unwrap_or("");
     matches!(
         ext.to_ascii_lowercase().as_str(),
-        "ogg" | "mp3" | "mp4" | "m4a" | "wav" | "webm" | "opus" | "flac"
+        "ogg" | "mp3" | "m4a" | "wav" | "opus" | "flac"
     )
 }
 
@@ -1181,7 +1214,7 @@ mod tests {
             crate::config::TranscriptionConfig {
                 enabled: true,
                 default_provider: "groq".to_string(),
-                api_key: Some("".to_string()),
+                api_key: Some(String::new()),
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
                 language: None,
