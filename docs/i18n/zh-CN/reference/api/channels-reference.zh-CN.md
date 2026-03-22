@@ -76,7 +76,8 @@ ZeroClaw 通过内联消息标记支持多模态输入：
 
 Matrix 和 Lark 支持在编译时控制。
 
-- 默认构建是精简的（`default = []`），不包含 Matrix/Lark。
+- 当前默认 feature 为 `channel-nostr`、`observability-prometheus`、`skill-creation`；
+  Matrix/Lark 仍需显式启用，默认不包含。
 - 仅包含硬件支持的典型本地检查：
 
 ```bash
@@ -93,6 +94,12 @@ cargo check --features hardware,channel-matrix
 
 ```bash
 cargo check --features hardware,channel-lark
+```
+
+- 对已安装二进制，`cargo install` 也要显式带同样的 feature（它不会继承之前 `cargo build` 的 feature）：
+
+```bash
+cargo install --path . --force --locked --features channel-lark
 ```
 
 如果存在 `[channels_config.matrix]`、`[channels_config.lark]` 或 `[channels_config.feishu]`，但对应的功能未编译进去，`zeroclaw channel list`、`zeroclaw channel doctor` 和 `zeroclaw channel start` 会报告该渠道在此构建中被故意跳过。

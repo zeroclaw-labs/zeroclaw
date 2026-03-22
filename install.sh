@@ -112,6 +112,7 @@ Options:
   --skip-onboard             Skip provider/API key configuration
   --skip-build               Skip build step
   --skip-install             Skip cargo install step
+  --cargo-features <list>    Cargo features for build/install (comma-separated)
   --build-first              Alias for explicitly enabling separate `cargo build --release --locked`
   -h, --help                 Show help
 
@@ -138,6 +139,7 @@ Environment:
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   ZEROCLAW_MODEL             Used when --model is not provided
+  ZEROCLAW_CARGO_FEATURES    Features passed to both cargo build/install (e.g. channel-lark,channel-matrix)
   ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
   ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
   ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS
@@ -449,6 +451,35 @@ bool_to_word() {
   else
     echo "no"
   fi
+}
+
+merge_feature_csv() {
+  local base="${1:-}"
+  local extra="${2:-}"
+  local merged="$base"
+  local raw=""
+  local feature=""
+  local -a extras=()
+
+  [[ -n "$extra" ]] || {
+    echo "$merged"
+    return 0
+  }
+
+  IFS=',' read -r -a extras <<< "$extra"
+  for raw in "${extras[@]}"; do
+    feature="$(echo "$raw" | xargs)"
+    [[ -n "$feature" ]] || continue
+    if [[ ",$merged," != *",$feature,"* ]]; then
+      if [[ -n "$merged" ]]; then
+        merged="${merged},${feature}"
+      else
+        merged="$feature"
+      fi
+    fi
+  done
+
+  echo "$merged"
 }
 
 guided_open_input() {
@@ -952,7 +983,8 @@ ensure_docker_ready() {
 run_docker_bootstrap() {
   local docker_image docker_data_dir default_data_dir fallback_image
   local config_mount workspace_mount
-  local -a container_run_user_args container_run_namespace_args
+  local docker_features=""
+  local -a container_run_user_args container_run_namespace_args docker_build_args
   docker_image="${ZEROCLAW_DOCKER_IMAGE:-zeroclaw-bootstrap:local}"
   fallback_image="ghcr.io/zeroclaw-labs/zeroclaw:latest"
   if [[ "$TEMP_CLONE" == true ]]; then
@@ -971,7 +1003,13 @@ run_docker_bootstrap() {
 
   if [[ "$SKIP_BUILD" == false ]]; then
     info "Building Docker image ($docker_image)"
-    DOCKER_BUILDKIT=1 "$CONTAINER_CLI" build --target release -t "$docker_image" "$WORK_DIR"
+    docker_build_args=(--target release -t "$docker_image")
+    if [[ -n "$CARGO_FEATURES" ]]; then
+      docker_features="$(merge_feature_csv "memory-postgres" "$CARGO_FEATURES")"
+      step_dot "Docker build features: $docker_features"
+      docker_build_args+=(--build-arg "ZEROCLAW_CARGO_FEATURES=$docker_features")
+    fi
+    DOCKER_BUILDKIT=1 "$CONTAINER_CLI" build "${docker_build_args[@]}" "$WORK_DIR"
   else
     info "Skipping Docker image build"
     if ! "$CONTAINER_CLI" image inspect "$docker_image" >/dev/null 2>&1; then
@@ -1066,6 +1104,7 @@ CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
 MODEL="${ZEROCLAW_MODEL:-}"
+CARGO_FEATURES="${ZEROCLAW_CARGO_FEATURES:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1129,6 +1168,14 @@ while [[ $# -gt 0 ]]; do
       }
       shift 2
       ;;
+    --cargo-features)
+      CARGO_FEATURES="${2:-}"
+      [[ -n "$CARGO_FEATURES" ]] || {
+        error "--cargo-features requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
     --build-first)
       SKIP_BUILD=false
       shift
@@ -1166,6 +1213,19 @@ fi
 if [[ "$DOCKER_MODE" == true && "$GUIDED_MODE" == "on" ]]; then
   warn "--guided is ignored with --docker."
   GUIDED_MODE="off"
+fi
+
+if [[ -n "$CARGO_FEATURES" ]]; then
+  if [[ "$PREBUILT_ONLY" == true ]]; then
+    error "--prebuilt-only cannot be combined with --cargo-features."
+    error "Use source build/install for custom features."
+    exit 1
+  fi
+  if [[ "$PREFER_PREBUILT" == true ]]; then
+    warn "--prefer-prebuilt is ignored when --cargo-features is set."
+  fi
+  PREFER_PREBUILT=false
+  FORCE_SOURCE_BUILD=true
 fi
 
 if [[ "$GUIDED_MODE" == "on" ]]; then
@@ -1309,6 +1369,9 @@ step_dot "Install method: ${INSTALL_METHOD}"
 if [[ -n "$TARGET_VERSION" ]]; then
   step_dot "Requested version: v${TARGET_VERSION}"
 fi
+if [[ -n "$CARGO_FEATURES" ]]; then
+  step_dot "Cargo features: $CARGO_FEATURES"
+fi
 step_dot "Workspace: $WORK_DIR"
 if [[ "$INSTALL_MODE" == "upgrade" && -n "$EXISTING_VERSION" ]]; then
   step_dot "Existing ZeroClaw installation detected, upgrading from v${EXISTING_VERSION}"
@@ -1317,6 +1380,11 @@ elif [[ "$INSTALL_MODE" == "upgrade" ]]; then
 fi
 
 cd "$WORK_DIR"
+
+CARGO_FEATURE_ARGS=()
+if [[ -n "$CARGO_FEATURES" ]]; then
+  CARGO_FEATURE_ARGS=(--features "$CARGO_FEATURES")
+fi
 
 if [[ "$FORCE_SOURCE_BUILD" == true ]]; then
   PREFER_PREBUILT=false
@@ -1417,7 +1485,7 @@ if [[ "$SKIP_BUILD" == false ]]; then
     cargo clean --release 2>/dev/null || true
   fi
   step_dot "Building release binary"
-  cargo build --release --locked
+  cargo build --release --locked "${CARGO_FEATURE_ARGS[@]}"
   step_ok "Release binary built"
 else
   step_dot "Skipping build"
@@ -1436,7 +1504,7 @@ if [[ "$SKIP_INSTALL" == false ]]; then
     fi
   fi
 
-  cargo install --path "$WORK_DIR" --force --locked
+  cargo install --path "$WORK_DIR" --force --locked "${CARGO_FEATURE_ARGS[@]}"
   step_ok "ZeroClaw installed"
 
   # Sync binary to ~/.local/bin so PATH lookups find the fresh version

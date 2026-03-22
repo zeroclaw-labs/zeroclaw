@@ -76,7 +76,8 @@ Operational notes:
 
 Matrix and Lark support are controlled at compile time.
 
-- Default builds are lean (`default = []`) and do not include Matrix/Lark.
+- Current default features are `channel-nostr`, `observability-prometheus`, and
+  `skill-creation`; Matrix/Lark are still opt-in and not included by default.
 - Typical local check with only hardware support:
 
 ```bash
@@ -93,6 +94,13 @@ cargo check --features hardware,channel-matrix
 
 ```bash
 cargo check --features hardware,channel-lark
+```
+
+- For installed binaries, pass the same feature set to `cargo install` (it does
+  not inherit features from a previous `cargo build`):
+
+```bash
+cargo install --path . --force --locked --features channel-lark
 ```
 
 If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.

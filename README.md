@@ -150,6 +150,14 @@ cargo install --path . --force --locked
 zeroclaw onboard
 ```
 
+If you enable feature-gated channels (for example Lark/Feishu), pass the same
+features to **both** commands:
+
+```bash
+cargo build --release --locked --features channel-lark
+cargo install --path . --force --locked --features channel-lark
+```
+
 > **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
 
 ## Migrating from OpenClaw

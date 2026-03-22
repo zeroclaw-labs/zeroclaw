@@ -23,6 +23,13 @@ What it does by default:
 1. `cargo build --release --locked`
 2. `cargo install --path . --force --locked`
 
+For feature-gated channels (for example Lark/Feishu), pass features so build
+and install stay aligned:
+
+```bash
+./install.sh --cargo-features channel-lark
+```
+
 ### Resource preflight and pre-built flow
 
 Source builds typically require at least:

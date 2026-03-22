@@ -3609,7 +3609,13 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             }
             if !cfg!(feature = "channel-lark") {
                 println!(
-                    "  ℹ️ Lark/Feishu channel support is disabled in this build (enable `channel-lark`)."
+                    "  ℹ️ Lark/Feishu channel support is disabled in this build (`channel-lark` not enabled)."
+                );
+                println!(
+                    "     Reinstall (crates.io): cargo install zeroclawlabs --locked --features channel-lark"
+                );
+                println!(
+                    "     Reinstall (source checkout): cargo install --path . --force --locked --features channel-lark"
                 );
             }
             println!("\nTo start channels: zeroclaw channel start");
@@ -4061,7 +4067,7 @@ fn collect_configured_channels(
     #[cfg(not(feature = "channel-lark"))]
     if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
         tracing::warn!(
-            "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check."
+            "Lark/Feishu channel is configured but this build was compiled without `channel-lark`; skipping Lark/Feishu health check. Reinstall from crates.io with `cargo install zeroclawlabs --locked --features channel-lark`, or from source checkout with `cargo install --path . --force --locked --features channel-lark`."
         );
     }
 
