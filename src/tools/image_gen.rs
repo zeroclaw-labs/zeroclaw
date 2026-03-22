@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -105,6 +106,25 @@ impl ImageGenTool {
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
             .unwrap_or(&self.default_model);
+
+        // Validate model identifier: must look like a fal.ai model path
+        // (e.g. "fal-ai/flux/schnell"). Reject values with "..", query
+        // strings, or fragments that could redirect the HTTP request.
+        if model.contains("..")
+            || model.contains('?')
+            || model.contains('#')
+            || model.contains('\\')
+            || model.starts_with('/')
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Invalid model identifier '{model}'. \
+                     Must be a fal.ai model path (e.g. 'fal-ai/flux/schnell')."
+                )),
+            });
+        }
 
         // ── Read API key ───────────────────────────────────────────
         let api_key = match Self::read_api_key(&self.api_key_env) {
@@ -250,19 +270,14 @@ impl Tool for ImageGenTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // Security: image generation is a side-effecting action (HTTP + file write).
-        if !self.security.can_act() {
+        if let Err(error) = self
+            .security
+            .enforce_tool_operation(ToolOperation::Act, "image_gen")
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
+                error: Some(error),
             });
         }
 
@@ -411,7 +426,35 @@ mod tests {
         );
         let result = tool.execute(json!({"prompt": "test image"})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap().contains("read-only"));
+        let err = result.error.as_deref().unwrap();
+        assert!(
+            err.contains("read-only") || err.contains("image_gen"),
+            "expected read-only or image_gen in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_model_with_traversal_returns_error() {
+        std::env::set_var("FAL_API_KEY_TEST_MODEL", "dummy_key");
+
+        let tool = ImageGenTool::new(
+            test_security(),
+            std::env::temp_dir(),
+            "fal-ai/flux/schnell".into(),
+            "FAL_API_KEY_TEST_MODEL".into(),
+        );
+        let result = tool
+            .execute(json!({"prompt": "test", "model": "../../evil-endpoint"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Invalid model identifier"));
+
+        std::env::remove_var("FAL_API_KEY_TEST_MODEL");
     }
 
     #[test]
@@ -421,6 +464,23 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("DEFINITELY_NOT_SET_ZC_TEST_12345"));
+    }
+
+    #[test]
+    fn filename_traversal_is_sanitized() {
+        // Verify that path traversal in filenames is stripped to just the final component.
+        let sanitized = PathBuf::from("../../etc/passwd").file_name().map_or_else(
+            || "generated_image".to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
+        assert_eq!(sanitized, "passwd");
+
+        // ".." alone has no file_name, falls back to default.
+        let sanitized = PathBuf::from("..").file_name().map_or_else(
+            || "generated_image".to_string(),
+            |n| n.to_string_lossy().to_string(),
+        );
+        assert_eq!(sanitized, "generated_image");
     }
 
     #[test]
