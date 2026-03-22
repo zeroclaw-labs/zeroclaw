@@ -1,5 +1,6 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
@@ -220,6 +221,21 @@ const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
 /// Max byte size for a single interactive card's markdown content.
 /// Lark card payloads have a ~30 KB limit; leave margin for JSON envelope.
 const LARK_CARD_MARKDOWN_MAX_BYTES: usize = 28_000;
+
+/// Maximum image size we will download and inline (5 MiB).
+const LARK_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// Maximum file size we will download and present as text (512 KiB).
+const LARK_FILE_MAX_BYTES: usize = 512 * 1024;
+
+/// Image MIME types we support for inline base64 encoding.
+const LARK_SUPPORTED_IMAGE_MIMES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+];
 
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
@@ -518,6 +534,17 @@ impl LarkChannel {
 
     fn message_reaction_url(&self, message_id: &str) -> String {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
+    }
+
+    fn image_download_url(&self, image_key: &str) -> String {
+        format!("{}/im/v1/images/{image_key}", self.api_base())
+    }
+
+    fn file_download_url(&self, message_id: &str, file_key: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/resources/{file_key}?type=file",
+            self.api_base()
+        )
     }
 
     fn resolved_bot_open_id(&self) -> Option<String> {
@@ -866,6 +893,44 @@ impl LarkChannel {
                             Some(details) => (details.text, details.mentioned_open_ids),
                             None => continue,
                         },
+                        "image" => {
+                            let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let image_key = match v.get("image_key").and_then(|k| k.as_str()) {
+                                Some(k) => k.to_string(),
+                                None => { tracing::debug!("Lark WS: image message missing image_key"); continue; }
+                            };
+                            match self.download_image_as_marker(&image_key).await {
+                                Some(marker) => (marker, Vec::new()),
+                                None => {
+                                    tracing::warn!("Lark WS: failed to download image {image_key}");
+                                    (format!("[IMAGE:{image_key} | download failed]"), Vec::new())
+                                }
+                            }
+                        }
+                        "file" => {
+                            let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
+                                Ok(v) => v,
+                                Err(_) => continue,
+                            };
+                            let file_key = match v.get("file_key").and_then(|k| k.as_str()) {
+                                Some(k) => k.to_string(),
+                                None => { tracing::debug!("Lark WS: file message missing file_key"); continue; }
+                            };
+                            let file_name = v.get("file_name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("unknown_file")
+                                .to_string();
+                            match self.download_file_as_content(&lark_msg.message_id, &file_key, &file_name).await {
+                                Some(content) => (content, Vec::new()),
+                                None => {
+                                    tracing::warn!("Lark WS: failed to download file {file_key}");
+                                    (format!("[ATTACHMENT:{file_name} | download failed]"), Vec::new())
+                                }
+                            }
+                        }
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
 
@@ -986,6 +1051,183 @@ impl LarkChannel {
         *cached = None;
     }
 
+    /// Download an image from the Lark API and return an `[IMAGE:data:...]` marker string.
+    async fn download_image_as_marker(&self, image_key: &str) -> Option<String> {
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Lark: failed to get token for image download: {e}");
+                return None;
+            }
+        };
+
+        let url = self.image_download_url(image_key);
+        let resp = match self
+            .http_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Lark: image download request failed for {image_key}: {e}");
+                return None;
+            }
+        };
+
+        if !resp.status().is_success() {
+            tracing::warn!(
+                "Lark: image download failed for {image_key}: status={}",
+                resp.status()
+            );
+            return None;
+        }
+
+        if let Some(cl) = resp.content_length() {
+            if cl > LARK_IMAGE_MAX_BYTES as u64 {
+                tracing::warn!("Lark: image too large for {image_key}: {cl} bytes exceeds limit");
+                return None;
+            }
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Lark: image body read failed for {image_key}: {e}");
+                return None;
+            }
+        };
+
+        if bytes.is_empty() || bytes.len() > LARK_IMAGE_MAX_BYTES {
+            tracing::warn!(
+                "Lark: image body empty or too large for {image_key}: {} bytes",
+                bytes.len()
+            );
+            return None;
+        }
+
+        let mime = lark_detect_image_mime(content_type.as_deref(), &bytes)?;
+        if !LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
+            tracing::warn!("Lark: unsupported image MIME for {image_key}: {mime}");
+            return None;
+        }
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Some(format!("[IMAGE:data:{mime};base64,{encoded}]"))
+    }
+
+    /// Download a file from the Lark API and return a text content marker.
+    /// For text-like files, the content is inlined. For binary files, a summary is returned.
+    async fn download_file_as_content(
+        &self,
+        message_id: &str,
+        file_key: &str,
+        file_name: &str,
+    ) -> Option<String> {
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Lark: failed to get token for file download: {e}");
+                return None;
+            }
+        };
+
+        let url = self.file_download_url(message_id, file_key);
+        let resp = match self
+            .http_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("Lark: file download request failed for {file_key}: {e}");
+                return None;
+            }
+        };
+
+        if !resp.status().is_success() {
+            tracing::warn!(
+                "Lark: file download failed for {file_key}: status={}",
+                resp.status()
+            );
+            return None;
+        }
+
+        if let Some(cl) = resp.content_length() {
+            if cl > LARK_FILE_MAX_BYTES as u64 {
+                tracing::warn!("Lark: file too large for {file_key}: {cl} bytes exceeds limit");
+                return Some(format!(
+                    "[ATTACHMENT:{file_name} | size={cl} bytes | too large to inline]"
+                ));
+            }
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("Lark: file body read failed for {file_key}: {e}");
+                return None;
+            }
+        };
+
+        if bytes.is_empty() {
+            tracing::warn!("Lark: file body is empty for {file_key}");
+            return None;
+        }
+
+        // If the content is image-like, return as image marker
+        if content_type.starts_with("image/") && bytes.len() <= LARK_IMAGE_MAX_BYTES {
+            if let Some(mime) = lark_detect_image_mime(Some(&content_type), &bytes) {
+                if LARK_SUPPORTED_IMAGE_MIMES.contains(&mime.as_str()) {
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    return Some(format!("[IMAGE:data:{mime};base64,{encoded}]"));
+                }
+            }
+        }
+
+        // If the file looks like text, inline it
+        if bytes.len() <= LARK_FILE_MAX_BYTES
+            && !bytes.contains(&0)
+            && (content_type.starts_with("text/")
+                || content_type.contains("json")
+                || content_type.contains("xml")
+                || content_type.contains("yaml")
+                || content_type.contains("javascript")
+                || content_type.contains("csv")
+                || lark_is_text_filename(file_name))
+        {
+            let text = String::from_utf8_lossy(&bytes);
+            let truncated = if text.len() > 50_000 {
+                format!("{}...\n[truncated]", &text[..50_000])
+            } else {
+                text.into_owned()
+            };
+            let ext = file_name.rsplit('.').next().unwrap_or("text");
+            return Some(format!("[FILE:{file_name}]\n```{ext}\n{truncated}\n```"));
+        }
+
+        Some(format!(
+            "[ATTACHMENT:{file_name} | mime={content_type} | size={} bytes]",
+            bytes.len()
+        ))
+    }
+
     async fn fetch_bot_open_id_with_token(
         &self,
         token: &str,
@@ -1085,8 +1327,9 @@ impl LarkChannel {
         Ok((status, parsed))
     }
 
-    /// Parse an event callback payload and extract text messages
-    pub fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+    /// Parse an event callback payload and extract messages.
+    /// Supports text, post, image, and file message types.
+    pub async fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
         // Lark event v2 structure:
@@ -1143,6 +1386,11 @@ impl LarkChannel {
             .and_then(|c| c.as_str())
             .unwrap_or("");
 
+        let evt_message_id = event
+            .pointer("/message/message_id")
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+
         let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
             "text" => {
                 let extracted = serde_json::from_str::<serde_json::Value>(content_str)
@@ -1162,6 +1410,62 @@ impl LarkChannel {
                 Some(details) => (details.text, details.mentioned_open_ids),
                 None => return messages,
             },
+            "image" => {
+                let image_key = serde_json::from_str::<serde_json::Value>(content_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("image_key")
+                            .and_then(|k| k.as_str())
+                            .map(String::from)
+                    });
+                match image_key {
+                    Some(key) => {
+                        let marker = match self.download_image_as_marker(&key).await {
+                            Some(m) => m,
+                            None => {
+                                tracing::warn!("Lark: failed to download image {key}");
+                                format!("[IMAGE:{key} | download failed]")
+                            }
+                        };
+                        (marker, Vec::new())
+                    }
+                    None => {
+                        tracing::debug!("Lark: image message missing image_key");
+                        return messages;
+                    }
+                }
+            }
+            "file" => {
+                let parsed = serde_json::from_str::<serde_json::Value>(content_str).ok();
+                let file_key = parsed
+                    .as_ref()
+                    .and_then(|v| v.get("file_key").and_then(|k| k.as_str()))
+                    .map(String::from);
+                let file_name = parsed
+                    .as_ref()
+                    .and_then(|v| v.get("file_name").and_then(|n| n.as_str()))
+                    .unwrap_or("unknown_file")
+                    .to_string();
+                match file_key {
+                    Some(key) => {
+                        let content = match self
+                            .download_file_as_content(evt_message_id, &key, &file_name)
+                            .await
+                        {
+                            Some(c) => c,
+                            None => {
+                                tracing::warn!("Lark: failed to download file {key}");
+                                format!("[ATTACHMENT:{file_name} | download failed]")
+                            }
+                        };
+                        (content, Vec::new())
+                    }
+                    None => {
+                        tracing::debug!("Lark: file message missing file_key");
+                        return messages;
+                    }
+                }
+            }
             _ => {
                 tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
                 return messages;
@@ -1305,7 +1609,7 @@ impl LarkChannel {
             }
 
             // Parse event messages
-            let messages = state.channel.parse_event_payload(&payload);
+            let messages = state.channel.parse_event_payload(&payload).await;
             if !messages.is_empty() {
                 if let Some(message_id) = payload
                     .pointer("/event/message/message_id")
@@ -1554,6 +1858,72 @@ fn detect_lark_ack_locale(
     }
 
     detect_locale_from_text(fallback_text).unwrap_or(LarkAckLocale::En)
+}
+
+/// Detect image MIME type from magic bytes, falling back to Content-Type header.
+fn lark_detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
+    if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        return Some("image/png".to_string());
+    }
+    if bytes.len() >= 3 && bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg".to_string());
+    }
+    if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return Some("image/gif".to_string());
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp".to_string());
+    }
+    if bytes.len() >= 2 && bytes.starts_with(b"BM") {
+        return Some("image/bmp".to_string());
+    }
+    content_type
+        .and_then(|ct| ct.split(';').next())
+        .map(|ct| ct.trim().to_lowercase())
+        .filter(|ct| ct.starts_with("image/"))
+}
+
+/// Check if a filename looks like a text file based on extension.
+fn lark_is_text_filename(name: &str) -> bool {
+    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "txt"
+            | "md"
+            | "rs"
+            | "py"
+            | "js"
+            | "ts"
+            | "tsx"
+            | "jsx"
+            | "java"
+            | "c"
+            | "h"
+            | "cpp"
+            | "hpp"
+            | "go"
+            | "rb"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "toml"
+            | "yaml"
+            | "yml"
+            | "json"
+            | "xml"
+            | "html"
+            | "css"
+            | "sql"
+            | "csv"
+            | "tsv"
+            | "log"
+            | "cfg"
+            | "ini"
+            | "conf"
+            | "env"
+            | "dockerfile"
+            | "makefile"
+    )
 }
 
 fn random_lark_ack_reaction(
@@ -1892,8 +2262,8 @@ mod tests {
         assert!(!ch.is_user_allowed("ou_anyone"));
     }
 
-    #[test]
-    fn lark_parse_challenge() {
+    #[tokio::test]
+    async fn lark_parse_challenge() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "challenge": "abc123",
@@ -1901,12 +2271,12 @@ mod tests {
             "type": "url_verification"
         });
         // Challenge payloads should not produce messages
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_valid_text_message() {
+    #[tokio::test]
+    async fn lark_parse_valid_text_message() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "header": {
@@ -1927,7 +2297,7 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello ZeroClaw!");
         assert_eq!(msgs[0].sender, "oc_chat123");
@@ -1935,8 +2305,8 @@ mod tests {
         assert_eq!(msgs[0].timestamp, 1_699_999_999);
     }
 
-    #[test]
-    fn lark_parse_unauthorized_user() {
+    #[tokio::test]
+    async fn lark_parse_unauthorized_user() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -1951,12 +2321,38 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_non_text_message_skipped() {
+    #[tokio::test]
+    async fn lark_parse_unsupported_message_type_skipped() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "sticker",
+                    "content": "{}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lark_parse_image_missing_key_skipped() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -1977,12 +2373,38 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_empty_text_skipped() {
+    #[tokio::test]
+    async fn lark_parse_file_missing_key_skipped() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "file",
+                    "content": "{}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lark_parse_empty_text_skipped() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2003,24 +2425,24 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_wrong_event_type() {
+    #[tokio::test]
+    async fn lark_parse_wrong_event_type() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "header": { "event_type": "im.chat.disbanded_v1" },
             "event": {}
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_missing_sender() {
+    #[tokio::test]
+    async fn lark_parse_missing_sender() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2040,12 +2462,12 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_unicode_message() {
+    #[tokio::test]
+    async fn lark_parse_unicode_message() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2067,24 +2489,24 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "Hello world 🌍");
     }
 
-    #[test]
-    fn lark_parse_missing_event() {
+    #[tokio::test]
+    async fn lark_parse_missing_event() {
         let ch = make_channel();
         let payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
-    #[test]
-    fn lark_parse_invalid_content_json() {
+    #[tokio::test]
+    async fn lark_parse_invalid_content_json() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
@@ -2105,7 +2527,7 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
     }
 
@@ -2237,8 +2659,8 @@ mod tests {
         assert_eq!(ch.name(), "feishu");
     }
 
-    #[test]
-    fn lark_parse_fallback_sender_to_open_id() {
+    #[tokio::test]
+    async fn lark_parse_fallback_sender_to_open_id() {
         // When chat_id is missing, sender should fall back to open_id
         let ch = LarkChannel::new(
             "id".into(),
@@ -2260,13 +2682,13 @@ mod tests {
             }
         });
 
-        let msgs = ch.parse_event_payload(&payload);
+        let msgs = ch.parse_event_payload(&payload).await;
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "ou_user");
     }
 
-    #[test]
-    fn lark_parse_group_message_requires_bot_mention_when_enabled() {
+    #[tokio::test]
+    async fn lark_parse_group_message_requires_bot_mention_when_enabled() {
         let ch = with_bot_open_id(
             LarkChannel::new(
                 "cli_app123".into(),
@@ -2292,7 +2714,7 @@ mod tests {
                 }
             }
         });
-        assert!(ch.parse_event_payload(&no_mention_payload).is_empty());
+        assert!(ch.parse_event_payload(&no_mention_payload).await.is_empty());
 
         let wrong_mention_payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -2307,7 +2729,10 @@ mod tests {
                 }
             }
         });
-        assert!(ch.parse_event_payload(&wrong_mention_payload).is_empty());
+        assert!(ch
+            .parse_event_payload(&wrong_mention_payload)
+            .await
+            .is_empty());
 
         let bot_mention_payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -2322,11 +2747,11 @@ mod tests {
                 }
             }
         });
-        assert_eq!(ch.parse_event_payload(&bot_mention_payload).len(), 1);
+        assert_eq!(ch.parse_event_payload(&bot_mention_payload).await.len(), 1);
     }
 
-    #[test]
-    fn lark_parse_group_post_message_accepts_at_when_top_level_mentions_empty() {
+    #[tokio::test]
+    async fn lark_parse_group_post_message_accepts_at_when_top_level_mentions_empty() {
         let ch = with_bot_open_id(
             LarkChannel::new(
                 "cli_app123".into(),
@@ -2353,11 +2778,11 @@ mod tests {
             }
         });
 
-        assert_eq!(ch.parse_event_payload(&payload).len(), 1);
+        assert_eq!(ch.parse_event_payload(&payload).await.len(), 1);
     }
 
-    #[test]
-    fn lark_parse_group_message_allows_without_mention_when_disabled() {
+    #[tokio::test]
+    async fn lark_parse_group_message_allows_without_mention_when_disabled() {
         let ch = LarkChannel::new(
             "cli_app123".into(),
             "secret".into(),
@@ -2381,7 +2806,7 @@ mod tests {
             }
         });
 
-        assert_eq!(ch.parse_event_payload(&payload).len(), 1);
+        assert_eq!(ch.parse_event_payload(&payload).await.len(), 1);
     }
 
     #[test]
@@ -2407,6 +2832,69 @@ mod tests {
             ch_feishu.message_reaction_url("om_test_message_id"),
             "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/reactions"
         );
+    }
+
+    #[test]
+    fn lark_image_download_url_matches_region() {
+        let ch = make_channel();
+        assert_eq!(
+            ch.image_download_url("img_abc123"),
+            "https://open.larksuite.com/open-apis/im/v1/images/img_abc123"
+        );
+    }
+
+    #[test]
+    fn lark_file_download_url_matches_region() {
+        let ch = make_channel();
+        assert_eq!(
+            ch.file_download_url("om_msg123", "file_abc"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_msg123/resources/file_abc?type=file"
+        );
+    }
+
+    #[test]
+    fn lark_detect_image_mime_from_magic_bytes() {
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        assert_eq!(
+            lark_detect_image_mime(None, &png).as_deref(),
+            Some("image/png")
+        );
+
+        let jpeg = [0xff, 0xd8, 0xff, 0xe0];
+        assert_eq!(
+            lark_detect_image_mime(None, &jpeg).as_deref(),
+            Some("image/jpeg")
+        );
+
+        let gif = b"GIF89a...";
+        assert_eq!(
+            lark_detect_image_mime(None, gif).as_deref(),
+            Some("image/gif")
+        );
+
+        // Unknown bytes should fall back to content-type header
+        let unknown = [0x00, 0x01, 0x02];
+        assert_eq!(
+            lark_detect_image_mime(Some("image/webp"), &unknown).as_deref(),
+            Some("image/webp")
+        );
+
+        // Non-image content-type should be rejected
+        assert_eq!(lark_detect_image_mime(Some("text/html"), &unknown), None);
+
+        // No info at all should return None
+        assert_eq!(lark_detect_image_mime(None, &unknown), None);
+    }
+
+    #[test]
+    fn lark_is_text_filename_recognizes_common_extensions() {
+        assert!(lark_is_text_filename("script.py"));
+        assert!(lark_is_text_filename("config.toml"));
+        assert!(lark_is_text_filename("data.csv"));
+        assert!(lark_is_text_filename("README.md"));
+        assert!(!lark_is_text_filename("image.png"));
+        assert!(!lark_is_text_filename("archive.zip"));
+        assert!(!lark_is_text_filename("binary.exe"));
     }
 
     #[test]
