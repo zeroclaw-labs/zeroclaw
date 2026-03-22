@@ -149,7 +149,9 @@ impl GroqProvider {
     ///
     /// Credential resolution order:
     /// 1. `config.api_key`
-    /// 2. `GROQ_API_KEY` environment variable (backward compatibility)
+    /// 2. `GROQ_API_KEY` environment variable
+    /// 3. `TRANSCRIPTION_API_KEY` environment variable (fallback)
+    /// 4. `OPENAI_API_KEY` environment variable (fallback)
     pub fn from_config(config: &TranscriptionConfig) -> Result<Self> {
         let api_key = config
             .api_key
@@ -163,8 +165,20 @@ impl GroqProvider {
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty())
             })
+            .or_else(|| {
+                std::env::var("TRANSCRIPTION_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .or_else(|| {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
             .context(
-                "Missing transcription API key: set [transcription].api_key or GROQ_API_KEY environment variable",
+                "Missing transcription API key: set [transcription].api_key or GROQ_API_KEY, TRANSCRIPTION_API_KEY, or OPENAI_API_KEY environment variable",
             )?;
 
         Ok(Self {
@@ -559,9 +573,9 @@ impl TranscriptionProvider for GoogleSttProvider {
             }
         });
 
+        let encoded_key = urlencoding::encode(&self.api_key);
         let url = format!(
-            "https://speech.googleapis.com/v1/speech:recognize?key={}",
-            self.api_key
+            "https://speech.googleapis.com/v1/speech:recognize?key={encoded_key}"
         );
 
         let resp = client
@@ -585,7 +599,7 @@ impl TranscriptionProvider for GoogleSttProvider {
 
         let text = body["results"][0]["alternatives"][0]["transcript"]
             .as_str()
-            .unwrap_or("")
+            .context("Google STT response missing transcript field")?
             .to_string();
 
         Ok(text)
@@ -623,7 +637,12 @@ impl LocalWhisperProvider {
             parsed.scheme()
         );
 
-        let bearer_token = config.bearer_token.trim().to_string();
+        let bearer_token = config
+            .bearer_token
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .to_string();
         anyhow::ensure!(
             !bearer_token.is_empty(),
             "local_whisper: `bearer_token` must not be empty"

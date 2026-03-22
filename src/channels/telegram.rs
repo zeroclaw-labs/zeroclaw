@@ -4396,6 +4396,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn telegram_voice_skips_download_when_manager_none() {
+        // Config is Some but manager failed to initialize (e.g. invalid provider).
+        // This tests the early-return path at line 1183 that skips the download.
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+        tc.default_provider = "nonexistent_provider".to_string();
+
+        let ch =
+            TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
+        assert!(ch.transcription_manager.is_none());
+
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 1,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        assert!(parsed.is_none());
+    }
+
+    #[tokio::test]
     async fn try_parse_voice_message_skips_when_duration_exceeds_limit() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
