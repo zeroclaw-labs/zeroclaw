@@ -1,9 +1,8 @@
-# Zeroclaw K8s Infrastructure Agent — replaces Goose ACP.
+# Zeroclaw K8s Infrastructure Agent (Walter).
 #
 # Runs as an ACP-over-HTTP server (JSON-RPC 2.0 + SSE) that Sam can
-# delegate Kubernetes tasks to. Unlike Goose, this agent persists
-# conversation history across prompts and uses Serena for cross-session
-# memory.
+# delegate Kubernetes tasks to. Persists conversation history across
+# prompts and uses Serena for cross-session memory.
 #
 # ACP Protocol:
 #   POST   /acp — JSON-RPC requests (initialize, session/new, session/prompt)
@@ -26,6 +25,8 @@ spec:
         agent-role: k8s-infrastructure
         protocol: acp-http
     spec:
+      # TODO: rename SA from goose-todolist-configurator → walter-k8s-agent
+      # (requires coordinated cluster-side SA rename + RBAC rebind)
       serviceAccountName: goose-todolist-configurator
       automountServiceAccountToken: true
       securityContext:

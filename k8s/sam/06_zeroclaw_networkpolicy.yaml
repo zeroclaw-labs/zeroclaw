@@ -61,28 +61,19 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # ACP-over-HTTP to goose-subagent (legacy WebSocket)
+    # ACP-over-HTTP to Walter (zeroclaw-k8s-agent)
     - to:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: ai-agents
           podSelector:
             matchLabels:
-              app: goose-subagent
+              app: zeroclaw-k8s-agent
       ports:
         - protocol: TCP
-          port: 8080
-    # ACP-over-HTTP to goose-acp (standardized ACP protocol)
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: ai-agents
-          podSelector:
-            matchLabels:
-              app: goose-acp
-      ports:
+          port: 3000
         - protocol: TCP
-          port: 8080
+          port: 15008
     # Vikunja API (todolist project management)
     # Both the application port and HBONE port are needed because
     # ambient mesh tunnels traffic through ztunnel on port 15008.

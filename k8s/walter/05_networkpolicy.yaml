@@ -1,5 +1,5 @@
-# Network policy for zeroclaw-k8s-agent — mirrors the goose-acp policy
-# but scoped to the zeroclaw-k8s-agent pod and port 3000.
+# Network policy for zeroclaw-k8s-agent (Walter).
+# Scoped to the zeroclaw-k8s-agent pod and port 3000.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
