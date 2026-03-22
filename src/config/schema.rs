@@ -1164,7 +1164,7 @@ fn default_loop_detection_ping_pong_cycles() -> usize {
 }
 
 fn default_loop_detection_failure_streak() -> usize {
-    3
+    5
 }
 
 fn default_safety_heartbeat_interval() -> usize {
@@ -2613,11 +2613,11 @@ fn default_web_search_max_results() -> usize {
 }
 
 fn default_web_search_timeout_secs() -> u64 {
-    300 // 5 minutes — generous to avoid timeouts on slow search providers (DuckDuckGo, etc.)
+    30 // 30 seconds per provider request — prevents long hangs; fallback chain handles transient failures
 }
 
 fn default_web_search_retries_per_provider() -> u32 {
-    0
+    2
 }
 
 fn default_web_search_retry_backoff_ms() -> u64 {
@@ -2702,7 +2702,7 @@ impl Default for WebSearchConfig {
             perplexity_api_key: None,
             exa_api_key: None,
             jina_api_key: None,
-            fallback_providers: Vec::new(),
+            fallback_providers: vec!["jina".to_string()],
             retries_per_provider: default_web_search_retries_per_provider(),
             retry_backoff_ms: default_web_search_retry_backoff_ms(),
             domain_filter: Vec::new(),
@@ -12727,8 +12727,8 @@ default_temperature = 0.7
     async fn web_search_config_default_extended_fields() {
         let ws = WebSearchConfig::default();
         assert_eq!(ws.provider, "duckduckgo");
-        assert!(ws.fallback_providers.is_empty());
-        assert_eq!(ws.retries_per_provider, 0);
+        assert_eq!(ws.fallback_providers, vec!["jina"]);
+        assert_eq!(ws.retries_per_provider, 2);
         assert_eq!(ws.retry_backoff_ms, 250);
         assert!(ws.domain_filter.is_empty());
         assert!(ws.language_filter.is_empty());

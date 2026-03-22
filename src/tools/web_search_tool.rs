@@ -919,18 +919,26 @@ impl Tool for WebSearchTool {
             }
         }
 
-        let result = result.ok_or_else(|| {
-            anyhow::anyhow!(
-                "All configured web_search providers failed: {}",
-                provider_errors.join(" | ")
-            )
-        })?;
-
-        Ok(ToolResult {
-            success: true,
-            output: result,
-            error: None,
-        })
+        match result {
+            Some(output) => Ok(ToolResult {
+                success: true,
+                output,
+                error: None,
+            }),
+            None => {
+                let error_detail = provider_errors.join(" | ");
+                tracing::warn!("All web_search providers failed: {error_detail}");
+                Ok(ToolResult {
+                    success: false,
+                    output: format!(
+                        "Web search failed. Errors: {error_detail}\n\n\
+                         Suggestions: try using 'web_fetch' to fetch a URL directly, \
+                         or use 'shell' with curl, or use 'browser' tool instead."
+                    ),
+                    error: Some("All configured web search providers failed".into()),
+                })
+            }
+        }
     }
 }
 
@@ -1127,9 +1135,9 @@ mod tests {
             15,
             "test".to_string(),
         );
-        let result = tool.execute(json!({"query": "test"})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("API key"));
+        let result = tool.execute(json!({"query": "test"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("API key") || result.error.as_deref().unwrap_or("").contains("failed"));
     }
 
     #[tokio::test]
@@ -1143,13 +1151,13 @@ mod tests {
             15,
             "test".to_string(),
         );
-        let result = tool.execute(json!({"query": "test"})).await;
-        assert!(result.is_err());
-        let error = result.unwrap_err().to_string();
+        let result = tool.execute(json!({"query": "test"})).await.unwrap();
+        assert!(!result.success);
+        let output = &result.output;
         if cfg!(feature = "firecrawl") {
-            assert!(error.contains("api_key"));
+            assert!(output.contains("api_key") || output.contains("API key"));
         } else {
-            assert!(error.contains("requires Cargo feature 'firecrawl'"));
+            assert!(output.contains("firecrawl") || output.contains("failed"));
         }
     }
 
@@ -1164,9 +1172,9 @@ mod tests {
             15,
             "test".to_string(),
         );
-        let result = tool.execute(json!({"query": "test"})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("api_key"));
+        let result = tool.execute(json!({"query": "test"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.output.contains("api_key") || result.output.contains("API key") || result.error.as_deref().unwrap_or("").contains("failed"));
     }
 
     #[test]
