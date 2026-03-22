@@ -2,6 +2,7 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 /// Mattermost channel — polls channel posts via REST API v4.
 /// Mattermost is API-compatible with many Slack patterns but uses a dedicated v4 structure.
@@ -19,6 +20,8 @@ pub struct MattermostChannel {
     typing_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
 }
 
 impl MattermostChannel {
@@ -41,12 +44,29 @@ impl MattermostChannel {
             mention_only,
             typing_handle: Mutex::new(None),
             proxy_url: None,
+            transcription: None,
+            transcription_manager: None,
         }
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
+        self
+    }
+
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(Arc::new(m));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
+        }
+        self.transcription = Some(config);
         self
     }
 
@@ -89,6 +109,55 @@ impl MattermostChannel {
             .unwrap_or("")
             .to_string();
         (id, username)
+    }
+
+    async fn try_transcribe_audio_attachment(&self, post: &serde_json::Value) -> Option<String> {
+        let config = self.transcription.as_ref()?;
+        let manager = self.transcription_manager.as_deref()?;
+
+        let files = post
+            .get("metadata")
+            .and_then(|m| m.get("files"))
+            .and_then(|f| f.as_array())?;
+
+        let audio_file = files.iter().find(|f| is_audio_file(f))?;
+
+        if let Some(duration_ms) = audio_file.get("duration").and_then(|d| d.as_u64()) {
+            let duration_secs = duration_ms / 1000;
+            if duration_secs > config.max_duration_secs as u64 {
+                tracing::debug!(
+                    duration_secs,
+                    max = config.max_duration_secs,
+                    "Mattermost audio attachment exceeds max duration, skipping"
+                );
+                return None;
+            }
+        }
+
+        let file_id = audio_file.get("id").and_then(|i| i.as_str())?;
+        let file_name = audio_file
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("audio");
+
+        let bytes = self
+            .http_client()
+            .get(format!("{}/api/v4/files/{}", self.base_url, file_id))
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+            .ok()?
+            .bytes()
+            .await
+            .ok()?;
+
+        match manager.transcribe(&bytes, file_name).await {
+            Ok(text) => Some(text),
+            Err(e) => {
+                tracing::warn!("Mattermost audio transcription failed: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -188,21 +257,35 @@ impl Channel for MattermostChannel {
                 let mut post_list: Vec<_> = posts.values().collect();
                 post_list.sort_by_key(|p| p.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0));
 
+                let last_create_at_before_this_batch = last_create_at;
                 for post in post_list {
-                    let msg = self.parse_mattermost_post(
-                        post,
-                        &bot_user_id,
-                        &bot_username,
-                        last_create_at,
-                        &channel_id,
-                    );
                     let create_at = post
                         .get("create_at")
                         .and_then(|c| c.as_i64())
                         .unwrap_or(last_create_at);
                     last_create_at = last_create_at.max(create_at);
 
-                    if let Some(channel_msg) = msg {
+                    let effective_text = if post
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                        && post_has_audio_attachment(post)
+                    {
+                        self.try_transcribe_audio_attachment(post).await
+                    } else {
+                        None
+                    };
+
+                    if let Some(channel_msg) = self.parse_mattermost_post(
+                        post,
+                        &bot_user_id,
+                        &bot_username,
+                        last_create_at_before_this_batch,
+                        &channel_id,
+                        effective_text.as_deref(),
+                    ) {
                         if tx.send(channel_msg).await.is_err() {
                             return Ok(());
                         }
@@ -286,6 +369,7 @@ impl MattermostChannel {
         bot_username: &str,
         last_create_at: i64,
         channel_id: &str,
+        injected_text: Option<&str>,
     ) -> Option<ChannelMessage> {
         let id = post.get("id").and_then(|i| i.as_str()).unwrap_or("");
         let user_id = post.get("user_id").and_then(|u| u.as_str()).unwrap_or("");
@@ -293,9 +377,15 @@ impl MattermostChannel {
         let create_at = post.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0);
         let root_id = post.get("root_id").and_then(|r| r.as_str()).unwrap_or("");
 
-        if user_id == bot_user_id || create_at <= last_create_at || text.is_empty() {
+        if user_id == bot_user_id || create_at <= last_create_at {
             return None;
         }
+
+        let effective_text = if text.is_empty() {
+            injected_text?
+        } else {
+            text
+        };
 
         if !self.is_user_allowed(user_id) {
             tracing::warn!("Mattermost: ignoring message from unauthorized user: {user_id}");
@@ -304,10 +394,11 @@ impl MattermostChannel {
 
         // mention_only filtering: skip messages that don't @-mention the bot.
         let content = if self.mention_only {
-            let normalized = normalize_mattermost_content(text, bot_user_id, bot_username, post);
+            let normalized =
+                normalize_mattermost_content(effective_text, bot_user_id, bot_username, post);
             normalized?
         } else {
-            text.to_string()
+            effective_text.to_string()
         };
 
         // Reply routing depends on thread_replies config:
@@ -334,6 +425,27 @@ impl MattermostChannel {
             interruption_scope_id: None,
         })
     }
+}
+
+fn post_has_audio_attachment(post: &serde_json::Value) -> bool {
+    let files = post
+        .get("metadata")
+        .and_then(|m| m.get("files"))
+        .and_then(|f| f.as_array());
+    let Some(files) = files else { return false };
+    files.iter().any(is_audio_file)
+}
+
+fn is_audio_file(file: &serde_json::Value) -> bool {
+    let mime = file.get("mime_type").and_then(|m| m.as_str()).unwrap_or("");
+    if mime.starts_with("audio/") {
+        return true;
+    }
+    let ext = file.get("extension").and_then(|e| e.as_str()).unwrap_or("");
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "ogg" | "mp3" | "mp4" | "m4a" | "wav" | "webm" | "opus" | "flac"
+    )
 }
 
 /// Check whether a Mattermost post contains an @-mention of the bot.
@@ -518,7 +630,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "botname",
+                1_500_000_000_000_i64,
+                "chan789",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.sender, "user456");
         assert_eq!(msg.content, "hello world");
@@ -537,7 +656,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "botname",
+                1_500_000_000_000_i64,
+                "chan789",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.reply_target, "chan789:post123"); // Threaded reply
     }
@@ -554,7 +680,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "botname",
+                1_500_000_000_000_i64,
+                "chan789",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.reply_target, "chan789:root789"); // Stays in the thread
     }
@@ -569,8 +702,14 @@ mod tests {
             "create_at": 1_600_000_000_000_i64
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789");
+        let msg = ch.parse_mattermost_post(
+            &post,
+            "bot123",
+            "botname",
+            1_500_000_000_000_i64,
+            "chan789",
+            None,
+        );
         assert!(msg.is_none());
     }
 
@@ -584,8 +723,14 @@ mod tests {
             "create_at": 1_400_000_000_000_i64
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789");
+        let msg = ch.parse_mattermost_post(
+            &post,
+            "bot123",
+            "botname",
+            1_500_000_000_000_i64,
+            "chan789",
+            None,
+        );
         assert!(msg.is_none());
     }
 
@@ -601,7 +746,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "botname",
+                1_500_000_000_000_i64,
+                "chan789",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.reply_target, "chan789"); // No thread suffix
     }
@@ -619,7 +771,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "botname", 1_500_000_000_000_i64, "chan789")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "botname",
+                1_500_000_000_000_i64,
+                "chan789",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.reply_target, "chan789:root789"); // Stays in existing thread
     }
@@ -637,8 +796,14 @@ mod tests {
             "root_id": ""
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1");
+        let msg = ch.parse_mattermost_post(
+            &post,
+            "bot123",
+            "mybot",
+            1_500_000_000_000_i64,
+            "chan1",
+            None,
+        );
         assert!(msg.is_none());
     }
 
@@ -654,7 +819,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "mybot",
+                1_500_000_000_000_i64,
+                "chan1",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.content, "what is the weather?");
     }
@@ -671,7 +843,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "mybot",
+                1_500_000_000_000_i64,
+                "chan1",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.content, "run status");
     }
@@ -687,8 +866,14 @@ mod tests {
             "root_id": ""
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1");
+        let msg = ch.parse_mattermost_post(
+            &post,
+            "bot123",
+            "mybot",
+            1_500_000_000_000_i64,
+            "chan1",
+            None,
+        );
         assert!(msg.is_none());
     }
 
@@ -704,7 +889,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "mybot",
+                1_500_000_000_000_i64,
+                "chan1",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.content, "hello");
     }
@@ -725,7 +917,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "mybot",
+                1_500_000_000_000_i64,
+                "chan1",
+                None,
+            )
             .unwrap();
         // Content is preserved as-is since no @username was in the text to strip.
         assert_eq!(msg.content, "hey check this out");
@@ -743,8 +942,14 @@ mod tests {
             "root_id": ""
         });
 
-        let msg =
-            ch.parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1");
+        let msg = ch.parse_mattermost_post(
+            &post,
+            "bot123",
+            "mybot",
+            1_500_000_000_000_i64,
+            "chan1",
+            None,
+        );
         assert!(msg.is_none());
     }
 
@@ -760,7 +965,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "mybot",
+                1_500_000_000_000_i64,
+                "chan1",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.content, "hey   how are you?");
     }
@@ -778,7 +990,14 @@ mod tests {
         });
 
         let msg = ch
-            .parse_mattermost_post(&post, "bot123", "mybot", 1_500_000_000_000_i64, "chan1")
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "mybot",
+                1_500_000_000_000_i64,
+                "chan1",
+                None,
+            )
             .unwrap();
         assert_eq!(msg.content, "no mention here");
     }
@@ -924,5 +1143,334 @@ mod tests {
         let result =
             normalize_mattermost_content("@mybot hello @mybotx world", "bot123", "mybot", &post);
         assert_eq!(result.as_deref(), Some("hello @mybotx world"));
+    }
+
+    // ── Transcription tests ───────────────────────────────────────
+
+    #[test]
+    fn mattermost_manager_none_when_transcription_not_configured() {
+        let ch = make_channel(vec!["*".into()], false);
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn mattermost_manager_some_when_valid_config() {
+        let ch = make_channel(vec!["*".into()], false).with_transcription(
+            crate::config::TranscriptionConfig {
+                enabled: true,
+                default_provider: "groq".to_string(),
+                api_key: Some("test_key".to_string()),
+                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                model: "whisper-large-v3".to_string(),
+                language: None,
+                initial_prompt: None,
+                max_duration_secs: 600,
+                openai: None,
+                deepgram: None,
+                assemblyai: None,
+                google: None,
+                local_whisper: None,
+            },
+        );
+        assert!(ch.transcription_manager.is_some());
+    }
+
+    #[test]
+    fn mattermost_manager_none_and_warn_on_init_failure() {
+        let ch = make_channel(vec!["*".into()], false).with_transcription(
+            crate::config::TranscriptionConfig {
+                enabled: true,
+                default_provider: "groq".to_string(),
+                api_key: Some("".to_string()),
+                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                model: "whisper-large-v3".to_string(),
+                language: None,
+                initial_prompt: None,
+                max_duration_secs: 600,
+                openai: None,
+                deepgram: None,
+                assemblyai: None,
+                google: None,
+                local_whisper: None,
+            },
+        );
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn mattermost_post_has_audio_attachment_true_for_audio_mime() {
+        let post = json!({
+            "metadata": {
+                "files": [
+                    {
+                        "id": "file1",
+                        "mime_type": "audio/ogg",
+                        "name": "voice.ogg"
+                    }
+                ]
+            }
+        });
+        assert!(post_has_audio_attachment(&post));
+    }
+
+    #[test]
+    fn mattermost_post_has_audio_attachment_true_for_audio_ext() {
+        let post = json!({
+            "metadata": {
+                "files": [
+                    {
+                        "id": "file1",
+                        "mime_type": "application/octet-stream",
+                        "extension": "ogg"
+                    }
+                ]
+            }
+        });
+        assert!(post_has_audio_attachment(&post));
+    }
+
+    #[test]
+    fn mattermost_post_has_audio_attachment_false_for_image() {
+        let post = json!({
+            "metadata": {
+                "files": [
+                    {
+                        "id": "file1",
+                        "mime_type": "image/png",
+                        "name": "screenshot.png"
+                    }
+                ]
+            }
+        });
+        assert!(!post_has_audio_attachment(&post));
+    }
+
+    #[test]
+    fn mattermost_post_has_audio_attachment_false_when_no_files() {
+        let post = json!({
+            "metadata": {}
+        });
+        assert!(!post_has_audio_attachment(&post));
+    }
+
+    #[test]
+    fn mattermost_parse_post_uses_injected_text() {
+        let ch = make_channel(vec!["*".into()], true);
+        let post = json!({
+            "id": "post123",
+            "user_id": "user456",
+            "message": "",
+            "create_at": 1_600_000_000_000_i64,
+            "root_id": ""
+        });
+
+        let msg = ch
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "botname",
+                1_500_000_000_000_i64,
+                "chan789",
+                Some("transcript text"),
+            )
+            .unwrap();
+        assert_eq!(msg.content, "transcript text");
+    }
+
+    #[test]
+    fn mattermost_parse_post_rejects_empty_message_without_injected() {
+        let ch = make_channel(vec!["*".into()], true);
+        let post = json!({
+            "id": "post123",
+            "user_id": "user456",
+            "message": "",
+            "create_at": 1_600_000_000_000_i64,
+            "root_id": ""
+        });
+
+        let msg = ch.parse_mattermost_post(
+            &post,
+            "bot123",
+            "botname",
+            1_500_000_000_000_i64,
+            "chan789",
+            None,
+        );
+        assert!(msg.is_none());
+    }
+
+    #[tokio::test]
+    async fn mattermost_transcribe_skips_when_manager_none() {
+        let ch = make_channel(vec!["*".into()], false);
+        let post = json!({
+            "metadata": {
+                "files": [
+                    {
+                        "id": "file1",
+                        "mime_type": "audio/ogg",
+                        "name": "voice.ogg"
+                    }
+                ]
+            }
+        });
+        let result = ch.try_transcribe_audio_attachment(&post).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn mattermost_transcribe_skips_over_duration_limit() {
+        let ch = make_channel(vec!["*".into()], false).with_transcription(
+            crate::config::TranscriptionConfig {
+                enabled: true,
+                default_provider: "groq".to_string(),
+                api_key: Some("test_key".to_string()),
+                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                model: "whisper-large-v3".to_string(),
+                language: None,
+                initial_prompt: None,
+                max_duration_secs: 3600,
+                openai: None,
+                deepgram: None,
+                assemblyai: None,
+                google: None,
+                local_whisper: None,
+            },
+        );
+
+        let post = json!({
+            "metadata": {
+                "files": [
+                    {
+                        "id": "file1",
+                        "mime_type": "audio/ogg",
+                        "name": "voice.ogg",
+                        "duration": 7_200_000_u64
+                    }
+                ]
+            }
+        });
+
+        let result = ch.try_transcribe_audio_attachment(&post).await;
+        assert!(result.is_none());
+    }
+
+    #[cfg(test)]
+    mod http_tests {
+        use super::*;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[tokio::test]
+        async fn mattermost_audio_routes_through_local_whisper() {
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/api/v4/files/file1"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"audio bytes"))
+                .mount(&mock_server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/transcriptions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"text": "test transcript"})),
+                )
+                .mount(&mock_server)
+                .await;
+
+            let whisper_url = format!("{}/v1/audio/transcriptions", mock_server.uri());
+            let ch = MattermostChannel::new(
+                mock_server.uri(),
+                "test_token".to_string(),
+                None,
+                vec!["*".into()],
+                false,
+                false,
+            )
+            .with_transcription(crate::config::TranscriptionConfig {
+                enabled: true,
+                default_provider: "local_whisper".to_string(),
+                api_key: None,
+                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                model: "whisper-large-v3".to_string(),
+                language: None,
+                initial_prompt: None,
+                max_duration_secs: 600,
+                openai: None,
+                deepgram: None,
+                assemblyai: None,
+                google: None,
+                local_whisper: Some(crate::config::LocalWhisperConfig {
+                    url: whisper_url,
+                    bearer_token: "test_token".to_string(),
+                    max_audio_bytes: 25_000_000,
+                    timeout_secs: 300,
+                }),
+            });
+
+            let post = json!({
+                "metadata": {
+                    "files": [
+                        {
+                            "id": "file1",
+                            "mime_type": "audio/ogg",
+                            "name": "voice.ogg"
+                        }
+                    ]
+                }
+            });
+
+            let result = ch.try_transcribe_audio_attachment(&post).await;
+            assert_eq!(result.as_deref(), Some("test transcript"));
+        }
+
+        #[tokio::test]
+        async fn mattermost_audio_skips_non_audio_attachment() {
+            let mock_server = MockServer::start().await;
+
+            let ch = MattermostChannel::new(
+                mock_server.uri(),
+                "test_token".to_string(),
+                None,
+                vec!["*".into()],
+                false,
+                false,
+            )
+            .with_transcription(crate::config::TranscriptionConfig {
+                enabled: true,
+                default_provider: "local_whisper".to_string(),
+                api_key: None,
+                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                model: "whisper-large-v3".to_string(),
+                language: None,
+                initial_prompt: None,
+                max_duration_secs: 600,
+                openai: None,
+                deepgram: None,
+                assemblyai: None,
+                google: None,
+                local_whisper: Some(crate::config::LocalWhisperConfig {
+                    url: mock_server.uri(),
+                    bearer_token: "test_token".to_string(),
+                    max_audio_bytes: 25_000_000,
+                    timeout_secs: 300,
+                }),
+            });
+
+            let post = json!({
+                "metadata": {
+                    "files": [
+                        {
+                            "id": "file1",
+                            "mime_type": "image/png",
+                            "name": "screenshot.png"
+                        }
+                    ]
+                }
+            });
+
+            let result = ch.try_transcribe_audio_attachment(&post).await;
+            assert!(result.is_none());
+        }
     }
 }

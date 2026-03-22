@@ -3865,7 +3865,8 @@ fn collect_configured_channels(
                     mm.thread_replies.unwrap_or(true),
                     mm.mention_only.unwrap_or(false),
                 )
-                .with_proxy_url(mm.proxy_url.clone()),
+                .with_proxy_url(mm.proxy_url.clone())
+                .with_transcription(config.transcription.clone()),
             ),
         });
     }
