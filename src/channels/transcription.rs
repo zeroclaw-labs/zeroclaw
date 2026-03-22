@@ -852,6 +852,28 @@ mod tests {
     }
 
     #[test]
+    fn manager_rejects_enabled_without_credentials() {
+        std::env::remove_var("GROQ_API_KEY");
+
+        let config = TranscriptionConfig {
+            enabled: true,
+            default_provider: "groq".to_string(),
+            api_key: None,
+            ..Default::default()
+        };
+        let result = TranscriptionManager::new(&config);
+        assert!(
+            result.is_err(),
+            "expected Err when enabled=true but default provider has no credentials"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not configured") || err_msg.contains("not available"),
+            "error should mention provider not configured, got: {err_msg}"
+        );
+    }
+
+    #[test]
     fn manager_registers_groq_with_key() {
         std::env::remove_var("GROQ_API_KEY");
 

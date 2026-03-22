@@ -4454,7 +4454,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires GROQ_API_KEY environment variable"]
     async fn e2e_live_voice_transcription_and_reply_cache() {
-        if std::env::var("GROQ_API_KEY").is_err() {
+        if std::env::var("GROQ_API_KEY")
+            .map(|v| v.trim().is_empty())
+            .unwrap_or(true)
+        {
             eprintln!("GROQ_API_KEY not set — skipping live voice transcription test");
             return;
         }
