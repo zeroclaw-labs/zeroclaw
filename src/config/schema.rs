@@ -1005,6 +1005,10 @@ fn default_edge_tts_binary_path() -> String {
     "edge-tts".into()
 }
 
+fn default_piper_tts_api_url() -> String {
+    "http://127.0.0.1:5000/v1/audio/speech".into()
+}
+
 /// Text-to-Speech configuration (`[tts]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TtsConfig {
@@ -1035,6 +1039,9 @@ pub struct TtsConfig {
     /// Edge TTS provider configuration (`[tts.edge]`).
     #[serde(default)]
     pub edge: Option<EdgeTtsConfig>,
+    /// Piper TTS provider configuration (`[tts.piper]`).
+    #[serde(default)]
+    pub piper: Option<PiperTtsConfig>,
 }
 
 impl Default for TtsConfig {
@@ -1049,6 +1056,7 @@ impl Default for TtsConfig {
             elevenlabs: None,
             google: None,
             edge: None,
+            piper: None,
         }
     }
 }
@@ -1101,6 +1109,14 @@ pub struct EdgeTtsConfig {
     /// Path to the `edge-tts` binary (default `"edge-tts"`).
     #[serde(default = "default_edge_tts_binary_path")]
     pub binary_path: String,
+}
+
+/// Piper TTS provider configuration (local GPU-accelerated, OpenAI-compatible endpoint).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PiperTtsConfig {
+    /// Base URL for the Piper TTS HTTP server (e.g. `"http://127.0.0.1:5000/v1/audio/speech"`).
+    #[serde(default = "default_piper_tts_api_url")]
+    pub api_url: String,
 }
 
 /// Determines when a `ToolFilterGroup` is active.

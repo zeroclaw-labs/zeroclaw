@@ -1,6 +1,7 @@
 //! Multi-provider Text-to-Speech (TTS) subsystem.
 //!
-//! Supports OpenAI, ElevenLabs, Google Cloud TTS, and Edge TTS (free, subprocess-based).
+//! Supports OpenAI, ElevenLabs, Google Cloud TTS, Edge TTS (free, subprocess-based),
+//! and Piper TTS (local GPU-accelerated, OpenAI-compatible endpoint).
 //! Provider selection is driven by [`TtsConfig`] in `config.toml`.
 
 use std::collections::HashMap;
@@ -451,6 +452,80 @@ impl TtsProvider for EdgeTtsProvider {
     }
 }
 
+// ── Piper TTS (local, OpenAI-compatible) ─────────────────────────
+
+/// Piper TTS provider — local GPU-accelerated server with an OpenAI-compatible endpoint.
+pub struct PiperTtsProvider {
+    client: reqwest::Client,
+    api_url: String,
+}
+
+impl PiperTtsProvider {
+    /// Create a new Piper TTS provider pointing at the given API URL.
+    pub fn new(api_url: &str) -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .timeout(TTS_HTTP_TIMEOUT)
+                .build()
+                .expect("Failed to build HTTP client for Piper TTS"),
+            api_url: api_url.to_string(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TtsProvider for PiperTtsProvider {
+    fn name(&self) -> &str {
+        "piper"
+    }
+
+    async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
+        let body = serde_json::json!({
+            "model": "tts-1",
+            "input": text,
+            "voice": voice,
+        });
+
+        let resp = self
+            .client
+            .post(&self.api_url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to send Piper TTS request")?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let error_body: serde_json::Value = resp
+                .json()
+                .await
+                .unwrap_or_else(|_| serde_json::json!({"error": "unknown"}));
+            let msg = error_body["error"]["message"]
+                .as_str()
+                .unwrap_or("unknown error");
+            bail!("Piper TTS API error ({}): {}", status, msg);
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .context("Failed to read Piper TTS response body")?;
+        Ok(bytes.to_vec())
+    }
+
+    fn supported_voices(&self) -> Vec<String> {
+        // Piper voices depend on installed models; return empty (dynamic).
+        Vec::new()
+    }
+
+    fn supported_formats(&self) -> Vec<String> {
+        ["mp3", "wav", "opus"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+}
+
 // ── TtsManager ───────────────────────────────────────────────────
 
 /// Central manager for multi-provider TTS synthesis.
@@ -508,6 +583,11 @@ impl TtsManager {
                     tracing::warn!("Skipping Edge TTS provider: {e}");
                 }
             }
+        }
+
+        if let Some(ref piper_cfg) = config.piper {
+            let provider = PiperTtsProvider::new(&piper_cfg.api_url);
+            providers.insert("piper".to_string(), Box::new(provider));
         }
 
         let max_text_length = if config.max_text_length == 0 {
@@ -653,6 +733,54 @@ mod tests {
     }
 
     #[test]
+    fn piper_provider_creation() {
+        let provider = PiperTtsProvider::new("http://127.0.0.1:5000/v1/audio/speech");
+        assert_eq!(provider.name(), "piper");
+        assert_eq!(provider.api_url, "http://127.0.0.1:5000/v1/audio/speech");
+        assert_eq!(provider.supported_formats(), vec!["mp3", "wav", "opus"]);
+        // Piper voices depend on installed models; list is empty.
+        assert!(provider.supported_voices().is_empty());
+    }
+
+    #[test]
+    fn tts_manager_with_piper_provider() {
+        let mut config = default_tts_config();
+        config.default_provider = "piper".to_string();
+        config.piper = Some(crate::config::PiperTtsConfig {
+            api_url: "http://127.0.0.1:5000/v1/audio/speech".into(),
+        });
+
+        let manager = TtsManager::new(&config).unwrap();
+        assert_eq!(manager.available_providers(), vec!["piper"]);
+    }
+
+    #[tokio::test]
+    async fn tts_rejects_empty_text_for_piper() {
+        let mut config = default_tts_config();
+        config.default_provider = "piper".to_string();
+        config.piper = Some(crate::config::PiperTtsConfig {
+            api_url: "http://127.0.0.1:5000/v1/audio/speech".into(),
+        });
+
+        let manager = TtsManager::new(&config).unwrap();
+        let err = manager
+            .synthesize_with_provider("", "piper", "default")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must not be empty"),
+            "expected empty-text error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn piper_not_registered_when_config_is_none() {
+        let config = default_tts_config();
+        let manager = TtsManager::new(&config).unwrap();
+        assert!(!manager.available_providers().contains(&"piper".to_string()));
+    }
+
+    #[test]
     fn tts_config_defaults() {
         let config = TtsConfig::default();
         assert!(!config.enabled);
@@ -664,6 +792,7 @@ mod tests {
         assert!(config.elevenlabs.is_none());
         assert!(config.google.is_none());
         assert!(config.edge.is_none());
+        assert!(config.piper.is_none());
     }
 
     #[test]
