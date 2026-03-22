@@ -117,6 +117,25 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
     ) -> anyhow::Result<Vec<MemoryEntry>>;
 
+    /// List memories filtered by category and key prefix.
+    ///
+    /// Default implementation calls `list()` and filters in memory.
+    /// Backends with native prefix support (e.g. SQLite `LIKE`) should
+    /// override this for efficiency.
+    async fn list_by_prefix(
+        &self,
+        category: Option<&MemoryCategory>,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let all = self.list(category, None).await?;
+        Ok(all
+            .into_iter()
+            .filter(|e| e.key.starts_with(prefix))
+            .take(limit)
+            .collect())
+    }
+
     /// Remove a memory by key
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
 

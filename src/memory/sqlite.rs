@@ -873,6 +873,67 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn list_by_prefix(
+        &self,
+        category: Option<&MemoryCategory>,
+        prefix: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let category = category.cloned();
+        let prefix = prefix.to_string();
+
+        #[allow(clippy::cast_possible_truncation)]
+        let limit = limit as i64;
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut results = Vec::new();
+
+            let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                })
+            };
+
+            // Escape LIKE wildcards in the prefix itself, then append %
+            let escaped = prefix.replace('%', "\\%").replace('_', "\\_");
+            let like_pattern = format!("{escaped}%");
+
+            if let Some(ref cat) = category {
+                let cat_str = Self::category_to_str(cat);
+                let mut stmt = conn.prepare(
+                    "SELECT id, key, content, category, created_at, session_id FROM memories \
+                     WHERE category = ?1 AND key LIKE ?2 ESCAPE '\\' \
+                     ORDER BY updated_at DESC LIMIT ?3",
+                )?;
+                let rows = stmt.query_map(params![cat_str, like_pattern, limit], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
+            } else {
+                let mut stmt = conn.prepare(
+                    "SELECT id, key, content, category, created_at, session_id FROM memories \
+                     WHERE key LIKE ?1 ESCAPE '\\' \
+                     ORDER BY updated_at DESC LIMIT ?2",
+                )?;
+                let rows = stmt.query_map(params![like_pattern, limit], row_mapper)?;
+                for row in rows {
+                    results.push(row?);
+                }
+            }
+
+            Ok(results)
+        })
+        .await?
+    }
+
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -1812,6 +1873,61 @@ mod tests {
         let (_tmp, mem) = temp_sqlite();
         let all = mem.list(None, None).await.unwrap();
         assert!(all.is_empty());
+    }
+
+    // ── list_by_prefix (SQL-optimized) ────────────────────────────
+
+    #[tokio::test]
+    async fn list_by_prefix_filters_in_sql() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("todo:active:1", "task 1", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("todo:active:2", "task 2", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("todo:done:3", "done task", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store("health:food:1", "food", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let active = mem
+            .list_by_prefix(Some(&MemoryCategory::Core), "todo:active:", 100)
+            .await
+            .unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().all(|e| e.key.starts_with("todo:active:")));
+
+        // Without category filter
+        let all_todo = mem.list_by_prefix(None, "todo:", 100).await.unwrap();
+        assert_eq!(all_todo.len(), 3);
+
+        // Respects limit
+        let limited = mem
+            .list_by_prefix(None, "todo:", 1)
+            .await
+            .unwrap();
+        assert_eq!(limited.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_by_prefix_escapes_wildcards() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a%b:1", "tricky key", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("axb:2", "should not match", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem
+            .list_by_prefix(Some(&MemoryCategory::Core), "a%b:", 100)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "a%b:1");
     }
 
     // ── Session isolation ─────────────────────────────────────────
