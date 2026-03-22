@@ -293,7 +293,6 @@ impl Provider for ClaudeCodeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -399,21 +398,21 @@ mod tests {
     /// The script ignores CLI flags (`--print`, `--model`, `-`) and just cats stdin.
     fn echo_provider() -> ClaudeCodeProvider {
         use std::io::Write;
+        use tempfile::Builder;
 
-        static SCRIPT_ID: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join("zeroclaw_test_claude_code");
-        std::fs::create_dir_all(&dir).unwrap();
+        let mut file = Builder::new()
+            .prefix("fake_claude_")
+            .suffix(".sh")
+            .tempfile()
+            .unwrap();
 
-        let script_id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            "fake_claude_{}_{}.sh",
-            std::process::id(),
-            script_id
-        ));
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
-        f.sync_all().unwrap();
+        writeln!(file, "#!/bin/sh\ncat /dev/stdin").unwrap();
+        file.flush().unwrap();
+
+        // Close the file handle before changing permissions and executing
+        let (f, path) = file.keep().unwrap();
         drop(f);
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
