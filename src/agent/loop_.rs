@@ -3902,16 +3902,40 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
+        // ── Parse thinking directive from user message ─────────
+        let (thinking_directive, effective_msg) =
+            match crate::agent::thinking::parse_thinking_directive(&msg) {
+                Some((level, remaining)) => {
+                    tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
+                    (Some(level), remaining)
+                }
+                None => (None, msg.clone()),
+            };
+        let thinking_level = crate::agent::thinking::resolve_thinking_level(
+            thinking_directive,
+            None,
+            &config.agent.thinking,
+        );
+        let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
+        let effective_temperature = crate::agent::thinking::clamp_temperature(
+            temperature + thinking_params.temperature_adjustment,
+        );
+
+        // Prepend thinking system prompt prefix when present.
+        if let Some(ref prefix) = thinking_params.system_prompt_prefix {
+            system_prompt = format!("{prefix}\n\n{system_prompt}");
+        }
+
         // Auto-save user message to memory (skip short/trivial messages)
         if config.memory.auto_save
-            && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-            && !memory::should_skip_autosave_content(&msg)
+            && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+            && !memory::should_skip_autosave_content(&effective_msg)
         {
             let user_key = autosave_memory_key("user_msg");
             let _ = mem
                 .store(
                     &user_key,
-                    &msg,
+                    &effective_msg,
                     MemoryCategory::Conversation,
                     memory_session_id.as_deref(),
                 )
@@ -3921,7 +3945,7 @@ pub async fn run(
         // Inject memory + hardware RAG context into user message
         let mem_context = build_context(
             mem.as_ref(),
-            &msg,
+            &effective_msg,
             config.memory.min_relevance_score,
             memory_session_id.as_deref(),
         )
@@ -3929,14 +3953,14 @@ pub async fn run(
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
-            .map(|r| build_hardware_context(r, &msg, &board_names, rag_limit))
+            .map(|r| build_hardware_context(r, &effective_msg, &board_names, rag_limit))
             .unwrap_or_default();
         let context = format!("{mem_context}{hw_context}");
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let enriched = if context.is_empty() {
-            format!("[{now}] {msg}")
+            format!("[{now}] {effective_msg}")
         } else {
-            format!("{context}[{now}] {msg}")
+            format!("{context}[{now}] {effective_msg}")
         };
 
         let mut history = vec![
@@ -3945,8 +3969,11 @@ pub async fn run(
         ];
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
-        let excluded_tools =
-            compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, &msg);
+        let excluded_tools = compute_excluded_mcp_tools(
+            &tools_registry,
+            &config.agent.tool_filter_groups,
+            &effective_msg,
+        );
 
         #[allow(unused_assignments)]
         let mut response = String::new();
@@ -3958,7 +3985,7 @@ pub async fn run(
                 observer.as_ref(),
                 &provider_name,
                 &model_name,
-                temperature,
+                effective_temperature,
                 false,
                 approval_manager.as_ref(),
                 channel_name,
@@ -4078,9 +4105,10 @@ pub async fn run(
                 "/quit" | "/exit" => break,
                 "/help" => {
                     println!("Available commands:");
-                    println!("  /help        Show this help message");
-                    println!("  /clear /new  Clear conversation history");
-                    println!("  /quit /exit  Exit interactive mode\n");
+                    println!("  /help             Show this help message");
+                    println!("  /clear /new       Clear conversation history");
+                    println!("  /quit /exit       Exit interactive mode");
+                    println!("  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n");
                     continue;
                 }
                 "/clear" | "/new" => {
@@ -4132,16 +4160,47 @@ pub async fn run(
                 _ => {}
             }
 
+            // ── Parse thinking directive from interactive input ───
+            let (thinking_directive, effective_input) =
+                match crate::agent::thinking::parse_thinking_directive(&user_input) {
+                    Some((level, remaining)) => {
+                        tracing::info!(thinking_level = ?level, "Thinking directive parsed");
+                        (Some(level), remaining)
+                    }
+                    None => (None, user_input.clone()),
+                };
+            let thinking_level = crate::agent::thinking::resolve_thinking_level(
+                thinking_directive,
+                None,
+                &config.agent.thinking,
+            );
+            let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
+            let turn_temperature = crate::agent::thinking::clamp_temperature(
+                temperature + thinking_params.temperature_adjustment,
+            );
+
+            // For non-Medium levels, temporarily patch the system prompt with prefix.
+            let turn_system_prompt;
+            if let Some(ref prefix) = thinking_params.system_prompt_prefix {
+                turn_system_prompt = format!("{prefix}\n\n{system_prompt}");
+                // Update the system message in history for this turn.
+                if let Some(sys_msg) = history.first_mut() {
+                    if sys_msg.role == "system" {
+                        sys_msg.content = turn_system_prompt.clone();
+                    }
+                }
+            }
+
             // Auto-save conversation turns (skip short/trivial messages)
             if config.memory.auto_save
-                && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                && !memory::should_skip_autosave_content(&user_input)
+                && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+                && !memory::should_skip_autosave_content(&effective_input)
             {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
                     .store(
                         &user_key,
-                        &user_input,
+                        &effective_input,
                         MemoryCategory::Conversation,
                         memory_session_id.as_deref(),
                     )
@@ -4151,7 +4210,7 @@ pub async fn run(
             // Inject memory + hardware RAG context into user message
             let mem_context = build_context(
                 mem.as_ref(),
-                &user_input,
+                &effective_input,
                 config.memory.min_relevance_score,
                 memory_session_id.as_deref(),
             )
@@ -4159,14 +4218,14 @@ pub async fn run(
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
             let hw_context = hardware_rag
                 .as_ref()
-                .map(|r| build_hardware_context(r, &user_input, &board_names, rag_limit))
+                .map(|r| build_hardware_context(r, &effective_input, &board_names, rag_limit))
                 .unwrap_or_default();
             let context = format!("{mem_context}{hw_context}");
             let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
             let enriched = if context.is_empty() {
-                format!("[{now}] {user_input}")
+                format!("[{now}] {effective_input}")
             } else {
-                format!("{context}[{now}] {user_input}")
+                format!("{context}[{now}] {effective_input}")
             };
 
             history.push(ChatMessage::user(&enriched));
@@ -4175,7 +4234,7 @@ pub async fn run(
             let excluded_tools = compute_excluded_mcp_tools(
                 &tools_registry,
                 &config.agent.tool_filter_groups,
-                &user_input,
+                &effective_input,
             );
 
             let response = loop {
@@ -4186,7 +4245,7 @@ pub async fn run(
                     observer.as_ref(),
                     &provider_name,
                     &model_name,
-                    temperature,
+                    turn_temperature,
                     false,
                     approval_manager.as_ref(),
                     channel_name,
@@ -4270,6 +4329,15 @@ pub async fn run(
 
             // Hard cap as a safety net.
             trim_history(&mut history, config.agent.max_history_messages);
+
+            // Restore base system prompt (remove per-turn thinking prefix).
+            if thinking_params.system_prompt_prefix.is_some() {
+                if let Some(sys_msg) = history.first_mut() {
+                    if sys_msg.role == "system" {
+                        sys_msg.content.clone_from(&system_prompt);
+                    }
+                }
+            }
 
             if let Some(path) = session_state_file.as_deref() {
                 save_interactive_session_history(path, &history)?;
@@ -4544,9 +4612,34 @@ pub async fn process_message(
         system_prompt.push_str(&deferred_section);
     }
 
+    // ── Parse thinking directive from user message ─────────────
+    let (thinking_directive, effective_message) =
+        match crate::agent::thinking::parse_thinking_directive(message) {
+            Some((level, remaining)) => {
+                tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
+                (Some(level), remaining)
+            }
+            None => (None, message.to_string()),
+        };
+    let thinking_level = crate::agent::thinking::resolve_thinking_level(
+        thinking_directive,
+        None,
+        &config.agent.thinking,
+    );
+    let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
+    let effective_temperature = crate::agent::thinking::clamp_temperature(
+        config.default_temperature + thinking_params.temperature_adjustment,
+    );
+
+    // Prepend thinking system prompt prefix when present.
+    if let Some(ref prefix) = thinking_params.system_prompt_prefix {
+        system_prompt = format!("{prefix}\n\n{system_prompt}");
+    }
+
+    let effective_msg_ref = effective_message.as_str();
     let mem_context = build_context(
         mem.as_ref(),
-        message,
+        effective_msg_ref,
         config.memory.min_relevance_score,
         session_id,
     )
@@ -4554,22 +4647,25 @@ pub async fn process_message(
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
     let hw_context = hardware_rag
         .as_ref()
-        .map(|r| build_hardware_context(r, message, &board_names, rag_limit))
+        .map(|r| build_hardware_context(r, effective_msg_ref, &board_names, rag_limit))
         .unwrap_or_default();
     let context = format!("{mem_context}{hw_context}");
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
     let enriched = if context.is_empty() {
-        format!("[{now}] {message}")
+        format!("[{now}] {effective_message}")
     } else {
-        format!("{context}[{now}] {message}")
+        format!("{context}[{now}] {effective_message}")
     };
 
     let mut history = vec![
         ChatMessage::system(&system_prompt),
         ChatMessage::user(&enriched),
     ];
-    let mut excluded_tools =
-        compute_excluded_mcp_tools(&tools_registry, &config.agent.tool_filter_groups, message);
+    let mut excluded_tools = compute_excluded_mcp_tools(
+        &tools_registry,
+        &config.agent.tool_filter_groups,
+        effective_msg_ref,
+    );
     if config.autonomy.level != AutonomyLevel::Full {
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
@@ -4581,7 +4677,7 @@ pub async fn process_message(
         observer.as_ref(),
         provider_name,
         &model_name,
-        config.default_temperature,
+        effective_temperature,
         true,
         "daemon",
         None,
