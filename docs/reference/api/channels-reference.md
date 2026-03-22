@@ -251,6 +251,7 @@ session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 pair_phone = "15551234567"         # optional; omit to use QR flow
 pair_code = ""                     # optional custom pair code
 allowed_numbers = ["*"]
+mention_only = false               # optional: require @mention in groups (DMs always processed)
 ```
 
 Notes:
@@ -258,6 +259,7 @@ Notes:
 - Build with `cargo build --features whatsapp-web` (or equivalent run command).
 - Keep `session_path` on persistent storage to avoid relinking after restart.
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
+- `mention_only = true` makes the bot ignore group messages unless the bot is @-mentioned. Direct messages are always processed. Bot identity is seeded from `pair_phone` and updated from the device store on connect.
 
 ### 4.8 Webhook Channel Config (Gateway)
 

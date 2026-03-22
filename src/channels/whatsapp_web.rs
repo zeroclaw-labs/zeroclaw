@@ -58,6 +58,10 @@ pub struct WhatsAppWebChannel {
     pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups
+    mention_only: bool,
+    /// Bot phone number (digits only), resolved from pair_phone or device identity at runtime
+    bot_phone: Arc<Mutex<Option<String>>>,
     /// Usage mode (business vs personal policy filtering)
     mode: crate::config::WhatsAppWebMode,
     /// DM policy when mode = personal
@@ -97,6 +101,7 @@ impl WhatsAppWebChannel {
     /// * `mode` - Usage mode (business or personal)
     /// * `dm_policy` - DM policy when mode = personal
     /// * `group_policy` - Group policy when mode = personal
+    /// * `mention_only` - When true, only respond to group messages that @-mention the bot
     /// * `self_chat_mode` - Whether to always respond in self-chat when mode = personal
     #[cfg(feature = "whatsapp-web")]
     pub fn new(
@@ -104,16 +109,33 @@ impl WhatsAppWebChannel {
         pair_phone: Option<String>,
         pair_code: Option<String>,
         allowed_numbers: Vec<String>,
+        mention_only: bool,
         mode: crate::config::WhatsAppWebMode,
         dm_policy: crate::config::WhatsAppChatPolicy,
         group_policy: crate::config::WhatsAppChatPolicy,
         self_chat_mode: bool,
     ) -> Self {
+        // Seed bot_phone from pair_phone (digits only)
+        let bot_phone = pair_phone
+            .as_ref()
+            .map(|p| p.chars().filter(|c| c.is_ascii_digit()).collect::<String>())
+            .filter(|digits| !digits.is_empty());
+
+        if mention_only && bot_phone.is_none() {
+            tracing::warn!(
+                "WhatsApp Web: mention_only enabled but pair_phone not set. \
+                Bot identity will be resolved after connection. Group messages \
+                will be skipped until identity is known."
+            );
+        }
+
         Self {
             session_path,
             pair_phone,
             pair_code,
             allowed_numbers,
+            mention_only,
+            bot_phone: Arc::new(Mutex::new(bot_phone)),
             mode,
             dm_policy,
             group_policy,
@@ -456,6 +478,114 @@ impl WhatsAppWebChannel {
         );
         Ok(())
     }
+
+    // ── Mention detection helpers (used when mention_only is enabled) ──
+
+    /// Extract digits from a JID string (e.g. "919211916069@s.whatsapp.net" -> "919211916069").
+    #[cfg(feature = "whatsapp-web")]
+    fn jid_digits(jid: &str) -> String {
+        let user_part = jid.split_once('@').map(|(u, _)| u).unwrap_or(jid);
+        user_part.chars().filter(|c| c.is_ascii_digit()).collect()
+    }
+
+    /// Extract mentioned JIDs from the base (unwrapped) message's context_info.
+    ///
+    /// Uses `get_base_message()` to see through ephemeral/view-once/edited/document wrappers,
+    /// matching the same unwrapping that `text_content()` performs.
+    ///
+    /// NOTE: Only checks `extended_text_message.context_info`. Media messages (image, video,
+    /// document) carry mentions in their own `context_info`, but `text_content()` already
+    /// ignores captions so those messages are filtered out upstream as empty text.
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_mentioned_jids(msg: &wa_rs_proto::whatsapp::Message) -> Vec<String> {
+        use wa_rs_core::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+
+        if let Some(ref ext) = base.extended_text_message {
+            if let Some(ref ctx) = ext.context_info {
+                if !ctx.mentioned_jid.is_empty() {
+                    return ctx.mentioned_jid.clone();
+                }
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Check whether the bot is mentioned -- either structurally or via text fallback.
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention(text: &str, mentioned_jids: &[String], bot_phone: &str) -> bool {
+        // 1. Structured: check if any mentioned_jid's digits match the bot's phone digits
+        for jid in mentioned_jids {
+            let digits = Self::jid_digits(jid);
+            if !digits.is_empty() && digits == bot_phone {
+                return true;
+            }
+        }
+
+        // 2. Text fallback: word-boundary-aware match for @<bot_digits>.
+        //    Scan all occurrences -- an earlier prefix false-match must not mask a later real mention.
+        let pattern = format!("@{bot_phone}");
+        let mut search_from = 0;
+        while let Some(rel_pos) = text[search_from..].find(&pattern) {
+            let pos = search_from + rel_pos;
+            let after_idx = pos + pattern.len();
+            // Leading boundary: @ must be preceded by whitespace or start-of-string
+            let leading_ok = pos == 0
+                || text[..pos]
+                    .chars()
+                    .next_back()
+                    .map_or(true, |ch| !ch.is_ascii_alphanumeric());
+            // Trailing boundary: character after digits must not be a digit
+            let trailing_ok = text[after_idx..]
+                .chars()
+                .next()
+                .map_or(true, |ch| !ch.is_ascii_digit());
+            if leading_ok && trailing_ok {
+                return true;
+            }
+            search_from = after_idx;
+        }
+
+        false
+    }
+
+    /// Strip text-based @<bot_phone> mention from the message, collapse whitespace.
+    /// Returns None if the result is empty after stripping.
+    #[cfg(feature = "whatsapp-web")]
+    fn normalize_incoming_content(text: &str, bot_phone: &str) -> Option<String> {
+        let pattern = format!("@{bot_phone}");
+        let mut result = String::with_capacity(text.len());
+        let mut remaining = text;
+
+        while let Some(pos) = remaining.find(&pattern) {
+            let after = pos + pattern.len();
+            let leading_ok = pos == 0
+                || remaining[..pos]
+                    .chars()
+                    .next_back()
+                    .map_or(true, |ch| !ch.is_ascii_alphanumeric());
+            let trailing_ok = remaining[after..]
+                .chars()
+                .next()
+                .map_or(true, |ch| !ch.is_ascii_digit());
+            if leading_ok && trailing_ok {
+                result.push_str(&remaining[..pos]);
+                remaining = &remaining[after..];
+            } else {
+                result.push_str(&remaining[..after]);
+                remaining = &remaining[after..];
+            }
+        }
+        result.push_str(remaining);
+
+        let normalized: String = result.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -649,6 +779,8 @@ impl Channel for WhatsAppWebChannel {
             let wa_dm_policy = self.dm_policy.clone();
             let wa_group_policy = self.group_policy.clone();
             let wa_self_chat_mode = self.self_chat_mode;
+            let mention_only = self.mention_only;
+            let bot_phone_clone = self.bot_phone.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -665,12 +797,14 @@ impl Channel for WhatsAppWebChannel {
                     let wa_mode = wa_mode.clone();
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
+                    let bot_phone_inner = bot_phone_clone.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
                                 let sender = sender_jid.user().to_string();
+                                let is_group = info.source.chat.is_group();
                                 let chat = info.source.chat.to_string();
 
                                 let mapped_phone = if sender_jid.is_lid() {
@@ -811,6 +945,43 @@ impl Channel for WhatsAppWebChannel {
                                     return;
                                 }
 
+                                // mention_only: skip group messages without a bot mention
+                                let content = if mention_only && is_group {
+                                    let bot_phone = bot_phone_inner.lock();
+                                    if let Some(ref bp) = *bot_phone {
+                                        let mentioned_jids =
+                                            Self::extract_mentioned_jids(&msg);
+                                        if !Self::contains_bot_mention(
+                                            &content,
+                                            &mentioned_jids,
+                                            bp,
+                                        ) {
+                                            tracing::debug!(
+                                                "WhatsApp Web: ignoring group message without bot mention"
+                                            );
+                                            return;
+                                        }
+                                        match Self::normalize_incoming_content(
+                                            &content, bp,
+                                        ) {
+                                            Some(c) => c,
+                                            None => {
+                                                tracing::debug!(
+                                                    "WhatsApp Web: message empty after stripping mention"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    } else {
+                                        tracing::debug!(
+                                            "WhatsApp Web: mention_only active but bot identity unknown, skipping group msg"
+                                        );
+                                        return;
+                                    }
+                                } else {
+                                    content
+                                };
+
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
@@ -831,6 +1002,27 @@ impl Channel for WhatsAppWebChannel {
                             Event::Connected(_) => {
                                 tracing::info!("WhatsApp Web connected successfully");
                                 WhatsAppWebChannel::reset_retry(&retry_count);
+                                // Resolve bot identity from the device store
+                                if mention_only {
+                                    let device = client
+                                        .persistence_manager()
+                                        .get_device_snapshot()
+                                        .await;
+                                    if let Some(ref pn) = device.pn {
+                                        let phone = pn.user();
+                                        let digits: String = phone
+                                            .chars()
+                                            .filter(|c: &char| c.is_ascii_digit())
+                                            .collect();
+                                        if !digits.is_empty() {
+                                            *bot_phone_inner.lock() = Some(digits.clone());
+                                            tracing::info!(
+                                                "WhatsApp Web: resolved bot identity from device: +{}",
+                                                digits
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             Event::LoggedOut(_) => {
                                 session_revoked.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1059,6 +1251,7 @@ impl WhatsAppWebChannel {
         _pair_phone: Option<String>,
         _pair_code: Option<String>,
         _allowed_numbers: Vec<String>,
+        _mention_only: bool,
         _mode: crate::config::WhatsAppWebMode,
         _dm_policy: crate::config::WhatsAppChatPolicy,
         _group_policy: crate::config::WhatsAppChatPolicy,
@@ -1129,6 +1322,7 @@ mod tests {
             None,
             None,
             vec!["+1234567890".into()],
+            false,
             crate::config::WhatsAppWebMode::default(),
             crate::config::WhatsAppChatPolicy::default(),
             crate::config::WhatsAppChatPolicy::default(),
@@ -1159,6 +1353,7 @@ mod tests {
             None,
             None,
             vec!["*".into()],
+            false,
             crate::config::WhatsAppWebMode::default(),
             crate::config::WhatsAppChatPolicy::default(),
             crate::config::WhatsAppChatPolicy::default(),
@@ -1176,6 +1371,7 @@ mod tests {
             None,
             None,
             vec![],
+            false,
             crate::config::WhatsAppWebMode::default(),
             crate::config::WhatsAppChatPolicy::default(),
             crate::config::WhatsAppChatPolicy::default(),
@@ -1367,5 +1563,190 @@ mod tests {
                 "/tmp/test.db-shm".to_string(),
             ]
         );
+    }
+
+    // ── Mention detection tests ──
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn jid_digits_extracts_phone_from_jid() {
+        assert_eq!(
+            WhatsAppWebChannel::jid_digits("919211916069@s.whatsapp.net"),
+            "919211916069"
+        );
+        assert_eq!(
+            WhatsAppWebChannel::jid_digits("76188559093817@lid"),
+            "76188559093817"
+        );
+        assert_eq!(WhatsAppWebChannel::jid_digits("15551234567"), "15551234567");
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_structured() {
+        let jids = vec!["919211916069@s.whatsapp.net".to_string()];
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "hey @919211916069 check this",
+            &jids,
+            "919211916069"
+        ));
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "hey check this",
+            &jids,
+            "919211916069"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_text_fallback() {
+        let no_jids: Vec<String> = vec![];
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "hey @919211916069 check this",
+            &no_jids,
+            "919211916069"
+        ));
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "hey @919211916069",
+            &no_jids,
+            "919211916069"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_prefix_false_positive() {
+        let no_jids: Vec<String> = vec![];
+        assert!(!WhatsAppWebChannel::contains_bot_mention(
+            "hey @919211916069 check this",
+            &no_jids,
+            "91921191606"
+        ));
+        assert!(!WhatsAppWebChannel::contains_bot_mention(
+            "hey @155512345678",
+            &no_jids,
+            "15551234567"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_no_match() {
+        let no_jids: Vec<String> = vec![];
+        assert!(!WhatsAppWebChannel::contains_bot_mention(
+            "just a regular message",
+            &no_jids,
+            "919211916069"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_scans_past_prefix_false_match() {
+        let no_jids: Vec<String> = vec![];
+        assert!(WhatsAppWebChannel::contains_bot_mention(
+            "@9192119160691 real @919211916069",
+            &no_jids,
+            "919211916069"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn contains_bot_mention_rejects_embedded_at() {
+        let no_jids: Vec<String> = vec![];
+        assert!(!WhatsAppWebChannel::contains_bot_mention(
+            "foo@919211916069 bar",
+            &no_jids,
+            "919211916069"
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn normalize_incoming_content_strips_mention() {
+        assert_eq!(
+            WhatsAppWebChannel::normalize_incoming_content(
+                "@919211916069 what's the weather?",
+                "919211916069"
+            ),
+            Some("what's the weather?".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn normalize_incoming_content_strips_multiple() {
+        assert_eq!(
+            WhatsAppWebChannel::normalize_incoming_content(
+                "@919211916069 hey @919211916069 hello",
+                "919211916069"
+            ),
+            Some("hey hello".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn normalize_incoming_content_returns_none_for_empty() {
+        assert_eq!(
+            WhatsAppWebChannel::normalize_incoming_content("@919211916069", "919211916069"),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn normalize_incoming_content_preserves_prefix_match() {
+        assert_eq!(
+            WhatsAppWebChannel::normalize_incoming_content("@155512345678 hello", "15551234567"),
+            Some("@155512345678 hello".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn normalize_incoming_content_ignores_embedded_at() {
+        assert_eq!(
+            WhatsAppWebChannel::normalize_incoming_content(
+                "foo@919211916069 hello",
+                "919211916069"
+            ),
+            Some("foo@919211916069 hello".to_string())
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn constructor_seeds_bot_phone_from_pair_phone() {
+        let ch = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            Some("919211916069".into()),
+            None,
+            vec!["*".into()],
+            true,
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
+        );
+        assert_eq!(*ch.bot_phone.lock(), Some("919211916069".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn constructor_no_pair_phone_leaves_bot_phone_none() {
+        let ch = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            None,
+            None,
+            vec!["*".into()],
+            true,
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
+        );
+        assert_eq!(*ch.bot_phone.lock(), None);
     }
 }
