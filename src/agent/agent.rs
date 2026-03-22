@@ -17,6 +17,33 @@ use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Events emitted during a streaming agent turn.
+///
+/// Used by `turn_streaming()` to push real-time updates to callers
+/// (e.g. WebSocket handlers) as tool calls execute.
+#[derive(Debug, Clone)]
+pub enum AgentEvent {
+    /// The agent is about to invoke a tool.
+    ToolCall {
+        id: String,
+        name: String,
+        args: serde_json::Value,
+    },
+    /// A tool has finished executing.
+    ToolResult {
+        id: String,
+        name: String,
+        output: String,
+        success: bool,
+    },
+    /// Intermediate text emitted before tool calls.
+    Text(String),
+    /// Final complete response — the turn is finished.
+    Done(String),
+    /// An error occurred during the turn.
+    Error(String),
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -798,6 +825,223 @@ impl Agent {
         )
     }
 
+    /// Streaming version of [`turn()`] that emits [`AgentEvent`]s as tool
+    /// calls execute, allowing callers to display real-time progress.
+    ///
+    /// The final response text is both sent as `AgentEvent::Done` on the
+    /// channel and returned as `Ok(String)`.
+    ///
+    /// If the receiver is dropped (e.g. client disconnects), the turn
+    /// completes normally but stops emitting events — the agent still
+    /// produces the response text for session persistence.
+    ///
+    /// NOTE: This method intentionally mirrors the logic in [`turn()`].
+    /// A future refactor could extract the shared agent loop into a
+    /// private helper that both methods call.
+    pub async fn turn_streaming(
+        &mut self,
+        user_message: &str,
+        tx: &tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<String> {
+        if self.history.is_empty() {
+            let system_prompt = self.build_system_prompt()?;
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(
+                    system_prompt,
+                )));
+        }
+
+        let context = self
+            .memory_loader
+            .load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
+            .await
+            .unwrap_or_default();
+
+        if self.auto_save {
+            let _ = self
+                .memory
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    self.memory_session_id.as_deref(),
+                )
+                .await;
+        }
+
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if context.is_empty() {
+            format!("[{now}] {user_message}")
+        } else {
+            format!("{context}[{now}] {user_message}")
+        };
+
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
+
+        let effective_model = self.classify_model(user_message);
+
+        for _ in 0..self.config.max_tool_iterations {
+            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Response cache: check before LLM call
+            let cache_key = if self.temperature == 0.0 {
+                self.response_cache.as_ref().map(|_| {
+                    let last_user = messages
+                        .iter()
+                        .rfind(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    let system = messages
+                        .iter()
+                        .find(|m| m.role == "system")
+                        .map(|m| m.content.as_str());
+                    crate::memory::response_cache::ResponseCache::cache_key(
+                        &effective_model,
+                        system,
+                        last_user,
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let Ok(Some(cached)) = cache.get(key) {
+                    self.observer.record_event(&ObserverEvent::CacheHit {
+                        cache_type: "response".into(),
+                        tokens_saved: 0,
+                    });
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            cached.clone(),
+                        )));
+                    self.trim_history();
+                    let _ = tx.send(AgentEvent::Done(cached.clone())).await;
+                    return Ok(cached);
+                }
+                self.observer.record_event(&ObserverEvent::CacheMiss {
+                    cache_type: "response".into(),
+                });
+            }
+
+            let response = match self
+                .provider
+                .chat(
+                    ChatRequest {
+                        messages: &messages,
+                        tools: if self.tool_dispatcher.should_send_tool_specs() {
+                            Some(&self.tool_specs)
+                        } else {
+                            None
+                        },
+                    },
+                    &effective_model,
+                    self.temperature,
+                )
+                .await
+            {
+                Ok(resp) => resp,
+                Err(err) => {
+                    let _ = tx.send(AgentEvent::Error(err.to_string())).await;
+                    return Err(err);
+                }
+            };
+
+            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            if calls.is_empty() {
+                let final_text = if text.is_empty() {
+                    response.text.unwrap_or_default()
+                } else {
+                    text
+                };
+
+                // Store in response cache
+                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                    let token_count = response
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.output_tokens)
+                        .unwrap_or(0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
+                }
+
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        final_text.clone(),
+                    )));
+                self.trim_history();
+
+                let _ = tx.send(AgentEvent::Done(final_text.clone())).await;
+                return Ok(final_text);
+            }
+
+            // Emit intermediate text
+            if !text.is_empty() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        text.clone(),
+                    )));
+                let _ = tx.send(AgentEvent::Text(text)).await;
+            }
+
+            // Emit tool_call events for each pending call
+            for call in &calls {
+                let id = call
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let _ = tx
+                    .send(AgentEvent::ToolCall {
+                        id: id.clone(),
+                        name: call.name.clone(),
+                        args: call.arguments.clone(),
+                    })
+                    .await;
+            }
+
+            self.history.push(ConversationMessage::AssistantToolCalls {
+                text: response.text.clone(),
+                tool_calls: response.tool_calls.clone(),
+                reasoning_content: response.reasoning_content.clone(),
+            });
+
+            let results = self.execute_tools(&calls).await;
+
+            // Emit tool_result events for each completed call
+            for (call, result) in calls.iter().zip(results.iter()) {
+                let id = call
+                    .tool_call_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let _ = tx
+                    .send(AgentEvent::ToolResult {
+                        id,
+                        name: result.name.clone(),
+                        output: result.output.clone(),
+                        success: result.success,
+                    })
+                    .await;
+            }
+
+            let formatted = self.tool_dispatcher.format_results(&results);
+            self.history.push(formatted);
+            self.trim_history();
+        }
+
+        let err_msg = format!(
+            "Agent exceeded maximum tool iterations ({})",
+            self.config.max_tool_iterations
+        );
+        let _ = tx.send(AgentEvent::Error(err_msg.clone())).await;
+        anyhow::bail!("{err_msg}")
+    }
+
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
         self.turn(message).await
     }
@@ -1323,5 +1567,190 @@ mod tests {
             matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
         );
         assert_eq!(history.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn turn_streaming_emits_done_for_text_response() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![crate::providers::ChatResponse {
+                text: Some("streamed hello".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            }]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let result = agent.turn_streaming("hi", &tx).await.unwrap();
+        assert_eq!(result, "streamed hello");
+        drop(tx);
+
+        // Should have received a Done event
+        let mut got_done = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Done(ref text) if text == "streamed hello") {
+                got_done = true;
+            }
+        }
+        assert!(got_done, "expected AgentEvent::Done with response text");
+    }
+
+    #[tokio::test]
+    async fn turn_streaming_emits_tool_events() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![
+                crate::providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "tc1".into(),
+                        name: "echo".into(),
+                        arguments: r#"{"input": "test"}"#.into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                },
+                crate::providers::ChatResponse {
+                    text: Some("tool done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let result = agent.turn_streaming("use the tool", &tx).await.unwrap();
+        assert_eq!(result, "tool done");
+        drop(tx);
+
+        // Collect all events
+        let mut events = vec![];
+        while let Some(event) = rx.recv().await {
+            events.push(event);
+        }
+
+        // Should have ToolCall, ToolResult, and Done events
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolCall { name, .. } if name == "echo")),
+            "expected AgentEvent::ToolCall for 'echo'"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ToolResult { name, .. } if name == "echo")),
+            "expected AgentEvent::ToolResult for 'echo'"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Done(ref text) if text == "tool done")),
+            "expected AgentEvent::Done"
+        );
+    }
+
+    /// A provider that always returns an error.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            anyhow::bail!("provider unavailable")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            anyhow::bail!("provider unavailable")
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streaming_emits_error_on_provider_failure() {
+        let provider: Box<dyn Provider> = Box::new(FailingProvider);
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        let result = agent.turn_streaming("trigger error", &tx).await;
+        assert!(result.is_err(), "expected error from provider");
+        drop(tx);
+
+        // Should have received an Error event
+        let mut got_error = false;
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Error(_)) {
+                got_error = true;
+            }
+        }
+        assert!(got_error, "expected AgentEvent::Error on provider failure");
     }
 }

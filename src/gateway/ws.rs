@@ -311,7 +311,10 @@ async fn handle_socket(
     }
 }
 
-/// Process a single chat message through the agent and send the response.
+/// Process a single chat message through the agent and stream events to the client.
+///
+/// Uses `turn_streaming()` to emit real-time `tool_call` and `tool_result`
+/// frames so clients can display tool execution progress.
 async fn process_chat_message(
     state: &AppState,
     agent: &mut crate::agent::Agent,
@@ -319,6 +322,8 @@ async fn process_chat_message(
     content: &str,
     session_key: &str,
 ) {
+    use crate::agent::AgentEvent;
+
     let provider_label = state
         .config
         .lock()
@@ -333,20 +338,65 @@ async fn process_chat_message(
         "model": state.model,
     }));
 
-    // Multi-turn chat via persistent Agent (history is maintained across turns)
-    match agent.turn(content).await {
-        Ok(response) => {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(32);
+
+    // Run the agent turn and event forwarding concurrently.
+    // We use a channel + select loop so we can stream events to the WS
+    // client as they're produced, while the agent keeps running.
+    let turn_result = tokio::join!(
+        // Producer: run the agent turn, sending events to tx
+        async {
+            let result = agent.turn_streaming(content, &tx).await;
+            drop(tx); // close channel so the consumer loop exits
+            result
+        },
+        // Consumer: forward events from rx to the WebSocket
+        async {
+            while let Some(event) = rx.recv().await {
+                let frame = match &event {
+                    AgentEvent::ToolCall { id, name, args } => serde_json::json!({
+                        "type": "tool_call",
+                        "id": id,
+                        "name": name,
+                        "args": args,
+                    }),
+                    AgentEvent::ToolResult {
+                        id,
+                        name,
+                        output,
+                        success,
+                    } => serde_json::json!({
+                        "type": "tool_result",
+                        "id": id,
+                        "name": name,
+                        "output": output,
+                        "success": success,
+                    }),
+                    AgentEvent::Text(text) => serde_json::json!({
+                        "type": "chunk",
+                        "content": text,
+                    }),
+                    AgentEvent::Done(full_response) => serde_json::json!({
+                        "type": "done",
+                        "full_response": full_response,
+                    }),
+                    AgentEvent::Error(message) => serde_json::json!({
+                        "type": "error",
+                        "message": message,
+                    }),
+                };
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            }
+        }
+    );
+
+    match turn_result.0 {
+        Ok(ref response) => {
             // Persist assistant response
             if let Some(ref backend) = state.session_backend {
-                let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                let assistant_msg = crate::providers::ChatMessage::assistant(response);
                 let _ = backend.append(session_key, &assistant_msg);
             }
-
-            let done = serde_json::json!({
-                "type": "done",
-                "full_response": response,
-            });
-            let _ = sender.send(Message::Text(done.to_string().into())).await;
 
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
@@ -355,15 +405,10 @@ async fn process_chat_message(
                 "model": state.model,
             }));
         }
-        Err(e) => {
+        Err(ref e) => {
             let sanitized = crate::providers::sanitize_api_error(&e.to_string());
-            let err = serde_json::json!({
-                "type": "error",
-                "message": sanitized,
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-
-            // Broadcast error event
+            // Error frame was already sent by turn_streaming via the channel;
+            // broadcast to internal event bus for monitoring.
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "error",
                 "component": "ws_chat",
