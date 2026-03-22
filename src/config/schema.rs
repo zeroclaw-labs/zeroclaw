@@ -4200,7 +4200,12 @@ pub struct AutonomyConfig {
     /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
     /// Resolved paths outside the workspace still require `allowed_roots`.
     pub workspace_only: bool,
-    /// Allowlist of executable names permitted for shell execution.
+    /// Shell command policy entries.
+    ///
+    /// Default is `["*"]`, which enables blacklist-oriented behavior:
+    /// structurally safe commands may run unless blocked by risk gates.
+    /// Concrete entries act as explicit overrides for commands that would
+    /// otherwise remain blocked by the high-risk policy.
     pub allowed_commands: Vec<String>,
     /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
     pub forbidden_paths: Vec<String>,
@@ -4210,11 +4215,17 @@ pub struct AutonomyConfig {
     pub max_cost_per_day_cents: u32,
 
     /// Require explicit approval for medium-risk shell commands.
-    #[serde(default = "default_true")]
+    ///
+    /// Default: `false`. ZeroClaw now uses a blacklist-oriented shell policy,
+    /// so only approval-gated risk tiers should interrupt execution.
+    #[serde(default = "default_false")]
     pub require_approval_for_medium_risk: bool,
 
-    /// Block high-risk shell commands even if allowlisted.
-    #[serde(default = "default_true")]
+    /// Block high-risk shell commands unless explicitly overridden in `allowed_commands`.
+    ///
+    /// Default: `false`. In supervised mode, high-risk commands prompt for
+    /// approval instead of being blocked outright.
+    #[serde(default = "default_false")]
     pub block_high_risk_commands: bool,
 
     /// Additional environment variables allowed for shell tool subprocesses.
@@ -4277,21 +4288,7 @@ impl Default for AutonomyConfig {
         Self {
             level: AutonomyLevel::Supervised,
             workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-                "date".into(),
-            ],
+            allowed_commands: vec!["*".into()],
             forbidden_paths: vec![
                 "/etc".into(),
                 "/root".into(),
@@ -4314,8 +4311,8 @@ impl Default for AutonomyConfig {
             ],
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
-            require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
+            require_approval_for_medium_risk: false,
+            block_high_risk_commands: false,
             shell_env_passthrough: vec![],
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
@@ -7019,12 +7016,44 @@ fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
     default_dir.join(ACTIVE_WORKSPACE_STATE_FILE)
 }
 
+fn normalize_path_for_prefix_check(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+
+    let mut missing_components = Vec::new();
+    let mut cursor = path;
+    loop {
+        if let Ok(canonical_existing) = cursor.canonicalize() {
+            let mut rebuilt = canonical_existing;
+            for component in missing_components.iter().rev() {
+                rebuilt.push(component);
+            }
+            return rebuilt;
+        }
+
+        let Some(file_name) = cursor.file_name() else {
+            break;
+        };
+        missing_components.push(file_name.to_os_string());
+
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        cursor = parent;
+    }
+
+    path.to_path_buf()
+}
+
 /// Returns `true` if `path` lives under the OS temp directory.
 fn is_temp_directory(path: &Path) -> bool {
     let temp = std::env::temp_dir();
-    // Canonicalize when possible to handle symlinks (macOS /var → /private/var)
-    let canon_temp = temp.canonicalize().unwrap_or_else(|_| temp.clone());
-    let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Normalize via the nearest existing ancestor so non-existent subpaths
+    // still compare correctly on systems where temp uses symlinked prefixes
+    // such as macOS `/var` -> `/private/var`.
+    let canon_temp = normalize_path_for_prefix_check(&temp);
+    let canon_path = normalize_path_for_prefix_check(path);
     canon_path.starts_with(&canon_temp)
 }
 
@@ -7477,9 +7506,10 @@ async fn ensure_bootstrap_files(workspace_dir: &Path) -> Result<()> {
 }
 
 impl Config {
-    pub async fn load_or_init() -> Result<Self> {
-        let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
-
+    async fn load_or_init_with_dirs(
+        default_zeroclaw_dir: PathBuf,
+        default_workspace_dir: PathBuf,
+    ) -> Result<Self> {
         let (zeroclaw_dir, workspace_dir, resolution_source) =
             resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
 
@@ -7939,6 +7969,15 @@ impl Config {
             );
             Ok(config)
         }
+    }
+
+    pub async fn load_or_init() -> Result<Self> {
+        let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+        Box::pin(Self::load_or_init_with_dirs(
+            default_zeroclaw_dir,
+            default_workspace_dir,
+        ))
+        .await
     }
 
     fn lookup_model_provider_profile(
@@ -9667,14 +9706,20 @@ mod tests {
         let a = AutonomyConfig::default();
         assert_eq!(a.level, AutonomyLevel::Supervised);
         assert!(a.workspace_only);
-        assert!(a.allowed_commands.contains(&"git".to_string()));
-        assert!(a.allowed_commands.contains(&"cargo".to_string()));
+        assert_eq!(a.allowed_commands, vec!["*".to_string()]);
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
         assert_eq!(a.max_actions_per_hour, 20);
         assert_eq!(a.max_cost_per_day_cents, 500);
-        assert!(a.require_approval_for_medium_risk);
-        assert!(a.block_high_risk_commands);
+        assert!(!a.require_approval_for_medium_risk);
+        assert!(!a.block_high_risk_commands);
         assert!(a.shell_env_passthrough.is_empty());
+    }
+
+    #[test]
+    async fn autonomy_config_deserialize_uses_blacklist_defaults() {
+        let a: AutonomyConfig = toml::from_str("").unwrap();
+        assert!(!a.require_approval_for_medium_risk);
+        assert!(!a.block_high_risk_commands);
     }
 
     #[test]
@@ -12086,24 +12131,16 @@ default_model = "legacy-model"
             .await
             .unwrap();
 
-        // Config::load_or_init still reads HOME to find the marker, so we
-        // must override HOME here. The persist above already wrote to the
-        // correct temp location, so no stale marker can leak.
-        let original_home = std::env::var("HOME").ok();
-        std::env::set_var("HOME", &temp_home);
-        std::env::remove_var("ZEROCLAW_WORKSPACE");
-
-        let config = Box::pin(Config::load_or_init()).await.unwrap();
+        let config = Box::pin(Config::load_or_init_with_dirs(
+            temp_default_dir.clone(),
+            temp_default_dir.join("workspace"),
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(config.config_path, custom_config_dir.join("config.toml"));
         assert_eq!(config.workspace_dir, custom_config_dir.join("workspace"));
         assert_eq!(config.default_model.as_deref(), Some("persisted-profile"));
-
-        if let Some(home) = original_home {
-            std::env::set_var("HOME", home);
-        } else {
-            std::env::remove_var("HOME");
-        }
         let _ = fs::remove_dir_all(temp_home).await;
     }
 

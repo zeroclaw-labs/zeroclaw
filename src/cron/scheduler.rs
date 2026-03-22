@@ -536,7 +536,7 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    // Unified command validation: allowlist + risk + path checks in one call.
+    // Unified command validation: structural safety + risk + path checks in one call.
     // Jobs created via the validated helpers were already checked at creation
     // time, but we re-validate at execution time to catch policy changes and
     // manually-edited job stores.
@@ -720,7 +720,7 @@ mod tests {
         let (success, output) = run_job_command(&config, &security, &job).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
-        assert!(output.to_lowercase().contains("not allowed"));
+        assert!(output.contains("explicit approval"));
     }
 
     #[tokio::test]

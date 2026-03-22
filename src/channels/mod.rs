@@ -98,8 +98,8 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
-    build_tool_instructions, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scrub_credentials,
+    auto_compact_history, build_tool_instructions, clear_model_switch_request,
+    get_model_switch_state, is_model_switch_requested, run_tool_call_loop, scrub_credentials,
 };
 use crate::approval::ApprovalManager;
 use crate::config::Config;
@@ -210,13 +210,7 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
-/// Proactive context-window budget in estimated characters (~4 chars/token).
-/// When the total character count of conversation history exceeds this limit,
-/// older turns are dropped before the request is sent to the provider,
-/// preventing context-window-exceeded errors.  Set conservatively below
-/// common context windows (128 k tokens ≈ 512 k chars) to leave room for
-/// system prompt, memory context, and model output.
-const PROACTIVE_CONTEXT_BUDGET_CHARS: usize = 400_000;
+const CHANNEL_HISTORY_SUMMARY_MAX_CHARS: usize = 1_800;
 /// Guardrail for hook-modified outbound channel content.
 const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
@@ -664,6 +658,10 @@ fn build_channel_system_prompt(
     prompt
 }
 
+fn is_history_summary_message(content: &str) -> bool {
+    content.starts_with("[Conversation summary]") || content.starts_with("[Compaction summary]")
+}
+
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -673,6 +671,9 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
             (true, "user") => {
                 normalized.push(turn);
                 expecting_user = false;
+            }
+            (true, "assistant") if is_history_summary_message(&turn.content) => {
+                normalized.push(turn);
             }
             (false, "assistant") => {
                 normalized.push(turn);
@@ -1084,6 +1085,71 @@ fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
     replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
 }
 
+fn estimate_channel_history_tokens(turns: &[ChatMessage]) -> usize {
+    turns
+        .iter()
+        .map(|turn| turn.content.len().div_ceil(4) + 4)
+        .sum()
+}
+
+fn configured_channel_history_budget_tokens(config: &crate::config::AgentConfig) -> usize {
+    let max_tokens = config.max_context_tokens.max(1);
+    let budget = max_tokens.saturating_mul(3).div_ceil(4);
+    budget.max(max_tokens.min(256))
+}
+
+fn recent_turn_boundary(turns: &[ChatMessage], keep_recent: usize) -> usize {
+    if turns.len() <= keep_recent {
+        return 0;
+    }
+
+    let fallback = turns.len().saturating_sub(keep_recent);
+    let mut boundary = fallback;
+    while boundary > 0 && turns.get(boundary).is_some_and(|turn| turn.role != "user") {
+        boundary -= 1;
+    }
+
+    if boundary == 0 {
+        fallback
+    } else {
+        boundary
+    }
+}
+
+fn build_channel_history_summary(turns: &[ChatMessage]) -> Option<ChatMessage> {
+    let mut summary = String::from("[Conversation summary]\n");
+
+    for turn in turns {
+        let content = turn
+            .content
+            .strip_prefix("[Conversation summary]\n")
+            .unwrap_or(turn.content.as_str());
+        let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed = collapsed.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let label = match turn.role.as_str() {
+            "user" => "User",
+            "assistant" => "Assistant",
+            _ => "Tool",
+        };
+        let line = truncate_with_ellipsis(trimmed, CHANNEL_HISTORY_COMPACT_CONTENT_CHARS);
+        let entry = format!("- {label}: {line}\n");
+        if summary.chars().count() + entry.chars().count() > CHANNEL_HISTORY_SUMMARY_MAX_CHARS {
+            break;
+        }
+        summary.push_str(&entry);
+    }
+
+    if summary == "[Conversation summary]\n" {
+        None
+    } else {
+        Some(ChatMessage::assistant(summary.trim_end().to_string()))
+    }
+}
+
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
     let mut histories = ctx
         .conversation_histories
@@ -1098,10 +1164,22 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
         return false;
     }
 
-    let keep_from = turns
-        .len()
-        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(turns[keep_from..].to_vec());
+    let normalized = normalize_cached_channel_turns(turns.clone());
+    if normalized.is_empty() {
+        turns.clear();
+        return false;
+    }
+
+    let recent_start = recent_turn_boundary(&normalized, CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+    let mut compacted = if recent_start > 0 {
+        let mut rebuilt = build_channel_history_summary(&normalized[..recent_start])
+            .into_iter()
+            .collect::<Vec<_>>();
+        rebuilt.extend_from_slice(&normalized[recent_start..]);
+        normalize_cached_channel_turns(rebuilt)
+    } else {
+        normalized
+    };
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
@@ -1119,29 +1197,107 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
     true
 }
 
-/// Proactively trim conversation turns so that the total estimated character
-/// count stays within [`PROACTIVE_CONTEXT_BUDGET_CHARS`].  Drops the oldest
-/// turns first, but always preserves the most recent turn (the current user
-/// message).  Returns the number of turns dropped.
-fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
-    let total_chars: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-    if total_chars <= budget || turns.len() <= 1 {
+/// Proactively compact conversation turns so that the estimated token count
+/// stays within the configured history budget. Older turns are summarized
+/// first; if that is still insufficient, the oldest retained turns are
+/// dropped. The newest turn is always preserved.
+fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget_tokens: usize) -> usize {
+    let original_len = turns.len();
+    if estimate_channel_history_tokens(turns) <= budget_tokens || turns.len() <= 1 {
         return 0;
     }
 
-    let mut excess = total_chars.saturating_sub(budget);
-    let mut drop_count = 0;
+    let mut compacted = normalize_cached_channel_turns(turns.clone());
+    let recent_start = recent_turn_boundary(&compacted, CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
 
-    // Walk from the oldest turn forward, but never drop the very last turn.
-    while excess > 0 && drop_count < turns.len().saturating_sub(1) {
-        excess = excess.saturating_sub(turns[drop_count].content.chars().count());
-        drop_count += 1;
+    if recent_start > 0 {
+        if let Some(summary) = build_channel_history_summary(&compacted[..recent_start]) {
+            let mut rebuilt = vec![summary];
+            rebuilt.extend_from_slice(&compacted[recent_start..]);
+            compacted = normalize_cached_channel_turns(rebuilt);
+        }
     }
 
-    if drop_count > 0 {
-        turns.drain(..drop_count);
+    while estimate_channel_history_tokens(&compacted) > budget_tokens && compacted.len() > 1 {
+        compacted.remove(0);
     }
-    drop_count
+
+    *turns = compacted;
+    original_len.saturating_sub(turns.len())
+}
+
+fn compact_runtime_history_after_overflow(
+    history: &mut Vec<ChatMessage>,
+    budget_tokens: usize,
+) -> usize {
+    if history.is_empty() {
+        return 0;
+    }
+
+    let (system_prompt, mut turns) = if history.first().is_some_and(|msg| msg.role == "system") {
+        (Some(history[0].clone()), history[1..].to_vec())
+    } else {
+        (None, history.clone())
+    };
+
+    let dropped = proactive_trim_turns(&mut turns, budget_tokens);
+    if dropped == 0 {
+        return 0;
+    }
+
+    history.clear();
+    if let Some(system_prompt) = system_prompt {
+        history.push(system_prompt);
+    }
+    history.extend(turns);
+    dropped
+}
+
+fn persist_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str, turns: &[ChatMessage]) {
+    {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        histories.insert(sender_key.to_string(), turns.to_vec());
+    }
+
+    if let Some(ref store) = ctx.session_store {
+        if let Err(err) = store.replace(sender_key, turns) {
+            tracing::warn!("Failed to rewrite session history for {sender_key}: {err}");
+        }
+    }
+}
+
+fn repair_sender_history_tool_results(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    budget_tokens: usize,
+) -> usize {
+    let (repaired_count, rewritten_turns) = {
+        let mut histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(turns) = histories.get_mut(sender_key) else {
+            return 0;
+        };
+
+        let repaired = crate::agent::context::repair_oversized_tool_results(turns, budget_tokens);
+        if repaired == 0 {
+            return 0;
+        }
+
+        (repaired, turns.clone())
+    };
+
+    if let Some(ref store) = ctx.session_store {
+        if let Err(err) = store.replace(sender_key, &rewritten_turns) {
+            tracing::warn!("Failed to persist repaired session history for {sender_key}: {err}");
+        }
+    }
+
+    repaired_count
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
@@ -2204,7 +2360,7 @@ async fn process_channel_message(
     // session file and permanently breaks the conversation (fixes #3674).
     // We skip the last turn (the current message) so the vision check can
     // still reject fresh image sends with a proper error.
-    if !active_provider.supports_vision() && prior_turns.len() > 1 {
+    if !active_provider.supports_vision_for_model(&route.model) && prior_turns.len() > 1 {
         let last_idx = prior_turns.len() - 1;
         for turn in &mut prior_turns[..last_idx] {
             if turn.content.contains("[IMAGE:") {
@@ -2221,15 +2377,65 @@ async fn process_channel_message(
         }
     }
 
+    let history_budget_tokens = configured_channel_history_budget_tokens(&ctx.prompt_config.agent);
+    let repaired_turns = crate::agent::context::repair_oversized_tool_results(
+        &mut prior_turns,
+        history_budget_tokens,
+    );
+    if repaired_turns > 0 {
+        persist_sender_history(ctx.as_ref(), &history_key, &prior_turns);
+        tracing::info!(
+            channel = %msg.channel,
+            sender = %msg.sender,
+            repaired_turns,
+            history_budget_tokens,
+            "Re-truncated oversized cached tool results before provider call"
+        );
+    }
+
+    // Compact older turns into a summary before the hard trim fallback so
+    // multi-turn channel sessions keep more useful context under budget.
+    match auto_compact_history(
+        &mut prior_turns,
+        active_provider.as_ref(),
+        &route.model,
+        ctx.prompt_config.agent.max_history_messages,
+        history_budget_tokens,
+    )
+    .await
+    {
+        Ok(true) => {
+            persist_sender_history(ctx.as_ref(), &history_key, &prior_turns);
+            tracing::info!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                remaining_turns = prior_turns.len(),
+                history_budget_tokens,
+                "Auto-compacted older channel history into a summary"
+            );
+        }
+        Ok(false) => {}
+        Err(err) => {
+            tracing::debug!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                "Failed to auto-compact channel history: {err}"
+            );
+        }
+    }
+
     // Proactively trim conversation history before sending to the provider
-    // to prevent context-window-exceeded errors (bug #3460).
-    let dropped = proactive_trim_turns(&mut prior_turns, PROACTIVE_CONTEXT_BUDGET_CHARS);
+    // to prevent context-window-exceeded errors when summary compaction alone
+    // is not enough (bug #3460).
+    let dropped = proactive_trim_turns(&mut prior_turns, history_budget_tokens);
     if dropped > 0 {
+        persist_sender_history(ctx.as_ref(), &history_key, &prior_turns);
         tracing::info!(
             channel = %msg.channel,
             sender = %msg.sender,
             dropped_turns = dropped,
             remaining_turns = prior_turns.len(),
+            history_budget_tokens,
             "Proactively trimmed conversation history to fit context budget"
         );
     }
@@ -2436,6 +2642,7 @@ async fn process_channel_message(
         crate::agent::loop_::ToolLoopCostTrackingContext::new(state.tracker, state.prices)
     });
     let llm_call_start = Instant::now();
+    let mut overflow_recovery_attempted = false;
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
@@ -2460,6 +2667,7 @@ async fn process_channel_message(
                     Some(msg.reply_target.as_str()),
                     &ctx.multimodal,
                     ctx.max_tool_iterations,
+                    Some(history_budget_tokens),
                     Some(cancellation_token.clone()),
                     delta_tx.clone(),
                     ctx.hooks.as_deref(),
@@ -2517,6 +2725,51 @@ async fn process_channel_message(
                         clear_model_switch_request();
                         // Fall through with the original error
                     }
+                }
+            }
+        }
+
+        // OpenClaw-style recovery: if context overflows, compact local/runtime
+        // history and retry once before surfacing an error to the user.
+        if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
+            if is_context_window_overflow_error(e) && !overflow_recovery_attempted {
+                overflow_recovery_attempted = true;
+                let repaired_sender_cache = repair_sender_history_tool_results(
+                    ctx.as_ref(),
+                    &history_key,
+                    history_budget_tokens,
+                );
+                let repaired_runtime_turns = crate::agent::context::repair_oversized_tool_results(
+                    &mut history,
+                    history_budget_tokens,
+                );
+
+                if repaired_sender_cache > 0 || repaired_runtime_turns > 0 {
+                    tracing::warn!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        repaired_sender_cache,
+                        repaired_runtime_turns,
+                        history_budget_tokens,
+                        "Context window exceeded; repaired oversized tool results and retrying request once"
+                    );
+                    continue;
+                }
+
+                let compacted_sender_cache = compact_sender_history(ctx.as_ref(), &history_key);
+                let compacted_runtime_turns =
+                    compact_runtime_history_after_overflow(&mut history, history_budget_tokens);
+
+                if compacted_sender_cache || compacted_runtime_turns > 0 {
+                    tracing::warn!(
+                        channel = %msg.channel,
+                        sender = %msg.sender,
+                        compacted_sender_cache,
+                        compacted_runtime_turns,
+                        history_budget_tokens,
+                        "Context window exceeded; compacted history and retrying request once"
+                    );
+                    continue;
                 }
             }
         }
@@ -4522,7 +4775,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider.supports_native_tools_for_model(&model);
     let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
         &workspace,
         &model,
@@ -5110,7 +5363,12 @@ mod tests {
         let kept = locked_histories
             .get(&sender)
             .expect("sender history should remain");
-        assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+        assert!(kept.len() <= CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES + 1);
+        assert!(
+            kept.first().is_some_and(|turn| turn.role == "assistant"
+                && turn.content.starts_with("[Conversation summary]")),
+            "compaction should retain a leading summary turn"
+        );
         assert!(kept.iter().all(|turn| {
             let len = turn.content.chars().count();
             len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS
@@ -5120,9 +5378,24 @@ mod tests {
     }
 
     #[test]
+    fn normalize_cached_channel_turns_preserves_leading_summary_message() {
+        let turns = vec![
+            ChatMessage::assistant("[Conversation summary]\n- User: earlier question"),
+            ChatMessage::user("latest question"),
+            ChatMessage::assistant("latest answer"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].role, "assistant");
+        assert!(normalized[0].content.starts_with("[Conversation summary]"));
+        assert_eq!(normalized[1].role, "user");
+        assert_eq!(normalized[2].role, "assistant");
+    }
+
+    #[test]
     fn proactive_trim_drops_oldest_turns_when_over_budget() {
-        // Each message is 100 chars; 10 messages = 1000 chars total.
-        let mut turns: Vec<ChatMessage> = (0..10)
+        let mut turns: Vec<ChatMessage> = (0..16)
             .map(|i| {
                 let content = format!("m{i}-{}", "a".repeat(96));
                 if i % 2 == 0 {
@@ -5133,18 +5406,56 @@ mod tests {
             })
             .collect();
 
-        // Budget of 500 should drop roughly half (oldest turns).
-        let dropped = proactive_trim_turns(&mut turns, 500);
+        let dropped = proactive_trim_turns(&mut turns, 450);
         assert!(dropped > 0, "should have dropped some turns");
-        assert!(turns.len() < 10, "should have fewer turns after trimming");
-        // Last turn should always be preserved.
+        assert!(turns.len() < 16, "should have fewer turns after trimming");
+        let has_summary = turns
+            .iter()
+            .any(|turn| turn.content.starts_with("[Conversation summary]"));
         assert!(
-            turns.last().unwrap().content.starts_with("m9-"),
+            has_summary
+                || turns
+                    .first()
+                    .is_some_and(|turn| !turn.content.starts_with("m0-")),
+            "older turns should either be summarized or dropped from the leading edge"
+        );
+        assert!(
+            turns.last().unwrap().content.starts_with("m15-"),
             "most recent turn must be preserved"
         );
-        // Total chars should now be within budget.
-        let total: usize = turns.iter().map(|t| t.content.chars().count()).sum();
-        assert!(total <= 500, "total chars {total} should be within budget");
+        let total = estimate_channel_history_tokens(&turns);
+        assert!(
+            total <= 450,
+            "estimated tokens {total} should be within budget"
+        );
+    }
+
+    #[test]
+    fn compact_runtime_history_after_overflow_preserves_system_prompt() {
+        let mut history = vec![ChatMessage::system("system prompt")];
+        history.extend((0..14).map(|i| {
+            let content = format!("turn-{i}-{}", "x".repeat(120));
+            if i % 2 == 0 {
+                ChatMessage::user(content)
+            } else {
+                ChatMessage::assistant(content)
+            }
+        }));
+
+        let dropped = compact_runtime_history_after_overflow(&mut history, 420);
+        assert!(
+            dropped > 0,
+            "overflow compaction should drop or summarize turns"
+        );
+        assert_eq!(history.first().map(|m| m.role.as_str()), Some("system"));
+        assert_eq!(
+            history.first().map(|m| m.content.as_str()),
+            Some("system prompt")
+        );
+        assert!(
+            estimate_channel_history_tokens(&history[1..]) <= 420,
+            "non-system history should fit within budget after compaction"
+        );
     }
 
     #[test]

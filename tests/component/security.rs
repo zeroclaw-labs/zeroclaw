@@ -46,23 +46,23 @@ fn security_default_max_actions_per_hour() {
     );
 }
 
-/// Require approval for medium risk is enabled by default.
+/// Medium-risk commands are not approval-gated by default.
 #[test]
 fn security_default_require_approval_for_medium_risk() {
     let config = AutonomyConfig::default();
     assert!(
-        config.require_approval_for_medium_risk,
-        "Should require approval for medium-risk commands by default"
+        !config.require_approval_for_medium_risk,
+        "Blacklist defaults should not require approval for medium-risk commands"
     );
 }
 
-/// Block high risk commands is enabled by default.
+/// High-risk commands are not hard-blocked by default.
 #[test]
 fn security_default_block_high_risk_commands() {
     let config = AutonomyConfig::default();
     assert!(
-        config.block_high_risk_commands,
-        "Should block high-risk commands by default"
+        !config.block_high_risk_commands,
+        "Blacklist defaults should not hard-block high-risk commands"
     );
 }
 

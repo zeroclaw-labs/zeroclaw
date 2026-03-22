@@ -2,6 +2,7 @@ use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
 };
 use super::Provider;
+use crate::agent::context::{repair_oversized_tool_results, DEFAULT_CONTEXT_WINDOW_TOKENS};
 use async_trait::async_trait;
 use futures_util::{stream, StreamExt};
 use std::collections::HashMap;
@@ -326,6 +327,70 @@ impl ReliableProvider {
         chain
     }
 
+    fn supports_vision_request_for_model(&self, model: &str) -> bool {
+        let models = self.model_chain(model);
+        !self.providers.is_empty()
+            && models.iter().any(|current_model| {
+                self.providers
+                    .iter()
+                    .any(|(_, provider)| provider.supports_vision_for_model(current_model))
+            })
+    }
+
+    fn supports_native_tools_request_for_model(&self, model: &str) -> bool {
+        let models = self.model_chain(model);
+        !self.providers.is_empty()
+            && models.iter().all(|current_model| {
+                self.providers
+                    .iter()
+                    .all(|(_, provider)| provider.supports_native_tools_for_model(current_model))
+            })
+    }
+
+    fn skip_for_vision_mismatch(
+        &self,
+        failures: &mut Vec<String>,
+        provider_name: &str,
+        current_model: &str,
+    ) {
+        push_failure(
+            failures,
+            provider_name,
+            current_model,
+            1,
+            1,
+            "capability_mismatch",
+            "provider/model does not support vision input",
+        );
+        tracing::warn!(
+            provider = provider_name,
+            model = current_model,
+            "Skipping provider/model without vision support for multimodal request"
+        );
+    }
+
+    fn skip_for_native_tool_mismatch(
+        &self,
+        failures: &mut Vec<String>,
+        provider_name: &str,
+        current_model: &str,
+    ) {
+        push_failure(
+            failures,
+            provider_name,
+            current_model,
+            1,
+            1,
+            "capability_mismatch",
+            "provider/model does not support native tool calling",
+        );
+        tracing::warn!(
+            provider = provider_name,
+            model = current_model,
+            "Skipping provider/model without native tool support"
+        );
+    }
+
     /// Advance to the next API key and return it, or None if no extra keys configured.
     fn rotate_key(&self) -> Option<&str> {
         if self.api_keys.is_empty() {
@@ -504,6 +569,7 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
+        let mut tool_results_repaired = false;
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
@@ -528,7 +594,25 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            // Context window exceeded: truncate history and retry
+                            // Context window exceeded: first repair oversized tool results,
+                            // then fall back to dropping older history if needed.
+                            if is_context_window_exceeded(&e) && !tool_results_repaired {
+                                let repaired = repair_oversized_tool_results(
+                                    &mut effective_messages,
+                                    DEFAULT_CONTEXT_WINDOW_TOKENS,
+                                );
+                                if repaired > 0 {
+                                    tool_results_repaired = true;
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        repaired,
+                                        "Context window exceeded; repaired oversized tool results and retrying"
+                                    );
+                                    continue;
+                                }
+                            }
+
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
@@ -635,16 +719,25 @@ impl Provider for ReliableProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        self.providers
-            .first()
-            .map(|(_, p)| p.supports_native_tools())
-            .unwrap_or(false)
+        !self.providers.is_empty()
+            && self
+                .providers
+                .iter()
+                .all(|(_, provider)| provider.supports_native_tools())
+    }
+
+    fn supports_native_tools_for_model(&self, model: &str) -> bool {
+        self.supports_native_tools_request_for_model(model)
     }
 
     fn supports_vision(&self) -> bool {
         self.providers
             .iter()
             .any(|(_, provider)| provider.supports_vision())
+    }
+
+    fn supports_vision_for_model(&self, model: &str) -> bool {
+        self.supports_vision_request_for_model(model)
     }
 
     async fn chat_with_tools(
@@ -658,9 +751,19 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
+        let mut tool_results_repaired = false;
+        let needs_vision = crate::multimodal::contains_image_markers(messages);
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if !provider.supports_native_tools_for_model(current_model) {
+                    self.skip_for_native_tool_mismatch(&mut failures, provider_name, current_model);
+                    continue;
+                }
+                if needs_vision && !provider.supports_vision_for_model(current_model) {
+                    self.skip_for_vision_mismatch(&mut failures, provider_name, current_model);
+                    continue;
+                }
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -682,7 +785,23 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            // Context window exceeded: truncate history and retry
+                            if is_context_window_exceeded(&e) && !tool_results_repaired {
+                                let repaired = repair_oversized_tool_results(
+                                    &mut effective_messages,
+                                    DEFAULT_CONTEXT_WINDOW_TOKENS,
+                                );
+                                if repaired > 0 {
+                                    tool_results_repaired = true;
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        repaired,
+                                        "Context window exceeded; repaired oversized tool results and retrying"
+                                    );
+                                    continue;
+                                }
+                            }
+
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
@@ -798,9 +917,15 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
+        let mut tool_results_repaired = false;
+        let needs_vision = crate::multimodal::contains_image_markers(request.messages);
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if needs_vision && !provider.supports_vision_for_model(current_model) {
+                    self.skip_for_vision_mismatch(&mut failures, provider_name, current_model);
+                    continue;
+                }
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -823,7 +948,23 @@ impl Provider for ReliableProvider {
                             return Ok(resp);
                         }
                         Err(e) => {
-                            // Context window exceeded: truncate history and retry
+                            if is_context_window_exceeded(&e) && !tool_results_repaired {
+                                let repaired = repair_oversized_tool_results(
+                                    &mut effective_messages,
+                                    DEFAULT_CONTEXT_WINDOW_TOKENS,
+                                );
+                                if repaired > 0 {
+                                    tool_results_repaired = true;
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        repaired,
+                                        "Context window exceeded; repaired oversized tool results and retrying"
+                                    );
+                                    continue;
+                                }
+                            }
+
                             if is_context_window_exceeded(&e) && !context_truncated {
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
@@ -1930,6 +2071,120 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn mixed_provider_chain_disables_native_tools_for_model() {
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "native".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "ok",
+                        tool_calls: vec![],
+                        error: "boom",
+                    }) as Box<dyn Provider>,
+                ),
+                (
+                    "prompt".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "ok",
+                        error: "boom",
+                    }) as Box<dyn Provider>,
+                ),
+            ],
+            2,
+            1,
+        );
+
+        assert!(
+            !provider.supports_native_tools_for_model("test-model"),
+            "Mixed fallback chains must not advertise native tools when some providers cannot handle them"
+        );
+    }
+
+    struct VisionMock {
+        calls: Arc<AtomicUsize>,
+        response_text: &'static str,
+        vision: bool,
+    }
+
+    #[async_trait]
+    impl Provider for VisionMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(self.response_text.to_string())
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.vision
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ChatResponse {
+                text: Some(self.response_text.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_skips_non_vision_provider_for_multimodal_requests() {
+        let blind_calls = Arc::new(AtomicUsize::new(0));
+        let vision_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "blind".into(),
+                    Box::new(VisionMock {
+                        calls: Arc::clone(&blind_calls),
+                        response_text: "blind",
+                        vision: false,
+                    }) as Box<dyn Provider>,
+                ),
+                (
+                    "vision".into(),
+                    Box::new(VisionMock {
+                        calls: Arc::clone(&vision_calls),
+                        response_text: "vision-ok",
+                        vision: true,
+                    }) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user(
+            "[IMAGE:data:image/png;base64,AAAA] describe",
+        )];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let result = provider.chat(request, "vision-model", 0.0).await.unwrap();
+
+        assert!(provider.supports_vision_for_model("vision-model"));
+        assert_eq!(result.text.as_deref(), Some("vision-ok"));
+        assert_eq!(blind_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(vision_calls.load(Ordering::SeqCst), 1);
+    }
+
     // ── Gap 2-4: Parity tests for chat() ────────────────────────
 
     /// Gap 2: `chat()` returns an aggregated error when all providers fail,
@@ -2269,6 +2524,96 @@ mod tests {
         assert_eq!(result, "recovered after truncation");
         // Should have been called twice: once with full messages, once with truncated
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Mock that records both message count and aggregate content length.
+    struct ToolResultRepairMock {
+        calls: Arc<AtomicUsize>,
+        fail_until_attempt: usize,
+        message_counts: Arc<parking_lot::Mutex<Vec<usize>>>,
+        total_chars: Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    #[async_trait]
+    impl Provider for ToolResultRepairMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.message_counts.lock().push(messages.len());
+            self.total_chars
+                .lock()
+                .push(messages.iter().map(|msg| msg.content.len()).sum());
+            if attempt <= self.fail_until_attempt {
+                anyhow::bail!(
+                    "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
+                );
+            }
+            Ok("recovered after tool-result repair".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_repairs_tool_results_before_dropping_messages() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let message_counts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let total_chars = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mock = ToolResultRepairMock {
+            calls: Arc::clone(&calls),
+            fail_until_attempt: 1,
+            message_counts: Arc::clone(&message_counts),
+            total_chars: Arc::clone(&total_chars),
+        };
+
+        let provider = ReliableProvider::new(
+            vec![("local".into(), Box::new(mock) as Box<dyn Provider>)],
+            3,
+            1,
+        );
+
+        let large_tool_payload = serde_json::json!({
+            "tool_call_id": "call_large",
+            "content": format!("HEAD{}TAIL", "x".repeat(20_000)),
+        });
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old message"),
+            ChatMessage::assistant("tool call pending"),
+            ChatMessage::tool(large_tool_payload.to_string()),
+            ChatMessage::user("current question"),
+        ];
+
+        let result = provider
+            .chat_with_history(&messages, "local-model", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "recovered after tool-result repair");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let counts = message_counts.lock();
+        let chars = total_chars.lock();
+        assert_eq!(counts.len(), 2);
+        assert_eq!(counts[0], counts[1]);
+        assert_eq!(
+            counts[0], 5,
+            "tool-result repair should preserve message count before any history dropping"
+        );
+        assert!(
+            chars[1] < chars[0],
+            "second attempt should be smaller after tool-result repair"
+        );
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@ impl Tool for CronRunTool {
                 "job_id": { "type": "string" },
                 "approved": {
                     "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
+                    "description": "Set true to explicitly approve approval-gated shell commands in supervised mode",
                     "default": false
                 }
             },
@@ -224,7 +224,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_run_requires_approval_for_medium_risk() {
+    async fn shell_run_allows_medium_risk_command_by_default() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -250,13 +250,10 @@ mod tests {
         .unwrap();
         let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
 
-        // Without approval, the tool-level policy check blocks medium-risk commands.
+        // Without approval, medium-risk commands should still run under the
+        // blacklist-style policy.
         let denied = tool.execute(json!({ "job_id": job.id })).await.unwrap();
-        assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(denied.success, "{:?}", denied.error);
     }
 
     #[tokio::test]

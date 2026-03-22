@@ -1,3 +1,10 @@
+use crate::agent::context::{
+    estimate_history_tokens as shared_estimate_history_tokens, repair_oversized_tool_results,
+    tool_result_budget_chars as shared_tool_result_budget_chars,
+    truncate_tool_result_for_context as shared_truncate_tool_result_for_context,
+    DEFAULT_CONTEXT_WINDOW_TOKENS, TOOL_RESULT_MAX_CHARS as SHARED_TOOL_RESULT_MAX_CHARS,
+    TOOL_RESULT_MIN_CHARS as SHARED_TOOL_RESULT_MIN_CHARS,
+};
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::schema::ModelPricing;
 use crate::config::Config;
@@ -342,16 +349,106 @@ const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 /// Max characters retained in stored compaction summary.
 const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
 
+/// Approximate context window used for tool-result budgeting when provider
+/// metadata does not expose a concrete model window.
+const TOOL_RESULT_BUDGET_CONTEXT_TOKENS: usize = DEFAULT_CONTEXT_WINDOW_TOKENS;
+/// Per-tool hard floor so even constrained budgets keep actionable output.
+const TOOL_RESULT_MIN_CHARS: usize = SHARED_TOOL_RESULT_MIN_CHARS;
+/// Per-tool hard cap to prevent a single tool from dominating context.
+const TOOL_RESULT_MAX_CHARS: usize = SHARED_TOOL_RESULT_MAX_CHARS;
+
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
-    history
-        .iter()
-        .map(|m| {
-            // ~4 chars per token + ~4 framing tokens per message (role, delimiters)
-            m.content.len().div_ceil(4) + 4
-        })
-        .sum()
+    shared_estimate_history_tokens(history)
+}
+
+fn tool_result_budget_chars(history: &[ChatMessage]) -> usize {
+    tool_result_budget_chars_for_window(history, TOOL_RESULT_BUDGET_CONTEXT_TOKENS)
+}
+
+fn tool_result_budget_chars_for_window(
+    history: &[ChatMessage],
+    context_window_tokens: usize,
+) -> usize {
+    shared_tool_result_budget_chars(history, context_window_tokens)
+}
+
+fn truncate_tool_result_for_context(tool_name: &str, output: &str, max_chars: usize) -> String {
+    shared_truncate_tool_result_for_context(tool_name, output, max_chars)
+}
+
+fn trim_history_to_token_budget(history: &mut Vec<ChatMessage>, budget_tokens: usize) -> usize {
+    let mut dropped = 0usize;
+
+    while estimate_history_tokens(history) > budget_tokens {
+        let removable_index = history
+            .iter()
+            .enumerate()
+            .find(|(idx, message)| {
+                message.role != "system" && *idx < history.len().saturating_sub(1)
+            })
+            .map(|(idx, _)| idx);
+
+        let Some(idx) = removable_index else {
+            break;
+        };
+
+        history.remove(idx);
+        dropped += 1;
+    }
+
+    dropped
+}
+
+async fn govern_history_before_llm_call(
+    history: &mut Vec<ChatMessage>,
+    provider: &dyn Provider,
+    model: &str,
+    context_window_tokens: usize,
+) {
+    let repaired = repair_oversized_tool_results(history, context_window_tokens);
+    if repaired > 0 {
+        tracing::info!(
+            repaired_messages = repaired,
+            context_window_tokens,
+            "Re-truncated oversized tool results before provider call"
+        );
+    }
+
+    if estimate_history_tokens(history) > context_window_tokens {
+        match auto_compact_history(
+            history,
+            provider,
+            model,
+            DEFAULT_MAX_HISTORY_MESSAGES,
+            context_window_tokens,
+        )
+        .await
+        {
+            Ok(true) => {
+                tracing::info!(
+                    context_window_tokens,
+                    remaining_messages = history.len(),
+                    "Auto-compacted history before provider call"
+                );
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::debug!("Failed to auto-compact history before provider call: {err}");
+            }
+        }
+    }
+
+    let trimmed = trim_history_to_token_budget(history, context_window_tokens);
+    if trimmed > 0 {
+        tracing::info!(
+            dropped_messages = trimmed,
+            context_window_tokens,
+            remaining_messages = history.len(),
+            "Trimmed oldest history turns to fit context budget before provider call"
+        );
+    }
 }
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
@@ -455,7 +552,7 @@ fn apply_compaction_summary(
     history.splice(start..compact_end, std::iter::once(summary_msg));
 }
 
-async fn auto_compact_history(
+pub(crate) async fn auto_compact_history(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
     model: &str,
@@ -2304,6 +2401,7 @@ pub(crate) async fn agent_turn(
     channel_reply_target: Option<&str>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    context_window_tokens: Option<usize>,
     approval: Option<&ApprovalManager>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
@@ -2324,6 +2422,7 @@ pub(crate) async fn agent_turn(
         channel_reply_target,
         multimodal_config,
         max_tool_iterations,
+        context_window_tokens,
         None,
         None,
         None,
@@ -2544,7 +2643,10 @@ fn should_execute_tools_in_parallel(
     }
 
     if let Some(mgr) = approval {
-        if tool_calls.iter().any(|call| mgr.needs_approval(&call.name)) {
+        if tool_calls
+            .iter()
+            .any(|call| mgr.needs_approval_call(&call.name, &call.arguments))
+        {
             // Approval-gated calls must keep sequential handling so the caller can
             // enforce CLI prompt/deny policy consistently.
             return false;
@@ -2634,6 +2736,7 @@ pub(crate) async fn run_tool_call_loop(
     channel_reply_target: Option<&str>,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
+    context_window_tokens: Option<usize>,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
@@ -2648,6 +2751,7 @@ pub(crate) async fn run_tool_call_loop(
     } else {
         max_tool_iterations
     };
+    let context_window_tokens = context_window_tokens.unwrap_or(TOOL_RESULT_BUDGET_CONTEXT_TOKENS);
 
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
@@ -2691,6 +2795,8 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
 
+        govern_history_before_llm_call(history, provider, model, context_window_tokens).await;
+
         // Rebuild tool_specs each iteration so newly activated deferred tools appear.
         let mut tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
             .iter()
@@ -2704,10 +2810,11 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
         }
-        let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+        let use_native_tools =
+            provider.supports_native_tools_for_model(model) && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
+        if image_marker_count > 0 && !provider.supports_vision_for_model(model) {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
                 capability: "vision".to_string(),
@@ -3121,7 +3228,7 @@ pub(crate) async fn run_tool_call_loop(
 
             // ── Approval hook ────────────────────────────────
             if let Some(mgr) = approval {
-                if mgr.needs_approval(&tool_name) {
+                if mgr.needs_approval_call(&tool_name, &tool_args) {
                     let request = ApprovalRequest {
                         tool_name: tool_name.clone(),
                         arguments: tool_args.clone(),
@@ -3268,11 +3375,30 @@ pub(crate) async fn run_tool_call_loop(
             .await?
         };
 
+        let per_tool_result_budget_chars =
+            tool_result_budget_chars_for_window(history, context_window_tokens);
         for ((idx, call), outcome) in executable_indices
             .iter()
             .zip(executable_calls.iter())
             .zip(executed_outcomes.into_iter())
         {
+            let mut outcome = outcome;
+            let original_chars = outcome.output.chars().count();
+            if original_chars > per_tool_result_budget_chars {
+                outcome.output = truncate_tool_result_for_context(
+                    &call.name,
+                    &outcome.output,
+                    per_tool_result_budget_chars,
+                );
+                tracing::info!(
+                    tool = %call.name,
+                    original_chars,
+                    truncated_chars = outcome.output.chars().count(),
+                    budget_chars = per_tool_result_budget_chars,
+                    "Truncated oversized tool output before appending to history"
+                );
+            }
+
             runtime_trace::record_event(
                 "tool_call_result",
                 Some(channel_name),
@@ -3285,7 +3411,7 @@ pub(crate) async fn run_tool_call_loop(
                     "iteration": iteration + 1,
                     "tool": call.name.clone(),
                     "duration_ms": outcome.duration.as_millis(),
-                    "output": scrub_credentials(&outcome.output),
+                    "output": scrub_credentials(&truncate_with_ellipsis(&outcome.output, 4_000)),
                 }),
             );
 
@@ -3823,7 +3949,7 @@ pub async fn run(
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider.supports_native_tools_for_model(&model_name);
     let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
@@ -3929,6 +4055,7 @@ pub async fn run(
                 None,
                 &config.multimodal,
                 config.agent.max_tool_iterations,
+                Some(config.agent.max_context_tokens),
                 None,
                 None,
                 None,
@@ -4157,6 +4284,7 @@ pub async fn run(
                     None,
                     &config.multimodal,
                     config.agent.max_tool_iterations,
+                    Some(config.agent.max_context_tokens),
                     None,
                     None,
                     None,
@@ -4486,7 +4614,7 @@ pub async fn process_message(
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider.supports_native_tools_for_model(&model_name);
     let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
@@ -4551,6 +4679,7 @@ pub async fn process_message(
         None,
         &config.multimodal,
         config.agent.max_tool_iterations,
+        Some(config.agent.max_context_tokens),
         Some(&approval_manager),
         &excluded_tools,
         &config.agent.tool_call_dedup_exempt,
@@ -5062,6 +5191,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -5113,6 +5243,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -5158,6 +5289,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -5187,7 +5319,7 @@ mod tests {
         let calls = vec![
             ParsedToolCall {
                 name: "shell".to_string(),
-                arguments: serde_json::json!({"command": "pwd"}),
+                arguments: serde_json::json!({"command": "rm -rf /tmp/parallel-check"}),
                 tool_call_id: None,
             },
             ParsedToolCall {
@@ -5289,6 +5421,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -5360,6 +5493,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -5423,6 +5557,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -5478,6 +5613,7 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             None,
             None,
@@ -5551,6 +5687,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &[],
             None,
@@ -5609,6 +5746,7 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             None,
             None,
@@ -5693,6 +5831,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &[],
             &exempt,
             None,
@@ -5748,6 +5887,7 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             None,
             None,
@@ -5830,6 +5970,7 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             Some(tx),
             None,
@@ -5916,6 +6057,7 @@ mod tests {
                 None,
                 &crate::config::MultimodalConfig::default(),
                 4,
+                None,
                 None,
                 &[],
                 &[],
@@ -7780,6 +7922,33 @@ Let me check the result."#;
         assert_eq!(tokens, 23);
     }
 
+    #[test]
+    fn tool_result_budget_shrinks_as_history_grows() {
+        let small_history = vec![ChatMessage::system("sys"), ChatMessage::user("hello")];
+        let large_history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u".repeat(120_000)),
+            ChatMessage::assistant("a".repeat(120_000)),
+        ];
+
+        let small_budget = super::tool_result_budget_chars(&small_history);
+        let large_budget = super::tool_result_budget_chars(&large_history);
+
+        assert!(small_budget >= large_budget);
+        assert!(large_budget >= super::TOOL_RESULT_MIN_CHARS);
+    }
+
+    #[test]
+    fn truncate_tool_result_for_context_preserves_head_and_tail() {
+        let output = format!("HEAD:{}:TAIL", "x".repeat(8_000));
+        let truncated = super::truncate_tool_result_for_context("shell", &output, 1_600);
+
+        assert!(truncated.contains("HEAD:"));
+        assert!(truncated.contains(":TAIL"));
+        assert!(truncated.contains("output truncated"));
+        assert!(truncated.chars().count() <= 1_600);
+    }
+
     #[tokio::test]
     async fn run_tool_call_loop_surfaces_tool_failure_reason_in_on_delta() {
         let provider = ScriptedProvider::from_text_responses(vec![
@@ -7816,6 +7985,7 @@ Let me check the result."#;
             None,
             &crate::config::MultimodalConfig::default(),
             4,
+            None,
             None,
             Some(tx),
             None,
@@ -7967,6 +8137,7 @@ Let me check the result."#;
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     None,
@@ -8046,6 +8217,7 @@ Let me check the result."#;
                     None,
                     None,
                     None,
+                    None,
                     &[],
                     &[],
                     None,
@@ -8098,6 +8270,7 @@ Let me check the result."#;
             None,
             &crate::config::MultimodalConfig::default(),
             2,
+            None,
             None,
             None,
             None,

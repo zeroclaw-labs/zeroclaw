@@ -1153,8 +1153,12 @@ async fn main() -> Result<()> {
                 }
             );
             println!(
-                "  Allowed commands:  {}",
-                config.autonomy.allowed_commands.join(", ")
+                "  Command overrides: {}",
+                if config.autonomy.allowed_commands.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    config.autonomy.allowed_commands.join(", ")
+                }
             );
             println!(
                 "  Max actions/hour:  {}",

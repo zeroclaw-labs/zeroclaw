@@ -1,3 +1,4 @@
+use crate::agent::context::repair_oversized_tool_results;
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
@@ -11,6 +12,7 @@ use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Prov
 use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
+use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
@@ -74,6 +76,115 @@ pub struct AgentBuilder {
     tool_descriptions: Option<ToolDescriptions>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+}
+
+const AGENT_HISTORY_SUMMARY_MAX_CHARS: usize = 1_800;
+const AGENT_HISTORY_SUMMARY_KEEP_RECENT_MESSAGES: usize = 20;
+
+fn summarize_history_message(msg: &ConversationMessage) -> Option<String> {
+    let (label, raw) = match msg {
+        ConversationMessage::Chat(chat) if chat.role == "system" => return None,
+        ConversationMessage::Chat(chat) => (
+            match chat.role.as_str() {
+                "user" => "User",
+                "assistant" => "Assistant",
+                _ => "Tool",
+            }
+            .to_string(),
+            chat.content.clone(),
+        ),
+        ConversationMessage::AssistantToolCalls {
+            text, tool_calls, ..
+        } => (
+            if tool_calls.is_empty() {
+                "Assistant tool call".to_string()
+            } else {
+                format!(
+                    "Assistant tool call ({})",
+                    tool_calls
+                        .iter()
+                        .map(|call| call.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+            text.clone().unwrap_or_default(),
+        ),
+        ConversationMessage::ToolResults(results) => (
+            "Tool result".to_string(),
+            results
+                .iter()
+                .map(|result| result.content.as_str())
+                .collect::<Vec<_>>()
+                .join(" | "),
+        ),
+    };
+
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "- {label}: {}",
+            truncate_with_ellipsis(trimmed, 240)
+        ))
+    }
+}
+
+fn build_history_summary(messages: &[ConversationMessage]) -> Option<ConversationMessage> {
+    let mut lines = Vec::new();
+    let mut used_chars = "[Conversation summary]\n".chars().count();
+
+    for msg in messages {
+        let Some(line) = summarize_history_message(msg) else {
+            continue;
+        };
+        let line_chars = line.chars().count() + 1;
+        if used_chars + line_chars > AGENT_HISTORY_SUMMARY_MAX_CHARS {
+            break;
+        }
+        used_chars += line_chars;
+        lines.push(line);
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(ConversationMessage::Chat(ChatMessage::assistant(format!(
+            "[Conversation summary]\n{}",
+            lines.join("\n")
+        ))))
+    }
+}
+
+fn is_history_summary_message(message: &ConversationMessage) -> bool {
+    matches!(
+        message,
+        ConversationMessage::Chat(chat)
+            if chat.role == "assistant"
+                && chat.content.starts_with("[Conversation summary]")
+    )
+}
+
+fn truncate_history_summary_content(content: &str, max_chars: usize) -> String {
+    const PREFIX: &str = "[Conversation summary]";
+
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+
+    if max_chars <= PREFIX.chars().count() {
+        return PREFIX.to_string();
+    }
+
+    let body_budget = max_chars.saturating_sub(PREFIX.chars().count() + 1);
+    let body = content
+        .strip_prefix(PREFIX)
+        .unwrap_or(content)
+        .trim_start_matches('\n');
+
+    format!("{PREFIX}\n{}", truncate_with_ellipsis(body, body_budget))
 }
 
 impl AgentBuilder {
@@ -299,6 +410,14 @@ impl Agent {
         AgentBuilder::new()
     }
 
+    fn estimated_history_tokens(&self) -> usize {
+        self.tool_dispatcher
+            .to_provider_messages(&self.history)
+            .iter()
+            .map(|msg| msg.content.len().div_ceil(4) + 4)
+            .sum()
+    }
+
     pub fn history(&self) -> &[ConversationMessage] {
         &self.history
     }
@@ -460,7 +579,9 @@ impl Agent {
         let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
             "native" => Box::new(NativeToolDispatcher),
             "xml" => Box::new(XmlToolDispatcher),
-            _ if provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+            _ if provider.supports_native_tools_for_model(&model_name) => {
+                Box::new(NativeToolDispatcher)
+            }
             _ => Box::new(XmlToolDispatcher),
         };
 
@@ -517,7 +638,14 @@ impl Agent {
 
     fn trim_history(&mut self) {
         let max = self.config.max_history_messages;
-        if self.history.len() <= max {
+        let non_system_count = self
+            .history
+            .iter()
+            .filter(|msg| !matches!(msg, ConversationMessage::Chat(chat) if chat.role == "system"))
+            .count();
+        let estimated_tokens = self.estimated_history_tokens();
+
+        if non_system_count <= max && estimated_tokens <= self.config.max_context_tokens {
             return;
         }
 
@@ -533,9 +661,123 @@ impl Agent {
             }
         }
 
-        if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
-            other_messages.drain(0..drop_count);
+        let should_compact_by_length = other_messages.len() > max;
+        let should_compact_by_tokens = estimated_tokens > self.config.max_context_tokens;
+
+        if should_compact_by_length || should_compact_by_tokens {
+            let keep_recent_cap = if should_compact_by_length {
+                max.saturating_sub(1)
+            } else {
+                other_messages.len().saturating_sub(1)
+            };
+
+            if keep_recent_cap > 0 {
+                let keep_recent = AGENT_HISTORY_SUMMARY_KEEP_RECENT_MESSAGES
+                    .min(keep_recent_cap)
+                    .min(other_messages.len());
+                let fallback_boundary = other_messages.len().saturating_sub(keep_recent);
+                let mut summary_boundary = fallback_boundary;
+
+                while summary_boundary > 0 {
+                    if matches!(
+                        &other_messages[summary_boundary],
+                        ConversationMessage::Chat(chat) if chat.role == "user"
+                    ) {
+                        break;
+                    }
+                    summary_boundary -= 1;
+                }
+
+                if summary_boundary == 0 {
+                    summary_boundary = fallback_boundary;
+                }
+
+                // If we already compacted history earlier in the session, avoid
+                // "summarizing only the summary" because the subsequent length
+                // trim can then drop the synthetic summary entirely.
+                if summary_boundary == 1
+                    && fallback_boundary > 1
+                    && other_messages
+                        .first()
+                        .is_some_and(is_history_summary_message)
+                {
+                    summary_boundary = fallback_boundary;
+                }
+
+                if summary_boundary > 0 {
+                    if let Some(summary) =
+                        build_history_summary(&other_messages[..summary_boundary])
+                    {
+                        let mut compacted = vec![summary];
+                        compacted.extend_from_slice(&other_messages[summary_boundary..]);
+                        other_messages = compacted;
+                    }
+                }
+            }
+
+            if other_messages.len() > max {
+                let drop_count = other_messages.len() - max;
+                if other_messages
+                    .first()
+                    .is_some_and(is_history_summary_message)
+                    && other_messages.len() > 1
+                {
+                    let end = (1 + drop_count).min(other_messages.len());
+                    other_messages.drain(1..end);
+                } else {
+                    other_messages.drain(0..drop_count);
+                }
+            }
+        }
+
+        while !other_messages.is_empty() {
+            let mut candidate = system_messages.clone();
+            candidate.extend(other_messages.clone());
+            let estimated_tokens = self
+                .tool_dispatcher
+                .to_provider_messages(&candidate)
+                .iter()
+                .map(|msg| msg.content.len().div_ceil(4) + 4)
+                .sum::<usize>();
+            if estimated_tokens <= self.config.max_context_tokens {
+                break;
+            }
+            if other_messages.len() == 1
+                && other_messages
+                    .first()
+                    .is_some_and(is_history_summary_message)
+            {
+                let system_tokens = self
+                    .tool_dispatcher
+                    .to_provider_messages(&system_messages)
+                    .iter()
+                    .map(|msg| msg.content.len().div_ceil(4) + 4)
+                    .sum::<usize>();
+                let remaining_tokens = self
+                    .config
+                    .max_context_tokens
+                    .saturating_sub(system_tokens)
+                    .saturating_sub(4);
+                let max_chars = remaining_tokens.saturating_mul(4).max(24);
+
+                if let Some(ConversationMessage::Chat(chat)) = other_messages.first_mut() {
+                    let truncated = truncate_history_summary_content(&chat.content, max_chars);
+                    if truncated == chat.content {
+                        break;
+                    }
+                    chat.content = truncated;
+                    continue;
+                }
+            }
+            if other_messages
+                .first()
+                .is_some_and(is_history_summary_message)
+                && other_messages.len() > 1
+            {
+                other_messages.remove(1);
+            } else {
+                other_messages.remove(0);
+            }
         }
 
         self.history = system_messages;
@@ -681,7 +923,9 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         for _ in 0..self.config.max_tool_iterations {
-            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            self.trim_history();
+            let mut messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            repair_oversized_tool_results(&mut messages, self.config.max_context_tokens);
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
             let cache_key = if self.temperature == 0.0 {
@@ -1276,6 +1520,62 @@ mod tests {
         assert!(
             agent.tool_specs.is_empty(),
             "No tools should match a non-existent allowlist entry"
+        );
+    }
+
+    #[test]
+    fn trim_history_compacts_when_token_budget_is_exceeded() {
+        let provider = Box::new(MockProvider {
+            responses: Mutex::new(vec![]),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(crate::config::AgentConfig {
+                max_history_messages: 20,
+                max_context_tokens: 40,
+                ..crate::config::AgentConfig::default()
+            })
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let long = "x".repeat(220);
+        agent.history = vec![
+            ConversationMessage::Chat(ChatMessage::system("system")),
+            ConversationMessage::Chat(ChatMessage::user(format!("user {long}"))),
+            ConversationMessage::Chat(ChatMessage::assistant(format!("assistant {long}"))),
+            ConversationMessage::Chat(ChatMessage::user(format!("follow-up {long}"))),
+            ConversationMessage::Chat(ChatMessage::assistant(format!("reply {long}"))),
+        ];
+
+        agent.trim_history();
+
+        assert!(agent.history.len() < 5, "history should be compacted");
+        assert!(
+            agent.history.iter().any(|msg| {
+                matches!(
+                    msg,
+                    ConversationMessage::Chat(chat)
+                        if chat.role == "assistant"
+                            && chat.content.contains("[Conversation summary]")
+                )
+            }),
+            "history should include a synthetic summary when token budget is exceeded"
         );
     }
 

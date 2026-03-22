@@ -165,7 +165,7 @@ impl Tool for CronAddTool {
                 },
                 "approved": {
                     "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
+                    "description": "Set true to explicitly approve approval-gated shell commands in supervised mode",
                     "default": false
                 }
             },
@@ -468,7 +468,10 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("not allowed"));
+        assert!(result
+            .error
+            .unwrap_or_default()
+            .contains("explicit approval"));
     }
 
     #[tokio::test]
@@ -530,7 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn medium_risk_shell_command_requires_approval() {
+    async fn medium_risk_shell_command_is_allowed_by_default() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -551,11 +554,7 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(denied.success, "{:?}", denied.error);
 
         let approved = tool
             .execute(json!({

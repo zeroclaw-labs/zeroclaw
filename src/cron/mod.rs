@@ -22,7 +22,8 @@ pub use types::{
     Schedule, SessionTarget,
 };
 
-/// Validate a shell command against the full security policy (allowlist + risk gate).
+/// Validate a shell command against the full security policy
+/// (structural checks + blacklist/risk gate).
 ///
 /// Returns `Ok(())` if the command passes all checks, or an error describing
 /// why it was blocked.
@@ -687,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn add_shell_job_requires_explicit_approval_for_medium_risk() {
+    fn add_shell_job_allows_medium_risk_by_default() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
@@ -701,11 +702,7 @@ mod tests {
             },
             "touch cron-medium-risk",
         );
-        assert!(denied.is_err());
-        assert!(denied
-            .unwrap_err()
-            .to_string()
-            .contains("explicit approval"));
+        assert!(denied.is_ok(), "{denied:?}");
 
         let approved = add_shell_job_with_approval(
             &config,
@@ -722,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn update_requires_explicit_approval_for_medium_risk() {
+    fn update_allows_medium_risk_by_default() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
@@ -737,11 +734,7 @@ mod tests {
             },
             false,
         );
-        assert!(denied.is_err());
-        assert!(denied
-            .unwrap_err()
-            .to_string()
-            .contains("explicit approval"));
+        assert!(denied.is_ok(), "{denied:?}");
 
         let approved = update_shell_job_with_approval(
             &config,
@@ -757,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_update_requires_explicit_approval_for_medium_risk() {
+    fn cli_update_allows_medium_risk_by_default() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
@@ -771,11 +764,7 @@ mod tests {
             Some("touch cron-cli-medium-risk"),
             None,
         );
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("explicit approval"));
+        assert!(result.is_ok(), "{result:?}");
     }
 
     #[test]
@@ -815,18 +804,14 @@ mod tests {
     }
 
     #[test]
-    fn add_once_at_validated_blocks_medium_risk_without_approval() {
+    fn add_once_at_validated_allows_medium_risk_without_approval() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
         let at = chrono::Utc::now() + chrono::Duration::hours(1);
 
         let denied = add_once_at_validated(&config, at, "touch at-medium", false);
-        assert!(denied.is_err());
-        assert!(denied
-            .unwrap_err()
-            .to_string()
-            .contains("explicit approval"));
+        assert!(denied.is_ok(), "{denied:?}");
 
         let approved = add_once_at_validated(&config, at, "touch at-medium", true);
         assert!(approved.is_ok(), "{approved:?}");

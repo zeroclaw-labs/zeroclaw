@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -97,31 +98,7 @@ pub struct SecurityPolicy {
 /// Default allowed commands for Unix platforms.
 #[cfg(not(target_os = "windows"))]
 fn default_allowed_commands() -> Vec<String> {
-    #[allow(unused_mut)]
-    let mut cmds = vec![
-        "git".into(),
-        "npm".into(),
-        "cargo".into(),
-        "ls".into(),
-        "cat".into(),
-        "grep".into(),
-        "find".into(),
-        "echo".into(),
-        "pwd".into(),
-        "wc".into(),
-        "head".into(),
-        "tail".into(),
-        "date".into(),
-        "df".into(),
-        "du".into(),
-        "uname".into(),
-        "uptime".into(),
-        "hostname".into(),
-    ];
-    // `free` is Linux-only; it does not exist on macOS or other BSDs.
-    #[cfg(target_os = "linux")]
-    cmds.push("free".into());
-    cmds
+    vec!["*".into()]
 }
 
 /// Default allowed commands for Windows platforms.
@@ -130,34 +107,7 @@ fn default_allowed_commands() -> Vec<String> {
 /// (available via Git for Windows, WSL, etc.).
 #[cfg(target_os = "windows")]
 fn default_allowed_commands() -> Vec<String> {
-    vec![
-        // Cross-platform tools
-        "git".into(),
-        "npm".into(),
-        "cargo".into(),
-        "echo".into(),
-        // Windows-native equivalents
-        "dir".into(),
-        "type".into(),
-        "findstr".into(),
-        "where".into(),
-        "more".into(),
-        "date".into(),
-        // Unix commands (available via Git for Windows / MSYS2)
-        "ls".into(),
-        "cat".into(),
-        "grep".into(),
-        "find".into(),
-        "pwd".into(),
-        "wc".into(),
-        "head".into(),
-        "tail".into(),
-        "df".into(),
-        "du".into(),
-        "uname".into(),
-        "uptime".into(),
-        "hostname".into(),
-    ]
+    vec!["*".into()]
 }
 
 /// Default forbidden paths for Unix platforms.
@@ -207,13 +157,13 @@ impl Default for SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
             workspace_only: true,
-            allowed_commands: default_allowed_commands(),
+            allowed_commands: vec!["*".into()],
             forbidden_paths: default_forbidden_paths(),
             allowed_roots: Vec::new(),
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
-            require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
+            require_approval_for_medium_risk: false,
+            block_high_risk_commands: false,
             shell_env_passthrough: vec![],
             tracker: ActionTracker::new(),
         }
@@ -756,11 +706,32 @@ impl SecurityPolicy {
                     | "runas"
                     | "icacls"
                     | "takeown"
+                    | "cmd"
                     | "powershell"
                     | "pwsh"
                     | "wmic"
                     | "sc"
                     | "netsh"
+                    | "bash"
+                    | "sh"
+                    | "zsh"
+                    | "fish"
+                    | "dash"
+                    | "ksh"
+                    | "csh"
+                    | "tcsh"
+                    | "python"
+                    | "python3"
+                    | "pypy"
+                    | "pypy3"
+                    | "node"
+                    | "deno"
+                    | "perl"
+                    | "ruby"
+                    | "php"
+                    | "lua"
+                    | "osascript"
+                    | "xargs"
             ) {
                 return CommandRiskLevel::High;
             }
@@ -825,32 +796,33 @@ impl SecurityPolicy {
 
     // ── Command Execution Policy Gate ──────────────────────────────────────
     // Validation follows a strict precedence order:
-    //   1. Allowlist check (is the base command permitted at all?)
+    //   1. Structural policy check (shell syntax, unsafe args)
     //   2. Risk classification (high / medium / low)
     //   3. Policy flags (block_high_risk_commands, require_approval_for_medium_risk)
-    //      — explicit allowlist entries exempt a command from the high-risk block,
-    //        but the wildcard "*" does NOT grant an exemption.
-    //   4. Autonomy level × approval status (supervised requires explicit approval)
-    // This ordering ensures deny-by-default: unknown commands are rejected
-    // before any risk or autonomy logic runs.
+    //      — explicit command entries act as operator overrides for otherwise
+    //        blocked or approval-gated high-risk commands; the wildcard "*"
+    //        does NOT grant that exemption.
+    //   4. Autonomy level × approval status
+    // Structurally safe commands are permitted unless they trip a risk gate.
 
-    /// Validate full command execution policy (allowlist + risk gate).
+    /// Validate full command execution policy (structural checks + risk gate).
     pub fn validate_command_execution(
         &self,
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if !self.is_command_allowed(command) {
+        if !self.passes_command_safety_checks(command) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
         let risk = self.command_risk_level(command);
+        let explicitly_allowed = self.is_command_explicitly_allowed(command);
 
         if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
+            if self.block_high_risk_commands && !explicitly_allowed {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
             }
-            if self.autonomy == AutonomyLevel::Supervised && !approved {
+            if self.autonomy == AutonomyLevel::Supervised && !approved && !explicitly_allowed {
                 return Err(
                     "Command requires explicit approval (approved=true): high-risk operation"
                         .into(),
@@ -913,21 +885,34 @@ impl SecurityPolicy {
         })
     }
 
-    // ── Layered Command Allowlist ──────────────────────────────────────────
-    // Defence-in-depth: five independent gates run in order before the
-    // per-segment allowlist check. Each gate targets a specific bypass
-    // technique. If any gate rejects, the whole command is blocked.
+    fn normalized_allowlist(entries: &[String]) -> BTreeSet<String> {
+        entries
+            .iter()
+            .map(|entry| strip_wrapping_quotes(entry).trim().to_ascii_lowercase())
+            .filter(|entry| !entry.is_empty())
+            .collect()
+    }
 
-    /// Check if a shell command is allowed.
+    fn uses_default_command_allowlist(&self) -> bool {
+        Self::normalized_allowlist(&self.allowed_commands)
+            == Self::normalized_allowlist(&default_allowed_commands())
+    }
+
+    // ── Layered Command Policy ─────────────────────────────────────────────
+    // Defence-in-depth: structural shell checks run before risk gating. This
+    // keeps the default policy blacklist-oriented while still allowing explicit
+    // operator overrides for individual high-risk commands.
+
+    /// Check whether a shell command passes the structural policy.
     ///
     /// Validates the **entire** command string, not just the first word:
     /// - Blocks subshell operators (`` ` ``, `$(`) that hide arbitrary execution
     /// - Splits on command separators (`|`, `&&`, `||`, `;`, newlines) and
-    ///   validates each sub-command against the allowlist
+    ///   validates each sub-command independently
     /// - Blocks single `&` background chaining (`&&` remains supported)
     /// - Blocks shell redirections (`<`, `>`, `>>`) that can bypass path policy
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
-    pub fn is_command_allowed(&self, command: &str) -> bool {
+    fn passes_command_safety_checks(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
@@ -982,14 +967,6 @@ impl SecurityPolicy {
                 continue;
             }
 
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
-            {
-                return false;
-            }
-
             // Validate arguments for the command
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             if !self.is_args_safe(base_cmd, &args) {
@@ -1004,6 +981,22 @@ impl SecurityPolicy {
         });
 
         has_cmd
+    }
+
+    /// Check whether a shell command is allowed by the active blacklist/risk policy.
+    ///
+    /// Low-risk and medium-risk commands are allowed by default if they pass
+    /// the structural shell-safety checks. High-risk commands are then handled
+    /// by the configured approval/block policy, and explicit command entries
+    /// can override high-risk blocks for trusted operator-approved commands.
+    pub fn is_command_allowed(&self, command: &str) -> bool {
+        if !self.passes_command_safety_checks(command) {
+            return false;
+        }
+
+        !(self.block_high_risk_commands
+            && self.command_risk_level(command) == CommandRiskLevel::High
+            && !self.is_command_explicitly_allowed(command))
     }
 
     /// Check for dangerous arguments that allow sub-command execution.
@@ -1413,8 +1406,19 @@ impl SecurityPolicy {
             let _ = writeln!(out, "**Additional allowed paths**: {}", roots.join(", "));
         }
 
-        // Allowed commands
-        if !self.allowed_commands.is_empty() {
+        // Shell command mode / explicit overrides
+        if self
+            .allowed_commands
+            .iter()
+            .any(|entry| entry.trim() == "*")
+            || self.uses_default_command_allowlist()
+            || self.allowed_commands.is_empty()
+        {
+            let _ = writeln!(
+                out,
+                "**Shell command mode**: blacklist-oriented. Structurally safe commands may run unless blocked by risk gates."
+            );
+        } else if !self.allowed_commands.is_empty() {
             let cmds: Vec<String> = self
                 .allowed_commands
                 .iter()
@@ -1422,8 +1426,8 @@ impl SecurityPolicy {
                 .collect();
             let _ = writeln!(
                 out,
-                "**Allowed shell commands**: {}. \
-                 Commands not on this list will be rejected.",
+                "**Explicit shell command overrides**: {}. \
+                 Commands are evaluated by blacklist/risk rules by default; these entries explicitly permit otherwise-blocked commands.",
                 cmds.join(", ")
             );
         }
@@ -1447,7 +1451,12 @@ impl SecurityPolicy {
         if self.block_high_risk_commands {
             let _ = writeln!(
                 out,
-                "**High-risk commands** (rm, kill, reboot, etc.) are blocked."
+                "**High-risk commands** (rm, curl, bash, python, etc.) are blocked unless explicitly permitted."
+            );
+        } else if self.autonomy == AutonomyLevel::Supervised {
+            let _ = writeln!(
+                out,
+                "**High-risk commands** (rm, curl, bash, python, etc.) require user approval before execution."
             );
         }
         if self.require_approval_for_medium_risk {
@@ -1567,12 +1576,30 @@ mod tests {
     #[test]
     fn blocked_commands_basic() {
         let p = default_policy();
-        assert!(!p.is_command_allowed("rm -rf /"));
-        assert!(!p.is_command_allowed("sudo apt install"));
-        assert!(!p.is_command_allowed("curl http://evil.com"));
-        assert!(!p.is_command_allowed("wget http://evil.com"));
-        assert!(!p.is_command_allowed("python3 exploit.py"));
-        assert!(!p.is_command_allowed("node malicious.js"));
+        assert!(p.validate_command_execution("rm -rf /", false).is_err());
+        assert!(p
+            .validate_command_execution("sudo apt install", false)
+            .is_err());
+        assert!(p
+            .validate_command_execution("curl http://evil.com", false)
+            .is_err());
+        assert!(p
+            .validate_command_execution("wget http://evil.com", false)
+            .is_err());
+        assert!(p.is_command_allowed("python3 exploit.py"));
+        assert!(p.is_command_allowed("node malicious.js"));
+        let python = p.validate_command_execution("python3 exploit.py", false);
+        assert!(python.is_err());
+        assert!(
+            python.unwrap_err().contains("requires explicit approval"),
+            "high-risk interpreters should require explicit approval in supervised mode"
+        );
+        let node = p.validate_command_execution("node malicious.js", false);
+        assert!(node.is_err());
+        assert!(
+            node.unwrap_err().contains("requires explicit approval"),
+            "high-risk interpreters should require explicit approval in supervised mode"
+        );
     }
 
     #[test]
@@ -1584,10 +1611,10 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_still_uses_allowlist() {
+    fn full_autonomy_still_allows_structurally_safe_commands() {
         let p = full_policy();
         assert!(p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("rm -rf /"));
+        assert!(p.is_command_allowed("git status"));
     }
 
     #[test]
@@ -1600,12 +1627,13 @@ mod tests {
     #[test]
     fn allowlist_supports_explicit_executable_paths() {
         let p = SecurityPolicy {
-            allowed_commands: vec!["/usr/bin/antigravity".into()],
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["/usr/bin/curl".into()],
             ..SecurityPolicy::default()
         };
 
-        assert!(p.is_command_allowed("/usr/bin/antigravity"));
-        assert!(!p.is_command_allowed("antigravity"));
+        let result = p.validate_command_execution("/usr/bin/curl https://api.example.com", true);
+        assert_eq!(result.unwrap(), CommandRiskLevel::High);
     }
 
     #[test]
@@ -1618,10 +1646,12 @@ mod tests {
         assert!(p.is_command_allowed("python3 --version"));
         assert!(p.is_command_allowed("/usr/bin/antigravity"));
 
-        // Wildcard still respects risk gates in validate_command_execution.
-        let blocked = p.validate_command_execution("rm -rf /tmp/test", true);
+        let blocked = p.validate_command_execution("rm -rf /tmp/test", false);
         assert!(blocked.is_err());
-        assert!(blocked.unwrap_err().contains("high-risk"));
+        assert!(blocked.unwrap_err().contains("requires explicit approval"));
+
+        let allowed = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert_eq!(allowed.unwrap(), CommandRiskLevel::High);
     }
 
     #[test]
@@ -1632,36 +1662,42 @@ mod tests {
     }
 
     #[test]
-    fn command_with_pipes_validates_all_segments() {
+    fn command_with_pipes_allow_structural_validation_but_keep_risk_gates() {
         let p = default_policy();
-        // Both sides of the pipe are in the allowlist
         assert!(p.is_command_allowed("ls | grep foo"));
         assert!(p.is_command_allowed("cat file.txt | wc -l"));
-        // Second command not in allowlist — blocked
-        assert!(!p.is_command_allowed("ls | curl http://evil.com"));
-        assert!(!p.is_command_allowed("echo hello | python3 -"));
+        assert!(p.is_command_allowed("ls | curl http://evil.com"));
+        assert!(p.is_command_allowed("echo hello | python3 -"));
+        assert!(p
+            .validate_command_execution("ls | curl http://evil.com", false)
+            .is_err());
+        assert!(p
+            .validate_command_execution("echo hello | python3 -", false)
+            .is_err());
     }
 
     #[test]
-    fn custom_allowlist() {
+    fn custom_command_overrides_do_not_disable_blacklist_mode() {
         let p = SecurityPolicy {
             allowed_commands: vec!["docker".into(), "kubectl".into()],
             ..SecurityPolicy::default()
         };
         assert!(p.is_command_allowed("docker ps"));
         assert!(p.is_command_allowed("kubectl get pods"));
-        assert!(!p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("git status"));
+        assert!(p.is_command_allowed("ls"));
+        assert!(p.is_command_allowed("git status"));
     }
 
     #[test]
-    fn empty_allowlist_blocks_everything() {
+    fn empty_allowed_commands_still_uses_blacklist_policy() {
         let p = SecurityPolicy {
             allowed_commands: vec![],
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("echo hello"));
+        assert!(p.is_command_allowed("ls"));
+        assert!(p.is_command_allowed("echo hello"));
+        assert!(p.is_command_allowed("rm -rf /"));
+        assert!(p.validate_command_execution("rm -rf /", false).is_err());
     }
 
     #[test]
@@ -1697,6 +1733,10 @@ mod tests {
             p.command_risk_level("rm -rf /tmp/test"),
             CommandRiskLevel::High
         );
+        assert_eq!(
+            p.command_risk_level("python3 -c 'print(1)'"),
+            CommandRiskLevel::High
+        );
     }
 
     #[test]
@@ -1724,6 +1764,7 @@ mod tests {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
             ..SecurityPolicy::default()
         };
 
@@ -1774,7 +1815,7 @@ mod tests {
 
         let result = p.validate_command_execution("wget https://evil.com", true);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("not allowed"));
+        assert!(result.unwrap_err().contains("high-risk"));
     }
 
     #[test]
@@ -1792,10 +1833,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_command_high_risk_still_needs_approval_in_supervised() {
-        // Even when explicitly allowed, supervised mode still requires
-        // approval for high-risk commands (the approval gate is separate
-        // from the block gate).
+    fn validate_command_explicit_high_risk_override_skips_runtime_prompt() {
+        // Explicit operator overrides serve as the approval source for
+        // scheduler/non-interactive paths where there is no runtime prompt.
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec!["curl".into()],
@@ -1803,11 +1843,7 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        let denied = p.validate_command_execution("curl https://api.example.com", false);
-        assert!(denied.is_err());
-        assert!(denied.unwrap_err().contains("requires explicit approval"));
-
-        let allowed = p.validate_command_execution("curl https://api.example.com", true);
+        let allowed = p.validate_command_execution("curl https://api.example.com", false);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::High);
     }
 
@@ -2006,11 +2042,12 @@ mod tests {
         assert_eq!(p.autonomy, AutonomyLevel::Supervised);
         assert!(p.workspace_only);
         assert!(!p.allowed_commands.is_empty());
+        assert!(p.allowed_commands.iter().any(|entry| entry == "*"));
         assert!(!p.forbidden_paths.is_empty());
         assert!(p.max_actions_per_hour > 0);
         assert!(p.max_cost_per_day_cents > 0);
-        assert!(p.require_approval_for_medium_risk);
-        assert!(p.block_high_risk_commands);
+        assert!(!p.require_approval_for_medium_risk);
+        assert!(!p.block_high_risk_commands);
         assert!(p.shell_env_passthrough.is_empty());
     }
 
@@ -2084,15 +2121,15 @@ mod tests {
     #[test]
     fn command_injection_semicolon_blocked() {
         let p = default_policy();
-        // First word is "ls;" (with semicolon) — doesn't match "ls" in allowlist.
-        // This is a safe default: chained commands are blocked.
-        assert!(!p.is_command_allowed("ls; rm -rf /"));
+        assert!(p.is_command_allowed("ls; rm -rf /"));
+        assert!(p.validate_command_execution("ls; rm -rf /", false).is_err());
     }
 
     #[test]
     fn command_injection_semicolon_no_space() {
         let p = default_policy();
-        assert!(!p.is_command_allowed("ls;rm -rf /"));
+        assert!(p.is_command_allowed("ls;rm -rf /"));
+        assert!(p.validate_command_execution("ls;rm -rf /", false).is_err());
     }
 
     #[test]
@@ -2118,7 +2155,10 @@ mod tests {
             allowed_commands: vec!["sqlite3".into()],
             ..SecurityPolicy::default()
         };
-        assert!(!p.is_command_allowed("sqlite3 /tmp/test.db \"SELECT 1;\"; rm -rf /"));
+        assert!(p.is_command_allowed("sqlite3 /tmp/test.db \"SELECT 1;\"; rm -rf /"));
+        assert!(p
+            .validate_command_execution("sqlite3 /tmp/test.db \"SELECT 1;\"; rm -rf /", false)
+            .is_err());
     }
 
     #[test]
@@ -2156,33 +2196,42 @@ mod tests {
     #[test]
     fn command_with_env_var_prefix() {
         let p = default_policy();
-        // "FOO=bar" is the first word — not in allowlist
-        assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
+        assert!(p.is_command_allowed("FOO=bar rm -rf /"));
+        assert!(p
+            .validate_command_execution("FOO=bar rm -rf /", false)
+            .unwrap_err()
+            .contains("requires explicit approval"));
     }
 
     #[test]
     fn command_newline_injection_blocked() {
         let p = default_policy();
-        // Newline splits into two commands; "rm" is not in allowlist
-        assert!(!p.is_command_allowed("ls\nrm -rf /"));
-        // Both allowed — OK
+        assert!(p.is_command_allowed("ls\nrm -rf /"));
+        assert!(p.validate_command_execution("ls\nrm -rf /", false).is_err());
         assert!(p.is_command_allowed("ls\necho hello"));
     }
 
     #[test]
     fn command_injection_and_chain_blocked() {
         let p = default_policy();
-        assert!(!p.is_command_allowed("ls && rm -rf /"));
-        assert!(!p.is_command_allowed("echo ok && curl http://evil.com"));
-        // Both allowed — OK
+        assert!(p.is_command_allowed("ls && rm -rf /"));
+        assert!(p
+            .validate_command_execution("ls && rm -rf /", false)
+            .is_err());
+        assert!(p.is_command_allowed("echo ok && curl http://evil.com"));
+        assert!(p
+            .validate_command_execution("echo ok && curl http://evil.com", false)
+            .is_err());
         assert!(p.is_command_allowed("ls && echo done"));
     }
 
     #[test]
     fn command_injection_or_chain_blocked() {
         let p = default_policy();
-        assert!(!p.is_command_allowed("ls || rm -rf /"));
-        // Both allowed — OK
+        assert!(p.is_command_allowed("ls || rm -rf /"));
+        assert!(p
+            .validate_command_execution("ls || rm -rf /", false)
+            .is_err());
         assert!(p.is_command_allowed("ls || echo fallback"));
     }
 
@@ -2258,11 +2307,13 @@ mod tests {
     #[test]
     fn command_env_var_prefix_with_allowed_cmd() {
         let p = default_policy();
-        // env assignment + allowed command — OK
         assert!(p.is_command_allowed("FOO=bar ls"));
         assert!(p.is_command_allowed("LANG=C grep pattern file"));
-        // env assignment + disallowed command — blocked
-        assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
+        assert!(p.is_command_allowed("FOO=bar rm -rf /"));
+        assert!(p
+            .validate_command_execution("FOO=bar rm -rf /", false)
+            .unwrap_err()
+            .contains("requires explicit approval"));
     }
 
     #[test]
@@ -2472,7 +2523,7 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert!(p.is_command_allowed("git status"));
-        assert!(!p.is_command_allowed("docker ps"));
+        assert!(p.is_command_allowed("docker ps"));
     }
 
     #[test]
@@ -2502,10 +2553,11 @@ mod tests {
         };
 
         // Path outside workspace should be allowed when workspace_only=false
-        let outside = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/home"))
-            .join("zeroclaw_outside_ws");
+        let outside = if cfg!(windows) {
+            PathBuf::from(r"C:\zeroclaw_outside_ws")
+        } else {
+            PathBuf::from("/opt/zeroclaw_outside_ws")
+        };
         assert!(
             p.is_resolved_path_allowed(&outside),
             "workspace_only=false must allow resolved paths outside workspace"
@@ -3001,7 +3053,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_summary_includes_allowed_commands() {
+    fn prompt_summary_includes_explicit_override_details() {
         let p = SecurityPolicy {
             allowed_commands: vec!["git".into(), "ls".into()],
             ..SecurityPolicy::default()
@@ -3010,8 +3062,18 @@ mod tests {
         assert!(summary.contains("`git`"), "should list allowed commands");
         assert!(summary.contains("`ls`"), "should list allowed commands");
         assert!(
-            summary.contains("not on this list will be rejected"),
-            "should warn about rejection"
+            summary.contains("explicitly permit otherwise-blocked commands"),
+            "should explain override behavior"
+        );
+    }
+
+    #[test]
+    fn prompt_summary_describes_blacklist_mode_for_wildcard() {
+        let p = SecurityPolicy::default();
+        let summary = p.prompt_summary();
+        assert!(
+            summary.contains("blacklist-oriented"),
+            "should describe wildcard command mode"
         );
     }
 

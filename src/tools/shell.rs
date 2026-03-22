@@ -575,6 +575,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec!["touch".into()],
+            require_approval_for_medium_risk: true,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });

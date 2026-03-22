@@ -4,12 +4,13 @@
 //! with session-scoped "Always" allowlists and audit logging.
 
 use crate::config::AutonomyConfig;
-use crate::security::AutonomyLevel;
+use crate::security::{AutonomyLevel, SecurityPolicy};
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -70,6 +71,8 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// Shell-policy snapshot used to classify shell-like tool calls.
+    shell_policy: SecurityPolicy,
 }
 
 impl ApprovalManager {
@@ -82,6 +85,7 @@ impl ApprovalManager {
             non_interactive: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            shell_policy: SecurityPolicy::from_config(config, Path::new(".")),
         }
     }
 
@@ -98,6 +102,7 @@ impl ApprovalManager {
             non_interactive: true,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            shell_policy: SecurityPolicy::from_config(config, Path::new(".")),
         }
     }
 
@@ -111,6 +116,15 @@ impl ApprovalManager {
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
+        self.needs_approval_call(tool_name, &serde_json::Value::Null)
+    }
+
+    /// Args-aware approval check used by the tool loop.
+    ///
+    /// ZeroClaw now follows a blacklist-style approval model: only explicitly
+    /// configured tools (`always_ask`) or concrete high-risk operations prompt.
+    /// Low-risk and medium-risk tool calls are allowed to proceed by default.
+    pub fn needs_approval_call(&self, tool_name: &str, args: &serde_json::Value) -> bool {
         // Full autonomy never prompts.
         if self.autonomy_level == AutonomyLevel::Full {
             return false;
@@ -126,15 +140,6 @@ impl ApprovalManager {
             return true;
         }
 
-        // Channel-driven shell execution is still guarded by the shell tool's
-        // own command allowlist and risk policy. Skipping the outer approval
-        // gate here lets low-risk allowlisted commands (e.g. `ls`) work in
-        // non-interactive channels without silently allowing medium/high-risk
-        // commands.
-        if self.non_interactive && tool_name == "shell" {
-            return false;
-        }
-
         // auto_approve skips the prompt.
         if self.auto_approve.contains("*") || self.auto_approve.contains(tool_name) {
             return false;
@@ -146,8 +151,50 @@ impl ApprovalManager {
             return false;
         }
 
-        // Default: supervised mode requires approval.
-        true
+        self.is_high_risk_operation(tool_name, args)
+    }
+
+    fn is_high_risk_operation(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        if self.shell_like_tool_requires_approval(tool_name, args) {
+            return true;
+        }
+
+        let normalized = tool_name.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            // Delegation, external automation, and cross-session actions all
+            // expand the execution or delivery boundary.
+            "delegate" | "swarm" | "claude_code" | "browser_delegate" | "composio"
+            | "security_ops" | "sessions_send" | "reaction" => true,
+            // External SaaS integrations: only prompt on mutating actions.
+            "jira" => matches_action(args, &["comment_ticket"]),
+            "notion" => matches_action(args, &["create_page", "update_page"]),
+            "microsoft365" => matches_action(
+                args,
+                &[
+                    "mail_send",
+                    "teams_message_send",
+                    "calendar_event_create",
+                    "calendar_event_delete",
+                ],
+            ),
+            "google_workspace" => args
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(is_mutating_method),
+            _ => false,
+        }
+    }
+
+    fn shell_like_tool_requires_approval(&self, tool_name: &str, args: &serde_json::Value) -> bool {
+        let command = extract_shell_command(tool_name, args);
+        let Some(command) = command else {
+            return false;
+        };
+
+        match self.shell_policy.validate_command_execution(command, false) {
+            Ok(_) => false,
+            Err(reason) => reason.contains("requires explicit approval"),
+        }
     }
 
     /// Record an approval decision and update session state.
@@ -256,6 +303,32 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
     }
 }
 
+fn matches_action(args: &serde_json::Value, actions: &[&str]) -> bool {
+    args.get("action")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|action| actions.contains(&action))
+}
+
+fn is_mutating_method(method: &str) -> bool {
+    matches!(
+        method,
+        "create" | "update" | "delete" | "patch" | "post" | "put" | "send"
+    )
+}
+
+fn extract_shell_command<'a>(tool_name: &str, args: &'a serde_json::Value) -> Option<&'a str> {
+    match tool_name {
+        "shell" | "schedule" | "cron_add" | "cron_run" => {
+            args.get("command").and_then(serde_json::Value::as_str)
+        }
+        "cron_update" => args
+            .get("patch")
+            .and_then(|patch| patch.get("command"))
+            .and_then(serde_json::Value::as_str),
+        _ => None,
+    }
+}
+
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -295,10 +368,42 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tool_needs_approval_in_supervised() {
+    fn low_risk_tools_no_longer_need_approval_in_supervised() {
         let mgr = ApprovalManager::from_config(&supervised_config());
-        assert!(mgr.needs_approval("file_write"));
-        assert!(mgr.needs_approval("http_request"));
+        assert!(!mgr.needs_approval("file_write"));
+        assert!(!mgr.needs_approval("http_request"));
+    }
+
+    #[test]
+    fn high_risk_shell_command_requires_approval() {
+        let mgr = ApprovalManager::from_config(&AutonomyConfig::default());
+        assert!(
+            mgr.needs_approval_call("shell", &serde_json::json!({"command": "rm -rf /tmp/test"}))
+        );
+    }
+
+    #[test]
+    fn low_risk_shell_command_skips_outer_approval() {
+        let mgr = ApprovalManager::from_config(&AutonomyConfig::default());
+        assert!(!mgr.needs_approval_call("shell", &serde_json::json!({"command": "ls -la"})));
+    }
+
+    #[test]
+    fn delegate_requires_approval_as_high_risk_tool() {
+        let mgr = ApprovalManager::from_config(&AutonomyConfig::default());
+        assert!(mgr.needs_approval_call(
+            "delegate",
+            &serde_json::json!({"agent": "researcher", "task": "scan repo"})
+        ));
+    }
+
+    #[test]
+    fn read_only_external_tools_skip_approval() {
+        let mgr = ApprovalManager::from_config(&AutonomyConfig::default());
+        assert!(!mgr.needs_approval_call(
+            "jira",
+            &serde_json::json!({"action": "get_ticket", "issue_key": "PROJ-1"})
+        ));
     }
 
     #[test]
@@ -324,17 +429,17 @@ mod tests {
     #[test]
     fn always_response_adds_to_session_allowlist() {
         let mgr = ApprovalManager::from_config(&supervised_config());
-        assert!(mgr.needs_approval("file_write"));
+        assert!(mgr.needs_approval("delegate"));
 
         mgr.record_decision(
-            "file_write",
-            &serde_json::json!({"path": "test.txt"}),
+            "delegate",
+            &serde_json::json!({"agent": "coder"}),
             ApprovalResponse::Always,
             "cli",
         );
 
-        // Now file_write should be in session allowlist.
-        assert!(!mgr.needs_approval("file_write"));
+        // Now delegate should be in session allowlist.
+        assert!(!mgr.needs_approval("delegate"));
     }
 
     #[test]
@@ -357,12 +462,12 @@ mod tests {
     fn yes_response_does_not_add_to_allowlist() {
         let mgr = ApprovalManager::from_config(&supervised_config());
         mgr.record_decision(
-            "file_write",
+            "delegate",
             &serde_json::json!({}),
             ApprovalResponse::Yes,
             "cli",
         );
-        assert!(mgr.needs_approval("file_write"));
+        assert!(mgr.needs_approval("delegate"));
     }
 
     // ── audit log ────────────────────────────────────────────
@@ -466,9 +571,9 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_shell_skips_outer_approval_by_default() {
+    fn non_interactive_low_risk_shell_skips_outer_approval_by_default() {
         let mgr = ApprovalManager::for_non_interactive(&AutonomyConfig::default());
-        assert!(!mgr.needs_approval("shell"));
+        assert!(!mgr.needs_approval_call("shell", &serde_json::json!({"command": "ls"})));
     }
 
     #[test]
@@ -482,10 +587,17 @@ mod tests {
     #[test]
     fn non_interactive_unknown_tools_need_approval_in_supervised() {
         let mgr = ApprovalManager::for_non_interactive(&supervised_config());
-        // Unknown tools in supervised mode need approval (will be auto-denied
-        // by the tool-call loop for non-interactive managers).
-        assert!(mgr.needs_approval("file_write"));
-        assert!(mgr.needs_approval("http_request"));
+        assert!(!mgr.needs_approval("file_write"));
+        assert!(!mgr.needs_approval("http_request"));
+    }
+
+    #[test]
+    fn non_interactive_high_risk_shell_needs_approval() {
+        let mgr = ApprovalManager::for_non_interactive(&AutonomyConfig::default());
+        assert!(mgr.needs_approval_call(
+            "shell",
+            &serde_json::json!({"command": "curl https://example.com"})
+        ));
     }
 
     #[test]
@@ -511,18 +623,18 @@ mod tests {
     #[test]
     fn non_interactive_session_allowlist_still_works() {
         let mgr = ApprovalManager::for_non_interactive(&supervised_config());
-        assert!(mgr.needs_approval("file_write"));
+        assert!(mgr.needs_approval("delegate"));
 
         // Simulate an "Always" decision (would come from a prior channel run
         // if the tool was auto-approved somehow, e.g. via config change).
         mgr.record_decision(
-            "file_write",
-            &serde_json::json!({"path": "test.txt"}),
+            "delegate",
+            &serde_json::json!({"agent": "coder"}),
             ApprovalResponse::Always,
             "telegram",
         );
 
-        assert!(!mgr.needs_approval("file_write"));
+        assert!(!mgr.needs_approval("delegate"));
     }
 
     #[test]

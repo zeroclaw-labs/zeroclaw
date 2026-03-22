@@ -337,7 +337,7 @@ pub trait Provider: Send + Sync {
         // If tools are provided but provider doesn't support native tools,
         // inject tool instructions into system prompt as fallback.
         if let Some(tools) = request.tools {
-            if !tools.is_empty() && !self.supports_native_tools() {
+            if !tools.is_empty() && !self.supports_native_tools_for_model(model) {
                 let tool_instructions = match self.convert_tools(tools) {
                     ToolsPayload::PromptGuided { instructions } => instructions,
                     payload => {
@@ -389,9 +389,27 @@ pub trait Provider: Send + Sync {
         self.capabilities().native_tool_calling
     }
 
+    /// Whether the provider supports native tool calls for the requested model.
+    ///
+    /// Wrappers can override this to answer based on the effective
+    /// provider/model selected for a given request.
+    fn supports_native_tools_for_model(&self, model: &str) -> bool {
+        let _ = model;
+        self.supports_native_tools()
+    }
+
     /// Whether provider supports multimodal vision input.
     fn supports_vision(&self) -> bool {
         self.capabilities().vision
+    }
+
+    /// Whether the provider supports vision input for the requested model.
+    ///
+    /// Wrappers can override this to answer based on the effective
+    /// provider/model selected for a given request.
+    fn supports_vision_for_model(&self, model: &str) -> bool {
+        let _ = model;
+        self.supports_vision()
     }
 
     /// Warm up the HTTP connection pool (TLS handshake, DNS, HTTP/2 setup).
@@ -648,6 +666,18 @@ mod tests {
     fn supports_vision_reflects_capabilities_default_mapping() {
         let provider = CapabilityMockProvider;
         assert!(provider.supports_vision());
+    }
+
+    #[test]
+    fn supports_native_tools_for_model_defaults_to_capabilities_mapping() {
+        let provider = CapabilityMockProvider;
+        assert!(provider.supports_native_tools_for_model("any-model"));
+    }
+
+    #[test]
+    fn supports_vision_for_model_defaults_to_capabilities_mapping() {
+        let provider = CapabilityMockProvider;
+        assert!(provider.supports_vision_for_model("any-model"));
     }
 
     #[test]

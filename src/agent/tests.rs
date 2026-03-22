@@ -627,6 +627,36 @@ async fn history_trims_after_max_messages() {
     assert!(matches!(first, ConversationMessage::Chat(c) if c.role == "system"));
 }
 
+#[tokio::test]
+async fn history_trimming_inserts_summary_for_older_turns() {
+    let max_history = 6;
+    let mut responses = vec![];
+    for _ in 0..max_history + 5 {
+        responses.push(text_response("ok"));
+    }
+
+    let provider = Box::new(ScriptedProvider::new(responses));
+    let config = AgentConfig {
+        max_history_messages: max_history,
+        ..AgentConfig::default()
+    };
+
+    let mut agent = build_agent_with_config(provider, vec![], config);
+
+    for i in 0..max_history + 5 {
+        let _ = agent.turn(&format!("msg {i}")).await.unwrap();
+    }
+
+    assert!(agent.history().iter().any(|msg| {
+        matches!(
+            msg,
+            ConversationMessage::Chat(chat)
+                if chat.role == "assistant"
+                    && chat.content.starts_with("[Conversation summary]")
+        )
+    }));
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 9. Memory auto-save round-trip
 // ═══════════════════════════════════════════════════════════════════════════

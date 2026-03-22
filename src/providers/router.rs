@@ -158,10 +158,26 @@ impl Provider for RouterProvider {
             .unwrap_or(false)
     }
 
+    fn supports_native_tools_for_model(&self, model: &str) -> bool {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.providers
+            .get(provider_idx)
+            .map(|(_, provider)| provider.supports_native_tools_for_model(&resolved_model))
+            .unwrap_or(false)
+    }
+
     fn supports_vision(&self) -> bool {
         self.providers
             .iter()
             .any(|(_, provider)| provider.supports_vision())
+    }
+
+    fn supports_vision_for_model(&self, model: &str) -> bool {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.providers
+            .get(provider_idx)
+            .map(|(_, provider)| provider.supports_vision_for_model(&resolved_model))
+            .unwrap_or(false)
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -185,14 +201,22 @@ mod tests {
         calls: Arc<AtomicUsize>,
         response: &'static str,
         last_model: parking_lot::Mutex<String>,
+        native_tools: bool,
+        vision: bool,
     }
 
     impl MockProvider {
         fn new(response: &'static str) -> Self {
+            Self::with_capabilities(response, false, false)
+        }
+
+        fn with_capabilities(response: &'static str, native_tools: bool, vision: bool) -> Self {
             Self {
                 calls: Arc::new(AtomicUsize::new(0)),
                 response,
                 last_model: parking_lot::Mutex::new(String::new()),
+                native_tools,
+                vision,
             }
         }
 
@@ -217,6 +241,14 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            self.native_tools
+        }
+
+        fn supports_vision(&self) -> bool {
+            self.vision
         }
     }
 
@@ -460,5 +492,63 @@ mod tests {
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
         assert_eq!(mocks[0].call_count(), 0);
+    }
+
+    #[test]
+    fn supports_native_tools_for_model_uses_resolved_route() {
+        let router = RouterProvider::new(
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockProvider::with_capabilities("default", false, false))
+                        as Box<dyn Provider>,
+                ),
+                (
+                    "smart".into(),
+                    Box::new(MockProvider::with_capabilities("smart", true, false))
+                        as Box<dyn Provider>,
+                ),
+            ],
+            vec![(
+                "reasoning".into(),
+                Route {
+                    provider_name: "smart".into(),
+                    model: "claude-opus".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        assert!(!router.supports_native_tools_for_model("gpt-4o"));
+        assert!(router.supports_native_tools_for_model("hint:reasoning"));
+    }
+
+    #[test]
+    fn supports_vision_for_model_uses_resolved_route() {
+        let router = RouterProvider::new(
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockProvider::with_capabilities("default", false, false))
+                        as Box<dyn Provider>,
+                ),
+                (
+                    "vision".into(),
+                    Box::new(MockProvider::with_capabilities("vision", false, true))
+                        as Box<dyn Provider>,
+                ),
+            ],
+            vec![(
+                "images".into(),
+                Route {
+                    provider_name: "vision".into(),
+                    model: "gpt-4.1-vision".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        assert!(!router.supports_vision_for_model("gpt-4o"));
+        assert!(router.supports_vision_for_model("hint:images"));
     }
 }

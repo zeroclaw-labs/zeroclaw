@@ -60,7 +60,7 @@ impl Tool for ScheduleTool {
                 },
                 "approved": {
                     "type": "boolean",
-                    "description": "Set true to explicitly approve medium/high-risk shell commands in supervised mode",
+                    "description": "Set true to explicitly approve approval-gated shell commands in supervised mode",
                     "default": false
                 },
                 "id": {
@@ -305,7 +305,8 @@ impl ScheduleTool {
         }
 
         // All job creation routes through validated cron helpers, which enforce
-        // the full security policy (allowlist + risk gate) before persistence.
+        // the full security policy (structural checks + blacklist/risk gate)
+        // before persistence.
         if let Some(value) = expression {
             let job = match cron::add_shell_job_with_approval(
                 &self.config,
@@ -754,11 +755,11 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or_default()
-            .contains("not allowed"));
+            .contains("explicit approval"));
     }
 
     #[tokio::test]
-    async fn medium_risk_create_requires_approval() {
+    async fn medium_risk_create_is_allowed_by_default() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -782,12 +783,7 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(!denied.success);
-        assert!(denied
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(denied.success, "{:?}", denied.error);
 
         let approved = tool
             .execute(json!({
