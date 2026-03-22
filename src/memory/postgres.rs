@@ -14,8 +14,9 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 
 /// PostgreSQL-backed persistent memory.
 ///
-/// This backend focuses on reliable CRUD and keyword recall using SQL, without
-/// requiring extension setup (for example pgvector).
+/// Uses PostgreSQL's built-in full-text search (`to_tsvector`/`plainto_tsquery`/
+/// `ts_rank_cd`) for recall — no extensions required. Falls back to ILIKE
+/// substring matching when the query is too short for FTS tokenization.
 pub struct PostgresMemory {
     client: Arc<Mutex<Client>>,
     qualified_table: String,
@@ -100,6 +101,11 @@ impl PostgresMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);
             CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);
             CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
+
+            -- GIN index for built-in full-text search on key + content
+            CREATE INDEX IF NOT EXISTS idx_memories_fts
+                ON {qualified_table}
+                USING GIN (to_tsvector('simple', key || ' ' || content));
             "
         ))?;
 
@@ -136,6 +142,43 @@ impl PostgresMemory {
             session_id: row.get(5),
             score: row.try_get(6).ok(),
         })
+    }
+
+    /// ILIKE-based fallback for very short queries or when FTS returns no results.
+    fn ilike_recall(
+        client: &mut Client,
+        qualified_table: &str,
+        query: &str,
+        sid: Option<&str>,
+        limit: i64,
+        time_filter: &str,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<Row>> {
+        let stmt = format!(
+            "
+            SELECT id, key, content, category, created_at, session_id,
+                   (
+                     CASE WHEN key ILIKE '%' || $1 || '%' THEN 2.0 ELSE 0.0 END +
+                     CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
+                   ) AS score
+            FROM {qualified_table}
+            WHERE ($2::TEXT IS NULL OR session_id = $2)
+              AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
+              {time_filter}
+            ORDER BY score DESC, updated_at DESC
+            LIMIT $3
+            "
+        );
+
+        let sid_owned = sid.map(str::to_string);
+        let rows = match (since, until) {
+            (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid_owned, &limit, &s, &u])?,
+            (Some(s), None) => client.query(&stmt, &[&query, &sid_owned, &limit, &s])?,
+            (None, Some(u)) => client.query(&stmt, &[&query, &sid_owned, &limit, &u])?,
+            (None, None) => client.query(&stmt, &[&query, &sid_owned, &limit])?,
+        };
+        Ok(rows)
     }
 }
 
@@ -263,31 +306,75 @@ impl Memory for PostgresMemory {
                 (None, None) => String::new(),
             };
 
-            let stmt = format!(
-                "
-                SELECT id, key, content, category, created_at, session_id,
-                       (
-                         CASE WHEN key ILIKE '%' || $1 || '%' THEN 2.0 ELSE 0.0 END +
-                         CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
-                       ) AS score
-                FROM {qualified_table}
-                WHERE ($2::TEXT IS NULL OR session_id = $2)
-                  AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
-                  {time_filter}
-                ORDER BY score DESC, updated_at DESC
-                LIMIT $3
-                "
-            );
-
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = match (since_ref, until_ref) {
-                (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &s, &u])?,
-                (Some(s), None) => client.query(&stmt, &[&query, &sid, &limit_i64, &s])?,
-                (None, Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &u])?,
-                (None, None) => client.query(&stmt, &[&query, &sid, &limit_i64])?,
+            // Use PostgreSQL built-in full-text search for multi-word queries.
+            // plainto_tsquery safely tokenizes the input (no special syntax needed).
+            // ts_rank_cd uses cover density ranking for meaningful continuous scores.
+            // Key matches get a 2x boost via weighted tsvector (A-weight on key).
+            // Falls back to ILIKE for very short queries (< 2 chars) where FTS
+            // tokenization produces an empty tsquery.
+            let rows = if query.len() >= 2 {
+                let fts_stmt = format!(
+                    "
+                    SELECT id, key, content, category, created_at, session_id,
+                           ts_rank_cd(
+                               setweight(to_tsvector('simple', key), 'A') ||
+                               to_tsvector('simple', content),
+                               plainto_tsquery('simple', $1)
+                           )::DOUBLE PRECISION AS score
+                    FROM {qualified_table}
+                    WHERE ($2::TEXT IS NULL OR session_id = $2)
+                      AND (
+                          to_tsvector('simple', key || ' ' || content)
+                          @@ plainto_tsquery('simple', $1)
+                      )
+                      {time_filter}
+                    ORDER BY score DESC, updated_at DESC
+                    LIMIT $3
+                    "
+                );
+
+                let fts_rows = match (since_ref, until_ref) {
+                    (Some(s), Some(u)) => {
+                        client.query(&fts_stmt, &[&query, &sid, &limit_i64, &s, &u])?
+                    }
+                    (Some(s), None) => client.query(&fts_stmt, &[&query, &sid, &limit_i64, &s])?,
+                    (None, Some(u)) => client.query(&fts_stmt, &[&query, &sid, &limit_i64, &u])?,
+                    (None, None) => client.query(&fts_stmt, &[&query, &sid, &limit_i64])?,
+                };
+
+                // If FTS returned no results (e.g. all stop-words, single rare
+                // token not in any row), fall back to ILIKE so the caller still
+                // gets a best-effort answer.
+                if fts_rows.is_empty() {
+                    Self::ilike_recall(
+                        &mut client,
+                        &qualified_table,
+                        &query,
+                        sid.as_deref(),
+                        limit_i64,
+                        &time_filter,
+                        since_ref,
+                        until_ref,
+                    )?
+                } else {
+                    fts_rows
+                }
+            } else {
+                Self::ilike_recall(
+                    &mut client,
+                    &qualified_table,
+                    &query,
+                    sid.as_deref(),
+                    limit_i64,
+                    &time_filter,
+                    since_ref,
+                    until_ref,
+                )?
             };
+
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
