@@ -1448,6 +1448,25 @@ else
   step_dot "Skipping install"
 fi
 
+# --- Build web dashboard ---
+if [[ "$SKIP_BUILD" == false && -d "$WORK_DIR/web" ]]; then
+  if have_cmd node && have_cmd npm; then
+    step_dot "Building web dashboard"
+    if (cd "$WORK_DIR/web" && npm ci --ignore-scripts 2>/dev/null && npm run build 2>/dev/null); then
+      step_ok "Web dashboard built"
+    else
+      warn "Web dashboard build failed — dashboard will not be available"
+    fi
+  else
+    warn "node/npm not found — skipping web dashboard build"
+    warn "Install Node.js (>=18) and re-run, or build manually: cd web && npm ci && npm run build"
+  fi
+else
+  if [[ "$SKIP_BUILD" == true ]]; then
+    step_dot "Skipping web dashboard build"
+  fi
+fi
+
 ZEROCLAW_BIN=""
 if [[ -x "$HOME/.cargo/bin/zeroclaw" ]]; then
   ZEROCLAW_BIN="$HOME/.cargo/bin/zeroclaw"
