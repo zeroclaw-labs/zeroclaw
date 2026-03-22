@@ -386,12 +386,12 @@ mod tests {
         assert!(type_matches(&json!("hello"), "string"));
         assert!(!type_matches(&json!(42), "string"));
 
-        assert!(type_matches(&json!(3.14), "number"));
+        assert!(type_matches(&json!(2.72), "number"));
         assert!(type_matches(&json!(42), "number"));
         assert!(!type_matches(&json!("42"), "number"));
 
         assert!(type_matches(&json!(42), "integer"));
-        assert!(!type_matches(&json!(3.14), "integer"));
+        assert!(!type_matches(&json!(2.72), "integer"));
 
         assert!(type_matches(&json!(true), "boolean"));
         assert!(!type_matches(&json!(1), "boolean"));
