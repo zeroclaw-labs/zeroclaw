@@ -21,6 +21,7 @@ env:
 jobs:
   version:
     name: Resolve Version
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.ver.outputs.version }}
@@ -40,6 +41,7 @@ jobs:
 
   release-notes:
     name: Generate Release Notes
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     runs-on: ubuntu-latest
     outputs:
       notes: ${{ steps.notes.outputs.body }}
@@ -130,6 +132,7 @@ jobs:
 
   web:
     name: Build Web Dashboard
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
