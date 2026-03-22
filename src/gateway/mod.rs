@@ -826,6 +826,29 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // ── A2A (Agent-to-Agent) protocol ────────────────────────
     let (a2a_agent_card, a2a_task_store) = if config.a2a.enabled {
+        // Security: warn when no authentication is configured for A2A
+        let has_bearer = config
+            .a2a
+            .bearer_token
+            .as_ref()
+            .is_some_and(|t| !t.is_empty());
+        if !has_bearer && !config.gateway.require_pairing {
+            tracing::warn!(
+                "A2A protocol enabled WITHOUT authentication — \
+                 set [a2a] bearer_token or enable gateway pairing to secure the /a2a endpoint"
+            );
+        }
+
+        // Security: warn when agent card exposes internal bind address
+        if config.a2a.public_url.is_none() {
+            tracing::warn!(
+                "A2A agent card will advertise internal bind address ({}:{}) — \
+                 set [a2a] public_url to expose only the public-facing URL",
+                config.gateway.host,
+                config.gateway.port
+            );
+        }
+
         let card = a2a::generate_agent_card(&config);
         tracing::info!("A2A protocol enabled — agent card generated");
         (Some(Arc::new(card)), Some(Arc::new(a2a::TaskStore::new())))
