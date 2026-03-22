@@ -81,6 +81,8 @@ pub mod screenshot;
 pub mod security_ops;
 pub mod sessions;
 pub mod shell;
+pub mod skill_http;
+pub mod skill_tool;
 pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
@@ -156,6 +158,10 @@ pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
 pub use sessions::{SessionsHistoryTool, SessionsListTool, SessionsSendTool};
 pub use shell::ShellTool;
+#[allow(unused_imports)]
+pub use skill_http::SkillHttpTool;
+#[allow(unused_imports)]
+pub use skill_tool::SkillShellTool;
 pub use swarm::SwarmTool;
 pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
@@ -255,6 +261,33 @@ pub fn default_tools_with_runtime(
         Box::new(GlobSearchTool::new(security.clone())),
         Box::new(ContentSearchTool::new(security)),
     ]
+}
+
+/// Register skill-defined tools into an existing tool registry.
+///
+/// Converts each skill's `[[tools]]` entries into callable `Tool` implementations
+/// and appends them to the registry. Skill tools that would shadow a built-in tool
+/// name are skipped with a warning.
+pub fn register_skill_tools(
+    tools_registry: &mut Vec<Box<dyn Tool>>,
+    skills: &[crate::skills::Skill],
+    security: Arc<SecurityPolicy>,
+) {
+    let skill_tools = crate::skills::skills_to_tools(skills, security);
+    let existing_names: std::collections::HashSet<String> = tools_registry
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect();
+    for tool in skill_tools {
+        if existing_names.contains(tool.name()) {
+            tracing::warn!(
+                "Skill tool '{}' shadows built-in tool, skipping",
+                tool.name()
+            );
+        } else {
+            tools_registry.push(tool);
+        }
+    }
 }
 
 /// Create full tool registry including memory tools and optional Composio

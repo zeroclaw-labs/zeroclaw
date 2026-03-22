@@ -473,8 +473,9 @@ mod tests {
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(output.contains("<name>release_checklist</name>"));
-        assert!(output.contains("<kind>shell</kind>"));
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed names
+        assert!(output.contains("<callable_tools"));
+        assert!(output.contains("<name>deploy.release_checklist</name>"));
     }
 
     #[test]
@@ -516,10 +517,10 @@ mod tests {
         assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
         assert!(output.contains("read_skill(name)"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        // Compact mode should still include tools so the LLM knows about them
-        assert!(output.contains("<tools>"));
-        assert!(output.contains("<name>release_checklist</name>"));
-        assert!(output.contains("<kind>shell</kind>"));
+        // Compact mode should still include tools so the LLM knows about them.
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
+        assert!(output.contains("<callable_tools"));
+        assert!(output.contains("<name>deploy.release_checklist</name>"));
     }
 
     #[test]
