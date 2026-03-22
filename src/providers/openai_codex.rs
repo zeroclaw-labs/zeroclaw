@@ -1,13 +1,17 @@
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
 use crate::multimodal;
-use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
+use crate::providers::traits::{
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
+    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
+};
 use crate::providers::ProviderRuntimeOptions;
+use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 
 const DEFAULT_CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -29,7 +33,7 @@ pub struct OpenAiCodexProvider {
 #[derive(Debug, Serialize)]
 struct ResponsesRequest {
     model: String,
-    input: Vec<ResponsesInput>,
+    input: Vec<Value>,
     instructions: String,
     store: bool,
     stream: bool,
@@ -38,6 +42,8 @@ struct ResponsesRequest {
     include: Vec<String>,
     tool_choice: String,
     parallel_tool_calls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ResponsesToolSpec>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,12 +79,28 @@ struct ResponsesResponse {
     output: Vec<ResponsesOutput>,
     #[serde(default)]
     output_text: Option<String>,
+    #[serde(default)]
+    usage: Option<ResponsesUsage>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponsesOutput {
+    #[serde(rename = "type")]
+    kind: Option<String>,
     #[serde(default)]
     content: Vec<ResponsesContent>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    encrypted_content: Option<String>,
+    #[serde(default)]
+    summary: Vec<ResponsesSummary>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +108,34 @@ struct ResponsesContent {
     #[serde(rename = "type")]
     kind: Option<String>,
     text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesSummary {
+    text: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesUsage {
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResponsesToolSpec {
+    #[serde(rename = "type")]
+    kind: String,
+    function: ResponsesToolFunctionSpec,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResponsesToolFunctionSpec {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    parameters: Value,
 }
 
 impl OpenAiCodexProvider {
@@ -210,9 +260,26 @@ fn normalize_model_id(model: &str) -> &str {
     model.rsplit('/').next().unwrap_or(model)
 }
 
-fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInput>) {
+fn tool_call_item(call_id: String, name: String, arguments: String) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    })
+}
+
+fn tool_result_item(call_id: String, output: String) -> Value {
+    json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": output,
+    })
+}
+
+fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<Value>) {
     let mut system_parts: Vec<&str> = Vec::new();
-    let mut input: Vec<ResponsesInput> = Vec::new();
+    let mut input: Vec<Value> = Vec::new();
 
     for msg in messages {
         match msg.role.as_str() {
@@ -249,20 +316,75 @@ fn build_responses_input(messages: &[ChatMessage]) -> (String, Vec<ResponsesInpu
                     });
                 }
 
-                input.push(ResponsesInput {
-                    role: "user".to_string(),
-                    content: content_items,
-                });
+                input.push(
+                    serde_json::to_value(ResponsesInput {
+                        role: "user".to_string(),
+                        content: content_items,
+                    })
+                    .expect("responses input should serialize"),
+                );
             }
             "assistant" => {
-                input.push(ResponsesInput {
-                    role: "assistant".to_string(),
-                    content: vec![ResponsesInputContent {
-                        kind: "output_text".to_string(),
-                        text: Some(msg.content.clone()),
-                        image_url: None,
-                    }],
-                });
+                if let Ok(value) = serde_json::from_str::<Value>(&msg.content) {
+                    if let Some(tool_calls_value) = value.get("tool_calls") {
+                        if let Ok(parsed_calls) = serde_json::from_value::<Vec<ProviderToolCall>>(
+                            tool_calls_value.clone(),
+                        ) {
+                            let content = value
+                                .get("content")
+                                .and_then(Value::as_str)
+                                .filter(|text| !text.is_empty())
+                                .map(ToString::to_string);
+                            if let Some(content) = content {
+                                input.push(
+                                    serde_json::to_value(ResponsesInput {
+                                        role: "assistant".to_string(),
+                                        content: vec![ResponsesInputContent {
+                                            kind: "output_text".to_string(),
+                                            text: Some(content),
+                                            image_url: None,
+                                        }],
+                                    })
+                                    .expect("responses input should serialize"),
+                                );
+                            }
+                            input.extend(
+                                parsed_calls
+                                    .into_iter()
+                                    .map(|call| tool_call_item(call.id, call.name, call.arguments)),
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                input.push(
+                    serde_json::to_value(ResponsesInput {
+                        role: "assistant".to_string(),
+                        content: vec![ResponsesInputContent {
+                            kind: "output_text".to_string(),
+                            text: Some(msg.content.clone()),
+                            image_url: None,
+                        }],
+                    })
+                    .expect("responses input should serialize"),
+                );
+            }
+            "tool" => {
+                if let Ok(value) = serde_json::from_str::<Value>(&msg.content) {
+                    let tool_call_id = value
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .filter(|text| !text.is_empty())
+                        .map(ToString::to_string);
+                    let content = value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    if let (Some(tool_call_id), Some(content)) = (tool_call_id, content) {
+                        input.push(tool_result_item(tool_call_id, content));
+                    }
+                }
             }
             _ => {}
         }
@@ -593,11 +715,108 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
 }
 
 impl OpenAiCodexProvider {
+    fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<ResponsesToolSpec>> {
+        tools.map(|items| {
+            items
+                .iter()
+                .map(|tool| ResponsesToolSpec {
+                    kind: "function".to_string(),
+                    function: ResponsesToolFunctionSpec {
+                        name: tool.name.clone(),
+                        description: Some(tool.description.clone()),
+                        parameters: tool.parameters.clone(),
+                    },
+                })
+                .collect()
+        })
+    }
+
+    fn parse_native_tool_spec(value: Value) -> anyhow::Result<ResponsesToolSpec> {
+        let spec: ResponsesToolSpec = serde_json::from_value(value)
+            .map_err(|e| anyhow::anyhow!("Invalid OpenAI Codex tool specification: {e}"))?;
+
+        if spec.kind != "function" {
+            anyhow::bail!(
+                "Invalid OpenAI Codex tool specification: unsupported tool type '{}', expected 'function'",
+                spec.kind
+            );
+        }
+
+        Ok(spec)
+    }
+
+    fn parse_native_response(response: ResponsesResponse) -> ProviderChatResponse {
+        let mut tool_calls = Vec::new();
+        let mut text_parts = Vec::new();
+        let mut reasoning_content = None;
+
+        for item in &response.output {
+            match item.kind.as_deref() {
+                Some("function_call") => {
+                    if let (Some(name), Some(arguments)) =
+                        (item.name.as_ref(), item.arguments.as_ref())
+                    {
+                        tool_calls.push(ProviderToolCall {
+                            id: item
+                                .call_id
+                                .clone()
+                                .or_else(|| item.id.clone())
+                                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        });
+                    }
+                }
+                Some("reasoning") => {
+                    if reasoning_content.is_none() {
+                        reasoning_content = item.encrypted_content.clone().or_else(|| {
+                            item.summary
+                                .iter()
+                                .find_map(|s| first_nonempty(s.text.as_deref()))
+                        });
+                    }
+                }
+                _ => {
+                    for content in &item.content {
+                        if content.kind.as_deref() == Some("output_text") {
+                            if let Some(text) = first_nonempty(content.text.as_deref()) {
+                                text_parts.push(text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let text = first_nonempty(response.output_text.as_deref()).or_else(|| {
+            if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join("\n\n"))
+            }
+        });
+
+        let usage = response.usage.map(|usage| TokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: None,
+        });
+
+        ProviderChatResponse {
+            text,
+            tool_calls,
+            usage,
+            reasoning_content,
+        }
+    }
+
     async fn send_responses_request(
         &self,
-        input: Vec<ResponsesInput>,
+        input: Vec<Value>,
         instructions: String,
         model: &str,
+        tools: Option<Vec<ResponsesToolSpec>>,
+        stream: bool,
     ) -> anyhow::Result<String> {
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
         let profile = match self
@@ -661,7 +880,7 @@ impl OpenAiCodexProvider {
             input,
             instructions,
             store: false,
-            stream: true,
+            stream,
             text: ResponsesTextOptions {
                 verbosity: "medium".to_string(),
             },
@@ -673,8 +892,13 @@ impl OpenAiCodexProvider {
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
-            tool_choice: "auto".to_string(),
-            parallel_tool_calls: true,
+            tool_choice: if tools.is_some() {
+                "auto".to_string()
+            } else {
+                "none".to_string()
+            },
+            parallel_tool_calls: tools.is_some(),
+            tools,
         };
 
         let bearer_token = if use_gateway_api_key_auth {
@@ -713,13 +937,140 @@ impl OpenAiCodexProvider {
 
         decode_responses_body(response).await
     }
+
+    async fn send_responses_request_native(
+        &self,
+        input: Vec<Value>,
+        instructions: String,
+        model: &str,
+        tools: Option<Vec<ResponsesToolSpec>>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
+        let profile = match self
+            .auth
+            .get_profile("openai-codex", self.auth_profile_override.as_deref())
+            .await
+        {
+            Ok(profile) => profile,
+            Err(err) if use_gateway_api_key_auth => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to load OpenAI Codex profile; continuing with custom endpoint API key mode"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        let oauth_access_token = match self
+            .auth
+            .get_valid_openai_access_token(self.auth_profile_override.as_deref())
+            .await
+        {
+            Ok(token) => token,
+            Err(err) if use_gateway_api_key_auth => {
+                tracing::warn!(
+                    error = %err,
+                    "failed to refresh OpenAI token; continuing with custom endpoint API key mode"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
+
+        let account_id = profile.and_then(|profile| profile.account_id).or_else(|| {
+            oauth_access_token
+                .as_deref()
+                .and_then(extract_account_id_from_jwt)
+        });
+        let access_token = if use_gateway_api_key_auth {
+            oauth_access_token
+        } else {
+            Some(oauth_access_token.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`."
+                )
+            })?)
+        };
+        let account_id = if use_gateway_api_key_auth {
+            account_id
+        } else {
+            Some(account_id.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "OpenAI Codex account id not found in auth profile/token. Run `zeroclaw auth login --provider openai-codex` again."
+                )
+            })?)
+        };
+        let normalized_model = normalize_model_id(model);
+
+        let request = ResponsesRequest {
+            model: normalized_model.to_string(),
+            input,
+            instructions,
+            store: false,
+            stream: false,
+            text: ResponsesTextOptions {
+                verbosity: "medium".to_string(),
+            },
+            reasoning: ResponsesReasoningOptions {
+                effort: resolve_reasoning_effort(
+                    normalized_model,
+                    self.reasoning_effort.as_deref(),
+                ),
+                summary: "auto".to_string(),
+            },
+            include: vec!["reasoning.encrypted_content".to_string()],
+            tool_choice: if tools.is_some() {
+                "auto".to_string()
+            } else {
+                "none".to_string()
+            },
+            parallel_tool_calls: tools.is_some(),
+            tools,
+        };
+
+        let bearer_token = if use_gateway_api_key_auth {
+            self.gateway_api_key.as_deref().unwrap_or_default()
+        } else {
+            access_token.as_deref().unwrap_or_default()
+        };
+
+        let mut request_builder = self
+            .client
+            .post(&self.responses_url)
+            .header("Authorization", format!("Bearer {bearer_token}"))
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("originator", "pi")
+            .header("Content-Type", "application/json");
+
+        if let Some(account_id) = account_id.as_deref() {
+            request_builder = request_builder.header("chatgpt-account-id", account_id);
+        }
+
+        if use_gateway_api_key_auth {
+            if let Some(access_token) = access_token.as_deref() {
+                request_builder = request_builder.header("x-openai-access-token", access_token);
+            }
+            if let Some(account_id) = account_id.as_deref() {
+                request_builder = request_builder.header("x-openai-account-id", account_id);
+            }
+        }
+
+        let response = request_builder.json(&request).send().await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI Codex", response).await);
+        }
+
+        let parsed: ResponsesResponse = response.json().await?;
+        Ok(Self::parse_native_response(parsed))
+    }
 }
 
 #[async_trait]
 impl Provider for OpenAiCodexProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            native_tool_calling: false,
+            native_tool_calling: true,
             vision: true,
             prompt_caching: false,
         }
@@ -744,7 +1095,7 @@ impl Provider for OpenAiCodexProvider {
         let prepared = crate::multimodal::prepare_messages_for_provider(&messages, &config).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
-        self.send_responses_request(input, instructions, model)
+        self.send_responses_request(input, instructions, model, None, true)
             .await
     }
 
@@ -759,7 +1110,47 @@ impl Provider for OpenAiCodexProvider {
         let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
 
         let (instructions, input) = build_responses_input(&prepared.messages);
-        self.send_responses_request(input, instructions, model)
+        self.send_responses_request(input, instructions, model, None, true)
+            .await
+    }
+
+    async fn chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let config = crate::config::MultimodalConfig::default();
+        let prepared =
+            crate::multimodal::prepare_messages_for_provider(request.messages, &config).await?;
+        let (instructions, input) = build_responses_input(&prepared.messages);
+        let tools = Self::convert_tools(request.tools);
+        self.send_responses_request_native(input, instructions, model, tools)
+            .await
+    }
+
+    async fn chat_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        _temperature: f64,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        let config = crate::config::MultimodalConfig::default();
+        let prepared = crate::multimodal::prepare_messages_for_provider(messages, &config).await?;
+        let (instructions, input) = build_responses_input(&prepared.messages);
+        let native_tools = if tools.is_empty() {
+            None
+        } else {
+            Some(
+                tools
+                    .iter()
+                    .cloned()
+                    .map(Self::parse_native_tool_spec)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+        self.send_responses_request_native(input, instructions, model, native_tools)
             .await
     }
 }
@@ -805,6 +1196,7 @@ mod tests {
         let response = ResponsesResponse {
             output: vec![],
             output_text: Some("hello".into()),
+            usage: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("hello"));
     }
@@ -813,12 +1205,20 @@ mod tests {
     fn extracts_nested_output_text() {
         let response = ResponsesResponse {
             output: vec![ResponsesOutput {
+                kind: Some("message".into()),
                 content: vec![ResponsesContent {
                     kind: Some("output_text".into()),
                     text: Some("nested".into()),
                 }],
+                id: None,
+                call_id: None,
+                name: None,
+                arguments: None,
+                encrypted_content: None,
+                summary: vec![],
             }],
             output_text: None,
+            usage: None,
         };
         assert_eq!(extract_responses_text(&response).as_deref(), Some("nested"));
     }
@@ -1062,6 +1462,27 @@ data: [DONE]
     }
 
     #[test]
+    fn build_responses_input_emits_function_call_history_items() {
+        let messages = vec![
+            ChatMessage::assistant(
+                r#"{"content":"Let me check","tool_calls":[{"id":"call_1","name":"shell","arguments":"{\"command\":\"date\"}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"tool_call_id":"call_1","content":"Sun Mar 22"}"#),
+        ];
+
+        let (_, input) = build_responses_input(&messages);
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[0]["content"][0]["text"], "Let me check");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["name"], "shell");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[2]["output"], "Sun Mar 22");
+    }
+
+    #[test]
     fn build_responses_input_uses_default_instructions_without_system() {
         let messages = vec![ChatMessage {
             role: "user".into(),
@@ -1099,14 +1520,8 @@ data: [DONE]
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);
-        assert_eq!(input[0].role, "user");
-        assert_eq!(input[0].content.len(), 2);
-
-        let json: Vec<Value> = input[0]
-            .content
-            .iter()
-            .map(|item| serde_json::to_value(item).unwrap())
-            .collect();
+        assert_eq!(input[0]["role"], "user");
+        let json = input[0]["content"].as_array().unwrap();
 
         // First content = text
         assert_eq!(json[0]["type"], "input_text");
@@ -1123,9 +1538,7 @@ data: [DONE]
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);
-        assert_eq!(input[0].content.len(), 1);
-
-        let json = serde_json::to_value(&input[0].content[0]).unwrap();
+        let json = &input[0]["content"][0];
         assert_eq!(json["type"], "input_text");
         assert_eq!(json["text"], "Hello without images");
     }
@@ -1138,13 +1551,8 @@ data: [DONE]
         let (_, input) = build_responses_input(&messages);
 
         assert_eq!(input.len(), 1);
-        assert_eq!(input[0].content.len(), 3); // text + 2 images
-
-        let json: Vec<Value> = input[0]
-            .content
-            .iter()
-            .map(|item| serde_json::to_value(item).unwrap())
-            .collect();
+        let json = input[0]["content"].as_array().unwrap();
+        assert_eq!(json.len(), 3); // text + 2 images
 
         assert_eq!(json[0]["type"], "input_text");
         assert_eq!(json[1]["type"], "input_image");
@@ -1168,7 +1576,167 @@ data: [DONE]
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");
         let caps = provider.capabilities();
 
-        assert!(!caps.native_tool_calling);
+        assert!(caps.native_tool_calling);
         assert!(caps.vision);
+    }
+
+    #[test]
+    fn parse_native_response_extracts_tool_calls_text_and_usage() {
+        let response = ResponsesResponse {
+            output: vec![
+                ResponsesOutput {
+                    kind: Some("message".into()),
+                    content: vec![ResponsesContent {
+                        kind: Some("output_text".into()),
+                        text: Some("I'll check that.".into()),
+                    }],
+                    id: None,
+                    call_id: None,
+                    name: None,
+                    arguments: None,
+                    encrypted_content: None,
+                    summary: vec![],
+                },
+                ResponsesOutput {
+                    kind: Some("function_call".into()),
+                    content: vec![],
+                    id: Some("fc_item".into()),
+                    call_id: Some("call_abc".into()),
+                    name: Some("shell".into()),
+                    arguments: Some("{\"command\":\"date\"}".into()),
+                    encrypted_content: None,
+                    summary: vec![],
+                },
+                ResponsesOutput {
+                    kind: Some("reasoning".into()),
+                    content: vec![],
+                    id: None,
+                    call_id: None,
+                    name: None,
+                    arguments: None,
+                    encrypted_content: Some("enc_reasoning_blob".into()),
+                    summary: vec![],
+                },
+            ],
+            output_text: None,
+            usage: Some(ResponsesUsage {
+                input_tokens: Some(111),
+                output_tokens: Some(22),
+            }),
+        };
+
+        let parsed = OpenAiCodexProvider::parse_native_response(response);
+        assert_eq!(parsed.text.as_deref(), Some("I'll check that."));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_abc");
+        assert_eq!(parsed.tool_calls[0].name, "shell");
+        assert_eq!(parsed.tool_calls[0].arguments, "{\"command\":\"date\"}");
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("enc_reasoning_blob")
+        );
+        assert_eq!(
+            parsed.usage.as_ref().and_then(|u| u.input_tokens),
+            Some(111)
+        );
+        assert_eq!(
+            parsed.usage.as_ref().and_then(|u| u.output_tokens),
+            Some(22)
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_sends_native_tools_and_parses_function_call_response() {
+        use axum::{routing::post, Json, Router};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_clone.clone();
+                async move {
+                    *captured.lock().unwrap() = Some(body);
+                    Json(json!({
+                        "output": [
+                            {
+                                "type": "message",
+                                "content": [{"type": "output_text", "text": "Let me check."}]
+                            },
+                            {
+                                "type": "function_call",
+                                "id": "fc_1",
+                                "call_id": "call_1",
+                                "name": "shell",
+                                "arguments": "{\"command\":\"date\"}"
+                            }
+                        ],
+                        "usage": {
+                            "input_tokens": 42,
+                            "output_tokens": 7
+                        }
+                    }))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let options = ProviderRuntimeOptions {
+            provider_api_url: Some(format!("http://{addr}/v1")),
+            ..ProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexProvider::new(&options, Some("test-key")).unwrap();
+
+        let tools = vec![ToolSpec {
+            name: "shell".into(),
+            description: "Run a shell command".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }),
+        }];
+
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::user("what time is it?")],
+                    tools: Some(&tools),
+                },
+                "gpt-5-codex",
+                0.7,
+            )
+            .await
+            .unwrap();
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("No request captured");
+
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["function"]["name"], "shell");
+        assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(result.text.as_deref(), Some("Let me check."));
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        assert_eq!(result.tool_calls[0].name, "shell");
+        assert_eq!(result.usage.as_ref().and_then(|u| u.input_tokens), Some(42));
+
+        server_handle.abort();
     }
 }
