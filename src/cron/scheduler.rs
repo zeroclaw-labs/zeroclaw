@@ -7,8 +7,8 @@ use crate::channels::{
 use crate::config::Config;
 use crate::cron::{
     all_overdue_jobs, due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job,
-    reschedule_after_run, update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule,
-    SessionTarget,
+    reschedule_after_run, sync_declarative_jobs, update_job, CronJob, CronJobPatch, DeliveryConfig,
+    JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -33,6 +33,19 @@ pub async fn run(config: Config) -> Result<()> {
     ));
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+
+    // ── Declarative job sync: reconcile config-defined jobs with the DB.
+    match sync_declarative_jobs(&config, &config.cron.jobs) {
+        Ok(()) => {
+            if !config.cron.jobs.is_empty() {
+                tracing::info!(
+                    count = config.cron.jobs.len(),
+                    "Synced declarative cron jobs from config"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("Failed to sync declarative cron jobs: {e}"),
+    }
 
     // ── Startup catch-up: run ALL overdue jobs before entering the
     //    normal polling loop. The regular loop is capped by `max_tasks`,
@@ -657,6 +670,7 @@ mod tests {
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
             allowed_tools: None,
+            source: "imperative".into(),
             created_at: Utc::now(),
             next_run: Utc::now(),
             last_run: None,
