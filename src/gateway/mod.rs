@@ -11,6 +11,7 @@ pub mod api;
 pub mod api_pairing;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
+pub mod canvas;
 pub mod nodes;
 pub mod sse;
 pub mod static_files;
@@ -28,6 +29,7 @@ use crate::runtime;
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
 use crate::tools;
+use crate::tools::canvas::CanvasStore;
 use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -356,6 +358,8 @@ pub struct AppState {
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
+    /// Shared canvas store for Live Canvas (A2UI) system
+    pub canvas_store: CanvasStore,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -432,22 +436,24 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let (mut tools_registry_raw, delegate_handle_gw, _reaction_handle_gw) =
-        tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.workspace_dir,
-            &config.agents,
-            config.api_key.as_deref(),
-            &config,
-        );
+    let canvas_store = tools::CanvasStore::new();
+
+    let (mut tools_registry_raw, delegate_handle_gw) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        Arc::clone(&mem),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        Some(canvas_store.clone()),
+    );
 
     // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
     // Without this, the `/api/tools` endpoint misses MCP tools.
@@ -811,6 +817,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
+        canvas_store,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -875,6 +882,18 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/devices/{id}/token/rotate",
             post(api_pairing::rotate_token),
+        )
+        // ── Live Canvas (A2UI) routes ──
+        .route("/api/canvas", get(canvas::handle_canvas_list))
+        .route(
+            "/api/canvas/{id}",
+            get(canvas::handle_canvas_get)
+                .post(canvas::handle_canvas_post)
+                .delete(canvas::handle_canvas_clear),
+        )
+        .route(
+            "/api/canvas/{id}/history",
+            get(canvas::handle_canvas_history),
         );
 
     // ── Plugin management API (requires plugins-wasm feature) ──
@@ -889,6 +908,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
+        // ── WebSocket canvas updates ──
+        .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
@@ -2011,6 +2032,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            canvas_store: CanvasStore::new(),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2067,6 +2089,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            canvas_store: CanvasStore::new(),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2452,6 +2475,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            canvas_store: CanvasStore::new(),
         };
 
         let mut headers = HeaderMap::new();
@@ -2522,6 +2546,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            canvas_store: CanvasStore::new(),
         };
 
         let headers = HeaderMap::new();
@@ -2604,6 +2629,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            canvas_store: CanvasStore::new(),
         };
 
         let response = handle_webhook(
@@ -2658,6 +2684,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            canvas_store: CanvasStore::new(),
         };
 
         let mut headers = HeaderMap::new();
@@ -2717,6 +2744,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            canvas_store: CanvasStore::new(),
         };
 
         let mut headers = HeaderMap::new();
@@ -2781,6 +2809,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            canvas_store: CanvasStore::new(),
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -2841,6 +2870,7 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            canvas_store: CanvasStore::new(),
         };
 
         let mut headers = HeaderMap::new();
