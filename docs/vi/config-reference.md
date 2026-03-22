@@ -535,11 +535,45 @@ Lưu ý:
 - Đặt file `.md`/`.txt` datasheet đặt tên theo bo mạch (ví dụ `nucleo-f401re.md`, `rpi-gpio.md`) trong `datasheet_dir` cho RAG.
 - Xem [hardware-peripherals-design.md](hardware-peripherals-design.md) để biết giao thức bo mạch và ghi chú firmware.
 
+## `[a2a]`
+
+Cấu hình giao thức A2A (Agent-to-Agent). Cho phép khám phá và giao tiếp giữa các agent qua [chuẩn mở A2A](https://google.github.io/A2A/).
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `enabled` | `false` | Bật server và tool client A2A |
+| `agent_name` | `"ZeroClaw Agent"` | Tên hiển thị trong agent card |
+| `description` | `"ZeroClaw autonomous agent"` | Mô tả trong agent card |
+| `public_url` | tự động (gateway host:port) | URL công khai cho agent card; đặt để tránh lộ địa chỉ bind nội bộ |
+| `bearer_token` | không đặt | Token bearer để xác thực yêu cầu A2A đến |
+| `version` | phiên bản crate | Phiên bản giao thức trong agent card |
+| `capabilities` | `[]` | Các tag khả năng trong danh sách skills của agent card |
+
+```toml
+[a2a]
+enabled = true
+agent_name = "my-agent"
+description = "Agent lập trình tự động"
+public_url = "https://agent.example.com"
+bearer_token = "secret-token-here"
+capabilities = ["code", "search"]
+```
+
+Ghi chú:
+
+- Khi `enabled = false` (mặc định), các endpoint `/.well-known/agent-card.json` và `/a2a` trả về 404 và tool `a2a` không được đăng ký.
+- `GET /.well-known/agent-card.json` không yêu cầu xác thực (chỉ metadata, theo đặc tả A2A).
+- `POST /a2a` yêu cầu xác thực: `bearer_token` riêng nếu đặt, nếu không dùng ghép nối gateway. Nếu không cấu hình xác thực, endpoint mở — cảnh báo được phát ra khi khởi động.
+- Đặt `public_url` để tránh lộ địa chỉ bind nội bộ trong agent card.
+- Task store trong bộ nhớ giới hạn 10.000 mục; vượt quá trả về 503.
+- Tool `a2a` gửi đi có bảo vệ SSRF: chỉ HTTP/HTTPS, chặn host nội bộ/riêng tư.
+
 ## Giá trị mặc định liên quan bảo mật
 
 - Allowlist kênh mặc định từ chối tất cả (`[]` nghĩa là từ chối tất cả)
 - Gateway mặc định yêu cầu ghép nối
 - Mặc định chặn public bind
+- Giao thức A2A mặc định tắt; cảnh báo khi bật mà không có xác thực
 
 ## Lệnh kiểm tra
 
