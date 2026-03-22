@@ -4256,6 +4256,7 @@ fn default_auto_approve() -> Vec<String> {
         "glob_search".into(),
         "content_search".into(),
         "image_info".into(),
+        "weather".into(),
     ]
 }
 
