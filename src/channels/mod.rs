@@ -1337,13 +1337,13 @@ async fn handle_restart_command_if_needed(
         };
 
         cmd.env("ZEROCLAW_BIN", &exe);
-        if !config_dir.is_empty() {
-            cmd.env("ZEROCLAW_CONFIG_DIR", &config_dir);
-        } else {
+        if config_dir.is_empty() {
             // Derive config dir from workspace_dir (parent of workspace)
             if let Some(parent) = std::path::Path::new(&workspace).parent() {
                 cmd.env("ZEROCLAW_CONFIG_DIR", parent);
             }
+        } else {
+            cmd.env("ZEROCLAW_CONFIG_DIR", &config_dir);
         }
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -1360,11 +1360,7 @@ fn is_cron_command(content: &str) -> bool {
     lower == "cron" || lower == "cron all" || lower == "cron --all" || lower.starts_with("cron ")
 }
 
-fn format_cron_listing(
-    jobs: &[crate::cron::CronJob],
-    show_all: bool,
-    room_id: &str,
-) -> String {
+fn format_cron_listing(jobs: &[crate::cron::CronJob], show_all: bool, room_id: &str) -> String {
     if jobs.is_empty() {
         return if show_all {
             "No cron jobs scheduled.".to_string()
@@ -1480,9 +1476,7 @@ async fn check_tmux_pending_questions(
                 .send(&SendMessage::new(msg, &reply_target))
                 .await
             {
-                tracing::warn!(
-                    "Failed to send pending-question notice to {room_id}: {e}"
-                );
+                tracing::warn!("Failed to send pending-question notice to {room_id}: {e}");
             }
         }
     }
@@ -1512,11 +1506,8 @@ async fn handle_cron_command_if_needed(
         Err(e) => {
             let _ = channel
                 .send(
-                    &SendMessage::new(
-                        format!("Failed to load cron jobs: {e}"),
-                        &msg.reply_target,
-                    )
-                    .in_thread(msg.thread_ts.clone()),
+                    &SendMessage::new(format!("Failed to load cron jobs: {e}"), &msg.reply_target)
+                        .in_thread(msg.thread_ts.clone()),
                 )
                 .await;
             return true;
@@ -1566,7 +1557,13 @@ fn is_idle_command(content: &str) -> bool {
 async fn classify_tmux_target(target: &str) -> &'static str {
     // 1. Check what command is currently running in the pane.
     let current_cmd = tokio::process::Command::new("tmux")
-        .args(["display-message", "-t", target, "-p", "#{pane_current_command}"])
+        .args([
+            "display-message",
+            "-t",
+            target,
+            "-p",
+            "#{pane_current_command}",
+        ])
         .output()
         .await
         .ok()
@@ -1619,8 +1616,7 @@ async fn classify_tmux_target(target: &str) -> &'static str {
             let content = String::from_utf8_lossy(&out.stdout);
             classify_tmux_pane_content(&content)
         }
-        Ok(_) => "unavailable",
-        Err(_) => "unavailable",
+        Ok(_) | Err(_) => "unavailable",
     }
 }
 
@@ -1655,42 +1651,92 @@ fn classify_tmux_pane_content(pane: &str) -> &'static str {
     let active_patterns: &[&str] = &[
         "esc to interrupt",
         "auto-accept edits on",
+        "⎿  running", // tool actively executing (Claude Code indented result prefix)
     ];
     for pat in active_patterns {
         if lower.contains(pat) {
             return "active";
         }
     }
-    // Bullet + verb on its own line (Claude Code tool execution)
+    // Claude Code progress indicator: "… (Nm Xs" or "… (N tokens" or "… (N s"
+    // Appears as: "· Building thing… (3m 24s · ↓ 10.9k tokens · thinking with medium effort)"
+    // The "… (" pattern with time/token context is a reliable in-progress signal.
+    if lower.contains("… (")
+        && (lower.contains("token")
+            || lower.contains("thinking")
+            || lower.contains("thought for")
+            || lower.contains(" s ·")
+            || lower.contains(" s)"))
+    {
+        return "active";
+    }
+    // Bullet + verb on its own line (Claude Code tool execution).
+    // Claude Code uses multiple bullet characters: ● (U+25CF), ⏺ (U+23FA), · (U+00B7)
     for line in pane.lines() {
-        let t = line.trim().to_lowercase();
-        if t.starts_with('●')
-            && (t.contains("running")
-                || t.contains("thinking")
-                || t.contains("reading")
-                || t.contains("writing")
-                || t.contains("searching")
-                || t.contains("fetching")
-                || t.contains("executing"))
+        let t = line.trim();
+        let tl = t.to_lowercase();
+        let is_bullet = t.starts_with('●')
+            || t.starts_with('⏺')
+            || t.starts_with('·')
+            || t.starts_with('✽')
+            || t.starts_with('✻');
+        if is_bullet
+            && (tl.contains("running")
+                || tl.contains("thinking")
+                || tl.contains("reading")
+                || tl.contains("writing")
+                || tl.contains("searching")
+                || tl.contains("fetching")
+                || tl.contains("executing")
+                || tl.contains("building")
+                || tl.contains("cooking")
+                || tl.contains("working")
+                || tl.contains("generating"))
         {
             return "active";
         }
+        // Trailing ellipsis on a bullet line = still in progress
+        if is_bullet && t.ends_with('…') {
+            return "active";
+        }
     }
-    let question_patterns: &[&str] = &[
-        "[y/n]", "[yes/no]", "[y/n/s]", "(y/n)",
-    ];
+    let question_patterns: &[&str] = &["[y/n]", "[yes/no]", "[y/n/s]", "(y/n)"];
     for pat in question_patterns {
         if lower.contains(pat) {
             return "question";
         }
     }
-    // Natural-language question patterns
+    // Natural-language question patterns (explicit phrases)
     let nl_question: &[&str] = &[
-        "do you want", "would you like", "should i ", "shall i ",
+        "do you want",
+        "would you like",
+        "should i ",
+        "shall i ",
+        "want me to",
+        "should we",
+        "ready to continue",
+        "shall we",
     ];
     for pat in nl_question {
         if lower.contains(pat) && lower.contains('?') {
             return "question";
+        }
+    }
+    // Broad heuristic: any line ending with '?' that looks like natural language
+    // (not a URL, not a code comment, at least a few words). Catches Claude Code
+    // questions like "want me to continue?" regardless of exact phrasing.
+    for line in pane.lines() {
+        let t = line.trim();
+        if t.ends_with('?')
+            && t.len() > 12
+            && !t.contains("://")
+            && !t.starts_with("//")
+            && !t.starts_with('#')
+        {
+            // Must contain at least one space (multi-word sentence, not a bare symbol)
+            if t.contains(' ') {
+                return "question";
+            }
         }
     }
     "idle"
@@ -1714,11 +1760,8 @@ async fn handle_idle_command_if_needed(
     if targets.is_empty() {
         let _ = channel
             .send(
-                &SendMessage::new(
-                    "No tmux targets configured.",
-                    &msg.reply_target,
-                )
-                .in_thread(msg.thread_ts.clone()),
+                &SendMessage::new("No tmux targets configured.", &msg.reply_target)
+                    .in_thread(msg.thread_ts.clone()),
             )
             .await;
         return true;
@@ -1808,7 +1851,6 @@ async fn handle_peek_command_if_needed(
             // Parse optional line count: "peek 30" → last 30 lines (default 50)
             let lines: usize = msg
                 .content
-                .trim()
                 .split_whitespace()
                 .nth(1)
                 .and_then(|s| s.parse().ok())
@@ -2072,13 +2114,16 @@ fn format_ticket_show(stdout: &str) -> String {
 
     let mut out = format!("{type_badge} **{title}**\n`{id}` \u{2022} **{stage}** \u{2022} P{priority} \u{2022} {ticket_type}");
     if !assignee.is_empty() {
-        out.push_str(&format!(" \u{2022} {assignee}"));
+        use std::fmt::Write;
+        let _ = write!(out, " \u{2022} {assignee}");
     }
     if !tags.is_empty() {
-        out.push_str(&format!("\nTags: {tags}"));
+        use std::fmt::Write;
+        let _ = write!(out, "\nTags: {tags}");
     }
     if !description.is_empty() {
-        out.push_str(&format!("\n\n{description}"));
+        use std::fmt::Write;
+        let _ = write!(out, "\n\n{description}");
     }
     out
 }
@@ -2126,12 +2171,12 @@ fn parse_ticket_title_desc(rest: &str) -> (String, Option<String>) {
 
     let split_at = rest
         .char_indices()
-        .find(|(_, c)| matches!(c, '.' | '!' | '?' | '\n'))
+        .find(|(_, c)| ['.', '!', '?', '\n'].contains(c))
         .map(|(i, c)| i + c.len_utf8());
 
     if let Some(idx) = split_at {
         let title = rest[..idx]
-            .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+            .trim_end_matches(['.', '!', '?', '\n'])
             .trim()
             .to_string();
         let desc = rest[idx..].trim();
@@ -2173,12 +2218,12 @@ fn parse_ticket_content(content: &str) -> (String, Option<String>) {
     // Split on the first sentence boundary or newline.
     let split_at = rest
         .char_indices()
-        .find(|(_, c)| matches!(c, '.' | '!' | '?' | '\n'))
+        .find(|(_, c)| ['.', '!', '?', '\n'].contains(c))
         .map(|(i, c)| i + c.len_utf8());
 
     if let Some(idx) = split_at {
         let title = rest[..idx]
-            .trim_end_matches(|c: char| matches!(c, '.' | '!' | '?' | '\n'))
+            .trim_end_matches(['.', '!', '?', '\n'])
             .trim()
             .to_string();
         let desc = rest[idx..].trim();
@@ -2927,7 +2972,7 @@ async fn process_channel_message(
             || ctx.channel_tmux_targets.contains_key(&msg.channel));
     let classification_hint = if has_tmux_target {
         None
-    } else if let (Some(ref cls_provider), Some(ref cls_model)) = (
+    } else if let (Some(cls_provider), Some(cls_model)) = (
         ctx.query_classification.classifier_provider.as_ref(),
         ctx.query_classification.classifier_model.as_ref(),
     ) {
@@ -3136,7 +3181,8 @@ async fn process_channel_message(
         }
         s.push_str(&session_key_prefix);
         if let Some(ref target) = tmux_target {
-            s.push_str(&format!("[ZEROCLAW_TMUX_TARGET:{}]\n", target));
+            use std::fmt::Write;
+            let _ = writeln!(s, "[ZEROCLAW_TMUX_TARGET:{}]", target);
         }
         s.push_str(&system_prompt);
         s

@@ -1215,7 +1215,11 @@ async fn main() -> Result<()> {
         }
 
         Commands::Peripheral { peripheral_command } => {
-            peripherals::handle_command(peripheral_command.clone(), &config).await
+            Box::pin(peripherals::handle_command(
+                peripheral_command.clone(),
+                &config,
+            ))
+            .await
         }
 
         Commands::Config { config_command } => match config_command {

@@ -326,7 +326,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
 
 pub(crate) async fn deliver_announcement(
     config: &Config,
-    delivery: &DeliveryConfig,
+    _delivery: &DeliveryConfig,
     channel: &str,
     target: &str,
     output: &str,
