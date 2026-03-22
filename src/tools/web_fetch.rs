@@ -1294,14 +1294,17 @@ mod tests {
         // Firecrawl fallback should also fail (missing API key)
         let firecrawl_result = Box::pin(tool.fetch_via_firecrawl(&url)).await;
         assert!(
-            firecrawl_result.is_err()
-                || !firecrawl_result.as_ref().unwrap().success,
+            firecrawl_result.is_err() || !firecrawl_result.as_ref().unwrap().success,
             "Expected Firecrawl fallback to fail without API key"
         );
 
         // The orchestration should return the original 403 error
         assert!(
-            standard_result.error.as_deref().unwrap_or("").contains("403"),
+            standard_result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("403"),
             "Expected original HTTP 403 error, got: {:?}",
             standard_result.error
         );
