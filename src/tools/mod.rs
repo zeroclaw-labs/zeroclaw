@@ -77,6 +77,7 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod security_ops;
+pub mod sessions;
 pub mod shell;
 pub mod swarm;
 pub mod text_browser;
@@ -149,6 +150,7 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
+pub use sessions::{SessionsHistoryTool, SessionsListTool, SessionsSendTool};
 pub use shell::ShellTool;
 pub use swarm::SwarmTool;
 pub use text_browser::TextBrowserTool;
@@ -552,6 +554,18 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
+
+    // Session-to-session messaging tools (always available when sessions dir exists)
+    if let Ok(session_store) = crate::channels::session_store::SessionStore::new(workspace_dir) {
+        let backend: Arc<dyn crate::channels::session_backend::SessionBackend> =
+            Arc::new(session_store);
+        tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
+        tool_arcs.push(Arc::new(SessionsHistoryTool::new(
+            backend.clone(),
+            security.clone(),
+        )));
+        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+    }
 
     // LinkedIn integration (config-gated)
     if root_config.linkedin.enabled {
