@@ -337,30 +337,6 @@ Lưu ý:
 
 - Chèn ngữ cảnh memory bỏ qua khóa auto-save `assistant_resp*` kiểu cũ để tránh tóm tắt do model tạo bị coi là sự thật.
 
-### `[memory.mem0]`
-
-Backend Mem0 (OpenMemory) — kết nối đến server mem0 tự host, cung cấp bộ nhớ vector với trích xuất sự kiện bằng LLM. Cần feature flag `memory-mem0` khi build và `backend = "mem0"` trong config.
-
-| Khóa | Mặc định | Biến môi trường | Mục đích |
-|---|---|---|---|
-| `url` | `http://localhost:8765` | `MEM0_URL` | URL server OpenMemory |
-| `user_id` | `zeroclaw` | `MEM0_USER_ID` | User ID để phân vùng memory |
-| `app_name` | `zeroclaw` | `MEM0_APP_NAME` | Tên ứng dụng đăng ký trong mem0 |
-| `infer` | `true` | — | Dùng LLM trích xuất sự kiện từ text (`true`) hoặc lưu nguyên (`false`) |
-| `extraction_prompt` | chưa đặt | `MEM0_EXTRACTION_PROMPT` | Prompt tùy chỉnh cho trích xuất sự kiện LLM (vd: cho nội dung không phải tiếng Anh) |
-
-```toml
-[memory]
-backend = "mem0"
-
-[memory.mem0]
-url = "http://192.168.0.171:8765"
-user_id = "zeroclaw-bot"
-extraction_prompt = "Trích xuất sự kiện bằng ngôn ngữ gốc..."
-```
-
-Script triển khai server nằm trong `deploy/mem0/`.
-
 ## `[[model_routes]]` và `[[embedding_routes]]`
 
 Route hint giúp tên tích hợp ổn định khi model ID thay đổi.

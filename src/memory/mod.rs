@@ -1,24 +1,32 @@
+pub mod audit;
 pub mod backend;
 pub mod chunker;
 pub mod cli;
+pub mod conflict;
 pub mod consolidation;
 pub mod embeddings;
 pub mod hygiene;
+pub mod importance;
 pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
-#[cfg(feature = "memory-mem0")]
-pub mod mem0;
 pub mod none;
+pub mod policy;
 #[cfg(feature = "memory-postgres")]
 pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
+pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
 pub mod vector;
 
+#[cfg(test)]
+mod battle_tests;
+
+#[allow(unused_imports)]
+pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
@@ -26,13 +34,15 @@ pub use backend::{
 };
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
-#[cfg(feature = "memory-mem0")]
-pub use mem0::Mem0Memory;
 pub use none::NoneMemory;
+#[allow(unused_imports)]
+pub use policy::PolicyEnforcer;
 #[cfg(feature = "memory-postgres")]
 pub use postgres::PostgresMemory;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
+#[allow(unused_imports)]
+pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
@@ -61,7 +71,7 @@ where
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
         MemoryBackendKind::Postgres => postgres_builder(),
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Mem0 | MemoryBackendKind::Markdown => {
+        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
         MemoryBackendKind::None => Ok(Box::new(NoneMemory::new())),
@@ -338,28 +348,6 @@ pub fn create_memory_with_storage_and_routes(
         anyhow::bail!(
             "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
         );
-    }
-
-    #[cfg(feature = "memory-mem0")]
-    fn build_mem0_memory(config: &crate::config::MemoryConfig) -> anyhow::Result<Box<dyn Memory>> {
-        let mem = Mem0Memory::new(&config.mem0)?;
-        tracing::info!(
-            "📦 Mem0 memory backend configured (url: {}, user: {})",
-            config.mem0.url,
-            config.mem0.user_id
-        );
-        Ok(Box::new(mem))
-    }
-
-    #[cfg(not(feature = "memory-mem0"))]
-    fn build_mem0_memory(_config: &crate::config::MemoryConfig) -> anyhow::Result<Box<dyn Memory>> {
-        anyhow::bail!(
-            "memory backend 'mem0' requested but this build was compiled without `memory-mem0`; rebuild with `--features memory-mem0`"
-        );
-    }
-
-    if matches!(backend_kind, MemoryBackendKind::Mem0) {
-        return build_mem0_memory(config);
     }
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {

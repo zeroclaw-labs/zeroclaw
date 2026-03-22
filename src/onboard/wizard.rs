@@ -420,9 +420,17 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         snapshot_enabled: false,
         snapshot_on_hygiene: false,
         auto_hydrate: true,
+        retrieval_stages: vec!["cache".into(), "fts".into(), "vector".into()],
+        rerank_enabled: false,
+        rerank_threshold: 5,
+        fts_early_return_score: 0.85,
+        default_namespace: "default".into(),
+        conflict_threshold: 0.85,
+        audit_enabled: false,
+        audit_retention_days: 30,
+        policy: crate::config::MemoryPolicyConfig::default(),
         sqlite_open_timeout_secs: None,
         qdrant: crate::config::QdrantConfig::default(),
-        mem0: crate::config::schema::Mem0Config::default(),
     }
 }
 

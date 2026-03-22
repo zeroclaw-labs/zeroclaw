@@ -1,4 +1,5 @@
 use crate::config::MemoryConfig;
+use crate::memory::policy::PolicyEnforcer;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection};
@@ -47,6 +48,13 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // Use policy engine for per-category retention overrides.
+    let enforcer = PolicyEnforcer::new(&config.policy);
+    let conversation_retention = enforcer.retention_days_for_category(
+        &crate::memory::traits::MemoryCategory::Conversation,
+        config.conversation_retention_days,
+    );
+
     let report = HygieneReport {
         archived_memory_files: archive_daily_memory_files(
             workspace_dir,
@@ -55,11 +63,15 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         archived_session_files: archive_session_files(workspace_dir, config.archive_after_days)?,
         purged_memory_archives: purge_memory_archives(workspace_dir, config.purge_after_days)?,
         purged_session_archives: purge_session_archives(workspace_dir, config.purge_after_days)?,
-        pruned_conversation_rows: prune_conversation_rows(
-            workspace_dir,
-            config.conversation_retention_days,
-        )?,
+        pruned_conversation_rows: prune_conversation_rows(workspace_dir, conversation_retention)?,
     };
+
+    // Prune audit entries if audit is enabled.
+    if config.audit_enabled {
+        if let Err(e) = prune_audit_entries(workspace_dir, config.audit_retention_days) {
+            tracing::debug!("audit pruning skipped: {e}");
+        }
+    }
 
     write_state(workspace_dir, &report)?;
 
@@ -316,6 +328,32 @@ fn prune_conversation_rows(workspace_dir: &Path, retention_days: u32) -> Result<
     )?;
 
     Ok(u64::try_from(affected).unwrap_or(0))
+}
+
+fn prune_audit_entries(workspace_dir: &Path, retention_days: u32) -> Result<()> {
+    if retention_days == 0 {
+        return Ok(());
+    }
+
+    let db_path = workspace_dir.join("memory").join("audit.db");
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+    let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
+
+    let affected = conn.execute(
+        "DELETE FROM memory_audit WHERE timestamp < ?1",
+        params![cutoff],
+    )?;
+
+    if affected > 0 {
+        tracing::debug!("pruned {affected} audit entries older than {retention_days} days");
+    }
+
+    Ok(())
 }
 
 fn memory_date_from_filename(filename: &str) -> Option<NaiveDate> {

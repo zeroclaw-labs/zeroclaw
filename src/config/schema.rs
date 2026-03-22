@@ -3809,77 +3809,6 @@ impl Default for QdrantConfig {
     }
 }
 
-/// Configuration for the mem0 (OpenMemory) memory backend.
-///
-/// Connects to a self-hosted OpenMemory server via its REST API.
-/// Deploy OpenMemory with `docker compose up` from the mem0 repo,
-/// then point `url` at the API (default `http://localhost:8765`).
-///
-/// ```toml
-/// [memory]
-/// backend = "mem0"
-///
-/// [memory.mem0]
-/// url = "http://localhost:8765"
-/// user_id = "zeroclaw"
-/// app_name = "zeroclaw"
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Mem0Config {
-    /// OpenMemory server URL (e.g. `http://localhost:8765`).
-    /// Falls back to `MEM0_URL` env var if not set.
-    #[serde(default = "default_mem0_url")]
-    pub url: String,
-    /// User ID for scoping memories within mem0.
-    /// Falls back to `MEM0_USER_ID` env var, or default `"zeroclaw"`.
-    #[serde(default = "default_mem0_user_id")]
-    pub user_id: String,
-    /// Application name registered in mem0.
-    /// Falls back to `MEM0_APP_NAME` env var, or default `"zeroclaw"`.
-    #[serde(default = "default_mem0_app_name")]
-    pub app_name: String,
-    /// Whether mem0 should use its built-in LLM to extract facts from
-    /// stored text (`infer = true`) or store raw text as-is (`false`).
-    #[serde(default = "default_mem0_infer")]
-    pub infer: bool,
-    /// Custom prompt for guiding LLM-based fact extraction when `infer = true`.
-    /// Useful for non-English content (e.g. Cantonese/Chinese).
-    /// Falls back to `MEM0_EXTRACTION_PROMPT` env var.
-    /// If unset, the mem0 server uses its built-in default prompt.
-    #[serde(default = "default_mem0_extraction_prompt")]
-    pub extraction_prompt: Option<String>,
-}
-
-fn default_mem0_url() -> String {
-    std::env::var("MEM0_URL").unwrap_or_else(|_| "http://localhost:8765".into())
-}
-fn default_mem0_user_id() -> String {
-    std::env::var("MEM0_USER_ID").unwrap_or_else(|_| "zeroclaw".into())
-}
-fn default_mem0_app_name() -> String {
-    std::env::var("MEM0_APP_NAME").unwrap_or_else(|_| "zeroclaw".into())
-}
-fn default_mem0_infer() -> bool {
-    true
-}
-fn default_mem0_extraction_prompt() -> Option<String> {
-    std::env::var("MEM0_EXTRACTION_PROMPT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-}
-
-impl Default for Mem0Config {
-    fn default() -> Self {
-        Self {
-            url: default_mem0_url(),
-            user_id: default_mem0_user_id(),
-            app_name: default_mem0_app_name(),
-            infer: default_mem0_infer(),
-            extraction_prompt: default_mem0_extraction_prompt(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
@@ -3954,6 +3883,43 @@ pub struct MemoryConfig {
     #[serde(default = "default_true")]
     pub auto_hydrate: bool,
 
+    // ── Retrieval Pipeline ─────────────────────────────────────
+    /// Retrieval stages to execute in order. Valid: "cache", "fts", "vector".
+    #[serde(default = "default_retrieval_stages")]
+    pub retrieval_stages: Vec<String>,
+    /// Enable LLM reranking when candidate count exceeds threshold.
+    #[serde(default)]
+    pub rerank_enabled: bool,
+    /// Minimum candidate count to trigger reranking.
+    #[serde(default = "default_rerank_threshold")]
+    pub rerank_threshold: usize,
+    /// FTS score above which to early-return without vector search (0.0–1.0).
+    #[serde(default = "default_fts_early_return_score")]
+    pub fts_early_return_score: f64,
+
+    // ── Namespace Isolation ─────────────────────────────────────
+    /// Default namespace for memory entries.
+    #[serde(default = "default_namespace")]
+    pub default_namespace: String,
+
+    // ── Conflict Resolution ─────────────────────────────────────
+    /// Cosine similarity threshold for conflict detection (0.0–1.0).
+    #[serde(default = "default_conflict_threshold")]
+    pub conflict_threshold: f64,
+
+    // ── Audit Trail ─────────────────────────────────────────────
+    /// Enable audit logging of memory operations.
+    #[serde(default)]
+    pub audit_enabled: bool,
+    /// Retention period for audit entries in days (default: 30).
+    #[serde(default = "default_audit_retention_days")]
+    pub audit_retention_days: u32,
+
+    // ── Policy Engine ───────────────────────────────────────────
+    /// Memory policy configuration.
+    #[serde(default)]
+    pub policy: MemoryPolicyConfig,
+
     // ── SQLite backend options ─────────────────────────────────
     /// For sqlite backend: max seconds to wait when opening the DB (e.g. file locked).
     /// None = wait indefinitely (default). Recommended max: 300.
@@ -3965,13 +3931,42 @@ pub struct MemoryConfig {
     /// Only used when `backend = "qdrant"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+}
 
-    // ── Mem0 backend options ─────────────────────────────────
-    /// Configuration for mem0 (OpenMemory) backend.
-    /// Only used when `backend = "mem0"`.
-    /// Requires `--features memory-mem0` at build time.
+/// Memory policy configuration (`[memory.policy]` section).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryPolicyConfig {
+    /// Maximum entries per namespace (0 = unlimited).
     #[serde(default)]
-    pub mem0: Mem0Config,
+    pub max_entries_per_namespace: usize,
+    /// Maximum entries per category (0 = unlimited).
+    #[serde(default)]
+    pub max_entries_per_category: usize,
+    /// Retention days by category (overrides global). Keys: "core", "daily", "conversation".
+    #[serde(default)]
+    pub retention_days_by_category: std::collections::HashMap<String, u32>,
+    /// Namespaces that are read-only (writes are rejected).
+    #[serde(default)]
+    pub read_only_namespaces: Vec<String>,
+}
+
+fn default_retrieval_stages() -> Vec<String> {
+    vec!["cache".into(), "fts".into(), "vector".into()]
+}
+fn default_rerank_threshold() -> usize {
+    5
+}
+fn default_fts_early_return_score() -> f64 {
+    0.85
+}
+fn default_namespace() -> String {
+    "default".into()
+}
+fn default_conflict_threshold() -> f64 {
+    0.85
+}
+fn default_audit_retention_days() -> u32 {
+    30
 }
 
 fn default_embedding_provider() -> String {
@@ -4045,9 +4040,17 @@ impl Default for MemoryConfig {
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,
+            retrieval_stages: default_retrieval_stages(),
+            rerank_enabled: false,
+            rerank_threshold: default_rerank_threshold(),
+            fts_early_return_score: default_fts_early_return_score(),
+            default_namespace: default_namespace(),
+            conflict_threshold: default_conflict_threshold(),
+            audit_enabled: false,
+            audit_retention_days: default_audit_retention_days(),
+            policy: MemoryPolicyConfig::default(),
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
-            mem0: Mem0Config::default(),
         }
     }
 }
@@ -7556,8 +7559,8 @@ impl Config {
             // Warn about each unknown config key.
             // serde_ignored + #[serde(default)] on nested structs can produce
             // false positives: parent-level fields get re-reported under the
-            // nested key (e.g. "memory.mem0.auto_hydrate" even though
-            // auto_hydrate belongs to MemoryConfig, not Mem0Config).  We
+            // nested key (e.g. "memory.qdrant.auto_hydrate" even though
+            // auto_hydrate belongs to MemoryConfig, not QdrantConfig).  We
             // suppress these by checking whether the leaf key is a known field
             // on the parent struct.
             let known_memory_fields: &[&str] = &[
@@ -7586,7 +7589,7 @@ impl Config {
             ];
             for path in ignored_paths {
                 // Skip false positives from nested memory sub-sections
-                if path.starts_with("memory.mem0.") || path.starts_with("memory.qdrant.") {
+                if path.starts_with("memory.qdrant.") {
                     let leaf = path.rsplit('.').next().unwrap_or("");
                     if known_memory_fields.contains(&leaf) {
                         continue;
