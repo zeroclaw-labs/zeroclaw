@@ -9,6 +9,8 @@
 use std::sync::Arc;
 use zeroclaw::memory::sqlite::SqliteMemory;
 use zeroclaw::memory::traits::{Memory, MemoryCategory};
+use zeroclaw::tools::memory_list::MemoryListTool;
+use zeroclaw::tools::traits::Tool;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Deduplication: same key overwrites instead of duplicating (#430)
@@ -423,5 +425,111 @@ async fn sqlite_memory_list_by_prefix_without_category() {
         results.len(),
         2,
         "should find 2 active tasks across categories"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MemoryListTool end-to-end: store multiple todos, verify tool returns all
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn memory_list_tool_returns_all_active_todos() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+
+    // Simulate what the todo-manager skill does: store several active todos
+    let todos = vec![
+        (
+            "todo:active:aaa-111",
+            r#"{"id":"aaa-111","title":"Buy groceries","priority":"high"}"#,
+        ),
+        (
+            "todo:active:bbb-222",
+            r#"{"id":"bbb-222","title":"Call dentist","priority":"medium"}"#,
+        ),
+        (
+            "todo:active:ccc-333",
+            r#"{"id":"ccc-333","title":"Review PR #4206","priority":"high"}"#,
+        ),
+        (
+            "todo:active:ddd-444",
+            r#"{"id":"ddd-444","title":"Pay electric bill","priority":"low"}"#,
+        ),
+        (
+            "todo:active:eee-555",
+            r#"{"id":"eee-555","title":"Schedule team sync","priority":"medium"}"#,
+        ),
+        (
+            "todo:active:fff-666",
+            r#"{"id":"fff-666","title":"Update resume","priority":"low"}"#,
+        ),
+        (
+            "todo:active:ggg-777",
+            r#"{"id":"ggg-777","title":"Book flight","priority":"high"}"#,
+        ),
+    ];
+
+    // Also store some non-active entries that should NOT appear
+    let other = [
+        (
+            "todo:done:hhh-888",
+            r#"{"id":"hhh-888","title":"Completed task"}"#,
+        ),
+        ("health:food:2026-03-21", "Lunch: salad"),
+        (
+            "todo:active:iii-999",
+            r#"{"id":"iii-999","title":"Daily active in wrong category"}"#,
+        ),
+    ];
+
+    for (key, content) in &todos {
+        mem.store(key, content, MemoryCategory::Core, None)
+            .await
+            .unwrap();
+    }
+    for (i, (key, content)) in other.iter().enumerate() {
+        let cat = if i == 2 {
+            MemoryCategory::Daily
+        } else {
+            MemoryCategory::Core
+        };
+        mem.store(key, content, cat, None).await.unwrap();
+    }
+
+    let tool = MemoryListTool::new(mem);
+
+    // The agent would call: memory_list(category: "core", prefix: "todo:active:")
+    let result = tool
+        .execute(serde_json::json!({
+            "category": "core",
+            "prefix": "todo:active:"
+        }))
+        .await
+        .unwrap();
+
+    assert!(result.success);
+    assert!(
+        result.output.contains("Found 7"),
+        "expected 7 active Core todos, got: {}",
+        result.output
+    );
+
+    // Verify every todo is present in the output
+    for (key, _) in &todos {
+        assert!(result.output.contains(key), "missing key {key} in output");
+    }
+
+    // Verify excluded entries are absent
+    assert!(
+        !result.output.contains("hhh-888"),
+        "done todo should be excluded"
+    );
+    assert!(
+        !result.output.contains("food"),
+        "health entry should be excluded"
+    );
+    assert!(
+        !result.output.contains("iii-999"),
+        "Daily-category entry should be excluded by category filter"
     );
 }
