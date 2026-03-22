@@ -1,13 +1,21 @@
 //! WebSocket agent chat handler.
 //!
+//! Connect: `ws://host:port/ws/chat?session_id=ID&name=My+Session`
+//!
 //! Protocol:
 //! ```text
+//! Server -> Client: {"type":"session_start","session_id":"...","name":"...","resumed":true,"message_count":42}
 //! Client -> Server: {"type":"message","content":"Hello"}
 //! Server -> Client: {"type":"chunk","content":"Hi! "}
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
 //! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
 //! Server -> Client: {"type":"done","full_response":"..."}
 //! ```
+//!
+//! Query params:
+//! - `session_id` — resume or create a session (default: new UUID)
+//! - `name` — optional human-readable label for the session
+//! - `token` — bearer auth token (alternative to Authorization header)
 
 use super::AppState;
 use axum::{
@@ -53,6 +61,8 @@ const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
 pub struct WsQuery {
     pub token: Option<String>,
     pub session_id: Option<String>,
+    /// Optional human-readable name for the session.
+    pub name: Option<String>,
 }
 
 /// Extract a bearer token from WebSocket-compatible sources.
@@ -134,14 +144,20 @@ pub async fn handle_ws_chat(
     };
 
     let session_id = params.session_id;
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    let session_name = params.name;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name))
         .into_response()
 }
 
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
-async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<String>) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    session_id: Option<String>,
+    session_name: Option<String>,
+) {
     let (mut sender, mut receiver) = socket.split();
 
     // Resolve session ID: use provided or generate a new UUID
@@ -163,6 +179,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
     // Hydrate agent from persisted session (if available)
     let mut resumed = false;
     let mut message_count: usize = 0;
+    let mut effective_name: Option<String> = None;
     if let Some(ref backend) = state.session_backend {
         let messages = backend.load(&session_key);
         if !messages.is_empty() {
@@ -170,15 +187,29 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: Option<St
             agent.seed_history(&messages);
             resumed = true;
         }
+        // Set session name if provided (non-empty) on connect
+        if let Some(ref name) = session_name {
+            if !name.is_empty() {
+                let _ = backend.set_session_name(&session_key, name);
+                effective_name = Some(name.clone());
+            }
+        }
+        // If no name was provided via query param, load the stored name
+        if effective_name.is_none() {
+            effective_name = backend.get_session_name(&session_key).unwrap_or(None);
+        }
     }
 
     // Send session_start message to client
-    let session_start = serde_json::json!({
+    let mut session_start = serde_json::json!({
         "type": "session_start",
         "session_id": session_id,
         "resumed": resumed,
         "message_count": message_count,
     });
+    if let Some(ref name) = effective_name {
+        session_start["name"] = serde_json::Value::String(name.clone());
+    }
     let _ = sender
         .send(Message::Text(session_start.to_string().into()))
         .await;
