@@ -2739,6 +2739,11 @@ pub fn build_system_prompt_with_mode(
         "## Workspace\n\nWorking directory: `{}`\n",
         workspace_dir.display()
     );
+    if !skills.is_empty() {
+        prompt.push_str(
+            "Note: When executing scripts in skills, they often use relative paths. Either `cd` into the skill's `location` before executing, or resolve relative paths to absolute paths using the `location` and execute from the workspace root.\n\n",
+        );
+    }
 
     // ── 5. Bootstrap files (injected into context) ──────────────
     prompt.push_str("## Project Context\n\n");
