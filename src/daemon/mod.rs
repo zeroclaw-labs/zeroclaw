@@ -536,6 +536,11 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
         .map(str::trim)
         .filter(|v| !v.is_empty())?;
 
+    if channel.contains('/') || channel.contains('\\') || to.contains('/') || to.contains('\\') {
+        tracing::warn!("heartbeat session context: channel/to contains path separators, skipping");
+        return None;
+    }
+
     let sessions_dir = config.workspace_dir.join("sessions");
 
     // Find the most recently modified JSONL file that belongs to this target.
@@ -631,9 +636,17 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
     );
     for msg in &recent {
         let label = if msg.role == "user" { "User" } else { "You" };
-        // Truncate very long messages to avoid bloating the prompt
+        // Truncate very long messages to avoid bloating the prompt.
+        // Use char_indices to avoid panicking on multi-byte UTF-8 characters.
         let content = if msg.content.len() > 500 {
-            format!("{}…", &msg.content[..500])
+            let truncate_at = msg
+                .content
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= 500)
+                .last()
+                .unwrap_or(0);
+            format!("{}…", &msg.content[..truncate_at])
         } else {
             msg.content.clone()
         };
@@ -646,8 +659,11 @@ fn load_heartbeat_session_context(config: &Config) -> Option<String> {
     Some(ctx)
 }
 
-/// Read all `ChatMessage` lines from a JSONL session file.
+/// Read the last `HEARTBEAT_SESSION_CONTEXT_MESSAGES` `ChatMessage` lines from
+/// a JSONL session file using a bounded rolling window so we never hold the
+/// entire file in memory.
 fn load_jsonl_messages(path: &std::path::Path) -> Vec<crate::providers::traits::ChatMessage> {
+    use std::collections::VecDeque;
     use std::io::BufRead;
 
     let file = match std::fs::File::open(path) {
@@ -655,7 +671,8 @@ fn load_jsonl_messages(path: &std::path::Path) -> Vec<crate::providers::traits::
         Err(_) => return Vec::new(),
     };
     let reader = std::io::BufReader::new(file);
-    let mut messages = Vec::new();
+    let mut window: VecDeque<crate::providers::traits::ChatMessage> =
+        VecDeque::with_capacity(HEARTBEAT_SESSION_CONTEXT_MESSAGES + 1);
     for line in reader.lines() {
         let Ok(line) = line else { continue };
         let trimmed = line.trim();
@@ -663,10 +680,13 @@ fn load_jsonl_messages(path: &std::path::Path) -> Vec<crate::providers::traits::
             continue;
         }
         if let Ok(msg) = serde_json::from_str::<crate::providers::traits::ChatMessage>(trimmed) {
-            messages.push(msg);
+            window.push_back(msg);
+            if window.len() > HEARTBEAT_SESSION_CONTEXT_MESSAGES {
+                window.pop_front();
+            }
         }
     }
-    messages
+    window.into_iter().collect()
 }
 
 /// Auto-detect the best channel for heartbeat delivery by checking which
