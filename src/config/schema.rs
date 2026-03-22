@@ -7516,16 +7516,31 @@ impl Config {
                 .await
                 .context("Failed to read config file")?;
 
-            // Track ignored/unknown config keys to warn users about silent misconfigurations
-            // (e.g., using [providers.ollama] which doesn't exist instead of top-level api_url)
+            // Deserialize the config with the standard TOML parser.
+            //
+            // Previously this used `serde_ignored::deserialize` for both
+            // deserialization and unknown-key detection.  However,
+            // `serde_ignored` silently drops field values inside nested
+            // structs that carry `#[serde(default)]` (e.g. the entire
+            // `[autonomy]` table), causing user-supplied values to be
+            // replaced by defaults.  See #4171.
+            //
+            // We now deserialize with `toml::from_str` (which is correct)
+            // and run `serde_ignored` separately just for diagnostics.
+            let mut config: Config =
+                toml::from_str(&contents).context("Failed to deserialize config file")?;
+
+            // Detect unknown/ignored config keys for diagnostic warnings.
+            // This second pass uses serde_ignored but discards the parsed
+            // result — only the ignored-path list is kept.
             let mut ignored_paths: Vec<String> = Vec::new();
-            let mut config: Config = serde_ignored::deserialize(
-                toml::de::Deserializer::parse(&contents).context("Failed to parse config file")?,
+            let _: Result<Config, _> = serde_ignored::deserialize(
+                toml::de::Deserializer::parse(&contents)
+                    .unwrap_or_else(|_| unreachable!("already parsed above")),
                 |path| {
                     ignored_paths.push(path.to_string());
                 },
-            )
-            .context("Failed to deserialize config file")?;
+            );
 
             // Warn about each unknown config key.
             // serde_ignored + #[serde(default)] on nested structs can produce
@@ -9984,6 +9999,37 @@ default_temperature = 0.7
         assert_eq!(parsed.memory.conversation_retention_days, 30);
         // provider_timeout_secs defaults to 120 when not specified
         assert_eq!(parsed.provider_timeout_secs, 120);
+    }
+
+    /// Regression test for #4171: the `[autonomy]` section must not be
+    /// silently dropped when parsing config TOML.
+    #[test]
+    async fn autonomy_section_is_not_silently_ignored() {
+        let raw = r#"
+default_temperature = 0.7
+
+[autonomy]
+level = "full"
+max_actions_per_hour = 99
+auto_approve = ["file_read", "memory_recall", "http_request"]
+"#;
+        let parsed = parse_test_config(raw);
+        assert_eq!(
+            parsed.autonomy.level,
+            AutonomyLevel::Full,
+            "autonomy.level must be parsed from config (was silently defaulting to Supervised)"
+        );
+        assert_eq!(
+            parsed.autonomy.max_actions_per_hour, 99,
+            "autonomy.max_actions_per_hour must be parsed from config"
+        );
+        assert!(
+            parsed
+                .autonomy
+                .auto_approve
+                .contains(&"http_request".to_string()),
+            "autonomy.auto_approve must include http_request from config"
+        );
     }
 
     #[test]
