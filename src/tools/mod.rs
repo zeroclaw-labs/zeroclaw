@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod a2a;
 pub mod ask_user;
 pub mod backup_tool;
 pub mod browser;
@@ -987,6 +988,11 @@ pub fn all_tools_with_runtime(
             security.clone(),
             strictness,
         )));
+    }
+
+    // A2A (Agent-to-Agent) outbound client tool
+    if root_config.a2a.enabled {
+        tool_arcs.push(Arc::new(a2a::A2aTool::new(security.clone(), 30)));
     }
 
     // ── WASM plugin tools (requires plugins-wasm feature) ──
