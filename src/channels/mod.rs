@@ -26,6 +26,7 @@ pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
+pub mod link_enricher;
 pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
@@ -2065,6 +2066,25 @@ async fn process_channel_message(
     } else {
         msg
     };
+
+    // ── Link enricher: prepend URL summaries before agent sees the message ──
+    let le_config = &ctx.prompt_config.link_enricher;
+    if le_config.enabled {
+        let enricher_cfg = link_enricher::LinkEnricherConfig {
+            enabled: le_config.enabled,
+            max_links: le_config.max_links,
+            timeout_secs: le_config.timeout_secs,
+        };
+        let enriched = link_enricher::enrich_message(&msg.content, &enricher_cfg).await;
+        if enriched != msg.content {
+            tracing::info!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                "Link enricher: prepended URL summaries to message"
+            );
+            msg.content = enriched;
+        }
+    }
 
     let target_channel = ctx
         .channels_by_name
