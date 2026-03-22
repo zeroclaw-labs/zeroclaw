@@ -67,12 +67,33 @@ struct ToolCallRecord {
     result_hash: u64,
 }
 
+/// Produce a deterministic hash for a JSON value by recursively sorting
+/// object keys before serialisation.  This ensures `{"a":1,"b":2}` and
+/// `{"b":2,"a":1}` hash identically.
 fn hash_value(value: &serde_json::Value) -> u64 {
     let mut hasher = DefaultHasher::new();
-    // Canonical JSON string for stable hashing.
-    let canonical = serde_json::to_string(value).unwrap_or_default();
+    let canonical = serde_json::to_string(&canonicalise(value)).unwrap_or_default();
     canonical.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Return a clone of `value` with all object keys sorted recursively.
+fn canonicalise(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut sorted: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            sorted.sort_by_key(|(k, _)| *k);
+            let new_map: serde_json::Map<String, serde_json::Value> = sorted
+                .into_iter()
+                .map(|(k, v)| (k.clone(), canonicalise(v)))
+                .collect();
+            serde_json::Value::Object(new_map)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(canonicalise).collect())
+        }
+        other => other.clone(),
+    }
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -419,21 +440,21 @@ mod tests {
         let mut det = LoopDetector::new(default_config());
         let args = json!({});
 
-        // 5 cycles = 10 calls -> Block
+        // 5 cycles = 10 calls.  The 10th call (completing cycle 5) triggers Block.
         for i in 0..10 {
             let name = if i % 2 == 0 { "fetch" } else { "parse" };
             det.record(name, &args, &format!("r{i}"));
         }
-        // The 10th call (index 9) should have triggered Block.
-        // Record one more pair to check Break.
+        // 11th call extends to 5.5 cycles; detector still counts 5 full -> Block.
         let r = det.record("fetch", &args, "r10");
-        // After 11 calls we're past the 5-cycle mark; check we don't crash.
-        assert!(matches!(
-            r,
-            LoopDetectionResult::Warning(_)
-                | LoopDetectionResult::Block(_)
-                | LoopDetectionResult::Break(_)
-        ));
+        match r {
+            LoopDetectionResult::Block(msg) => {
+                assert!(msg.contains("fetch"));
+                assert!(msg.contains("parse"));
+                assert!(msg.contains("5 cycles"));
+            }
+            other => panic!("expected Block at 5 cycles, got {other:?}"),
+        }
     }
 
     #[test]
@@ -483,20 +504,21 @@ mod tests {
     fn no_progress_escalates_to_block_and_break() {
         let mut det = LoopDetector::new(default_config());
 
-        // 6 calls -> Block
+        // 6 calls with different args, same result.
         for i in 0..6 {
             let args = json!({"q": format!("v{i}")});
             det.record("web_fetch", &args, "timeout");
         }
-        // 6th call should be Block.
-        let r6 = det.record("web_fetch", &json!({"q": "v6"}), "timeout");
-        assert!(
-            matches!(
-                r6,
-                LoopDetectionResult::Block(_) | LoopDetectionResult::Break(_)
-            ),
-            "expected Block or Break at 7 calls, got {r6:?}"
-        );
+        // 7th call: count=7 which is >= MIN_CALLS(5)+2 -> Break.
+        let r7 = det.record("web_fetch", &json!({"q": "v6"}), "timeout");
+        match r7 {
+            LoopDetectionResult::Break(msg) => {
+                assert!(msg.contains("web_fetch"));
+                assert!(msg.contains("7 times"));
+                assert!(msg.contains("no progress"));
+            }
+            other => panic!("expected Break at 7 calls, got {other:?}"),
+        }
     }
 
     #[test]
@@ -519,22 +541,17 @@ mod tests {
         for _ in 0..5 {
             det.record("search", &args, "no results");
         }
-        // At 5 calls with same args, we're under max_repeats=6 so exact_repeat
-        // doesn't fire. no_progress requires >=2 unique args, so it shouldn't
-        // fire either.
+        // 6th call = exact repeat at threshold (max_repeats=6) -> Warning.
+        // no_progress requires >=2 unique args, so it must NOT fire.
         let r = det.record("search", &args, "no results");
-        // 6th call = exact repeat at threshold -> Warning
         match r {
             LoopDetectionResult::Warning(msg) => {
                 assert!(
                     msg.contains("identical arguments"),
-                    "should be exact-repeat: {msg}"
+                    "should be exact-repeat Warning, got: {msg}"
                 );
             }
-            LoopDetectionResult::Ok => {
-                // Also acceptable — no_progress correctly not triggered.
-            }
-            other => panic!("unexpected {other:?}"),
+            other => panic!("expected exact-repeat Warning, got {other:?}"),
         }
     }
 
@@ -574,6 +591,88 @@ mod tests {
         det.record("tool_5", &args, "result");
         assert_eq!(det.window.len(), 5);
         assert_eq!(det.window.front().unwrap().name, "tool_1");
+    }
+
+    // ── Ping-pong with varying args ─────────────────────────────
+
+    #[test]
+    fn ping_pong_detects_alternation_with_varying_args() {
+        let mut det = LoopDetector::new(default_config());
+
+        // A->B->A->B with different args each time — ping-pong cares only
+        // about tool names, not argument equality.
+        for i in 0..8 {
+            let name = if i % 2 == 0 { "read" } else { "write" };
+            let args = json!({"attempt": i});
+            let result = det.record(name, &args, &format!("r{i}"));
+            if i < 7 {
+                assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
+            } else {
+                match result {
+                    LoopDetectionResult::Warning(msg) => {
+                        assert!(msg.contains("read"));
+                        assert!(msg.contains("write"));
+                        assert!(msg.contains("4 cycles"));
+                    }
+                    other => panic!("expected Warning at cycle 4, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    // ── Window eviction test ────────────────────────────────────
+
+    #[test]
+    fn window_eviction_prevents_stale_pattern_detection() {
+        let config = LoopDetectorConfig {
+            enabled: true,
+            window_size: 6,
+            max_repeats: 3,
+        };
+        let mut det = LoopDetector::new(config);
+        let args = json!({"x": 1});
+
+        // 2 consecutive calls of "tool_a".
+        det.record("tool_a", &args, "r");
+        det.record("tool_a", &args, "r");
+
+        // Fill the rest of the window with different tools (evicting the
+        // first "tool_a" calls as the window is only 6).
+        for i in 0..5 {
+            det.record(&format!("other_{i}"), &json!({}), "ok");
+        }
+
+        // Now "tool_a" again — only 1 consecutive, not 3.
+        let r = det.record("tool_a", &args, "r");
+        assert_eq!(
+            r,
+            LoopDetectionResult::Ok,
+            "stale entries should be evicted"
+        );
+    }
+
+    // ── hash_value key-order independence ────────────────────────
+
+    #[test]
+    fn hash_value_is_key_order_independent() {
+        let a = json!({"alpha": 1, "beta": 2});
+        let b = json!({"beta": 2, "alpha": 1});
+        assert_eq!(
+            hash_value(&a),
+            hash_value(&b),
+            "hash_value must produce identical hashes regardless of JSON key order"
+        );
+    }
+
+    #[test]
+    fn hash_value_nested_key_order_independent() {
+        let a = json!({"outer": {"x": 1, "y": 2}, "z": [1, 2]});
+        let b = json!({"z": [1, 2], "outer": {"y": 2, "x": 1}});
+        assert_eq!(
+            hash_value(&a),
+            hash_value(&b),
+            "nested objects must also be key-order independent"
+        );
     }
 
     // ── Escalation order tests ───────────────────────────────────

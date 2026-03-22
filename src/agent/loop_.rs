@@ -3369,9 +3369,12 @@ pub(crate) async fn run_tool_call_loop(
         // Collect tool results and build per-tool output for loop detection.
         // Only non-ignored tool outputs contribute to the identical-output hash.
         let mut detection_relevant_output = String::new();
-        // Track call index so we can pair each result with its ParsedToolCall args.
-        for (result_index, (tool_name, tool_call_id, outcome)) in
-            ordered_results.into_iter().flatten().enumerate()
+        // Use enumerate *before* filter_map so result_index stays aligned with
+        // tool_calls even when some ordered_results entries are None.
+        for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, opt)| opt.map(|v| (i, v)))
         {
             if !loop_ignore_tools.contains(tool_name.as_str()) {
                 detection_relevant_output.push_str(&outcome.output);

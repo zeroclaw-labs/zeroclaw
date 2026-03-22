@@ -14229,4 +14229,32 @@ require_otp_to_resume = true
             .unwrap();
         assert!(identity.contains("IDENTITY.md"));
     }
+
+    // ── PacingConfig serde defaults ─────────────────────────────
+
+    #[test]
+    async fn pacing_config_serde_defaults_match_manual_default() {
+        // Deserialise an empty TOML table and verify the loop-detection
+        // fields receive the same defaults as `PacingConfig::default()`.
+        let from_toml: PacingConfig = toml::from_str("").unwrap();
+        let manual = PacingConfig::default();
+
+        assert_eq!(
+            from_toml.loop_detection_enabled,
+            manual.loop_detection_enabled
+        );
+        assert_eq!(
+            from_toml.loop_detection_window_size,
+            manual.loop_detection_window_size
+        );
+        assert_eq!(
+            from_toml.loop_detection_max_repeats,
+            manual.loop_detection_max_repeats
+        );
+
+        // Verify concrete values so a silent change to the defaults is caught.
+        assert!(from_toml.loop_detection_enabled, "default should be true");
+        assert_eq!(from_toml.loop_detection_window_size, 20);
+        assert_eq!(from_toml.loop_detection_max_repeats, 3);
+    }
 }
