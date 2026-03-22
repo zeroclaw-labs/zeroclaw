@@ -362,10 +362,22 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         };
 
         // ── Phase 2: Execute selected tasks ─────────────────────
+        // Re-read session context on every tick so we pick up messages
+        // that arrived since the daemon started.
+        let session_context = if config.heartbeat.load_session_context {
+            load_heartbeat_session_context(&config)
+        } else {
+            None
+        };
+
         let mut tick_had_error = false;
         for task in &tasks_to_run {
             let task_start = std::time::Instant::now();
-            let prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
+            let task_prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
+            let prompt = match &session_context {
+                Some(ctx) => format!("{ctx}\n\n{task_prompt}"),
+                None => task_prompt,
+            };
             let temp = config.default_temperature;
             match Box::pin(crate::agent::run(
                 config.clone(),
@@ -495,6 +507,166 @@ fn resolve_heartbeat_delivery(config: &Config) -> Result<Option<(String, String)
         // Neither set — try auto-detect the first configured channel.
         (None, None) => Ok(auto_detect_heartbeat_channel(config)),
     }
+}
+
+/// Load recent conversation history for the heartbeat's delivery target and
+/// format it as a text preamble to inject into the task prompt.
+///
+/// Scans `{workspace}/sessions/` for JSONL files whose name starts with
+/// `{channel}_` and ends with `_{to}.jsonl` (or exactly `{channel}_{to}.jsonl`),
+/// then picks the most recently modified match. This handles session key
+/// formats such as `telegram_diskiller.jsonl` and
+/// `telegram_5673725398_diskiller.jsonl`.
+/// Returns `None` when `target`/`to` are not configured or no session exists.
+const HEARTBEAT_SESSION_CONTEXT_MESSAGES: usize = 20;
+
+fn load_heartbeat_session_context(config: &Config) -> Option<String> {
+    use crate::providers::traits::ChatMessage;
+
+    let channel = config
+        .heartbeat
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+    let to = config
+        .heartbeat
+        .to
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+
+    let sessions_dir = config.workspace_dir.join("sessions");
+
+    // Find the most recently modified JSONL file that belongs to this target.
+    // Matches both `{channel}_{to}.jsonl` and `{channel}_{anything}_{to}.jsonl`.
+    let prefix = format!("{channel}_");
+    let suffix = format!("_{to}.jsonl");
+    let exact = format!("{channel}_{to}.jsonl");
+    let mid_prefix = format!("{channel}_{to}_");
+
+    let path = std::fs::read_dir(&sessions_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".jsonl")
+                && (name == exact
+                    || (name.starts_with(&prefix) && name.ends_with(&suffix))
+                    || name.starts_with(&mid_prefix))
+        })
+        .max_by_key(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+        })
+        .map(|e| e.path())?;
+
+    if !path.exists() {
+        tracing::debug!("💓 Heartbeat session context: no session file found for {channel}/{to}");
+        return None;
+    }
+
+    let messages = load_jsonl_messages(&path);
+    if messages.is_empty() {
+        return None;
+    }
+
+    let recent: Vec<&ChatMessage> = messages
+        .iter()
+        .filter(|m| m.role == "user" || m.role == "assistant")
+        .rev()
+        .take(HEARTBEAT_SESSION_CONTEXT_MESSAGES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+
+    // Only inject context if there is at least one real user message in the
+    // window. If the JSONL contains only assistant messages (e.g. previous
+    // heartbeat outputs with no reply yet), skip context to avoid feeding
+    // Monika's own messages back to her in a loop.
+    let has_user_message = recent.iter().any(|m| m.role == "user");
+    if !has_user_message {
+        tracing::debug!(
+            "💓 Heartbeat session context: no user messages in recent history — skipping"
+        );
+        return None;
+    }
+
+    // Use the session file's mtime as a proxy for when the last message arrived.
+    let last_message_age = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|mtime| mtime.elapsed().ok());
+
+    let silence_note = match last_message_age {
+        Some(age) => {
+            let mins = age.as_secs() / 60;
+            if mins < 60 {
+                format!("(last message ~{mins} minutes ago)\n")
+            } else {
+                let hours = mins / 60;
+                let rem = mins % 60;
+                if rem == 0 {
+                    format!("(last message ~{hours}h ago)\n")
+                } else {
+                    format!("(last message ~{hours}h {rem}m ago)\n")
+                }
+            }
+        }
+        None => String::new(),
+    };
+
+    tracing::debug!(
+        "💓 Heartbeat session context: {} messages from {}, silence: {}",
+        recent.len(),
+        path.display(),
+        silence_note.trim(),
+    );
+
+    let mut ctx = format!(
+        "[Recent conversation history — use this for context when composing your message] {silence_note}",
+    );
+    for msg in &recent {
+        let label = if msg.role == "user" { "User" } else { "You" };
+        // Truncate very long messages to avoid bloating the prompt
+        let content = if msg.content.len() > 500 {
+            format!("{}…", &msg.content[..500])
+        } else {
+            msg.content.clone()
+        };
+        ctx.push_str(label);
+        ctx.push_str(": ");
+        ctx.push_str(&content);
+        ctx.push('\n');
+    }
+
+    Some(ctx)
+}
+
+/// Read all `ChatMessage` lines from a JSONL session file.
+fn load_jsonl_messages(path: &std::path::Path) -> Vec<crate::providers::traits::ChatMessage> {
+    use std::io::BufRead;
+
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut messages = Vec::new();
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(msg) = serde_json::from_str::<crate::providers::traits::ChatMessage>(trimmed) {
+            messages.push(msg);
+        }
+    }
+    messages
 }
 
 /// Auto-detect the best channel for heartbeat delivery by checking which

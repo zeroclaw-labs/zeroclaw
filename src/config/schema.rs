@@ -4643,6 +4643,7 @@ pub struct ClassificationRule {
 
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct HeartbeatConfig {
     /// Enable periodic heartbeat pings. Default: `false`.
     pub enabled: bool,
@@ -4689,6 +4690,14 @@ pub struct HeartbeatConfig {
     /// Maximum number of heartbeat run history records to retain. Default: `100`.
     #[serde(default = "default_heartbeat_max_run_history")]
     pub max_run_history: u32,
+    /// Load the channel session history before each heartbeat task execution so
+    /// the LLM has conversational context. Default: `false`.
+    ///
+    /// When `true`, the session file for the configured `target`/`to` is passed
+    /// to the agent as `session_state_file`, giving it access to the recent
+    /// conversation history — just as if the user had sent a message.
+    #[serde(default)]
+    pub load_session_context: bool,
 }
 
 fn default_heartbeat_interval() -> u32 {
@@ -4727,6 +4736,7 @@ impl Default for HeartbeatConfig {
             deadman_channel: None,
             deadman_to: None,
             max_run_history: default_heartbeat_max_run_history(),
+            load_session_context: false,
         }
     }
 }
