@@ -3128,9 +3128,12 @@ pub fn build_system_prompt_with_mode(
         Some(&autonomy_cfg),
         native_tools,
         skills_prompt_mode,
+        false,
+        0,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt_with_mode_and_autonomy(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -3141,6 +3144,8 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     autonomy_config: Option<&crate::config::AutonomyConfig>,
     native_tools: bool,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
+    compact_context: bool,
+    max_system_prompt_chars: usize,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -3167,11 +3172,19 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // ── 1. Tooling ──────────────────────────────────────────────
     if !tools.is_empty() {
         prompt.push_str("## Tools\n\n");
-        prompt.push_str("You have access to the following tools:\n\n");
-        for (name, desc) in tools {
-            let _ = writeln!(prompt, "- **{name}**: {desc}");
+        if compact_context {
+            // Compact mode: tool names only, no descriptions/schemas
+            prompt.push_str("Available tools: ");
+            let names: Vec<&str> = tools.iter().map(|(name, _)| *name).collect();
+            prompt.push_str(&names.join(", "));
+            prompt.push_str("\n\n");
+        } else {
+            prompt.push_str("You have access to the following tools:\n\n");
+            for (name, desc) in tools {
+                let _ = writeln!(prompt, "- **{name}**: {desc}");
+            }
+            prompt.push('\n');
         }
-        prompt.push('\n');
     }
 
     // ── 1b. Hardware (when gpio/arduino tools present) ───────────
@@ -3315,11 +3328,13 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         std::env::consts::OS,
     );
 
-    // ── 8. Channel Capabilities ─────────────────────────────────────
-    prompt.push_str("## Channel Capabilities\n\n");
-    prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
-    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
-    prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
+    // ── 8. Channel Capabilities (skipped in compact_context mode) ──
+    if !compact_context {
+        prompt.push_str("## Channel Capabilities\n\n");
+        prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
+        prompt
+            .push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
+        prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
             "- If the runtime policy already allows a tool, use it directly; do not ask the user for extra approval.\n\
              - Never pretend you are waiting for a human approval click or confirmation when the runtime policy already permits the action.\n\
@@ -3333,10 +3348,23 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              - If there is no approval path for this channel or the runtime blocks an action, explain that restriction directly instead of simulating an approval flow.\n"
         }
     });
-    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-    prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
-    prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
-    prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
+        prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
+        prompt.push_str("- If a tool output contains credentials, they have already been redacted — do not mention them.\n");
+        prompt.push_str("- When a user sends a voice note, it is automatically transcribed to text. Your text reply is automatically converted to a voice note and sent back. Do NOT attempt to generate audio yourself — TTS is handled by the channel.\n");
+        prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n\n");
+    } // end if !compact_context (Channel Capabilities)
+
+    // ── 9. Truncation (max_system_prompt_chars budget) ──────────
+    if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
+        // Truncate on a char boundary, keeping the top portion (identity + safety).
+        let mut end = max_system_prompt_chars;
+        // Ensure we don't split a multi-byte UTF-8 character.
+        while !prompt.is_char_boundary(end) && end > 0 {
+            end -= 1;
+        }
+        prompt.truncate(end);
+        prompt.push_str("\n\n[System prompt truncated to fit context budget]\n");
+    }
 
     if prompt.is_empty() {
         "You are ZeroClaw, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct."
@@ -4452,6 +4480,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         Some(&config.autonomy),
         native_tools,
         config.skills.prompt_injection_mode,
+        config.agent.compact_context,
+        config.agent.max_system_prompt_chars,
     );
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(
@@ -7774,6 +7804,8 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&config),
             false,
             crate::config::SkillsPromptInjectionMode::Full,
+            false,
+            0,
         );
 
         assert!(
@@ -7803,6 +7835,8 @@ BTC is currently around $65,000 based on latest tool output."#
             Some(&config),
             false,
             crate::config::SkillsPromptInjectionMode::Full,
+            false,
+            0,
         );
 
         assert!(

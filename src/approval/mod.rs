@@ -122,7 +122,7 @@ impl ApprovalManager {
         }
 
         // always_ask overrides everything.
-        if self.always_ask.contains(tool_name) {
+        if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
             return true;
         }
 
@@ -136,7 +136,7 @@ impl ApprovalManager {
         }
 
         // auto_approve skips the prompt.
-        if self.auto_approve.contains(tool_name) {
+        if self.auto_approve.contains("*") || self.auto_approve.contains(tool_name) {
             return false;
         }
 

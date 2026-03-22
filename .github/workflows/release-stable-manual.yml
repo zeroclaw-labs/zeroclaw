@@ -348,6 +348,21 @@ jobs:
       - name: Clean web build artifacts
         run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
 
+      - name: Publish aardvark-sys to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify -p aardvark-sys 2>&1) && exit 0
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q 'already exists'; then
+            echo "::notice::aardvark-sys already on crates.io — skipping"
+            exit 0
+          fi
+          exit 1
+
+      - name: Wait for aardvark-sys to index
+        run: sleep 15
+
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

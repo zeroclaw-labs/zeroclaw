@@ -1248,6 +1248,12 @@ pub struct AgentConfig {
     /// Default: `[]` (no filtering — all tools included).
     #[serde(default)]
     pub tool_filter_groups: Vec<ToolFilterGroup>,
+    /// Maximum characters for the assembled system prompt. When `> 0`, the prompt
+    /// is truncated to this limit after assembly (keeping the top portion which
+    /// contains identity and safety instructions). `0` means unlimited.
+    /// Useful for small-context models (e.g. glm-4.5-air ~8K tokens → set to 8000).
+    #[serde(default = "default_max_system_prompt_chars")]
+    pub max_system_prompt_chars: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1266,6 +1272,10 @@ fn default_agent_tool_dispatcher() -> String {
     "auto".into()
 }
 
+fn default_max_system_prompt_chars() -> usize {
+    0
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -1277,6 +1287,7 @@ impl Default for AgentConfig {
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
             tool_filter_groups: Vec::new(),
+            max_system_prompt_chars: default_max_system_prompt_chars(),
         }
     }
 }
