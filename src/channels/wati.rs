@@ -2,6 +2,8 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use uuid::Uuid;
 
+const MAX_WATI_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+
 /// WATI WhatsApp Business API channel.
 ///
 /// This channel operates in webhook mode (push-based) rather than polling.
@@ -47,6 +49,9 @@ impl WatiChannel {
     }
 
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if !config.enabled {
+            return self;
+        }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
                 self.transcription_manager = Some(std::sync::Arc::new(m));
@@ -117,6 +122,46 @@ impl WatiChannel {
         }
     }
 
+    /// Extract and normalize a timestamp from a WATI webhook payload.
+    ///
+    /// Handles unix seconds, unix milliseconds (divided by 1000), and ISO 8601
+    /// strings. Falls back to the current system time if parsing fails.
+    fn extract_timestamp(payload: &serde_json::Value) -> u64 {
+        payload
+            .get("timestamp")
+            .or_else(|| payload.get("created"))
+            .map(|t| {
+                if let Some(secs) = t.as_u64() {
+                    if secs > 10_000_000_000 {
+                        secs / 1000
+                    } else {
+                        secs
+                    }
+                } else if let Some(s) = t.as_str() {
+                    chrono::DateTime::parse_from_rfc3339(s)
+                        .ok()
+                        .map(|dt| dt.timestamp().cast_unsigned())
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        })
+                } else {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                }
+            })
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            })
+    }
+
     /// Parse an incoming webhook payload from WATI and extract messages.
     ///
     /// WATI's webhook payloads have variable field names depending on the API
@@ -159,42 +204,7 @@ impl WatiChannel {
             return messages;
         };
 
-        // Extract timestamp — handle unix seconds, unix ms, or ISO string
-        let timestamp = payload
-            .get("timestamp")
-            .or_else(|| payload.get("created"))
-            .map(|t| {
-                if let Some(secs) = t.as_u64() {
-                    // Distinguish seconds from milliseconds (ms > 10_000_000_000)
-                    if secs > 10_000_000_000 {
-                        secs / 1000
-                    } else {
-                        secs
-                    }
-                } else if let Some(s) = t.as_str() {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .ok()
-                        .map(|dt| dt.timestamp().cast_unsigned())
-                        .unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs()
-                        })
-                } else {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                }
-            })
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            });
-
+        let timestamp = Self::extract_timestamp(payload);
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
             reply_target: normalized_phone.clone(),
@@ -209,6 +219,14 @@ impl WatiChannel {
         messages
     }
 
+    /// Extract host from URL string.
+    fn extract_host(url_str: &str) -> Option<String> {
+        reqwest::Url::parse(url_str)
+            .ok()?
+            .host_str()
+            .map(|h| h.to_ascii_lowercase())
+    }
+
     /// Attempt to download and transcribe an audio message from a WATI webhook payload.
     ///
     /// Returns `Some(transcript)` if transcription succeeds, `None` otherwise.
@@ -220,6 +238,29 @@ impl WatiChannel {
             .get("mediaUrl")
             .or_else(|| payload.get("media_url"))
             .and_then(|v| v.as_str())?;
+
+        // Validate media_url host matches api_url to prevent SSRF
+        let api_host = Self::extract_host(&self.api_url);
+        let media_host = Self::extract_host(media_url);
+        match (api_host, media_host) {
+            (Some(ref expected), Some(ref actual)) if actual == expected => {}
+            _ => {
+                tracing::warn!("WATI: blocked media URL with unexpected host: {media_url}");
+                return None;
+            }
+        }
+
+        // Check fromMe early to avoid downloading media for outgoing messages
+        let from_me = payload
+            .get("fromMe")
+            .or_else(|| payload.get("from_me"))
+            .or_else(|| payload.get("owner"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if from_me {
+            tracing::debug!("WATI: skipping fromMe audio before download");
+            return None;
+        }
 
         let msg_type = payload
             .get("type")
@@ -244,7 +285,26 @@ impl WatiChannel {
             return None;
         }
 
+        if let Some(content_length) = resp.content_length() {
+            if content_length > MAX_WATI_AUDIO_BYTES {
+                tracing::warn!(
+                    "WATI: media download skipped: content-length {content_length} exceeds {} bytes",
+                    MAX_WATI_AUDIO_BYTES
+                );
+                return None;
+            }
+        }
+
         let audio_bytes = resp.bytes().await.ok()?;
+
+        if audio_bytes.len() as u64 > MAX_WATI_AUDIO_BYTES {
+            tracing::warn!(
+                "WATI: audio download too large after fetch: {} bytes exceeds {} bytes",
+                audio_bytes.len(),
+                MAX_WATI_AUDIO_BYTES
+            );
+            return None;
+        }
 
         match manager.transcribe(&audio_bytes, file_name).await {
             Ok(transcript) => Some(transcript),
@@ -279,47 +339,17 @@ impl WatiChannel {
             return messages;
         }
 
+        if transcript.trim().is_empty() {
+            tracing::debug!("WATI: skipping empty audio transcript");
+            return messages;
+        }
+
         // Extract and validate sender
         let Some(normalized_phone) = self.extract_sender(payload) else {
             return messages;
         };
 
-        // Extract timestamp — handle unix seconds, unix ms, or ISO string
-        let timestamp = payload
-            .get("timestamp")
-            .or_else(|| payload.get("created"))
-            .map(|t| {
-                if let Some(secs) = t.as_u64() {
-                    // Distinguish seconds from milliseconds (ms > 10_000_000_000)
-                    if secs > 10_000_000_000 {
-                        secs / 1000
-                    } else {
-                        secs
-                    }
-                } else if let Some(s) = t.as_str() {
-                    chrono::DateTime::parse_from_rfc3339(s)
-                        .ok()
-                        .map(|dt| dt.timestamp().cast_unsigned())
-                        .unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs()
-                        })
-                } else {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                }
-            })
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            });
-
+        let timestamp = Self::extract_timestamp(payload);
         messages.push(ChannelMessage {
             id: Uuid::new_v4().to_string(),
             reply_target: normalized_phone.clone(),
@@ -328,6 +358,7 @@ impl WatiChannel {
             channel: "wati".to_string(),
             timestamp,
             thread_ts: None,
+            interruption_scope_id: None,
         });
 
         messages
@@ -689,7 +720,7 @@ mod tests {
     #[test]
     fn wati_manager_some_when_valid_config() {
         let config = crate::config::TranscriptionConfig {
-            enabled: false,
+            enabled: true,
             default_provider: "groq".to_string(),
             api_key: Some("test-key".to_string()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
@@ -720,7 +751,7 @@ mod tests {
         let config = crate::config::TranscriptionConfig {
             enabled: true,
             default_provider: "groq".to_string(),
-            api_key: Some("".to_string()),
+            api_key: Some(String::new()),
             api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
@@ -794,7 +825,7 @@ mod tests {
 
     #[test]
     fn wati_filename_voice_type() {
-        let ch = make_channel();
+        let _ch = make_channel();
         let payload = serde_json::json!({
             "type": "voice",
             "mediaUrl": "https://example.com/media/123",
@@ -815,7 +846,7 @@ mod tests {
 
     #[test]
     fn wati_filename_audio_type() {
-        let ch = make_channel();
+        let _ch = make_channel();
         let payload = serde_json::json!({
             "type": "audio",
             "mediaUrl": "https://example.com/media/123",
@@ -984,6 +1015,52 @@ mod tests {
         let payload = serde_json::json!({
             "type": "audio",
             "mediaUrl": format!("{}/media/123", media_server.uri()),
+            "waId": "1234567890"
+        });
+
+        let result = ch.try_transcribe_audio(&payload).await;
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_host_uses_url_parser() {
+        assert_eq!(
+            WatiChannel::extract_host("https://live-mt-server.wati.io/media/123"),
+            Some("live-mt-server.wati.io".to_string())
+        );
+        // URL with userinfo@ — proper parser extracts the real host, not the
+        // attacker-controlled host that naive string splitting would produce
+        assert_eq!(
+            WatiChannel::extract_host("https://live-mt-server.wati.io@evil.com/media/123"),
+            Some("evil.com".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn wati_try_transcribe_blocks_host_mismatch() {
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "local_whisper".into(),
+            local_whisper: Some(crate::config::LocalWhisperConfig {
+                url: "http://localhost:8001/v1/transcribe".into(),
+                bearer_token: "test-token".into(),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 120,
+            }),
+            ..Default::default()
+        };
+
+        let ch = WatiChannel::new(
+            "test-token".into(),
+            "https://live-mt-server.wati.io".into(),
+            None,
+            vec!["+1234567890".into()],
+        )
+        .with_transcription(config);
+
+        let payload = serde_json::json!({
+            "type": "audio",
+            "mediaUrl": "https://evil.com/media/123",
             "waId": "1234567890"
         });
 
