@@ -86,11 +86,13 @@ impl DiscordHistoryChannel {
         if let Ok(Some(cached_mem)) = self.discord_memory.get(&cache_key).await {
             // Check if it's still fresh (e.g., less than 24 hours old)
             // Note: cached_mem.timestamp is an RFC3339 string
-            let is_fresh = if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&cached_mem.timestamp) {
-                chrono::Utc::now().signed_duration_since(ts.with_timezone(&chrono::Utc)) < chrono::Duration::hours(24)
-            } else {
-                false
-            };
+            let is_fresh =
+                if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&cached_mem.timestamp) {
+                    chrono::Utc::now().signed_duration_since(ts.with_timezone(&chrono::Utc))
+                        < chrono::Duration::hours(24)
+                } else {
+                    false
+                };
 
             if is_fresh {
                 return cached_mem.content.clone();
@@ -130,12 +132,15 @@ impl DiscordHistoryChannel {
         let resolved = name.unwrap_or_else(|| channel_id.to_string());
 
         // 3. Store in persistent database
-        let _ = self.discord_memory.store(
-            &cache_key,
-            &resolved,
-            crate::memory::MemoryCategory::Custom("channel_cache".to_string()),
-            Some(channel_id),
-        ).await;
+        let _ = self
+            .discord_memory
+            .store(
+                &cache_key,
+                &resolved,
+                crate::memory::MemoryCategory::Custom("channel_cache".to_string()),
+                Some(channel_id),
+            )
+            .await;
 
         resolved
     }
