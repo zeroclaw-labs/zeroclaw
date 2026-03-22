@@ -738,15 +738,47 @@ pub fn skills_to_prompt_with_mode(
         }
 
         if !skill.tools.is_empty() {
-            let _ = writeln!(prompt, "    <tools>");
-            for tool in &skill.tools {
-                let _ = writeln!(prompt, "      <tool>");
-                write_xml_text_element(&mut prompt, 8, "name", &tool.name);
-                write_xml_text_element(&mut prompt, 8, "description", &tool.description);
-                write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
-                let _ = writeln!(prompt, "      </tool>");
+            // Tools with known kinds (shell, script, http) are registered as
+            // callable tool specs and can be invoked directly via function calling.
+            // We note them here for context but mark them as callable.
+            let registered: Vec<_> = skill
+                .tools
+                .iter()
+                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http"))
+                .collect();
+            let unregistered: Vec<_> = skill
+                .tools
+                .iter()
+                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http"))
+                .collect();
+
+            if !registered.is_empty() {
+                let _ = writeln!(prompt, "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">");
+                for tool in &registered {
+                    let _ = writeln!(prompt, "      <tool>");
+                    write_xml_text_element(
+                        &mut prompt,
+                        8,
+                        "name",
+                        &format!("{}.{}", skill.name, tool.name),
+                    );
+                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
+                    let _ = writeln!(prompt, "      </tool>");
+                }
+                let _ = writeln!(prompt, "    </callable_tools>");
             }
-            let _ = writeln!(prompt, "    </tools>");
+
+            if !unregistered.is_empty() {
+                let _ = writeln!(prompt, "    <tools>");
+                for tool in &unregistered {
+                    let _ = writeln!(prompt, "      <tool>");
+                    write_xml_text_element(&mut prompt, 8, "name", &tool.name);
+                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
+                    write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
+                    let _ = writeln!(prompt, "      </tool>");
+                }
+                let _ = writeln!(prompt, "    </tools>");
+            }
         }
 
         let _ = writeln!(prompt, "  </skill>");
@@ -754,6 +786,47 @@ pub fn skills_to_prompt_with_mode(
 
     prompt.push_str("</available_skills>");
     prompt
+}
+
+/// Convert skill tools into callable `Tool` trait objects.
+///
+/// Each skill's `[[tools]]` entries are converted to either `SkillShellTool`
+/// (for `shell`/`script` kinds) or `SkillHttpTool` (for `http` kind),
+/// enabling them to appear as first-class callable tool specs rather than
+/// only as XML in the system prompt.
+pub fn skills_to_tools(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+) -> Vec<Box<dyn crate::tools::traits::Tool>> {
+    let mut tools: Vec<Box<dyn crate::tools::traits::Tool>> = Vec::new();
+    for skill in skills {
+        for tool in &skill.tools {
+            match tool.kind.as_str() {
+                "shell" | "script" => {
+                    tools.push(Box::new(crate::tools::skill_tool::SkillShellTool::new(
+                        &skill.name,
+                        tool,
+                        security.clone(),
+                    )));
+                }
+                "http" => {
+                    tools.push(Box::new(crate::tools::skill_http::SkillHttpTool::new(
+                        &skill.name,
+                        tool,
+                    )));
+                }
+                other => {
+                    tracing::warn!(
+                        "Unknown skill tool kind '{}' for {}.{}, skipping",
+                        other,
+                        skill.name,
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+    tools
 }
 
 /// Get the skills directory path
@@ -1517,10 +1590,10 @@ command = "echo hello"
         assert!(prompt.contains("read_skill(name)"));
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
-        // Compact mode should still include tools so the LLM knows about them
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<name>run</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
+        // Compact mode should still include tools so the LLM knows about them.
+        // Registered tools (shell/script/http) appear under <callable_tools>.
+        assert!(prompt.contains("<callable_tools"));
+        assert!(prompt.contains("<name>test.run</name>"));
     }
 
     #[test]
@@ -1710,9 +1783,11 @@ description = "Bare minimum"
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
-        assert!(prompt.contains("<name>get_weather</name>"));
+        // Registered tools (shell kind) now appear under <callable_tools> with
+        // prefixed names (skill_name.tool_name).
+        assert!(prompt.contains("<callable_tools"));
+        assert!(prompt.contains("<name>weather.get_weather</name>"));
         assert!(prompt.contains("<description>Fetch forecast</description>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
     }
 
     #[test]

@@ -3737,6 +3737,11 @@ pub async fn run(
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // Register skill-defined tools as callable tool specs in the tool registry
+    // so the LLM can invoke them via native function calling, not just XML prompts.
+    tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
@@ -4450,6 +4455,10 @@ pub async fn process_message(
     let i18n_descs = crate::i18n::ToolDescriptions::load(&i18n_locale, &i18n_search_dirs);
 
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+
+    // Register skill-defined tools as callable tool specs (process_message path).
+    tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
