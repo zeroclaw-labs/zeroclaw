@@ -1,10 +1,15 @@
 use super::traits::{Tool, ToolResult};
+use crate::config::schema::FirecrawlConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Minimum body length to consider a standard fetch successful.
+/// Bodies shorter than this are treated as JS-only pages that need Firecrawl.
+const FIRECRAWL_MIN_BODY_LEN: usize = 100;
 
 /// Web fetch tool: fetches a web page and converts HTML to plain text for LLM consumption.
 ///
@@ -14,12 +19,14 @@ use std::time::Duration;
 /// - Converts HTML to clean plain text via `nanohtml2text`
 /// - Passes through text/plain, text/markdown, and application/json as-is
 /// - Sets a descriptive User-Agent
+/// - Falls back to Firecrawl API when standard fetch fails (if enabled)
 pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
     blocked_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
+    firecrawl: FirecrawlConfig,
 }
 
 impl WebFetchTool {
@@ -29,6 +36,7 @@ impl WebFetchTool {
         blocked_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
+        firecrawl: FirecrawlConfig,
     ) -> Self {
         Self {
             security,
@@ -36,6 +44,7 @@ impl WebFetchTool {
             blocked_domains: normalize_allowed_domains(blocked_domains),
             max_response_size,
             timeout_secs,
+            firecrawl,
         }
     }
 
@@ -78,6 +87,172 @@ impl WebFetchTool {
 
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
+
+    /// Whether the standard fetch result should trigger a Firecrawl fallback.
+    fn should_fallback_to_firecrawl(&self, result: &ToolResult) -> bool {
+        if !self.firecrawl.enabled {
+            return false;
+        }
+        // Fallback on failure (HTTP error, network error, etc.)
+        if !result.success {
+            return true;
+        }
+        // Fallback on empty or very short body (JS-only pages)
+        if result.output.trim().len() < FIRECRAWL_MIN_BODY_LEN {
+            return true;
+        }
+        false
+    }
+
+    /// Fetch content via the Firecrawl API.
+    async fn fetch_via_firecrawl(&self, url: &str) -> anyhow::Result<ToolResult> {
+        let api_key = std::env::var(&self.firecrawl.api_key_env).map_err(|_| {
+            anyhow::anyhow!(
+                "Firecrawl API key not found in environment variable '{}'",
+                self.firecrawl.api_key_env
+            )
+        })?;
+
+        let endpoint = format!("{}/scrape", self.firecrawl.api_url.trim_end_matches('/'));
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| anyhow::anyhow!("Failed to build Firecrawl HTTP client: {e}"))?;
+
+        let body = json!({
+            "url": url,
+            "formats": ["markdown"]
+        });
+
+        let response = client
+            .post(&endpoint)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Firecrawl request failed: {e}"))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Firecrawl API error: HTTP {} - {}",
+                    status.as_u16(),
+                    error_body
+                )),
+            });
+        }
+
+        let resp_json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to parse Firecrawl response: {e}"))?;
+
+        let markdown = resp_json
+            .get("data")
+            .and_then(|d| d.get("markdown"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+
+        if markdown.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Firecrawl returned empty markdown content".into()),
+            });
+        }
+
+        let output = self.truncate_response(markdown);
+
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
+    }
+
+    /// Perform the standard HTTP GET fetch and convert to text.
+    async fn standard_fetch(&self, client: &reqwest::Client, url: &str) -> ToolResult {
+        let response = match client.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                return ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("HTTP request failed: {e}")),
+                }
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            return ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "HTTP {} {}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("Unknown")
+                )),
+            };
+        }
+
+        // Determine content type for processing strategy
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let body_mode = if content_type.contains("text/html") || content_type.is_empty() {
+            "html"
+        } else if content_type.contains("text/plain")
+            || content_type.contains("text/markdown")
+            || content_type.contains("application/json")
+        {
+            "plain"
+        } else {
+            return ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Unsupported content type: {content_type}. \
+                     web_fetch supports text/html, text/plain, text/markdown, and application/json."
+                )),
+            };
+        };
+
+        let body = match self.read_response_text_limited(response).await {
+            Ok(t) => t,
+            Err(e) => {
+                return ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to read response body: {e}")),
+                }
+            }
+        };
+
+        let text = if body_mode == "html" {
+            nanohtml2text::html2text(&body)
+        } else {
+            body
+        };
+
+        let output = self.truncate_response(&text);
+
+        ToolResult {
+            success: true,
+            output,
+            error: None,
+        }
+    }
 }
 
 #[async_trait]
@@ -91,6 +266,7 @@ impl Tool for WebFetchTool {
          HTML pages are automatically converted to readable text. \
          JSON and plain text responses are returned as-is. \
          Only GET requests; follows redirects. \
+         Falls back to Firecrawl for JS-heavy/bot-blocked sites (if enabled). \
          Security: allowlist-only domains, no local/private hosts."
     }
 
@@ -187,80 +363,32 @@ impl Tool for WebFetchTool {
             }
         };
 
-        let response = match client.get(&url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("HTTP request failed: {e}")),
-                })
-            }
-        };
+        let standard_result = self.standard_fetch(&client, &url).await;
 
-        let status = response.status();
-        if !status.is_success() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "HTTP {} {}",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("Unknown")
-                )),
-            });
+        // If standard fetch succeeded well enough, return it directly.
+        // Otherwise, try Firecrawl fallback if enabled.
+        if self.should_fallback_to_firecrawl(&standard_result) {
+            tracing::info!(
+                "web_fetch: standard fetch insufficient for {url}, attempting Firecrawl fallback"
+            );
+            match Box::pin(self.fetch_via_firecrawl(&url)).await {
+                Ok(firecrawl_result) if firecrawl_result.success => {
+                    return Ok(firecrawl_result);
+                }
+                Ok(firecrawl_result) => {
+                    tracing::warn!(
+                        "web_fetch: Firecrawl fallback also failed: {:?}",
+                        firecrawl_result.error
+                    );
+                    // Return original standard result if Firecrawl also failed
+                }
+                Err(e) => {
+                    tracing::warn!("web_fetch: Firecrawl fallback error: {e}");
+                }
+            }
         }
 
-        // Determine content type for processing strategy
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_lowercase();
-
-        let body_mode = if content_type.contains("text/html") || content_type.is_empty() {
-            "html"
-        } else if content_type.contains("text/plain")
-            || content_type.contains("text/markdown")
-            || content_type.contains("application/json")
-        {
-            "plain"
-        } else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Unsupported content type: {content_type}. \
-                     web_fetch supports text/html, text/plain, text/markdown, and application/json."
-                )),
-            });
-        };
-
-        let body = match self.read_response_text_limited(response).await {
-            Ok(t) => t,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to read response body: {e}")),
-                })
-            }
-        };
-
-        let text = if body_mode == "html" {
-            nanohtml2text::html2text(&body)
-        } else {
-            body
-        };
-
-        let output = self.truncate_response(&text);
-
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
+        Ok(standard_result)
     }
 }
 
@@ -509,6 +637,7 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::FirecrawlConfig;
     use crate::security::{AutonomyLevel, SecurityPolicy};
 
     fn test_tool(allowed_domains: Vec<&str>) -> WebFetchTool {
@@ -529,7 +658,16 @@ mod tests {
             blocked_domains.into_iter().map(String::from).collect(),
             500_000,
             30,
+            FirecrawlConfig::default(),
         )
+    }
+
+    fn test_tool_with_firecrawl(firecrawl: FirecrawlConfig) -> WebFetchTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        WebFetchTool::new(security, vec!["*".into()], vec![], 500_000, 30, firecrawl)
     }
 
     // ── Name and schema ──────────────────────────────────────────
@@ -620,7 +758,14 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = WebFetchTool::new(security, vec![], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(
+            security,
+            vec![],
+            vec![],
+            500_000,
+            30,
+            FirecrawlConfig::default(),
+        );
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -714,7 +859,14 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(
+            security,
+            vec!["example.com".into()],
+            vec![],
+            500_000,
+            30,
+            FirecrawlConfig::default(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -729,7 +881,14 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(
+            security,
+            vec!["example.com".into()],
+            vec![],
+            500_000,
+            30,
+            FirecrawlConfig::default(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -755,6 +914,7 @@ mod tests {
             vec![],
             10,
             30,
+            FirecrawlConfig::default(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -850,5 +1010,172 @@ mod tests {
     fn resolved_public_ips_are_allowed() {
         let ips = vec!["93.184.216.34".parse().unwrap(), "1.1.1.1".parse().unwrap()];
         assert!(validate_resolved_ips_are_public("example.com", &ips).is_ok());
+    }
+
+    // ── Firecrawl config parsing ────────────────────────────────────
+
+    #[test]
+    fn firecrawl_config_defaults() {
+        let cfg = FirecrawlConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.api_key_env, "FIRECRAWL_API_KEY");
+        assert_eq!(cfg.api_url, "https://api.firecrawl.dev/v1");
+        assert_eq!(cfg.mode, crate::config::schema::FirecrawlMode::Scrape);
+    }
+
+    #[test]
+    fn firecrawl_config_deserializes_from_toml() {
+        let toml_str = r#"
+            enabled = true
+            api_key_env = "MY_FC_KEY"
+            api_url = "https://custom.firecrawl.io/v2"
+            mode = "crawl"
+        "#;
+        let cfg: FirecrawlConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.api_key_env, "MY_FC_KEY");
+        assert_eq!(cfg.api_url, "https://custom.firecrawl.io/v2");
+        assert_eq!(cfg.mode, crate::config::schema::FirecrawlMode::Crawl);
+    }
+
+    #[test]
+    fn firecrawl_config_deserializes_defaults_from_empty_toml() {
+        let cfg: FirecrawlConfig = toml::from_str("").unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.api_key_env, "FIRECRAWL_API_KEY");
+    }
+
+    #[test]
+    fn web_fetch_config_with_firecrawl_section() {
+        use crate::config::schema::WebFetchConfig;
+        let toml_str = r#"
+            enabled = true
+            [firecrawl]
+            enabled = true
+            api_key_env = "FC_KEY"
+        "#;
+        let cfg: WebFetchConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.enabled);
+        assert!(cfg.firecrawl.enabled);
+        assert_eq!(cfg.firecrawl.api_key_env, "FC_KEY");
+    }
+
+    // ── Firecrawl fallback trigger conditions ───────────────────────
+
+    #[test]
+    fn fallback_disabled_when_firecrawl_not_enabled() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig::default());
+        let result = ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some("HTTP 403 Forbidden".into()),
+        };
+        assert!(!tool.should_fallback_to_firecrawl(&result));
+    }
+
+    #[test]
+    fn fallback_triggers_on_http_error() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let result = ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some("HTTP 403 Forbidden".into()),
+        };
+        assert!(tool.should_fallback_to_firecrawl(&result));
+    }
+
+    #[test]
+    fn fallback_triggers_on_empty_body() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let result = ToolResult {
+            success: true,
+            output: String::new(),
+            error: None,
+        };
+        assert!(tool.should_fallback_to_firecrawl(&result));
+    }
+
+    #[test]
+    fn fallback_triggers_on_short_body() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let result = ToolResult {
+            success: true,
+            output: "Loading...".into(), // < 100 chars, JS-only page
+            error: None,
+        };
+        assert!(tool.should_fallback_to_firecrawl(&result));
+    }
+
+    #[test]
+    fn fallback_skipped_on_good_response() {
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let result = ToolResult {
+            success: true,
+            output: "A".repeat(200), // well above 100 chars
+            error: None,
+        };
+        assert!(!tool.should_fallback_to_firecrawl(&result));
+    }
+
+    // ── Firecrawl response parsing ──────────────────────────────────
+
+    #[test]
+    fn firecrawl_response_parses_markdown() {
+        let response_json = json!({
+            "success": true,
+            "data": {
+                "markdown": "# Hello World\n\nThis is extracted content from Firecrawl.",
+                "metadata": {
+                    "title": "Test Page"
+                }
+            }
+        });
+        let markdown = response_json
+            .get("data")
+            .and_then(|d| d.get("markdown"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        assert!(markdown.contains("Hello World"));
+        assert!(markdown.contains("extracted content"));
+    }
+
+    #[test]
+    fn firecrawl_response_handles_missing_markdown() {
+        let response_json = json!({
+            "success": true,
+            "data": {}
+        });
+        let markdown = response_json
+            .get("data")
+            .and_then(|d| d.get("markdown"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        assert!(markdown.is_empty());
+    }
+
+    #[test]
+    fn firecrawl_response_handles_missing_data() {
+        let response_json = json!({
+            "success": false,
+            "error": "Rate limit exceeded"
+        });
+        let markdown = response_json
+            .get("data")
+            .and_then(|d| d.get("markdown"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("");
+        assert!(markdown.is_empty());
     }
 }

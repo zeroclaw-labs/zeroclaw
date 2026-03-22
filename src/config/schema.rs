@@ -2229,6 +2229,58 @@ pub struct WebFetchConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_web_fetch_timeout_secs")]
     pub timeout_secs: u64,
+    /// Firecrawl fallback configuration (`[web_fetch.firecrawl]`)
+    #[serde(default)]
+    pub firecrawl: FirecrawlConfig,
+}
+
+/// Firecrawl fallback mode: scrape a single page or crawl linked pages.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FirecrawlMode {
+    #[default]
+    Scrape,
+    Crawl,
+}
+
+/// Firecrawl fallback configuration for JS-heavy and bot-blocked sites.
+///
+/// When enabled, if the standard web fetch fails (HTTP error, empty body, or
+/// body shorter than 100 characters suggesting a JS-only page), the tool
+/// falls back to the Firecrawl API for stealth content extraction.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FirecrawlConfig {
+    /// Enable Firecrawl fallback
+    #[serde(default)]
+    pub enabled: bool,
+    /// Environment variable name for the Firecrawl API key
+    #[serde(default = "default_firecrawl_api_key_env")]
+    pub api_key_env: String,
+    /// Firecrawl API base URL
+    #[serde(default = "default_firecrawl_api_url")]
+    pub api_url: String,
+    /// Firecrawl extraction mode
+    #[serde(default)]
+    pub mode: FirecrawlMode,
+}
+
+fn default_firecrawl_api_key_env() -> String {
+    "FIRECRAWL_API_KEY".into()
+}
+
+fn default_firecrawl_api_url() -> String {
+    "https://api.firecrawl.dev/v1".into()
+}
+
+impl Default for FirecrawlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_env: default_firecrawl_api_key_env(),
+            api_url: default_firecrawl_api_url(),
+            mode: FirecrawlMode::default(),
+        }
+    }
 }
 
 fn default_web_fetch_max_response_size() -> usize {
@@ -2251,6 +2303,7 @@ impl Default for WebFetchConfig {
             blocked_domains: vec![],
             max_response_size: default_web_fetch_max_response_size(),
             timeout_secs: default_web_fetch_timeout_secs(),
+            firecrawl: FirecrawlConfig::default(),
         }
     }
 }
