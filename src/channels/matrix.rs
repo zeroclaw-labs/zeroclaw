@@ -526,8 +526,9 @@ impl MatrixChannel {
         if client.encryption().backups().are_enabled().await {
             tracing::info!("Matrix room-key backup is enabled for this device.");
         } else {
+            client.encryption().backups().disable().await;
             tracing::warn!(
-                "Matrix room-key backup is not enabled for this device; `matrix_sdk_crypto::backups` warnings about missing backup keys may appear until recovery is configured."
+                "Matrix room-key backup is not enabled for this device; automatic backup attempts have been disabled to suppress recurring warnings. To enable backups, configure server-side key backup and recovery for this device."
             );
         }
     }
