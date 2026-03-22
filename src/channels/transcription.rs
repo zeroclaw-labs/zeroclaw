@@ -574,9 +574,7 @@ impl TranscriptionProvider for GoogleSttProvider {
         });
 
         let encoded_key = urlencoding::encode(&self.api_key);
-        let url = format!(
-            "https://speech.googleapis.com/v1/speech:recognize?key={encoded_key}"
-        );
+        let url = format!("https://speech.googleapis.com/v1/speech:recognize?key={encoded_key}");
 
         let resp = client
             .post(&url)
