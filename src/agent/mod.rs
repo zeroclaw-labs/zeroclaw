@@ -3,6 +3,7 @@ pub mod agent;
 pub mod classifier;
 pub mod dispatcher;
 pub mod loop_;
+pub mod loop_detector;
 pub mod memory_loader;
 pub mod prompt;
 
