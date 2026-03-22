@@ -38,9 +38,9 @@ spec:
               cp /etc/zeroclaw-template/config.toml /data/.zeroclaw/config.toml
               chmod 600 /data/.zeroclaw/config.toml
               # Read-only identity files are mounted directly into the zeroclaw
-              # container. Writable files (MEMORY.md, USER.md, BOOTSTRAP.md) are
-              # seeded to the PVC only if missing, so Sam can update them.
-              for f in MEMORY.md USER.md BOOTSTRAP.md; do
+              # container. Writable files (MEMORY.md, USER.md) are seeded to
+              # the PVC only if missing, so Sam can update them.
+              for f in MEMORY.md USER.md; do
                 if [ ! -f "/data/.zeroclaw/workspace/$f" ] && [ -f "/etc/zeroclaw-template/identity/$f" ]; then
                   echo "Seeding writable $f"
                   cp "/etc/zeroclaw-template/identity/$f" "/data/.zeroclaw/workspace/$f"
@@ -197,10 +197,6 @@ spec:
             - name: zeroclaw-identity
               mountPath: /data/.zeroclaw/workspace/SOUL.md
               subPath: SOUL.md
-              readOnly: true
-            - name: zeroclaw-identity
-              mountPath: /data/.zeroclaw/workspace/HEARTBEAT.md
-              subPath: HEARTBEAT.md
               readOnly: true
             # Skills mounted directly — no init container copy needed.
             - name: zeroclaw-skills

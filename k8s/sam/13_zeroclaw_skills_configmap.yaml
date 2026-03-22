@@ -8,7 +8,7 @@ data:
     ---
     name: k8s-delegation
     version: 1.0.0
-    description: Structures K8s infrastructure tasks for delegation to Walter via ACP. Use whenever Dan asks about deploying, managing, or debugging anything in the Kubernetes cluster — including the todolist namespace.
+    description: Structures K8s infrastructure tasks for delegation to Walter via ACP. Use whenever Dan asks about deploying, managing, debugging, or checking status of anything in the Kubernetes cluster — including the todolist namespace. Also use when Dan mentions Walter, ACP, cluster status, pod health, namespace state, or asks what's running.
     always: false
     ---
 
@@ -224,7 +224,7 @@ data:
     ---
     name: vikunja-project-manager
     version: 1.0.0
-    description: Manage project status and tasks via the Vikunja CLI. Use whenever Dan asks about project status, task tracking, TODO lists, or wants to communicate progress on work items. Also use proactively when completing work that should be tracked.
+    description: Manage project status and tasks via the Vikunja CLI. Use whenever Dan asks about project status, task tracking, TODO lists, or wants to communicate progress on work items. Also use after completing multi-step work that Dan explicitly requested to track. Do not use proactively in cron sessions unless the cron prompt specifically calls for Vikunja operations.
     ---
 
     # Vikunja Project Manager

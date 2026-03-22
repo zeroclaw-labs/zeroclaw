@@ -9,7 +9,7 @@ data:
     name: daily-meeting-summary
     version: 2.3.0
     description: Fetches and summarizes daily meeting recordings from Speakr (meetings.coffee-anon.com), extracts action items into Vikunja tasks
-    always: true
+    always: false
     ---
 
     # Daily Meeting Summary
