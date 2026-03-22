@@ -19,6 +19,7 @@ env:
 jobs:
   detect-version-change:
     name: Detect Version Bump
+    if: github.repository == 'zeroclaw-labs/zeroclaw'
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.check.outputs.changed }}
