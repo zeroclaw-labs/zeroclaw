@@ -2556,9 +2556,12 @@ async fn process_channel_message(
         break loop_result;
     };
 
+    tracing::debug!("Post-loop: dropping delta_tx and awaiting draft updater");
+    drop(delta_tx);
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
+    tracing::debug!("Post-loop: draft updater completed");
 
     // Thread the final reply only if tools were used (multi-message response)
     if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
