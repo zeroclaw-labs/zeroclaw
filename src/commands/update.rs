@@ -154,10 +154,12 @@ fn find_asset_url(release: &serde_json::Value) -> Option<String> {
         }
     } else if cfg!(target_os = "linux") {
         if cfg!(target_arch = "aarch64") {
-            "aarch64-unknown-linux"
+            "aarch64-unknown-linux-gnu"
         } else {
-            "x86_64-unknown-linux"
+            "x86_64-unknown-linux-gnu"
         }
+    } else if cfg!(target_os = "windows") {
+        "x86_64-pc-windows-msvc"
     } else {
         return None;
     };
@@ -168,7 +170,11 @@ fn find_asset_url(release: &serde_json::Value) -> Option<String> {
         .find(|asset| {
             asset["name"]
                 .as_str()
-                .map(|name| name.contains(target))
+                .map(|name| {
+                    name.starts_with("zeroclaw-")
+                        && name.contains(target)
+                        && (name.ends_with(".tar.gz") || name.ends_with(".zip"))
+                })
                 .unwrap_or(false)
         })
         .and_then(|asset| asset["browser_download_url"].as_str().map(String::from))
@@ -264,6 +270,79 @@ async fn smoke_test(binary: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_find_asset_url_prefers_gnu_over_android() {
+        let release = serde_json::json!({
+            "assets": [
+                {
+                    "name": "zeroclaw-aarch64-linux-android.tar.gz",
+                    "browser_download_url": "https://example.com/android"
+                },
+                {
+                    "name": "zeroclaw-aarch64-unknown-linux-gnu.tar.gz",
+                    "browser_download_url": "https://example.com/linux-gnu"
+                },
+                {
+                    "name": "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+                    "browser_download_url": "https://example.com/x86-linux-gnu"
+                },
+                {
+                    "name": "zeroclaw-x86_64-pc-windows-msvc.zip",
+                    "browser_download_url": "https://example.com/windows"
+                },
+                {
+                    "name": "zeroclaw-aarch64-apple-darwin.tar.gz",
+                    "browser_download_url": "https://example.com/macos-arm"
+                }
+            ]
+        });
+
+        let url = find_asset_url(&release);
+
+        // The result depends on the compile target, but it must never be the
+        // Android asset.  On any recognised platform it should resolve to a
+        // URL that is NOT the android one.
+        if let Some(ref u) = url {
+            assert!(
+                !u.contains("android"),
+                "find_asset_url must not match Android binary, got: {u}"
+            );
+        }
+
+        // Platform-specific assertions (compile-time).
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        assert_eq!(url.as_deref(), Some("https://example.com/linux-gnu"));
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(url.as_deref(), Some("https://example.com/x86-linux-gnu"));
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(url.as_deref(), Some("https://example.com/windows"));
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(url.as_deref(), Some("https://example.com/macos-arm"));
+    }
+
+    #[test]
+    fn test_find_asset_url_ignores_non_archive_assets() {
+        let release = serde_json::json!({
+            "assets": [
+                {
+                    "name": "zeroclaw-x86_64-unknown-linux-gnu.sha256",
+                    "browser_download_url": "https://example.com/checksum"
+                },
+                {
+                    "name": "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+                    "browser_download_url": "https://example.com/archive"
+                }
+            ]
+        });
+
+        let _url = find_asset_url(&release);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(_url.as_deref(), Some("https://example.com/archive"));
+    }
 
     #[test]
     fn test_version_comparison() {
