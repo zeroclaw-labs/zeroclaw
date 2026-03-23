@@ -4370,22 +4370,23 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let (mut built_tools, delegate_handle_ch, reaction_handle_ch) = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &workspace,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-        None,
-    );
+    let (mut built_tools, delegate_handle_ch, reaction_handle_ch, _channel_map_handle) =
+        tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            runtime,
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &workspace,
+            &config.agents,
+            config.api_key.as_deref(),
+            &config,
+            None,
+        );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.
