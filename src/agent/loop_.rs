@@ -2471,6 +2471,10 @@ async fn execute_one_tool(
         });
     };
 
+    {
+        let args_log: String = call_arguments.to_string().chars().take(300).collect();
+        tracing::info!(tool = call_name, args = %args_log, "Tool execution started");
+    }
     let tool_future = tool.execute(call_arguments);
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
@@ -2484,6 +2488,12 @@ async fn execute_one_tool(
     match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
+            tracing::info!(
+                tool = call_name,
+                success = r.success,
+                duration_ms = duration.as_millis() as u64,
+                "Tool execution completed"
+            );
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
@@ -2932,6 +2942,17 @@ pub(crate) async fn run_tool_call_loop(
                                     600
                                 ),
                             }),
+                        );
+                    }
+
+                    {
+                        let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+                        tracing::info!(
+                            iteration = iteration + 1,
+                            tool_calls = calls.len(),
+                            tools = ?tool_names,
+                            text_len = response_text.len(),
+                            "LLM response parsed"
                         );
                     }
 
@@ -3804,6 +3825,12 @@ pub async fn run(
     // so the LLM can invoke them via native function calling, not just XML prompts.
     tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
 
+    {
+        let skill_names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        if !skill_names.is_empty() {
+            tracing::info!(skills = ?skill_names, count = skill_names.len(), "Skills loaded");
+        }
+    }
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",

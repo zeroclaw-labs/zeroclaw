@@ -580,6 +580,13 @@ impl Agent {
 
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
+        let args_preview: String = call
+            .arguments
+            .to_string()
+            .chars()
+            .take(200)
+            .collect();
+        tracing::info!(tool = %call.name, args = %args_preview, "Tool call started");
 
         let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
             match tool.execute(call.arguments.clone()).await {
@@ -607,6 +614,15 @@ impl Agent {
         } else {
             format!("Unknown tool: {}", call.name)
         };
+
+        let duration = start.elapsed();
+        let output_preview: String = result.chars().take(200).collect();
+        tracing::info!(
+            tool = %call.name,
+            duration_ms = duration.as_millis() as u64,
+            output = %output_preview,
+            "Tool call completed"
+        );
 
         ToolExecutionResult {
             name: call.name.clone(),
@@ -769,6 +785,13 @@ impl Agent {
             };
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            let tool_names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+            tracing::info!(
+                tool_calls = tool_names.len(),
+                tools = ?tool_names,
+                text_len = text.len(),
+                "LLM response parsed"
+            );
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
                     response.text.unwrap_or_default()
