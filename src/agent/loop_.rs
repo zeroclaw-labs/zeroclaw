@@ -2244,6 +2244,14 @@ fn resolve_display_text(
     }
 }
 
+fn ensure_trailing_newline(text: &str) -> String {
+    if text.ends_with('\n') {
+        text.to_string()
+    } else {
+        format!("{text}\n")
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ParsedToolCall {
     name: String,
@@ -3076,7 +3084,7 @@ pub(crate) async fn run_tool_call_loop(
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty() {
                 if let Some(ref tx) = on_delta {
-                    let _ = tx.send(display_text.clone()).await;
+                    let _ = tx.send(ensure_trailing_newline(&display_text)).await;
                 }
             }
             if !silent {
@@ -6306,7 +6314,7 @@ mod tests {
 
         let explanation_idx = deltas
             .iter()
-            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.")
+            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.\n")
             .expect("native assistant text should be relayed to on_delta");
         let clear_idx = deltas
             .iter()
@@ -6419,6 +6427,22 @@ mod tests {
     fn resolve_display_text_uses_response_text_for_final_turns() {
         let display = resolve_display_text("Final answer", "", false, false);
         assert_eq!(display, "Final answer");
+    }
+
+    #[test]
+    fn ensure_trailing_newline_appends_missing_linebreak() {
+        assert_eq!(
+            ensure_trailing_newline("Let me check that."),
+            "Let me check that.\n"
+        );
+    }
+
+    #[test]
+    fn ensure_trailing_newline_preserves_existing_linebreak() {
+        assert_eq!(
+            ensure_trailing_newline("Let me check that.\n"),
+            "Let me check that.\n"
+        );
     }
 
     #[test]
