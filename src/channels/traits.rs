@@ -28,6 +28,7 @@ pub struct ChannelMessage {
     pub observe_group: bool,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for ChannelMessage {
     fn default() -> Self {
         Self {
