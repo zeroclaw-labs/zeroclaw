@@ -249,9 +249,14 @@ impl EmailChannel {
                                     .to_ascii_lowercase()
                                     .as_str()
                                 {
+                                    // Known audio subtypes → file extensions.
+                                    // Unknown subtypes fall back to "bin", preserving
+                                    // raw bytes as voice.bin for manual inspection.
                                     "mpeg" => "mp3",
                                     "ogg" => "ogg",
-                                    "mp4" => "mp4",
+                                    "mp4" | "x-m4a" => "mp4",
+                                    "aac" => "aac",
+                                    "amr" => "amr",
                                     "wav" | "x-wav" => "wav",
                                     "webm" => "webm",
                                     "flac" => "flac",
@@ -1235,6 +1240,63 @@ audio-data\r\n\
         assert!(result.is_some());
         let (_bytes, filename) = result.unwrap();
         assert_eq!(filename, "voice.webm");
+    }
+
+    #[test]
+    fn extract_audio_attachment_fallback_ext_aac() {
+        let raw = b"From: test@example.com\r\n\
+Subject: Test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: audio/aac\r\n\
+\r\n\
+audio-data\r\n\
+--boundary123--\r\n";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        let result = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(result.is_some());
+        let (_bytes, filename) = result.unwrap();
+        assert_eq!(filename, "voice.aac");
+    }
+
+    #[test]
+    fn extract_audio_attachment_fallback_ext_amr() {
+        let raw = b"From: test@example.com\r\n\
+Subject: Test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: audio/amr\r\n\
+\r\n\
+audio-data\r\n\
+--boundary123--\r\n";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        let result = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(result.is_some());
+        let (_bytes, filename) = result.unwrap();
+        assert_eq!(filename, "voice.amr");
+    }
+
+    #[test]
+    fn extract_audio_attachment_fallback_ext_x_m4a() {
+        let raw = b"From: test@example.com\r\n\
+Subject: Test\r\n\
+MIME-Version: 1.0\r\n\
+Content-Type: multipart/mixed; boundary=\"boundary123\"\r\n\
+\r\n\
+--boundary123\r\n\
+Content-Type: audio/x-m4a\r\n\
+\r\n\
+audio-data\r\n\
+--boundary123--\r\n";
+        let parsed = MessageParser::default().parse(raw).unwrap();
+        let result = EmailChannel::extract_audio_attachment(&parsed);
+        assert!(result.is_some());
+        let (_bytes, filename) = result.unwrap();
+        assert_eq!(filename, "voice.mp4");
     }
 
     #[test]
