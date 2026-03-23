@@ -771,10 +771,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 "on" | "true" | "1" | "enable" | "yes" => {
                     Some(ChannelRuntimeCommand::SetThinking(Some(true)))
                 }
-                "reset" | "default" | "auto" => {
-                    Some(ChannelRuntimeCommand::SetThinking(None))
-                }
-                // No argument = show current status
+                // "reset" / "default" / "auto" / no argument = reset to global default
                 _ => Some(ChannelRuntimeCommand::SetThinking(None)),
             }
         }
@@ -1548,13 +1545,16 @@ async fn handle_runtime_command_if_needed(
                     if enabled {
                         "Thinking enabled for this chat. Reasoning models will use chain-of-thought (more accurate, uses more tokens).".to_string()
                     } else {
-                        "Thinking disabled for this chat. Responses will be faster and cheaper.".to_string()
+                        "Thinking disabled for this chat. Responses will be faster and cheaper."
+                            .to_string()
                     }
                 }
                 None => {
                     let was_set = overrides.remove(&sender_key);
-                    let global_default =
-                        ctx.provider_runtime_options.reasoning_enabled.unwrap_or(true);
+                    let global_default = ctx
+                        .provider_runtime_options
+                        .reasoning_enabled
+                        .unwrap_or(true);
                     if was_set.is_some() {
                         format!(
                             "Thinking reset to global default ({}).",
