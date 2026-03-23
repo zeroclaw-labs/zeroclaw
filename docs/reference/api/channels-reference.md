@@ -95,6 +95,16 @@ cargo check --features hardware,channel-matrix
 cargo check --features hardware,channel-lark
 ```
 
+> **Important:** When installing from source, `cargo install` recompiles the binary and requires the same feature flags:
+> ```bash
+> cargo build --release --features channel-lark
+> cargo install --path . --force --locked --features channel-lark
+> ```
+> Or use the install script with the `ZEROCLAW_FEATURES` environment variable:
+> ```bash
+> ZEROCLAW_FEATURES=channel-lark ./install.sh
+> ```
+
 If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.feishu]` is present but the corresponding feature is not compiled in, `zeroclaw channel list`, `zeroclaw channel doctor`, and `zeroclaw channel start` will report that the channel is intentionally skipped for this build.
 
 ---

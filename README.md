@@ -150,6 +150,13 @@ cargo install --path . --force --locked
 zeroclaw onboard
 ```
 
+> **Feature flags:** If you need optional channels (e.g., Lark/Feishu, Matrix), pass `--features` to **both** commands:
+> ```bash
+> cargo build --release --locked --features channel-lark
+> cargo install --path . --force --locked --features channel-lark
+> ```
+> The `cargo install` step recompiles the binary, so it needs the feature flags too.
+
 > **Dev fallback (no global install):** prefix commands with `cargo run --release --` (example: `cargo run --release -- status`).
 
 ## Migrating from OpenClaw

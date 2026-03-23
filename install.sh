@@ -138,6 +138,7 @@ Environment:
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   ZEROCLAW_MODEL             Used when --model is not provided
+  ZEROCLAW_FEATURES          Additional cargo features to enable (e.g., "channel-lark,channel-matrix")
   ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
   ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
   ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS
@@ -1427,6 +1428,17 @@ if [[ "$SKIP_BUILD" == false ]]; then
       CARGO_FEATURE_FLAGS="--no-default-features --features channel-nostr,skill-creation"
       ;;
   esac
+
+  # Append user-specified features from ZEROCLAW_FEATURES environment variable
+  if [[ -n "${ZEROCLAW_FEATURES:-}" ]]; then
+    if [[ -n "$CARGO_FEATURE_FLAGS" ]]; then
+      # Extract existing features and append new ones
+      CARGO_FEATURE_FLAGS="$CARGO_FEATURE_FLAGS,${ZEROCLAW_FEATURES}"
+    else
+      CARGO_FEATURE_FLAGS="--features ${ZEROCLAW_FEATURES}"
+    fi
+    step_dot "Enabling additional features: ${ZEROCLAW_FEATURES}"
+  fi
 
   step_dot "Building release binary"
   cargo build --release --locked $CARGO_FEATURE_FLAGS
