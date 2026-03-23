@@ -197,9 +197,15 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     }
 
     let bytes = resp.bytes().await.context("failed to read download body")?;
-    tokio::fs::write(dest, &bytes)
-        .await
-        .context("failed to write downloaded binary")?;
+
+    if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+        extract_binary_from_tarball(&bytes, dest)
+            .context("failed to extract binary from tarball")?;
+    } else {
+        tokio::fs::write(dest, &bytes)
+            .await
+            .context("failed to write downloaded binary")?;
+    }
 
     // Make executable on Unix
     #[cfg(unix)]
@@ -210,6 +216,34 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn extract_binary_from_tarball(data: &[u8], dest: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use tar::Archive;
+
+    let decoder = GzDecoder::new(data);
+    let mut archive = Archive::new(decoder);
+
+    for entry in archive
+        .entries()
+        .context("failed to read tarball entries")?
+    {
+        let mut entry = entry.context("failed to read tarball entry")?;
+        let path = entry.path().context("failed to read entry path")?;
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if file_name == "zeroclaw" || file_name == "zeroclaw.exe" {
+            entry
+                .unpack(dest)
+                .context("failed to unpack zeroclaw binary from tarball")?;
+            return Ok(());
+        }
+    }
+
+    bail!("tarball does not contain a 'zeroclaw' binary")
 }
 
 async fn validate_binary(path: &Path) -> Result<()> {

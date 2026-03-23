@@ -46,6 +46,10 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
+# Archive extraction (for self-update)
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
+
 # Matrix client + E2EE decryption
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
 
