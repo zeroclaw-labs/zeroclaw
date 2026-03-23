@@ -127,11 +127,6 @@ struct ResponsesUsage {
 struct ResponsesToolSpec {
     #[serde(rename = "type")]
     kind: String,
-    function: ResponsesToolFunctionSpec,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ResponsesToolFunctionSpec {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
@@ -821,11 +816,9 @@ impl OpenAiCodexProvider {
                 .iter()
                 .map(|tool| ResponsesToolSpec {
                     kind: "function".to_string(),
-                    function: ResponsesToolFunctionSpec {
-                        name: tool.name.clone(),
-                        description: Some(tool.description.clone()),
-                        parameters: tool.parameters.clone(),
-                    },
+                    name: tool.name.clone(),
+                    description: Some(tool.description.clone()),
+                    parameters: tool.parameters.clone(),
                 })
                 .collect()
         })
@@ -1863,7 +1856,8 @@ data: [DONE]
         assert_eq!(body["stream"], true);
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["function"]["name"], "shell");
+        assert_eq!(body["tools"][0]["name"], "shell");
+        assert_eq!(body["tools"][0]["parameters"]["type"], "object");
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(result.text.as_deref(), Some("Let me check."));
