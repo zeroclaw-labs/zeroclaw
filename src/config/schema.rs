@@ -5292,6 +5292,15 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Maximum shell command execution time in seconds before the process is
+    /// killed.  Default: `60`.
+    #[serde(default = "default_shell_timeout_secs")]
+    pub shell_timeout_secs: u64,
+}
+
+fn default_shell_timeout_secs() -> u64 {
+    60
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -5387,6 +5396,7 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            shell_timeout_secs: default_shell_timeout_secs(),
         }
     }
 }

@@ -91,6 +91,7 @@ pub struct SecurityPolicy {
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
+    pub shell_timeout_secs: u64,
     pub tracker: ActionTracker,
 }
 
@@ -223,6 +224,7 @@ impl Default for SecurityPolicy {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
+            shell_timeout_secs: 60,
             tracker: ActionTracker::new(),
         }
     }
@@ -1388,6 +1390,7 @@ impl SecurityPolicy {
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
+            shell_timeout_secs: autonomy_config.shell_timeout_secs,
             tracker: ActionTracker::new(),
         }
     }

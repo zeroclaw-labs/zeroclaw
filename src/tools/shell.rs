@@ -644,6 +644,12 @@ mod tests {
             DEFAULT_SHELL_TIMEOUT_SECS, 60,
             "default shell timeout must be 60 seconds"
         );
+        // SecurityPolicy::default() should carry the same value.
+        let policy = SecurityPolicy::default();
+        assert_eq!(
+            policy.shell_timeout_secs, DEFAULT_SHELL_TIMEOUT_SECS,
+            "SecurityPolicy default must match DEFAULT_SHELL_TIMEOUT_SECS"
+        );
     }
 
     #[test]
