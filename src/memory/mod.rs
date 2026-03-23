@@ -17,6 +17,7 @@ pub mod postgres;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;
+pub mod scoring;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
