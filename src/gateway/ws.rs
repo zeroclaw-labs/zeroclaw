@@ -270,7 +270,22 @@ async fn handle_socket(
                     process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
                         .await;
                 }
+            } else {
+                let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!(
+                        "Unsupported message type \"{unknown_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
+                    )
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
             }
+        } else {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
         }
     }
 
@@ -293,6 +308,13 @@ async fn handle_socket(
 
         let msg_type = parsed["type"].as_str().unwrap_or("");
         if msg_type != "message" {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!(
+                    "Unsupported message type \"{msg_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
+                )
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
             continue;
         }
 
