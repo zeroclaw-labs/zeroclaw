@@ -120,4 +120,5 @@ export interface WsMessage {
   args?: any;
   output?: string;
   message?: string;
+  code?: string;
 }

@@ -42,8 +42,12 @@ export default function AgentChat() {
       setError(null);
     };
 
-    ws.onClose = () => {
+    ws.onClose = (ev: CloseEvent) => {
       setConnected(false);
+      // Show error for abnormal closure codes
+      if (ev.code !== 1000 && ev.code !== 1001) {
+        setError(`Connection closed unexpectedly (code: ${ev.code}). Please check your configuration.`);
+      }
     };
 
     ws.onError = () => {
@@ -110,6 +114,12 @@ export default function AgentChat() {
               timestamp: new Date(),
             },
           ]);
+          // Show configuration error hints for specific error codes
+          if (msg.code === 'AGENT_INIT_FAILED' || msg.code === 'AUTH_ERROR' || msg.code === 'PROVIDER_ERROR') {
+            setError(`Configuration error: ${msg.message}. Please check your provider settings (API key, model, etc.).`);
+          } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
+            setError(`Message error: ${msg.message}`);
+          }
           setTyping(false);
           pendingContentRef.current = '';
           break;
