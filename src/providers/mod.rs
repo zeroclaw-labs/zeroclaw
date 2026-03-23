@@ -1518,13 +1518,18 @@ fn create_provider_with_url_and_options(
                 "Custom provider",
                 "custom:https://your-api.com",
             )?;
-            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
-                "Custom",
-                &base_url,
-                key,
-                AuthStyle::Bearer,
-                true,
-            )))
+            // Use no_responses_fallback variant since most custom OpenAI-compatible
+            // providers only support chat completions, not the /v1/responses API.
+            // Fixes: https://github.com/zeroclaw-labs/zeroclaw/issues/4296
+            Ok(compat(
+                OpenAiCompatibleProvider::new_with_vision_no_responses_fallback(
+                    "Custom",
+                    &base_url,
+                    key,
+                    AuthStyle::Bearer,
+                    true,
+                ),
+            ))
         }
 
         // ── Anthropic-compatible custom endpoints ───────────
