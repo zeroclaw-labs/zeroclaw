@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use tracing::warn;
 
-use super::traits::{Tool, ToolResult};
 use crate::sop::types::{SopRunAction, SopStepResult, SopStepStatus};
 use crate::sop::{SopAuditLogger, SopEngine, SopMetricsCollector};
+use crate::tools::traits::{Tool, ToolResult};
 
 /// Report a step result and advance an SOP run to the next step.
 pub struct SopAdvanceTool {

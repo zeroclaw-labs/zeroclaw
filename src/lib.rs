@@ -71,6 +71,7 @@ pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
+pub mod sop;
 pub mod tools;
 pub(crate) mod tunnel;
 pub(crate) mod util;
@@ -454,6 +455,23 @@ pub enum MemoryCommands {
         /// Skip confirmation prompt
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// SOP (Standard Operating Procedures) subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SopCommands {
+    /// List all loaded SOPs
+    List,
+    /// Validate one or all SOPs
+    Validate {
+        /// SOP name to validate (optional; validates all if omitted)
+        name: Option<String>,
+    },
+    /// Show detailed information about a specific SOP
+    Show {
+        /// SOP name to display
+        name: String,
     },
 }
 

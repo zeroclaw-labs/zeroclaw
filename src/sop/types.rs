@@ -27,7 +27,7 @@ impl fmt::Display for SopPriority {
     }
 }
 
-// ── Execution Mode ──────────────────────────────────────────────
+// ── Execution Mode ─────────────────────────────────────────────
 
 /// How much autonomy the agent has when executing an SOP.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]

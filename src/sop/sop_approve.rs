@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use tracing::warn;
 
-use super::traits::{Tool, ToolResult};
 use crate::sop::types::SopRunAction;
 use crate::sop::{SopAuditLogger, SopEngine, SopMetricsCollector};
+use crate::tools::traits::{Tool, ToolResult};
 
 /// Approve a pending SOP step that is waiting for operator approval.
 pub struct SopApproveTool {

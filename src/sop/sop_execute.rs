@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use tracing::warn;
 
-use super::traits::{Tool, ToolResult};
 use crate::sop::types::{SopEvent, SopRunAction, SopTriggerSource};
 use crate::sop::{SopAuditLogger, SopEngine};
+use crate::tools::traits::{Tool, ToolResult};
 
 /// Manually trigger an SOP by name. Returns the run ID and first step instruction.
 pub struct SopExecuteTool {

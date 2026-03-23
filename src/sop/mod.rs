@@ -7,6 +7,13 @@ pub mod gates;
 pub mod metrics;
 pub mod types;
 
+// SOP tool modules
+pub mod sop_advance;
+pub mod sop_approve;
+pub mod sop_execute;
+pub mod sop_list;
+pub mod sop_status;
+
 pub use audit::SopAuditLogger;
 pub use engine::SopEngine;
 #[cfg(feature = "ampersona-gates")]
@@ -18,11 +25,28 @@ pub use types::{
     SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
 };
 
+// SOP tool exports
+pub use sop_advance::SopAdvanceTool;
+pub use sop_approve::SopApproveTool;
+pub use sop_execute::SopExecuteTool;
+pub use sop_list::SopListTool;
+pub use sop_status::SopStatusTool;
+
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use types::{SopManifest, SopMeta};
+
+/// Parse execution mode from string.
+pub fn parse_execution_mode(mode: &str) -> SopExecutionMode {
+    match mode {
+        "auto" => SopExecutionMode::Auto,
+        "step_by_step" => SopExecutionMode::StepByStep,
+        "priority_based" => SopExecutionMode::PriorityBased,
+        _ => SopExecutionMode::Supervised,
+    }
+}
 
 // ── SOP directory helpers ───────────────────────────────────────
 
@@ -344,13 +368,11 @@ pub fn validate_sop(sop: &Sop) -> Vec<String> {
 pub fn handle_command(command: crate::SopCommands, config: &crate::config::Config) -> Result<()> {
     let sops_dir_override = config.sop.sops_dir.as_deref();
 
+    let execution_mode = parse_execution_mode(&config.sop.default_execution_mode);
+
     match command {
         crate::SopCommands::List => {
-            let sops = load_sops(
-                &config.workspace_dir,
-                sops_dir_override,
-                config.sop.default_execution_mode,
-            );
+            let sops = load_sops(&config.workspace_dir, sops_dir_override, execution_mode);
             if sops.is_empty() {
                 println!("No SOPs found.");
                 println!();
@@ -390,11 +412,7 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
         }
 
         crate::SopCommands::Validate { name } => {
-            let sops = load_sops(
-                &config.workspace_dir,
-                sops_dir_override,
-                config.sop.default_execution_mode,
-            );
+            let sops = load_sops(&config.workspace_dir, sops_dir_override, execution_mode);
             let matching: Vec<&Sop> = if let Some(ref name) = name {
                 sops.iter().filter(|s| s.name == *name).collect()
             } else {
@@ -440,11 +458,7 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
         }
 
         crate::SopCommands::Show { name } => {
-            let sops = load_sops(
-                &config.workspace_dir,
-                sops_dir_override,
-                config.sop.default_execution_mode,
-            );
+            let sops = load_sops(&config.workspace_dir, sops_dir_override, execution_mode);
             let sop = sops
                 .iter()
                 .find(|s| s.name == name)

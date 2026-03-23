@@ -64,7 +64,7 @@ shellexpand = "3.1"
 schemars = "1.2"
 
 # Logging - minimal
-tracing = { version = "0.1", default-features = false }
+tracing = { version = "0.1", default-features = false, features = ["attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "env-filter"] }
 
 # Observability - Prometheus metrics (optional; requires AtomicU64, unavailable on 32-bit)
@@ -251,6 +251,8 @@ probe = ["dep:probe-rs"]
 rag-pdf = ["dep:pdf-extract"]
 # skill-creation = Autonomous skill creation from successful multi-step tasks
 skill-creation = []
+# ampersona-gates = Ampersona gate evaluation support for SOP condition system
+ampersona-gates = []
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
 whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
 # voice-wake = Voice wake word detection via microphone (cpal)

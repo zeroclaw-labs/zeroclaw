@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::json;
 
-use super::traits::{Tool, ToolResult};
 use crate::sop::{SopEngine, SopMetricsCollector};
+use crate::tools::traits::{Tool, ToolResult};
 
 /// Query SOP execution status — active runs, finished runs, or a specific run by ID.
 pub struct SopStatusTool {

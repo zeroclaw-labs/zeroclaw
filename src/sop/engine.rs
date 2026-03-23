@@ -8,10 +8,20 @@ use tracing::{info, warn};
 use super::condition::evaluate_condition;
 use super::load_sops;
 use super::types::{
-    Sop, SopEvent, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep, SopStepResult,
-    SopStepStatus, SopTrigger, SopTriggerSource,
+    Sop, SopEvent, SopExecutionMode, SopPriority, SopRun, SopRunAction, SopRunStatus, SopStep,
+    SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
 };
 use crate::config::SopConfig;
+
+/// Parse execution mode from string.
+fn parse_execution_mode(mode: &str) -> SopExecutionMode {
+    match mode {
+        "auto" => SopExecutionMode::Auto,
+        "step_by_step" => SopExecutionMode::StepByStep,
+        "priority_based" => SopExecutionMode::PriorityBased,
+        _ => SopExecutionMode::Supervised,
+    }
+}
 
 /// Central SOP orchestrator: loads SOPs, matches triggers, manages run lifecycle.
 pub struct SopEngine {
@@ -37,10 +47,11 @@ impl SopEngine {
 
     /// Load/reload SOPs from the configured directory.
     pub fn reload(&mut self, workspace_dir: &Path) {
+        let execution_mode = parse_execution_mode(&self.config.default_execution_mode);
         self.sops = load_sops(
             workspace_dir,
             self.config.sops_dir.as_deref(),
-            self.config.default_execution_mode,
+            execution_mode,
         );
         info!("SOP engine loaded {} SOPs", self.sops.len());
     }
