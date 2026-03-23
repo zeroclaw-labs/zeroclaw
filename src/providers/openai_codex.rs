@@ -491,6 +491,16 @@ fn extract_stream_event_text(event: &Value, saw_delta: bool) -> Option<String> {
     }
 }
 
+fn extract_stream_response(event: &Value) -> Option<ResponsesResponse> {
+    let event_type = event.get("type").and_then(Value::as_str);
+    match event_type {
+        Some("response.completed" | "response.done") => event
+            .get("response")
+            .and_then(|value| serde_json::from_value::<ResponsesResponse>(value.clone()).ok()),
+        _ => None,
+    }
+}
+
 fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
     let mut saw_delta = false;
     let mut delta_accumulator = String::new();
@@ -565,6 +575,54 @@ fn parse_sse_text(body: &str) -> anyhow::Result<Option<String>> {
     }
 
     Ok(fallback_text)
+}
+
+fn parse_sse_response(body: &str) -> anyhow::Result<Option<ResponsesResponse>> {
+    let mut parsed_response = None;
+    let mut buffer = body.to_string();
+
+    let mut process_event = |event: Value| -> anyhow::Result<()> {
+        if let Some(message) = extract_stream_error_message(&event) {
+            return Err(anyhow::anyhow!("OpenAI Codex stream error: {message}"));
+        }
+        if parsed_response.is_none() {
+            parsed_response = extract_stream_response(&event);
+        }
+        Ok(())
+    };
+
+    let mut process_chunk = |chunk: &str| -> anyhow::Result<()> {
+        let data_lines: Vec<String> = chunk
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|line| line.trim().to_string())
+            .collect();
+        if data_lines.is_empty() {
+            return Ok(());
+        }
+        let data = data_lines.join("\n");
+        if data == "[DONE]" {
+            return Ok(());
+        }
+        let event: Value = serde_json::from_str(&data).map_err(|err| {
+            anyhow::anyhow!(
+                "OpenAI Codex SSE event parse failed: {err}. Payload: {}",
+                super::sanitize_api_error(&data)
+            )
+        })?;
+        process_event(event)
+    };
+
+    while let Some(idx) = buffer.find("\n\n") {
+        let chunk = buffer[..idx].to_string();
+        buffer.drain(..idx + 2);
+        process_chunk(&chunk)?;
+    }
+    if !buffer.trim().is_empty() {
+        process_chunk(&buffer)?;
+    }
+
+    Ok(parsed_response)
 }
 
 fn extract_stream_error_message(event: &Value) -> Option<String> {
@@ -712,6 +770,48 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
         )
     })?;
     extract_responses_text(&parsed).ok_or_else(|| anyhow::anyhow!("No response from OpenAI Codex"))
+}
+
+async fn decode_responses_native_body(
+    response: reqwest::Response,
+) -> anyhow::Result<ResponsesResponse> {
+    let mut body = String::new();
+    let mut pending_utf8 = Vec::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk
+            .map_err(|err| anyhow::anyhow!("error reading OpenAI Codex response stream: {err}"))?;
+        append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes)?;
+    }
+
+    if !pending_utf8.is_empty() {
+        let err = std::str::from_utf8(&pending_utf8)
+            .expect_err("pending bytes should be invalid UTF-8 at end of stream");
+        return Err(anyhow::anyhow!(
+            "OpenAI Codex response ended with incomplete UTF-8: {err}"
+        ));
+    }
+
+    if let Some(response) = parse_sse_response(&body)? {
+        return Ok(response);
+    }
+
+    let body_trimmed = body.trim_start();
+    let looks_like_sse = body_trimmed.starts_with("event:") || body_trimmed.starts_with("data:");
+    if looks_like_sse {
+        return Err(anyhow::anyhow!(
+            "No response from OpenAI Codex stream payload: {}",
+            super::sanitize_api_error(&body)
+        ));
+    }
+
+    serde_json::from_str(&body).map_err(|err| {
+        anyhow::anyhow!(
+            "OpenAI Codex JSON parse failed: {err}. Payload: {}",
+            super::sanitize_api_error(&body)
+        )
+    })
 }
 
 impl OpenAiCodexProvider {
@@ -1007,7 +1107,7 @@ impl OpenAiCodexProvider {
             input,
             instructions,
             store: false,
-            stream: false,
+            stream: true,
             text: ResponsesTextOptions {
                 verbosity: "medium".to_string(),
             },
@@ -1061,7 +1161,7 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        let parsed: ResponsesResponse = response.json().await?;
+        let parsed = decode_responses_native_body(response).await?;
         Ok(Self::parse_native_response(parsed))
     }
 }
@@ -1411,6 +1511,41 @@ data: [DONE]
     }
 
     #[test]
+    fn parse_sse_response_extracts_completed_response_with_tool_call() {
+        let payload = r#"data: {"type":"response.output_text.delta","delta":"Let me "}
+
+data: {"type":"response.completed","response":{"output":[{"type":"message","content":[{"type":"output_text","text":"Let me check."}]},{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"command\":\"date\"}"}],"usage":{"input_tokens":42,"output_tokens":7}}}
+
+data: [DONE]
+"#;
+
+        let response = parse_sse_response(payload)
+            .unwrap()
+            .expect("expected completed response");
+
+        assert_eq!(
+            extract_responses_text(&response).as_deref(),
+            Some("Let me check.")
+        );
+        assert_eq!(response.output.len(), 2);
+        assert_eq!(response.output[1].kind.as_deref(), Some("function_call"));
+        assert_eq!(response.output[1].call_id.as_deref(), Some("call_1"));
+        assert_eq!(response.output[1].name.as_deref(), Some("shell"));
+        assert_eq!(
+            response.output[1].arguments.as_deref(),
+            Some("{\"command\":\"date\"}")
+        );
+        assert_eq!(
+            response.usage.as_ref().and_then(|u| u.input_tokens),
+            Some(42)
+        );
+        assert_eq!(
+            response.usage.as_ref().and_then(|u| u.output_tokens),
+            Some(7)
+        );
+    }
+
+    #[test]
     fn decode_utf8_stream_chunks_handles_multibyte_split_across_chunks() {
         let payload =
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello 世\"}\n\ndata: [DONE]\n";
@@ -1725,7 +1860,7 @@ data: [DONE]
             .take()
             .expect("No request captured");
 
-        assert_eq!(body["stream"], false);
+        assert_eq!(body["stream"], true);
         assert_eq!(body["tool_choice"], "auto");
         assert_eq!(body["tools"][0]["type"], "function");
         assert_eq!(body["tools"][0]["function"]["name"], "shell");
@@ -1736,6 +1871,98 @@ data: [DONE]
         assert_eq!(result.tool_calls[0].id, "call_1");
         assert_eq!(result.tool_calls[0].name, "shell");
         assert_eq!(result.usage.as_ref().and_then(|u| u.input_tokens), Some(42));
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn chat_parses_native_sse_response() {
+        use axum::{
+            body::Body,
+            http::{header, HeaderValue, Response, StatusCode},
+            routing::post,
+            Json, Router,
+        };
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |Json(body): Json<Value>| {
+                let captured = captured_clone.clone();
+                async move {
+                    *captured.lock().unwrap() = Some(body);
+                    let payload = concat!(
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Let me \"}\n\n",
+                        "data: {\"type\":\"response.completed\",\"response\":{\"output\":[",
+                        "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Let me check.\"}]},",
+                        "{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"date\\\"}\"}",
+                        "],\"usage\":{\"input_tokens\":42,\"output_tokens\":7}}}\n\n",
+                        "data: [DONE]\n"
+                    );
+                    let mut response = Response::new(Body::from(payload));
+                    *response.status_mut() = StatusCode::OK;
+                    response.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/event-stream"),
+                    );
+                    response
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let options = ProviderRuntimeOptions {
+            provider_api_url: Some(format!("http://{addr}/v1")),
+            ..ProviderRuntimeOptions::default()
+        };
+        let provider = OpenAiCodexProvider::new(&options, Some("test-key")).unwrap();
+
+        let tools = vec![ToolSpec {
+            name: "shell".into(),
+            description: "Run a shell command".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                },
+                "required": ["command"]
+            }),
+        }];
+
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &[ChatMessage::user("what time is it?")],
+                    tools: Some(&tools),
+                },
+                "gpt-5-codex",
+                0.7,
+            )
+            .await
+            .unwrap();
+
+        let body = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("No request captured");
+
+        assert_eq!(body["stream"], true);
+        assert_eq!(result.text.as_deref(), Some("Let me check."));
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].id, "call_1");
+        assert_eq!(result.tool_calls[0].name, "shell");
+        assert_eq!(result.usage.as_ref().and_then(|u| u.input_tokens), Some(42));
+        assert_eq!(result.usage.as_ref().and_then(|u| u.output_tokens), Some(7));
 
         server_handle.abort();
     }
