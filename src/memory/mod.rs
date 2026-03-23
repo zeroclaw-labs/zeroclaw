@@ -333,12 +333,18 @@ pub fn create_memory_with_storage_and_routes(
                 "memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)",
             )?;
 
-        let memory = PostgresMemory::new(
-            db_url,
-            &storage_provider.schema,
-            &storage_provider.table,
-            storage_provider.connect_timeout_secs,
-        )?;
+        // `PostgresMemory::connect` is async. We bridge the gap here so the
+        // rest of the sync factory chain doesn't need to change.  block_in_place
+        // tells Tokio this thread is about to block (driving an async future),
+        // preventing worker starvation on multi-threaded runtimes.
+        let memory = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(PostgresMemory::connect(
+                db_url,
+                &storage_provider.schema,
+                &storage_provider.table,
+                storage_provider.connect_timeout_secs,
+            ))
+        })?;
         Ok(Box::new(memory))
     }
 

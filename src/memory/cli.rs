@@ -54,12 +54,14 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
                     .context(
                         "memory backend 'postgres' requires db_url in [storage.provider.config]",
                     )?;
-                let mem = super::PostgresMemory::new(
-                    db_url,
-                    &sp.schema,
-                    &sp.table,
-                    sp.connect_timeout_secs,
-                )?;
+                let mem = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(super::PostgresMemory::connect(
+                        db_url,
+                        &sp.schema,
+                        &sp.table,
+                        sp.connect_timeout_secs,
+                    ))
+                })?;
                 Ok(Box::new(mem))
             }
             #[cfg(not(feature = "memory-postgres"))]
