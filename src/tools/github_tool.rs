@@ -820,8 +820,8 @@ impl Tool for GitHubTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        let read_actions = vec!["get_repo", "list_repos", "list_issues", "get_issue"];
-        let write_actions = vec![
+        let read_actions = ["get_repo", "list_repos", "list_issues", "get_issue"];
+        let write_actions = [
             "create_issue",
             "comment_issue",
             "create_pr",
@@ -938,6 +938,7 @@ impl Tool for GitHubTool {
             });
         }
 
+        #[allow(clippy::match_same_arms)]
         let security_op = match action {
             "get_repo" | "list_repos" | "list_issues" | "get_issue" | "list_prs" | "get_pr"
             | "list_workflows" | "list_runs" => ToolOperation::Read,
@@ -1000,7 +1001,9 @@ impl Tool for GitHubTool {
                 }
                 let labels = args["labels"].as_str().filter(|s| !s.is_empty());
                 let state = args["state"].as_str();
-                let max_results = args["max_results"].as_u64().map(|n| n as u32);
+                let max_results = args["max_results"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok());
 
                 Ok(self
                     .list_issues(owner, repo, state, labels, max_results)
@@ -1015,7 +1018,8 @@ impl Tool for GitHubTool {
             "get_issue" => {
                 let owner = owner.unwrap_or_default();
                 let repo = repo.unwrap_or_default();
-                let issue_number = args["issue_number"].as_u64().unwrap_or(0) as u32;
+                let issue_number =
+                    u32::try_from(args["issue_number"].as_u64().unwrap_or(0)).unwrap_or(0);
                 if owner.is_empty() || repo.is_empty() || issue_number == 0 {
                     return Ok(ToolResult {
                         success: false,
@@ -1070,7 +1074,8 @@ impl Tool for GitHubTool {
             "comment_issue" => {
                 let owner = owner.unwrap_or_default();
                 let repo = repo.unwrap_or_default();
-                let issue_number = args["issue_number"].as_u64().unwrap_or(0) as u32;
+                let issue_number =
+                    u32::try_from(args["issue_number"].as_u64().unwrap_or(0)).unwrap_or(0);
                 let body = args["body"].as_str().unwrap_or_default();
                 if owner.is_empty() || repo.is_empty() || issue_number == 0 || body.is_empty() {
                     return Ok(ToolResult {
@@ -1116,10 +1121,13 @@ impl Tool for GitHubTool {
             "get_pr" => {
                 let owner = owner.unwrap_or_default();
                 let repo = repo.unwrap_or_default();
-                let pr_number = args["pr_number"]
-                    .as_u64()
-                    .or(args["issue_number"].as_u64())
-                    .unwrap_or(0) as u32;
+                let pr_number = u32::try_from(
+                    args["pr_number"]
+                        .as_u64()
+                        .or(args["issue_number"].as_u64())
+                        .unwrap_or(0),
+                )
+                .unwrap_or(0);
                 if owner.is_empty() || repo.is_empty() || pr_number == 0 {
                     return Ok(ToolResult {
                         success: false,
@@ -1142,10 +1150,13 @@ impl Tool for GitHubTool {
             "merge_pr" => {
                 let owner = owner.unwrap_or_default();
                 let repo = repo.unwrap_or_default();
-                let pr_number = args["pr_number"]
-                    .as_u64()
-                    .or(args["issue_number"].as_u64())
-                    .unwrap_or(0) as u32;
+                let pr_number = u32::try_from(
+                    args["pr_number"]
+                        .as_u64()
+                        .or(args["issue_number"].as_u64())
+                        .unwrap_or(0),
+                )
+                .unwrap_or(0);
                 if owner.is_empty() || repo.is_empty() || pr_number == 0 {
                     return Ok(ToolResult {
                         success: false,
