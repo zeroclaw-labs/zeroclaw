@@ -36,6 +36,7 @@ pub mod leak_detector;
 pub mod nevis;
 pub mod otp;
 pub mod pairing;
+pub mod path_validation;
 pub mod playbook;
 pub mod policy;
 pub mod prompt_guard;
@@ -75,8 +76,10 @@ pub use nevis::{NevisAuthProvider, NevisIdentity};
 #[allow(unused_imports)]
 pub use leak_detector::{LeakDetector, LeakResult};
 #[allow(unused_imports)]
-pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 #[allow(unused_imports)]
+pub use path_validation::PathValidationSandbox;
+#[allow(unused_imports)]
+pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 pub use workspace_boundary::{BoundaryVerdict, WorkspaceBoundary};
 
 /// Redact sensitive values for safe logging. Shows first 4 characters + "***" suffix.

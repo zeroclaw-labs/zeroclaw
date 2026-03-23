@@ -6538,6 +6538,9 @@ pub enum SandboxBackend {
     Bubblewrap,
     /// Docker container isolation
     Docker,
+    /// Software-only path validation (no OS-level isolation)
+    #[serde(alias = "path-validation")]
+    PathValidation,
     /// No sandboxing (application-layer only)
     None,
 }

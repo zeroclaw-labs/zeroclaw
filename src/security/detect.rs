@@ -64,6 +64,10 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
             tracing::warn!("Docker requested but not available, falling back to application-layer");
             Arc::new(super::traits::NoopSandbox)
         }
+        SandboxBackend::PathValidation => {
+            tracing::info!("Path-validation sandbox enabled (software-only)");
+            Arc::new(super::path_validation::PathValidationSandbox::new())
+        }
         SandboxBackend::Auto | SandboxBackend::None => {
             // Auto-detect best available
             detect_best_sandbox()
@@ -110,8 +114,8 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
     }
 
     // Fallback: application-layer security only
-    tracing::info!("No sandbox backend available, using application-layer security");
-    Arc::new(super::traits::NoopSandbox)
+    tracing::info!("No OS-level sandbox available, using path-validation fallback");
+    Arc::new(super::path_validation::PathValidationSandbox::new())
 }
 
 #[cfg(test)]
