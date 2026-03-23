@@ -78,6 +78,24 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.category': '类别',
     'tools.load_error': '加载工具失败',
 
+    // Skills
+    'skills.installed': '已安装',
+    'skills.open_enabled': '开放技能已启用',
+    'skills.search': '搜索技能...',
+    'skills.install': '安装',
+    'skills.installing': '安装中...',
+    'skills.install_placeholder': 'Git URL 或本地路径',
+    'skills.always': '始终启用',
+    'skills.tools': '工具',
+    'skills.prompts': '提示',
+    'skills.author': '作者',
+    'skills.location': '位置',
+    'skills.audit': '审计',
+    'skills.remove': '删除',
+    'skills.no_skills': '暂无安装的技能。使用上方的输入框安装技能。',
+    'skills.no_match': '未找到匹配的技能。',
+    'common.dismiss': '关闭',
+
     // Cron
     'cron.title': '定时任务',
     'cron.scheduled_tasks': '定时任务',
@@ -409,6 +427,24 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.version': 'Version',
     'tools.category': 'Category',
     'tools.load_error': 'Failed to load tools',
+
+    // Skills
+    'skills.installed': 'installed',
+    'skills.open_enabled': 'Open Skills enabled',
+    'skills.search': 'Search skills...',
+    'skills.install': 'Install',
+    'skills.installing': 'Installing...',
+    'skills.install_placeholder': 'Git URL or local path',
+    'skills.always': 'always',
+    'skills.tools': 'tools',
+    'skills.prompts': 'prompts',
+    'skills.author': 'author',
+    'skills.location': 'location',
+    'skills.audit': 'Audit',
+    'skills.remove': 'Remove',
+    'skills.no_skills': 'No skills installed. Use the input above to install one.',
+    'skills.no_match': 'No skills found matching your search.',
+    'common.dismiss': 'dismiss',
 
     // Cron
     'cron.title': 'Scheduled Jobs',
@@ -763,6 +799,24 @@ const translations: Record<Locale, Record<string, string>> = {
     'tools.version': 'Sürüm',
     'tools.category': 'Kategori',
     'tools.load_error': 'Araçlar yüklenemedi',
+
+    // Skills
+    'skills.installed': 'yüklendi',
+    'skills.open_enabled': 'Açık Yetenekler etkin',
+    'skills.search': 'Yetenekleri ara...',
+    'skills.install': 'Yükle',
+    'skills.installing': 'Yükleniyor...',
+    'skills.install_placeholder': 'Git URL veya yerel yol',
+    'skills.always': 'her zaman',
+    'skills.tools': 'araçlar',
+    'skills.prompts': 'komutlar',
+    'skills.author': 'yazar',
+    'skills.location': 'konum',
+    'skills.audit': 'Denetle',
+    'skills.remove': 'Kaldır',
+    'skills.no_skills': 'Yüklenmiş yetenek yok. Bir tane yüklemek için yukarıdaki girişi kullanın.',
+    'skills.no_match': 'Aramanızla eşleşen yetenek bulunamadı.',
+    'common.dismiss': 'kapat',
 
     // Cron
     'cron.title': 'Zamanlanmış Görevler',
