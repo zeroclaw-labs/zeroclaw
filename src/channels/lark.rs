@@ -1932,6 +1932,7 @@ fn pick_uniform_index(len: usize) -> usize {
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
+            #[allow(clippy::cast_possible_truncation)]
             return (value % upper) as usize;
         }
     }
@@ -3335,7 +3336,7 @@ mod tests {
         let tc = crate::config::TranscriptionConfig {
             enabled: true,
             default_provider: "groq".to_string(),
-            api_key: Some("".to_string()),
+            api_key: Some(String::new()),
             ..Default::default()
         };
         let ch = make_channel().with_transcription(tc);
@@ -3596,7 +3597,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path_regex("/im/v1/messages/.+/resources/.+"))
             .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
-                "code": 99991663,
+                "code": 99_991_663,
                 "msg": "token invalid"
             })))
             .up_to_n_times(1)
