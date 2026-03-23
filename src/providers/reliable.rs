@@ -1,5 +1,5 @@
 use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
 use super::Provider;
 use async_trait::async_trait;
@@ -939,6 +939,74 @@ impl Provider for ReliableProvider {
 
     fn supports_streaming(&self) -> bool {
         self.providers.iter().any(|(_, p)| p.supports_streaming())
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, p)| p.supports_streaming_tool_events())
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
+
+        for (_provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            if needs_tool_events && !provider.supports_streaming_tool_events() {
+                continue;
+            }
+
+            let provider_clone = provider_name.clone();
+
+            let current_model = match self.model_chain(model).first() {
+                Some(m) => m.to_string(),
+                None => model.to_string(),
+            };
+
+            let req = ChatRequest {
+                messages: request.messages,
+                tools: request.tools,
+            };
+            let stream = provider.stream_chat(req, &current_model, temperature, options);
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(event) = stream.next().await {
+                    if let Err(ref e) = event {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed();
+        }
+
+        let message = if needs_tool_events {
+            "No provider supports streaming tool events".to_string()
+        } else {
+            "No provider supports streaming".to_string()
+        };
+        stream::once(async move { Err(super::traits::StreamError::Provider(message)) }).boxed()
     }
 
     fn stream_chat_with_system(
