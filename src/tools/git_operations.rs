@@ -65,10 +65,15 @@ impl GitOperationsTool {
         )
     }
 
-    async fn run_git_command(&self, args: &[&str]) -> anyhow::Result<String> {
+    async fn run_git_command(
+        &self,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<String> {
+        let work_dir = cwd.unwrap_or(&self.workspace_dir);
         let output = tokio::process::Command::new("git")
             .args(args)
-            .current_dir(&self.workspace_dir)
+            .current_dir(work_dir)
             .output()
             .await?;
 
@@ -80,9 +85,13 @@ impl GitOperationsTool {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 
-    async fn git_status(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_status(
+        &self,
+        _args: serde_json::Value,
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<ToolResult> {
         let output = self
-            .run_git_command(&["status", "--porcelain=2", "--branch"])
+            .run_git_command(&["status", "--porcelain=2", "--branch"], cwd)
             .await?;
 
         // Parse git status output into structured format
@@ -131,7 +140,11 @@ impl GitOperationsTool {
         })
     }
 
-    async fn git_diff(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_diff(
+        &self,
+        args: serde_json::Value,
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<ToolResult> {
         let files = args.get("files").and_then(|v| v.as_str()).unwrap_or(".");
         let cached = args
             .get("cached")
@@ -148,7 +161,7 @@ impl GitOperationsTool {
         git_args.push("--");
         git_args.push(files);
 
-        let output = self.run_git_command(&git_args).await?;
+        let output = self.run_git_command(&git_args, cwd).await?;
 
         // Parse diff into structured hunks
         let mut result = serde_json::Map::new();
@@ -210,18 +223,25 @@ impl GitOperationsTool {
         })
     }
 
-    async fn git_log(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_log(
+        &self,
+        args: serde_json::Value,
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<ToolResult> {
         let limit_raw = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10);
         let limit = usize::try_from(limit_raw).unwrap_or(usize::MAX).min(1000);
         let limit_str = limit.to_string();
 
         let output = self
-            .run_git_command(&[
-                "log",
-                &format!("-{limit_str}"),
-                "--pretty=format:%H|%an|%ae|%ad|%s",
-                "--date=iso",
-            ])
+            .run_git_command(
+                &[
+                    "log",
+                    &format!("-{limit_str}"),
+                    "--pretty=format:%H|%an|%ae|%ad|%s",
+                    "--date=iso",
+                ],
+                cwd,
+            )
             .await?;
 
         let mut commits = Vec::new();
@@ -247,9 +267,13 @@ impl GitOperationsTool {
         })
     }
 
-    async fn git_branch(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_branch(
+        &self,
+        _args: serde_json::Value,
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<ToolResult> {
         let output = self
-            .run_git_command(&["branch", "--format=%(refname:short)|%(HEAD)"])
+            .run_git_command(&["branch", "--format=%(refname:short)|%(HEAD)"], cwd)
             .await?;
 
         let mut branches = Vec::new();
@@ -287,7 +311,11 @@ impl GitOperationsTool {
         }
     }
 
-    async fn git_commit(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_commit(
+        &self,
+        args: serde_json::Value,
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<ToolResult> {
         let message = args
             .get("message")
             .and_then(|v| v.as_str())
@@ -308,7 +336,7 @@ impl GitOperationsTool {
         // Limit message length
         let message = Self::truncate_commit_message(&sanitized);
 
-        let output = self.run_git_command(&["commit", "-m", &message]).await;
+        let output = self.run_git_command(&["commit", "-m", &message], cwd).await;
 
         match output {
             Ok(_) => Ok(ToolResult {
@@ -324,7 +352,11 @@ impl GitOperationsTool {
         }
     }
 
-    async fn git_add(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_add(
+        &self,
+        args: serde_json::Value,
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<ToolResult> {
         let paths = args
             .get("paths")
             .and_then(|v| v.as_str())
@@ -333,7 +365,7 @@ impl GitOperationsTool {
         // Validate paths against injection patterns
         self.sanitize_git_args(paths)?;
 
-        let output = self.run_git_command(&["add", "--", paths]).await;
+        let output = self.run_git_command(&["add", "--", paths], cwd).await;
 
         match output {
             Ok(_) => Ok(ToolResult {
@@ -349,7 +381,11 @@ impl GitOperationsTool {
         }
     }
 
-    async fn git_checkout(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_checkout(
+        &self,
+        args: serde_json::Value,
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<ToolResult> {
         let branch = args
             .get("branch")
             .and_then(|v| v.as_str())
@@ -369,7 +405,7 @@ impl GitOperationsTool {
             anyhow::bail!("Branch name contains invalid characters");
         }
 
-        let output = self.run_git_command(&["checkout", branch_name]).await;
+        let output = self.run_git_command(&["checkout", branch_name], cwd).await;
 
         match output {
             Ok(_) => Ok(ToolResult {
@@ -385,7 +421,11 @@ impl GitOperationsTool {
         }
     }
 
-    async fn git_stash(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+    async fn git_stash(
+        &self,
+        args: serde_json::Value,
+        cwd: Option<&std::path::Path>,
+    ) -> anyhow::Result<ToolResult> {
         let action = args
             .get("action")
             .and_then(|v| v.as_str())
@@ -393,16 +433,16 @@ impl GitOperationsTool {
 
         let output = match action {
             "push" | "save" => {
-                self.run_git_command(&["stash", "push", "-m", "auto-stash"])
+                self.run_git_command(&["stash", "push", "-m", "auto-stash"], cwd)
                     .await
             }
-            "pop" => self.run_git_command(&["stash", "pop"]).await,
-            "list" => self.run_git_command(&["stash", "list"]).await,
+            "pop" => self.run_git_command(&["stash", "pop"], cwd).await,
+            "list" => self.run_git_command(&["stash", "list"], cwd).await,
             "drop" => {
                 let index_raw = args.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                 let index = i32::try_from(index_raw)
                     .map_err(|_| anyhow::anyhow!("stash index too large: {index_raw}"))?;
-                self.run_git_command(&["stash", "drop", &format!("stash@{{{index}}}")])
+                self.run_git_command(&["stash", "drop", &format!("stash@{{{index}}}")], cwd)
                     .await
             }
             _ => anyhow::bail!("Unknown stash action: {action}. Use: push, pop, list, drop"),
@@ -441,6 +481,10 @@ impl Tool for GitOperationsTool {
                     "type": "string",
                     "enum": ["status", "diff", "log", "branch", "commit", "add", "checkout", "stash"],
                     "description": "Git operation to perform"
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Working directory for the git operation (relative to workspace or absolute path within workspace)"
                 },
                 "message": {
                     "type": "string",
@@ -492,10 +536,37 @@ impl Tool for GitOperationsTool {
             }
         };
 
-        // Check if we're in a git repository
-        if !self.workspace_dir.join(".git").exists() {
-            // Try to find .git in parent directories
-            let mut current_dir = self.workspace_dir.as_path();
+        // Extract and resolve the path parameter (working directory for git commands)
+        let cwd: Option<std::path::PathBuf> =
+            args.get("path").and_then(|v| v.as_str()).and_then(|p| {
+                if p.is_empty() {
+                    return None;
+                }
+                // Resolve the path - if it's absolute, use it; if relative, join with workspace
+                let resolved = if p.starts_with('/') {
+                    std::path::PathBuf::from(p)
+                } else {
+                    self.workspace_dir.join(p)
+                };
+                // Canonicalize to resolve any ".." or "." components
+                resolved.canonicalize().ok().map(|p| {
+                    // Ensure the resolved path is within the workspace
+                    if p.starts_with(&self.workspace_dir) {
+                        p
+                    } else {
+                        // If canonicalization fails to keep it in workspace, use original resolved path
+                        resolved
+                    }
+                })
+            });
+
+        // Determine the effective working directory for git operations
+        let effective_cwd: std::path::PathBuf = cwd.unwrap_or_else(|| self.workspace_dir.clone());
+
+        // Check if we're in a git repository (check effective_cwd, not just workspace root)
+        if !effective_cwd.join(".git").exists() {
+            // Try to find .git in parent directories of effective_cwd
+            let mut current_dir = effective_cwd.as_path();
             let mut found_git = false;
             while current_dir.parent().is_some() {
                 if current_dir.join(".git").exists() {
@@ -503,6 +574,18 @@ impl Tool for GitOperationsTool {
                     break;
                 }
                 current_dir = current_dir.parent().unwrap();
+            }
+
+            // Also check workspace root if not found in effective_cwd parents
+            if !found_git && !self.workspace_dir.join(".git").exists() {
+                let mut current_dir = self.workspace_dir.as_path();
+                while current_dir.parent().is_some() {
+                    if current_dir.join(".git").exists() {
+                        found_git = true;
+                        break;
+                    }
+                    current_dir = current_dir.parent().unwrap();
+                }
             }
 
             if !found_git {
@@ -549,14 +632,17 @@ impl Tool for GitOperationsTool {
 
         // Execute the requested operation
         match operation {
-            "status" => self.git_status(args).await,
-            "diff" => self.git_diff(args).await,
-            "log" => self.git_log(args).await,
-            "branch" => self.git_branch(args).await,
-            "commit" => self.git_commit(args).await,
-            "add" => self.git_add(args).await,
-            "checkout" => self.git_checkout(args).await,
-            "stash" => self.git_stash(args).await,
+            "status" => self.git_status(args, effective_cwd.as_path().into()).await,
+            "diff" => self.git_diff(args, effective_cwd.as_path().into()).await,
+            "log" => self.git_log(args, effective_cwd.as_path().into()).await,
+            "branch" => self.git_branch(args, effective_cwd.as_path().into()).await,
+            "commit" => self.git_commit(args, effective_cwd.as_path().into()).await,
+            "add" => self.git_add(args, effective_cwd.as_path().into()).await,
+            "checkout" => {
+                self.git_checkout(args, effective_cwd.as_path().into())
+                    .await
+            }
+            "stash" => self.git_stash(args, effective_cwd.as_path().into()).await,
             _ => Ok(ToolResult {
                 success: false,
                 output: String::new(),
