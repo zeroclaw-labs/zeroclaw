@@ -85,6 +85,11 @@ pub mod sessions;
 pub mod shell;
 pub mod skill_http;
 pub mod skill_tool;
+pub mod sop_advance;
+pub mod sop_approve;
+pub mod sop_execute;
+pub mod sop_list;
+pub mod sop_status;
 pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
@@ -166,6 +171,11 @@ pub use shell::ShellTool;
 pub use skill_http::SkillHttpTool;
 #[allow(unused_imports)]
 pub use skill_tool::SkillShellTool;
+pub use sop_advance::SopAdvanceTool;
+pub use sop_approve::SopApproveTool;
+pub use sop_execute::SopExecuteTool;
+pub use sop_list::SopListTool;
+pub use sop_status::SopStatusTool;
 pub use swarm::SwarmTool;
 pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
@@ -701,6 +711,18 @@ pub fn all_tools_with_runtime(
         security.clone(),
         Arc::clone(&channel_map_handle),
     )));
+
+    // SOP tools (registered when sops_dir is configured)
+    if root_config.sop.sops_dir.is_some() {
+        let sop_engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            root_config.sop.clone(),
+        )));
+        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
+    }
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
