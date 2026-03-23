@@ -1,16 +1,15 @@
 //! Tirith pre-exec security scanning.
 //!
-//! Scans commands for content-level threats (homograph URLs, pipe-to-shell,
-//! terminal injection, etc.) by invoking the tirith binary as a subprocess.
+//! Tirith (<https://github.com/sheeki03/tirith>) is a terminal security tool
+//! that scans commands for content-level threats: homograph/punycode URLs,
+//! pipe-to-interpreter patterns, terminal injection (ANSI escapes, bidi
+//! Unicode, zero-width chars), typosquatted packages, and insecure transport.
 //!
 //! Exit code is the verdict source of truth:
 //!   0 = allow, 1 = block, 2 = warn
 //!
 //! Auto-install: if tirith is not found, it is downloaded from GitHub releases
-//! to ~/.zeroclaw/bin/tirith with SHA-256 checksum verification.
-//!
-//! Already integrated in Hermes Agent (NousResearch/hermes-agent#1256) and
-//! EurekaClaw (EurekaClaw/EurekaClaw#1). This is the ZeroClaw adaptation.
+//! with SHA-256 checksum verification.
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

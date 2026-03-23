@@ -704,19 +704,6 @@ If you encounter impersonation or trademark misuse, please [open an issue](https
 
 ---
 
-## Security Scanning
-
-Shell commands and cron jobs are pre-screened by [Tirith](https://github.com/sheeki03/tirith) before execution. Tirith detects homograph/punycode URLs, pipe-to-shell patterns, terminal injection, typosquatted packages, and insecure transport. Auto-installed on first use with SHA-256 checksum verification. Also integrated in [Hermes Agent](https://github.com/NousResearch/hermes-agent/pull/1256).
-
-Configure in your config:
-```toml
-[security.tirith]
-enabled = true
-bin = "tirith"
-timeout_secs = 5
-fail_open = true
-```
-
 ## License
 
 ZeroClaw is dual-licensed for maximum openness and contributor protection:
