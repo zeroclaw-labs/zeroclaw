@@ -16,7 +16,6 @@ pub struct WatiChannel {
     tenant_id: Option<String>,
     allowed_numbers: Vec<String>,
     client: reqwest::Client,
-    transcription: Option<crate::config::TranscriptionConfig>,
     transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
 }
 
@@ -43,7 +42,6 @@ impl WatiChannel {
             tenant_id,
             allowed_numbers,
             client: crate::config::build_channel_proxy_client("channel.wati", proxy_url.as_deref()),
-            transcription: None,
             transcription_manager: None,
         }
     }
@@ -62,7 +60,6 @@ impl WatiChannel {
                 );
             }
         }
-        self.transcription = Some(config);
         self
     }
 
@@ -272,38 +269,35 @@ impl WatiChannel {
             _ => "audio.ogg",
         };
 
-        let resp = self
+        let mut resp = match self
             .client
             .get(media_url)
             .bearer_auth(&self.api_token)
             .send()
             .await
-            .ok()?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("WATI: media download request failed: {e}");
+                return None;
+            }
+        };
 
         if !resp.status().is_success() {
             tracing::warn!("WATI: media download failed: {}", resp.status());
             return None;
         }
 
-        if let Some(content_length) = resp.content_length() {
-            if content_length > MAX_WATI_AUDIO_BYTES {
+        let mut audio_bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.ok().flatten() {
+            audio_bytes.extend_from_slice(&chunk);
+            if audio_bytes.len() as u64 > MAX_WATI_AUDIO_BYTES {
                 tracing::warn!(
-                    "WATI: media download skipped: content-length {content_length} exceeds {} bytes",
+                    "WATI: audio download exceeds {} byte limit",
                     MAX_WATI_AUDIO_BYTES
                 );
                 return None;
             }
-        }
-
-        let audio_bytes = resp.bytes().await.ok()?;
-
-        if audio_bytes.len() as u64 > MAX_WATI_AUDIO_BYTES {
-            tracing::warn!(
-                "WATI: audio download too large after fetch: {} bytes exceeds {} bytes",
-                audio_bytes.len(),
-                MAX_WATI_AUDIO_BYTES
-            );
-            return None;
         }
 
         match manager.transcribe(&audio_bytes, file_name).await {
@@ -448,7 +442,6 @@ mod tests {
             tenant_id: None,
             allowed_numbers: vec!["+1234567890".into()],
             client: reqwest::Client::new(),
-            transcription: None,
             transcription_manager: None,
         }
     }
@@ -460,7 +453,6 @@ mod tests {
             tenant_id: None,
             allowed_numbers: vec!["*".into()],
             client: reqwest::Client::new(),
-            transcription: None,
             transcription_manager: None,
         }
     }
@@ -493,7 +485,6 @@ mod tests {
             tenant_id: None,
             allowed_numbers: vec![],
             client: reqwest::Client::new(),
-            transcription: None,
             transcription_manager: None,
         };
         assert!(!ch.is_number_allowed("+1234567890"));
@@ -507,7 +498,6 @@ mod tests {
             tenant_id: Some("tenant1".into()),
             allowed_numbers: vec![],
             client: reqwest::Client::new(),
-            transcription: None,
             transcription_manager: None,
         };
         assert_eq!(ch.build_target("+1234567890"), "tenant1:1234567890");
@@ -527,7 +517,6 @@ mod tests {
             tenant_id: Some("tenant1".into()),
             allowed_numbers: vec![],
             client: reqwest::Client::new(),
-            transcription: None,
             transcription_manager: None,
         };
         // If the phone already has the tenant prefix, don't double it
@@ -643,7 +632,6 @@ mod tests {
             tenant_id: None,
             allowed_numbers: vec!["+1234567890".into()],
             client: reqwest::Client::new(),
-            transcription: None,
             transcription_manager: None,
         };
 
