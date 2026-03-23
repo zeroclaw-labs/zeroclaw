@@ -165,7 +165,14 @@ jobs:
           # Ensure Node.js build dependency is declared so that build.rs can
           # run `npm ci && npm run build` to produce the web frontend assets.
           if ! grep -q 'depends_on "node" => :build' "$formula_file"; then
-            perl -0pi -e 's|(  depends_on "rust" => :build\n)|\1  depends_on "node" => :build\n|m' "$formula_file"
+            # Try inserting after the rust build dependency first; if that
+            # pattern is absent, fall back to inserting before the first
+            # `depends_on` line so the node dep is always present.
+            if grep -q 'depends_on "rust" => :build' "$formula_file"; then
+              perl -0pi -e 's|(  depends_on "rust" => :build\n)|\1  depends_on "node" => :build\n|m' "$formula_file"
+            else
+              perl -0pi -e 's|(  depends_on )|  depends_on "node" => :build\n\1|m' "$formula_file"
+            fi
           fi
 
           git -C "$repo_dir" diff -- "$FORMULA_PATH" > "$tmp_repo/formula.diff"
