@@ -6102,6 +6102,7 @@ impl Default for TirithScanConfig {
             fail_open: true,
         }
     }
+}
 
 /// OTP validation strategy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]

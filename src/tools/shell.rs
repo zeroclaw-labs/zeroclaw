@@ -76,12 +76,13 @@ impl ShellTool {
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
         sandbox: Arc<dyn Sandbox>,
+        tirith_config: crate::config::schema::TirithScanConfig,
     ) -> Self {
         Self {
             security,
             runtime,
             sandbox,
-            tirith_config: Default::default(),
+            tirith_config,
         }
     }
 }
@@ -759,6 +760,7 @@ mod tests {
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             sandbox,
+            Default::default(),
         );
         assert_eq!(tool.name(), "shell");
     }
@@ -794,6 +796,7 @@ mod tests {
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             sandbox,
+            Default::default(),
         );
         let result = tool
             .execute(json!({"command": "echo sandbox_test"}))

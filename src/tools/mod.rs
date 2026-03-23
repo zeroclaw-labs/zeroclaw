@@ -254,7 +254,7 @@ pub fn default_tools_with_runtime(
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(ShellTool::new(security.clone(), runtime)),
+        Box::new(ShellTool::new_with_tirith(security.clone(), runtime, Default::default())),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(FileEditTool::new(security.clone())),
@@ -358,6 +358,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             runtime,
             sandbox,
+            root_config.security.tirith.clone(),
         )),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
