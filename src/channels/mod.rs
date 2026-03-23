@@ -2544,9 +2544,18 @@ async fn process_channel_message(
         break loop_result;
     };
 
+    // Drop the delta sender so the draft-updater task sees the channel
+    // close and terminates.  Without this, `draft_updater.await` hangs
+    // indefinitely because the original `delta_tx` keeps the channel
+    // open even after `run_tool_call_loop` has dropped its clone
+    // (fixes #4300).
+    drop(delta_tx);
+
+    tracing::debug!("Post-loop: awaiting draft updater shutdown");
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
+    tracing::debug!("Post-loop: draft updater finished");
 
     // Thread the final reply only if tools were used (multi-message response)
     if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
