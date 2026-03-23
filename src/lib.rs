@@ -72,6 +72,7 @@ pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
 pub mod tools;
+pub mod zerotrading;
 pub(crate) mod tunnel;
 pub(crate) mod util;
 pub mod verifiable_intent;
