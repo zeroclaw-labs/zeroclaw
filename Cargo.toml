@@ -92,6 +92,7 @@ ring = "0.17"
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled", "load_extension"] }
+postgres = { version = "0.19", optional = true, features = ["with-chrono-0_4"] }
 
 # Local ONNX embeddings (brain vector DB)
 fastembed = { version = "4", optional = true }
@@ -143,6 +144,7 @@ lightwave-macos = { path = "crates/lightwave-macos" }
 default = ["createos"]
 createos = []
 brain = ["dep:fastembed"]
+memory-postgres = ["dep:postgres"]
 browser-native = ["dep:fantoccini"]
 orchestrator = ["dep:redis"]
 gateway = ["dep:axum"]
