@@ -2394,13 +2394,21 @@ async fn process_channel_message(
         && !memory::should_skip_autosave_content(&msg.content)
     {
         let autosave_key = conversation_memory_key(&msg);
+        let metadata = if msg.reply_target.ends_with("@g.us") {
+            Some(format!(r#"{{"group_jid":"{}"}}"#, msg.reply_target))
+        } else {
+            None
+        };
         let _ = ctx
             .memory
-            .store(
+            .store_with_metadata(
                 &autosave_key,
                 &msg.content,
                 crate::memory::MemoryCategory::Conversation,
                 Some(&history_key),
+                None,
+                None,
+                metadata.as_deref(),
             )
             .await;
     }

@@ -1476,13 +1476,21 @@ async fn handle_whatsapp_message(
         // Auto-save to memory
         if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
             let key = whatsapp_memory_key(msg);
+            let metadata = if msg.reply_target.ends_with("@g.us") {
+                Some(format!(r#"{{"group_jid":"{}"}}"#, msg.reply_target))
+            } else {
+                None
+            };
             let _ = state
                 .mem
-                .store(
+                .store_with_metadata(
                     &key,
                     &msg.content,
                     MemoryCategory::Conversation,
                     Some(&session_id),
+                    None,
+                    None,
+                    metadata.as_deref(),
                 )
                 .await;
         }
