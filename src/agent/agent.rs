@@ -1,6 +1,7 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
+use crate::agent::loop_::run_tool_call_loop;
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
@@ -637,7 +638,10 @@ impl Agent {
         self.model_name.clone()
     }
 
-    pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+    async fn prepare_turn_history(
+        &mut self,
+        user_message: &str,
+    ) -> Result<(String, String, Vec<ChatMessage>)> {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -675,10 +679,22 @@ impl Agent {
             format!("{context}[{now}] {user_message}")
         };
 
+        let effective_model = self.classify_model(user_message);
+        let mut history = self.tool_dispatcher.to_provider_messages(&self.history);
+        history.push(ChatMessage::user(enriched.clone()));
+
+        Ok((effective_model, enriched, history))
+    }
+
+    fn replace_history_from_chat_messages(&mut self, history: Vec<ChatMessage>) {
+        self.history = history.into_iter().map(ConversationMessage::Chat).collect();
+        self.trim_history();
+    }
+
+    pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        let (effective_model, enriched, _) = self.prepare_turn_history(user_message).await?;
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
-
-        let effective_model = self.classify_model(user_message);
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -796,6 +812,44 @@ impl Agent {
             "Agent exceeded maximum tool iterations ({})",
             self.config.max_tool_iterations
         )
+    }
+
+    pub async fn turn_streaming(
+        &mut self,
+        user_message: &str,
+        provider_name: &str,
+        multimodal_config: &crate::config::MultimodalConfig,
+        pacing: &crate::config::PacingConfig,
+        on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    ) -> Result<String> {
+        let (effective_model, _, mut history) = self.prepare_turn_history(user_message).await?;
+        let result = run_tool_call_loop(
+            self.provider.as_ref(),
+            &mut history,
+            &self.tools,
+            self.observer.as_ref(),
+            provider_name,
+            &effective_model,
+            self.temperature,
+            true,
+            None,
+            "gateway",
+            None,
+            multimodal_config,
+            self.config.max_tool_iterations,
+            None,
+            on_delta,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            pacing,
+        )
+        .await;
+
+        self.replace_history_from_chat_messages(history);
+        result
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {

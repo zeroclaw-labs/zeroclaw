@@ -22,6 +22,8 @@ export default function AgentChat() {
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [streamingContent, setStreamingContent] = useState('');
+  const [streamingTimestamp, setStreamingTimestamp] = useState<Date | null>(null);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -52,9 +54,23 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'session_start':
+        case 'connected':
+          break;
+
         case 'chunk':
           setTyping(true);
-          pendingContentRef.current += msg.content ?? '';
+          if (msg.content) {
+            pendingContentRef.current += msg.content;
+            setStreamingContent((prev) => prev + msg.content);
+            setStreamingTimestamp((prev) => prev ?? new Date());
+          }
+          break;
+
+        case 'chunk_reset':
+          pendingContentRef.current = '';
+          setStreamingContent('');
+          setStreamingTimestamp(new Date());
           break;
 
         case 'message':
@@ -72,6 +88,8 @@ export default function AgentChat() {
             ]);
           }
           pendingContentRef.current = '';
+          setStreamingContent('');
+          setStreamingTimestamp(null);
           setTyping(false);
           break;
         }
@@ -112,6 +130,8 @@ export default function AgentChat() {
           ]);
           setTyping(false);
           pendingContentRef.current = '';
+          setStreamingContent('');
+          setStreamingTimestamp(null);
           break;
       }
     };
@@ -126,7 +146,7 @@ export default function AgentChat() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, typing]);
+  }, [messages, typing, streamingContent]);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -146,6 +166,8 @@ export default function AgentChat() {
       wsRef.current.sendMessage(trimmed);
       setTyping(true);
       pendingContentRef.current = '';
+      setStreamingContent('');
+      setStreamingTimestamp(null);
     } catch {
       setError(t('agent.send_error'));
     }
@@ -289,10 +311,29 @@ export default function AgentChat() {
             <div className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
               <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            <div className="rounded-2xl px-4 py-3 border flex items-center gap-1.5" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
-              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+            <div
+              className={`rounded-2xl px-4 py-3 border ${streamingContent ? '' : 'flex items-center gap-1.5'}`}
+              style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}
+            >
+              {streamingContent ? (
+                <>
+                  <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">
+                    {streamingContent}
+                    <span className="inline-block w-2 animate-pulse" style={{ color: 'var(--pc-accent)' }}>|</span>
+                  </p>
+                  {streamingTimestamp && (
+                    <p className="text-[10px] mt-1.5" style={{ color: 'var(--pc-text-faint)' }}>
+                      {streamingTimestamp.toLocaleTimeString()}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <>
+                  <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+                  <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+                  <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+                </>
+              )}
             </div>
           </div>
         )}

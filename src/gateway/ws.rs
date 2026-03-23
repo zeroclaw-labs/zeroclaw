@@ -7,6 +7,7 @@
 //! Server -> Client: {"type":"session_start","session_id":"...","name":"...","resumed":true,"message_count":42}
 //! Client -> Server: {"type":"message","content":"Hello"}
 //! Server -> Client: {"type":"chunk","content":"Hi! "}
+//! Server -> Client: {"type":"chunk_reset"}
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
 //! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
 //! Server -> Client: {"type":"done","full_response":"..."}
@@ -28,6 +29,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::time::Duration;
 use tracing::debug;
 
 /// Optional connection parameters sent as the first WebSocket message.
@@ -151,6 +153,9 @@ pub async fn handle_ws_chat(
 
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
+const WS_CHUNK_RESET_TYPE: &str = "chunk_reset";
+const WS_TYPING_CHUNK_CHARS: usize = 6;
+const WS_TYPING_CHUNK_DELAY_MS: u64 = 35;
 
 async fn handle_socket(
     socket: WebSocket,
@@ -319,9 +324,8 @@ async fn process_chat_message(
     content: &str,
     session_key: &str,
 ) {
-    let provider_label = state
-        .config
-        .lock()
+    let config = state.config.lock().clone();
+    let provider_label = config
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -329,12 +333,58 @@ async fn process_chat_message(
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
-        "provider": provider_label,
+        "provider": provider_label.clone(),
         "model": state.model,
     }));
 
+    let cost_tracking_context = state.cost_tracker.clone().map(|tracker| {
+        crate::agent::loop_::ToolLoopCostTrackingContext::new(
+            tracker,
+            std::sync::Arc::new(config.cost.prices.clone()),
+        )
+    });
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let turn_future = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+        cost_tracking_context,
+        agent.turn_streaming(
+            content,
+            &provider_label,
+            &config.multimodal,
+            &config.pacing,
+            Some(delta_tx),
+        ),
+    );
+    tokio::pin!(turn_future);
+    let mut typing_mode = false;
+
+    let turn_result = loop {
+        tokio::select! {
+            result = &mut turn_future => break result,
+            maybe_delta = delta_rx.recv() => {
+                let Some(delta) = maybe_delta else {
+                    continue;
+                };
+                if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
+                    typing_mode = true;
+                }
+                if !send_stream_delta(sender, &delta, typing_mode).await {
+                    return;
+                }
+            }
+        }
+    };
+
+    while let Some(delta) = delta_rx.recv().await {
+        if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
+            typing_mode = true;
+        }
+        if !send_stream_delta(sender, &delta, typing_mode).await {
+            return;
+        }
+    }
+
     // Multi-turn chat via persistent Agent (history is maintained across turns)
-    match agent.turn(content).await {
+    match turn_result {
         Ok(response) => {
             // Persist assistant response
             if let Some(ref backend) = state.session_backend {
@@ -371,6 +421,60 @@ async fn process_chat_message(
             }));
         }
     }
+}
+
+async fn send_stream_delta(
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    delta: &str,
+    typing_mode: bool,
+) -> bool {
+    if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
+        let payload = serde_json::json!({
+            "type": WS_CHUNK_RESET_TYPE,
+        });
+        return sender
+            .send(Message::Text(payload.to_string().into()))
+            .await
+            .is_ok();
+    }
+
+    if !typing_mode {
+        let payload = serde_json::json!({
+            "type": "chunk",
+            "content": delta,
+        });
+        return sender
+            .send(Message::Text(payload.to_string().into()))
+            .await
+            .is_ok();
+    }
+
+    let mut remaining = delta;
+    while !remaining.is_empty() {
+        let end = remaining
+            .char_indices()
+            .nth(WS_TYPING_CHUNK_CHARS)
+            .map(|(idx, _)| idx)
+            .unwrap_or(remaining.len());
+        let part = &remaining[..end];
+        let payload = serde_json::json!({
+            "type": "chunk",
+            "content": part,
+        });
+        if sender
+            .send(Message::Text(payload.to_string().into()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        remaining = &remaining[end..];
+        if !remaining.is_empty() {
+            tokio::time::sleep(Duration::from_millis(WS_TYPING_CHUNK_DELAY_MS)).await;
+        }
+    }
+
+    true
 }
 
 #[cfg(test)]
