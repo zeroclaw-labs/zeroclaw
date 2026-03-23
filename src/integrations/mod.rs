@@ -143,7 +143,11 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         "GitHub" => {
             println!("  Setup:");
             println!("    1. Create a personal access token at https://github.com/settings/tokens");
-            println!("    2. Add to config: [integrations.github] token = \"ghp_...\"");
+            println!("    2. Add to config: [github] enabled = true, token = \"ghp_...\"");
+            println!(
+                "    3. Optionally set GITHUB_TOKEN env var instead of storing the token in config"
+            );
+            println!("    4. Configure allowed_actions in [github] to control what operations are permitted");
         }
         "Browser" => {
             println!("  Built-in:");

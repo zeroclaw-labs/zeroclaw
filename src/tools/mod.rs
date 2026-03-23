@@ -40,6 +40,7 @@ pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
+pub mod github_tool;
 pub mod glob_search;
 pub mod google_workspace;
 #[cfg(feature = "hardware")]
@@ -119,6 +120,7 @@ pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
+pub use github_tool::GitHubTool;
 pub use glob_search::GlobSearchTool;
 pub use google_workspace::GoogleWorkspaceTool;
 #[cfg(feature = "hardware")]
@@ -538,6 +540,20 @@ pub fn all_tools_with_runtime(
                 root_config.jira.allowed_actions.clone(),
                 security.clone(),
                 root_config.jira.timeout_secs,
+            )));
+        }
+    }
+
+    // GitHub integration (config-gated)
+    if root_config.github.enabled {
+        if root_config.github.token.trim().is_empty() && std::env::var("GITHUB_TOKEN").is_err() {
+            tracing::warn!(
+                "GitHub tool enabled but no token found (set github.token or GITHUB_TOKEN env var)"
+            );
+        } else {
+            tool_arcs.push(Arc::new(GitHubTool::new(
+                root_config.github.clone(),
+                security.clone(),
             )));
         }
     }

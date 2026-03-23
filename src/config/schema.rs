@@ -349,6 +349,10 @@ pub struct Config {
     #[serde(default)]
     pub jira: JiraConfig,
 
+    /// GitHub integration configuration (`[github]`).
+    #[serde(default)]
+    pub github: GitHubConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     pub node_transport: NodeTransportConfig,
@@ -6871,6 +6875,79 @@ impl Default for JiraConfig {
     }
 }
 
+/// GitHub integration configuration (`[github]`).
+///
+/// When `enabled = true`, registers the `github` tool which can read and
+/// create issues, manage pull requests, trigger workflows, and more.
+/// Requires `token` (or `GITHUB_TOKEN` env var).
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_actions`: `["get_repo", "list_issues", "get_issue"]` — read-only by default.
+///   Add `"create_issue"`, `"comment_issue"`, etc. to unlock mutations.
+/// - `timeout_secs`: `30`
+///
+/// ## Auth
+/// Uses GitHub personal access tokens (PAT) or GitHub App tokens.
+/// `token` is stored encrypted at rest; set it here or via `GITHUB_TOKEN`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GitHubConfig {
+    /// Enable the `github` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// GitHub personal access token or app installation token.
+    /// Encrypted at rest. Falls back to `GITHUB_TOKEN` env var.
+    #[serde(default)]
+    pub token: String,
+    /// GitHub API base URL. Defaults to `https://api.github.com`.
+    /// Change for GitHub Enterprise: `https://github.mycompany.com/api/v3`.
+    #[serde(default = "default_github_api_url")]
+    pub api_url: String,
+    /// Actions the agent is permitted to call.
+    /// Valid values: `"get_repo"`, `"list_repos"`, `"list_issues"`, `"get_issue"`,
+    /// `"create_issue"`, `"comment_issue"`, `"list_prs"`, `"get_pr"`, `"create_pr"`,
+    /// `"merge_pr"`, `"list_workflows"`, `"list_runs"`, `"trigger_workflow"`.
+    /// Defaults to read-only actions.
+    #[serde(default = "default_github_allowed_actions")]
+    pub allowed_actions: Vec<String>,
+    /// Request timeout in seconds. Default: `30`.
+    #[serde(default = "default_github_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Default owner/org for relative repo references. Optional.
+    #[serde(default)]
+    pub default_owner: Option<String>,
+}
+
+fn default_github_api_url() -> String {
+    "https://api.github.com".into()
+}
+
+fn default_github_allowed_actions() -> Vec<String> {
+    vec![
+        "get_repo".to_string(),
+        "list_repos".to_string(),
+        "list_issues".to_string(),
+        "get_issue".to_string(),
+    ]
+}
+
+fn default_github_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for GitHubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token: String::new(),
+            api_url: default_github_api_url(),
+            allowed_actions: default_github_allowed_actions(),
+            timeout_secs: default_github_timeout_secs(),
+            default_owner: None,
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -7184,6 +7261,7 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            github: GitHubConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -10167,6 +10245,7 @@ default_temperature = 0.7
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            github: GitHubConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -10684,6 +10763,7 @@ default_temperature = 0.7
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            github: GitHubConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),

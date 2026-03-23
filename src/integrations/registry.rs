@@ -523,9 +523,15 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         IntegrationEntry {
             name: "GitHub",
-            description: "Code, issues, PRs",
+            description: "Code, issues, PRs, and GitHub Actions workflows",
             category: IntegrationCategory::Productivity,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |c| {
+                if c.github.enabled {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Notion",
