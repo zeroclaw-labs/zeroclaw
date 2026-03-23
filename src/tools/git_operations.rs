@@ -96,11 +96,14 @@ impl GitOperationsTool {
             anyhow::bail!("project_path must be a directory: {}", resolved.display());
         }
 
-        // Security policy check using the string representation.
-        if !self
-            .security
-            .is_path_allowed(resolved.to_string_lossy().as_ref())
-        {
+        // Security check: ensure the resolved path is inside the workspace.
+        // We canonicalize workspace_dir as well to handle platform symlinks
+        // (e.g., macOS /var → /private/var).
+        let canonical_workspace = self
+            .workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace_dir.clone());
+        if !resolved.starts_with(&canonical_workspace) {
             anyhow::bail!(
                 "project_path is outside the allowed workspace: {}",
                 resolved.display()
