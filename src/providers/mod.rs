@@ -46,7 +46,7 @@ use reliable::ReliableProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-const MAX_API_ERROR_CHARS: usize = 200;
+const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
 const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
@@ -3333,18 +3333,18 @@ mod tests {
 
     #[test]
     fn sanitize_truncates_long_error() {
-        let long = "a".repeat(400);
+        let long = "a".repeat(600);
         let result = sanitize_api_error(&long);
-        assert!(result.len() <= 203);
+        assert!(result.len() <= 503);
         assert!(result.ends_with("..."));
     }
 
     #[test]
     fn sanitize_truncates_after_scrub() {
-        let input = format!("{} sk-abcdef123456 {}", "a".repeat(190), "b".repeat(190));
+        let input = format!("{} sk-abcdef123456 {}", "a".repeat(290), "b".repeat(290));
         let result = sanitize_api_error(&input);
         assert!(!result.contains("sk-abcdef123456"));
-        assert!(result.len() <= 203);
+        assert!(result.len() <= 503);
     }
 
     #[test]
