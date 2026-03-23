@@ -1217,7 +1217,9 @@ pub struct LocalWhisperConfig {
     /// HTTP or HTTPS endpoint URL, e.g. `"http://10.10.0.1:8001/v1/transcribe"`.
     pub url: String,
     /// Bearer token for endpoint authentication.
-    pub bearer_token: String,
+    /// Omit for unauthenticated local endpoints.
+    #[serde(default)]
+    pub bearer_token: Option<String>,
     /// Maximum audio file size in bytes accepted by this endpoint.
     /// Defaults to 25 MB — matching the cloud API cap for a safe out-of-the-box
     /// experience. Self-hosted endpoints can accept much larger files; raise this
@@ -7889,6 +7891,13 @@ impl Config {
                     "config.transcription.google.api_key",
                 )?;
             }
+            if let Some(ref mut local) = config.transcription.local_whisper {
+                decrypt_optional_secret(
+                    &store,
+                    &mut local.bearer_token,
+                    "config.transcription.local_whisper.bearer_token",
+                )?;
+            }
 
             #[cfg(feature = "channel-nostr")]
             if let Some(ref mut ns) = config.channels_config.nostr {
@@ -9335,6 +9344,13 @@ impl Config {
                 &store,
                 &mut google.api_key,
                 "config.transcription.google.api_key",
+            )?;
+        }
+        if let Some(ref mut local) = config_to_save.transcription.local_whisper {
+            encrypt_optional_secret(
+                &store,
+                &mut local.bearer_token,
+                "config.transcription.local_whisper.bearer_token",
             )?;
         }
 
