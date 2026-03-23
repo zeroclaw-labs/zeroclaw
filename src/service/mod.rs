@@ -558,6 +558,55 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
+/// Parse the output of `loginctl show-user $USER --property=Linger` and return
+/// whether linger is enabled. Returns `None` if the output cannot be parsed.
+fn parse_linger_property(output: &str) -> Option<bool> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("Linger=") {
+            return Some(value.eq_ignore_ascii_case("yes"));
+        }
+    }
+    None
+}
+
+/// Check whether loginctl linger is enabled for the current user and print a
+/// warning if it is not. Silently skipped when `loginctl` is unavailable.
+#[cfg(target_os = "linux")]
+fn warn_if_linger_disabled() {
+    let user = match std::env::var("USER") {
+        Ok(u) if !u.is_empty() => u,
+        _ => return,
+    };
+
+    let output = Command::new("loginctl")
+        .args(["show-user", &user, "--property=Linger"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        // loginctl not available or failed — skip silently
+        _ => return,
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(enabled) = parse_linger_property(&stdout) {
+        if !enabled {
+            eprintln!(
+                "\n\u{26a0}\u{fe0f}  Warning: loginctl linger is not enabled for your user.\n\
+                 The service will stop when your session ends (e.g., SSH disconnect).\n\
+                 To fix this, run: sudo loginctl enable-linger {}\n",
+                user,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn warn_if_linger_disabled() {
+    // Linger is a systemd/Linux concept — no-op on other platforms.
+}
+
 fn install_linux_systemd(config: &Config) -> Result<()> {
     let file = linux_service_file(config)?;
     if let Some(parent) = file.parent() {
@@ -591,6 +640,7 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
     println!("   Start with: zeroclaw service start");
+    warn_if_linger_disabled();
     Ok(())
 }
 
@@ -1492,5 +1542,40 @@ mod tests {
                 "zeroclaw".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn parse_linger_property_detects_yes() {
+        assert_eq!(parse_linger_property("Linger=yes\n"), Some(true));
+    }
+
+    #[test]
+    fn parse_linger_property_detects_no() {
+        assert_eq!(parse_linger_property("Linger=no\n"), Some(false));
+    }
+
+    #[test]
+    fn parse_linger_property_case_insensitive() {
+        assert_eq!(parse_linger_property("Linger=Yes\n"), Some(true));
+        assert_eq!(parse_linger_property("Linger=YES\n"), Some(true));
+        assert_eq!(parse_linger_property("Linger=NO\n"), Some(false));
+    }
+
+    #[test]
+    fn parse_linger_property_empty_output() {
+        assert_eq!(parse_linger_property(""), None);
+    }
+
+    #[test]
+    fn parse_linger_property_unrelated_output() {
+        assert_eq!(
+            parse_linger_property("State=active\nSomething=else\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_linger_property_with_surrounding_whitespace() {
+        assert_eq!(parse_linger_property("  Linger=yes  \n"), Some(true));
     }
 }

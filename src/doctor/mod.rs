@@ -898,6 +898,49 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
+
+    // Linger check for systemd user services
+    if cfg!(target_os = "linux") {
+        check_linger_status(items);
+    }
+}
+
+/// Check whether loginctl linger is enabled for the current user.
+#[cfg(target_os = "linux")]
+fn check_linger_status(items: &mut Vec<DiagItem>) {
+    let cat = "daemon";
+    let user = match std::env::var("USER") {
+        Ok(u) if !u.is_empty() => u,
+        _ => return,
+    };
+
+    let output = std::process::Command::new("loginctl")
+        .args(["show-user", &user, "--property=Linger"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return, // loginctl not available or failed — skip silently
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("Linger=") {
+            if value.eq_ignore_ascii_case("yes") {
+                items.push(DiagItem::ok(cat, "loginctl linger enabled"));
+            } else {
+                items.push(DiagItem::warn(
+                    cat,
+                    format!(
+                        "linger not enabled — daemon will stop on logout. \
+                         Fix: sudo loginctl enable-linger {user}"
+                    ),
+                ));
+            }
+            break;
+        }
+    }
 }
 
 // ── Environment checks ───────────────────────────────────────────
