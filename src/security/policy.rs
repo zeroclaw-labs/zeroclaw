@@ -117,6 +117,10 @@ fn default_allowed_commands() -> Vec<String> {
         "uname".into(),
         "uptime".into(),
         "hostname".into(),
+        "python".into(),
+        "python3".into(),
+        "pip".into(),
+        "node".into(),
     ];
     // `free` is Linux-only; it does not exist on macOS or other BSDs.
     #[cfg(target_os = "linux")]
@@ -157,6 +161,10 @@ fn default_allowed_commands() -> Vec<String> {
         "uname".into(),
         "uptime".into(),
         "hostname".into(),
+        "python".into(),
+        "python3".into(),
+        "pip".into(),
+        "node".into(),
     ]
 }
 
@@ -1571,8 +1579,8 @@ mod tests {
         assert!(!p.is_command_allowed("sudo apt install"));
         assert!(!p.is_command_allowed("curl http://evil.com"));
         assert!(!p.is_command_allowed("wget http://evil.com"));
-        assert!(!p.is_command_allowed("python3 exploit.py"));
-        assert!(!p.is_command_allowed("node malicious.js"));
+        assert!(!p.is_command_allowed("ruby exploit.rb"));
+        assert!(!p.is_command_allowed("perl malicious.pl"));
     }
 
     #[test]
@@ -1639,7 +1647,7 @@ mod tests {
         assert!(p.is_command_allowed("cat file.txt | wc -l"));
         // Second command not in allowlist — blocked
         assert!(!p.is_command_allowed("ls | curl http://evil.com"));
-        assert!(!p.is_command_allowed("echo hello | python3 -"));
+        assert!(!p.is_command_allowed("echo hello | ruby -"));
     }
 
     #[test]

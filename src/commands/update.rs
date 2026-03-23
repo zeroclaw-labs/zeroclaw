@@ -146,21 +146,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
 }
 
 fn find_asset_url(release: &serde_json::Value) -> Option<String> {
-    let target = if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            "aarch64-apple-darwin"
-        } else {
-            "x86_64-apple-darwin"
-        }
-    } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "aarch64") {
-            "aarch64-unknown-linux"
-        } else {
-            "x86_64-unknown-linux"
-        }
-    } else {
-        return None;
-    };
+    let target = current_target_triple();
 
     release["assets"]
         .as_array()?
@@ -172,6 +158,29 @@ fn find_asset_url(release: &serde_json::Value) -> Option<String> {
                 .unwrap_or(false)
         })
         .and_then(|asset| asset["browser_download_url"].as_str().map(String::from))
+}
+
+/// Return the exact Rust target triple for the current platform.
+///
+/// Using full triples (e.g. `aarch64-unknown-linux-gnu` instead of the
+/// shorter `aarch64-unknown-linux`) prevents substring matches from
+/// selecting the wrong asset (e.g. an Android binary on a GNU/Linux host).
+fn current_target_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-apple-darwin"
+        }
+    } else if cfg!(target_os = "linux") {
+        if cfg!(target_arch = "aarch64") {
+            "aarch64-unknown-linux-gnu"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        }
+    } else {
+        "unknown"
+    }
 }
 
 fn version_is_newer(current: &str, candidate: &str) -> bool {
@@ -221,6 +230,10 @@ async fn validate_binary(path: &Path) -> Result<()> {
         );
     }
 
+    // Check binary architecture before attempting execution so we can give
+    // a clear diagnostic instead of the opaque "Exec format error (os error 8)".
+    check_binary_arch(path).await?;
+
     // Quick check: try running --version
     let output = tokio::process::Command::new(path)
         .arg("--version")
@@ -238,6 +251,80 @@ async fn validate_binary(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Read the binary header and verify its architecture matches the host.
+///
+/// On Linux/FreeBSD this reads the ELF header; on macOS the Mach-O header.
+/// If the binary is for a different architecture, returns a descriptive error
+/// instead of the opaque "Exec format error (os error 8)".
+async fn check_binary_arch(path: &Path) -> Result<()> {
+    let header = tokio::fs::read(path)
+        .await
+        .map(|bytes| bytes.into_iter().take(32).collect::<Vec<u8>>())
+        .context("failed to read binary header")?;
+
+    if header.len() < 20 {
+        bail!("downloaded file too small to be a valid binary");
+    }
+
+    let binary_arch = detect_arch_from_header(&header);
+    let host_arch = host_architecture();
+
+    if let (Some(bin), Some(host)) = (binary_arch, host_arch) {
+        if bin != host {
+            bail!(
+                "architecture mismatch: downloaded binary is {bin} but this host is {host} — \
+                 the release asset may be mispackaged"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Detect the CPU architecture from an ELF or Mach-O binary header.
+fn detect_arch_from_header(header: &[u8]) -> Option<&'static str> {
+    // ELF magic: 0x7f 'E' 'L' 'F'
+    if header.len() >= 20 && header[0..4] == [0x7f, b'E', b'L', b'F'] {
+        // e_machine is at offset 18 (2 bytes, little-endian for LE binaries)
+        let e_machine = u16::from_le_bytes([header[18], header[19]]);
+        return Some(match e_machine {
+            0x3E => "x86_64",
+            0xB7 => "aarch64",
+            0x03 => "x86",
+            0x28 => "arm",
+            0xF3 => "riscv",
+            _ => "unknown-elf",
+        });
+    }
+
+    // Mach-O magic (64-bit little-endian): 0xFEEDFACF
+    if header.len() >= 8 && header[0..4] == [0xCF, 0xFA, 0xED, 0xFE] {
+        let cputype = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        return Some(match cputype {
+            0x0100_0007 => "x86_64",
+            0x0100_000C => "aarch64",
+            _ => "unknown-macho",
+        });
+    }
+
+    None
+}
+
+/// Return the host CPU architecture as a human-readable string.
+fn host_architecture() -> Option<&'static str> {
+    if cfg!(target_arch = "x86_64") {
+        Some("x86_64")
+    } else if cfg!(target_arch = "aarch64") {
+        Some("aarch64")
+    } else if cfg!(target_arch = "x86") {
+        Some("x86")
+    } else if cfg!(target_arch = "arm") {
+        Some("arm")
+    } else {
+        None
+    }
 }
 
 async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
@@ -272,5 +359,117 @@ mod tests {
         assert!(!version_is_newer("0.5.0", "0.4.3"));
         assert!(!version_is_newer("0.4.3", "0.4.3"));
         assert!(version_is_newer("1.0.0", "2.0.0"));
+    }
+
+    #[test]
+    fn current_target_triple_is_not_empty() {
+        let triple = current_target_triple();
+        assert_ne!(triple, "unknown", "unsupported platform");
+        // The triple must contain at least two hyphens (arch-vendor-os or arch-vendor-os-env)
+        assert!(
+            triple.matches('-').count() >= 2,
+            "triple should have at least two hyphens: {triple}"
+        );
+    }
+
+    fn make_release(assets: &[&str]) -> serde_json::Value {
+        let assets: Vec<serde_json::Value> = assets
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "browser_download_url": format!("https://example.com/{name}")
+                })
+            })
+            .collect();
+        serde_json::json!({ "assets": assets })
+    }
+
+    #[test]
+    fn find_asset_url_picks_correct_gnu_over_android() {
+        let release = make_release(&[
+            "zeroclaw-aarch64-linux-android.tar.gz",
+            "zeroclaw-aarch64-unknown-linux-gnu.tar.gz",
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+            "zeroclaw-x86_64-apple-darwin.tar.gz",
+            "zeroclaw-aarch64-apple-darwin.tar.gz",
+        ]);
+
+        let url = find_asset_url(&release);
+        assert!(url.is_some(), "should find an asset");
+        let url = url.unwrap();
+        // Must NOT match the android binary
+        assert!(
+            !url.contains("android"),
+            "should not select android binary, got: {url}"
+        );
+    }
+
+    #[test]
+    fn find_asset_url_returns_none_for_empty_assets() {
+        let release = serde_json::json!({ "assets": [] });
+        assert!(find_asset_url(&release).is_none());
+    }
+
+    #[test]
+    fn find_asset_url_returns_none_for_missing_assets() {
+        let release = serde_json::json!({});
+        assert!(find_asset_url(&release).is_none());
+    }
+
+    #[test]
+    fn detect_arch_elf_x86_64() {
+        // Minimal ELF header with e_machine = 0x3E (x86_64)
+        let mut header = vec![0u8; 20];
+        header[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        header[18] = 0x3E;
+        header[19] = 0x00;
+        assert_eq!(detect_arch_from_header(&header), Some("x86_64"));
+    }
+
+    #[test]
+    fn detect_arch_elf_aarch64() {
+        let mut header = vec![0u8; 20];
+        header[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        header[18] = 0xB7;
+        header[19] = 0x00;
+        assert_eq!(detect_arch_from_header(&header), Some("aarch64"));
+    }
+
+    #[test]
+    fn detect_arch_macho_x86_64() {
+        // Mach-O 64-bit LE magic + cputype 0x01000007 (x86_64)
+        let mut header = vec![0u8; 8];
+        header[0..4].copy_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]);
+        header[4..8].copy_from_slice(&0x0100_0007u32.to_le_bytes());
+        assert_eq!(detect_arch_from_header(&header), Some("x86_64"));
+    }
+
+    #[test]
+    fn detect_arch_macho_aarch64() {
+        let mut header = vec![0u8; 8];
+        header[0..4].copy_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]);
+        header[4..8].copy_from_slice(&0x0100_000Cu32.to_le_bytes());
+        assert_eq!(detect_arch_from_header(&header), Some("aarch64"));
+    }
+
+    #[test]
+    fn detect_arch_unknown_format() {
+        let header = vec![0u8; 20]; // all zeros — not ELF or Mach-O
+        assert_eq!(detect_arch_from_header(&header), None);
+    }
+
+    #[test]
+    fn detect_arch_too_short() {
+        let header = vec![0x7f, b'E', b'L', b'F']; // only 4 bytes
+        assert_eq!(detect_arch_from_header(&header), None);
+    }
+
+    #[test]
+    fn host_architecture_is_known() {
+        assert!(
+            host_architecture().is_some(),
+            "host architecture should be detected on CI platforms"
+        );
     }
 }
