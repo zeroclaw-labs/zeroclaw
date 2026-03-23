@@ -840,7 +840,9 @@ mod tests {
             result.output
         );
         assert!(
-            result.output.contains("PDF file detected but text extraction failed"),
+            result
+                .output
+                .contains("PDF file detected but text extraction failed"),
             "output must explain PDF extraction failure, got: {:?}",
             result.output
         );
