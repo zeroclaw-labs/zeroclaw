@@ -339,9 +339,9 @@ mod tests {
             ]
         });
 
-        let _url = find_asset_url(&release);
+        let url = find_asset_url(&release);
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        assert_eq!(_url.as_deref(), Some("https://example.com/archive"));
+        assert_eq!(url.as_deref(), Some("https://example.com/archive"));
     }
 
     #[test]
