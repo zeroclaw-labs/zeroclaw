@@ -391,6 +391,22 @@ pub struct Config {
     /// Claude Code tool configuration (`[claude_code]`).
     #[serde(default)]
     pub claude_code: ClaudeCodeConfig,
+
+    /// Codex CLI tool configuration (`[codex_cli]`).
+    #[serde(default)]
+    pub codex_cli: CodexCliConfig,
+
+    /// Gemini CLI tool configuration (`[gemini_cli]`).
+    #[serde(default)]
+    pub gemini_cli: GeminiCliConfig,
+
+    /// OpenCode CLI tool configuration (`[opencode_cli]`).
+    #[serde(default)]
+    pub opencode_cli: OpenCodeCliConfig,
+
+    /// Standard Operating Procedures engine configuration (`[sop]`).
+    #[serde(default)]
+    pub sop: SopConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -3291,6 +3307,132 @@ impl Default for ClaudeCodeConfig {
             allowed_tools: default_claude_code_allowed_tools(),
             system_prompt: None,
             max_output_bytes: default_claude_code_max_output_bytes(),
+            env_passthrough: Vec::new(),
+        }
+    }
+}
+
+// ── Codex CLI ───────────────────────────────────────────────────
+
+/// Codex CLI tool configuration (`[codex_cli]` section).
+///
+/// Delegates coding tasks to the `codex -q` CLI. Authentication uses the
+/// binary's own session by default — no API key needed unless
+/// `env_passthrough` includes `OPENAI_API_KEY`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CodexCliConfig {
+    /// Enable the `codex_cli` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_codex_cli_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_codex_cli_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the codex subprocess (e.g. OPENAI_API_KEY)
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+fn default_codex_cli_timeout_secs() -> u64 {
+    600
+}
+
+fn default_codex_cli_max_output_bytes() -> usize {
+    2_097_152
+}
+
+impl Default for CodexCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_codex_cli_timeout_secs(),
+            max_output_bytes: default_codex_cli_max_output_bytes(),
+            env_passthrough: Vec::new(),
+        }
+    }
+}
+
+// ── Gemini CLI ──────────────────────────────────────────────────
+
+/// Gemini CLI tool configuration (`[gemini_cli]` section).
+///
+/// Delegates coding tasks to the `gemini -p` CLI. Authentication uses the
+/// binary's own session by default — no API key needed unless
+/// `env_passthrough` includes `GOOGLE_API_KEY`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GeminiCliConfig {
+    /// Enable the `gemini_cli` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_gemini_cli_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_gemini_cli_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the gemini subprocess (e.g. GOOGLE_API_KEY)
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+fn default_gemini_cli_timeout_secs() -> u64 {
+    600
+}
+
+fn default_gemini_cli_max_output_bytes() -> usize {
+    2_097_152
+}
+
+impl Default for GeminiCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_gemini_cli_timeout_secs(),
+            max_output_bytes: default_gemini_cli_max_output_bytes(),
+            env_passthrough: Vec::new(),
+        }
+    }
+}
+
+// ── OpenCode CLI ───────────────────────────────────────────────
+
+/// OpenCode CLI tool configuration (`[opencode_cli]` section).
+///
+/// Delegates coding tasks to the `opencode run` CLI. Authentication uses the
+/// binary's own session by default — no API key needed unless
+/// `env_passthrough` includes provider-specific keys.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OpenCodeCliConfig {
+    /// Enable the `opencode_cli` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum execution time in seconds (coding tasks can be long)
+    #[serde(default = "default_opencode_cli_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Maximum output size in bytes (2MB default)
+    #[serde(default = "default_opencode_cli_max_output_bytes")]
+    pub max_output_bytes: usize,
+    /// Extra env vars passed to the opencode subprocess
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+}
+
+fn default_opencode_cli_timeout_secs() -> u64 {
+    600
+}
+
+fn default_opencode_cli_max_output_bytes() -> usize {
+    2_097_152
+}
+
+impl Default for OpenCodeCliConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_secs: default_opencode_cli_timeout_secs(),
+            max_output_bytes: default_opencode_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
         }
     }
@@ -7340,6 +7482,10 @@ impl Default for Config {
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
+            codex_cli: CodexCliConfig::default(),
+            gemini_cli: GeminiCliConfig::default(),
+            opencode_cli: OpenCodeCliConfig::default(),
+            sop: SopConfig::default(),
         }
     }
 }
@@ -9850,6 +9996,70 @@ async fn sync_directory(path: &Path) -> Result<()> {
     }
 }
 
+// ── SOP engine configuration ───────────────────────────────────
+
+/// Standard Operating Procedures engine configuration (`[sop]`).
+///
+/// The `default_execution_mode` field uses the `SopExecutionMode` type from
+/// `sop::types` (re-exported via `sop::SopExecutionMode`). To avoid circular
+/// module references, config stores it using the same enum definition.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SopConfig {
+    /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
+    /// Falls back to `<workspace>/sops` when omitted.
+    #[serde(default)]
+    pub sops_dir: Option<String>,
+
+    /// Default execution mode for SOPs that omit `execution_mode`.
+    /// Values: `auto`, `supervised` (default), `step_by_step`,
+    /// `priority_based`, `deterministic`.
+    #[serde(default = "default_sop_execution_mode")]
+    pub default_execution_mode: String,
+
+    /// Maximum total concurrent SOP runs across all SOPs.
+    #[serde(default = "default_sop_max_concurrent_total")]
+    pub max_concurrent_total: usize,
+
+    /// Approval timeout in seconds. When a run waits for approval longer than
+    /// this, Critical/High-priority SOPs auto-approve; others stay waiting.
+    /// Set to 0 to disable timeout.
+    #[serde(default = "default_sop_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+
+    /// Maximum number of finished runs kept in memory for status queries.
+    /// Oldest runs are evicted when over capacity. 0 = unlimited.
+    #[serde(default = "default_sop_max_finished_runs")]
+    pub max_finished_runs: usize,
+}
+
+fn default_sop_execution_mode() -> String {
+    "supervised".to_string()
+}
+
+fn default_sop_max_concurrent_total() -> usize {
+    4
+}
+
+fn default_sop_approval_timeout_secs() -> u64 {
+    300
+}
+
+fn default_sop_max_finished_runs() -> usize {
+    100
+}
+
+impl Default for SopConfig {
+    fn default() -> Self {
+        Self {
+            sops_dir: None,
+            default_execution_mode: default_sop_execution_mode(),
+            max_concurrent_total: default_sop_max_concurrent_total(),
+            approval_timeout_secs: default_sop_approval_timeout_secs(),
+            max_finished_runs: default_sop_max_finished_runs(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10330,6 +10540,10 @@ default_temperature = 0.7
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
+            codex_cli: CodexCliConfig::default(),
+            gemini_cli: GeminiCliConfig::default(),
+            opencode_cli: OpenCodeCliConfig::default(),
+            sop: SopConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -10848,6 +11062,10 @@ default_temperature = 0.7
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
+            codex_cli: CodexCliConfig::default(),
+            gemini_cli: GeminiCliConfig::default(),
+            opencode_cli: OpenCodeCliConfig::default(),
+            sop: SopConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -14411,9 +14629,9 @@ require_otp_to_resume = true
 
     // ── Bootstrap files ─────────────────────────────────────
 
-    #[test]
+    #[tokio::test]
     async fn ensure_bootstrap_files_creates_missing_files() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
         let ws = tmp.path().join("workspace");
         let _: () = tokio::fs::create_dir_all(&ws).await.unwrap();
 
@@ -14427,9 +14645,9 @@ require_otp_to_resume = true
         assert!(identity.contains("IDENTITY.md"));
     }
 
-    #[test]
+    #[tokio::test]
     async fn ensure_bootstrap_files_does_not_overwrite_existing() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
         let ws = tmp.path().join("workspace");
         let _: () = tokio::fs::create_dir_all(&ws).await.unwrap();
 

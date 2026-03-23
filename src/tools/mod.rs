@@ -25,6 +25,7 @@ pub mod claude_code;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
+pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
 pub mod cron_add;
@@ -39,6 +40,7 @@ pub mod discord_search;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod gemini_cli;
 pub mod git_operations;
 pub mod glob_search;
 pub mod google_workspace;
@@ -69,6 +71,7 @@ pub mod model_routing_config;
 pub mod model_switch;
 pub mod node_tool;
 pub mod notion_tool;
+pub mod opencode_cli;
 pub mod pdf_read;
 pub mod poll;
 pub mod project_intel;
@@ -85,6 +88,11 @@ pub mod sessions;
 pub mod shell;
 pub mod skill_http;
 pub mod skill_tool;
+pub mod sop_advance;
+pub mod sop_approve;
+pub mod sop_execute;
+pub mod sop_list;
+pub mod sop_status;
 pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
@@ -106,6 +114,7 @@ pub use canvas::{CanvasStore, CanvasTool};
 pub use claude_code::ClaudeCodeTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
+pub use codex_cli::CodexCliTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -116,10 +125,14 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use data_management::DataManagementTool;
 pub use delegate::DelegateTool;
+// Re-exported for downstream consumers of background delegation results.
+#[allow(unused_imports)]
+pub use delegate::{BackgroundDelegateResult, BackgroundTaskStatus};
 pub use discord_search::DiscordSearchTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use gemini_cli::GeminiCliTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
 pub use google_workspace::GoogleWorkspaceTool;
@@ -148,6 +161,7 @@ pub use model_switch::ModelSwitchTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
 pub use notion_tool::NotionTool;
+pub use opencode_cli::OpenCodeCliTool;
 pub use pdf_read::PdfReadTool;
 pub use poll::{ChannelMapHandle, PollTool};
 pub use project_intel::ProjectIntelTool;
@@ -166,6 +180,11 @@ pub use shell::ShellTool;
 pub use skill_http::SkillHttpTool;
 #[allow(unused_imports)]
 pub use skill_tool::SkillShellTool;
+pub use sop_advance::SopAdvanceTool;
+pub use sop_approve::SopApproveTool;
+pub use sop_execute::SopExecuteTool;
+pub use sop_list::SopListTool;
+pub use sop_status::SopStatusTool;
 pub use swarm::SwarmTool;
 pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
@@ -655,6 +674,30 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    // Codex CLI delegation tool
+    if root_config.codex_cli.enabled {
+        tool_arcs.push(Arc::new(CodexCliTool::new(
+            security.clone(),
+            root_config.codex_cli.clone(),
+        )));
+    }
+
+    // Gemini CLI delegation tool
+    if root_config.gemini_cli.enabled {
+        tool_arcs.push(Arc::new(GeminiCliTool::new(
+            security.clone(),
+            root_config.gemini_cli.clone(),
+        )));
+    }
+
+    // OpenCode CLI delegation tool
+    if root_config.opencode_cli.enabled {
+        tool_arcs.push(Arc::new(OpenCodeCliTool::new(
+            security.clone(),
+            root_config.opencode_cli.clone(),
+        )));
+    }
+
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
@@ -701,6 +744,18 @@ pub fn all_tools_with_runtime(
         security.clone(),
         Arc::clone(&channel_map_handle),
     )));
+
+    // SOP tools (registered when sops_dir is configured)
+    if root_config.sop.sops_dir.is_some() {
+        let sop_engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            root_config.sop.clone(),
+        )));
+        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
+    }
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
