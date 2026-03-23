@@ -3084,7 +3084,11 @@ pub(crate) async fn run_tool_call_loop(
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty() {
                 if let Some(ref tx) = on_delta {
-                    let _ = tx.send(display_text.clone()).await;
+                    let mut narration = display_text.clone();
+                    if !narration.ends_with('\n') {
+                        narration.push('\n');
+                    }
+                    let _ = tx.send(narration).await;
                 }
             }
             if !silent {
@@ -6360,7 +6364,7 @@ mod tests {
 
         let explanation_idx = deltas
             .iter()
-            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.")
+            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.\n")
             .expect("native assistant text should be relayed to on_delta");
         let clear_idx = deltas
             .iter()
