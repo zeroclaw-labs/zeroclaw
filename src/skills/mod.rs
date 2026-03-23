@@ -27,6 +27,10 @@ const MAX_CLAWHUB_ZIP_BYTES: u64 = 50 * 1024 * 1024; // 50 MiB
 /// A skill is a user-defined or community-built capability.
 /// Skills live in `~/.zeroclaw/workspace/skills/<name>/SKILL.md`
 /// and can include tool definitions, prompts, and automation scripts.
+///
+/// Compatible with the Anthropic Agent Skills format used by OpenClaw
+/// and RustyClaw: YAML frontmatter with gating requirements, metadata
+/// namespaces, and markdown-based agent instructions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Skill {
     pub name: String,
@@ -42,6 +46,75 @@ pub struct Skill {
     pub prompts: Vec<String>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    /// Gating requirements (bins, env vars) that must be satisfied.
+    #[serde(default)]
+    pub requires: SkillRequirements,
+    /// Whether this skill is enabled (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Gating requirements for a skill.
+///
+/// Compatible with the OpenClaw/RustyClaw `requires` frontmatter:
+/// ```yaml
+/// requires:
+///   bins: [git, gh]      # all must be on PATH
+///   any_bins: [docker, podman]  # at least one must be on PATH
+///   env: [GITHUB_TOKEN]  # all must be set
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillRequirements {
+    /// Binaries that must all be present on PATH.
+    #[serde(default)]
+    pub bins: Vec<String>,
+    /// At least one of these binaries must be present on PATH.
+    #[serde(default, alias = "anyBins")]
+    pub any_bins: Vec<String>,
+    /// Environment variables that must all be set.
+    #[serde(default)]
+    pub env: Vec<String>,
+}
+
+impl SkillRequirements {
+    /// Check whether all requirements are satisfied on this system.
+    /// Returns a list of unmet requirements (empty = all met).
+    pub fn check(&self) -> Vec<String> {
+        let mut unmet = Vec::new();
+
+        for bin in &self.bins {
+            if which::which(bin).is_err() {
+                unmet.push(format!("binary '{}' not found on PATH", bin));
+            }
+        }
+
+        if !self.any_bins.is_empty() {
+            let found = self.any_bins.iter().any(|b| which::which(b).is_ok());
+            if !found {
+                unmet.push(format!(
+                    "none of [{}] found on PATH",
+                    self.any_bins.join(", ")
+                ));
+            }
+        }
+
+        for var in &self.env {
+            if std::env::var(var).is_err() {
+                unmet.push(format!("environment variable '{}' is not set", var));
+            }
+        }
+
+        unmet
+    }
+
+    /// Returns true if no requirements are specified.
+    pub fn is_empty(&self) -> bool {
+        self.bins.is_empty() && self.any_bins.is_empty() && self.env.is_empty()
+    }
 }
 
 /// A tool defined by a skill (shell command, HTTP call, etc.)
@@ -79,7 +152,7 @@ struct SkillMeta {
     tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SkillMarkdownMeta {
     name: Option<String>,
     description: Option<String>,
@@ -87,6 +160,26 @@ struct SkillMarkdownMeta {
     author: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
+    /// Gating requirements (OpenClaw/RustyClaw compatible).
+    #[serde(default)]
+    requires: SkillRequirements,
+    /// Whether this skill is enabled (default: true).
+    #[serde(default = "default_true")]
+    enabled: bool,
+}
+
+impl Default for SkillMarkdownMeta {
+    fn default() -> Self {
+        Self {
+            name: None,
+            description: None,
+            version: None,
+            author: None,
+            tags: Vec::new(),
+            requires: SkillRequirements::default(),
+            enabled: true,
+        }
+    }
 }
 
 fn default_version() -> String {
@@ -165,7 +258,33 @@ fn load_skills_with_open_skills_config(
     }
 
     skills.extend(load_workspace_skills(workspace_dir, allow_scripts));
+    apply_skill_gating(skills)
+}
+
+/// Filter out disabled skills and those with unmet gating requirements.
+fn apply_skill_gating(skills: Vec<Skill>) -> Vec<Skill> {
     skills
+        .into_iter()
+        .filter(|skill| {
+            if !skill.enabled {
+                tracing::info!("skill '{}' is disabled, skipping", skill.name);
+                return false;
+            }
+            if skill.requires.is_empty() {
+                return true;
+            }
+            let unmet = skill.requires.check();
+            if unmet.is_empty() {
+                return true;
+            }
+            tracing::info!(
+                "skill '{}' has unmet requirements: {}",
+                skill.name,
+                unmet.join("; ")
+            );
+            false
+        })
+        .collect()
 }
 
 fn load_workspace_skills(workspace_dir: &Path, allow_scripts: bool) -> Vec<Skill> {
@@ -543,6 +662,8 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tools: manifest.tools,
         prompts: manifest.prompts,
         location: Some(path.to_path_buf()),
+        requires: SkillRequirements::default(),
+        enabled: true,
     })
 }
 
@@ -569,6 +690,8 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         location: Some(path.to_path_buf()),
+        requires: parsed.meta.requires,
+        enabled: parsed.meta.enabled,
     })
 }
 
@@ -608,6 +731,8 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         location: Some(path.to_path_buf()),
+        requires: parsed.meta.requires,
+        enabled: parsed.meta.enabled,
     }))
 }
 
@@ -1573,6 +1698,8 @@ command = "echo hello"
             tools: vec![],
             prompts: vec!["Do the thing.".to_string()],
             location: None,
+            requires: SkillRequirements::default(),
+            enabled: true,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("<available_skills>"));
@@ -1597,6 +1724,8 @@ command = "echo hello"
             }],
             prompts: vec!["Do the thing.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
+            requires: SkillRequirements::default(),
+            enabled: true,
         }];
         let prompt = skills_to_prompt_with_mode(
             &skills,
@@ -1801,6 +1930,8 @@ description = "Bare minimum"
             }],
             prompts: vec![],
             location: None,
+            requires: SkillRequirements::default(),
+            enabled: true,
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
@@ -1822,6 +1953,8 @@ description = "Bare minimum"
             tools: vec![],
             prompts: vec!["Use <tool> & check \"quotes\".".to_string()],
             location: None,
+            requires: SkillRequirements::default(),
+            enabled: true,
         }];
 
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
