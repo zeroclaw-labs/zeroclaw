@@ -156,6 +156,16 @@ jobs:
       - name: Check all features
         run: cargo check --features ci-all --locked
 
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+
   docs-quality:
     name: Docs Quality
     runs-on: ubuntu-latest
@@ -180,7 +190,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [lint, lint-strict-delta, test, build, docs-quality, check-all-features]
+    needs: [lint, lint-strict-delta, test, build, docs-quality, check-all-features, secret-scan]
     runs-on: ubuntu-latest
     steps:
       - name: Check upstream job results

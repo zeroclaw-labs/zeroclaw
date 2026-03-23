@@ -128,6 +128,16 @@ jobs:
       - name: Check licenses and sources
         run: cargo deny check licenses sources
 
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+
   check-32bit:
     name: "Check (32-bit)"
     runs-on: ubuntu-latest
@@ -151,7 +161,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [lint, test, build, security, check-32bit]
+    needs: [lint, test, build, security, secret-scan, check-32bit]
     runs-on: ubuntu-latest
     steps:
       - name: Check upstream job results
@@ -164,12 +174,12 @@ jobs:
   security-gate:
     name: Security Required Gate
     if: always()
-    needs: [security]
+    needs: [security, secret-scan]
     runs-on: ubuntu-latest
     steps:
-      - name: Check security job result
+      - name: Check security job results
         run: |
-          if [[ "${{ needs.security.result }}" != "success" ]]; then
-            echo "::error::Security audit failed or was cancelled"
+          if [[ "${{ needs.security.result }}" != "success" || "${{ needs.secret-scan.result }}" != "success" ]]; then
+            echo "::error::Security audit or secret scan failed or was cancelled"
             exit 1
           fi

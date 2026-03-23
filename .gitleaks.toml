@@ -1,0 +1,18 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "ZeroClaw global allowlist — test fixtures, example configs, and documentation placeholders"
+paths = [
+  '''^tests/''',
+  '''^examples/config\.example\.toml$''',
+  '''^install\.sh$''',
+  '''^src/security/secrets\.rs$''',
+  '''^src/security/leak_detector\.rs$''',
+  '''^src/config/schema\.rs$''',
+  '''^src/agent/loop_\.rs$''',
+  '''^src/providers/anthropic\.rs$''',
+  '''^docs/setup-guides/zai-glm-setup\.md$''',
+  '''^docs/vi/zai-glm-setup\.md$''',
+  '''^docs/superpowers/specs/.*linkedin-tool-design\.md$''',
+]
