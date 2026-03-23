@@ -603,7 +603,7 @@ async fn run_job_command_with_timeout(
     if let Err(msg) = crate::security::tirith::guard(
         &job.command,
         crate::security::tirith::ShellKind::Posix,
-        &crate::security::tirith::TirithConfig::default(),
+        &config.security.tirith,
     )
     .await
     {

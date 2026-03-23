@@ -6073,7 +6073,35 @@ pub struct SecurityConfig {
     /// Nevis IAM integration for SSO/MFA authentication and role-based access.
     #[serde(default)]
     pub nevis: NevisConfig,
+
+    /// Tirith pre-exec security scanning configuration.
+    #[serde(default)]
+    pub tirith: TirithScanConfig,
 }
+
+/// Tirith security scanner configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default)]
+pub struct TirithScanConfig {
+    /// Enable tirith scanning before shell/cron command execution.
+    pub enabled: bool,
+    /// Path to the tirith binary (auto-resolved from PATH if "tirith").
+    pub bin: String,
+    /// Scan timeout in seconds.
+    pub timeout_secs: u64,
+    /// If true, allow execution when tirith is unavailable or errors.
+    pub fail_open: bool,
+}
+
+impl Default for TirithScanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bin: "tirith".to_string(),
+            timeout_secs: 5,
+            fail_open: true,
+        }
+    }
 
 /// OTP validation strategy.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]

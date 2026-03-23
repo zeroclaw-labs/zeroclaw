@@ -46,6 +46,7 @@ pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
+    tirith_config: crate::config::schema::TirithScanConfig,
 }
 
 impl ShellTool {
@@ -54,6 +55,20 @@ impl ShellTool {
             security,
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
+            tirith_config: Default::default(),
+        }
+    }
+
+    pub fn new_with_tirith(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        tirith_config: crate::config::schema::TirithScanConfig,
+    ) -> Self {
+        Self {
+            security,
+            runtime,
+            sandbox: Arc::new(crate::security::NoopSandbox),
+            tirith_config,
         }
     }
 
@@ -66,6 +81,7 @@ impl ShellTool {
             security,
             runtime,
             sandbox,
+            tirith_config: Default::default(),
         }
     }
 }
@@ -175,7 +191,7 @@ impl Tool for ShellTool {
         if let Err(msg) = crate::security::tirith::guard(
             command,
             crate::security::tirith::ShellKind::Native,
-            &crate::security::tirith::TirithConfig::default(),
+            &self.tirith_config,
         )
         .await
         {
