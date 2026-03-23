@@ -436,7 +436,10 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     // gets an independent session.  Include thread_ts for per-topic
     // isolation in forum groups.
     match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}_{}", msg.channel, msg.reply_target, tid, msg.sender),
+        Some(tid) => format!(
+            "{}_{}_{}_{}",
+            msg.channel, msg.reply_target, tid, msg.sender
+        ),
         None => format!("{}_{}", msg.channel, msg.reply_target),
     }
 }
