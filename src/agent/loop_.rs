@@ -3076,7 +3076,14 @@ pub(crate) async fn run_tool_call_loop(
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty() {
                 if let Some(ref tx) = on_delta {
-                    let _ = tx.send(display_text.clone()).await;
+                    // Ensure narration text ends with a newline so the next
+                    // draft status line (e.g. "⏳ tool_name") doesn't get
+                    // concatenated directly onto it.
+                    let mut text = display_text.clone();
+                    if !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    let _ = tx.send(text).await;
                 }
             }
             if !silent {
@@ -6306,8 +6313,8 @@ mod tests {
 
         let explanation_idx = deltas
             .iter()
-            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.")
-            .expect("native assistant text should be relayed to on_delta");
+            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.\n")
+            .expect("native assistant text should be relayed to on_delta with trailing newline");
         let clear_idx = deltas
             .iter()
             .position(|delta| delta == DRAFT_CLEAR_SENTINEL)
