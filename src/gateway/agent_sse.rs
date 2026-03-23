@@ -1,6 +1,6 @@
 use super::AppState;
 use crate::agent::loop_::{
-    run_tool_call_loop, scrub_credentials, trim_history, DRAFT_CLEAR_SENTINEL,
+    run_tool_call_loop, scrub_credentials, trim_history, DraftEvent,
 };
 use crate::approval::ApprovalManager;
 use crate::providers::ChatMessage;
@@ -347,7 +347,7 @@ pub async fn handle_agent_sse(
             (None, None)
         };
 
-        let (built_tools, _delegate_handle, _reaction_handle) = tools::all_tools_with_runtime(
+        let (built_tools, _delegate_handle, _reaction_handle, _channel_map_handle, _ask_user_handle, _escalate_handle) = tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,
             runtime,
@@ -376,14 +376,17 @@ pub async fn handle_agent_sse(
             })
             .collect();
 
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
         let event_tx_delta = event_tx.clone();
         tokio::spawn(async move {
             while let Some(delta) = delta_rx.recv().await {
-                if delta == DRAFT_CLEAR_SENTINEL {
-                    continue;
+                match delta {
+                    DraftEvent::Clear => continue,
+                    DraftEvent::Progress(_) => continue,
+                    DraftEvent::Content(text) => {
+                        let _ = event_tx_delta.send(AgentEvent::chunk(text)).await;
+                    }
                 }
-                let _ = event_tx_delta.send(AgentEvent::chunk(delta)).await;
             }
         });
 
@@ -420,6 +423,9 @@ pub async fn handle_agent_sse(
             None,
             None,
             &config.pacing,
+            0,
+            0,
+            None,
         )
         .await;
 

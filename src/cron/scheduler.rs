@@ -715,6 +715,23 @@ pub(crate) async fn deliver_announcement(
                 anyhow::bail!("web channel not initialized");
             }
         }
+        "lark" | "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let channel = if let Some(cfg) = &config.channels_config.lark {
+                    crate::channels::lark::LarkChannel::from_config(cfg)
+                } else if let Some(cfg) = &config.channels_config.feishu {
+                    crate::channels::lark::LarkChannel::from_feishu_config(cfg)
+                } else {
+                    anyhow::bail!("lark/feishu channel not configured");
+                };
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("lark/feishu delivery requires `channel-lark` feature");
+            }
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 

@@ -835,13 +835,17 @@ fn load_jsonl_messages(path: &std::path::Path) -> Vec<crate::providers::traits::
 /// Auto-detect the best channel for heartbeat delivery by checking which
 /// channels are configured. Returns the first match in priority order.
 fn auto_detect_heartbeat_channel(config: &Config) -> Option<(String, String)> {
-    // Priority order: telegram > discord > slack > mattermost
+    // Priority order: telegram > lark/feishu > discord > slack > mattermost
     if let Some(tg) = &config.channels_config.telegram {
         // Use the first allowed_user as target, or fall back to empty (broadcast)
         let target = tg.allowed_users.first().cloned().unwrap_or_default();
         if !target.is_empty() {
             return Some(("telegram".to_string(), target));
         }
+    }
+    if config.channels_config.lark.is_some() || config.channels_config.feishu.is_some() {
+        // Lark/Feishu requires explicit target (heartbeat.to = chat_id)
+        return None;
     }
     if config.channels_config.discord.is_some() {
         // Discord requires explicit target — can't auto-detect
@@ -887,6 +891,23 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                     "heartbeat.target is set to mattermost but channels_config.mattermost is not configured"
                 );
             }
+        }
+        "lark" | "feishu" => {
+            if config.channels_config.lark.is_none() && config.channels_config.feishu.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to lark/feishu but neither channels_config.lark nor channels_config.feishu is configured"
+                );
+            }
+        }
+        "qq" | "napcat" => {
+            if config.channels_config.qq.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to qq but channels_config.qq/napcat is not configured"
+                );
+            }
+        }
+        "web" => {
+            // Web channel is always available when enabled
         }
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }

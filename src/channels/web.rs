@@ -359,6 +359,7 @@ pub async fn handle_ws_connection(
                                     timestamp: ts,
                                     thread_ts: None,
                                     interruption_scope_id: None,
+                                    attachments: vec![],
                                 }).await;
                             }
                             Ok(ClientMessage::Command { content }) => {
@@ -375,6 +376,7 @@ pub async fn handle_ws_connection(
                                     timestamp: ts,
                                     thread_ts: None,
                                     interruption_scope_id: None,
+                                    attachments: vec![],
                                 }).await;
                             }
                             Ok(ClientMessage::Ping) => {
