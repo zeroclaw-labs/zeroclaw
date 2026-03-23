@@ -17,6 +17,9 @@ struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
+    /// Explicitly disable streaming so custom OpenAI-compatible proxies
+    /// (e.g. sub2api) do not default to SSE mode when the field is absent.
+    stream: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -58,6 +61,9 @@ struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
     temperature: f64,
+    /// Explicitly disable streaming so custom OpenAI-compatible proxies
+    /// (e.g. sub2api) do not default to SSE mode when the field is absent.
+    stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -368,6 +374,7 @@ impl Provider for OpenAiProvider {
             model: model.to_string(),
             messages,
             temperature: adjusted_temperature,
+            stream: false,
         };
 
         let response = self
@@ -409,6 +416,7 @@ impl Provider for OpenAiProvider {
             model: model.to_string(),
             messages: Self::convert_messages(request.messages),
             temperature: adjusted_temperature,
+            stream: false,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
         };
@@ -475,6 +483,7 @@ impl Provider for OpenAiProvider {
             model: model.to_string(),
             messages: Self::convert_messages(messages),
             temperature: adjusted_temperature,
+            stream: false,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
         };
@@ -575,11 +584,13 @@ mod tests {
                 },
             ],
             temperature: 0.7,
+            stream: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
         assert!(json.contains("\"role\":\"user\""));
         assert!(json.contains("gpt-4o"));
+        assert!(json.contains("\"stream\":false"));
     }
 
     #[test]
@@ -591,10 +602,12 @@ mod tests {
                 content: "hello".to_string(),
             }],
             temperature: 0.0,
+            stream: false,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(!json.contains("system"));
+        assert!(!json.contains("\"role\":\"system\""));
         assert!(json.contains("\"temperature\":0.0"));
+        assert!(json.contains("\"stream\":false"));
     }
 
     #[test]

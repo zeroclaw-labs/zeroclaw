@@ -39,8 +39,15 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
     }
     // Fallback: parse status codes from stringified errors (some providers
     // embed codes in error messages rather than returning typed HTTP errors).
+    //
+    // IMPORTANT: only scan the *header* portion (before the first ": " separator).
+    // The error message format is "{provider} API error ({status}): {body}".
+    // Scanning the full string would cause embedded 4xx codes in the JSON response
+    // body (e.g. sub2api 502 body: `{"error":{"code":400}}`) to be misclassified
+    // as non-retryable, aborting the retry loop prematurely. Fix for #4299/#4296.
     let msg = err.to_string();
-    for word in msg.split(|c: char| !c.is_ascii_digit()) {
+    let header = msg.split(": ").next().unwrap_or(&msg);
+    for word in header.split(|c: char| !c.is_ascii_digit()) {
         if let Ok(code) = word.parse::<u16>() {
             if (400..500).contains(&code) {
                 return code != 429 && code != 408;
@@ -2358,5 +2365,37 @@ mod tests {
         // A regular 400 error (e.g. invalid API key) should still be non-retryable.
         let err = anyhow::anyhow!("400 Bad Request: invalid api key provided");
         assert!(is_non_retryable(&err));
+    }
+
+    // ── §2.x Regression: #4299/#4296 – sub2api 502 with embedded 400 ─────
+
+    #[test]
+    fn non_retryable_does_not_flag_502_with_embedded_400_in_body() {
+        // Regression test for #4299/#4296: custom OpenAI-compatible proxies
+        // (e.g. sub2api) may return a 502 whose JSON body contains a nested
+        // `"code": 400` field. The string-based fallback must NOT pick up that
+        // embedded 400 and incorrectly classify the error as non-retryable.
+        let err = anyhow::anyhow!(
+            "{}",
+            r#"OpenAI API error (502 Bad Gateway): {"error":{"message":"Upstream request failed","type":"upstream_error","code":400}}"#
+        );
+        assert!(
+            !is_non_retryable(&err),
+            "502 with embedded 400 in body must NOT be treated as non-retryable; \
+             the retry loop must keep trying"
+        );
+    }
+
+    #[test]
+    fn non_retryable_flags_genuine_400_error() {
+        // Genuine 400 from a custom proxy must still be non-retryable.
+        let err = anyhow::anyhow!(
+            "{}",
+            r#"OpenAI API error (400 Bad Request): {"error":{"message":"invalid request"}}"#
+        );
+        assert!(
+            is_non_retryable(&err),
+            "genuine 400 HTTP status must still be treated as non-retryable"
+        );
     }
 }
