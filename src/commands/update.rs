@@ -1,6 +1,7 @@
 //! `zeroclaw update` — self-update pipeline with rollback.
 
 use anyhow::{bail, Context, Result};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -14,6 +15,8 @@ pub struct UpdateInfo {
     pub current_version: String,
     pub latest_version: String,
     pub download_url: Option<String>,
+    pub checksum_url: Option<String>,
+    pub asset_filename: Option<String>,
     pub is_newer: bool,
 }
 
@@ -57,13 +60,16 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
         .trim_start_matches('v')
         .to_string();
 
-    let download_url = find_asset_url(&release);
+    let (download_url, asset_filename) = find_asset_url_and_name(&release);
+    let checksum_url = find_checksum_url(&release);
     let is_newer = version_is_newer(&current, &tag);
 
     Ok(UpdateInfo {
         current_version: current,
         latest_version: tag,
         download_url,
+        checksum_url,
+        asset_filename,
         is_newer,
     })
 }
@@ -98,6 +104,24 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let download_path = temp_dir.path().join("zeroclaw_new");
     download_binary(&download_url, &download_path).await?;
+
+    // Phase 2b: Checksum verification
+    if let Some(checksum_url) = &update_info.checksum_url {
+        info!("Verifying SHA256 checksum...");
+        let asset_name = update_info
+            .asset_filename
+            .as_deref()
+            .context("asset filename missing for checksum verification")?;
+        match verify_checksum_from_release(checksum_url, asset_name, &download_path).await {
+            Ok(()) => info!("SHA256 checksum verified successfully"),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&download_path).await;
+                bail!("Checksum verification failed: {e}");
+            }
+        }
+    } else {
+        warn!("SHA256SUMS not found in release assets — skipping checksum verification");
+    }
 
     // Phase 3: Backup
     info!("Phase 3/6: Creating backup...");
@@ -145,7 +169,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     }
 }
 
-fn find_asset_url(release: &serde_json::Value) -> Option<String> {
+fn find_asset_url_and_name(release: &serde_json::Value) -> (Option<String>, Option<String>) {
     let target = if cfg!(target_os = "macos") {
         if cfg!(target_arch = "aarch64") {
             "aarch64-apple-darwin"
@@ -159,16 +183,37 @@ fn find_asset_url(release: &serde_json::Value) -> Option<String> {
             "x86_64-unknown-linux"
         }
     } else {
-        return None;
+        return (None, None);
     };
 
+    let assets = match release["assets"].as_array() {
+        Some(a) => a,
+        None => return (None, None),
+    };
+
+    match assets.iter().find(|asset| {
+        asset["name"]
+            .as_str()
+            .map(|name| name.contains(target))
+            .unwrap_or(false)
+    }) {
+        Some(asset) => {
+            let url = asset["browser_download_url"].as_str().map(String::from);
+            let name = asset["name"].as_str().map(String::from);
+            (url, name)
+        }
+        None => (None, None),
+    }
+}
+
+fn find_checksum_url(release: &serde_json::Value) -> Option<String> {
     release["assets"]
         .as_array()?
         .iter()
         .find(|asset| {
             asset["name"]
                 .as_str()
-                .map(|name| name.contains(target))
+                .map(|name| name == "SHA256SUMS")
                 .unwrap_or(false)
         })
         .and_then(|asset| asset["browser_download_url"].as_str().map(String::from))
@@ -240,6 +285,72 @@ async fn validate_binary(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Download SHA256SUMS from the release, parse the expected hash for the given
+/// asset filename, and verify it against the downloaded file.
+async fn verify_checksum_from_release(
+    checksum_url: &str,
+    asset_name: &str,
+    downloaded_file: &Path,
+) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .user_agent(format!("zeroclaw/{}", env!("CARGO_PKG_VERSION")))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let resp = client
+        .get(checksum_url)
+        .send()
+        .await
+        .context("failed to download SHA256SUMS")?;
+    if !resp.status().is_success() {
+        bail!("SHA256SUMS download returned {}", resp.status());
+    }
+
+    let body = resp
+        .text()
+        .await
+        .context("failed to read SHA256SUMS body")?;
+    let expected_hash = parse_sha256sums(&body, asset_name)?;
+    verify_checksum(downloaded_file, &expected_hash).await
+}
+
+/// Parse a SHA256SUMS file and return the hex hash for the given filename.
+///
+/// Expected format per line: `<hex_hash>  <filename>` (two-space separator).
+fn parse_sha256sums(contents: &str, filename: &str) -> Result<String> {
+    for line in contents.lines() {
+        // Format: "<hash>  <filename>" (two spaces) or "<hash> <filename>" (one space)
+        let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
+        if parts.len() == 2 {
+            let hash = parts[0].trim();
+            let name = parts[1].trim();
+            if name == filename {
+                return Ok(hash.to_lowercase());
+            }
+        }
+    }
+    bail!("no SHA256 hash found for '{}' in SHA256SUMS file", filename)
+}
+
+/// Compute SHA256 of a file and compare against the expected hex hash.
+pub(crate) async fn verify_checksum(path: &Path, expected_hash: &str) -> Result<()> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .context("failed to read file for checksum")?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let computed = format!("{:x}", hasher.finalize());
+
+    if computed != expected_hash.to_lowercase() {
+        bail!(
+            "SHA256 mismatch: expected {}, computed {}",
+            expected_hash,
+            computed
+        );
+    }
+    Ok(())
+}
+
 async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
     tokio::fs::copy(new, target)
         .await
@@ -272,5 +383,96 @@ mod tests {
         assert!(!version_is_newer("0.5.0", "0.4.3"));
         assert!(!version_is_newer("0.4.3", "0.4.3"));
         assert!(version_is_newer("1.0.0", "2.0.0"));
+    }
+
+    #[test]
+    fn test_parse_sha256sums_found() {
+        let contents = "abc123def456  zeroclaw-x86_64-unknown-linux\n\
+                        789fedcba321  zeroclaw-aarch64-apple-darwin\n";
+        let hash = parse_sha256sums(contents, "zeroclaw-x86_64-unknown-linux").unwrap();
+        assert_eq!(hash, "abc123def456");
+    }
+
+    #[test]
+    fn test_parse_sha256sums_not_found() {
+        let contents = "abc123def456  zeroclaw-x86_64-unknown-linux\n";
+        let result = parse_sha256sums(contents, "zeroclaw-aarch64-apple-darwin");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_sha256sums_normalizes_case() {
+        let contents = "ABCDEF123456  some-binary\n";
+        let hash = parse_sha256sums(contents, "some-binary").unwrap();
+        assert_eq!(hash, "abcdef123456");
+    }
+
+    #[test]
+    fn test_parse_sha256sums_single_space() {
+        // Some tools produce single-space separation
+        let contents = "abc123 some-binary\n";
+        let hash = parse_sha256sums(contents, "some-binary").unwrap();
+        assert_eq!(hash, "abc123");
+    }
+
+    #[tokio::test]
+    async fn test_verify_checksum_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_file");
+        let data = b"hello world";
+        tokio::fs::write(&file_path, data).await.unwrap();
+
+        // SHA256 of "hello world"
+        let expected = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        verify_checksum(&file_path, expected).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_verify_checksum_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test_file");
+        tokio::fs::write(&file_path, b"hello world").await.unwrap();
+
+        let result = verify_checksum(
+            &file_path,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SHA256 mismatch"));
+    }
+
+    #[test]
+    fn test_find_checksum_url() {
+        let release: serde_json::Value = serde_json::json!({
+            "assets": [
+                {
+                    "name": "zeroclaw-x86_64-unknown-linux",
+                    "browser_download_url": "https://example.com/binary"
+                },
+                {
+                    "name": "SHA256SUMS",
+                    "browser_download_url": "https://example.com/SHA256SUMS"
+                }
+            ]
+        });
+        assert_eq!(
+            find_checksum_url(&release),
+            Some("https://example.com/SHA256SUMS".to_string())
+        );
+    }
+
+    #[test]
+    fn test_find_checksum_url_missing() {
+        let release: serde_json::Value = serde_json::json!({
+            "assets": [
+                {
+                    "name": "zeroclaw-x86_64-unknown-linux",
+                    "browser_download_url": "https://example.com/binary"
+                }
+            ]
+        });
+        assert_eq!(find_checksum_url(&release), None);
     }
 }
