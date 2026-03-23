@@ -1315,6 +1315,15 @@ impl Provider for GeminiProvider {
         let (text, usage) = self
             .chat_with_history_full(&messages, model, temperature)
             .await?;
+        if let Some(ref u) = usage {
+            tracing::info!(
+                input_tokens = ?u.input_tokens,
+                output_tokens = ?u.output_tokens,
+                "Gemini cost tracking: chat() returning usage"
+            );
+        } else {
+            tracing::warn!("Gemini cost tracking: chat() usage is None");
+        }
         Ok(ChatResponse {
             text: Some(text),
             tool_calls: Vec::new(),
