@@ -11382,6 +11382,7 @@ auto_save = true
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                shell_timeout_secs: default_shell_timeout_secs(),
             },
             trust: crate::trust::TrustConfig::default(),
             backup: BackupConfig::default(),
