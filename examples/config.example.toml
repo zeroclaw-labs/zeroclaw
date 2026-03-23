@@ -81,3 +81,31 @@ schedule = { kind = "every", every_ms = 300000 }
 # mode = "announce"
 # channel = "telegram"
 # to = "123456789"
+
+# ── Cost Tracking Configuration ────────────────────────────────
+[cost]
+# Enable cost tracking and budget enforcement. Default: false
+enabled = false
+# Daily spending limit in USD. Default: 10.0
+daily_limit_usd = 10.0
+# Monthly spending limit in USD. Default: 100.0
+monthly_limit_usd = 100.0
+# Warn when spending reaches this percentage of limit. Default: 80
+warn_at_percent = 80
+# Allow requests to exceed budget with --override flag. Default: false
+allow_override = false
+
+# Per-model pricing (USD per 1M tokens).
+# Built-in defaults exist for popular models; add overrides here.
+# [cost.prices."anthropic/claude-opus-4-20250514"]
+# input = 15.0
+# output = 75.0
+# [cost.prices."anthropic/claude-sonnet-4-20250514"]
+# input = 3.0
+# output = 15.0
+# [cost.prices."openai/gpt-4o"]
+# input = 5.0
+# output = 15.0
+# [cost.prices."openai/gpt-4o-mini"]
+# input = 0.15
+# output = 0.60
