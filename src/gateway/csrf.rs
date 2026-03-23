@@ -108,8 +108,8 @@ impl CsrfProtection {
     }
 
     fn compute_mac(&self, nonce: &[u8]) -> [u8; 32] {
-        let mut mac = HmacSha256::new_from_slice(&self.secret)
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts any key length");
         mac.update(nonce);
         mac.finalize().into_bytes().into()
     }
@@ -126,7 +126,10 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.iter().zip(b.iter()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 #[cfg(test)]
@@ -137,7 +140,10 @@ mod tests {
     fn issue_and_validate_roundtrip() {
         let csrf = CsrfProtection::new();
         let token = csrf.issue_token();
-        assert!(csrf.validate_token(&token), "freshly issued token must validate");
+        assert!(
+            csrf.validate_token(&token),
+            "freshly issued token must validate"
+        );
     }
 
     #[test]
@@ -160,7 +166,10 @@ mod tests {
         let last = token.pop().unwrap();
         let replacement = if last == 'A' { 'B' } else { 'A' };
         token.push(replacement);
-        assert!(!csrf.validate_token(&token), "tampered token must be rejected");
+        assert!(
+            !csrf.validate_token(&token),
+            "tampered token must be rejected"
+        );
     }
 
     #[test]
@@ -198,7 +207,9 @@ mod tests {
 
     #[test]
     fn query_string_stripped_from_exempt_check() {
-        assert!(CsrfProtection::is_exempt_path("/webhook?hub.verify_token=foo"));
+        assert!(CsrfProtection::is_exempt_path(
+            "/webhook?hub.verify_token=foo"
+        ));
         assert!(!CsrfProtection::is_exempt_path("/api/config?debug=1"));
     }
 }

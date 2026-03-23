@@ -1022,7 +1022,10 @@ pub fn check_csrf(
     if csrf.validate_token(token) {
         Ok(())
     } else {
-        tracing::warn!(path, "CSRF validation failed: missing or invalid X-CSRF-Token");
+        tracing::warn!(
+            path,
+            "CSRF validation failed: missing or invalid X-CSRF-Token"
+        );
         Err(StatusCode::FORBIDDEN)
     }
 }
@@ -2184,7 +2187,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-                csrf: Arc::new(csrf::CsrfProtection::new()),
+            csrf: Arc::new(csrf::CsrfProtection::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2243,7 +2246,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-                csrf: Arc::new(csrf::CsrfProtection::new()),
+            csrf: Arc::new(csrf::CsrfProtection::new()),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2632,7 +2635,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-                csrf: Arc::new(csrf::CsrfProtection::new()),
+            csrf: Arc::new(csrf::CsrfProtection::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2705,7 +2708,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-                csrf: Arc::new(csrf::CsrfProtection::new()),
+            csrf: Arc::new(csrf::CsrfProtection::new()),
         };
 
         let headers = HeaderMap::new();
@@ -2790,7 +2793,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-                csrf: Arc::new(csrf::CsrfProtection::new()),
+            csrf: Arc::new(csrf::CsrfProtection::new()),
         };
 
         let response = handle_webhook(
@@ -2847,7 +2850,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-                csrf: Arc::new(csrf::CsrfProtection::new()),
+            csrf: Arc::new(csrf::CsrfProtection::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2909,7 +2912,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-                csrf: Arc::new(csrf::CsrfProtection::new()),
+            csrf: Arc::new(csrf::CsrfProtection::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -2976,7 +2979,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-                csrf: Arc::new(csrf::CsrfProtection::new()),
+            csrf: Arc::new(csrf::CsrfProtection::new()),
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -3039,7 +3042,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-                csrf: Arc::new(csrf::CsrfProtection::new()),
+            csrf: Arc::new(csrf::CsrfProtection::new()),
         };
 
         let mut headers = HeaderMap::new();
