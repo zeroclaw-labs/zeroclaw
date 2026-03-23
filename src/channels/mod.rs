@@ -722,10 +722,6 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
-    if !supports_runtime_model_switch(channel_name) {
-        return None;
-    }
-
     let trimmed = content.trim();
     if !trimmed.starts_with('/') {
         return None;
@@ -740,7 +736,10 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         .to_ascii_lowercase();
 
     match base_command.as_str() {
-        "/models" => {
+        // `/new` is available on every channel — no model-switch gate.
+        "/new" => Some(ChannelRuntimeCommand::NewSession),
+        // Model/provider switching is channel-gated.
+        "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(provider) = parts.next() {
                 Some(ChannelRuntimeCommand::SetProvider(
                     provider.trim().to_string(),
@@ -749,7 +748,7 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::ShowProviders)
             }
         }
-        "/model" => {
+        "/model" if supports_runtime_model_switch(channel_name) => {
             let model = parts.collect::<Vec<_>>().join(" ").trim().to_string();
             if model.is_empty() {
                 Some(ChannelRuntimeCommand::ShowModel)
@@ -757,7 +756,6 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
         }
-        "/new" => Some(ChannelRuntimeCommand::NewSession),
         _ => None,
     }
 }
@@ -4372,22 +4370,23 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let (mut built_tools, delegate_handle_ch, reaction_handle_ch) = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &workspace,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-        None,
-    );
+    let (mut built_tools, delegate_handle_ch, reaction_handle_ch, _channel_map_handle) =
+        tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            runtime,
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &workspace,
+            &config.agents,
+            config.api_key.as_deref(),
+            &config,
+            None,
+        );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.
@@ -6705,7 +6704,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             cost_tracking: None,
-            pacing: crate::config::PacingConfig::default(),
+            pacing: crate::config::PacingConfig {
+                loop_detection_enabled: false,
+                ..crate::config::PacingConfig::default()
+            },
         });
 
         process_channel_message(
@@ -6788,7 +6790,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             cost_tracking: None,
-            pacing: crate::config::PacingConfig::default(),
+            pacing: crate::config::PacingConfig {
+                loop_detection_enabled: false,
+                ..crate::config::PacingConfig::default()
+            },
         });
 
         process_channel_message(

@@ -440,7 +440,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let canvas_store = tools::CanvasStore::new();
 
-    let (mut tools_registry_raw, delegate_handle_gw, _reaction_handle_gw) =
+    let (mut tools_registry_raw, delegate_handle_gw, _reaction_handle_gw, _channel_map_handle) =
         tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,

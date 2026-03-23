@@ -12,6 +12,7 @@ use crate::runtime;
 use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
+use chrono::{Datelike, Timelike};
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
@@ -359,22 +360,23 @@ impl Agent {
             None
         };
 
-        let (mut tools, delegate_handle, _reaction_handle) = tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            memory.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.workspace_dir,
-            &config.agents,
-            config.api_key.as_deref(),
-            config,
-            None,
-        );
+        let (mut tools, delegate_handle, _reaction_handle, _channel_map_handle) =
+            tools::all_tools_with_runtime(
+                Arc::new(config.clone()),
+                &security,
+                runtime,
+                memory.clone(),
+                composio_key,
+                composio_entity_id,
+                &config.browser,
+                &config.http_request,
+                &config.web_fetch,
+                &config.workspace_dir,
+                &config.agents,
+                config.api_key.as_deref(),
+                config,
+                None,
+            );
 
         // ── Wire MCP tools (non-fatal) ─────────────────────────────
         // Replicates the same MCP initialization logic used in the CLI
@@ -668,11 +670,17 @@ impl Agent {
                 .await;
         }
 
-        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let now = chrono::Local::now();
+        let (year, month, day) = (now.year(), now.month(), now.day());
+        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
+        let tz = now.format("%Z");
+        let date_str =
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
+
         let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
+            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
         } else {
-            format!("{context}[{now}] {user_message}")
+            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
         };
 
         self.history

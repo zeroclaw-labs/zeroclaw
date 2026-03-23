@@ -119,7 +119,8 @@ impl OllamaProvider {
         }
 
         trimmed
-            .strip_suffix("/api")
+            .strip_suffix("/api/chat")
+            .or_else(|| trimmed.strip_suffix("/api"))
             .unwrap_or(trimmed)
             .trim_end_matches('/')
             .to_string()
@@ -902,6 +903,12 @@ mod tests {
     fn custom_url_strips_api_suffix() {
         let p = OllamaProvider::new(Some("https://ollama.com/api/"), None);
         assert_eq!(p.base_url, "https://ollama.com");
+    }
+
+    #[test]
+    fn custom_url_strips_api_chat_suffix() {
+        let p = OllamaProvider::new(Some("http://172.30.30.50:11434/api/chat"), None);
+        assert_eq!(p.base_url, "http://172.30.30.50:11434");
     }
 
     #[test]
