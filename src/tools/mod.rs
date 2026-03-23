@@ -55,6 +55,7 @@ pub mod jira_tool;
 pub mod knowledge_tool;
 pub mod linkedin;
 pub mod linkedin_client;
+pub mod llm_task;
 pub mod mcp_client;
 pub mod mcp_deferred;
 pub mod mcp_protocol;
@@ -133,6 +134,7 @@ pub use image_info::ImageInfoTool;
 pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
 pub use linkedin::LinkedInTool;
+pub use llm_task::LlmTaskTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
@@ -395,6 +397,40 @@ pub fn all_tools_with_runtime(
                 tracing::warn!("discord_search: failed to open discord.db: {e}");
             }
         }
+    }
+
+    // LLM task tool — always registered when a provider is configured
+    {
+        let llm_task_provider = root_config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string());
+        let llm_task_model = root_config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+        let llm_task_runtime_options = crate::providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: root_config.api_url.clone(),
+            zeroclaw_dir: root_config
+                .config_path
+                .parent()
+                .map(std::path::PathBuf::from),
+            secrets_encrypt: root_config.secrets.encrypt,
+            reasoning_enabled: root_config.runtime.reasoning_enabled,
+            reasoning_effort: root_config.runtime.reasoning_effort.clone(),
+            provider_timeout_secs: Some(root_config.provider_timeout_secs),
+            extra_headers: root_config.extra_headers.clone(),
+            api_path: root_config.api_path.clone(),
+        };
+        tool_arcs.push(Arc::new(LlmTaskTool::new(
+            security.clone(),
+            llm_task_provider,
+            llm_task_model,
+            root_config.default_temperature,
+            root_config.api_key.clone(),
+            llm_task_runtime_options,
+        )));
     }
 
     if matches!(
