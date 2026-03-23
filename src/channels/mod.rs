@@ -2423,28 +2423,12 @@ async fn process_channel_message(
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
-    let notify_channel = target_channel.clone();
-    let notify_reply_target = msg.reply_target.clone();
-    let notify_thread_root = followup_thread_id(&msg);
-    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls {
-        Some(tokio::spawn(async move {
-            while notify_rx.recv().await.is_some() {}
-        }))
-    } else {
-        Some(tokio::spawn(async move {
-            let thread_ts = notify_thread_root;
-            while let Some(text) = notify_rx.recv().await {
-                if let Some(ref ch) = notify_channel {
-                    let _ = ch
-                        .send(
-                            &SendMessage::new(&text, &notify_reply_target)
-                                .in_thread(thread_ts.clone()),
-                        )
-                        .await;
-                }
-            }
-        }))
-    };
+    // Tool call notifications are already displayed via the draft updater (progress
+    // messages through on_delta channel), so we only consume them here without
+    // sending separate channel messages to avoid duplicate/spammy output.
+    let notify_task = Some(tokio::spawn(async move {
+        while notify_rx.recv().await.is_some() {}
+    }));
 
     // Record history length before tool loop so we can extract tool context after.
     let history_len_before_tools = history.len();
