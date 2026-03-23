@@ -1041,16 +1041,11 @@ fn sse_bytes_to_events(
 
                         // Emit tool calls when stream finishes for a choice.
                         if choice.finish_reason.is_some() {
-                            for acc_opt in tool_accumulators.drain(..) {
-                                if let Some(acc) = acc_opt {
-                                    if let Some(tool_call) = acc.into_provider_tool_call() {
-                                        if tx
-                                            .send(Ok(StreamEvent::ToolCall(tool_call)))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
+                            for acc in tool_accumulators.drain(..).flatten() {
+                                if let Some(tool_call) = acc.into_provider_tool_call() {
+                                    if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err()
+                                    {
+                                        return;
                                     }
                                 }
                             }
@@ -1065,11 +1060,9 @@ fn sse_bytes_to_events(
         }
 
         // Emit any remaining accumulated tool calls.
-        for acc_opt in tool_accumulators.drain(..) {
-            if let Some(acc) = acc_opt {
-                if let Some(tool_call) = acc.into_provider_tool_call() {
-                    let _ = tx.send(Ok(StreamEvent::ToolCall(tool_call))).await;
-                }
+        for acc in tool_accumulators.drain(..).flatten() {
+            if let Some(tool_call) = acc.into_provider_tool_call() {
+                let _ = tx.send(Ok(StreamEvent::ToolCall(tool_call))).await;
             }
         }
 

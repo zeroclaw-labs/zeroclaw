@@ -956,7 +956,7 @@ impl Provider for ReliableProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
 
-        for (_provider_index, (provider_name, provider)) in self.providers.iter().enumerate() {
+        for (provider_name, provider) in &self.providers {
             if !provider.supports_streaming() || !options.enabled {
                 continue;
             }
