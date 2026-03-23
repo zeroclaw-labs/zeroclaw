@@ -1,0 +1,38 @@
+{
+  "model_name": "test-single-tool-echo",
+  "turns": [
+    {
+      "user_input": "Echo hello for me",
+      "steps": [
+        {
+          "response": {
+            "type": "tool_calls",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "name": "echo",
+                "arguments": {"message": "hello"}
+              }
+            ],
+            "input_tokens": 30,
+            "output_tokens": 15
+          }
+        },
+        {
+          "response": {
+            "type": "text",
+            "content": "The echo tool said: hello",
+            "input_tokens": 50,
+            "output_tokens": 10
+          }
+        }
+      ]
+    }
+  ],
+  "expects": {
+    "response_contains": ["hello"],
+    "tools_used": ["echo"],
+    "max_tool_calls": 1,
+    "all_tools_succeeded": true
+  }
+}

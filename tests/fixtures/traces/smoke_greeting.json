@@ -1,0 +1,24 @@
+{
+  "model_name": "test-smoke-greeting",
+  "turns": [
+    {
+      "user_input": "Hello, how are you?",
+      "steps": [
+        {
+          "response": {
+            "type": "text",
+            "content": "Hello! I'm doing well, thank you for asking. How can I help you today?",
+            "input_tokens": 20,
+            "output_tokens": 15
+          }
+        }
+      ]
+    }
+  ],
+  "expects": {
+    "response_contains": ["Hello"],
+    "response_not_contains": ["error", "ERROR"],
+    "tools_used": [],
+    "max_tool_calls": 0
+  }
+}

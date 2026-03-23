@@ -7,17 +7,11 @@
 //! Contributed from RustyClaw (MIT licensed).
 
 use regex::Regex;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
-/// Minimum sensitivity required to activate heuristic (generic) secret rules.
-///
-/// Structurally identifiable patterns (API keys with known prefixes, AWS keys,
-/// JWTs, PEM blocks, database URLs) are always scanned regardless of sensitivity.
-/// Generic rules (password=, secret=, token=) only fire when `sensitivity` exceeds
-/// this threshold, reducing false positives on technical content.
-const GENERIC_SECRET_SENSITIVITY_THRESHOLD: f64 = 0.5;
-const ENTROPY_TOKEN_MIN_LEN: usize = 20;
-const HIGH_ENTROPY_BASELINE: f64 = 4.2;
+/// Minimum token length considered for high-entropy detection.
+const ENTROPY_TOKEN_MIN_LEN: usize = 24;
 
 /// Result of leak detection.
 #[derive(Debug, Clone)]
@@ -200,7 +194,7 @@ impl LeakDetector {
         });
 
         for (regex, name) in regexes {
-            if regex.is_match(content) && self.sensitivity > GENERIC_SECRET_SENSITIVITY_THRESHOLD {
+            if regex.is_match(content) && self.sensitivity > 0.5 {
                 patterns.push(name.to_string());
                 *redacted = regex.replace_all(redacted, "[REDACTED_SECRET]").to_string();
             }
@@ -300,73 +294,71 @@ impl LeakDetector {
         }
     }
 
-    /// Check for high-entropy tokens that resemble obfuscated secrets.
+    /// Check for high-entropy tokens that may be leaked credentials.
+    ///
+    /// Extracts candidate tokens from content (after stripping URLs to avoid
+    /// false-positives on path segments) and flags any that exceed the Shannon
+    /// entropy threshold derived from the detector's sensitivity.
     fn check_high_entropy_tokens(
         &self,
         content: &str,
         patterns: &mut Vec<String>,
         redacted: &mut String,
     ) {
-        let threshold = (HIGH_ENTROPY_BASELINE + (self.sensitivity - 0.5) * 0.6).clamp(3.9, 4.8);
-        let mut flagged = false;
+        // Entropy threshold scales with sensitivity: at 0.7 this is ~4.37.
+        let entropy_threshold = 3.5 + self.sensitivity * 1.25;
 
-        for token in extract_candidate_tokens(content) {
-            if token.len() < ENTROPY_TOKEN_MIN_LEN {
-                continue;
-            }
+        // Strip URLs before extracting tokens so that path segments like
+        // "org/documents/2024-report-a1b2c3d4e5f6g7h8i9j0" are not mistaken
+        // for high-entropy credentials.
+        static URL_PATTERN: OnceLock<Regex> = OnceLock::new();
+        let url_re = URL_PATTERN.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
+        let content_without_urls = url_re.replace_all(content, "");
 
-            // Lower false positives by requiring mixed alphanumerics.
-            let has_alpha = token.chars().any(|c| c.is_ascii_alphabetic());
-            let has_digit = token.chars().any(|c| c.is_ascii_digit());
-            if !(has_alpha && has_digit) {
-                continue;
-            }
+        let tokens = extract_candidate_tokens(&content_without_urls);
 
-            let entropy = shannon_entropy(token.as_bytes());
-            if entropy >= threshold {
-                flagged = true;
-                let replaced = redacted.replace(token, "[REDACTED_HIGH_ENTROPY_TOKEN]");
-                if replaced != *redacted {
-                    *redacted = replaced;
-                } else if redacted.contains("[REDACTED_SECRET]") {
-                    *redacted =
-                        redacted.replacen("[REDACTED_SECRET]", "[REDACTED_HIGH_ENTROPY_TOKEN]", 1);
+        for token in tokens {
+            if token.len() >= ENTROPY_TOKEN_MIN_LEN {
+                let entropy = shannon_entropy(token);
+                if entropy >= entropy_threshold && has_mixed_alpha_digit(token) {
+                    patterns.push("High-entropy token".to_string());
+                    *redacted = redacted.replace(token, "[REDACTED_HIGH_ENTROPY_TOKEN]");
                 }
             }
         }
-
-        if flagged {
-            patterns.push("High-entropy token (possible encoded secret)".to_string());
-        }
     }
 }
 
+/// Extract candidate tokens by splitting on characters outside the
+/// alphanumeric + common credential character set.
 fn extract_candidate_tokens(content: &str) -> Vec<&str> {
     content
-        .split(|c: char| {
-            !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '+' || c == '/' || c == '=')
-        })
-        .filter(|token| !token.is_empty())
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '+' && c != '/')
+        .filter(|s| !s.is_empty())
         .collect()
 }
 
-fn shannon_entropy(bytes: &[u8]) -> f64 {
-    if bytes.is_empty() {
+/// Compute Shannon entropy (bits per character) for the given string.
+fn shannon_entropy(s: &str) -> f64 {
+    let len = s.len() as f64;
+    if len == 0.0 {
         return 0.0;
     }
-    let mut counts = [0_u32; 256];
-    for &b in bytes {
-        counts[b as usize] += 1;
+    let mut freq: HashMap<u8, usize> = HashMap::new();
+    for &b in s.as_bytes() {
+        *freq.entry(b).or_insert(0) += 1;
     }
-    let len = bytes.len() as f64;
-    counts
-        .iter()
-        .filter(|&&count| count > 0)
-        .map(|&count| {
-            let p = count as f64 / len;
-            -p * p.log2()
-        })
-        .sum()
+    freq.values().fold(0.0, |acc, &count| {
+        let p = count as f64 / len;
+        acc - p * p.log2()
+    })
+}
+
+/// Check whether a token contains both alphabetic and digit characters.
+fn has_mixed_alpha_digit(s: &str) -> bool {
+    let has_alpha = s.bytes().any(|b| b.is_ascii_alphabetic());
+    let has_digit = s.bytes().any(|b| b.is_ascii_digit());
+    has_alpha && has_digit
 }
 
 #[cfg(test)]
@@ -390,7 +382,7 @@ mod tests {
                 assert!(patterns.iter().any(|p| p.contains("Stripe")));
                 assert!(redacted.contains("[REDACTED"));
             }
-            _ => panic!("Should detect Stripe key"),
+            LeakResult::Clean => panic!("Should detect Stripe key"),
         }
     }
 
@@ -403,7 +395,7 @@ mod tests {
             LeakResult::Detected { patterns, .. } => {
                 assert!(patterns.iter().any(|p| p.contains("AWS")));
             }
-            _ => panic!("Should detect AWS key"),
+            LeakResult::Clean => panic!("Should detect AWS key"),
         }
     }
 
@@ -421,7 +413,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 assert!(patterns.iter().any(|p| p.contains("private key")));
                 assert!(redacted.contains("[REDACTED_PRIVATE_KEY]"));
             }
-            _ => panic!("Should detect private key"),
+            LeakResult::Clean => panic!("Should detect private key"),
         }
     }
 
@@ -435,7 +427,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 assert!(patterns.iter().any(|p| p.contains("JWT")));
                 assert!(redacted.contains("[REDACTED_JWT]"));
             }
-            _ => panic!("Should detect JWT"),
+            LeakResult::Clean => panic!("Should detect JWT"),
         }
     }
 
@@ -448,7 +440,7 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
             LeakResult::Detected { patterns, .. } => {
                 assert!(patterns.iter().any(|p| p.contains("PostgreSQL")));
             }
-            _ => panic!("Should detect database URL"),
+            LeakResult::Clean => panic!("Should detect database URL"),
         }
     }
 
@@ -462,66 +454,85 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     #[test]
-    fn sensitivity_at_threshold_does_not_fire_generic() {
-        // The condition is strict `>`, so exactly 0.5 must NOT trigger generic rules.
-        let detector = LeakDetector::with_sensitivity(GENERIC_SECRET_SENSITIVITY_THRESHOLD);
-        let content = "password=hunter2isasecret";
+    fn url_path_segments_not_flagged() {
+        let detector = LeakDetector::new();
+        // URL with a long mixed-alphanumeric path segment that would previously
+        // false-positive as a high-entropy token.
+        let content =
+            "See https://example.org/documents/2024-report-a1b2c3d4e5f6g7h8i9j0.pdf for details";
         let result = detector.scan(content);
         assert!(
             matches!(result, LeakResult::Clean),
-            "sensitivity == threshold (0.5) should NOT activate generic-secret rules"
+            "URL path segments should not trigger high-entropy detection"
         );
     }
 
     #[test]
-    fn sensitivity_just_above_threshold_fires_generic() {
-        let detector = LeakDetector::with_sensitivity(GENERIC_SECRET_SENSITIVITY_THRESHOLD + 0.01);
-        let content = "password=hunter2isasecret";
+    fn url_with_long_path_not_redacted() {
+        let detector = LeakDetector::new();
+        let content = "Reference: https://gov.example.com/publications/research/2024-annual-fiscal-policy-review-9a8b7c6d5e4f3g2h1i0j.html";
         let result = detector.scan(content);
         assert!(
-            matches!(result, LeakResult::Detected { .. }),
-            "sensitivity just above threshold should activate generic-secret rules"
+            matches!(result, LeakResult::Clean),
+            "Long URL paths should not be redacted"
         );
     }
 
     #[test]
-    fn structural_api_key_detected_regardless_of_sensitivity() {
-        // Stripe key is structurally identifiable — must be caught even at zero sensitivity.
-        let detector = LeakDetector::with_sensitivity(0.0);
-        let content = "key: sk_test_1234567890abcdefghijklmnop";
-        let result = detector.scan(content);
-        assert!(
-            matches!(result, LeakResult::Detected { .. }),
-            "structural API key patterns must fire at any sensitivity level"
-        );
-    }
-
-    #[test]
-    fn high_entropy_token_is_detected_and_redacted() {
-        let detector = LeakDetector::with_sensitivity(0.9);
-        let content = "token: A9sD2kL0zQ1xW8vN3mR7tY6uI4oP2qS9dF1gH5jK";
+    fn detects_high_entropy_token_outside_url() {
+        let detector = LeakDetector::new();
+        // A standalone high-entropy token (not in a URL) should still be detected.
+        let content = "Found credential: aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
         let result = detector.scan(content);
         match result {
             LeakResult::Detected { patterns, redacted } => {
-                assert!(patterns.iter().any(|p| p.contains("High-entropy token")));
+                assert!(patterns.iter().any(|p| p.contains("High-entropy")));
                 assert!(redacted.contains("[REDACTED_HIGH_ENTROPY_TOKEN]"));
             }
-            _ => panic!("expected high-entropy detection"),
+            LeakResult::Clean => panic!("Should detect high-entropy token"),
         }
     }
 
     #[test]
-    fn natural_language_text_is_not_flagged_as_high_entropy() {
-        let detector = LeakDetector::with_sensitivity(0.9);
-        let content = "the quick brown fox jumps over the lazy dog";
+    fn low_sensitivity_raises_entropy_threshold() {
+        let detector = LeakDetector::with_sensitivity(0.3);
+        // At low sensitivity the entropy threshold is higher (3.5 + 0.3*1.25 = 3.875).
+        // A repetitive mixed token has low entropy and should not be flagged.
+        let content = "token found: ab12ab12ab12ab12ab12ab12ab12ab12";
         let result = detector.scan(content);
-        assert!(matches!(result, LeakResult::Clean));
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "Low-entropy repetitive tokens should not be flagged"
+        );
     }
 
     #[test]
-    fn shannon_entropy_distinguishes_repetitive_from_random_tokens() {
-        let low = shannon_entropy(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaa");
-        let high = shannon_entropy(b"aB3f9K1mP0qX8vT2nR6sW4yZ7uH5");
-        assert!(high > low);
+    fn extract_candidate_tokens_splits_correctly() {
+        let tokens = extract_candidate_tokens("foo.bar:baz qux-quux key=val");
+        assert!(tokens.contains(&"foo"));
+        assert!(tokens.contains(&"bar"));
+        assert!(tokens.contains(&"baz"));
+        assert!(tokens.contains(&"qux-quux"));
+        // '=' is a delimiter, not part of tokens
+        assert!(tokens.contains(&"key"));
+        assert!(tokens.contains(&"val"));
+    }
+
+    #[test]
+    fn shannon_entropy_empty_string() {
+        assert_eq!(shannon_entropy(""), 0.0);
+    }
+
+    #[test]
+    fn shannon_entropy_single_char() {
+        // All same characters: entropy = 0
+        assert_eq!(shannon_entropy("aaaa"), 0.0);
+    }
+
+    #[test]
+    fn shannon_entropy_two_equal_chars() {
+        // "ab" repeated: entropy = 1.0 bit
+        let e = shannon_entropy("abab");
+        assert!((e - 1.0).abs() < 0.001);
     }
 }

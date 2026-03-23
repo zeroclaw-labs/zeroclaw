@@ -12,7 +12,6 @@ import {
   setToken as writeToken,
   clearToken as removeToken,
   isAuthenticated as checkAuth,
-  TOKEN_STORAGE_KEY,
 } from '../lib/auth';
 import { pair as apiPair, getPublicHealth } from '../lib/api';
 
@@ -25,6 +24,8 @@ export interface AuthState {
   token: string | null;
   /** Whether the user is currently authenticated. */
   isAuthenticated: boolean;
+  /** Whether the server requires pairing. Defaults to true (safe fallback). */
+  requiresPairing: boolean;
   /** True while the initial auth check is in progress. */
   loading: boolean;
   /** Pair with the agent using a pairing code. Stores the token on success. */
@@ -46,6 +47,7 @@ export interface AuthProviderProps {
 export function AuthProvider({ children }: AuthProviderProps) {
   const [token, setTokenState] = useState<string | null>(readToken);
   const [authenticated, setAuthenticated] = useState<boolean>(checkAuth);
+  const [requiresPairing, setRequiresPairing] = useState<boolean>(true);
   const [loading, setLoading] = useState<boolean>(!checkAuth());
 
   // On mount: check if server requires pairing at all
@@ -56,6 +58,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
       .then((health) => {
         if (cancelled) return;
         if (!health.require_pairing) {
+          setRequiresPairing(false);
           setAuthenticated(true);
         }
       })
@@ -70,10 +73,10 @@ export function AuthProvider({ children }: AuthProviderProps) {
     };
   }, []);
 
-  // Keep state in sync if token storage is changed from another browser context.
+  // Keep state in sync if localStorage is changed in another tab
   useEffect(() => {
     const handler = (e: StorageEvent) => {
-      if (e.key === TOKEN_STORAGE_KEY) {
+      if (e.key === 'zeroclaw_token') {
         const t = readToken();
         setTokenState(t);
         setAuthenticated(t !== null && t.length > 0);
@@ -99,6 +102,7 @@ export function AuthProvider({ children }: AuthProviderProps) {
   const value: AuthState = {
     token,
     isAuthenticated: authenticated,
+    requiresPairing,
     loading,
     pair,
     logout,

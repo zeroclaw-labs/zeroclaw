@@ -5,9 +5,10 @@
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 use landlock::{AccessFs, PathBeneath, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr};
+#[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+use std::path::Path;
 
 use crate::security::traits::Sandbox;
-use std::path::Path;
 
 /// Landlock sandbox backend for Linux
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
@@ -126,17 +127,10 @@ impl LandlockSandbox {
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
 impl Sandbox for LandlockSandbox {
     fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
-        // `restrict_self()` affects the current process and all descendants.
-        // Applying it here would permanently tighten the parent agent runtime
-        // on every command invocation and eventually degrade execution.
-        //
-        // Until we can apply restrictions in the child pre-exec path, fail
-        // closed instead of mutating the long-lived parent process.
-        let _ = &self.workspace_dir;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Landlock per-command wrapping is not yet supported safely; use firejail, bubblewrap, or docker backend",
-        ))
+        // Apply Landlock restrictions before executing the command
+        // Note: This affects the current process, not the child process
+        // Child processes inherit the Landlock restrictions
+        self.apply_restrictions()
     }
 
     fn is_available(&self) -> bool {

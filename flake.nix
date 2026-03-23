@@ -8,44 +8,54 @@
     nixpkgs.url = "nixpkgs/nixos-unstable";
   };
 
-  outputs =
-    {
-      self,
-      flake-utils,
-      fenix,
-      nixpkgs,
-    }:
-    flake-utils.lib.eachDefaultSystem (
-      system:
+  outputs = { flake-utils, fenix, nixpkgs, ... }:
+    let
+      nixosModule = { pkgs, ... }: {
+        nixpkgs.overlays = [ fenix.overlays.default ];
+        environment.systemPackages = [
+          (pkgs.fenix.stable.withComponents [
+            "cargo"
+            "clippy"
+            "rust-src"
+            "rustc"
+            "rustfmt"
+          ])
+          pkgs.rust-analyzer
+        ];
+      };
+    in
+    flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
           inherit system;
-          overlays = [
-            fenix.overlays.default
-            (import ./overlay.nix)
-          ];
+          overlays = [ fenix.overlays.default ];
         };
-      in
-      {
-        formatter = pkgs.nixfmt-tree;
-
-        packages = {
-          default = self.packages.${system}.zeroclaw;
-          inherit (pkgs)
-            zeroclaw
-            zeroclaw-web
-            ;
-        };
-
+        rustToolchain = pkgs.fenix.stable.withComponents [
+          "cargo"
+          "clippy"
+          "rust-src"
+          "rustc"
+          "rustfmt"
+        ];
+      in {
+        packages.default = fenix.packages.${system}.stable.toolchain;
         devShells.default = pkgs.mkShell {
-          inputsFrom = [ pkgs.zeroclaw ];
           packages = [
+            rustToolchain
             pkgs.rust-analyzer
           ];
         };
-      }
-    )
-    // {
-      overlays.default = import ./overlay.nix;
+      }) // {
+      nixosConfigurations = {
+        nixos = nixpkgs.lib.nixosSystem {
+          system = "x86_64-linux";
+          modules = [ nixosModule ];
+        };
+
+        nixos-aarch64 = nixpkgs.lib.nixosSystem {
+          system = "aarch64-linux";
+          modules = [ nixosModule ];
+        };
+      };
     };
 }

@@ -11,15 +11,6 @@ body:
         Please provide a minimal reproducible case so maintainers can triage quickly.
         Do not include personal/sensitive data; redact and anonymize all logs/payloads.
 
-  - type: input
-    id: summary
-    attributes:
-      label: Summary
-      description: One-line description of the problem.
-      placeholder: zeroclaw daemon exits immediately when ...
-    validations:
-      required: true
-
   - type: dropdown
     id: component
     attributes:
@@ -72,7 +63,7 @@ body:
       label: Steps to reproduce
       description: Please provide exact commands/config.
       placeholder: |
-        1. zeroclaw onboard --interactive
+        1. zeroclaw onboard
         2. zeroclaw daemon
         3. Observe crash in logs
       render: bash
@@ -83,13 +74,13 @@ body:
     id: impact
     attributes:
       label: Impact
-      description: Who is affected, how often, and practical consequences.
+      description: Who is affected, how often, and practical consequences (optional but helps triage).
       placeholder: |
         Affected users: ...
         Frequency: always/intermittent
         Consequence: ...
     validations:
-      required: true
+      required: false
 
   - type: textarea
     id: logs
@@ -112,9 +103,10 @@ body:
     id: rust
     attributes:
       label: Rust version
+      description: Required for runtime/build bugs; optional for docs/config issues.
       placeholder: rustc 1.xx.x
     validations:
-      required: true
+      required: false
 
   - type: input
     id: os
@@ -140,9 +132,7 @@ body:
     attributes:
       label: Pre-flight checks
       options:
-        - label: I reproduced this on the latest main branch or latest release.
+        - label: I reproduced this on the latest master branch or latest release.
           required: true
-        - label: I redacted secrets/tokens from logs.
-          required: true
-        - label: I removed personal identifiers and replaced identity-specific data with neutral placeholders.
+        - label: I redacted secrets, tokens, and personal data from all submitted content.
           required: true

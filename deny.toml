@@ -9,12 +9,16 @@ unmaintained = "all"
 yanked = "deny"
 # Ignore known unmaintained transitive deps we cannot easily replace
 ignore = [
-    # bincode v2.0.1 via probe-rs — upstream project ceased; accepted transitive risk for current hardware stack.
-    { id = "RUSTSEC-2025-0141", reason = "Transitive via probe-rs in current release path; tracked for replacement when probe-rs updates." },
+    # bincode v2.0.1 via probe-rs — project ceased but 1.3.3 considered complete
+    "RUSTSEC-2025-0141",
     { id = "RUSTSEC-2024-0384", reason = "Reported to `rust-nostr/nostr` and it's WIP" },
-    # derivative v2.2.0 via wasm_evt_listener -> matrix_indexed_db_futures -> matrix-sdk-indexeddb.
-    # This chain is transitive under matrix-sdk's IndexedDB integration path; matrix-sdk remains pinned to 0.16 in current release line.
-    { id = "RUSTSEC-2024-0388", reason = "Transitive via matrix-sdk indexeddb dependency chain; tracked until matrix-sdk ecosystem removes derivative." },
+    { id = "RUSTSEC-2024-0388", reason = "derivative via extism → wasmtime transitive dep" },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash via extism → wasmtime transitive dep" },
+    { id = "RUSTSEC-2025-0119", reason = "number_prefix via indicatif — cosmetic dep" },
+    # wasmtime vulns via extism 1.13.0 — no upstream fix yet; plugins feature-gated
+    { id = "RUSTSEC-2026-0006", reason = "wasmtime segfault via extism; awaiting extism upgrade" },
+    { id = "RUSTSEC-2026-0020", reason = "WASI resource exhaustion via extism; awaiting extism upgrade" },
+    { id = "RUSTSEC-2026-0021", reason = "WASI http fields panic via extism; awaiting extism upgrade" },
 ]
 
 [licenses]

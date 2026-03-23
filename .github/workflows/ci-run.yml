@@ -1,397 +1,193 @@
-name: CI Run
+name: CI
 
 on:
-    push:
-        branches: [dev, main]
-    pull_request:
-        branches: [dev, main]
-    merge_group:
-        branches: [dev, main]
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
 
 concurrency:
-    group: ci-${{ github.event.pull_request.number || github.sha }}
-    cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 
 permissions:
-    contents: read
+  contents: read
 
 env:
-    GIT_CONFIG_COUNT: "1"
-    GIT_CONFIG_KEY_0: core.hooksPath
-    GIT_CONFIG_VALUE_0: /dev/null
-    CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
-    changes:
-        name: Detect Change Scope
-        runs-on: [self-hosted, aws-india]
-        outputs:
-            docs_only: ${{ steps.scope.outputs.docs_only }}
-            docs_changed: ${{ steps.scope.outputs.docs_changed }}
-            rust_changed: ${{ steps.scope.outputs.rust_changed }}
-            workflow_changed: ${{ steps.scope.outputs.workflow_changed }}
-            docs_files: ${{ steps.scope.outputs.docs_files }}
-            base_sha: ${{ steps.scope.outputs.base_sha }}
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-              with:
-                  fetch-depth: 0
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-            - name: Detect docs-only changes
-              id: scope
-              shell: bash
-              env:
-                  EVENT_NAME: ${{ github.event_name }}
-                  BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
-              run: ./scripts/ci/detect_change_scope.sh
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
 
-    lint:
-        name: Lint Gate (Format + Clippy + Strict Delta)
-        needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 25
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-              with:
-                  fetch-depth: 0
-            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-              with:
-                  toolchain: 1.92.0
-                  components: rustfmt, clippy
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
-              with:
-                  prefix-key: ci-run-check
-            - name: Run rust quality gate
-              run: ./scripts/ci/rust_quality_gate.sh
-            - name: Run strict lint delta gate
-              env:
-                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
-              run: ./scripts/ci/rust_strict_delta_gate.sh
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-    test:
-        name: Test
-        needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 35
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-              with:
-                  toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
-              with:
-                  prefix-key: ci-run-check
-            - name: Run tests with flake detection
-              shell: bash
-              env:
-                  BLOCK_ON_FLAKE: ${{ vars.CI_BLOCK_ON_FLAKE_SUSPECTED || 'false' }}
-              run: |
-                  set -euo pipefail
-                  mkdir -p artifacts
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
 
-                  if cargo test --locked --verbose; then
-                    echo '{"flake_suspected":false,"status":"success"}' > artifacts/flake-probe.json
-                    exit 0
-                  fi
+  lint-strict-delta:
+    name: Strict Delta Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          components: clippy
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-                  echo "::warning::First test run failed. Retrying for flake detection..."
-                  if cargo test --locked --verbose; then
-                    echo '{"flake_suspected":true,"status":"flake"}' > artifacts/flake-probe.json
-                    echo "::warning::Flake suspected — test passed on retry"
-                    if [ "${BLOCK_ON_FLAKE}" = "true" ]; then
-                      echo "BLOCK_ON_FLAKE is set; failing on suspected flake."
-                      exit 1
-                    fi
-                    exit 0
-                  fi
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
 
-                  echo '{"flake_suspected":false,"status":"failure"}' > artifacts/flake-probe.json
-                  exit 1
-            - name: Publish flake probe summary
-              if: always()
-              shell: bash
-              run: |
-                  set -euo pipefail
-                  if [ -f artifacts/flake-probe.json ]; then
-                    status=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['status'])")
-                    flake=$(python3 -c "import json; print(json.load(open('artifacts/flake-probe.json'))['flake_suspected'])")
-                    echo "### Test Flake Probe" >> "$GITHUB_STEP_SUMMARY"
-                    echo "- Status: \`${status}\`" >> "$GITHUB_STEP_SUMMARY"
-                    echo "- Flake suspected: \`${flake}\`" >> "$GITHUB_STEP_SUMMARY"
-                  fi
-            - name: Upload flake probe artifact
-              if: always()
-              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-              with:
-                  name: test-flake-probe
-                  path: artifacts/flake-probe.*
-                  if-no-files-found: ignore
-                  retention-days: 14
+      - name: Run strict delta lint gate
+        run: bash scripts/ci/rust_strict_delta_gate.sh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
 
-    build:
-        name: Build (Smoke)
-        needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 20
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
-              with:
-                  toolchain: 1.92.0
-            - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v3
-              with:
-                  prefix-key: ci-run-build
-                  cache-targets: true
-            - name: Build binary (smoke check)
-              run: cargo build --profile release-fast --locked --verbose
-            - name: Check binary size
-              run: bash scripts/ci/check_binary_size.sh target/release-fast/zeroclaw
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
 
-    docs-only:
-        name: Docs-Only Fast Path
-        needs: [changes]
-        if: needs.changes.outputs.docs_only == 'true'
-        runs-on: [self-hosted, aws-india]
-        steps:
-            - name: Skip heavy jobs for docs-only change
-              run: echo "Docs-only change detected. Rust lint/test/build skipped."
+      - name: Install mold linker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
 
-    non-rust:
-        name: Non-Rust Fast Path
-        needs: [changes]
-        if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.rust_changed != 'true'
-        runs-on: [self-hosted, aws-india]
-        steps:
-            - name: Skip Rust jobs for non-Rust change scope
-              run: echo "No Rust-impacting files changed. Rust lint/test/build skipped."
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
-    docs-quality:
-        name: Docs Quality
-        needs: [changes]
-        if: needs.changes.outputs.docs_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        timeout-minutes: 15
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-              with:
-                  fetch-depth: 0
+      - name: Run tests
+        run: cargo nextest run --locked
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-            - name: Markdown lint (changed lines only)
-              env:
-                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
-                  DOCS_FILES: ${{ needs.changes.outputs.docs_files }}
-              run: ./scripts/ci/docs_quality_gate.sh
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    needs: [lint]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        if: runner.os != 'Windows'
 
-            - name: Collect added links
-              id: collect_links
-              shell: bash
-              env:
-                  BASE_SHA: ${{ needs.changes.outputs.base_sha }}
-                  DOCS_FILES: ${{ needs.changes.outputs.docs_files }}
-              run: |
-                  set -euo pipefail
-                  python3 ./scripts/ci/collect_changed_links.py \
-                    --base "$BASE_SHA" \
-                    --docs-files "$DOCS_FILES" \
-                    --output .ci-added-links.txt
-                  count=$(wc -l < .ci-added-links.txt | tr -d ' ')
-                  echo "count=$count" >> "$GITHUB_OUTPUT"
-                  if [ "$count" -gt 0 ]; then
-                    echo "Added links queued for check:"
-                    cat .ci-added-links.txt
-                  else
-                    echo "No added links found in changed docs lines."
-                  fi
+      - name: Install mold linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
 
-            - name: Link check (offline, added links only)
-              if: steps.collect_links.outputs.count != '0'
-              uses: lycheeverse/lychee-action@a8c4c7cb88f0c7386610c35eb25108e448569cb0 # v2
-              with:
-                  fail: true
-                  args: >-
-                      --offline
-                      --no-progress
-                      --format detailed
-                      .ci-added-links.txt
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
 
-            - name: Skip link check (no added links)
-              if: steps.collect_links.outputs.count == '0'
-              run: echo "No added links in changed docs lines. Link check skipped."
+      - name: Build release
+        shell: bash
+        run: cargo build --profile ci --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
-    lint-feedback:
-        name: Lint Feedback
-        if: github.event_name == 'pull_request'
-        needs: [changes, lint, docs-quality]
-        runs-on: [self-hosted, aws-india]
-        permissions:
-            contents: read
-            pull-requests: write
-            issues: write
-        steps:
-            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+  check-all-features:
+    name: Check (all features)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [lint]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-            - name: Post actionable lint failure summary
-              if: always()
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              env:
-                  RUST_CHANGED: ${{ needs.changes.outputs.rust_changed }}
-                  DOCS_CHANGED: ${{ needs.changes.outputs.docs_changed }}
-                  LINT_RESULT: ${{ needs.lint.result }}
-                  LINT_DELTA_RESULT: ${{ needs.lint.result }}
-                  DOCS_RESULT: ${{ needs.docs-quality.result }}
-              with:
-                  script: |
-                      const script = require('./.github/workflows/scripts/lint_feedback.js');
-                      await script({github, context, core});
+      - name: Install system dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
 
-    workflow-owner-approval:
-        name: Workflow Owner Approval
-        needs: [changes]
-        if: github.event_name == 'pull_request' && needs.changes.outputs.workflow_changed == 'true'
-        runs-on: [self-hosted, aws-india]
-        permissions:
-            contents: read
-            pull-requests: read
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
 
-            - name: Require owner approval for workflow file changes
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              env:
-                  WORKFLOW_OWNER_LOGINS: ${{ vars.WORKFLOW_OWNER_LOGINS }}
-              with:
-                  script: |
-                    const script = require('./.github/workflows/scripts/ci_workflow_owner_approval.js');
-                    await script({ github, context, core });
+      - name: Check all features
+        run: cargo check --features ci-all --locked
 
-    human-review-approval:
-        name: Human Review Approval
-        needs: [changes]
-        if: github.event_name == 'pull_request'
-        runs-on: [self-hosted, aws-india]
-        permissions:
-            contents: read
-            pull-requests: read
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-              with:
-                  ref: ${{ github.event.pull_request.base.sha }}
+  docs-quality:
+    name: Docs Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a # v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
 
-            - name: Require at least one human approving review
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              env:
-                  HUMAN_REVIEW_BOT_LOGINS: ${{ vars.HUMAN_REVIEW_BOT_LOGINS }}
-              with:
-                  script: |
-                    const script = require('./.github/workflows/scripts/ci_human_review_guard.js');
-                    await script({ github, context, core });
+      - name: Run docs quality gate
+        run: bash scripts/ci/docs_quality_gate.sh
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
 
-    license-file-owner-guard:
-        name: License File Owner Guard
-        needs: [changes]
-        if: github.event_name == 'pull_request'
-        runs-on: [self-hosted, aws-india]
-        permissions:
-            contents: read
-            pull-requests: read
-        steps:
-            - name: Checkout repository
-              uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-
-            - name: Enforce owner-only edits for root license files
-              uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-              with:
-                  script: |
-                    const script = require('./.github/workflows/scripts/ci_license_file_owner_guard.js');
-                    await script({ github, context, core });
-    ci-required:
-        name: CI Required Gate
-        if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval, human-review-approval, license-file-owner-guard]
-        runs-on: [self-hosted, aws-india]
-        steps:
-            - name: Enforce required status
-              shell: bash
-              run: |
-                  set -euo pipefail
-
-                  event_name="${{ github.event_name }}"
-                  rust_changed="${{ needs.changes.outputs.rust_changed }}"
-                  docs_changed="${{ needs.changes.outputs.docs_changed }}"
-                  workflow_changed="${{ needs.changes.outputs.workflow_changed }}"
-                  docs_result="${{ needs.docs-quality.result }}"
-                  workflow_owner_result="${{ needs.workflow-owner-approval.result }}"
-                  human_review_result="${{ needs.human-review-approval.result }}"
-                  license_owner_result="${{ needs.license-file-owner-guard.result }}"
-
-                  # --- Helper: enforce PR governance gates ---
-                  check_pr_governance() {
-                    if [ "$event_name" != "pull_request" ]; then return 0; fi
-                    if [ "$workflow_changed" = "true" ] && [ "$workflow_owner_result" != "success" ]; then
-                      echo "Workflow files changed but workflow owner approval gate did not pass."
-                      exit 1
-                    fi
-                    if [ "$human_review_result" != "success" ]; then
-                      echo "Human review approval guard did not pass."
-                      exit 1
-                    fi
-                    if [ "$license_owner_result" != "success" ]; then
-                      echo "License file owner guard did not pass."
-                      exit 1
-                    fi
-                  }
-
-                  check_docs_quality() {
-                    if [ "$docs_changed" = "true" ] && [ "$docs_result" != "success" ]; then
-                      echo "Docs changed but docs-quality did not pass."
-                      exit 1
-                    fi
-                  }
-
-                  # --- Docs-only fast path ---
-                  if [ "${{ needs.changes.outputs.docs_only }}" = "true" ]; then
-                    check_pr_governance
-                    check_docs_quality
-                    echo "Docs-only fast path passed."
-                    exit 0
-                  fi
-
-                  # --- Non-rust fast path ---
-                  if [ "$rust_changed" != "true" ]; then
-                    check_pr_governance
-                    check_docs_quality
-                    echo "Non-rust fast path passed."
-                    exit 0
-                  fi
-
-                  # --- Rust change path ---
-                  lint_result="${{ needs.lint.result }}"
-                  test_result="${{ needs.test.result }}"
-                  build_result="${{ needs.build.result }}"
-
-                  echo "lint=${lint_result}"
-                  echo "test=${test_result}"
-                  echo "build=${build_result}"
-                  echo "docs=${docs_result}"
-                  echo "workflow_owner_approval=${workflow_owner_result}"
-                  echo "human_review_approval=${human_review_result}"
-                  echo "license_file_owner_guard=${license_owner_result}"
-
-                  check_pr_governance
-
-                  if [ "$lint_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
-                    echo "Required CI jobs did not pass: lint=${lint_result} test=${test_result} build=${build_result}"
-                    exit 1
-                  fi
-
-                  check_docs_quality
-
-                  echo "All required checks passed."
+  # Composite status check — branch protection requires this single job.
+  gate:
+    name: CI Required Gate
+    if: always()
+    needs: [lint, lint-strict-delta, test, build, docs-quality, check-all-features]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check upstream job results
+        env:
+          HAS_FAILURE: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
+        run: |
+          if [[ "$HAS_FAILURE" == "true" ]]; then
+            echo "::error::One or more upstream jobs failed or were cancelled"
+            exit 1
+          fi

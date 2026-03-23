@@ -1,203 +1,280 @@
 //! WebSocket agent chat handler.
 //!
+//! Connect: `ws://host:port/ws/chat?session_id=ID&name=My+Session`
+//!
 //! Protocol:
 //! ```text
+//! Server -> Client: {"type":"session_start","session_id":"...","name":"...","resumed":true,"message_count":42}
 //! Client -> Server: {"type":"message","content":"Hello"}
 //! Server -> Client: {"type":"chunk","content":"Hi! "}
 //! Server -> Client: {"type":"tool_call","name":"shell","args":{...}}
 //! Server -> Client: {"type":"tool_result","name":"shell","output":"..."}
 //! Server -> Client: {"type":"done","full_response":"..."}
 //! ```
+//!
+//! Query params:
+//! - `session_id` — resume or create a session (default: new UUID)
+//! - `name` — optional human-readable label for the session
+//! - `token` — bearer auth token (alternative to Authorization header)
 
 use super::AppState;
-use crate::agent::loop_::{
-    build_shell_policy_instructions, build_tool_instructions_from_specs, run_tool_call_loop,
-};
-use crate::approval::ApprovalManager;
-use crate::providers::ChatMessage;
 use axum::{
     extract::{
         ws::{Message, WebSocket},
-        State, WebSocketUpgrade,
+        Query, State, WebSocketUpgrade,
     },
     http::{header, HeaderMap},
     response::IntoResponse,
 };
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use tracing::debug;
 
-const EMPTY_WS_RESPONSE_FALLBACK: &str =
-    "Tool execution completed, but the model returned no final text response. Please ask me to summarize the result.";
-
-fn sanitize_ws_response(response: &str, tools: &[Box<dyn crate::tools::Tool>]) -> String {
-    let sanitized = crate::channels::sanitize_channel_response(response, tools);
-    if sanitized.is_empty() && !response.trim().is_empty() {
-        "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
-            .to_string()
-    } else {
-        sanitized
-    }
+/// Optional connection parameters sent as the first WebSocket message.
+///
+/// If the first message after upgrade is `{"type":"connect",...}`, these
+/// parameters are extracted and an acknowledgement is sent back. Old clients
+/// that send `{"type":"message",...}` as the first frame still work — the
+/// message is processed normally (backward-compatible).
+#[derive(Debug, Deserialize)]
+struct ConnectParams {
+    #[serde(rename = "type")]
+    msg_type: String,
+    /// Client-chosen session ID for memory persistence
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Device name for device registry tracking
+    #[serde(default)]
+    device_name: Option<String>,
+    /// Client capabilities
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
-fn normalize_prompt_tool_results(content: &str) -> Option<String> {
-    let mut cleaned_lines: Vec<&str> = Vec::new();
+/// The sub-protocol we support for the chat WebSocket.
+const WS_PROTOCOL: &str = "zeroclaw.v1";
 
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if trimmed.starts_with("<tool_result") || trimmed == "</tool_result>" {
-            continue;
-        }
-        cleaned_lines.push(line.trim_end());
-    }
+/// Prefix used in `Sec-WebSocket-Protocol` to carry a bearer token.
+const BEARER_SUBPROTO_PREFIX: &str = "bearer.";
 
-    if cleaned_lines.is_empty() {
-        None
-    } else {
-        Some(cleaned_lines.join("\n"))
-    }
+#[derive(Deserialize)]
+pub struct WsQuery {
+    pub token: Option<String>,
+    pub session_id: Option<String>,
+    /// Optional human-readable name for the session.
+    pub name: Option<String>,
 }
 
-fn extract_latest_tool_output(history: &[ChatMessage]) -> Option<String> {
-    for msg in history.iter().rev() {
-        match msg.role.as_str() {
-            "tool" => {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content) {
-                    if let Some(content) = value
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|v| !v.is_empty())
-                    {
-                        return Some(content.to_string());
-                    }
-                }
+/// Extract a bearer token from WebSocket-compatible sources.
+///
+/// Precedence (first non-empty wins):
+/// 1. `Authorization: Bearer <token>` header
+/// 2. `Sec-WebSocket-Protocol: bearer.<token>` subprotocol
+/// 3. `?token=<token>` query parameter
+///
+/// Browsers cannot set custom headers on `new WebSocket(url)`, so the query
+/// parameter and subprotocol paths are required for browser-based clients.
+fn extract_ws_token<'a>(headers: &'a HeaderMap, query_token: Option<&'a str>) -> Option<&'a str> {
+    // 1. Authorization header
+    if let Some(t) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|auth| auth.strip_prefix("Bearer "))
+    {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
 
-                let trimmed = msg.content.trim();
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
-            }
-            "user" => {
-                if let Some(payload) = msg.content.strip_prefix("[Tool results]") {
-                    let payload = payload.trim_start_matches('\n');
-                    if let Some(cleaned) = normalize_prompt_tool_results(payload) {
-                        return Some(cleaned);
-                    }
-                }
-            }
-            _ => {}
+    // 2. Sec-WebSocket-Protocol: bearer.<token>
+    if let Some(t) = headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|protos| {
+            protos
+                .split(',')
+                .map(|p| p.trim())
+                .find_map(|p| p.strip_prefix(BEARER_SUBPROTO_PREFIX))
+        })
+    {
+        if !t.is_empty() {
+            return Some(t);
+        }
+    }
+
+    // 3. ?token= query parameter
+    if let Some(t) = query_token {
+        if !t.is_empty() {
+            return Some(t);
         }
     }
 
     None
 }
 
-fn finalize_ws_response(
-    response: &str,
-    history: &[ChatMessage],
-    tools: &[Box<dyn crate::tools::Tool>],
-) -> String {
-    let sanitized = sanitize_ws_response(response, tools);
-    if !sanitized.trim().is_empty() {
-        return sanitized;
-    }
-
-    if let Some(tool_output) = extract_latest_tool_output(history) {
-        let excerpt = crate::util::truncate_with_ellipsis(tool_output.trim(), 1200);
-        return format!(
-            "Tool execution completed, but the model returned no final text response.\n\nLatest tool output:\n{excerpt}"
-        );
-    }
-
-    EMPTY_WS_RESPONSE_FALLBACK.to_string()
-}
-
-fn build_ws_system_prompt(
-    config: &crate::config::Config,
-    model: &str,
-    tools_registry: &[Box<dyn crate::tools::Tool>],
-    native_tools: bool,
-) -> String {
-    let mut tool_specs: Vec<crate::tools::ToolSpec> =
-        tools_registry.iter().map(|tool| tool.spec()).collect();
-    tool_specs.sort_by(|a, b| a.name.cmp(&b.name));
-
-    let tool_descs: Vec<(&str, &str)> = tool_specs
-        .iter()
-        .map(|spec| (spec.name.as_str(), spec.description.as_str()))
-        .collect();
-
-    let bootstrap_max_chars = if config.agent.compact_context {
-        Some(6000)
-    } else {
-        None
-    };
-
-    let mut prompt = crate::channels::build_system_prompt_with_mode(
-        &config.workspace_dir,
-        model,
-        &tool_descs,
-        &[],
-        Some(&config.identity),
-        bootstrap_max_chars,
-        native_tools,
-        config.skills.prompt_injection_mode,
-    );
-    if !native_tools {
-        prompt.push_str(&build_tool_instructions_from_specs(&tool_specs));
-    }
-    prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
-
-    prompt
-}
-
 /// GET /ws/chat — WebSocket upgrade for agent chat
 pub async fn handle_ws_chat(
     State(state): State<AppState>,
+    Query(params): Query<WsQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    // Auth via Authorization header or websocket protocol token.
+    // Auth: check header, subprotocol, then query param (precedence order)
     if state.pairing.require_pairing() {
-        let token = extract_ws_bearer_token(&headers).unwrap_or_default();
-        if !state.pairing.is_authenticated(&token) {
+        let token = extract_ws_token(&headers, params.token.as_deref()).unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                "Unauthorized — provide Authorization: Bearer <token> or Sec-WebSocket-Protocol: bearer.<token>",
+                "Unauthorized — provide Authorization header, Sec-WebSocket-Protocol bearer, or ?token= query param",
             )
                 .into_response();
         }
     }
 
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    // Echo Sec-WebSocket-Protocol if the client requests our sub-protocol.
+    let ws = if headers
+        .get("sec-websocket-protocol")
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |protos| {
+            protos.split(',').any(|p| p.trim() == WS_PROTOCOL)
+        }) {
+        ws.protocols([WS_PROTOCOL])
+    } else {
+        ws
+    };
+
+    let session_id = params.session_id;
+    let session_name = params.name;
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, session_name))
         .into_response()
 }
 
-async fn handle_socket(mut socket: WebSocket, state: AppState) {
-    // Maintain conversation history for this WebSocket session
-    let mut history: Vec<ChatMessage> = Vec::new();
+/// Gateway session key prefix to avoid collisions with channel sessions.
+const GW_SESSION_PREFIX: &str = "gw_";
 
-    // Build system prompt once for the session
-    let system_prompt = {
-        let config_guard = state.config.lock();
-        build_ws_system_prompt(
-            &config_guard,
-            &state.model,
-            state.tools_registry_exec.as_ref(),
-            state.provider.supports_native_tools(),
-        )
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    session_id: Option<String>,
+    session_name: Option<String>,
+) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // Resolve session ID: use provided or generate a new UUID
+    let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+    // Build a persistent Agent for this connection so history is maintained across turns.
+    let config = state.config.lock().clone();
+    let mut agent = match crate::agent::Agent::from_config(&config).await {
+        Ok(a) => a,
+        Err(e) => {
+            let err = serde_json::json!({"type": "error", "message": format!("Failed to initialise agent: {e}")});
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
     };
+    agent.set_memory_session_id(Some(session_id.clone()));
 
-    // Add system message to history
-    history.push(ChatMessage::system(&system_prompt));
+    // Hydrate agent from persisted session (if available)
+    let mut resumed = false;
+    let mut message_count: usize = 0;
+    let mut effective_name: Option<String> = None;
+    if let Some(ref backend) = state.session_backend {
+        let messages = backend.load(&session_key);
+        if !messages.is_empty() {
+            message_count = messages.len();
+            agent.seed_history(&messages);
+            resumed = true;
+        }
+        // Set session name if provided (non-empty) on connect
+        if let Some(ref name) = session_name {
+            if !name.is_empty() {
+                let _ = backend.set_session_name(&session_key, name);
+                effective_name = Some(name.clone());
+            }
+        }
+        // If no name was provided via query param, load the stored name
+        if effective_name.is_none() {
+            effective_name = backend.get_session_name(&session_key).unwrap_or(None);
+        }
+    }
 
-    let approval_manager = {
-        let config_guard = state.config.lock();
-        ApprovalManager::from_config(&config_guard.autonomy)
-    };
+    // Send session_start message to client
+    let mut session_start = serde_json::json!({
+        "type": "session_start",
+        "session_id": session_id,
+        "resumed": resumed,
+        "message_count": message_count,
+    });
+    if let Some(ref name) = effective_name {
+        session_start["name"] = serde_json::Value::String(name.clone());
+    }
+    let _ = sender
+        .send(Message::Text(session_start.to_string().into()))
+        .await;
 
-    while let Some(msg) = socket.recv().await {
+    // ── Optional connect handshake ──────────────────────────────────
+    // The first message may be a `{"type":"connect",...}` frame carrying
+    // connection parameters.  If it is, we extract the params, send an
+    // ack, and proceed to the normal message loop.  If the first message
+    // is a regular `{"type":"message",...}` frame, we fall through and
+    // process it immediately (backward-compatible).
+    let mut first_msg_fallback: Option<String> = None;
+
+    if let Some(first) = receiver.next().await {
+        match first {
+            Ok(Message::Text(text)) => {
+                if let Ok(cp) = serde_json::from_str::<ConnectParams>(&text) {
+                    if cp.msg_type == "connect" {
+                        debug!(
+                            session_id = ?cp.session_id,
+                            device_name = ?cp.device_name,
+                            capabilities = ?cp.capabilities,
+                            "WebSocket connect params received"
+                        );
+                        // Override session_id if provided in connect params
+                        if let Some(sid) = &cp.session_id {
+                            agent.set_memory_session_id(Some(sid.clone()));
+                        }
+                        let ack = serde_json::json!({
+                            "type": "connected",
+                            "message": "Connection established"
+                        });
+                        let _ = sender.send(Message::Text(ack.to_string().into())).await;
+                    } else {
+                        // Not a connect message — fall through to normal processing
+                        first_msg_fallback = Some(text.to_string());
+                    }
+                } else {
+                    // Not parseable as ConnectParams — fall through
+                    first_msg_fallback = Some(text.to_string());
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => return,
+            _ => {}
+        }
+    }
+
+    // Process the first message if it was not a connect frame
+    if let Some(ref text) = first_msg_fallback {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+            if parsed["type"].as_str() == Some("message") {
+                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                if !content.is_empty() {
+                    // Persist user message
+                    if let Some(ref backend) = state.session_backend {
+                        let user_msg = crate::providers::ChatMessage::user(&content);
+                        let _ = backend.append(&session_key, &user_msg);
+                    }
+                    process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
+                        .await;
+                }
+            }
+        }
+    }
+
+    while let Some(msg) = receiver.next().await {
         let msg = match msg {
             Ok(Message::Text(text)) => text,
             Ok(Message::Close(_)) | Err(_) => break,
@@ -209,7 +286,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             Ok(v) => v,
             Err(_) => {
                 let err = serde_json::json!({"type": "error", "message": "Invalid JSON"});
-                let _ = socket.send(Message::Text(err.to_string().into())).await;
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
                 continue;
             }
         };
@@ -223,288 +300,157 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         if content.is_empty() {
             continue;
         }
-        let perplexity_cfg = { state.config.lock().security.perplexity_filter.clone() };
-        if let Some(assessment) =
-            crate::security::detect_adversarial_suffix(&content, &perplexity_cfg)
-        {
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!(
-                    "Input blocked by security.perplexity_filter: perplexity={:.2} (threshold {:.2}), symbol_ratio={:.2} (threshold {:.2}), suspicious_tokens={}.",
-                    assessment.perplexity,
-                    perplexity_cfg.perplexity_threshold,
-                    assessment.symbol_ratio,
-                    perplexity_cfg.symbol_ratio_threshold,
-                    assessment.suspicious_token_count
-                ),
-            });
-            let _ = socket.send(Message::Text(err.to_string().into())).await;
-            continue;
+
+        // Persist user message
+        if let Some(ref backend) = state.session_backend {
+            let user_msg = crate::providers::ChatMessage::user(&content);
+            let _ = backend.append(&session_key, &user_msg);
         }
 
-        // Add user message to history
-        history.push(ChatMessage::user(&content));
-
-        // Get provider info
-        let provider_label = state
-            .config
-            .lock()
-            .default_provider
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-
-        // Broadcast agent_start event
-        let _ = state.event_tx.send(serde_json::json!({
-            "type": "agent_start",
-            "provider": provider_label,
-            "model": state.model,
-        }));
-
-        // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
-        match super::run_gateway_chat_with_tools(&state, &content).await {
-            Ok(response) => {
-                let safe_response =
-                    finalize_ws_response(&response, &history, state.tools_registry_exec.as_ref());
-                // Add assistant response to history
-                history.push(ChatMessage::assistant(&safe_response));
-
-                // Send the full response as a done message
-                let done = serde_json::json!({
-                    "type": "done",
-                    "full_response": safe_response,
-                });
-                let _ = socket.send(Message::Text(done.to_string().into())).await;
-
-                // Broadcast agent_end event
-                let _ = state.event_tx.send(serde_json::json!({
-                    "type": "agent_end",
-                    "provider": provider_label,
-                    "model": state.model,
-                }));
-            }
-            Err(e) => {
-                let sanitized = crate::providers::sanitize_api_error(&e.to_string());
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": sanitized,
-                });
-                let _ = socket.send(Message::Text(err.to_string().into())).await;
-
-                // Broadcast error event
-                let _ = state.event_tx.send(serde_json::json!({
-                    "type": "error",
-                    "component": "ws_chat",
-                    "message": sanitized,
-                }));
-            }
-        }
+        process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
     }
 }
 
-fn extract_ws_bearer_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(auth_header) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-    {
-        if let Some(token) = auth_header.strip_prefix("Bearer ") {
-            if !token.trim().is_empty() {
-                return Some(token.trim().to_string());
+/// Process a single chat message through the agent and send the response.
+async fn process_chat_message(
+    state: &AppState,
+    agent: &mut crate::agent::Agent,
+    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    content: &str,
+    session_key: &str,
+) {
+    let provider_label = state
+        .config
+        .lock()
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Broadcast agent_start event
+    let _ = state.event_tx.send(serde_json::json!({
+        "type": "agent_start",
+        "provider": provider_label,
+        "model": state.model,
+    }));
+
+    // Multi-turn chat via persistent Agent (history is maintained across turns)
+    match agent.turn(content).await {
+        Ok(response) => {
+            // Persist assistant response
+            if let Some(ref backend) = state.session_backend {
+                let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                let _ = backend.append(session_key, &assistant_msg);
             }
+
+            let done = serde_json::json!({
+                "type": "done",
+                "full_response": response,
+            });
+            let _ = sender.send(Message::Text(done.to_string().into())).await;
+
+            // Broadcast agent_end event
+            let _ = state.event_tx.send(serde_json::json!({
+                "type": "agent_end",
+                "provider": provider_label,
+                "model": state.model,
+            }));
+        }
+        Err(e) => {
+            let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+            let err = serde_json::json!({
+                "type": "error",
+                "message": sanitized,
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+
+            // Broadcast error event
+            let _ = state.event_tx.send(serde_json::json!({
+                "type": "error",
+                "component": "ws_chat",
+                "message": sanitized,
+            }));
         }
     }
-
-    let offered = headers
-        .get(header::SEC_WEBSOCKET_PROTOCOL)
-        .and_then(|value| value.to_str().ok())?;
-
-    for protocol in offered.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        if let Some(token) = protocol.strip_prefix("bearer.") {
-            if !token.trim().is_empty() {
-                return Some(token.trim().to_string());
-            }
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{Tool, ToolResult};
-    use async_trait::async_trait;
-    use axum::http::HeaderValue;
+    use axum::http::HeaderMap;
 
     #[test]
-    fn extract_ws_bearer_token_prefers_authorization_header() {
+    fn extract_ws_token_from_authorization_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer zc_test123".parse().unwrap());
+        assert_eq!(extract_ws_token(&headers, None), Some("zc_test123"));
+    }
+
+    #[test]
+    fn extract_ws_token_from_subprotocol() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer from-auth-header"),
+            "sec-websocket-protocol",
+            "zeroclaw.v1, bearer.zc_sub456".parse().unwrap(),
         );
-        headers.insert(
-            header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("zeroclaw.v1, bearer.from-protocol"),
-        );
+        assert_eq!(extract_ws_token(&headers, None), Some("zc_sub456"));
+    }
 
+    #[test]
+    fn extract_ws_token_from_query_param() {
+        let headers = HeaderMap::new();
         assert_eq!(
-            extract_ws_bearer_token(&headers).as_deref(),
-            Some("from-auth-header")
+            extract_ws_token(&headers, Some("zc_query789")),
+            Some("zc_query789")
         );
     }
 
     #[test]
-    fn extract_ws_bearer_token_reads_websocket_protocol_token() {
+    fn extract_ws_token_precedence_header_over_subprotocol() {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("zeroclaw.v1, bearer.protocol-token"),
-        );
-
+        headers.insert("authorization", "Bearer zc_header".parse().unwrap());
+        headers.insert("sec-websocket-protocol", "bearer.zc_sub".parse().unwrap());
         assert_eq!(
-            extract_ws_bearer_token(&headers).as_deref(),
-            Some("protocol-token")
+            extract_ws_token(&headers, Some("zc_query")),
+            Some("zc_header")
         );
     }
 
     #[test]
-    fn extract_ws_bearer_token_rejects_empty_tokens() {
+    fn extract_ws_token_precedence_subprotocol_over_query() {
+        let mut headers = HeaderMap::new();
+        headers.insert("sec-websocket-protocol", "bearer.zc_sub".parse().unwrap());
+        assert_eq!(extract_ws_token(&headers, Some("zc_query")), Some("zc_sub"));
+    }
+
+    #[test]
+    fn extract_ws_token_returns_none_when_empty() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_ws_token(&headers, None), None);
+    }
+
+    #[test]
+    fn extract_ws_token_skips_empty_header_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer ".parse().unwrap());
+        assert_eq!(
+            extract_ws_token(&headers, Some("zc_fallback")),
+            Some("zc_fallback")
+        );
+    }
+
+    #[test]
+    fn extract_ws_token_skips_empty_query_param() {
+        let headers = HeaderMap::new();
+        assert_eq!(extract_ws_token(&headers, Some("")), None);
+    }
+
+    #[test]
+    fn extract_ws_token_subprotocol_with_multiple_entries() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer    "),
+            "sec-websocket-protocol",
+            "zeroclaw.v1, bearer.zc_tok, other".parse().unwrap(),
         );
-        headers.insert(
-            header::SEC_WEBSOCKET_PROTOCOL,
-            HeaderValue::from_static("zeroclaw.v1, bearer."),
-        );
-
-        assert!(extract_ws_bearer_token(&headers).is_none());
-    }
-
-    struct MockScheduleTool;
-
-    #[async_trait]
-    impl Tool for MockScheduleTool {
-        fn name(&self) -> &str {
-            "schedule"
-        }
-
-        fn description(&self) -> &str {
-            "Mock schedule tool"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "action": { "type": "string" }
-                }
-            })
-        }
-
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-            Ok(ToolResult {
-                success: true,
-                output: "ok".to_string(),
-                error: None,
-            })
-        }
-    }
-
-    #[test]
-    fn sanitize_ws_response_removes_tool_call_tags() {
-        let input = r#"Before
-<tool_call>
-{"name":"schedule","arguments":{"action":"create"}}
-</tool_call>
-After"#;
-
-        let result = sanitize_ws_response(input, &[]);
-        let normalized = result
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(normalized, "Before\nAfter");
-        assert!(!result.contains("<tool_call>"));
-        assert!(!result.contains("\"name\":\"schedule\""));
-    }
-
-    #[test]
-    fn sanitize_ws_response_removes_isolated_tool_json_artifacts() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
-        let input = r#"{"name":"schedule","parameters":{"action":"create"}}
-{"result":{"status":"scheduled"}}
-Reminder set successfully."#;
-
-        let result = sanitize_ws_response(input, &tools);
-        assert_eq!(result, "Reminder set successfully.");
-        assert!(!result.contains("\"name\":\"schedule\""));
-        assert!(!result.contains("\"result\""));
-    }
-
-    #[test]
-    fn build_ws_system_prompt_includes_tool_protocol_for_prompt_mode() {
-        let config = crate::config::Config::default();
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
-
-        let prompt = build_ws_system_prompt(&config, "test-model", &tools, false);
-
-        assert!(prompt.contains("## Tool Use Protocol"));
-        assert!(prompt.contains("**schedule**"));
-        assert!(prompt.contains("## Shell Policy"));
-    }
-
-    #[test]
-    fn build_ws_system_prompt_omits_xml_protocol_for_native_mode() {
-        let config = crate::config::Config::default();
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
-
-        let prompt = build_ws_system_prompt(&config, "test-model", &tools, true);
-
-        assert!(!prompt.contains("## Tool Use Protocol"));
-        assert!(prompt.contains("**schedule**"));
-        assert!(prompt.contains("## Shell Policy"));
-    }
-
-    #[test]
-    fn finalize_ws_response_uses_prompt_mode_tool_output_when_final_text_empty() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
-        let history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::user(
-                "[Tool results]\n<tool_result name=\"schedule\">\nDisk usage: 72%\n</tool_result>",
-            ),
-        ];
-
-        let result = finalize_ws_response("", &history, &tools);
-        assert!(result.contains("Latest tool output:"));
-        assert!(result.contains("Disk usage: 72%"));
-        assert!(!result.contains("<tool_result"));
-    }
-
-    #[test]
-    fn finalize_ws_response_uses_native_tool_message_output_when_final_text_empty() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
-        let history = vec![ChatMessage {
-            role: "tool".to_string(),
-            content: r#"{"tool_call_id":"call_1","content":"Filesystem /dev/disk3s1: 210G free"}"#
-                .to_string(),
-        }];
-
-        let result = finalize_ws_response("", &history, &tools);
-        assert!(result.contains("Latest tool output:"));
-        assert!(result.contains("/dev/disk3s1"));
-    }
-
-    #[test]
-    fn finalize_ws_response_uses_static_fallback_when_nothing_available() {
-        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
-        let history = vec![ChatMessage::system("sys")];
-
-        let result = finalize_ws_response("", &history, &tools);
-        assert_eq!(result, EMPTY_WS_RESPONSE_FALLBACK);
+        assert_eq!(extract_ws_token(&headers, None), Some("zc_tok"));
     }
 }

@@ -1,0 +1,175 @@
+name: Quality Gate
+
+on:
+  pull_request:
+    branches: [master]
+
+concurrency:
+  group: checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Run tests
+        run: cargo nextest run --locked
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        if: runner.os != 'Windows'
+
+      - name: Install mold linker
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y mold
+
+      - name: Ensure web/dist placeholder exists
+        shell: bash
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+
+      - name: Build release
+        shell: bash
+        run: cargo build --profile ci --locked --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+
+  security:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Audit dependencies
+        run: cargo audit
+
+      - name: Check licenses and sources
+        run: cargo deny check licenses sources
+
+  check-32bit:
+    name: "Check (32-bit)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Install 32-bit libs
+        run: sudo apt-get update && sudo apt-get install -y gcc-multilib
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Cargo check (32-bit, no default features)
+        run: cargo check --target i686-unknown-linux-gnu --no-default-features
+
+  # Composite status check — branch protection only needs to require this
+  # single job instead of tracking every matrix leg individually.
+  gate:
+    name: CI Required Gate
+    if: always()
+    needs: [lint, test, build, security, check-32bit]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check upstream job results
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
+            echo "::error::One or more upstream jobs failed or were cancelled"
+            exit 1
+          fi
+
+  security-gate:
+    name: Security Required Gate
+    if: always()
+    needs: [security]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check security job result
+        run: |
+          if [[ "${{ needs.security.result }}" != "success" ]]; then
+            echo "::error::Security audit failed or was cancelled"
+            exit 1
+          fi

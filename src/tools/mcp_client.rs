@@ -3,7 +3,11 @@
 //! Supports multiple transports: stdio (spawn local process), HTTP, and SSE.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(not(target_has_atomic = "64"))]
+use std::sync::atomic::AtomicU32;
+#[cfg(target_has_atomic = "64")]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -32,7 +36,10 @@ const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 struct McpServerInner {
     config: McpServerConfig,
     transport: Box<dyn McpTransportConn>,
+    #[cfg(target_has_atomic = "64")]
     next_id: AtomicU64,
+    #[cfg(not(target_has_atomic = "64"))]
+    next_id: AtomicU32,
     tools: Vec<McpToolDef>,
 }
 
@@ -123,7 +130,10 @@ impl McpServer {
         let inner = McpServerInner {
             config,
             transport,
+            #[cfg(target_has_atomic = "64")]
             next_id: AtomicU64::new(3), // Start at 3 since we used 1 and 2
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3), // Start at 3 since we used 1 and 2
             tools: tool_list.tools,
         };
 
@@ -155,7 +165,7 @@ impl McpServer {
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
         let mut inner = self.inner.lock().await;
-        let id = inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let id = inner.next_id.fetch_add(1, Ordering::Relaxed) as u64;
         let req = JsonRpcRequest::new(
             id,
             "tools/call",
@@ -301,11 +311,11 @@ mod tests {
             name: "nonexistent".to_string(),
             command: "/usr/bin/this_binary_does_not_exist_zeroclaw_test".to_string(),
             args: vec![],
-            env: Default::default(),
+            env: std::collections::HashMap::default(),
             tool_timeout_secs: None,
             transport: McpTransport::Stdio,
             url: None,
-            headers: Default::default(),
+            headers: std::collections::HashMap::default(),
         };
         let result = McpServer::connect(config).await;
         assert!(result.is_err());
@@ -320,11 +330,11 @@ mod tests {
             name: "bad".to_string(),
             command: "/usr/bin/does_not_exist_zc_test".to_string(),
             args: vec![],
-            env: Default::default(),
+            env: std::collections::HashMap::default(),
             tool_timeout_secs: None,
             transport: McpTransport::Stdio,
             url: None,
-            headers: Default::default(),
+            headers: std::collections::HashMap::default(),
         }];
         let registry = McpRegistry::connect_all(&configs)
             .await
@@ -353,5 +363,57 @@ mod tests {
         };
         let result = create_transport(&config);
         assert!(result.is_err());
+    }
+
+    // ── Empty registry (no servers) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn empty_registry_is_empty() {
+        let registry = McpRegistry::connect_all(&[])
+            .await
+            .expect("connect_all on empty slice should succeed");
+        assert!(registry.is_empty());
+        assert_eq!(registry.server_count(), 0);
+        assert_eq!(registry.tool_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_registry_tool_names_is_empty() {
+        let registry = McpRegistry::connect_all(&[])
+            .await
+            .expect("connect_all should succeed");
+        assert!(registry.tool_names().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_registry_get_tool_def_returns_none() {
+        let registry = McpRegistry::connect_all(&[])
+            .await
+            .expect("connect_all should succeed");
+        let result = registry.get_tool_def("nonexistent__tool").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_registry_call_tool_unknown_name_returns_error() {
+        let registry = McpRegistry::connect_all(&[])
+            .await
+            .expect("connect_all should succeed");
+        let err = registry
+            .call_tool("nonexistent__tool", serde_json::json!({}))
+            .await
+            .expect_err("should fail for unknown tool");
+        assert!(err.to_string().contains("unknown MCP tool"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn connect_all_empty_gives_zero_servers() {
+        let registry = McpRegistry::connect_all(&[])
+            .await
+            .expect("connect_all should succeed");
+        // Verify all three count methods agree on zero.
+        assert_eq!(registry.server_count(), 0);
+        assert_eq!(registry.tool_count(), 0);
+        assert!(registry.is_empty());
     }
 }

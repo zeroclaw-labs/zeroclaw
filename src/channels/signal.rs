@@ -28,6 +28,8 @@ pub struct SignalChannel {
     allowed_from: Vec<String>,
     ignore_attachments: bool,
     ignore_stories: bool,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 // ── signal-cli SSE event JSON shapes ────────────────────────────
@@ -87,12 +89,23 @@ impl SignalChannel {
             allowed_from,
             ignore_attachments,
             ignore_stories,
+            proxy_url: None,
         }
+    }
+
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
     }
 
     fn http_client(&self) -> Client {
         let builder = Client::builder().connect_timeout(Duration::from_secs(10));
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "channel.signal");
+        let builder = crate::config::apply_channel_proxy_to_builder(
+            builder,
+            "channel.signal",
+            self.proxy_url.as_deref(),
+        );
         builder.build().expect("Signal HTTP client should build")
     }
 
@@ -266,6 +279,7 @@ impl SignalChannel {
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
+            interruption_scope_id: None,
         })
     }
 }
@@ -316,8 +330,7 @@ impl Channel for SignalChannel {
                 Ok(r) => {
                     let status = r.status();
                     let body = r.text().await.unwrap_or_default();
-                    let sanitized = crate::providers::sanitize_api_error(&body);
-                    tracing::warn!("Signal SSE returned {status}: {sanitized}");
+                    tracing::warn!("Signal SSE returned {status}: {body}");
                     tokio::time::sleep(tokio::time::Duration::from_secs(retry_delay_secs)).await;
                     retry_delay_secs = (retry_delay_secs * 2).min(max_delay_secs);
                     continue;

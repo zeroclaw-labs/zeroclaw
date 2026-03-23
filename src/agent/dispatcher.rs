@@ -31,20 +31,12 @@ pub struct XmlToolDispatcher;
 
 impl XmlToolDispatcher {
     fn parse_xml_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
+        // Strip `<think>...</think>` blocks before parsing tool calls.
+        // Qwen and other reasoning models may embed chain-of-thought inline.
+        let cleaned = Self::strip_think_tags(response);
         let mut text_parts = Vec::new();
         let mut calls = Vec::new();
-        // Normalize tag variants produced by some models/channels so the parser is consistent.
-        // The dispatcher expects <tool_call>...</tool_call>, but other parts of the system accept
-        // <toolcall>, <tool-call>, and <invoke>. Normalize them here.
-        let normalized = response
-            .replace("<toolcall>", "<tool_call>")
-            .replace("</toolcall>", "</tool_call>")
-            .replace("<tool-call>", "<tool_call>")
-            .replace("</tool-call>", "</tool_call>")
-            .replace("<invoke>", "<tool_call>")
-            .replace("</invoke>", "</tool_call>");
-
-        let mut remaining = normalized.as_str();
+        let mut remaining = cleaned.as_str();
 
         while let Some(start) = remaining.find("<tool_call>") {
             let before = &remaining[..start];
@@ -92,6 +84,26 @@ impl XmlToolDispatcher {
         (text_parts.join("\n"), calls)
     }
 
+    /// Remove `<think>...</think>` blocks from model output.
+    fn strip_think_tags(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut rest = s;
+        loop {
+            if let Some(start) = rest.find("<think>") {
+                result.push_str(&rest[..start]);
+                if let Some(end) = rest[start..].find("</think>") {
+                    rest = &rest[start + end + "</think>".len()..];
+                } else {
+                    break;
+                }
+            } else {
+                result.push_str(rest);
+                break;
+            }
+        }
+        result
+    }
+
     pub fn tool_specs(tools: &[Box<dyn Tool>]) -> Vec<ToolSpec> {
         tools.iter().map(|tool| tool.spec()).collect()
     }
@@ -116,7 +128,7 @@ impl ToolDispatcher for XmlToolDispatcher {
         ConversationMessage::Chat(ChatMessage::user(format!("[Tool results]\n{content}")))
     }
 
-    fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
+    fn prompt_instructions(&self, _tools: &[Box<dyn Tool>]) -> String {
         let mut instructions = String::new();
         instructions.push_str("## Tool Use Protocol\n\n");
         instructions
@@ -124,17 +136,6 @@ impl ToolDispatcher for XmlToolDispatcher {
         instructions.push_str(
             "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
         );
-        instructions.push_str("### Available Tools\n\n");
-
-        for tool in tools {
-            let _ = writeln!(
-                instructions,
-                "- **{}**: {}\n  Parameters: `{}`",
-                tool.name(),
-                tool.description(),
-                tool.parameters_schema()
-            );
-        }
 
         instructions
     }
@@ -268,6 +269,40 @@ mod tests {
         let (_, calls) = dispatcher.parse_response(&response);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "shell");
+    }
+
+    #[test]
+    fn xml_dispatcher_strips_think_before_tool_call() {
+        let response = ChatResponse {
+            text: Some(
+                "<think>I should list files</think>\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>"
+                    .into(),
+            ),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        };
+        let dispatcher = XmlToolDispatcher;
+        let (text, calls) = dispatcher.parse_response(&response);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert!(
+            !text.contains("<think>"),
+            "think tags should be stripped from text"
+        );
+    }
+
+    #[test]
+    fn xml_dispatcher_think_only_returns_no_calls() {
+        let response = ChatResponse {
+            text: Some("<think>Just thinking</think>".into()),
+            tool_calls: vec![],
+            usage: None,
+            reasoning_content: None,
+        };
+        let dispatcher = XmlToolDispatcher;
+        let (_, calls) = dispatcher.parse_response(&response);
+        assert!(calls.is_empty());
     }
 
     #[test]

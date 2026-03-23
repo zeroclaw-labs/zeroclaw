@@ -64,3 +64,8 @@ LICENSE
 *.profdata
 coverage
 lcov.info
+
+# Application and script directories (not needed for Docker runtime)
+apps/
+python/
+scripts/

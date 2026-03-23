@@ -10,6 +10,7 @@ import {
 } from 'lucide-react';
 import type { StatusResponse, CostSummary } from '@/types/api';
 import { getStatus, getCost } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 function formatUptime(seconds: number): string {
   const d = Math.floor(seconds / 86400);
@@ -28,13 +29,13 @@ function healthColor(status: string): string {
   switch (status.toLowerCase()) {
     case 'ok':
     case 'healthy':
-      return 'bg-green-500';
+      return 'var(--color-status-success)';
     case 'warn':
     case 'warning':
     case 'degraded':
-      return 'bg-yellow-500';
+      return 'var(--color-status-warning)';
     default:
-      return 'bg-red-500';
+      return 'var(--color-status-error)';
   }
 }
 
@@ -42,20 +43,67 @@ function healthBorder(status: string): string {
   switch (status.toLowerCase()) {
     case 'ok':
     case 'healthy':
-      return 'border-green-500/30';
+      return 'rgba(0, 230, 138, 0.2)';
     case 'warn':
     case 'warning':
     case 'degraded':
-      return 'border-yellow-500/30';
+      return 'rgba(255, 170, 0, 0.2)';
     default:
-      return 'border-red-500/30';
+      return 'rgba(255, 68, 102, 0.2)';
   }
 }
+
+function healthBg(status: string): string {
+  switch (status.toLowerCase()) {
+    case 'ok':
+    case 'healthy':
+      return 'rgba(0, 230, 138, 0.05)';
+    case 'warn':
+    case 'warning':
+    case 'degraded':
+      return 'rgba(255, 170, 0, 0.05)';
+    default:
+      return 'rgba(255, 68, 102, 0.05)';
+  }
+}
+
+const STATUS_CARDS = [
+  {
+    icon: Cpu,
+    accent: "var(--pc-accent)",
+    labelKey: "dashboard.provider_model",
+    getValue: (s: StatusResponse) => s.provider ?? "Unknown",
+    getSub: (s: StatusResponse) => s.model ?? "",
+  },
+  {
+    icon: Clock,
+    accent: "#34d399",
+    labelKey: "dashboard.uptime",
+    getValue: (s: StatusResponse) => formatUptime(s.uptime_seconds),
+    getSub: () => t("dashboard.since_last_restart"),
+  },
+  {
+    icon: Globe,
+    accent: "#a78bfa",
+    labelKey: "dashboard.gateway_port",
+    getValue: (s: StatusResponse) => `:${s.gateway_port}`,
+    getSub: () => "",
+  },
+  {
+    icon: Database,
+    accent: "#fbbf24",
+    labelKey: "dashboard.memory_backend",
+    getValue: (s: StatusResponse) => s.memory_backend,
+    getSub: (s: StatusResponse) =>
+      `${t("dashboard.paired")}: ${s.paired ? t("dashboard.paired_yes") : t("dashboard.paired_no")}`,
+  },
+];
 
 export default function Dashboard() {
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [cost, setCost] = useState<CostSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showAllChannels, setShowAllChannels] = useState(false);
 
   useEffect(() => {
     Promise.all([getStatus(), getCost()])
@@ -68,9 +116,9 @@ export default function Dashboard() {
 
   if (error) {
     return (
-      <div className="p-6">
-        <div className="rounded-lg bg-red-900/30 border border-red-700 p-4 text-red-300">
-          Failed to load dashboard: {error}
+      <div className="p-6 animate-fade-in">
+        <div className="rounded-2xl border p-4" style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171", }}>
+          {t("dashboard.load_error")}: {error}
         </div>
       </div>
     );
@@ -79,166 +127,258 @@ export default function Dashboard() {
   if (!status || !cost) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-8 w-8 border-2 border-blue-500 border-t-transparent" />
+        <div className="h-8 w-8 border-2 rounded-full animate-spin" style={{ borderColor: "var(--pc-border)", borderTopColor: "var(--pc-accent)", }}/>
       </div>
     );
   }
 
-  const maxCost = Math.max(cost.session_cost_usd, cost.daily_cost_usd, cost.monthly_cost_usd, 0.001);
+  const maxCost = Math.max(
+    cost.session_cost_usd,
+    cost.daily_cost_usd,
+    cost.monthly_cost_usd,
+    0.001
+  );
 
   return (
-    <div className="p-6 space-y-6">
+    <div className="p-6 space-y-6 animate-fade-in">
       {/* Status Cards Grid */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
-          <div className="flex items-center gap-3 mb-3">
-            <div className="p-2 bg-blue-600/20 rounded-lg">
-              <Cpu className="h-5 w-5 text-blue-400" />
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
+        {STATUS_CARDS.map(({ icon: Icon, accent, labelKey, getValue, getSub }) => (
+          <div key={labelKey} className="card p-5 animate-slide-in-up">
+            <div className="flex items-center gap-3 mb-3">
+              <div className="p-2 rounded-2xl" style={{ background: `rgba(var(--pc-accent-rgb), 0.08)`, color: accent, }}>
+                <Icon className="h-5 w-5" />
+              </div>
+              <span className="text-xs uppercase tracking-wider font-medium" style={{ color: "var(--pc-text-muted)" }}>{t(labelKey)}</span>
             </div>
-            <span className="text-sm text-gray-400">Provider / Model</span>
+            <p className="text-lg font-semibold truncate capitalize" style={{ color: "var(--pc-text-primary)" }}>{getValue(status)}</p>
+            <p className="text-sm truncate" style={{ color: "var(--pc-text-muted)" }}>{getSub(status)}</p>
           </div>
-          <p className="text-lg font-semibold text-white truncate">
-            {status.provider ?? 'Unknown'}
-          </p>
-          <p className="text-sm text-gray-400 truncate">{status.model}</p>
-        </div>
-
-        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
-          <div className="flex items-center gap-3 mb-3">
-            <div className="p-2 bg-green-600/20 rounded-lg">
-              <Clock className="h-5 w-5 text-green-400" />
-            </div>
-            <span className="text-sm text-gray-400">Uptime</span>
-          </div>
-          <p className="text-lg font-semibold text-white">
-            {formatUptime(status.uptime_seconds)}
-          </p>
-          <p className="text-sm text-gray-400">Since last restart</p>
-        </div>
-
-        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
-          <div className="flex items-center gap-3 mb-3">
-            <div className="p-2 bg-purple-600/20 rounded-lg">
-              <Globe className="h-5 w-5 text-purple-400" />
-            </div>
-            <span className="text-sm text-gray-400">Gateway Port</span>
-          </div>
-          <p className="text-lg font-semibold text-white">
-            :{status.gateway_port}
-          </p>
-          <p className="text-sm text-gray-400">Locale: {status.locale}</p>
-        </div>
-
-        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
-          <div className="flex items-center gap-3 mb-3">
-            <div className="p-2 bg-orange-600/20 rounded-lg">
-              <Database className="h-5 w-5 text-orange-400" />
-            </div>
-            <span className="text-sm text-gray-400">Memory Backend</span>
-          </div>
-          <p className="text-lg font-semibold text-white capitalize">
-            {status.memory_backend}
-          </p>
-          <p className="text-sm text-gray-400">
-            Paired: {status.paired ? 'Yes' : 'No'}
-          </p>
-        </div>
+        ))}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 stagger-children">
         {/* Cost Widget */}
-        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
-          <div className="flex items-center gap-2 mb-4">
-            <DollarSign className="h-5 w-5 text-blue-400" />
-            <h2 className="text-base font-semibold text-white">Cost Overview</h2>
+        <div className="card p-5 animate-slide-in-up">
+          <div className="flex items-center gap-2 mb-5">
+            <DollarSign className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+            <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: "var(--pc-text-primary)" }}>{t("dashboard.cost_overview")}</h2>
           </div>
           <div className="space-y-4">
             {[
-              { label: 'Session', value: cost.session_cost_usd, color: 'bg-blue-500' },
-              { label: 'Daily', value: cost.daily_cost_usd, color: 'bg-green-500' },
-              { label: 'Monthly', value: cost.monthly_cost_usd, color: 'bg-purple-500' },
+              {
+                label: t("dashboard.session_label"),
+                value: cost.session_cost_usd,
+                color: "var(--pc-accent)",
+              },
+              {
+                label: t("dashboard.daily_label"),
+                value: cost.daily_cost_usd,
+                color: "#34d399",
+              },
+              {
+                label: t("dashboard.monthly_label"),
+                value: cost.monthly_cost_usd,
+                color: "#a78bfa",
+              },
             ].map(({ label, value, color }) => (
               <div key={label}>
-                <div className="flex justify-between text-sm mb-1">
-                  <span className="text-gray-400">{label}</span>
-                  <span className="text-white font-medium">{formatUSD(value)}</span>
+                <div className="flex justify-between text-sm mb-1.5">
+                  <span style={{ color: "var(--pc-text-muted)" }}>{label}</span>
+                  <span
+                    className="font-medium font-mono"
+                    style={{ color: "var(--pc-text-primary)" }}
+                  >
+                    {formatUSD(value)}
+                  </span>
                 </div>
-                <div className="w-full h-2 bg-gray-800 rounded-full overflow-hidden">
+                <div
+                  className="w-full h-1.5 rounded-full overflow-hidden"
+                  style={{ background: "var(--pc-hover)" }}
+                >
                   <div
-                    className={`h-full rounded-full ${color}`}
-                    style={{ width: `${Math.max((value / maxCost) * 100, 2)}%` }}
+                    className="h-full rounded-full progress-bar-animated transition-all duration-700 ease-out"
+                    style={{
+                      width: `${Math.max((value / maxCost) * 100, 2)}%`,
+                      background: color,
+                    }}
                   />
                 </div>
               </div>
             ))}
           </div>
-          <div className="mt-4 pt-3 border-t border-gray-800 flex justify-between text-sm">
-            <span className="text-gray-400">Total Tokens</span>
-            <span className="text-white">{cost.total_tokens.toLocaleString()}</span>
+          <div
+            className="mt-5 pt-4 border-t flex justify-between text-sm"
+            style={{ borderColor: "var(--pc-border)" }}
+          >
+            <span style={{ color: "var(--pc-text-muted)" }}>
+              {t("dashboard.total_tokens_label")}
+            </span>
+            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
+              {cost.total_tokens.toLocaleString()}
+            </span>
           </div>
           <div className="flex justify-between text-sm mt-1">
-            <span className="text-gray-400">Requests</span>
-            <span className="text-white">{cost.request_count.toLocaleString()}</span>
+            <span style={{ color: "var(--pc-text-muted)" }}>
+              {t("dashboard.requests_label")}
+            </span>
+            <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
+              {cost.request_count.toLocaleString()}
+            </span>
           </div>
         </div>
 
         {/* Active Channels */}
-        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
-          <div className="flex items-center gap-2 mb-4">
-            <Radio className="h-5 w-5 text-blue-400" />
-            <h2 className="text-base font-semibold text-white">Active Channels</h2>
+        <div className="card p-5 animate-slide-in-up">
+          <div className="flex items-center gap-2 mb-5">
+            <Radio className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("dashboard.channels")}
+            </h2>
+            <button
+              onClick={() => setShowAllChannels((v) => !v)}
+              className="ml-auto flex items-center gap-1 rounded-full px-2.5 py-1 text-[10px] font-medium border transition-all"
+              style={
+                showAllChannels
+                  ? {
+                      background: "rgba(var(--pc-accent-rgb), 0.1)",
+                      borderColor: "rgba(var(--pc-accent-rgb), 0.3)",
+                      color: "var(--pc-accent-light)",
+                    }
+                  : {
+                      background: "rgba(0, 230, 138, 0.08)",
+                      borderColor: "rgba(0, 230, 138, 0.25)",
+                      color: "#34d399",
+                    }
+              }
+              aria-label={
+                showAllChannels
+                  ? t("dashboard.filter_active")
+                  : t("dashboard.filter_all")
+              }
+            >
+              {showAllChannels
+                ? t("dashboard.filter_all")
+                : t("dashboard.filter_active")}
+            </button>
           </div>
-          <div className="space-y-2">
+          <div className="space-y-2 overflow-y-auto max-h-48 pr-1">
             {Object.entries(status.channels).length === 0 ? (
-              <p className="text-sm text-gray-500">No channels configured</p>
-            ) : (
-              Object.entries(status.channels).map(([name, active]) => (
+              <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
+                {t("dashboard.no_channels")}
+              </p>
+            ) : (() => {
+              const entries = Object.entries(status.channels).filter(
+                ([, active]) => showAllChannels || active
+              );
+              if (entries.length === 0) {
+                return (
+                  <p className="text-sm" style={{ color: "var(--pc-text-faint)" }}>
+                    {t("dashboard.no_active_channels")}
+                  </p>
+                );
+              }
+              return entries.map(([name, active]) => (
                 <div
                   key={name}
-                  className="flex items-center justify-between py-2 px-3 rounded-lg bg-gray-800/50"
+                  className="flex items-center justify-between py-2.5 px-3 rounded-xl transition-all"
+                  style={{ background: "var(--pc-bg-elevated)" }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = "var(--pc-hover)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = "var(--pc-bg-elevated)";
+                  }}
                 >
-                  <span className="text-sm text-white capitalize">{name}</span>
+                  <span
+                    className="text-sm font-medium capitalize"
+                    style={{ color: "var(--pc-text-primary)" }}
+                  >
+                    {name}
+                  </span>
                   <div className="flex items-center gap-2">
                     <span
-                      className={`inline-block h-2.5 w-2.5 rounded-full ${
-                        active ? 'bg-green-500' : 'bg-gray-500'
-                      }`}
+                      className="status-dot"
+                      style={
+                        active
+                          ? {
+                              background: "var(--color-status-success)",
+                              boxShadow: "0 0 6px var(--color-status-success)",
+                            }
+                          : { background: "var(--pc-text-faint)" }
+                      }
                     />
-                    <span className="text-xs text-gray-400">
-                      {active ? 'Active' : 'Inactive'}
+                    <span className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
+                      {active ? t("dashboard.active") : t("dashboard.inactive")}
                     </span>
                   </div>
                 </div>
-              ))
-            )}
+              ));
+            })()}
           </div>
         </div>
 
-        {/* Health Grid */}
-        <div className="bg-gray-900 rounded-xl p-5 border border-gray-800">
-          <div className="flex items-center gap-2 mb-4">
-            <Activity className="h-5 w-5 text-blue-400" />
-            <h2 className="text-base font-semibold text-white">Component Health</h2>
+        <div className="card p-5 animate-slide-in-up">
+          <div className="flex items-center gap-2 mb-5">
+            <Activity className="h-5 w-5" style={{ color: "var(--pc-accent)" }} />
+            <h2
+              className="text-sm font-semibold uppercase tracking-wider"
+              style={{ color: "var(--pc-text-primary)" }}
+            >
+              {t("dashboard.component_health")}
+            </h2>
           </div>
           <div className="grid grid-cols-2 gap-3">
             {Object.entries(status.health.components).length === 0 ? (
-              <p className="text-sm text-gray-500 col-span-2">No components reporting</p>
+              <p
+                className="text-sm col-span-2"
+                style={{ color: "var(--pc-text-faint)" }}
+              >
+                {t("dashboard.no_components")}
+              </p>
             ) : (
               Object.entries(status.health.components).map(([name, comp]) => (
                 <div
                   key={name}
-                  className={`rounded-lg p-3 border ${healthBorder(comp.status)} bg-gray-800/50`}
+                  className="rounded-2xl p-3 transition-all"
+                  style={{
+                    border: `1px solid ${healthBorder(comp.status)}`,
+                    background: healthBg(comp.status),
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.transform = "scale(1.02)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.transform = "scale(1)";
+                  }}
                 >
                   <div className="flex items-center gap-2 mb-1">
-                    <span className={`inline-block h-2 w-2 rounded-full ${healthColor(comp.status)}`} />
-                    <span className="text-sm font-medium text-white capitalize truncate">
+                    <span
+                      className="status-dot"
+                      style={{
+                        background: healthColor(comp.status),
+                        boxShadow: `0 0 6px ${healthColor(comp.status)}`,
+                      }}
+                    />
+                    <span
+                      className="text-sm font-medium truncate capitalize"
+                      style={{ color: "var(--pc-text-primary)" }}
+                    >
                       {name}
                     </span>
                   </div>
-                  <p className="text-xs text-gray-400 capitalize">{comp.status}</p>
+                  <p className="text-xs capitalize" style={{ color: "var(--pc-text-muted)" }}>
+                    {comp.status}
+                  </p>
                   {comp.restart_count > 0 && (
-                    <p className="text-xs text-yellow-400 mt-1">
-                      Restarts: {comp.restart_count}
+                    <p
+                      className="text-xs mt-1"
+                      style={{ color: "var(--color-status-warning)" }}
+                    >
+                      {t("dashboard.restarts")}: {comp.restart_count}
                     </p>
                   )}
                 </div>

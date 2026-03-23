@@ -1,0 +1,133 @@
+{
+  "version": "2.0.0",
+  "inputs": [
+    {
+      "id": "testFilter",
+      "description": "Test name or filter pattern",
+      "type": "promptString",
+      "default": ""
+    }
+  ],
+  "tasks": [
+    // ── Build ──────────────────────────────────────────────
+    {
+      "label": "Build: Debug",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build"],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Build: Release",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["build", "--release"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Build: Check (fast)",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["check", "--all-targets"],
+      "problemMatcher": ["$rustc"]
+    },
+    // ── Lint ───────────────────────────────────────────────
+    {
+      "label": "Lint: Clippy",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["clippy", "--all-targets", "--", "-D", "warnings"],
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Lint: Format Check",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["fmt", "--all", "--", "--check"],
+      "problemMatcher": []
+    },
+    {
+      "label": "Lint: Format Fix",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["fmt", "--all"],
+      "problemMatcher": []
+    },
+    // ── Test ──────────────────────────────────────────────
+    {
+      "label": "Test: All",
+      "type": "shell",
+      "command": "cargo nextest --version >/dev/null 2>&1 || cargo install cargo-nextest && cargo nextest run",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Test: Filtered",
+      "type": "shell",
+      "command": "cargo nextest --version >/dev/null 2>&1 || cargo install cargo-nextest && cargo nextest run -E 'test(${input:testFilter})'",
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "Test: Coverage Report",
+      "type": "shell",
+      "command": "cargo llvm-cov --version >/dev/null 2>&1 || cargo install cargo-llvm-cov && cargo llvm-cov --lcov --output-path lcov.info",
+      "problemMatcher": []
+    },
+    {
+      "label": "Test: Benchmarks",
+      "type": "shell",
+      "command": "cargo",
+      "args": ["bench"],
+      "problemMatcher": []
+    },
+    // ── Security ──────────────────────────────────────────
+    {
+      "label": "Security: Audit",
+      "type": "shell",
+      "command": "cargo audit --version >/dev/null 2>&1 || cargo install cargo-audit && cargo audit",
+      "problemMatcher": []
+    },
+    {
+      "label": "Security: Deny (licenses + sources)",
+      "type": "shell",
+      "command": "cargo deny --version >/dev/null 2>&1 || cargo install cargo-deny && cargo deny check licenses sources",
+      "problemMatcher": []
+    },
+    // ── CI (Docker) ───────────────────────────────────────
+    {
+      "label": "CI: All (Docker)",
+      "type": "shell",
+      "command": "./dev/ci.sh",
+      "args": ["all"],
+      "problemMatcher": []
+    },
+    {
+      "label": "CI: Lint (Docker)",
+      "type": "shell",
+      "command": "./dev/ci.sh",
+      "args": ["lint"],
+      "problemMatcher": []
+    },
+    {
+      "label": "CI: Test (Docker)",
+      "type": "shell",
+      "command": "./dev/ci.sh",
+      "args": ["test"],
+      "problemMatcher": []
+    },
+    {
+      "label": "CI: Security (Docker)",
+      "type": "shell",
+      "command": "./dev/ci.sh",
+      "args": ["security"],
+      "problemMatcher": []
+    }
+  ]
+}

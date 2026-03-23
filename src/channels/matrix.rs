@@ -4,17 +4,24 @@ use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     ruma::{
+        api::client::receipt::create_receipt,
+        events::reaction::ReactionEventContent,
+        events::receipt::ReceiptThread,
+        events::relation::{Annotation, Thread},
+        events::room::member::StrippedRoomMemberEvent,
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
         },
-        events::Mentions,
-        OwnedRoomId, OwnedUserId,
+        events::room::MediaSource,
+        OwnedEventId, OwnedRoomId, OwnedUserId,
     },
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use reqwest::Client;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
 
@@ -26,13 +33,15 @@ pub struct MatrixChannel {
     access_token: String,
     room_id: String,
     allowed_users: Vec<String>,
-    mention_only: bool,
+    allowed_rooms: Vec<String>,
     session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
     zeroclaw_dir: Option<PathBuf>,
     resolved_room_id_cache: Arc<RwLock<Option<String>>>,
     sdk_client: Arc<OnceCell<MatrixSdkClient>>,
     http_client: Client,
+    reaction_events: Arc<RwLock<HashMap<String, String>>>,
+    voice_mode: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -41,6 +50,7 @@ impl std::fmt::Debug for MatrixChannel {
             .field("homeserver", &self.homeserver)
             .field("room_id", &self.room_id)
             .field("allowed_users", &self.allowed_users)
+            .field("allowed_rooms", &self.allowed_rooms)
             .finish_non_exhaustive()
     }
 }
@@ -102,12 +112,6 @@ struct RoomAliasResponse {
 }
 
 impl MatrixChannel {
-    fn sanitize_error_for_log(error: &impl std::fmt::Display) -> String {
-        // Avoid formatting potentially sensitive upstream payloads into logs.
-        let error_type = std::any::type_name_of_val(error);
-        format!("{error_type} (details redacted)")
-    }
-
     fn normalize_optional_field(value: Option<String>) -> Option<String> {
         value
             .map(|entry| entry.trim().to_string())
@@ -120,7 +124,16 @@ impl MatrixChannel {
         room_id: String,
         allowed_users: Vec<String>,
     ) -> Self {
-        Self::new_with_session_hint(homeserver, access_token, room_id, allowed_users, None, None)
+        Self::new_full(
+            homeserver,
+            access_token,
+            room_id,
+            allowed_users,
+            vec![],
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn new_with_session_hint(
@@ -131,11 +144,12 @@ impl MatrixChannel {
         owner_hint: Option<String>,
         device_id_hint: Option<String>,
     ) -> Self {
-        Self::new_with_session_hint_and_zeroclaw_dir(
+        Self::new_full(
             homeserver,
             access_token,
             room_id,
             allowed_users,
+            vec![],
             owner_hint,
             device_id_hint,
             None,
@@ -151,6 +165,28 @@ impl MatrixChannel {
         device_id_hint: Option<String>,
         zeroclaw_dir: Option<PathBuf>,
     ) -> Self {
+        Self::new_full(
+            homeserver,
+            access_token,
+            room_id,
+            allowed_users,
+            vec![],
+            owner_hint,
+            device_id_hint,
+            zeroclaw_dir,
+        )
+    }
+
+    pub fn new_full(
+        homeserver: String,
+        access_token: String,
+        room_id: String,
+        allowed_users: Vec<String>,
+        allowed_rooms: Vec<String>,
+        owner_hint: Option<String>,
+        device_id_hint: Option<String>,
+        zeroclaw_dir: Option<PathBuf>,
+    ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
         let access_token = access_token.trim().to_string();
         let room_id = room_id.trim().to_string();
@@ -159,25 +195,27 @@ impl MatrixChannel {
             .map(|user| user.trim().to_string())
             .filter(|user| !user.is_empty())
             .collect();
+        let allowed_rooms = allowed_rooms
+            .into_iter()
+            .map(|room| room.trim().to_string())
+            .filter(|room| !room.is_empty())
+            .collect();
 
         Self {
             homeserver,
             access_token,
             room_id,
             allowed_users,
-            mention_only: false,
+            allowed_rooms,
             session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
             zeroclaw_dir,
             resolved_room_id_cache: Arc::new(RwLock::new(None)),
             sdk_client: Arc::new(OnceCell::new()),
             http_client: Client::new(),
+            reaction_events: Arc::new(RwLock::new(HashMap::new())),
+            voice_mode: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    pub fn with_mention_only(mut self, mention_only: bool) -> Self {
-        self.mention_only = mention_only;
-        self
     }
 
     fn encode_path_segment(value: &str) -> String {
@@ -223,6 +261,21 @@ impl MatrixChannel {
         allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
     }
 
+    /// Check whether a room (by its canonical ID) is in the allowed_rooms list.
+    /// If allowed_rooms is empty, all rooms are allowed.
+    fn is_room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
+        if allowed_rooms.is_empty() {
+            return true;
+        }
+        allowed_rooms
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(room_id))
+    }
+
+    fn is_room_allowed(&self, room_id: &str) -> bool {
+        Self::is_room_allowed_static(&self.allowed_rooms, room_id)
+    }
+
     fn is_supported_message_type(msgtype: &str) -> bool {
         matches!(msgtype, "m.text" | "m.notice")
     }
@@ -231,135 +284,8 @@ impl MatrixChannel {
         !body.trim().is_empty()
     }
 
-    fn is_matrix_identifier_char(ch: char) -> bool {
-        ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.')
-    }
-
-    fn contains_matrix_user_id_mention(text: &str, user_id: &str) -> bool {
-        if text.is_empty() || user_id.is_empty() {
-            return false;
-        }
-
-        let text_lower = text.to_ascii_lowercase();
-        let user_id_lower = user_id.to_ascii_lowercase();
-        let mut search_from = 0;
-
-        while let Some(found) = text_lower[search_from..].find(&user_id_lower) {
-            let start = search_from + found;
-            let end = start + user_id_lower.len();
-
-            let before = text[..start].chars().next_back();
-            let after = text[end..].chars().next();
-
-            let left_ok = before.is_none_or(|c| !Self::is_matrix_identifier_char(c));
-            let right_ok = after.is_none_or(|c| !Self::is_matrix_identifier_char(c));
-
-            if left_ok && right_ok {
-                return true;
-            }
-
-            search_from = end;
-        }
-
-        false
-    }
-
-    fn percent_encode(input: &str) -> String {
-        let mut encoded = String::with_capacity(input.len());
-        for byte in input.bytes() {
-            if matches!(
-                byte,
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~'
-            ) {
-                encoded.push(char::from(byte));
-            } else {
-                use std::fmt::Write;
-                let _ = write!(&mut encoded, "%{byte:02X}");
-            }
-        }
-        encoded
-    }
-
-    fn has_structured_mention(mentions: Option<&Mentions>, bot_user_id: &str) -> bool {
-        mentions.is_some_and(|m| {
-            m.user_ids
-                .iter()
-                .any(|user_id| user_id.as_str().eq_ignore_ascii_case(bot_user_id))
-        })
-    }
-
-    fn extract_formatted_body(msgtype: &MessageType) -> Option<&str> {
-        match msgtype {
-            MessageType::Text(content) => content.formatted.as_ref().map(|f| f.body.as_str()),
-            MessageType::Notice(content) => content.formatted.as_ref().map(|f| f.body.as_str()),
-            MessageType::Emote(content) => content.formatted.as_ref().map(|f| f.body.as_str()),
-            _ => None,
-        }
-    }
-
-    fn event_mentions_user(
-        event: &OriginalSyncRoomMessageEvent,
-        plain_body: &str,
-        bot_user_id: &str,
-    ) -> bool {
-        if Self::has_structured_mention(event.content.mentions.as_ref(), bot_user_id) {
-            return true;
-        }
-
-        if Self::contains_matrix_user_id_mention(plain_body, bot_user_id) {
-            return true;
-        }
-
-        let Some(formatted_body) = Self::extract_formatted_body(&event.content.msgtype) else {
-            return false;
-        };
-
-        if Self::contains_matrix_user_id_mention(formatted_body, bot_user_id) {
-            return true;
-        }
-
-        let encoded_user_id = Self::percent_encode(bot_user_id).to_ascii_lowercase();
-        formatted_body
-            .to_ascii_lowercase()
-            .contains(&encoded_user_id)
-    }
-
-    fn reply_target_event_id(event: &OriginalSyncRoomMessageEvent) -> Option<String> {
-        match event.content.relates_to.as_ref()? {
-            Relation::Reply { in_reply_to } => Some(in_reply_to.event_id.to_string()),
-            Relation::Thread(thread) => thread.in_reply_to.as_ref().map(|r| r.event_id.to_string()),
-            Relation::Replacement(_) | Relation::_Custom(_) => None,
-            _ => None, // Handle any future relation types added by the Matrix SDK
-        }
-    }
-
-    async fn is_reply_to_cached_bot_event(
-        event: &OriginalSyncRoomMessageEvent,
-        bot_event_cache: &tokio::sync::Mutex<(
-            std::collections::VecDeque<String>,
-            std::collections::HashSet<String>,
-        )>,
-    ) -> bool {
-        let Some(target_event_id) = Self::reply_target_event_id(event) else {
-            return false;
-        };
-
-        let guard = bot_event_cache.lock().await;
-        let (_, known_bot_events) = &*guard;
-        known_bot_events.contains(&target_event_id)
-    }
-
-    fn should_process_message(
-        mention_only: bool,
-        is_direct_room: bool,
-        is_mentioned: bool,
-        is_reply_to_bot: bool,
-    ) -> bool {
-        if !mention_only {
-            return true;
-        }
-
-        is_direct_room || is_mentioned || is_reply_to_bot
+    fn room_matches_target(target_room_id: &str, incoming_room_id: &str) -> bool {
+        target_room_id == incoming_room_id
     }
 
     fn cache_event_id(
@@ -411,8 +337,7 @@ impl MatrixChannel {
 
         if !resp.status().is_success() {
             let err = resp.text().await?;
-            let sanitized = crate::providers::sanitize_api_error(&err);
-            anyhow::bail!("Matrix whoami failed: {sanitized}");
+            anyhow::bail!("Matrix whoami failed: {err}");
         }
 
         Ok(resp.json().await?)
@@ -432,9 +357,8 @@ impl MatrixChannel {
                     Err(error) => {
                         if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some()
                         {
-                            let safe_error = Self::sanitize_error_for_log(&error);
                             tracing::warn!(
-                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {safe_error}"
+                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
                             );
                             None
                         } else {
@@ -447,7 +371,9 @@ impl MatrixChannel {
                     if let Some(hinted) = self.session_owner_hint.as_ref() {
                         if hinted != &whoami.user_id {
                             tracing::warn!(
-                                "Matrix configured user_id does not match whoami user_id; using whoami."
+                                "Matrix configured user_id '{}' does not match whoami '{}'; using whoami.",
+                                crate::security::redact(hinted),
+                                crate::security::redact(&whoami.user_id)
                             );
                         }
                     }
@@ -465,7 +391,9 @@ impl MatrixChannel {
                         if let Some(whoami_device_id) = whoami.device_id.as_ref() {
                             if whoami_device_id != hinted {
                                 tracing::warn!(
-                                    "Matrix configured device_id does not match whoami device_id; using whoami."
+                                    "Matrix configured device_id '{}' does not match whoami '{}'; using whoami.",
+                                    crate::security::redact(hinted),
+                                    crate::security::redact(whoami_device_id)
                                 );
                             }
                             whoami_device_id.clone()
@@ -544,10 +472,7 @@ impl MatrixChannel {
 
             if !resp.status().is_success() {
                 let err = resp.text().await.unwrap_or_default();
-                let sanitized = crate::providers::sanitize_api_error(&err);
-                anyhow::bail!(
-                    "Matrix room alias resolution failed for '{configured}': {sanitized}"
-                );
+                anyhow::bail!("Matrix room alias resolution failed for '{configured}': {err}");
             }
 
             let resolved: RoomAliasResponse = resp.json().await?;
@@ -575,8 +500,7 @@ impl MatrixChannel {
 
         if !resp.status().is_success() {
             let err = resp.text().await.unwrap_or_default();
-            let sanitized = crate::providers::sanitize_api_error(&err);
-            anyhow::bail!("Matrix room access check failed for '{room_id}': {sanitized}");
+            anyhow::bail!("Matrix room access check failed for '{room_id}': {err}");
         }
 
         Ok(())
@@ -605,8 +529,7 @@ impl MatrixChannel {
         }
 
         let err = resp.text().await.unwrap_or_default();
-        let sanitized = crate::providers::sanitize_api_error(&err);
-        anyhow::bail!("Matrix room encryption check failed for '{room_id}': {sanitized}");
+        anyhow::bail!("Matrix room encryption check failed for '{room_id}': {err}");
     }
 
     async fn ensure_room_supported(&self, room_id: &str) -> anyhow::Result<()> {
@@ -639,10 +562,14 @@ impl MatrixChannel {
         match client.encryption().get_own_device().await {
             Ok(Some(device)) => {
                 if device.is_verified() {
-                    tracing::info!("Matrix device is verified for E2EE.");
+                    tracing::info!(
+                        "Matrix device '{}' is verified for E2EE.",
+                        device.device_id()
+                    );
                 } else {
                     tracing::warn!(
-                        "Matrix device is not verified. Some clients may label bot messages as unverified until you sign/verify this device from a trusted session."
+                        "Matrix device '{}' is not verified. Some clients may label bot messages as unverified until you sign/verify this device from a trusted session.",
+                        device.device_id()
                     );
                 }
             }
@@ -652,16 +579,16 @@ impl MatrixChannel {
                 );
             }
             Err(error) => {
-                let safe_error = Self::sanitize_error_for_log(&error);
-                tracing::warn!("Matrix own-device verification check failed: {safe_error}");
+                tracing::warn!("Matrix own-device verification check failed: {error}");
             }
         }
 
         if client.encryption().backups().are_enabled().await {
             tracing::info!("Matrix room-key backup is enabled for this device.");
         } else {
+            client.encryption().backups().disable().await;
             tracing::warn!(
-                "Matrix room-key backup is not enabled for this device; `matrix_sdk_crypto::backups` warnings about missing backup keys may appear until recovery is configured."
+                "Matrix room-key backup is not enabled for this device; automatic backup attempts have been disabled to suppress recurring warnings. To enable backups, configure server-side key backup and recovery for this device."
             );
         }
     }
@@ -675,7 +602,11 @@ impl Channel for MatrixChannel {
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let client = self.matrix_client().await?;
-        let target_room_id = self.target_room_id().await?;
+        let target_room_id = if message.recipient.contains("||") {
+            message.recipient.split_once("||").unwrap().1.to_string()
+        } else {
+            self.target_room_id().await?
+        };
         let target_room: OwnedRoomId = target_room_id.parse()?;
 
         let mut room = client.get_room(&target_room);
@@ -692,8 +623,98 @@ impl Channel for MatrixChannel {
             anyhow::bail!("Matrix room '{}' is not in joined state", target_room_id);
         }
 
-        room.send(RoomMessageEventContent::text_markdown(&message.content))
-            .await?;
+        // Stop typing notification before sending the response
+        if let Err(error) = room.typing_notice(false).await {
+            tracing::warn!("Matrix failed to stop typing notification: {error}");
+        }
+
+        let mut content = RoomMessageEventContent::text_markdown(&message.content);
+
+        if let Some(ref thread_ts) = message.thread_ts {
+            if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
+                content.relates_to = Some(Relation::Thread(Thread::plain(
+                    thread_root.clone(),
+                    thread_root,
+                )));
+            }
+        }
+
+        room.send(content).await?;
+
+        // Voice reply: generate TTS audio and send as m.audio when voice_mode is active
+        if self.voice_mode.load(Ordering::Relaxed) {
+            self.voice_mode.store(false, Ordering::Relaxed);
+            tracing::info!("Voice mode active, generating TTS reply");
+            let voice_work = std::path::PathBuf::from("/tmp/zeroclaw-voice");
+            let _ = tokio::fs::create_dir_all(&voice_work).await;
+            let mp3_path = voice_work.join("reply.mp3");
+
+            let tts_text = message
+                .content
+                .replace("**", "")
+                .replace(['*', '`'], "")
+                .replace("# ", "");
+
+            let tts_ok = tokio::process::Command::new("edge-tts")
+                .arg("--text")
+                .arg(&tts_text)
+                .arg("--write-media")
+                .arg(&mp3_path)
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+
+            if tts_ok && mp3_path.exists() {
+                if let Ok(audio_data) = tokio::fs::read(&mp3_path).await {
+                    let upload_url = format!(
+                        "{}/_matrix/media/v3/upload?filename=voice-reply.mp3",
+                        self.homeserver
+                    );
+                    if let Ok(resp) = self
+                        .http_client
+                        .post(&upload_url)
+                        .header("Authorization", self.auth_header_value())
+                        .header("Content-Type", "audio/mpeg")
+                        .body(audio_data)
+                        .send()
+                        .await
+                    {
+                        if resp.status().is_success() {
+                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                                if let Some(content_uri) = body["content_uri"].as_str() {
+                                    let encoded_room = Self::encode_path_segment(&target_room_id);
+                                    let txn_id = format!(
+                                        "voice_{}",
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                    );
+                                    let audio_msg = serde_json::json!({
+                                        "msgtype": "m.audio",
+                                        "body": "Voice reply",
+                                        "url": content_uri,
+                                        "info": { "mimetype": "audio/mpeg" }
+                                    });
+                                    let send_url = format!(
+                                        "{}/_matrix/client/v3/rooms/{}/send/m.room.message/{}",
+                                        self.homeserver, encoded_room, txn_id
+                                    );
+                                    let _ = self
+                                        .http_client
+                                        .put(&send_url)
+                                        .header("Authorization", self.auth_header_value())
+                                        .json(&audio_msg)
+                                        .send()
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -707,9 +728,8 @@ impl Channel for MatrixChannel {
             Ok(user_id) => user_id.parse()?,
             Err(error) => {
                 if let Some(hinted) = self.session_owner_hint.as_ref() {
-                    let safe_error = Self::sanitize_error_for_log(&error);
                     tracing::warn!(
-                        "Matrix whoami failed while resolving listener user_id; using configured user_id hint: {safe_error}"
+                        "Matrix whoami failed while resolving listener user_id; using configured user_id hint: {error}"
                     );
                     hinted.parse()?
                 } else {
@@ -733,38 +753,46 @@ impl Channel for MatrixChannel {
             std::collections::VecDeque::new(),
             std::collections::HashSet::new(),
         )));
-        let recent_bot_event_cache = Arc::new(Mutex::new((
-            std::collections::VecDeque::new(),
-            std::collections::HashSet::new(),
-        )));
 
         let tx_handler = tx.clone();
         let target_room_for_handler = target_room.clone();
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
+        let allowed_rooms_for_handler = self.allowed_rooms.clone();
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
-        let bot_dedupe_for_handler = Arc::clone(&recent_bot_event_cache);
-        let mention_only_for_handler = self.mention_only;
+        let homeserver_for_handler = self.homeserver.clone();
+        let access_token_for_handler = self.access_token.clone();
+        let voice_mode_for_handler = Arc::clone(&self.voice_mode);
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
             let target_room = target_room_for_handler.clone();
             let my_user_id = my_user_id_for_handler.clone();
             let allowed_users = allowed_users_for_handler.clone();
+            let allowed_rooms = allowed_rooms_for_handler.clone();
             let dedupe = Arc::clone(&dedupe_for_handler);
-            let bot_dedupe = Arc::clone(&bot_dedupe_for_handler);
+            let homeserver = homeserver_for_handler.clone();
+            let access_token = access_token_for_handler.clone();
+            let voice_mode = Arc::clone(&voice_mode_for_handler);
 
             async move {
-                if room.room_id().as_str() != target_room.as_str() {
+                if !MatrixChannel::room_matches_target(
+                    target_room.as_str(),
+                    room.room_id().as_str(),
+                ) {
                     return;
                 }
 
-                let event_id = event.event_id.to_string();
+                // Room allowlist: skip messages from rooms not in the configured list
+                if !MatrixChannel::is_room_allowed_static(&allowed_rooms, room.room_id().as_ref()) {
+                    tracing::debug!(
+                        "Matrix: ignoring message from room {} (not in allowed_rooms)",
+                        room.room_id()
+                    );
+                    return;
+                }
 
                 if event.sender == my_user_id {
-                    let mut guard = bot_dedupe.lock().await;
-                    let (recent_order, recent_lookup) = &mut *guard;
-                    MatrixChannel::cache_event_id(&event_id, recent_order, recent_lookup);
                     return;
                 }
 
@@ -773,45 +801,138 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
-                let body = match &event.content.msgtype {
-                    MessageType::Text(content) => content.body.clone(),
-                    MessageType::Notice(content) => content.body.clone(),
+                // Helper: extract mxc:// download URL and filename for media types
+                let media_info = |source: &MediaSource, name: &str| -> Option<(String, String)> {
+                    match source {
+                        MediaSource::Plain(mxc) => {
+                            let rest = mxc.as_str().strip_prefix("mxc://")?;
+                            let url =
+                                format!("{}/_matrix/client/v1/media/download/{}", homeserver, rest);
+                            Some((url, name.to_string()))
+                        }
+                        MediaSource::Encrypted(_) => None,
+                    }
+                };
+
+                let (body, media_download) = match &event.content.msgtype {
+                    MessageType::Text(content) => (content.body.clone(), None),
+                    MessageType::Notice(content) => (content.body.clone(), None),
+                    MessageType::Image(content) => {
+                        let dl = media_info(&content.source, &content.body);
+                        (format!("[IMAGE:{}]", content.body), dl)
+                    }
+                    MessageType::File(content) => {
+                        let dl = media_info(&content.source, &content.body);
+                        (format!("[file: {}]", content.body), dl)
+                    }
+                    MessageType::Audio(content) => {
+                        let dl = media_info(&content.source, &content.body);
+                        (format!("[audio: {}]", content.body), dl)
+                    }
+                    MessageType::Video(content) => {
+                        let dl = media_info(&content.source, &content.body);
+                        (format!("[video: {}]", content.body), dl)
+                    }
                     _ => return,
+                };
+
+                // Download media to workspace if present
+                let body = if let Some((url, filename)) = media_download {
+                    let workspace = std::path::PathBuf::from(
+                        shellexpand::tilde(
+                            &std::env::var("ZEROCLAW_WORKSPACE")
+                                .unwrap_or_else(|_| "/tmp/zeroclaw-uploads".to_string()),
+                        )
+                        .as_ref(),
+                    );
+                    let _ = tokio::fs::create_dir_all(&workspace).await;
+                    let dest = workspace.join(&filename);
+                    let client = reqwest::Client::new();
+                    match client
+                        .get(&url)
+                        .header("Authorization", format!("Bearer {}", access_token))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                            Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
+                                Ok(()) => {
+                                    if body.starts_with("[IMAGE:") {
+                                        format!("[IMAGE:{}]", dest.display())
+                                    } else {
+                                        format!("{} — saved to {}", body, dest.display())
+                                    }
+                                }
+                                Err(_) => format!("{} — failed to write to disk", body),
+                            },
+                            Err(_) => format!("{} — download failed", body),
+                        },
+                        _ => format!("{} — download failed (auth error?)", body),
+                    }
+                } else {
+                    body
+                };
+
+                // Voice transcription: if this was an audio message, transcribe it
+                let body = if body.starts_with("[audio:") {
+                    if let Some(path_start) = body.find("saved to ") {
+                        let audio_path = body[path_start + 9..].to_string();
+                        let wav_path = format!("{}.16k.wav", audio_path);
+                        let convert_ok = tokio::process::Command::new("ffmpeg")
+                            .args([
+                                "-y",
+                                "-i",
+                                &audio_path,
+                                "-ar",
+                                "16000",
+                                "-ac",
+                                "1",
+                                "-f",
+                                "wav",
+                                &wav_path,
+                            ])
+                            .stderr(std::process::Stdio::null())
+                            .output()
+                            .await
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        if convert_ok {
+                            let transcription = tokio::process::Command::new("whisper-cpp")
+                                .args([
+                                    "-m",
+                                    "/tmp/ggml-base.en.bin",
+                                    "-f",
+                                    &wav_path,
+                                    "--no-timestamps",
+                                    "-nt",
+                                ])
+                                .output()
+                                .await
+                                .ok()
+                                .filter(|o| o.status.success())
+                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                                .filter(|s| !s.is_empty());
+                            if let Some(text) = transcription {
+                                voice_mode.store(true, Ordering::Relaxed);
+                                format!("[Voice message]: {}", text)
+                            } else {
+                                body
+                            }
+                        } else {
+                            body
+                        }
+                    } else {
+                        body
+                    }
+                } else {
+                    body
                 };
 
                 if !MatrixChannel::has_non_empty_body(&body) {
                     return;
                 }
 
-                let mut is_direct_room = false;
-                let mut is_mentioned = false;
-                let mut is_reply_to_bot = false;
-
-                if mention_only_for_handler {
-                    is_direct_room = room.is_direct().await.unwrap_or_else(|error| {
-                        let safe_error = MatrixChannel::sanitize_error_for_log(&error);
-                        tracing::warn!(
-                            "Matrix is_direct() failed while evaluating mention_only gate: {safe_error}"
-                        );
-                        false
-                    });
-                    if !is_direct_room {
-                        is_mentioned =
-                            MatrixChannel::event_mentions_user(&event, &body, my_user_id.as_str());
-                        is_reply_to_bot =
-                            MatrixChannel::is_reply_to_cached_bot_event(&event, &bot_dedupe).await;
-                    }
-
-                    if !MatrixChannel::should_process_message(
-                        mention_only_for_handler,
-                        is_direct_room,
-                        is_mentioned,
-                        is_reply_to_bot,
-                    ) {
-                        return;
-                    }
-                }
-
+                let event_id = event.event_id.to_string();
                 {
                     let mut guard = dedupe.lock().await;
                     let (recent_order, recent_lookup) = &mut *guard;
@@ -820,20 +941,81 @@ impl Channel for MatrixChannel {
                     }
                 }
 
+                // Send a read receipt for the incoming event
+                if let Err(error) = room
+                    .send_single_receipt(
+                        create_receipt::v3::ReceiptType::Read,
+                        ReceiptThread::Unthreaded,
+                        event.event_id.clone(),
+                    )
+                    .await
+                {
+                    tracing::warn!("Matrix failed to send read receipt: {error}");
+                }
+
+                // Start typing notification while processing begins
+                if let Err(error) = room.typing_notice(true).await {
+                    tracing::warn!("Matrix failed to start typing notification: {error}");
+                }
+
+                let thread_ts = match &event.content.relates_to {
+                    Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
+                    _ => None,
+                };
                 let msg = ChannelMessage {
                     id: event_id,
                     sender: sender.clone(),
-                    reply_target: sender,
+                    reply_target: format!("{}||{}", sender, room.room_id()),
                     content: body,
                     channel: "matrix".to_string(),
                     timestamp: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    thread_ts: None,
+                    thread_ts: thread_ts.clone(),
+                    interruption_scope_id: thread_ts,
                 };
 
                 let _ = tx.send(msg).await;
+            }
+        });
+
+        // Invite handler: auto-accept invites for allowed rooms, auto-reject others
+        let allowed_rooms_for_invite = self.allowed_rooms.clone();
+        client.add_event_handler(move |event: StrippedRoomMemberEvent, room: Room| {
+            let allowed_rooms = allowed_rooms_for_invite.clone();
+            async move {
+                // Only process invite events targeting us
+                if event.content.membership
+                    != matrix_sdk::ruma::events::room::member::MembershipState::Invite
+                {
+                    return;
+                }
+
+                let room_id_str = room.room_id().to_string();
+
+                if MatrixChannel::is_room_allowed_static(&allowed_rooms, &room_id_str) {
+                    // Room is allowed (or no allowlist configured): auto-accept
+                    tracing::info!(
+                        "Matrix: auto-accepting invite for allowed room {}",
+                        room_id_str
+                    );
+                    if let Err(error) = room.join().await {
+                        tracing::warn!("Matrix: failed to auto-join room {}: {error}", room_id_str);
+                    }
+                } else {
+                    // Room is NOT in allowlist: auto-reject
+                    tracing::info!(
+                        "Matrix: auto-rejecting invite for room {} (not in allowed_rooms)",
+                        room_id_str
+                    );
+                    if let Err(error) = room.leave().await {
+                        tracing::warn!(
+                            "Matrix: failed to reject invite for room {}: {error}",
+                            room_id_str
+                        );
+                    }
+                }
             }
         });
 
@@ -847,8 +1029,7 @@ impl Channel for MatrixChannel {
                     }
 
                     if let Err(error) = sync_result {
-                        let safe_error = MatrixChannel::sanitize_error_for_log(&error);
-                        tracing::warn!("Matrix sync error: {safe_error}, retrying...");
+                        tracing::warn!("Matrix sync error: {error}, retrying...");
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     }
 
@@ -871,12 +1052,184 @@ impl Channel for MatrixChannel {
 
         self.matrix_client().await.is_ok()
     }
+
+    async fn add_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let client = self.matrix_client().await?;
+        let target_room_id = self.target_room_id().await?;
+        let target_room: OwnedRoomId = target_room_id.parse()?;
+
+        let room = client
+            .get_room(&target_room)
+            .ok_or_else(|| anyhow::anyhow!("Matrix room not found for reaction"))?;
+
+        let event_id: OwnedEventId = message_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid event ID for reaction: {}", message_id))?;
+
+        let reaction = ReactionEventContent::new(Annotation::new(event_id, emoji.to_string()));
+        let response = room.send(reaction).await?;
+
+        let key = format!("{}:{}", message_id, emoji);
+        self.reaction_events
+            .write()
+            .await
+            .insert(key, response.event_id.to_string());
+
+        Ok(())
+    }
+
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        let key = format!("{}:{}", message_id, emoji);
+        let reaction_event_id = self.reaction_events.write().await.remove(&key);
+
+        if let Some(reaction_event_id) = reaction_event_id {
+            let client = self.matrix_client().await?;
+            let target_room_id = self.target_room_id().await?;
+            let target_room: OwnedRoomId = target_room_id.parse()?;
+
+            let room = client
+                .get_room(&target_room)
+                .ok_or_else(|| anyhow::anyhow!("Matrix room not found for reaction removal"))?;
+
+            let event_id: OwnedEventId = reaction_event_id
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid reaction event ID: {}", reaction_event_id))?;
+
+            room.redact(&event_id, None, None).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn pin_message(&self, _channel_id: &str, message_id: &str) -> anyhow::Result<()> {
+        let room_id = self.target_room_id().await?;
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await?;
+
+        let mut pinned: Vec<String> = if resp.status().is_success() {
+            let body: serde_json::Value = resp.json().await?;
+            body.get("pinned")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let msg_id = message_id.to_string();
+        if pinned.contains(&msg_id) {
+            return Ok(());
+        }
+        pinned.push(msg_id);
+
+        let put_url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let body = serde_json::json!({ "pinned": pinned });
+        let resp = self
+            .http_client
+            .put(&put_url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix pin_message failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    async fn unpin_message(&self, _channel_id: &str, message_id: &str) -> anyhow::Result<()> {
+        let room_id = self.target_room_id().await?;
+        let encoded_room = Self::encode_path_segment(&room_id);
+
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Ok(());
+        }
+
+        let body: serde_json::Value = resp.json().await?;
+        let mut pinned: Vec<String> = body
+            .get("pinned")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let msg_id = message_id.to_string();
+        let original_len = pinned.len();
+        pinned.retain(|id| id != &msg_id);
+
+        if pinned.len() == original_len {
+            return Ok(());
+        }
+
+        let put_url = format!(
+            "{}/_matrix/client/v3/rooms/{}/state/m.room.pinned_events",
+            self.homeserver, encoded_room
+        );
+        let body = serde_json::json!({ "pinned": pinned });
+        let resp = self
+            .http_client
+            .put(&put_url)
+            .header("Authorization", self.auth_header_value())
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix unpin_message failed: {err}");
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::ruma::{OwnedEventId, OwnedUserId};
 
     fn make_channel() -> MatrixChannel {
         MatrixChannel::new(
@@ -1030,124 +1383,6 @@ mod tests {
         assert!(!MatrixChannel::has_non_empty_body("   \n\t  "));
     }
 
-    fn parse_sync_message_event(value: serde_json::Value) -> OriginalSyncRoomMessageEvent {
-        serde_json::from_value(value).expect("valid m.room.message event")
-    }
-
-    #[test]
-    fn mention_only_builder_sets_flag() {
-        let ch = make_channel().with_mention_only(true);
-        assert!(ch.mention_only);
-    }
-
-    #[test]
-    fn event_mentions_user_detects_plain_text_user_id() {
-        let event = parse_sync_message_event(serde_json::json!({
-            "type": "m.room.message",
-            "event_id": "$event:matrix.org",
-            "sender": "@user:matrix.org",
-            "origin_server_ts": 1u64,
-            "content": {
-                "msgtype": "m.text",
-                "body": "hello @bot:matrix.org"
-            }
-        }));
-
-        assert!(MatrixChannel::event_mentions_user(
-            &event,
-            "hello @bot:matrix.org",
-            "@bot:matrix.org"
-        ));
-    }
-
-    #[test]
-    fn event_mentions_user_detects_html_matrix_to_link() {
-        let event = parse_sync_message_event(serde_json::json!({
-            "type": "m.room.message",
-            "event_id": "$event:matrix.org",
-            "sender": "@user:matrix.org",
-            "origin_server_ts": 1u64,
-            "content": {
-                "msgtype": "m.text",
-                "body": "hello bot",
-                "format": "org.matrix.custom.html",
-                "formatted_body": "<a href=\"https://matrix.to/#/%40bot%3Amatrix.org\">bot</a>"
-            }
-        }));
-
-        assert!(MatrixChannel::event_mentions_user(
-            &event,
-            "hello bot",
-            "@bot:matrix.org"
-        ));
-    }
-
-    #[test]
-    fn event_mentions_user_detects_structured_mentions() {
-        let event = parse_sync_message_event(serde_json::json!({
-            "type": "m.room.message",
-            "event_id": "$event:matrix.org",
-            "sender": "@user:matrix.org",
-            "origin_server_ts": 1u64,
-            "content": {
-                "msgtype": "m.text",
-                "body": "hello there",
-                "m.mentions": {
-                    "user_ids": ["@bot:matrix.org"]
-                }
-            }
-        }));
-
-        assert!(MatrixChannel::event_mentions_user(
-            &event,
-            "hello there",
-            "@bot:matrix.org"
-        ));
-    }
-
-    #[test]
-    fn reply_target_event_id_extracts_reply_relation() {
-        let event = parse_sync_message_event(serde_json::json!({
-            "type": "m.room.message",
-            "event_id": "$event:matrix.org",
-            "sender": "@user:matrix.org",
-            "origin_server_ts": 1u64,
-            "content": {
-                "msgtype": "m.text",
-                "body": "reply",
-                "m.relates_to": {
-                    "m.in_reply_to": {
-                        "event_id": "$botmsg:matrix.org"
-                    }
-                }
-            }
-        }));
-
-        assert_eq!(
-            MatrixChannel::reply_target_event_id(&event).as_deref(),
-            Some("$botmsg:matrix.org")
-        );
-    }
-
-    #[test]
-    fn mention_only_gate_behaves_as_expected() {
-        assert!(MatrixChannel::should_process_message(
-            false, false, false, false
-        ));
-        assert!(MatrixChannel::should_process_message(
-            true, true, false, false
-        ));
-        assert!(MatrixChannel::should_process_message(
-            true, false, true, false
-        ));
-        assert!(MatrixChannel::should_process_message(
-            true, false, false, true
-        ));
-        assert!(!MatrixChannel::should_process_message(
-            true, false, false, false
-        ));
-    }
-
     #[test]
     fn send_content_uses_markdown_formatting() {
         let content = RoomMessageEventContent::text_markdown("**hello**");
@@ -1169,6 +1404,22 @@ mod tests {
 
         assert_eq!(value["room"]["rooms"][0], "!room:matrix.org");
         assert_eq!(value["room"]["timeline"]["limit"], 1);
+    }
+
+    #[test]
+    fn room_scope_matches_configured_room() {
+        assert!(MatrixChannel::room_matches_target(
+            "!ops:matrix.org",
+            "!ops:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn room_scope_rejects_other_rooms() {
+        assert!(!MatrixChannel::room_matches_target(
+            "!ops:matrix.org",
+            "!other:matrix.org"
+        ));
     }
 
     #[test]
@@ -1425,5 +1676,80 @@ mod tests {
         let json = r#"{"next_batch":"s0"}"#;
         let resp: SyncResponse = serde_json::from_str(json).unwrap();
         assert!(resp.rooms.join.is_empty());
+    }
+
+    #[test]
+    fn empty_allowed_rooms_permits_all() {
+        let ch = make_channel();
+        assert!(ch.is_room_allowed("!any:matrix.org"));
+        assert!(ch.is_room_allowed("!other:evil.org"));
+    }
+
+    #[test]
+    fn allowed_rooms_filters_by_id() {
+        let ch = MatrixChannel::new_full(
+            "https://m.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec!["@user:m".to_string()],
+            vec!["!allowed:matrix.org".to_string()],
+            None,
+            None,
+            None,
+        );
+        assert!(ch.is_room_allowed("!allowed:matrix.org"));
+        assert!(!ch.is_room_allowed("!forbidden:matrix.org"));
+    }
+
+    #[test]
+    fn allowed_rooms_supports_aliases() {
+        let ch = MatrixChannel::new_full(
+            "https://m.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec!["@user:m".to_string()],
+            vec![
+                "#ops:matrix.org".to_string(),
+                "!direct:matrix.org".to_string(),
+            ],
+            None,
+            None,
+            None,
+        );
+        assert!(ch.is_room_allowed("!direct:matrix.org"));
+        assert!(ch.is_room_allowed("#ops:matrix.org"));
+        assert!(!ch.is_room_allowed("!other:matrix.org"));
+    }
+
+    #[test]
+    fn allowed_rooms_case_insensitive() {
+        let ch = MatrixChannel::new_full(
+            "https://m.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+            vec!["!Room:Matrix.org".to_string()],
+            None,
+            None,
+            None,
+        );
+        assert!(ch.is_room_allowed("!room:matrix.org"));
+        assert!(ch.is_room_allowed("!ROOM:MATRIX.ORG"));
+    }
+
+    #[test]
+    fn allowed_rooms_trims_whitespace() {
+        let ch = MatrixChannel::new_full(
+            "https://m.org".to_string(),
+            "tok".to_string(),
+            "!r:m".to_string(),
+            vec![],
+            vec!["  !room:matrix.org  ".to_string(), "   ".to_string()],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(ch.allowed_rooms.len(), 1);
+        assert!(ch.is_room_allowed("!room:matrix.org"));
     }
 }

@@ -5,6 +5,68 @@ use rusqlite::{Connection, OpenFlags};
 use std::path::Path;
 use tokio::sync::mpsc;
 
+/// Extract plain text from an iMessage `attributedBody` typedstream blob.
+///
+/// Modern macOS (Ventura+) stores message content in `attributedBody` as an
+/// `NSMutableAttributedString` serialized via Apple's typedstream format,
+/// rather than the plain `text` column.
+///
+/// This follows the well-documented marker-based approach used by LangChain,
+/// steipete/imsg, and mac_apt (all MIT-licensed). See:
+/// <https://chrissardegna.com/blog/reverse-engineering-apples-typedstream-format/>
+fn extract_text_from_attributed_body(blob: &[u8]) -> Option<String> {
+    // Find the start-of-text marker: [0x01, 0x2B]
+    // 0x2B is the C-string type tag in Apple's typedstream format.
+    let marker_pos = blob.windows(2).position(|w| w == [0x01, 0x2B])?;
+    let rest = blob.get(marker_pos + 2..)?;
+
+    if rest.is_empty() {
+        return None;
+    }
+
+    // Read variable-length prefix immediately after the marker.
+    // The length determines text extent — we do NOT scan for an end marker,
+    // because byte pairs like [0x86, 0x84] can appear inside valid UTF-8
+    // (e.g. U+2184 LATIN SMALL LETTER REVERSED C encodes to E2 86 84).
+    //
+    //   0x00-0x7F => literal length (1 byte)
+    //   0x81      => next 2 bytes are little-endian u16 length
+    //   0x82      => next 4 bytes are little-endian u32 length
+    //   0x80, 0x83+ are not observed in iMessage typedstreams; reject gracefully.
+    let (length, text_start) = match rest[0] {
+        0x81 if rest.len() >= 3 => {
+            let len = u16::from_le_bytes([rest[1], rest[2]]) as usize;
+            (len, 3)
+        }
+        0x82 if rest.len() >= 5 => {
+            let len = u32::from_le_bytes([rest[1], rest[2], rest[3], rest[4]]) as usize;
+            (len, 5)
+        }
+        b if b <= 0x7F => (b as usize, 1),
+        _ => return None,
+    };
+
+    let text_bytes = rest.get(text_start..text_start + length)?;
+    std::str::from_utf8(text_bytes).ok().map(str::to_owned)
+}
+
+/// Resolve message content from the `text` column with `attributedBody` fallback.
+///
+/// Prefers the plain `text` column when present. Falls back to parsing the
+/// typedstream blob in `attributedBody` (modern macOS). Logs a warning when
+/// `attributedBody` exists but cannot be parsed.
+fn resolve_message_content(rowid: i64, text: Option<String>, body: Option<Vec<u8>>) -> String {
+    text.filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            let parsed = body.as_deref().and_then(extract_text_from_attributed_body);
+            if parsed.is_none() && body.as_ref().is_some_and(|b| !b.is_empty()) {
+                tracing::warn!(rowid, "failed to parse attributedBody");
+            }
+            parsed
+        })
+        .unwrap_or_default()
+}
+
 /// iMessage channel using macOS `AppleScript` bridge.
 /// Polls the Messages database for new messages and sends replies via `osascript`.
 #[derive(Clone)]
@@ -179,21 +241,21 @@ end tell"#
                 move || -> (Connection, anyhow::Result<Vec<(i64, String, String)>>) {
                     let result = (|| -> anyhow::Result<Vec<(i64, String, String)>> {
                         let mut stmt = conn.prepare(
-                            "SELECT m.ROWID, h.id, m.text \
+                            "SELECT m.ROWID, h.id, m.text, m.attributedBody \
                      FROM message m \
                      JOIN handle h ON m.handle_id = h.ROWID \
                      WHERE m.ROWID > ?1 \
                      AND m.is_from_me = 0 \
-                     AND m.text IS NOT NULL \
+                     AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL) \
                      ORDER BY m.ROWID ASC \
                      LIMIT 20",
                         )?;
                         let rows = stmt.query_map([since], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ))
+                            let rowid = row.get::<_, i64>(0)?;
+                            let sender = row.get::<_, String>(1)?;
+                            let text: Option<String> = row.get(2)?;
+                            let body: Option<Vec<u8>> = row.get(3)?;
+                            Ok((rowid, sender, resolve_message_content(rowid, text, body)))
                         })?;
                         let results = rows.collect::<Result<Vec<_>, _>>()?;
                         Ok(results)
@@ -232,6 +294,7 @@ end tell"#
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: None,
+                            interruption_scope_id: None,
                         };
 
                         if tx.send(msg).await.is_err() {
@@ -291,23 +354,28 @@ async fn fetch_new_messages(
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
             let mut stmt = conn.prepare(
-                "SELECT m.ROWID, h.id, m.text \
+                "SELECT m.ROWID, h.id, m.text, m.attributedBody \
              FROM message m \
              JOIN handle h ON m.handle_id = h.ROWID \
              WHERE m.ROWID > ?1 \
              AND m.is_from_me = 0 \
-             AND m.text IS NOT NULL \
+             AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL) \
              ORDER BY m.ROWID ASC \
              LIMIT 20",
             )?;
             let rows = stmt.query_map([since_rowid], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
+                let rowid = row.get::<_, i64>(0)?;
+                let sender = row.get::<_, String>(1)?;
+                let text: Option<String> = row.get(2)?;
+                let body: Option<Vec<u8>> = row.get(3)?;
+                Ok((rowid, sender, resolve_message_content(rowid, text, body)))
             })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+            let results: Vec<_> = rows
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|(_, _, content)| !content.trim().is_empty())
+                .collect();
+            Ok(results)
         })
         .await??;
     Ok(results)
@@ -608,6 +676,7 @@ mod tests {
                 ROWID INTEGER PRIMARY KEY,
                 handle_id INTEGER,
                 text TEXT,
+                attributedBody BLOB,
                 is_from_me INTEGER DEFAULT 0,
                 FOREIGN KEY (handle_id) REFERENCES handle(ROWID)
             );",
@@ -773,10 +842,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_new_messages_excludes_null_text() {
+    async fn fetch_new_messages_excludes_null_text_and_null_body() {
         let (_dir, db_path) = create_test_db();
 
-        // Insert test data
+        // Insert test data: one with text, one with neither text nor attributedBody
         {
             let conn = Connection::open(&db_path).unwrap();
             conn.execute(
@@ -789,13 +858,14 @@ mod tests {
                 []
             ).unwrap();
             conn.execute(
-                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (20, 1, NULL, 0)",
+                "INSERT INTO message (ROWID, handle_id, text, attributedBody, is_from_me) VALUES (20, 1, NULL, NULL, 0)",
                 [],
             )
             .unwrap();
         }
 
         let result = fetch_new_messages(&db_path, 0).await.unwrap();
+        // Message with NULL text AND NULL attributedBody is excluded
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].2, "Has text");
     }
@@ -913,7 +983,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_new_messages_handles_empty_text() {
+    async fn fetch_new_messages_filters_empty_text() {
         let (_dir, db_path) = create_test_db();
 
         {
@@ -931,9 +1001,8 @@ mod tests {
         }
 
         let result = fetch_new_messages(&db_path, 0).await.unwrap();
-        // Empty string is NOT NULL, so it's included
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].2, "");
+        // Empty-content messages are filtered out
+        assert!(result.is_empty());
     }
 
     #[tokio::test]
@@ -978,5 +1047,271 @@ mod tests {
         // Very large rowid should return empty (no messages after this)
         let result = fetch_new_messages(&db_path, i64::MAX - 1).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // attributedBody / typedstream parsing tests
+    // ══════════════════════════════════════════════════════════
+
+    /// Build a minimal typedstream blob containing the given text.
+    /// Format: [header] [class bytes] [0x01, 0x2B] [length-prefix] [utf8] [0x86, 0x84]
+    fn make_attributed_body(text: &str) -> Vec<u8> {
+        let text_bytes = text.as_bytes();
+        let mut blob = Vec::new();
+        // Fake streamtyped header (not parsed by our extractor)
+        blob.extend_from_slice(b"\x04\x0bstreamtyped\x81\xe8\x03");
+        // Class hierarchy bytes (skipped by marker scan)
+        blob.extend_from_slice(b"\x84\x84NSMutableAttributedString\x00");
+        // Start-of-text marker
+        blob.push(0x01);
+        blob.push(0x2B);
+        // Length prefix (try_from panics on violation — correct for test helper)
+        let len = text_bytes.len();
+        if len <= 0x7F {
+            blob.push(u8::try_from(len).unwrap());
+        } else if len <= 0xFFFF {
+            blob.push(0x81);
+            blob.extend_from_slice(&u16::try_from(len).unwrap().to_le_bytes());
+        } else {
+            blob.push(0x82);
+            blob.extend_from_slice(&u32::try_from(len).unwrap().to_le_bytes());
+        }
+        // Text content
+        blob.extend_from_slice(text_bytes);
+        // End-of-text marker
+        blob.push(0x86);
+        blob.push(0x84);
+        // Trailing attribute bytes (ignored)
+        blob.extend_from_slice(b"\x86\x86");
+        blob
+    }
+
+    // Real attributedBody blob from macOS chat.db, captured during testing.
+    // Decodes to: "Testing with imsg installed"
+    const REAL_BLOB_TESTING: &[u8] = &[
+        0x04, 0x0B, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6D, 0x74, 0x79, 0x70, 0x65, 0x64, 0x81, 0xE8,
+        0x03, 0x84, 0x01, 0x40, 0x84, 0x84, 0x84, 0x12, 0x4E, 0x53, 0x41, 0x74, 0x74, 0x72, 0x69,
+        0x62, 0x75, 0x74, 0x65, 0x64, 0x53, 0x74, 0x72, 0x69, 0x6E, 0x67, 0x00, 0x84, 0x84, 0x08,
+        0x4E, 0x53, 0x4F, 0x62, 0x6A, 0x65, 0x63, 0x74, 0x00, 0x85, 0x92, 0x84, 0x84, 0x84, 0x08,
+        0x4E, 0x53, 0x53, 0x74, 0x72, 0x69, 0x6E, 0x67, 0x01, 0x94, 0x84, 0x01, 0x2B, 0x1B, 0x54,
+        0x65, 0x73, 0x74, 0x69, 0x6E, 0x67, 0x20, 0x77, 0x69, 0x74, 0x68, 0x20, 0x69, 0x6D, 0x73,
+        0x67, 0x20, 0x69, 0x6E, 0x73, 0x74, 0x61, 0x6C, 0x6C, 0x65, 0x64, 0x86, 0x84, 0x02, 0x69,
+        0x49, 0x01, 0x1B, 0x92, 0x84, 0x84, 0x84, 0x0C, 0x4E, 0x53, 0x44, 0x69, 0x63, 0x74, 0x69,
+        0x6F, 0x6E, 0x61, 0x72, 0x79, 0x00, 0x94, 0x84, 0x01, 0x69, 0x01, 0x92, 0x84, 0x96, 0x96,
+        0x1D, 0x5F, 0x5F, 0x6B, 0x49, 0x4D, 0x4D, 0x65, 0x73, 0x73, 0x61, 0x67, 0x65, 0x50, 0x61,
+        0x72, 0x74, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75, 0x74, 0x65, 0x4E, 0x61, 0x6D, 0x65,
+        0x86, 0x92, 0x84, 0x84, 0x84, 0x08, 0x4E, 0x53, 0x4E, 0x75, 0x6D, 0x62, 0x65, 0x72, 0x00,
+        0x84, 0x84, 0x07, 0x4E, 0x53, 0x56, 0x61, 0x6C, 0x75, 0x65, 0x00, 0x94, 0x84, 0x01, 0x2A,
+        0x84, 0x99, 0x99, 0x00, 0x86, 0x86, 0x86,
+    ];
+
+    // Real attributedBody blob from unknownbreaker/MessageBridge (MIT).
+    // Decodes to: "1"
+    const REAL_BLOB_ONE: &[u8] = &[
+        0x04, 0x0b, 0x73, 0x74, 0x72, 0x65, 0x61, 0x6d, 0x74, 0x79, 0x70, 0x65, 0x64, 0x81, 0xe8,
+        0x03, 0x84, 0x01, 0x40, 0x84, 0x84, 0x84, 0x12, 0x4e, 0x53, 0x41, 0x74, 0x74, 0x72, 0x69,
+        0x62, 0x75, 0x74, 0x65, 0x64, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x84, 0x84, 0x08,
+        0x4e, 0x53, 0x4f, 0x62, 0x6a, 0x65, 0x63, 0x74, 0x00, 0x85, 0x92, 0x84, 0x84, 0x84, 0x08,
+        0x4e, 0x53, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x01, 0x94, 0x84, 0x01, 0x2b, 0x01, 0x31,
+        0x86, 0x84, 0x02, 0x69, 0x49, 0x01, 0x01, 0x92, 0x84, 0x84, 0x84, 0x0c, 0x4e, 0x53, 0x44,
+        0x69, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x61, 0x72, 0x79, 0x00, 0x94, 0x84, 0x01, 0x69, 0x01,
+        0x92, 0x84, 0x96, 0x96, 0x1d, 0x5f, 0x5f, 0x6b, 0x49, 0x4d, 0x4d, 0x65, 0x73, 0x73, 0x61,
+        0x67, 0x65, 0x50, 0x61, 0x72, 0x74, 0x41, 0x74, 0x74, 0x72, 0x69, 0x62, 0x75, 0x74, 0x65,
+        0x4e, 0x61, 0x6d, 0x65, 0x86, 0x92, 0x84, 0x84, 0x84, 0x08, 0x4e, 0x53, 0x4e, 0x75, 0x6d,
+        0x62, 0x65, 0x72, 0x00, 0x84, 0x84, 0x07, 0x4e, 0x53, 0x56, 0x61, 0x6c, 0x75, 0x65, 0x00,
+        0x94, 0x84, 0x01, 0x2a, 0x84, 0x99, 0x99, 0x00, 0x86, 0x86, 0x86,
+    ];
+
+    #[test]
+    fn extract_real_blob_testing_with_imsg() {
+        let result = extract_text_from_attributed_body(REAL_BLOB_TESTING);
+        assert_eq!(result, Some("Testing with imsg installed".to_string()));
+    }
+
+    #[test]
+    fn extract_real_blob_single_char() {
+        // From unknownbreaker/MessageBridge (MIT)
+        let result = extract_text_from_attributed_body(REAL_BLOB_ONE);
+        assert_eq!(result, Some("1".to_string()));
+    }
+
+    #[test]
+    fn extract_text_containing_end_marker_bytes() {
+        // U+2184 LATIN SMALL LETTER REVERSED C encodes to E2 86 84 in UTF-8.
+        // The old parser scanned for [0x86, 0x84] as end marker and would
+        // truncate here. The length-based parser must handle this correctly.
+        let text = "before\u{2184}after";
+        let blob = make_attributed_body(text);
+        let result = extract_text_from_attributed_body(&blob);
+        assert_eq!(result, Some(text.to_string()));
+    }
+
+    #[test]
+    fn extract_zero_length_returns_empty_string() {
+        // Marker found with length prefix = 0. Valid typedstream encoding
+        // for an empty NSString — parser returns Some(""), which
+        // resolve_message_content() will treat as empty and discard.
+        let blob = b"\x01\x2B\x00";
+        let result = extract_text_from_attributed_body(blob);
+        assert_eq!(result, Some(String::new()));
+    }
+
+    #[test]
+    fn extract_no_markers_returns_none() {
+        let blob = b"just some random bytes with no markers";
+        let result = extract_text_from_attributed_body(blob);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_invalid_utf8_returns_none() {
+        let blob = b"\x01\x2B\x04\xFF\xFE\x80\x81";
+        let result = extract_text_from_attributed_body(blob);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_truncated_blob_returns_none() {
+        // Length prefix says 27 bytes but blob is truncated
+        let blob = b"\x01\x2B\x1B\x54\x65\x73\x74";
+        let result = extract_text_from_attributed_body(blob);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn extract_long_text_two_byte_length() {
+        // >127 bytes triggers 0x81 length prefix
+        let long_text: String = "A".repeat(200);
+        let blob = make_attributed_body(&long_text);
+        let result = extract_text_from_attributed_body(&blob);
+        assert_eq!(result, Some(long_text));
+    }
+
+    #[test]
+    fn extract_four_byte_length_prefix() {
+        // Test the 0x82 branch: 4-byte little-endian u32 length prefix.
+        // Construct directly — make_attributed_body only emits 0x82 for >64KB.
+        let text = b"Hello";
+        let mut blob = Vec::new();
+        blob.extend_from_slice(b"\x01\x2B"); // start marker
+        blob.push(0x82); // 4-byte length tag
+        blob.extend_from_slice(&5_u32.to_le_bytes()); // length = 5
+        blob.extend_from_slice(text);
+        let result = extract_text_from_attributed_body(&blob);
+        assert_eq!(result, Some("Hello".to_string()));
+    }
+
+    #[test]
+    fn extract_text_boundary_127_to_128() {
+        // 127 is max single-byte length, 128 is min two-byte length
+        for len in [127, 128] {
+            let text: String = "X".repeat(len);
+            let blob = make_attributed_body(&text);
+            let result = extract_text_from_attributed_body(&blob);
+            assert_eq!(result, Some(text), "failed at length {len}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_new_messages_reads_attributed_body_fallback() {
+        let (_dir, db_path) = create_test_db();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                [],
+            )
+            .unwrap();
+            // Real blob from macOS chat.db — text=NULL, attributedBody present
+            conn.execute(
+                "INSERT INTO message (ROWID, handle_id, text, attributedBody, is_from_me) VALUES (10, 1, NULL, ?1, 0)",
+                [REAL_BLOB_TESTING.to_vec()],
+            ).unwrap();
+        }
+
+        let result = fetch_new_messages(&db_path, 0).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].2, "Testing with imsg installed");
+    }
+
+    #[tokio::test]
+    async fn fetch_new_messages_empty_text_falls_back_to_attributed_body() {
+        let (_dir, db_path) = create_test_db();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                [],
+            )
+            .unwrap();
+            // text = '' (empty string, not NULL) with valid attributedBody
+            conn.execute(
+                "INSERT INTO message (ROWID, handle_id, text, attributedBody, is_from_me) VALUES (10, 1, '', ?1, 0)",
+                [REAL_BLOB_ONE.to_vec()],
+            ).unwrap();
+        }
+
+        let result = fetch_new_messages(&db_path, 0).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].2, "1");
+    }
+
+    #[tokio::test]
+    async fn fetch_new_messages_prefers_text_over_attributed_body() {
+        let (_dir, db_path) = create_test_db();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                [],
+            )
+            .unwrap();
+            // Both text and attributedBody present — text column wins
+            conn.execute(
+                "INSERT INTO message (ROWID, handle_id, text, attributedBody, is_from_me) VALUES (10, 1, 'Plain text', ?1, 0)",
+                [REAL_BLOB_ONE.to_vec()],
+            ).unwrap();
+        }
+
+        let result = fetch_new_messages(&db_path, 0).await.unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].2, "Plain text");
+    }
+
+    #[tokio::test]
+    async fn fetch_new_messages_mixed_text_and_attributed_body() {
+        let (_dir, db_path) = create_test_db();
+
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute(
+                "INSERT INTO handle (ROWID, id) VALUES (1, '+1234567890')",
+                [],
+            )
+            .unwrap();
+            // Old-style message with text column
+            conn.execute(
+                "INSERT INTO message (ROWID, handle_id, text, is_from_me) VALUES (10, 1, 'Legacy message', 0)",
+                []
+            ).unwrap();
+            // Modern message with only attributedBody (real blob)
+            conn.execute(
+                "INSERT INTO message (ROWID, handle_id, text, attributedBody, is_from_me) VALUES (20, 1, NULL, ?1, 0)",
+                [REAL_BLOB_ONE.to_vec()],
+            ).unwrap();
+            // Message with neither (should be excluded)
+            conn.execute(
+                "INSERT INTO message (ROWID, handle_id, text, attributedBody, is_from_me) VALUES (30, 1, NULL, NULL, 0)",
+                [],
+            ).unwrap();
+        }
+
+        let result = fetch_new_messages(&db_path, 0).await.unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].2, "Legacy message");
+        assert_eq!(result[1].2, "1");
     }
 }

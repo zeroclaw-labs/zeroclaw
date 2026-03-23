@@ -1,5 +1,7 @@
 use crate::config::IdentityConfig;
+use crate::i18n::ToolDescriptions;
 use crate::identity;
+use crate::security::AutonomyLevel;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
@@ -17,6 +19,18 @@ pub struct PromptContext<'a> {
     pub skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     pub identity_config: Option<&'a IdentityConfig>,
     pub dispatcher_instructions: &'a str,
+    /// Locale-aware tool descriptions. When present, tool descriptions in
+    /// prompts are resolved from the locale file instead of hardcoded values.
+    pub tool_descriptions: Option<&'a ToolDescriptions>,
+    /// Pre-rendered security policy summary for inclusion in the Safety
+    /// prompt section.  When present, the LLM sees the concrete constraints
+    /// (allowed commands, forbidden paths, autonomy level) so it can plan
+    /// tool calls without trial-and-error.  See issue #2404.
+    pub security_summary: Option<String>,
+    /// Autonomy level from config. Controls whether the safety section
+    /// includes "ask before acting" instructions. Full autonomy omits them
+    /// so the model executes tools directly without simulating approval.
+    pub autonomy_level: AutonomyLevel,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -34,6 +48,7 @@ impl SystemPromptBuilder {
         Self {
             sections: vec![
                 Box::new(IdentitySection),
+                Box::new(ToolHonestySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
@@ -65,6 +80,7 @@ impl SystemPromptBuilder {
 }
 
 pub struct IdentitySection;
+pub struct ToolHonestySection;
 pub struct ToolsSection;
 pub struct SafetySection;
 pub struct SkillsSection;
@@ -107,22 +123,28 @@ impl PromptSection for IdentitySection {
             "USER.md",
             "HEARTBEAT.md",
             "BOOTSTRAP.md",
+            "MEMORY.md",
         ] {
             inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
         }
-        let memory_path = ctx.workspace_dir.join("MEMORY.md");
-        if memory_path.exists() {
-            inject_workspace_file(&mut prompt, ctx.workspace_dir, "MEMORY.md");
-        }
-
-        let extra_files = ctx.identity_config.map_or(&[][..], |cfg| cfg.extra_files.as_slice());
-        for file in extra_files {
-            if let Some(safe_relative) = normalize_openclaw_identity_extra_file(file) {
-                inject_workspace_file(&mut prompt, ctx.workspace_dir, safe_relative);
-            }
-        }
 
         Ok(prompt)
+    }
+}
+
+impl PromptSection for ToolHonestySection {
+    fn name(&self) -> &str {
+        "tool_honesty"
+    }
+
+    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        Ok(
+            "## CRITICAL: Tool Honesty\n\n\
+             - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
+             - If a tool call fails, report the error — never make up data to fill the gap.\n\
+             - When unsure whether a tool call succeeded, ask the user rather than guessing."
+                .into(),
+        )
     }
 }
 
@@ -134,11 +156,15 @@ impl PromptSection for ToolsSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
+            let desc = ctx
+                .tool_descriptions
+                .and_then(|td: &ToolDescriptions| td.get(tool.name()))
+                .unwrap_or_else(|| tool.description());
             let _ = writeln!(
                 out,
                 "- **{}**: {}\n  Parameters: `{}`",
                 tool.name(),
-                tool.description(),
+                desc,
                 tool.parameters_schema()
             );
         }
@@ -155,8 +181,50 @@ impl PromptSection for SafetySection {
         "safety"
     }
 
-    fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
-        Ok("## Safety\n\n- Do not exfiltrate private data.\n- Do not run destructive commands without asking.\n- Do not bypass oversight or approval mechanisms.\n- Prefer `trash` over `rm`.\n- When in doubt, ask before acting externally.".into())
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let mut out = String::from("## Safety\n\n- Do not exfiltrate private data.\n");
+
+        // Omit "ask before acting" instructions when autonomy is Full —
+        // mirrors build_system_prompt_with_mode_and_autonomy. See #3952.
+        if ctx.autonomy_level != AutonomyLevel::Full {
+            out.push_str(
+                "- Do not run destructive commands without asking.\n\
+                 - Do not bypass oversight or approval mechanisms.\n",
+            );
+        }
+
+        out.push_str("- Prefer `trash` over `rm`.\n");
+        out.push_str(match ctx.autonomy_level {
+            AutonomyLevel::Full => {
+                "- Respect the runtime autonomy policy: if a tool or action is allowed, \
+                 execute it directly instead of asking the user for extra approval.\n\
+                 - If a tool or action is blocked by policy or unavailable, explain that \
+                 concrete restriction instead of simulating an approval dialog."
+            }
+            AutonomyLevel::ReadOnly => {
+                "- This runtime is read-only for side effects unless a tool explicitly \
+                 reports otherwise.\n\
+                 - If a requested action is blocked by policy, explain the restriction \
+                 directly instead of simulating an approval dialog."
+            }
+            AutonomyLevel::Supervised => {
+                "- When in doubt, ask before acting externally.\n\
+                 - Respect the runtime autonomy policy: ask for approval only when the \
+                 current runtime policy actually requires it.\n\
+                 - If a tool or action is blocked by policy or unavailable, explain that \
+                 concrete restriction instead of simulating an approval dialog."
+            }
+        });
+
+        // Append concrete security policy constraints when available (#2404).
+        // This tells the LLM exactly what commands are allowed, which paths
+        // are off-limits, etc. — preventing wasteful trial-and-error.
+        if let Some(ref summary) = ctx.security_summary {
+            out.push_str("\n\n### Active Security Policy\n\n");
+            out.push_str(summary);
+        }
+
+        Ok(out)
     }
 }
 
@@ -267,29 +335,6 @@ fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &s
     }
 }
 
-fn normalize_openclaw_identity_extra_file(raw: &str) -> Option<&str> {
-    use std::path::{Component, Path};
-
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let path = Path::new(trimmed);
-    if path.is_absolute() {
-        return None;
-    }
-
-    for component in path.components() {
-        match component {
-            Component::Normal(_) | Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-
-    Some(trimmed)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,7 +382,6 @@ mod tests {
 
         let identity_config = crate::config::IdentityConfig {
             format: "aieos".into(),
-            extra_files: Vec::new(),
             aieos_path: None,
             aieos_inline: Some(r#"{"identity":{"names":{"first":"Nova"}}}"#.into()),
         };
@@ -351,6 +395,9 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: Some(&identity_config),
             dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let section = IdentitySection;
@@ -369,96 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn identity_section_openclaw_injects_extra_files() {
-        let workspace = std::env::temp_dir().join(format!(
-            "zeroclaw_prompt_extra_files_test_{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(workspace.join("memory")).unwrap();
-        std::fs::write(workspace.join("AGENTS.md"), "agent baseline").unwrap();
-        std::fs::write(workspace.join("SOUL.md"), "soul baseline").unwrap();
-        std::fs::write(workspace.join("TOOLS.md"), "tools baseline").unwrap();
-        std::fs::write(workspace.join("IDENTITY.md"), "identity baseline").unwrap();
-        std::fs::write(workspace.join("USER.md"), "user baseline").unwrap();
-        std::fs::write(workspace.join("FRAMEWORK.md"), "framework context").unwrap();
-        std::fs::write(workspace.join("memory").join("notes.md"), "memory notes").unwrap();
-
-        let identity_config = crate::config::IdentityConfig {
-            format: "openclaw".into(),
-            extra_files: vec!["FRAMEWORK.md".into(), "memory/notes.md".into()],
-            aieos_path: None,
-            aieos_inline: None,
-        };
-
-        let tools: Vec<Box<dyn Tool>> = vec![];
-        let ctx = PromptContext {
-            workspace_dir: &workspace,
-            model_name: "test-model",
-            tools: &tools,
-            skills: &[],
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
-            identity_config: Some(&identity_config),
-            dispatcher_instructions: "",
-        };
-
-        let section = IdentitySection;
-        let output = section.build(&ctx).unwrap();
-
-        assert!(output.contains("### FRAMEWORK.md"));
-        assert!(output.contains("framework context"));
-        assert!(output.contains("### memory/notes.md"));
-        assert!(output.contains("memory notes"));
-
-        let _ = std::fs::remove_dir_all(workspace);
-    }
-
-    #[test]
-    fn identity_section_openclaw_rejects_unsafe_extra_files() {
-        let workspace = std::env::temp_dir().join(format!(
-            "zeroclaw_prompt_extra_files_unsafe_test_{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("AGENTS.md"), "agent baseline").unwrap();
-        std::fs::write(workspace.join("SOUL.md"), "soul baseline").unwrap();
-        std::fs::write(workspace.join("TOOLS.md"), "tools baseline").unwrap();
-        std::fs::write(workspace.join("IDENTITY.md"), "identity baseline").unwrap();
-        std::fs::write(workspace.join("USER.md"), "user baseline").unwrap();
-        std::fs::write(workspace.join("SAFE.md"), "safe context").unwrap();
-
-        let identity_config = crate::config::IdentityConfig {
-            format: "openclaw".into(),
-            extra_files: vec![
-                "SAFE.md".into(),
-                "../outside.md".into(),
-                "/tmp/absolute.md".into(),
-            ],
-            aieos_path: None,
-            aieos_inline: None,
-        };
-
-        let tools: Vec<Box<dyn Tool>> = vec![];
-        let ctx = PromptContext {
-            workspace_dir: &workspace,
-            model_name: "test-model",
-            tools: &tools,
-            skills: &[],
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
-            identity_config: Some(&identity_config),
-            dispatcher_instructions: "",
-        };
-
-        let section = IdentitySection;
-        let output = section.build(&ctx).unwrap();
-
-        assert!(output.contains("### SAFE.md"));
-        assert!(!output.contains("outside.md"));
-        assert!(!output.contains("absolute.md"));
-
-        let _ = std::fs::remove_dir_all(workspace);
-    }
-
-    #[test]
     fn prompt_builder_assembles_sections() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(TestTool)];
         let ctx = PromptContext {
@@ -469,6 +426,9 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -504,18 +464,22 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(output.contains("<name>release_checklist</name>"));
-        assert!(output.contains("<kind>shell</kind>"));
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed names
+        assert!(output.contains("<callable_tools"));
+        assert!(output.contains("<name>deploy.release_checklist</name>"));
     }
 
     #[test]
-    fn skills_section_compact_mode_omits_instructions_and_tools() {
+    fn skills_section_compact_mode_omits_instructions_but_keeps_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let skills = vec![crate::skills::Skill {
             name: "deploy".into(),
@@ -542,14 +506,21 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Compact,
             identity_config: None,
             dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
         assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
+        assert!(output.contains("read_skill(name)"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(!output.contains("<tools>"));
+        // Compact mode should still include tools so the LLM knows about them.
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
+        assert!(output.contains("<callable_tools"));
+        assert!(output.contains("<name>deploy.release_checklist</name>"));
     }
 
     #[test]
@@ -563,6 +534,9 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "instr",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -601,6 +575,9 @@ mod tests {
             skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             identity_config: None,
             dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -616,5 +593,132 @@ mod tests {
         assert!(prompt.contains(
             "<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>"
         ));
+    }
+
+    #[test]
+    fn safety_section_includes_security_summary_when_present() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let summary = "**Autonomy level**: Supervised\n\
+                        **Allowed shell commands**: `git`, `ls`.\n"
+            .to_string();
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: Some(summary.clone()),
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+
+        let output = SafetySection.build(&ctx).unwrap();
+        assert!(
+            output.contains("## Safety"),
+            "should contain base safety header"
+        );
+        assert!(
+            output.contains("### Active Security Policy"),
+            "should contain security policy header"
+        );
+        assert!(
+            output.contains("Autonomy level"),
+            "should contain autonomy level from summary"
+        );
+        assert!(
+            output.contains("`git`"),
+            "should contain allowed commands from summary"
+        );
+    }
+
+    #[test]
+    fn safety_section_omits_security_policy_when_none() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+
+        let output = SafetySection.build(&ctx).unwrap();
+        assert!(
+            output.contains("## Safety"),
+            "should contain base safety header"
+        );
+        assert!(
+            !output.contains("### Active Security Policy"),
+            "should NOT contain security policy header when None"
+        );
+    }
+
+    #[test]
+    fn safety_section_full_autonomy_omits_approval_instructions() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Full,
+        };
+
+        let output = SafetySection.build(&ctx).unwrap();
+        assert!(
+            !output.contains("without asking"),
+            "full autonomy should NOT include 'ask before acting' instructions"
+        );
+        assert!(
+            !output.contains("bypass oversight"),
+            "full autonomy should NOT include 'bypass oversight' instructions"
+        );
+        assert!(
+            output.contains("execute it directly"),
+            "full autonomy should instruct to execute directly"
+        );
+        assert!(
+            output.contains("Do not exfiltrate"),
+            "full autonomy should still include data exfiltration guard"
+        );
+    }
+
+    #[test]
+    fn safety_section_supervised_includes_approval_instructions() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+        };
+
+        let output = SafetySection.build(&ctx).unwrap();
+        assert!(
+            output.contains("without asking"),
+            "supervised should include 'ask before acting' instructions"
+        );
+        assert!(
+            output.contains("bypass oversight"),
+            "supervised should include 'bypass oversight' instructions"
+        );
     }
 }

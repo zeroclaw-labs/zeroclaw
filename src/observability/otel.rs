@@ -27,6 +27,9 @@ pub struct OtelObserver {
     tokens_used: Counter<u64>,
     active_sessions: Gauge<u64>,
     queue_depth: Gauge<u64>,
+    hand_runs: Counter<u64>,
+    hand_duration: Histogram<f64>,
+    hand_findings: Counter<u64>,
 }
 
 impl OtelObserver {
@@ -152,6 +155,22 @@ impl OtelObserver {
             .with_description("Current message queue depth")
             .build();
 
+        let hand_runs = meter
+            .u64_counter("zeroclaw.hand.runs")
+            .with_description("Total hand runs")
+            .build();
+
+        let hand_duration = meter
+            .f64_histogram("zeroclaw.hand.duration")
+            .with_description("Hand run duration in seconds")
+            .with_unit("s")
+            .build();
+
+        let hand_findings = meter
+            .u64_counter("zeroclaw.hand.findings")
+            .with_description("Total findings produced by hand runs")
+            .build();
+
         Ok(Self {
             tracer_provider,
             meter_provider: meter_provider_clone,
@@ -168,6 +187,9 @@ impl OtelObserver {
             tokens_used,
             active_sessions,
             queue_depth,
+            hand_runs,
+            hand_duration,
+            hand_findings,
         })
     }
 }
@@ -188,7 +210,9 @@ impl Observer for OtelObserver {
             }
             ObserverEvent::LlmRequest { .. }
             | ObserverEvent::ToolCallStart { .. }
-            | ObserverEvent::TurnComplete => {}
+            | ObserverEvent::TurnComplete
+            | ObserverEvent::CacheHit { .. }
+            | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::LlmResponse {
                 provider,
                 model,
@@ -335,6 +359,77 @@ impl Observer for OtelObserver {
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
             }
+            ObserverEvent::HandStarted { .. } => {}
+            ObserverEvent::HandCompleted {
+                hand_name,
+                duration_ms,
+                findings_count,
+            } => {
+                let secs = *duration_ms as f64 / 1000.0;
+                let duration = std::time::Duration::from_millis(*duration_ms);
+                let start_time = SystemTime::now()
+                    .checked_sub(duration)
+                    .unwrap_or(SystemTime::now());
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(vec![
+                            KeyValue::new("hand.name", hand_name.clone()),
+                            KeyValue::new("hand.success", true),
+                            KeyValue::new("hand.findings", *findings_count as i64),
+                            KeyValue::new("duration_s", secs),
+                        ]),
+                );
+                span.set_status(Status::Ok);
+                span.end();
+
+                let attrs = [
+                    KeyValue::new("hand", hand_name.clone()),
+                    KeyValue::new("success", "true"),
+                ];
+                self.hand_runs.add(1, &attrs);
+                self.hand_duration
+                    .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
+                self.hand_findings.add(
+                    *findings_count as u64,
+                    &[KeyValue::new("hand", hand_name.clone())],
+                );
+            }
+            ObserverEvent::HandFailed {
+                hand_name,
+                error,
+                duration_ms,
+            } => {
+                let secs = *duration_ms as f64 / 1000.0;
+                let duration = std::time::Duration::from_millis(*duration_ms);
+                let start_time = SystemTime::now()
+                    .checked_sub(duration)
+                    .unwrap_or(SystemTime::now());
+
+                let mut span = tracer.build(
+                    opentelemetry::trace::SpanBuilder::from_name("hand.run")
+                        .with_kind(SpanKind::Internal)
+                        .with_start_time(start_time)
+                        .with_attributes(vec![
+                            KeyValue::new("hand.name", hand_name.clone()),
+                            KeyValue::new("hand.success", false),
+                            KeyValue::new("error.message", error.clone()),
+                            KeyValue::new("duration_s", secs),
+                        ]),
+                );
+                span.set_status(Status::error(error.clone()));
+                span.end();
+
+                let attrs = [
+                    KeyValue::new("hand", hand_name.clone()),
+                    KeyValue::new("success", "false"),
+                ];
+                self.hand_runs.add(1, &attrs);
+                self.hand_duration
+                    .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
+            }
         }
     }
 
@@ -351,6 +446,29 @@ impl Observer for OtelObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 self.queue_depth.record(*d as u64, &[]);
+            }
+            ObserverMetric::HandRunDuration {
+                hand_name,
+                duration,
+            } => {
+                self.hand_duration.record(
+                    duration.as_secs_f64(),
+                    &[KeyValue::new("hand", hand_name.clone())],
+                );
+            }
+            ObserverMetric::HandFindingsCount { hand_name, count } => {
+                self.hand_findings
+                    .add(*count, &[KeyValue::new("hand", hand_name.clone())]);
+            }
+            ObserverMetric::HandSuccessRate { hand_name, success } => {
+                let success_str = if *success { "true" } else { "false" };
+                self.hand_runs.add(
+                    1,
+                    &[
+                        KeyValue::new("hand", hand_name.clone()),
+                        KeyValue::new("success", success_str),
+                    ],
+                );
             }
         }
     }
@@ -434,6 +552,7 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
+            arguments: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -516,6 +635,41 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(0));
         obs.record_metric(&ObserverMetric::ActiveSessions(0));
         obs.record_metric(&ObserverMetric::QueueDepth(0));
+    }
+
+    #[test]
+    fn otel_hand_events_do_not_panic() {
+        let obs = test_observer();
+        obs.record_event(&ObserverEvent::HandStarted {
+            hand_name: "review".into(),
+        });
+        obs.record_event(&ObserverEvent::HandCompleted {
+            hand_name: "review".into(),
+            duration_ms: 1500,
+            findings_count: 3,
+        });
+        obs.record_event(&ObserverEvent::HandFailed {
+            hand_name: "review".into(),
+            error: "timeout".into(),
+            duration_ms: 5000,
+        });
+    }
+
+    #[test]
+    fn otel_hand_metrics_do_not_panic() {
+        let obs = test_observer();
+        obs.record_metric(&ObserverMetric::HandRunDuration {
+            hand_name: "review".into(),
+            duration: Duration::from_millis(1500),
+        });
+        obs.record_metric(&ObserverMetric::HandFindingsCount {
+            hand_name: "review".into(),
+            count: 5,
+        });
+        obs.record_metric(&ObserverMetric::HandSuccessRate {
+            hand_name: "review".into(),
+            success: true,
+        });
     }
 
     #[test]

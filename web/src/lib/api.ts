@@ -2,8 +2,8 @@ import type {
   StatusResponse,
   ToolSpec,
   CronJob,
+  CronRun,
   Integration,
-  IntegrationSettingsPayload,
   DiagResult,
   MemoryEntry,
   CostSummary,
@@ -11,6 +11,7 @@ import type {
   HealthSnapshot,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
+import { basePath } from './basePath';
 
 // ---------------------------------------------------------------------------
 // Base fetch wrapper
@@ -42,7 +43,7 @@ export async function apiFetch<T = unknown>(
     headers.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(path, { ...options, headers });
+  const response = await fetch(`${basePath}${path}`, { ...options, headers });
 
   if (response.status === 401) {
     clearToken();
@@ -78,7 +79,7 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
 // ---------------------------------------------------------------------------
 
 export async function pair(code: string): Promise<{ token: string }> {
-  const response = await fetch('/pair', {
+  const response = await fetch(`${basePath}/pair`, {
     method: 'POST',
     headers: { 'X-Pairing-Code': code },
   });
@@ -93,12 +94,20 @@ export async function pair(code: string): Promise<{ token: string }> {
   return data;
 }
 
+export async function getAdminPairCode(): Promise<{ pairing_code: string | null; pairing_required: boolean }> {
+  const response = await fetch('/admin/paircode');
+  if (!response.ok) {
+    throw new Error(`Failed to fetch pairing code (${response.status})`);
+  }
+  return response.json() as Promise<{ pairing_code: string | null; pairing_required: boolean }>;
+}
+
 // ---------------------------------------------------------------------------
 // Public health (no auth required)
 // ---------------------------------------------------------------------------
 
 export async function getPublicHealth(): Promise<{ require_pairing: boolean; paired: boolean }> {
-  const response = await fetch('/health');
+  const response = await fetch(`${basePath}/health`);
   if (!response.ok) {
     throw new Error(`Health check failed (${response.status})`);
   }
@@ -174,6 +183,48 @@ export function deleteCronJob(id: string): Promise<void> {
     method: 'DELETE',
   });
 }
+export function patchCronJob(
+  id: string,
+  patch: { name?: string; schedule?: string; command?: string },
+): Promise<CronJob> {
+  return apiFetch<CronJob | { status: string; job: CronJob }>(
+    `/api/cron/${encodeURIComponent(id)}`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    },
+  ).then((data) => (typeof (data as { job?: CronJob }).job === 'object' ? (data as { job: CronJob }).job : (data as CronJob)));
+}
+
+
+export function getCronRuns(
+  jobId: string,
+  limit: number = 20,
+): Promise<CronRun[]> {
+  const params = new URLSearchParams({ limit: String(limit) });
+  return apiFetch<CronRun[] | { runs: CronRun[] }>(
+    `/api/cron/${encodeURIComponent(jobId)}/runs?${params}`,
+  ).then((data) => unwrapField(data, 'runs'));
+}
+
+export interface CronSettings {
+  enabled: boolean;
+  catch_up_on_startup: boolean;
+  max_run_history: number;
+}
+
+export function getCronSettings(): Promise<CronSettings> {
+  return apiFetch<CronSettings>('/api/cron/settings');
+}
+
+export function patchCronSettings(
+  patch: Partial<CronSettings>,
+): Promise<CronSettings> {
+  return apiFetch<CronSettings & { status: string }>('/api/cron/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Integrations
@@ -182,23 +233,6 @@ export function deleteCronJob(id: string): Promise<void> {
 export function getIntegrations(): Promise<Integration[]> {
   return apiFetch<Integration[] | { integrations: Integration[] }>('/api/integrations').then(
     (data) => unwrapField(data, 'integrations'),
-  );
-}
-
-export function getIntegrationSettings(): Promise<IntegrationSettingsPayload> {
-  return apiFetch<IntegrationSettingsPayload>('/api/integrations/settings');
-}
-
-export function putIntegrationCredentials(
-  integrationId: string,
-  body: { revision?: string; fields: Record<string, string> },
-): Promise<{ status: string; revision: string; unchanged?: boolean }> {
-  return apiFetch<{ status: string; revision: string; unchanged?: boolean }>(
-    `/api/integrations/${encodeURIComponent(integrationId)}/credentials`,
-    {
-      method: 'PUT',
-      body: JSON.stringify(body),
-    },
   );
 }
 

@@ -1,95 +1,89 @@
-# Tóm tắt tài liệu ZeroClaw (Mục lục hợp nhất)
+# Tóm tắt Tài liệu ZeroClaw (Mục lục Thống nhất)
 
-Tệp này là mục lục chuẩn của hệ thống tài liệu.
+Tệp này là mục lục chính thức của hệ thống tài liệu.
 
 > 📖 [English version](SUMMARY.md)
 
-Cập nhật lần cuối: **24 tháng 2, 2026**.
+Cập nhật lần cuối: **18 tháng 2, 2026**.
 
-## Điểm vào theo ngôn ngữ
+## Điểm vào theo Ngôn ngữ
 
-- Bản đồ cấu trúc docs (ngôn ngữ/phần/chức năng): [structure/README.md](structure/README.md)
+- Bản đồ cấu trúc tài liệu (ngôn ngữ/phần/chức năng): [structure/README.md](maintainers/structure-README.md)
 - README tiếng Anh: [../README.md](../README.md)
-- README tiếng Trung: [docs/i18n/zh-CN/README.md](i18n/zh-CN/README.md)
-- README tiếng Nhật: [docs/i18n/ja/README.md](i18n/ja/README.md)
-- README tiếng Nga: [docs/i18n/ru/README.md](i18n/ru/README.md)
-- README tiếng Pháp: [docs/i18n/fr/README.md](i18n/fr/README.md)
-- README tiếng Việt: [docs/i18n/vi/README.md](i18n/vi/README.md)
-- README tiếng Hy Lạp: [docs/i18n/el/README.md](i18n/el/README.md)
-- Hub docs tiếng Anh: [README.md](README.md)
-- Hub docs tiếng Trung: [i18n/zh-CN/README.md](i18n/zh-CN/README.md)
-- Hub docs tiếng Nhật: [i18n/ja/README.md](i18n/ja/README.md)
-- Hub docs tiếng Nga: [i18n/ru/README.md](i18n/ru/README.md)
-- Hub docs tiếng Pháp: [i18n/fr/README.md](i18n/fr/README.md)
-- Hub docs tiếng Việt: [i18n/vi/README.md](i18n/vi/README.md)
-- Hub docs tiếng Hy Lạp: [i18n/el/README.md](i18n/el/README.md)
-- Chỉ mục i18n: [i18n/README.md](i18n/README.md)
-- Bản đồ coverage i18n: [i18n-coverage.md](i18n-coverage.md)
-- Hướng dẫn i18n: [i18n-guide.md](i18n-guide.md)
-- Theo dõi gap i18n: [i18n-gap-backlog.md](i18n-gap-backlog.md)
+- README tiếng Trung: [../README.zh-CN.md](../README.zh-CN.md)
+- README tiếng Nhật: [../README.ja.md](../README.ja.md)
+- README tiếng Nga: [../README.ru.md](../README.ru.md)
+- README tiếng Pháp: [../README.fr.md](../README.fr.md)
+- README tiếng Việt: [../README.vi.md](../README.vi.md)
+- Tài liệu tiếng Anh: [README.md](README.md)
+- Tài liệu tiếng Trung: [README.zh-CN.md](README.zh-CN.md)
+- Tài liệu tiếng Nhật: [README.ja.md](README.ja.md)
+- Tài liệu tiếng Nga: [README.ru.md](README.ru.md)
+- Tài liệu tiếng Pháp: [README.fr.md](README.fr.md)
+- Tài liệu tiếng Việt: [README.vi.md](README.vi.md)
+- Chỉ mục bản địa hóa: [i18n/README.md](i18n/README.md)
+- Bản đồ phủ sóng i18n: [i18n-coverage.md](maintainers/i18n-coverage.md)
 
 ## Danh mục
 
-### 1) Bắt đầu nhanh
+### 1) Bắt đầu Nhanh
 
-- [docs/i18n/vi/README.md](i18n/vi/getting-started/README.md)
-- [i18n/vi/one-click-bootstrap.md](i18n/vi/one-click-bootstrap.md)
-- [i18n/vi/android-setup.md](i18n/vi/android-setup.md)
+- [setup-guides/README.md](setup-guides/README.md)
+- [one-click-bootstrap.md](setup-guides/one-click-bootstrap.md)
 
-### 2) Tham chiếu lệnh/cấu hình và tích hợp
+### 2) Tham chiếu Lệnh, Cấu hình và Tích hợp
 
-- [docs/i18n/vi/README.md](i18n/vi/reference/README.md)
-- [i18n/vi/commands-reference.md](i18n/vi/commands-reference.md)
-- [i18n/vi/providers-reference.md](i18n/vi/providers-reference.md)
-- [i18n/vi/channels-reference.md](i18n/vi/channels-reference.md)
-- [i18n/vi/config-reference.md](i18n/vi/config-reference.md)
-- [i18n/vi/custom-providers.md](i18n/vi/custom-providers.md)
-- [i18n/vi/zai-glm-setup.md](i18n/vi/zai-glm-setup.md)
-- [i18n/vi/langgraph-integration.md](i18n/vi/langgraph-integration.md)
-- [i18n/vi/proxy-agent-playbook.md](i18n/vi/proxy-agent-playbook.md)
+- [reference/README.md](reference/README.md)
+- [commands-reference.md](reference/cli/commands-reference.md)
+- [providers-reference.md](reference/api/providers-reference.md)
+- [channels-reference.md](reference/api/channels-reference.md)
+- [nextcloud-talk-setup.md](setup-guides/nextcloud-talk-setup.md)
+- [config-reference.md](reference/api/config-reference.md)
+- [custom-providers.md](contributing/custom-providers.md)
+- [zai-glm-setup.md](setup-guides/zai-glm-setup.md)
+- [langgraph-integration.md](contributing/langgraph-integration.md)
 
-### 3) Vận hành và triển khai
+### 3) Vận hành và Triển khai
 
-- [docs/i18n/vi/README.md](i18n/vi/operations/README.md)
-- [i18n/vi/operations-runbook.md](i18n/vi/operations-runbook.md)
-- [i18n/vi/release-process.md](i18n/vi/release-process.md)
-- [i18n/vi/troubleshooting.md](i18n/vi/troubleshooting.md)
-- [i18n/vi/network-deployment.md](i18n/vi/network-deployment.md)
-- [i18n/vi/mattermost-setup.md](i18n/vi/mattermost-setup.md)
-- [i18n/vi/nextcloud-talk-setup.md](i18n/vi/nextcloud-talk-setup.md)
+- [ops/README.md](ops/README.md)
+- [operations-runbook.md](ops/operations-runbook.md)
+- [release-process.md](contributing/release-process.md)
+- [troubleshooting.md](ops/troubleshooting.md)
+- [network-deployment.md](ops/network-deployment.md)
+- [mattermost-setup.md](setup-guides/mattermost-setup.md)
 
-### 4) Bảo mật và quản trị
+### 4) Thiết kế Bảo mật và Đề xuất
 
-- [docs/i18n/vi/README.md](i18n/vi/security/README.md)
-- [i18n/vi/agnostic-security.md](i18n/vi/agnostic-security.md)
-- [i18n/vi/frictionless-security.md](i18n/vi/frictionless-security.md)
-- [i18n/vi/sandboxing.md](i18n/vi/sandboxing.md)
-- [i18n/vi/resource-limits.md](i18n/vi/resource-limits.md)
-- [i18n/vi/audit-logging.md](i18n/vi/audit-logging.md)
-- [i18n/vi/audit-event-schema.md](i18n/vi/audit-event-schema.md)
-- [i18n/vi/security-roadmap.md](i18n/vi/security-roadmap.md)
+- [security/README.md](security/README.md)
+- [agnostic-security.md](security/agnostic-security.md)
+- [frictionless-security.md](security/frictionless-security.md)
+- [sandboxing.md](security/sandboxing.md)
+- [resource-limits.md](ops/resource-limits.md)
+- [audit-logging.md](security/audit-logging.md)
+- [security-roadmap.md](security/security-roadmap.md)
 
-### 5) Phần cứng và ngoại vi
+### 5) Phần cứng và Thiết bị Ngoại vi
 
-- [docs/i18n/vi/README.md](i18n/vi/hardware/README.md)
-- [i18n/vi/hardware-peripherals-design.md](i18n/vi/hardware-peripherals-design.md)
-- [i18n/vi/adding-boards-and-tools.md](i18n/vi/adding-boards-and-tools.md)
-- [i18n/vi/nucleo-setup.md](i18n/vi/nucleo-setup.md)
-- [i18n/vi/arduino-uno-q-setup.md](i18n/vi/arduino-uno-q-setup.md)
-- [datasheets/README.md](datasheets/README.md)
+- [hardware/README.md](hardware/README.md)
+- [hardware-peripherals-design.md](hardware/hardware-peripherals-design.md)
+- [adding-boards-and-tools.md](contributing/adding-boards-and-tools.md)
+- [nucleo-setup.md](hardware/nucleo-setup.md)
+- [arduino-uno-q-setup.md](hardware/arduino-uno-q-setup.md)
+- [datasheets/nucleo-f401re.md](hardware/datasheets/nucleo-f401re.md)
+- [datasheets/arduino-uno.md](hardware/datasheets/arduino-uno.md)
+- [datasheets/esp32.md](hardware/datasheets/esp32.md)
 
 ### 6) Đóng góp và CI
 
-- [docs/i18n/vi/README.md](i18n/vi/contributing/README.md)
+- [contributing/README.md](contributing/README.md)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
-- [i18n/vi/pr-workflow.md](i18n/vi/pr-workflow.md)
-- [i18n/vi/reviewer-playbook.md](i18n/vi/reviewer-playbook.md)
-- [i18n/vi/ci-map.md](i18n/vi/ci-map.md)
-- [i18n/vi/actions-source-policy.md](i18n/vi/actions-source-policy.md)
+- [pr-workflow.md](contributing/pr-workflow.md)
+- [reviewer-playbook.md](contributing/reviewer-playbook.md)
+- [ci-map.md](contributing/ci-map.md)
+- [actions-source-policy.md](contributing/actions-source-policy.md)
 
-### 7) Trạng thái dự án và ảnh chụp
+### 7) Trạng thái Dự án và Ảnh chụp
 
-- [docs/i18n/vi/README.md](i18n/vi/project/README.md)
-- [i18n/vi/project-triage-snapshot-2026-02-18.md](i18n/vi/project-triage-snapshot-2026-02-18.md)
-- [i18n/vi/docs-audit-2026-02-24.md](i18n/vi/docs-audit-2026-02-24.md)
-- [i18n/vi/docs-inventory.md](i18n/vi/docs-inventory.md)
+- [maintainers/README.md](maintainers/README.md)
+- [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md)
+- [docs-inventory.md](maintainers/docs-inventory.md)

@@ -1,26 +1,18 @@
 use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
-use crate::config::DelegateAgentConfig;
-use crate::coordination::{CoordinationEnvelope, CoordinationPayload, InMemoryMessageBus};
+use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use uuid::Uuid;
-
-/// Default timeout for sub-agent provider calls.
-const DELEGATE_TIMEOUT_SECS: u64 = 120;
-/// Default timeout for agentic sub-agent runs.
-const DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
-/// Default synthetic lead-agent name used for coordination event tracing.
-const DEFAULT_COORDINATION_LEAD_AGENT: &str = "delegate-lead";
-/// Maximum characters retained in coordination event previews.
-const COORDINATION_PREVIEW_MAX_CHARS: usize = 240;
 
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
@@ -36,13 +28,13 @@ pub struct DelegateTool {
     /// Depth at which this tool instance lives in the delegation chain.
     depth: u32,
     /// Parent tool registry for agentic sub-agents.
-    parent_tools: Arc<Vec<Arc<dyn Tool>>>,
+    parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
-    /// Optional typed coordination bus used to trace delegate lifecycle events.
-    coordination_bus: Option<InMemoryMessageBus>,
-    /// Logical lead agent identity used in coordination trace events.
-    coordination_lead_agent: String,
+    /// Global delegate tool config providing default timeout values.
+    delegate_config: DelegateToolConfig,
+    /// Workspace directory inherited from the root agent context.
+    workspace_dir: PathBuf,
 }
 
 impl DelegateTool {
@@ -65,17 +57,16 @@ impl DelegateTool {
         security: Arc<SecurityPolicy>,
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
-        let coordination_bus = build_coordination_bus(&agents, DEFAULT_COORDINATION_LEAD_AGENT);
         Self {
             agents: Arc::new(agents),
             security,
             fallback_credential,
             provider_runtime_options,
             depth: 0,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            coordination_bus,
-            coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
+            delegate_config: DelegateToolConfig::default(),
+            workspace_dir: PathBuf::new(),
         }
     }
 
@@ -104,22 +95,21 @@ impl DelegateTool {
         depth: u32,
         provider_runtime_options: providers::ProviderRuntimeOptions,
     ) -> Self {
-        let coordination_bus = build_coordination_bus(&agents, DEFAULT_COORDINATION_LEAD_AGENT);
         Self {
             agents: Arc::new(agents),
             security,
             fallback_credential,
             provider_runtime_options,
             depth,
-            parent_tools: Arc::new(Vec::new()),
+            parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            coordination_bus,
-            coordination_lead_agent: DEFAULT_COORDINATION_LEAD_AGENT.to_string(),
+            delegate_config: DelegateToolConfig::default(),
+            workspace_dir: PathBuf::new(),
         }
     }
 
     /// Attach parent tools used to build sub-agent allowlist registries.
-    pub fn with_parent_tools(mut self, parent_tools: Arc<Vec<Arc<dyn Tool>>>) -> Self {
+    pub fn with_parent_tools(mut self, parent_tools: Arc<RwLock<Vec<Arc<dyn Tool>>>>) -> Self {
         self.parent_tools = parent_tools;
         self
     }
@@ -130,41 +120,22 @@ impl DelegateTool {
         self
     }
 
-    /// Override the coordination bus used for delegate event tracing.
-    pub fn with_coordination_bus(
-        mut self,
-        bus: InMemoryMessageBus,
-        lead_agent: impl Into<String>,
-    ) -> Self {
-        let lead_agent = {
-            let lead = lead_agent.into();
-            if lead.trim().is_empty() {
-                DEFAULT_COORDINATION_LEAD_AGENT.to_string()
-            } else {
-                lead.trim().to_string()
-            }
-        };
-
-        if let Err(error) = bus.register_agent(lead_agent.clone()) {
-            tracing::warn!(
-                "delegate coordination: failed to register lead agent '{lead_agent}': {error}"
-            );
-        }
-
-        self.coordination_bus = Some(bus);
-        self.coordination_lead_agent = lead_agent;
+    /// Attach global delegate tool configuration for default timeout values.
+    pub fn with_delegate_config(mut self, config: DelegateToolConfig) -> Self {
+        self.delegate_config = config;
         self
     }
 
-    /// Disable coordination tracing for this tool instance.
-    pub fn with_coordination_disabled(mut self) -> Self {
-        self.coordination_bus = None;
-        self
+    /// Return a shared handle to the parent tools list.
+    /// Callers can push additional tools (e.g. MCP wrappers) after construction.
+    pub fn parent_tools_handle(&self) -> Arc<RwLock<Vec<Arc<dyn Tool>>>> {
+        Arc::clone(&self.parent_tools)
     }
 
-    #[cfg(test)]
-    fn coordination_bus_snapshot(&self) -> Option<InMemoryMessageBus> {
-        self.coordination_bus.clone()
+    /// Attach the workspace directory for system prompt enrichment.
+    pub fn with_workspace_dir(mut self, workspace_dir: PathBuf) -> Self {
+        self.workspace_dir = workspace_dir;
+        self
     }
 }
 
@@ -293,9 +264,6 @@ impl Tool for DelegateTool {
             });
         }
 
-        let coordination_trace =
-            self.start_coordination_trace(agent_name, prompt, context, agent_config);
-
         // Create provider for this agent
         let provider_credential_owned = agent_config
             .api_key
@@ -311,20 +279,13 @@ impl Tool for DelegateTool {
         ) {
             Ok(p) => p,
             Err(e) => {
-                let error_message = format!(
-                    "Failed to create provider '{}' for agent '{agent_name}': {e}",
-                    agent_config.provider
-                );
-                self.finish_coordination_trace(
-                    agent_name,
-                    &coordination_trace,
-                    false,
-                    &error_message,
-                );
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(error_message),
+                    error: Some(format!(
+                        "Failed to create provider '{}' for agent '{agent_name}': {e}",
+                        agent_config.provider
+                    )),
                 });
             }
         };
@@ -340,7 +301,7 @@ impl Tool for DelegateTool {
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agent_config.agentic {
-            let result = self
+            return self
                 .execute_agentic(
                     agent_name,
                     agent_config,
@@ -348,31 +309,22 @@ impl Tool for DelegateTool {
                     &full_prompt,
                     temperature,
                 )
-                .await?;
-
-            let summary = if result.success {
-                result.output.as_str()
-            } else {
-                result
-                    .error
-                    .as_deref()
-                    .unwrap_or("delegate agentic execution failed")
-            };
-            self.finish_coordination_trace(
-                agent_name,
-                &coordination_trace,
-                result.success,
-                summary,
-            );
-
-            return Ok(result);
+                .await;
         }
 
+        // Build enriched system prompt for non-agentic sub-agent.
+        let enriched_system_prompt =
+            self.build_enriched_system_prompt(agent_config, &[], &self.workspace_dir);
+        let system_prompt_ref = enriched_system_prompt.as_deref();
+
         // Wrap the provider call in a timeout to prevent indefinite blocking
+        let timeout_secs = agent_config
+            .timeout_secs
+            .unwrap_or(self.delegate_config.timeout_secs);
         let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_TIMEOUT_SECS),
+            Duration::from_secs(timeout_secs),
             provider.chat_with_system(
-                agent_config.system_prompt.as_deref(),
+                system_prompt_ref,
                 &full_prompt,
                 &agent_config.model,
                 temperature,
@@ -383,18 +335,12 @@ impl Tool for DelegateTool {
         let result = match result {
             Ok(inner) => inner,
             Err(_elapsed) => {
-                let timeout_message =
-                    format!("Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s");
-                self.finish_coordination_trace(
-                    agent_name,
-                    &coordination_trace,
-                    false,
-                    &timeout_message,
-                );
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(timeout_message),
+                    error: Some(format!(
+                        "Agent '{agent_name}' timed out after {timeout_secs}s"
+                    )),
                 });
             }
         };
@@ -405,38 +351,101 @@ impl Tool for DelegateTool {
                 if rendered.trim().is_empty() {
                     rendered = "[Empty response]".to_string();
                 }
-                let output = format!(
-                    "[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
-                    provider = agent_config.provider,
-                    model = agent_config.model
-                );
-                self.finish_coordination_trace(agent_name, &coordination_trace, true, &output);
 
                 Ok(ToolResult {
                     success: true,
-                    output,
+                    output: format!(
+                        "[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
+                        provider = agent_config.provider,
+                        model = agent_config.model
+                    ),
                     error: None,
                 })
             }
-            Err(e) => {
-                let failure_message = format!("Agent '{agent_name}' failed: {e}");
-                self.finish_coordination_trace(
-                    agent_name,
-                    &coordination_trace,
-                    false,
-                    &failure_message,
-                );
-                Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(failure_message),
-                })
-            }
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Agent '{agent_name}' failed: {e}",)),
+            }),
         }
     }
 }
 
 impl DelegateTool {
+    /// Build an enriched system prompt for a sub-agent by composing structured
+    /// operational sections (tools, skills, workspace, datetime, shell policy)
+    /// with the operator-configured `system_prompt` string.
+    fn build_enriched_system_prompt(
+        &self,
+        agent_config: &DelegateAgentConfig,
+        sub_tools: &[Box<dyn Tool>],
+        workspace_dir: &Path,
+    ) -> Option<String> {
+        // Resolve skills directory: scoped if configured, otherwise workspace default.
+        let skills_dir = agent_config
+            .skills_directory
+            .as_ref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|dir| workspace_dir.join(dir))
+            .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir));
+        let skills = crate::skills::load_skills_from_directory(&skills_dir, false);
+
+        // Determine shell policy instructions when the `shell` tool is in the
+        // effective tool list.
+        let has_shell = sub_tools.iter().any(|t| t.name() == "shell");
+        let shell_policy = if has_shell {
+            "## Shell Policy\n\n\
+             - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
+             - Do not run commands that exfiltrate data or modify system-critical paths.\n\
+             - Avoid interactive commands that block on stdin.\n\
+             - Quote paths that may contain spaces."
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        // Build structured operational context using SystemPromptBuilder sections.
+        let ctx = PromptContext {
+            workspace_dir,
+            model_name: &agent_config.model,
+            tools: sub_tools,
+            skills: &skills,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            tool_descriptions: None,
+            security_summary: None,
+            autonomy_level: crate::security::AutonomyLevel::default(),
+        };
+
+        let builder = SystemPromptBuilder::default()
+            .add_section(Box::new(crate::agent::prompt::ToolsSection))
+            .add_section(Box::new(crate::agent::prompt::SafetySection))
+            .add_section(Box::new(crate::agent::prompt::SkillsSection))
+            .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
+            .add_section(Box::new(crate::agent::prompt::DateTimeSection));
+
+        let mut enriched = builder.build(&ctx).unwrap_or_default();
+
+        if !shell_policy.is_empty() {
+            enriched.push_str(&shell_policy);
+            enriched.push_str("\n\n");
+        }
+
+        // Append the operator-configured system_prompt as the identity/role block.
+        if let Some(operator_prompt) = agent_config.system_prompt.as_ref() {
+            enriched.push_str(operator_prompt);
+            enriched.push('\n');
+        }
+
+        let trimmed = enriched.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
     async fn execute_agentic(
         &self,
         agent_name: &str,
@@ -462,13 +471,15 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
-        let sub_tools: Vec<Box<dyn Tool>> = self
-            .parent_tools
-            .iter()
-            .filter(|tool| allowed.contains(tool.name()))
-            .filter(|tool| tool.name() != "delegate")
-            .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
-            .collect();
+        let sub_tools: Vec<Box<dyn Tool>> = {
+            let parent_tools = self.parent_tools.read();
+            parent_tools
+                .iter()
+                .filter(|tool| allowed.contains(tool.name()))
+                .filter(|tool| tool.name() != "delegate")
+                .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
+                .collect()
+        };
 
         if sub_tools.is_empty() {
             return Ok(ToolResult {
@@ -481,16 +492,23 @@ impl DelegateTool {
             });
         }
 
+        // Build enriched system prompt with tools, skills, workspace, datetime context.
+        let enriched_system_prompt =
+            self.build_enriched_system_prompt(agent_config, &sub_tools, &self.workspace_dir);
+
         let mut history = Vec::new();
-        if let Some(system_prompt) = agent_config.system_prompt.as_ref() {
+        if let Some(system_prompt) = enriched_system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
         }
         history.push(ChatMessage::user(full_prompt.to_string()));
 
         let noop_observer = NoopObserver;
 
+        let agentic_timeout_secs = agent_config
+            .agentic_timeout_secs
+            .unwrap_or(self.delegate_config.agentic_timeout_secs);
         let result = tokio::time::timeout(
-            Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
+            Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(
                 provider,
                 &mut history,
@@ -502,12 +520,17 @@ impl DelegateTool {
                 true,
                 None,
                 "delegate",
+                None,
                 &self.multimodal_config,
                 agent_config.max_iterations,
                 None,
                 None,
                 None,
                 &[],
+                &[],
+                None,
+                None,
+                &crate::config::PacingConfig::default(),
             ),
         )
         .await;
@@ -539,191 +562,11 @@ impl DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
+                    "Agent '{agent_name}' timed out after {agentic_timeout_secs}s"
                 )),
             }),
         }
     }
-
-    fn start_coordination_trace(
-        &self,
-        agent_name: &str,
-        prompt: &str,
-        context: &str,
-        agent_config: &DelegateAgentConfig,
-    ) -> CoordinationTrace {
-        let correlation_id = Uuid::new_v4().to_string();
-        let conversation_id = format!("delegate:{correlation_id}");
-        let mut trace = CoordinationTrace {
-            correlation_id: correlation_id.clone(),
-            conversation_id: conversation_id.clone(),
-            request_message_id: None,
-        };
-
-        let Some(bus) = &self.coordination_bus else {
-            return trace;
-        };
-
-        let mut request = CoordinationEnvelope::new_direct(
-            self.coordination_lead_agent.clone(),
-            agent_name.to_string(),
-            conversation_id.clone(),
-            "delegate.request",
-            CoordinationPayload::DelegateTask {
-                task_id: correlation_id.clone(),
-                summary: text_preview(prompt, COORDINATION_PREVIEW_MAX_CHARS),
-                metadata: json!({
-                    "provider": agent_config.provider,
-                    "model": agent_config.model,
-                    "agentic": agent_config.agentic,
-                    "max_depth": agent_config.max_depth,
-                    "max_iterations": agent_config.max_iterations,
-                    "context_present": !context.is_empty()
-                }),
-            },
-        );
-        request.correlation_id = Some(correlation_id.clone());
-        let request_message_id = request.id.clone();
-        if let Err(error) = bus.publish(request) {
-            tracing::warn!(
-                "delegate coordination: failed to publish delegate request for '{agent_name}': {error}"
-            );
-        } else {
-            trace.request_message_id = Some(request_message_id);
-        }
-
-        let mut queued_state = CoordinationEnvelope::new_direct(
-            self.coordination_lead_agent.clone(),
-            self.coordination_lead_agent.clone(),
-            conversation_id,
-            "delegate.state",
-            CoordinationPayload::ContextPatch {
-                key: format!("delegate/{correlation_id}/state"),
-                expected_version: 0,
-                value: json!({
-                    "phase": "queued",
-                    "agent": agent_name,
-                    "context_present": !context.is_empty()
-                }),
-            },
-        );
-        queued_state.correlation_id = Some(correlation_id);
-        queued_state.causation_id = trace.request_message_id.clone();
-        if let Err(error) = bus.publish(queued_state) {
-            tracing::warn!(
-                "delegate coordination: failed to publish queued-state patch for '{agent_name}': {error}"
-            );
-        }
-
-        trace
-    }
-
-    fn finish_coordination_trace(
-        &self,
-        agent_name: &str,
-        trace: &CoordinationTrace,
-        success: bool,
-        detail: &str,
-    ) {
-        let Some(bus) = &self.coordination_bus else {
-            return;
-        };
-
-        let detail_preview = text_preview(detail, COORDINATION_PREVIEW_MAX_CHARS);
-
-        let mut result = CoordinationEnvelope::new_direct(
-            agent_name.to_string(),
-            self.coordination_lead_agent.clone(),
-            trace.conversation_id.clone(),
-            "delegate.result",
-            CoordinationPayload::TaskResult {
-                task_id: trace.correlation_id.clone(),
-                success,
-                output: detail_preview.clone(),
-            },
-        );
-        result.correlation_id = Some(trace.correlation_id.clone());
-        result.causation_id = trace.request_message_id.clone();
-        if let Err(error) = bus.publish(result) {
-            tracing::warn!(
-                "delegate coordination: failed to publish delegate result for '{agent_name}': {error}"
-            );
-        }
-
-        let phase = if success { "completed" } else { "failed" };
-        let mut completed_state = CoordinationEnvelope::new_direct(
-            self.coordination_lead_agent.clone(),
-            self.coordination_lead_agent.clone(),
-            trace.conversation_id.clone(),
-            "delegate.state",
-            CoordinationPayload::ContextPatch {
-                key: format!("delegate/{}/state", trace.correlation_id),
-                expected_version: 1,
-                value: json!({
-                    "phase": phase,
-                    "agent": agent_name,
-                    "success": success,
-                    "detail": detail_preview
-                }),
-            },
-        );
-        completed_state.correlation_id = Some(trace.correlation_id.clone());
-        completed_state.causation_id = trace.request_message_id.clone();
-        if let Err(error) = bus.publish(completed_state) {
-            tracing::warn!(
-                "delegate coordination: failed to publish completion-state patch for '{agent_name}': {error}"
-            );
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct CoordinationTrace {
-    correlation_id: String,
-    conversation_id: String,
-    request_message_id: Option<String>,
-}
-
-fn build_coordination_bus(
-    agents: &HashMap<String, DelegateAgentConfig>,
-    lead_agent: &str,
-) -> Option<InMemoryMessageBus> {
-    if agents.is_empty() {
-        return None;
-    }
-
-    let bus = InMemoryMessageBus::new();
-    if let Err(error) = bus.register_agent(lead_agent.to_string()) {
-        tracing::warn!(
-            "delegate coordination: failed to register default lead agent '{lead_agent}': {error}"
-        );
-        return None;
-    }
-
-    for name in agents.keys() {
-        if let Err(error) = bus.register_agent(name.clone()) {
-            tracing::warn!(
-                "delegate coordination: failed to register delegate agent '{name}': {error}"
-            );
-            return None;
-        }
-    }
-
-    Some(bus)
-}
-
-fn text_preview(value: &str, max_chars: usize) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return "[empty]".to_string();
-    }
-    if trimmed.chars().count() <= max_chars {
-        return trimmed.to_string();
-    }
-
-    let mut preview = trimmed.chars().take(max_chars).collect::<String>();
-    preview.push_str("...");
-    preview
 }
 
 struct ToolArcRef {
@@ -774,7 +617,9 @@ impl Observer for NoopObserver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordination::CoordinationPayload;
+    use crate::config::schema::{
+        DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS, DEFAULT_DELEGATE_TIMEOUT_SECS,
+    };
     use crate::providers::{ChatRequest, ChatResponse, ToolCall};
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use anyhow::anyhow;
@@ -797,6 +642,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
         agents.insert(
@@ -811,6 +659,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
         agents
@@ -964,6 +815,9 @@ mod tests {
             agentic: true,
             allowed_tools,
             max_iterations,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
         }
     }
 
@@ -1072,6 +926,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1178,6 +1035,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1213,6 +1073,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1278,7 +1141,7 @@ mod tests {
         );
 
         let tool = DelegateTool::new(agents, None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
         let result = tool
             .execute(json!({"agent": "agentic", "prompt": "test"}))
             .await
@@ -1296,10 +1159,10 @@ mod tests {
     async fn execute_agentic_runs_tool_call_loop_with_filtered_tools() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![
+            Arc::new(RwLock::new(vec![
                 Arc::new(EchoTool),
                 Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
-            ]),
+            ])),
         );
 
         let provider = OneToolThenFinalProvider;
@@ -1317,11 +1180,11 @@ mod tests {
     async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
         let config = agentic_config(vec!["delegate".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
-            Arc::new(vec![Arc::new(DelegateTool::new(
+            Arc::new(RwLock::new(vec![Arc::new(DelegateTool::new(
                 HashMap::new(),
                 None,
                 test_security(),
-            ))]),
+            ))])),
         );
 
         let provider = OneToolThenFinalProvider;
@@ -1342,7 +1205,7 @@ mod tests {
     async fn execute_agentic_respects_max_iterations() {
         let config = agentic_config(vec!["echo_tool".to_string()], 2);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = InfiniteToolCallProvider;
         let result = tool
@@ -1362,7 +1225,7 @@ mod tests {
     async fn execute_agentic_propagates_provider_errors() {
         let config = agentic_config(vec!["echo_tool".to_string()], 10);
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
 
         let provider = FailingProvider;
         let result = tool
@@ -1378,14 +1241,346 @@ mod tests {
             .contains("provider boom"));
     }
 
+    /// MCP tools pushed into the shared parent_tools handle after DelegateTool
+    /// construction must be visible to the sub-agent tool list.
+    #[derive(Default)]
+    struct FakeMcpTool;
+
+    #[async_trait]
+    impl Tool for FakeMcpTool {
+        fn name(&self) -> &str {
+            "mcp_fake"
+        }
+
+        fn description(&self) -> &str {
+            "Fake MCP tool for testing."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "mcp_fake_output".into(),
+                error: None,
+            })
+        }
+    }
+
+    struct McpToolThenFinalProvider;
+
+    #[async_trait]
+    impl Provider for McpToolThenFinalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("unused".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let has_tool_message = request.messages.iter().any(|m| m.role == "tool");
+            if has_tool_message {
+                Ok(ChatResponse {
+                    text: Some("mcp done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_mcp".to_string(),
+                        name: "mcp_fake".to_string(),
+                        arguments: "{}".to_string(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn execute_records_failure_events_in_coordination_bus() {
-        let mut agents = HashMap::new();
-        agents.insert(
-            "broken".to_string(),
+    async fn mcp_tools_included_in_subagent_tool_list() {
+        // Build DelegateTool with NO parent tools initially
+        let config = agentic_config(vec!["mcp_fake".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        // Simulate late MCP tool injection via the shared handle
+        let handle = tool.parent_tools_handle();
+        handle.write().push(Arc::new(FakeMcpTool));
+
+        let provider = McpToolThenFinalProvider;
+        let result = tool
+            .execute_agentic("agentic", &config, &provider, "run mcp", 0.2)
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(
+            result.output.contains("mcp done"),
+            "Expected output containing 'mcp done', got: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn enriched_prompt_includes_tools_workspace_datetime() {
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: Some("You are a code reviewer.".to_string()),
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_enrich_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(prompt.contains("## Tools"), "should contain tools section");
+        assert!(prompt.contains("echo_tool"), "should list allowed tools");
+        assert!(
+            prompt.contains("## Workspace"),
+            "should contain workspace section"
+        );
+        assert!(
+            prompt.contains(&workspace.display().to_string()),
+            "should contain workspace path"
+        );
+        assert!(
+            prompt.contains("## Current Date & Time"),
+            "should contain datetime section"
+        );
+        assert!(
+            prompt.contains("You are a code reviewer."),
+            "should append operator system_prompt"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_includes_shell_policy_when_shell_present() {
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["shell".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+        };
+
+        struct MockShellTool;
+        #[async_trait]
+        impl Tool for MockShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Execute shell commands"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                })
+            }
+        }
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
+        let workspace = std::env::temp_dir();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("## Shell Policy"),
+            "should contain shell policy when shell tool is present"
+        );
+    }
+
+    #[test]
+    fn parent_tools_handle_returns_shared_reference() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(
+            Arc::new(RwLock::new(vec![Arc::new(EchoTool) as Arc<dyn Tool>])),
+        );
+
+        let handle = tool.parent_tools_handle();
+        assert_eq!(handle.read().len(), 1);
+
+        // Push a new tool via the handle
+        handle.write().push(Arc::new(FakeMcpTool));
+        assert_eq!(handle.read().len(), 2);
+    }
+
+    // ── Configurable timeout tests ──────────────────────────────────
+
+    #[test]
+    fn default_timeout_values_used_when_config_unset() {
+        let config = DelegateAgentConfig {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+        };
+        assert_eq!(
+            config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
+            120
+        );
+        assert_eq!(
+            config
+                .agentic_timeout_secs
+                .unwrap_or(DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS),
+            300
+        );
+    }
+
+    #[test]
+    fn enriched_prompt_omits_shell_policy_without_shell_tool() {
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+        let workspace = std::env::temp_dir();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "should not contain shell policy when shell tool is absent"
+        );
+    }
+
+    #[test]
+    fn custom_timeout_values_are_respected() {
+        let config = DelegateAgentConfig {
+            provider: "ollama".to_string(),
+            model: "llama3".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: false,
+            allowed_tools: Vec::new(),
+            max_iterations: 10,
+            timeout_secs: Some(60),
+            agentic_timeout_secs: Some(600),
+            skills_directory: None,
+        };
+        assert_eq!(
+            config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
+            60
+        );
+        assert_eq!(
+            config
+                .agentic_timeout_secs
+                .unwrap_or(DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS),
+            600
+        );
+    }
+
+    #[test]
+    fn timeout_deserialization_defaults_to_none() {
+        let toml_str = r#"
+            provider = "ollama"
+            model = "llama3"
+        "#;
+        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.timeout_secs.is_none());
+        assert!(config.agentic_timeout_secs.is_none());
+    }
+
+    #[test]
+    fn timeout_deserialization_with_custom_values() {
+        let toml_str = r#"
+            provider = "ollama"
+            model = "llama3"
+            timeout_secs = 45
+            agentic_timeout_secs = 900
+        "#;
+        let config: DelegateAgentConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.timeout_secs, Some(45));
+        assert_eq!(config.agentic_timeout_secs, Some(900));
+    }
+
+    #[test]
+    fn config_validation_rejects_zero_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
             DelegateAgentConfig {
-                provider: "totally-invalid-provider".to_string(),
-                model: "model".to_string(),
+                provider: "ollama".into(),
+                model: "llama3".into(),
                 system_prompt: None,
                 api_key: None,
                 temperature: None,
@@ -1393,101 +1588,234 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: Some(0),
+                agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
-
-        let tool = DelegateTool::new(agents, None, test_security());
-        let result = tool
-            .execute(json!({
-                "agent": "broken",
-                "prompt": "Investigate failing integration test",
-                "context": "CI logs attached"
-            }))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Failed to create provider"));
-
-        let bus = tool
-            .coordination_bus_snapshot()
-            .expect("coordination bus should be initialized");
-
-        let worker_messages = bus
-            .drain_for_agent("broken", 0)
-            .expect("worker inbox should exist");
-        assert_eq!(worker_messages.len(), 1);
-        let correlation_id = worker_messages[0]
-            .envelope
-            .correlation_id
-            .clone()
-            .expect("request should have correlation id");
-
-        let lead_messages = bus
-            .drain_for_agent(DEFAULT_COORDINATION_LEAD_AGENT, 0)
-            .expect("lead inbox should exist");
-        assert_eq!(lead_messages.len(), 3);
+        let err = config.validate().unwrap_err();
         assert!(
-            lead_messages.iter().any(|entry| matches!(
-                entry.envelope.payload,
-                CoordinationPayload::TaskResult { success: false, .. }
-            )),
-            "lead inbox should contain failed task result event"
+            format!("{err}").contains("timeout_secs must be greater than 0"),
+            "unexpected error: {err}"
         );
-
-        let state_key = format!("delegate/{correlation_id}/state");
-        let state_entry = bus
-            .context_entry(&state_key)
-            .expect("state context should exist");
-        assert_eq!(state_entry.version, 2);
-        assert_eq!(state_entry.value["phase"], json!("failed"));
-        assert_eq!(state_entry.value["success"], json!(false));
     }
 
     #[test]
-    fn coordination_trace_transitions_state_to_completed() {
-        let mut agents = HashMap::new();
-        agents.insert(
-            "tester".to_string(),
+    fn config_validation_rejects_zero_agentic_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
             DelegateAgentConfig {
-                provider: "openrouter".to_string(),
-                model: "model-test".to_string(),
+                provider: "ollama".into(),
+                model: "llama3".into(),
                 system_prompt: None,
-                api_key: Some("delegate-test-credential".to_string()),
-                temperature: Some(0.2),
-                max_depth: 2,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: Some(0),
+                skills_directory: None,
             },
         );
-        let tool = DelegateTool::new(agents, None, test_security());
-        let agent_config = tool
-            .agents
-            .get("tester")
-            .expect("tester config should exist");
-
-        let trace = tool.start_coordination_trace(
-            "tester",
-            "Summarize findings",
-            "runbook notes",
-            agent_config,
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("agentic_timeout_secs must be greater than 0"),
+            "unexpected error: {err}"
         );
-        tool.finish_coordination_trace("tester", &trace, true, "done");
+    }
 
-        let bus = tool
-            .coordination_bus_snapshot()
-            .expect("coordination bus should be initialized");
-        let state_key = format!("delegate/{}/state", trace.correlation_id);
-        let state_entry = bus
-            .context_entry(&state_key)
-            .expect("state context should exist");
+    #[test]
+    fn config_validation_rejects_excessive_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: Some(7200),
+                agentic_timeout_secs: None,
+                skills_directory: None,
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds max 3600"),
+            "unexpected error: {err}"
+        );
+    }
 
-        assert_eq!(state_entry.version, 2);
-        assert_eq!(state_entry.value["phase"], json!("completed"));
-        assert_eq!(state_entry.value["success"], json!(true));
+    #[test]
+    fn config_validation_rejects_excessive_agentic_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "bad".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: Some(5000),
+                skills_directory: None,
+            },
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("exceeds max 3600"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_validation_accepts_max_boundary_timeout() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "ok".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: Some(3600),
+                agentic_timeout_secs: Some(3600),
+                skills_directory: None,
+            },
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_validation_accepts_none_timeouts() {
+        let mut config = crate::config::Config::default();
+        config.agents.insert(
+            "ok".into(),
+            DelegateAgentConfig {
+                provider: "ollama".into(),
+                model: "llama3".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
+            },
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn enriched_prompt_loads_skills_from_scoped_directory() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_skills_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let scoped_skills_dir = workspace.join("skills/code-review");
+        std::fs::create_dir_all(scoped_skills_dir.join("lint-check")).unwrap();
+        std::fs::write(
+            scoped_skills_dir.join("lint-check/SKILL.toml"),
+            "[skill]\nname = \"lint-check\"\ndescription = \"Run lint checks\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: Some("skills/code-review".to_string()),
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("lint-check"),
+            "should contain skills from scoped directory"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_falls_back_to_default_skills_dir() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_fallback_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let default_skills_dir = workspace.join("skills");
+        std::fs::create_dir_all(default_skills_dir.join("deploy")).unwrap();
+        std::fs::write(
+            default_skills_dir.join("deploy/SKILL.toml"),
+            "[skill]\nname = \"deploy\"\ndescription = \"Deploy safely\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("deploy"),
+            "should contain skills from default workspace skills/ directory"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }

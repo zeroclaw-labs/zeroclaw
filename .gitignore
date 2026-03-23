@@ -1,5 +1,8 @@
 /target
+/target-*/
 firmware/*/target
+web/dist/*
+!web/dist/.gitkeep
 *.db
 *.db-journal
 .DS_Store
@@ -8,11 +11,6 @@ firmware/*/target
 __pycache__/
 *.pyc
 docker-compose.override.yml
-site/node_modules/
-site/.vite/
-site/public/docs-content/
-gh-pages/
-.idea
 
 # Environment files (may contain secrets)
 .env
@@ -34,6 +32,20 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+.zeroclaw/*
 
-# Nix
-result
+# Skill eval workspaces (test outputs, transcripts, grading)
+.claude/skills/*-workspace/
+
+# Local state backups
+.local-state-backups/
+*.local-state-backup/
+
+# Coverage artifacts
+lcov.info
+
+# IDE's stuff
+.idea
+
+# Wrangler cache
+.wrangler/

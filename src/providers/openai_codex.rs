@@ -4,6 +4,7 @@ use crate::multimodal;
 use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use crate::providers::ProviderRuntimeOptions;
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,7 +22,7 @@ pub struct OpenAiCodexProvider {
     responses_url: String,
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
-    reasoning_level: Option<String>,
+    reasoning_effort: Option<String>,
     client: Client,
 }
 
@@ -105,13 +106,10 @@ impl OpenAiCodexProvider {
             custom_endpoint: !is_default_responses_url(&responses_url),
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
-            reasoning_level: normalize_reasoning_level(
-                options.reasoning_level.as_deref(),
-                "provider.reasoning_level",
-            ),
+            reasoning_effort: options.reasoning_effort.clone(),
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         })
@@ -308,35 +306,13 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     effort.to_string()
 }
 
-fn normalize_reasoning_level(raw: Option<&str>, source: &str) -> Option<String> {
-    let value = raw?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let normalized = value.to_ascii_lowercase().replace(['-', '_'], "");
-    match normalized.as_str() {
-        "minimal" | "low" | "medium" | "high" | "xhigh" => Some(normalized),
-        _ => {
-            tracing::warn!(
-                reasoning_level = %value,
-                source,
-                "Ignoring invalid reasoning level override"
-            );
-            None
-        }
-    }
-}
-
-fn resolve_reasoning_effort(model_id: &str, override_level: Option<&str>) -> String {
-    let override_level = normalize_reasoning_level(override_level, "provider.reasoning_level");
-    let env_level = std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
-        .ok()
-        .and_then(|value| {
-            normalize_reasoning_level(Some(&value), "ZEROCLAW_CODEX_REASONING_EFFORT")
-        });
-    let raw = override_level
-        .or(env_level)
-        .unwrap_or_else(|| "xhigh".to_string());
+fn resolve_reasoning_effort(model_id: &str, configured: Option<&str>) -> String {
+    let raw = configured
+        .map(ToString::to_string)
+        .or_else(|| std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT").ok())
+        .and_then(|value| first_nonempty(Some(&value)))
+        .unwrap_or_else(|| "xhigh".to_string())
+        .to_ascii_lowercase();
     clamp_reasoning_effort(model_id, &raw)
 }
 
@@ -500,8 +476,99 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
+fn append_utf8_stream_chunk(
+    body: &mut String,
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+) -> anyhow::Result<()> {
+    if pending.is_empty() {
+        if let Ok(text) = std::str::from_utf8(chunk) {
+            body.push_str(text);
+            return Ok(());
+        }
+    }
+
+    if !chunk.is_empty() {
+        pending.extend_from_slice(chunk);
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            body.push_str(text);
+            pending.clear();
+            Ok(())
+        }
+        Err(err) => {
+            let valid_up_to = err.valid_up_to();
+            if valid_up_to > 0 {
+                // SAFETY: `valid_up_to` always points to the end of a valid UTF-8 prefix.
+                let prefix = std::str::from_utf8(&pending[..valid_up_to])
+                    .expect("valid UTF-8 prefix from Utf8Error::valid_up_to");
+                body.push_str(prefix);
+                pending.drain(..valid_up_to);
+            }
+
+            if err.error_len().is_some() {
+                return Err(anyhow::anyhow!(
+                    "OpenAI Codex response contained invalid UTF-8: {err}"
+                ));
+            }
+
+            // `error_len == None` means we have a valid prefix and an incomplete
+            // multi-byte sequence at the end; keep it buffered until next chunk.
+            Ok(())
+        }
+    }
+}
+
+fn decode_utf8_stream_chunks<'a, I>(chunks: I) -> anyhow::Result<String>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut body = String::new();
+    let mut pending = Vec::new();
+
+    for chunk in chunks {
+        append_utf8_stream_chunk(&mut body, &mut pending, chunk)?;
+    }
+
+    if !pending.is_empty() {
+        let err = std::str::from_utf8(&pending).expect_err("pending bytes should be invalid UTF-8");
+        return Err(anyhow::anyhow!(
+            "OpenAI Codex response ended with incomplete UTF-8: {err}"
+        ));
+    }
+
+    Ok(body)
+}
+
+/// Read the response body incrementally via `bytes_stream()` to avoid
+/// buffering the entire SSE payload in memory.  The previous implementation
+/// used `response.text().await?` which holds the HTTP connection open until
+/// every byte has arrived — on high-latency links the long-lived connection
+/// often drops mid-read, producing the "error decoding response body" failure
+/// reported in #3544.
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
-    let body = response.text().await?;
+    let mut body = String::new();
+    let mut pending_utf8 = Vec::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk
+            .map_err(|err| anyhow::anyhow!("error reading OpenAI Codex response stream: {err}"))?;
+        append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes)?;
+    }
+
+    if !pending_utf8.is_empty() {
+        let err = std::str::from_utf8(&pending_utf8)
+            .expect_err("pending bytes should be invalid UTF-8 at end of stream");
+        return Err(anyhow::anyhow!(
+            "OpenAI Codex response ended with incomplete UTF-8: {err}"
+        ));
+    }
 
     if let Some(text) = parse_sse_text(&body)? {
         return Ok(text);
@@ -599,7 +666,10 @@ impl OpenAiCodexProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model, self.reasoning_level.as_deref()),
+                effort: resolve_reasoning_effort(
+                    normalized_model,
+                    self.reasoning_effort.as_deref(),
+                ),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
@@ -651,6 +721,7 @@ impl Provider for OpenAiCodexProvider {
         ProviderCapabilities {
             native_tool_calling: false,
             vision: true,
+            prompt_caching: false,
         }
     }
 
@@ -696,7 +767,12 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
+
+    /// Mutex that serializes all tests which mutate process-global env vars
+    /// (`std::env::set_var` / `remove_var`).  Each such test must hold this
+    /// lock for its entire duration so that parallel test threads don't race.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     struct EnvGuard {
         key: &'static str,
@@ -722,13 +798,6 @@ mod tests {
                 std::env::remove_var(self.key);
             }
         }
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
     }
 
     #[test]
@@ -778,7 +847,7 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_prefers_explicit_endpoint_env() {
-        let _env_lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _endpoint_guard = EnvGuard::set(
             CODEX_RESPONSES_URL_ENV,
             Some("https://env.example.com/v1/responses"),
@@ -794,7 +863,7 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_uses_provider_api_url_override() {
-        let _env_lock = env_lock();
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
         let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
 
@@ -822,10 +891,6 @@ mod tests {
 
     #[test]
     fn constructor_enables_custom_endpoint_key_mode() {
-        let _env_lock = env_lock();
-        let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
-        let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
-
         let options = ProviderRuntimeOptions {
             provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
             ..ProviderRuntimeOptions::default()
@@ -901,24 +966,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_reasoning_effort_prefers_config_override() {
-        let _env_lock = env_lock();
-        let _reasoning_guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("low"));
-
+    fn resolve_reasoning_effort_prefers_configured_override() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("low"));
         assert_eq!(
-            resolve_reasoning_effort("gpt-5-codex", Some("xhigh")),
+            resolve_reasoning_effort("gpt-5-codex", Some("high")),
             "high".to_string()
         );
     }
 
     #[test]
-    fn resolve_reasoning_effort_falls_back_to_env_when_override_invalid() {
-        let _env_lock = env_lock();
-        let _reasoning_guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("medium"));
-
+    fn resolve_reasoning_effort_uses_legacy_env_when_unconfigured() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("minimal"));
         assert_eq!(
-            resolve_reasoning_effort("gpt-5-codex", Some("banana")),
-            "medium".to_string()
+            resolve_reasoning_effort("gpt-5-codex", None),
+            "low".to_string()
         );
     }
 
@@ -945,6 +1008,21 @@ data: [DONE]
 "#;
 
         assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn decode_utf8_stream_chunks_handles_multibyte_split_across_chunks() {
+        let payload =
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello 世\"}\n\ndata: [DONE]\n";
+        let bytes = payload.as_bytes();
+        let split_at = payload.find('世').unwrap() + 1;
+
+        let decoded = decode_utf8_stream_chunks([&bytes[..split_at], &bytes[split_at..]]).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            parse_sse_text(&decoded).unwrap().as_deref(),
+            Some("Hello 世")
+        );
     }
 
     #[test]
@@ -1081,10 +1159,10 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
-            reasoning_level: None,
-            custom_provider_api_mode: None,
-            max_tokens_override: None,
-            model_support_vision: None,
+            reasoning_effort: None,
+            provider_timeout_secs: None,
+            extra_headers: std::collections::HashMap::new(),
+            api_path: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

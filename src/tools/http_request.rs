@@ -1,8 +1,4 @@
 use super::traits::{Tool, ToolResult};
-use super::url_validation::{
-    normalize_allowed_domains, validate_url, DomainPolicy, UrlSchemePolicy,
-};
-use crate::config::UrlAccessConfig;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -14,45 +10,60 @@ use std::time::Duration;
 pub struct HttpRequestTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
-    url_access: UrlAccessConfig,
     max_response_size: usize,
     timeout_secs: u64,
-    user_agent: String,
+    allow_private_hosts: bool,
 }
 
 impl HttpRequestTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
-        url_access: UrlAccessConfig,
         max_response_size: usize,
         timeout_secs: u64,
-        user_agent: String,
+        allow_private_hosts: bool,
     ) -> Self {
         Self {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
-            url_access,
             max_response_size,
             timeout_secs,
-            user_agent,
+            allow_private_hosts,
         }
     }
 
     fn validate_url(&self, raw_url: &str) -> anyhow::Result<String> {
-        validate_url(
-            raw_url,
-            &DomainPolicy {
-                allowed_domains: &self.allowed_domains,
-                blocked_domains: &[],
-                allowed_field_name: "http_request.allowed_domains",
-                blocked_field_name: None,
-                empty_allowed_message: "HTTP request tool is enabled but no allowed_domains are configured. Add [http_request].allowed_domains in config.toml",
-                scheme_policy: UrlSchemePolicy::HttpOrHttps,
-                ipv6_error_context: "http_request",
-                url_access: Some(&self.url_access),
-            },
-        )
+        let url = raw_url.trim();
+
+        if url.is_empty() {
+            anyhow::bail!("URL cannot be empty");
+        }
+
+        if url.chars().any(char::is_whitespace) {
+            anyhow::bail!("URL cannot contain whitespace");
+        }
+
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            anyhow::bail!("Only http:// and https:// URLs are allowed");
+        }
+
+        if self.allowed_domains.is_empty() {
+            anyhow::bail!(
+                "HTTP request tool is enabled but no allowed_domains are configured. Add [http_request].allowed_domains in config.toml"
+            );
+        }
+
+        let host = extract_host(url)?;
+
+        if !self.allow_private_hosts && is_private_or_local_host(&host) {
+            anyhow::bail!("Blocked local/private host: {host}");
+        }
+
+        if !host_matches_allowlist(&host, &self.allowed_domains) {
+            anyhow::bail!("Host '{host}' is not in http_request.allowed_domains");
+        }
+
+        Ok(url.to_string())
     }
 
     fn validate_method(&self, method: &str) -> anyhow::Result<reqwest::Method> {
@@ -115,8 +126,7 @@ impl HttpRequestTool {
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .user_agent(self.user_agent.as_str());
+            .redirect(reqwest::redirect::Policy::none());
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
         let client = builder.build()?;
 
@@ -134,6 +144,10 @@ impl HttpRequestTool {
     }
 
     fn truncate_response(&self, text: &str) -> String {
+        // 0 means unlimited — no truncation.
+        if self.max_response_size == 0 {
+            return text.to_string();
+        }
         if text.len() > self.max_response_size {
             let mut truncated = text
                 .chars()
@@ -290,13 +304,166 @@ impl Tool for HttpRequestTool {
     }
 }
 
+// Helper functions similar to browser_open.rs
+
+fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
+    let mut normalized = domains
+        .into_iter()
+        .filter_map(|d| normalize_domain(&d))
+        .collect::<Vec<_>>();
+    normalized.sort_unstable();
+    normalized.dedup();
+    normalized
+}
+
+fn normalize_domain(raw: &str) -> Option<String> {
+    let mut d = raw.trim().to_lowercase();
+    if d.is_empty() {
+        return None;
+    }
+
+    if let Some(stripped) = d.strip_prefix("https://") {
+        d = stripped.to_string();
+    } else if let Some(stripped) = d.strip_prefix("http://") {
+        d = stripped.to_string();
+    }
+
+    if let Some((host, _)) = d.split_once('/') {
+        d = host.to_string();
+    }
+
+    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
+
+    if let Some((host, _)) = d.split_once(':') {
+        d = host.to_string();
+    }
+
+    if d.is_empty() || d.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    Some(d)
+}
+
+fn extract_host(url: &str) -> anyhow::Result<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| anyhow::anyhow!("Only http:// and https:// URLs are allowed"))?;
+
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Invalid URL"))?;
+
+    if authority.is_empty() {
+        anyhow::bail!("URL must include a host");
+    }
+
+    if authority.contains('@') {
+        anyhow::bail!("URL userinfo is not allowed");
+    }
+
+    if authority.starts_with('[') {
+        anyhow::bail!("IPv6 hosts are not supported in http_request");
+    }
+
+    let host = authority
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('.')
+        .to_lowercase();
+
+    if host.is_empty() {
+        anyhow::bail!("URL must include a valid host");
+    }
+
+    Ok(host)
+}
+
+fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
+    if allowed_domains.iter().any(|domain| domain == "*") {
+        return true;
+    }
+
+    allowed_domains.iter().any(|domain| {
+        host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn is_private_or_local_host(host: &str) -> bool {
+    // Strip brackets from IPv6 addresses like [::1]
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    let has_local_tld = bare
+        .rsplit('.')
+        .next()
+        .is_some_and(|label| label == "local");
+
+    if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
+        return true;
+    }
+
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
+        };
+    }
+
+    false
+}
+
+/// Returns true if the IPv4 address is not globally routable.
+fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    v4.is_loopback()                       // 127.0.0.0/8
+        || v4.is_private()                 // 10/8, 172.16/12, 192.168/16
+        || v4.is_link_local()              // 169.254.0.0/16
+        || v4.is_unspecified()             // 0.0.0.0
+        || v4.is_broadcast()              // 255.255.255.255
+        || v4.is_multicast()              // 224.0.0.0/4
+        || (a == 100 && (64..=127).contains(&b)) // Shared address space (RFC 6598)
+        || a >= 240                        // Reserved (240.0.0.0/4, except broadcast)
+        || (a == 192 && b == 0 && (c == 0 || c == 2)) // IETF assignments + TEST-NET-1
+        || (a == 198 && b == 51)           // Documentation (198.51.100.0/24)
+        || (a == 203 && b == 0)            // Documentation (203.0.113.0/24)
+        || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
+}
+
+/// Returns true if the IPv6 address is not globally routable.
+fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
+    let segs = v6.segments();
+    v6.is_loopback()                       // ::1
+        || v6.is_unspecified()             // ::
+        || v6.is_multicast()              // ff00::/8
+        || (segs[0] & 0xfe00) == 0xfc00   // Unique-local (fc00::/7)
+        || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
+        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
+        || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use crate::tools::url_validation::{is_private_or_local_host, normalize_domain};
 
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
+        test_tool_with_private(allowed_domains, false)
+    }
+
+    fn test_tool_with_private(
+        allowed_domains: Vec<&str>,
+        allow_private_hosts: bool,
+    ) -> HttpRequestTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -304,10 +471,9 @@ mod tests {
         HttpRequestTool::new(
             security,
             allowed_domains.into_iter().map(String::from).collect(),
-            UrlAccessConfig::default(),
             1_000_000,
             30,
-            "test".to_string(),
+            allow_private_hosts,
         )
     }
 
@@ -363,14 +529,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_wildcard_subdomain_pattern() {
-        let tool = test_tool(vec!["*.example.com"]);
-        assert!(tool.validate_url("https://example.com").is_ok());
-        assert!(tool.validate_url("https://sub.example.com").is_ok());
-        assert!(tool.validate_url("https://other.com").is_err());
-    }
-
-    #[test]
     fn validate_rejects_allowlist_miss() {
         let tool = test_tool(vec!["example.com"]);
         let err = tool
@@ -423,14 +581,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(
-            security,
-            vec![],
-            UrlAccessConfig::default(),
-            1_000_000,
-            30,
-            "test".to_string(),
-        );
+        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false);
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -546,14 +697,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(
-            security,
-            vec!["example.com".into()],
-            UrlAccessConfig::default(),
-            1_000_000,
-            30,
-            "test".to_string(),
-        );
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -568,14 +712,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(
-            security,
-            vec!["example.com".into()],
-            UrlAccessConfig::default(),
-            1_000_000,
-            30,
-            "test".to_string(),
-        );
+        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -596,14 +733,41 @@ mod tests {
         let tool = HttpRequestTool::new(
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
-            UrlAccessConfig::default(),
             10,
             30,
-            "test".to_string(),
+            false,
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
         assert!(truncated.len() <= 10 + 60); // limit + message
+        assert!(truncated.contains("[Response truncated"));
+    }
+
+    #[test]
+    fn truncate_response_zero_means_unlimited() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            0, // max_response_size = 0 means no limit
+            30,
+            false,
+        );
+        let text = "a".repeat(10_000_000);
+        assert_eq!(tool.truncate_response(&text), text);
+    }
+
+    #[test]
+    fn truncate_response_nonzero_still_truncates() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            5,
+            30,
+            false,
+        );
+        let text = "hello world";
+        let truncated = tool.truncate_response(text);
+        assert!(truncated.starts_with("hello"));
         assert!(truncated.contains("[Response truncated"));
     }
 
@@ -784,5 +948,71 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("IPv6"));
+    }
+
+    // ── allow_private_hosts opt-in tests ────────────────────────
+
+    #[test]
+    fn default_blocks_private_hosts() {
+        let tool = test_tool(vec!["localhost", "192.168.1.5", "*"]);
+        assert!(tool
+            .validate_url("https://localhost:8080")
+            .unwrap_err()
+            .to_string()
+            .contains("local/private"));
+        assert!(tool
+            .validate_url("https://192.168.1.5")
+            .unwrap_err()
+            .to_string()
+            .contains("local/private"));
+        assert!(tool
+            .validate_url("https://10.0.0.1")
+            .unwrap_err()
+            .to_string()
+            .contains("local/private"));
+    }
+
+    #[test]
+    fn allow_private_hosts_permits_localhost() {
+        let tool = test_tool_with_private(vec!["localhost"], true);
+        assert!(tool.validate_url("https://localhost:8080").is_ok());
+    }
+
+    #[test]
+    fn allow_private_hosts_permits_private_ipv4() {
+        let tool = test_tool_with_private(vec!["192.168.1.5"], true);
+        assert!(tool.validate_url("https://192.168.1.5").is_ok());
+    }
+
+    #[test]
+    fn allow_private_hosts_permits_rfc1918_with_wildcard() {
+        let tool = test_tool_with_private(vec!["*"], true);
+        assert!(tool.validate_url("https://10.0.0.1").is_ok());
+        assert!(tool.validate_url("https://172.16.0.1").is_ok());
+        assert!(tool.validate_url("https://192.168.1.1").is_ok());
+        assert!(tool.validate_url("http://localhost:8123").is_ok());
+    }
+
+    #[test]
+    fn allow_private_hosts_still_requires_allowlist() {
+        let tool = test_tool_with_private(vec!["example.com"], true);
+        let err = tool
+            .validate_url("https://192.168.1.5")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("allowed_domains"),
+            "Private host should still need allowlist match, got: {err}"
+        );
+    }
+
+    #[test]
+    fn allow_private_hosts_false_still_blocks() {
+        let tool = test_tool_with_private(vec!["*"], false);
+        assert!(tool
+            .validate_url("https://localhost:8080")
+            .unwrap_err()
+            .to_string()
+            .contains("local/private"));
     }
 }

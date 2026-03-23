@@ -1,0 +1,73 @@
+{
+  "version": "0.2.0",
+  "inputs": [
+    {
+      "id": "testName",
+      "description": "Exact test name to debug (e.g. tests::my_test)",
+      "type": "promptString",
+      "default": ""
+    }
+  ],
+  "configurations": [
+    // ── Runtime ───────────────────────────────────────────
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: Agent",
+      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "args": ["agent"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build: Debug"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: Gateway",
+      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "args": ["gateway"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build: Debug"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: Daemon",
+      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "args": ["daemon"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build: Debug"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: Status",
+      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "args": ["status"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build: Debug"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: Onboard",
+      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "args": ["onboard"],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build: Debug"
+    },
+    // ── Test ──────────────────────────────────────────────
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug: Test (by name)",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib", "--"],
+        "filter": {
+          "kind": "lib"
+        }
+      },
+      "args": ["--exact", "${input:testName}", "--nocapture"],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

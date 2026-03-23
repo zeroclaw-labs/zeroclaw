@@ -1,11 +1,11 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
 use serde_json::json;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -17,9 +17,12 @@ pub struct DiscordChannel {
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
-    group_reply_allowed_sender_ids: Vec<String>,
-    workspace_dir: Option<PathBuf>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
+    /// Voice transcription config — when set, audio attachments are
+    /// downloaded, transcribed, and their text inlined into the message.
+    transcription: Option<crate::config::TranscriptionConfig>,
 }
 
 impl DiscordChannel {
@@ -36,26 +39,28 @@ impl DiscordChannel {
             allowed_users,
             listen_to_bots,
             mention_only,
-            group_reply_allowed_sender_ids: Vec::new(),
-            workspace_dir: None,
             typing_handles: Mutex::new(HashMap::new()),
+            proxy_url: None,
+            transcription: None,
         }
     }
 
-    /// Configure sender IDs that bypass mention gating in guild channels.
-    pub fn with_group_reply_allowed_senders(mut self, sender_ids: Vec<String>) -> Self {
-        self.group_reply_allowed_sender_ids = normalize_group_reply_allowed_sender_ids(sender_ids);
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
         self
     }
 
-    /// Configure workspace directory used for validating local attachment paths.
-    pub fn with_workspace_dir(mut self, dir: PathBuf) -> Self {
-        self.workspace_dir = Some(dir);
+    /// Configure voice transcription for audio attachments.
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if config.enabled {
+            self.transcription = Some(config);
+        }
         self
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.discord")
+        crate::config::build_channel_proxy_client("channel.discord", self.proxy_url.as_deref())
     }
 
     /// Check if a Discord user ID is in the allowlist.
@@ -65,76 +70,18 @@ impl DiscordChannel {
         self.allowed_users.iter().any(|u| u == "*" || u == user_id)
     }
 
-    fn is_group_sender_trigger_enabled(&self, sender_id: &str) -> bool {
-        let sender_id = sender_id.trim();
-        if sender_id.is_empty() {
-            return false;
-        }
-        self.group_reply_allowed_sender_ids
-            .iter()
-            .any(|entry| entry == "*" || entry == sender_id)
-    }
-
     fn bot_user_id_from_token(token: &str) -> Option<String> {
         // Discord bot tokens are base64(bot_user_id).timestamp.hmac
         let part = token.split('.').next()?;
         base64_decode(part)
     }
-
-    fn resolve_local_attachment_path(&self, target: &str) -> anyhow::Result<PathBuf> {
-        let workspace = self.workspace_dir.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("workspace_dir is not configured; local file attachments are disabled")
-        })?;
-        let workspace_root = workspace
-            .canonicalize()
-            .unwrap_or_else(|_| workspace.to_path_buf());
-
-        let target_path = if let Some(rel) = target.strip_prefix("/workspace/") {
-            workspace.join(rel)
-        } else if target == "/workspace" {
-            workspace.to_path_buf()
-        } else {
-            let path = Path::new(target);
-            if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                workspace.join(path)
-            }
-        };
-
-        let resolved = target_path
-            .canonicalize()
-            .with_context(|| format!("attachment path not found: {target}"))?;
-
-        if !resolved.starts_with(&workspace_root) {
-            anyhow::bail!("attachment path escapes workspace: {target}");
-        }
-
-        if !resolved.is_file() {
-            anyhow::bail!("attachment path is not a file: {}", resolved.display());
-        }
-
-        Ok(resolved)
-    }
-}
-
-fn normalize_group_reply_allowed_sender_ids(sender_ids: Vec<String>) -> Vec<String> {
-    let mut normalized = sender_ids
-        .into_iter()
-        .map(|entry| entry.trim().to_string())
-        .filter(|entry| !entry.is_empty())
-        .collect::<Vec<_>>();
-    normalized.sort();
-    normalized.dedup();
-    normalized
 }
 
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// `text/*` MIME types are fetched and inlined, while `image/*` MIME types are
-/// forwarded as `[IMAGE:<url>]` markers. Other types are skipped. Fetch errors
-/// are logged as warnings.
+/// Only `text/*` MIME types are fetched and inlined. All other types are
+/// silently skipped. Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -167,8 +114,6 @@ async fn process_attachments(
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
                 }
             }
-        } else if ct.starts_with("image/") {
-            parts.push(format!("[IMAGE:{url}]"));
         } else {
             tracing::debug!(
                 name,
@@ -178,6 +123,88 @@ async fn process_attachments(
         }
     }
     parts.join("\n---\n")
+}
+
+/// Audio file extensions accepted for voice transcription.
+const DISCORD_AUDIO_EXTENSIONS: &[&str] = &[
+    "flac", "mp3", "mpeg", "mpga", "mp4", "m4a", "ogg", "oga", "opus", "wav", "webm",
+];
+
+/// Check if a content type or filename indicates an audio file.
+fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
+    if content_type.starts_with("audio/") {
+        return true;
+    }
+    if let Some(ext) = filename.rsplit('.').next() {
+        return DISCORD_AUDIO_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str());
+    }
+    false
+}
+
+/// Download and transcribe audio attachments from a Discord message.
+///
+/// Returns transcribed text blocks for any audio attachments found.
+/// Non-audio attachments and failures are silently skipped.
+async fn transcribe_discord_audio_attachments(
+    attachments: &[serde_json::Value],
+    client: &reqwest::Client,
+    config: &crate::config::TranscriptionConfig,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for att in attachments {
+        let ct = att
+            .get("content_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let name = att
+            .get("filename")
+            .and_then(|v| v.as_str())
+            .unwrap_or("file");
+
+        if !is_discord_audio_attachment(ct, name) {
+            continue;
+        }
+
+        let Some(url) = att.get("url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let audio_data = match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(bytes) => bytes.to_vec(),
+                Err(e) => {
+                    tracing::warn!(name, error = %e, "discord: failed to read audio attachment bytes");
+                    continue;
+                }
+            },
+            Ok(resp) => {
+                tracing::warn!(name, status = %resp.status(), "discord: audio attachment download failed");
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(name, error = %e, "discord: audio attachment fetch error");
+                continue;
+            }
+        };
+
+        match super::transcription::transcribe_audio(audio_data, name, config).await {
+            Ok(text) => {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    tracing::info!(
+                        "Discord: transcribed audio attachment {} ({} chars)",
+                        name,
+                        trimmed.len()
+                    );
+                    parts.push(format!("[Voice] {trimmed}"));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(name, error = %e, "discord: voice transcription failed");
+            }
+        }
+    }
+    parts.join("\n")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,10 +292,10 @@ fn parse_attachment_markers(message: &str) -> (String, Vec<DiscordAttachment>) {
 
 fn classify_outgoing_attachments(
     attachments: &[DiscordAttachment],
-) -> (Vec<DiscordAttachment>, Vec<String>, Vec<String>) {
+) -> (Vec<PathBuf>, Vec<String>, Vec<String>) {
     let mut local_files = Vec::new();
     let mut remote_urls = Vec::new();
-    let unresolved_markers = Vec::new();
+    let mut unresolved_markers = Vec::new();
 
     for attachment in attachments {
         let target = attachment.target.trim();
@@ -277,7 +304,13 @@ fn classify_outgoing_attachments(
             continue;
         }
 
-        local_files.push(attachment.clone());
+        let path = Path::new(target);
+        if path.exists() && path.is_file() {
+            local_files.push(path.to_path_buf());
+            continue;
+        }
+
+        unresolved_markers.push(format!("[{}:{}]", attachment.kind.marker_name(), target));
     }
 
     (local_files, remote_urls, unresolved_markers)
@@ -323,8 +356,7 @@ async fn send_discord_message_json(
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        let sanitized = crate::providers::sanitize_api_error(&err);
-        anyhow::bail!("Discord send message failed ({status}): {sanitized}");
+        anyhow::bail!("Discord send message failed ({status}): {err}");
     }
 
     Ok(())
@@ -372,8 +404,7 @@ async fn send_discord_message_with_files(
             .text()
             .await
             .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-        let sanitized = crate::providers::sanitize_api_error(&err);
-        anyhow::bail!("Discord send message with files failed ({status}): {sanitized}");
+        anyhow::bail!("Discord send message with files failed ({status}): {err}");
     }
 
     Ok(())
@@ -435,7 +466,6 @@ fn split_message_for_discord(message: &str) -> Vec<String> {
     chunks
 }
 
-#[allow(clippy::cast_possible_truncation)]
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
     let upper = len as u64;
@@ -444,6 +474,7 @@ fn pick_uniform_index(len: usize) -> usize {
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
+            #[allow(clippy::cast_possible_truncation)]
             return (value % upper) as usize;
         }
     }
@@ -463,10 +494,9 @@ fn encode_emoji_for_discord(emoji: &str) -> String {
         return emoji.to_string();
     }
 
-    use std::fmt::Write as _;
     let mut encoded = String::new();
     for byte in emoji.as_bytes() {
-        write!(encoded, "%{byte:02X}").ok();
+        let _ = write!(encoded, "%{byte:02X}");
     }
     encoded
 }
@@ -490,19 +520,19 @@ fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
 
 fn normalize_incoming_content(
     content: &str,
-    require_mention: bool,
+    mention_only: bool,
     bot_user_id: &str,
 ) -> Option<String> {
     if content.is_empty() {
         return None;
     }
 
-    if require_mention && !contains_bot_mention(content, bot_user_id) {
+    if mention_only && !contains_bot_mention(content, bot_user_id) {
         return None;
     }
 
     let mut normalized = content.to_string();
-    if require_mention {
+    if mention_only {
         for tag in mention_tags(bot_user_id) {
             normalized = normalized.replace(&tag, " ");
         }
@@ -563,28 +593,8 @@ impl Channel for DiscordChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let raw_content = super::strip_tool_call_tags(&message.content);
         let (cleaned_content, parsed_attachments) = parse_attachment_markers(&raw_content);
-        let (local_attachment_targets, remote_urls, mut unresolved_markers) =
+        let (mut local_files, remote_urls, unresolved_markers) =
             classify_outgoing_attachments(&parsed_attachments);
-        let mut local_files = Vec::new();
-
-        for attachment in &local_attachment_targets {
-            let target = attachment.target.trim();
-            match self.resolve_local_attachment_path(target) {
-                Ok(path) => local_files.push(path),
-                Err(error) => {
-                    tracing::warn!(
-                        target,
-                        error = %error,
-                        "discord: local attachment rejected by workspace policy"
-                    );
-                    unresolved_markers.push(format!(
-                        "[{}:{}]",
-                        attachment.kind.marker_name(),
-                        target
-                    ));
-                }
-            }
-        }
 
         if !unresolved_markers.is_empty() {
             tracing::warn!(
@@ -715,7 +725,18 @@ impl Channel for DiscordChannel {
                 msg = read.next() => {
                     let msg = match msg {
                         Some(Ok(Message::Text(t))) => t,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if write.send(Message::Pong(payload)).await.is_err() {
+                                tracing::warn!("Discord: pong send failed, reconnecting");
+                                break;
+                            }
+                            continue;
+                        }
                         Some(Ok(Message::Close(_))) | None => break,
+                        Some(Err(e)) => {
+                            tracing::warn!("Discord: websocket read error: {e}, reconnecting");
+                            break;
+                        }
                         _ => continue,
                     };
 
@@ -793,13 +814,13 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let is_group_message = d.get("guild_id").is_some();
-                    let allow_sender_without_mention =
-                        is_group_message && self.is_group_sender_trigger_enabled(author_id);
-                    let require_mention =
-                        self.mention_only && is_group_message && !allow_sender_without_mention;
+                    // DMs carry no guild_id in the Discord gateway payload. They are
+                    // inherently private and implicitly addressed to the bot, so bypass
+                    // the mention gate — requiring a @mention in a DM is never correct.
+                    let is_dm = d.get("guild_id").is_none();
+                    let effective_mention_only = self.mention_only && !is_dm;
                     let Some(clean_content) =
-                        normalize_incoming_content(content, require_mention, &bot_user_id)
+                        normalize_incoming_content(content, effective_mention_only, &bot_user_id)
                     else {
                         continue;
                     };
@@ -810,7 +831,28 @@ impl Channel for DiscordChannel {
                             .and_then(|a| a.as_array())
                             .cloned()
                             .unwrap_or_default();
-                        process_attachments(&atts, &self.http_client()).await
+                        let client = self.http_client();
+                        let mut text_parts = process_attachments(&atts, &client).await;
+
+                        // Transcribe audio attachments when transcription is configured
+                        if let Some(ref transcription_config) = self.transcription {
+                            let voice_text = transcribe_discord_audio_attachments(
+                                &atts,
+                                &client,
+                                transcription_config,
+                            )
+                            .await;
+                            if !voice_text.is_empty() {
+                                if text_parts.is_empty() {
+                                    text_parts = voice_text;
+                                } else {
+                                    text_parts = format!("{text_parts}
+            {voice_text}");
+                                }
+                            }
+                        }
+
+                        text_parts
                     };
                     let final_content = if attachment_text.is_empty() {
                         clean_content
@@ -871,6 +913,7 @@ impl Channel for DiscordChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                        interruption_scope_id: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -948,8 +991,7 @@ impl Channel for DiscordChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-            let sanitized = crate::providers::sanitize_api_error(&err);
-            anyhow::bail!("Discord add reaction failed ({status}): {sanitized}");
+            anyhow::bail!("Discord add reaction failed ({status}): {err}");
         }
 
         Ok(())
@@ -976,8 +1018,7 @@ impl Channel for DiscordChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-            let sanitized = crate::providers::sanitize_api_error(&err);
-            anyhow::bail!("Discord remove reaction failed ({status}): {sanitized}");
+            anyhow::bail!("Discord remove reaction failed ({status}): {err}");
         }
 
         Ok(())
@@ -1116,26 +1157,39 @@ mod tests {
         assert!(cleaned.is_none());
     }
 
+    // mention_only DM-bypass tests
+
     #[test]
-    fn normalize_group_reply_allowed_sender_ids_trims_and_deduplicates() {
-        let normalized = normalize_group_reply_allowed_sender_ids(vec![
-            " 111 ".into(),
-            "111".into(),
-            String::new(),
-            "  ".into(),
-            "222".into(),
-        ]);
-        assert_eq!(normalized, vec!["111".to_string(), "222".to_string()]);
+    fn mention_only_dm_bypasses_mention_gate() {
+        // DMs (no guild_id) must pass through even when mention_only is true
+        // and the message contains no @mention. Mirrors the listen call-site logic.
+        let mention_only = true;
+        let is_dm = true;
+        let effective = mention_only && !is_dm;
+        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        assert_eq!(cleaned.as_deref(), Some("hello without mention"));
     }
 
     #[test]
-    fn group_reply_sender_override_matches_exact_and_wildcard() {
-        let ch = DiscordChannel::new("token".into(), None, vec!["*".into()], false, true)
-            .with_group_reply_allowed_senders(vec!["111".into(), "*".into()]);
+    fn mention_only_guild_message_without_mention_is_rejected() {
+        // Guild messages (has guild_id, so is_dm = false) must still be rejected
+        // when mention_only is true and the message contains no @mention.
+        let mention_only = true;
+        let is_dm = false;
+        let effective = mention_only && !is_dm;
+        let cleaned = normalize_incoming_content("hello without mention", effective, "12345");
+        assert!(cleaned.is_none());
+    }
 
-        assert!(ch.is_group_sender_trigger_enabled("111"));
-        assert!(ch.is_group_sender_trigger_enabled("anyone"));
-        assert!(!ch.is_group_sender_trigger_enabled(""));
+    #[test]
+    fn mention_only_guild_message_with_mention_passes_and_strips() {
+        // Guild messages that do carry a @mention pass through and have the
+        // mention tag stripped, consistent with pre-existing behaviour.
+        let mention_only = true;
+        let is_dm = false;
+        let effective = mention_only && !is_dm;
+        let cleaned = normalize_incoming_content("<@12345> run status", effective, "12345");
+        assert_eq!(cleaned.as_deref(), Some("run status"));
     }
 
     // Message splitting tests
@@ -1490,10 +1544,12 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::format_collect)]
     fn split_message_many_short_lines() {
         // Many short lines should be batched into chunks under the limit
-        let msg: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let msg: String = (0..500).fold(String::new(), |mut acc, i| {
+            let _ = writeln!(acc, "line {i}");
+            acc
+        });
         let parts = split_message_for_discord(&msg);
         for part in &parts {
             assert!(
@@ -1561,43 +1617,6 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[tokio::test]
-    async fn process_attachments_emits_single_image_marker() {
-        let client = reqwest::Client::new();
-        let attachments = vec![serde_json::json!({
-            "url": "https://cdn.discordapp.com/attachments/123/456/photo.png",
-            "filename": "photo.png",
-            "content_type": "image/png"
-        })];
-        let result = process_attachments(&attachments, &client).await;
-        assert_eq!(
-            result,
-            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/photo.png]"
-        );
-    }
-
-    #[tokio::test]
-    async fn process_attachments_emits_multiple_image_markers() {
-        let client = reqwest::Client::new();
-        let attachments = vec![
-            serde_json::json!({
-                "url": "https://cdn.discordapp.com/attachments/123/456/one.jpg",
-                "filename": "one.jpg",
-                "content_type": "image/jpeg"
-            }),
-            serde_json::json!({
-                "url": "https://cdn.discordapp.com/attachments/123/456/two.webp",
-                "filename": "two.webp",
-                "content_type": "image/webp"
-            }),
-        ];
-        let result = process_attachments(&attachments, &client).await;
-        assert_eq!(
-            result,
-            "[IMAGE:https://cdn.discordapp.com/attachments/123/456/one.jpg]\n---\n[IMAGE:https://cdn.discordapp.com/attachments/123/456/two.webp]"
-        );
-    }
-
     #[test]
     fn parse_attachment_markers_extracts_supported_markers() {
         let input = "Report\n[IMAGE:https://example.com/a.png]\n[DOCUMENT:/tmp/a.pdf]";
@@ -1642,11 +1661,13 @@ mod tests {
         ];
 
         let (locals, remotes, unresolved) = classify_outgoing_attachments(&attachments);
-        assert_eq!(locals.len(), 2);
-        assert_eq!(locals[0].target, file_path.to_string_lossy());
-        assert_eq!(locals[1].target, "/tmp/does-not-exist.mp4");
+        assert_eq!(locals.len(), 1);
+        assert_eq!(locals[0], file_path);
         assert_eq!(remotes, vec!["https://example.com/remote.png".to_string()]);
-        assert!(unresolved.is_empty());
+        assert_eq!(
+            unresolved,
+            vec!["[VIDEO:/tmp/does-not-exist.mp4]".to_string()]
+        );
     }
 
     #[test]
@@ -1660,38 +1681,5 @@ mod tests {
             rendered,
             "Done\nhttps://example.com/a.png\n[IMAGE:/tmp/missing.png]"
         );
-    }
-
-    #[test]
-    fn with_workspace_dir_sets_field() {
-        let channel = DiscordChannel::new("fake".into(), None, vec![], false, false)
-            .with_workspace_dir(PathBuf::from("/tmp/discord-workspace"));
-        assert_eq!(
-            channel.workspace_dir.as_deref(),
-            Some(Path::new("/tmp/discord-workspace"))
-        );
-    }
-
-    #[test]
-    fn resolve_local_attachment_path_blocks_workspace_escape() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let workspace = temp.path().join("workspace");
-        std::fs::create_dir_all(&workspace).expect("workspace should exist");
-
-        let outside = temp.path().join("outside.txt");
-        std::fs::write(&outside, b"secret").expect("fixture should be written");
-
-        let channel = DiscordChannel::new("fake".into(), None, vec![], false, false)
-            .with_workspace_dir(workspace.clone());
-
-        let allowed_path = workspace.join("ok.txt");
-        std::fs::write(&allowed_path, b"ok").expect("workspace fixture should be written");
-        let allowed = channel
-            .resolve_local_attachment_path("ok.txt")
-            .expect("workspace file should be allowed");
-        assert!(allowed.starts_with(workspace.canonicalize().unwrap_or(workspace)));
-
-        let escaped = channel.resolve_local_attachment_path(outside.to_string_lossy().as_ref());
-        assert!(escaped.is_err(), "path outside workspace must be rejected");
     }
 }

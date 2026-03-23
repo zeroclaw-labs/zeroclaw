@@ -35,11 +35,29 @@ export interface ToolSpec {
 export interface CronJob {
   id: string;
   name: string | null;
+  expression: string;
   command: string;
+  prompt: string | null;
+  job_type: string;
+  schedule: unknown;
+  enabled: boolean;
+  delivery: unknown;
+  delete_after_run: boolean;
+  created_at: string;
   next_run: string;
   last_run: string | null;
   last_status: string | null;
-  enabled: boolean;
+  last_output: string | null;
+}
+
+export interface CronRun {
+  id: number;
+  job_id: string;
+  started_at: string;
+  finished_at: string;
+  status: string;
+  output: string | null;
+  duration_ms: number | null;
 }
 
 export interface Integration {
@@ -47,34 +65,6 @@ export interface Integration {
   description: string;
   category: string;
   status: 'Available' | 'Active' | 'ComingSoon';
-}
-
-export interface IntegrationCredentialsField {
-  key: string;
-  label: string;
-  required: boolean;
-  has_value: boolean;
-  input_type: 'secret' | 'text' | 'select';
-  options: string[];
-  current_value?: string;
-  masked_value?: string;
-}
-
-export interface IntegrationSettingsEntry {
-  id: string;
-  name: string;
-  description: string;
-  category: string;
-  status: Integration['status'];
-  configured: boolean;
-  activates_default_provider: boolean;
-  fields: IntegrationCredentialsField[];
-}
-
-export interface IntegrationSettingsPayload {
-  revision: string;
-  active_default_provider_integration_id?: string;
-  integrations: IntegrationSettingsEntry[];
 }
 
 export interface DiagResult {

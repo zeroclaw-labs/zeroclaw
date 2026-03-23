@@ -1,7 +1,7 @@
 use super::traits::RuntimeAdapter;
 use std::path::{Path, PathBuf};
 
-/// Native runtime — full access, runs on Mac/Linux/Docker/Raspberry Pi
+/// Native runtime — full access, runs on Mac/Linux/Windows/Docker/Raspberry Pi
 pub struct NativeRuntime;
 
 impl NativeRuntime {
@@ -11,10 +11,6 @@ impl NativeRuntime {
 }
 
 impl RuntimeAdapter for NativeRuntime {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "native"
     }
@@ -43,9 +39,19 @@ impl RuntimeAdapter for NativeRuntime {
         command: &str,
         workspace_dir: &Path,
     ) -> anyhow::Result<tokio::process::Command> {
-        let mut process = tokio::process::Command::new("sh");
-        process.arg("-c").arg(command).current_dir(workspace_dir);
-        Ok(process)
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut process = tokio::process::Command::new("sh");
+            process.arg("-c").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let mut process = tokio::process::Command::new("cmd.exe");
+            process.arg("/C").arg(command).current_dir(workspace_dir);
+            Ok(process)
+        }
     }
 }
 

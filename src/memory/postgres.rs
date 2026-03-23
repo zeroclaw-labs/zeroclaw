@@ -6,65 +6,11 @@ use parking_lot::Mutex;
 use postgres::{Client, NoTls, Row};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
-
-/// A no-op TLS certificate verifier used for `tls = "require"` mode.
-///
-/// This accepts any server certificate without verification — equivalent to
-/// PostgreSQL's `sslmode=require`. Use `tls = "verify-full"` for production
-/// environments where cert authenticity matters.
-#[derive(Debug)]
-struct NoCertVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls_pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
-        _server_name: &rustls_pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls_pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls_pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls_pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
 
 /// PostgreSQL-backed persistent memory.
 ///
@@ -81,7 +27,6 @@ impl PostgresMemory {
         schema: &str,
         table: &str,
         connect_timeout_secs: Option<u64>,
-        tls_mode: bool,
     ) -> Result<Self> {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
@@ -93,7 +38,6 @@ impl PostgresMemory {
         let client = Self::initialize_client(
             db_url.to_string(),
             connect_timeout_secs,
-            tls_mode,
             schema_ident.clone(),
             qualified_table.clone(),
         )?;
@@ -107,7 +51,6 @@ impl PostgresMemory {
     fn initialize_client(
         db_url: String,
         connect_timeout_secs: Option<u64>,
-        tls_mode: bool,
         schema_ident: String,
         qualified_table: String,
     ) -> Result<Client> {
@@ -123,28 +66,9 @@ impl PostgresMemory {
                     config.connect_timeout(Duration::from_secs(bounded));
                 }
 
-                let mut client = if tls_mode {
-                    // TLS enabled: encrypt the connection but skip certificate
-                    // verification (suitable for self-signed certs and most
-                    // managed cloud databases whose CA is not in webpki-roots).
-                    let tls_config = rustls::ClientConfig::builder()
-                        .with_root_certificates(rustls::RootCertStore::empty())
-                        .with_no_client_auth();
-                    let tls_config = {
-                        let mut cfg = tls_config;
-                        cfg.dangerous()
-                            .set_certificate_verifier(std::sync::Arc::new(NoCertVerifier));
-                        cfg
-                    };
-                    let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
-                    config
-                        .connect(tls)
-                        .context("failed to connect to PostgreSQL memory backend (TLS)")?
-                } else {
-                    config
-                        .connect(NoTls)
-                        .context("failed to connect to PostgreSQL memory backend")?
-                };
+                let mut client = config
+                    .connect(NoTls)
+                    .context("failed to connect to PostgreSQL memory backend")?;
 
                 Self::init_schema(&mut client, &schema_ident, &qualified_table)?;
                 Ok(client)
@@ -176,6 +100,8 @@ impl PostgresMemory {
             CREATE INDEX IF NOT EXISTS idx_memories_category ON {qualified_table}(category);
             CREATE INDEX IF NOT EXISTS idx_memories_session_id ON {qualified_table}(session_id);
             CREATE INDEX IF NOT EXISTS idx_memories_updated_at ON {qualified_table}(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_memories_content_fts ON {qualified_table} USING gin(to_tsvector('simple', content));
+            CREATE INDEX IF NOT EXISTS idx_memories_key_fts ON {qualified_table} USING gin(to_tsvector('simple', key));
             "
         ))?;
 
@@ -211,8 +137,35 @@ impl PostgresMemory {
             timestamp: timestamp.to_rfc3339(),
             session_id: row.get(5),
             score: row.try_get(6).ok(),
+            namespace: "default".into(),
+            importance: None,
+            superseded_by: None,
         })
     }
+}
+
+/// Run a blocking closure on a plain OS thread to avoid nested Tokio runtime
+/// panics. The sync `postgres` crate internally calls `Runtime::block_on()`,
+/// which conflicts with `tokio::task::spawn_blocking` threads that are still
+/// associated with the Tokio runtime's blocking pool. Plain OS threads have no
+/// runtime context, so the nested `block_on` succeeds.
+async fn run_on_os_thread<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = oneshot::channel();
+
+    std::thread::Builder::new()
+        .name("postgres-memory-op".to_string())
+        .spawn(move || {
+            let result = f();
+            let _ = tx.send(result);
+        })
+        .context("failed to spawn PostgreSQL operation thread")?;
+
+    rx.await
+        .map_err(|_| anyhow::anyhow!("PostgreSQL operation thread terminated unexpectedly"))?
 }
 
 fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
@@ -262,7 +215,7 @@ impl Memory for PostgresMemory {
         let category = Self::category_to_str(&category);
         let sid = session_id.map(str::to_string);
 
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        run_on_os_thread(move || -> Result<()> {
             let now = Utc::now();
             let mut client = client.lock();
             let stmt = format!(
@@ -283,7 +236,7 @@ impl Memory for PostgresMemory {
             client.execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])?;
             Ok(())
         })
-        .await?
+        .await
     }
 
     async fn recall(
@@ -291,24 +244,45 @@ impl Memory for PostgresMemory {
         query: &str,
         limit: usize,
         session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let query = query.trim().to_string();
         let sid = session_id.map(str::to_string);
+        let since_owned = since.map(str::to_string);
+        let until_owned = until.map(str::to_string);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
+            let since_ref = since_owned.as_deref();
+            let until_ref = until_owned.as_deref();
+
+            let time_filter: String = match (since_ref, until_ref) {
+                (Some(_), Some(_)) => {
+                    " AND created_at >= $4::TIMESTAMPTZ AND created_at <= $5::TIMESTAMPTZ".into()
+                }
+                (Some(_), None) => " AND created_at >= $4::TIMESTAMPTZ".into(),
+                (None, Some(_)) => " AND created_at <= $4::TIMESTAMPTZ".into(),
+                (None, None) => String::new(),
+            };
+
             let stmt = format!(
                 "
                 SELECT id, key, content, category, created_at, session_id,
                        (
-                         CASE WHEN key ILIKE '%' || $1 || '%' THEN 2.0 ELSE 0.0 END +
-                         CASE WHEN content ILIKE '%' || $1 || '%' THEN 1.0 ELSE 0.0 END
+                         CASE WHEN to_tsvector('simple', key) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', key), plainto_tsquery('simple', $1)) * 2.0
+                           ELSE 0.0 END +
+                         CASE WHEN to_tsvector('simple', content) @@ plainto_tsquery('simple', $1)
+                           THEN ts_rank_cd(to_tsvector('simple', content), plainto_tsquery('simple', $1))
+                           ELSE 0.0 END
                        ) AS score
                 FROM {qualified_table}
                 WHERE ($2::TEXT IS NULL OR session_id = $2)
-                  AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
+                  AND ($1 = '' OR to_tsvector('simple', key || ' ' || content) @@ plainto_tsquery('simple', $1))
+                  {time_filter}
                 ORDER BY score DESC, updated_at DESC
                 LIMIT $3
                 "
@@ -317,12 +291,17 @@ impl Memory for PostgresMemory {
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = limit as i64;
 
-            let rows = client.query(&stmt, &[&query, &sid, &limit_i64])?;
+            let rows = match (since_ref, until_ref) {
+                (Some(s), Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &s, &u])?,
+                (Some(s), None) => client.query(&stmt, &[&query, &sid, &limit_i64, &s])?,
+                (None, Some(u)) => client.query(&stmt, &[&query, &sid, &limit_i64, &u])?,
+                (None, None) => client.query(&stmt, &[&query, &sid, &limit_i64])?,
+            };
             rows.iter()
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
         })
-        .await?
+        .await
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
@@ -330,7 +309,7 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
 
-        tokio::task::spawn_blocking(move || -> Result<Option<MemoryEntry>> {
+        run_on_os_thread(move || -> Result<Option<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
@@ -344,7 +323,7 @@ impl Memory for PostgresMemory {
             let row = client.query_opt(&stmt, &[&key])?;
             row.as_ref().map(Self::row_to_entry).transpose()
         })
-        .await?
+        .await
     }
 
     async fn list(
@@ -357,7 +336,7 @@ impl Memory for PostgresMemory {
         let category = category.map(Self::category_to_str);
         let sid = session_id.map(str::to_string);
 
-        tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
+        run_on_os_thread(move || -> Result<Vec<MemoryEntry>> {
             let mut client = client.lock();
             let stmt = format!(
                 "
@@ -376,7 +355,7 @@ impl Memory for PostgresMemory {
                 .map(Self::row_to_entry)
                 .collect::<Result<Vec<MemoryEntry>>>()
         })
-        .await?
+        .await
     }
 
     async fn forget(&self, key: &str) -> Result<bool> {
@@ -384,20 +363,20 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
         let key = key.to_string();
 
-        tokio::task::spawn_blocking(move || -> Result<bool> {
+        run_on_os_thread(move || -> Result<bool> {
             let mut client = client.lock();
             let stmt = format!("DELETE FROM {qualified_table} WHERE key = $1");
             let deleted = client.execute(&stmt, &[&key])?;
             Ok(deleted > 0)
         })
-        .await?
+        .await
     }
 
     async fn count(&self) -> Result<usize> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
 
-        tokio::task::spawn_blocking(move || -> Result<usize> {
+        run_on_os_thread(move || -> Result<usize> {
             let mut client = client.lock();
             let stmt = format!("SELECT COUNT(*) FROM {qualified_table}");
             let count: i64 = client.query_one(&stmt, &[])?.get(0);
@@ -405,12 +384,12 @@ impl Memory for PostgresMemory {
                 usize::try_from(count).context("PostgreSQL returned a negative memory count")?;
             Ok(count)
         })
-        .await?
+        .await
     }
 
     async fn health_check(&self) -> bool {
         let client = self.client.clone();
-        tokio::task::spawn_blocking(move || client.lock().simple_query("SELECT 1").is_ok())
+        run_on_os_thread(move || Ok(client.lock().simple_query("SELECT 1").is_ok()))
             .await
             .unwrap_or(false)
     }
@@ -458,7 +437,6 @@ mod tests {
                 "public",
                 "memories",
                 Some(1),
-                false,
             )
         });
 

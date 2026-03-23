@@ -3,14 +3,14 @@
 use anyhow::{Context, Result};
 use std::process::Command;
 
-const BRIDGE_APP_NAME: &str = "zeroclaw-uno-q-bridge";
+const BRIDGE_APP_NAME: &str = "uno-q-bridge";
 
 /// Deploy the Bridge app. If host is Some, scp from repo and ssh to start.
 /// If host is None, assume we're ON the Uno Q — use embedded files and start.
 pub fn setup_uno_q_bridge(host: Option<&str>) -> Result<()> {
     let bridge_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("firmware")
-        .join("zeroclaw-uno-q-bridge");
+        .join("uno-q-bridge");
 
     if let Some(h) = host {
         if bridge_dir.exists() {
@@ -66,7 +66,7 @@ fn deploy_remote(host: &str, bridge_dir: &std::path::Path) -> Result<()> {
             "arduino-app-cli",
             "app",
             "start",
-            "~/ArduinoApps/zeroclaw-uno-q-bridge",
+            "~/ArduinoApps/uno-q-bridge",
         ])
         .status()
         .context("arduino-app-cli start failed")?;
@@ -110,11 +110,11 @@ fn deploy_local(bridge_dir: Option<&std::path::Path>) -> Result<()> {
 }
 
 fn write_embedded_bridge(dest: &std::path::Path) -> Result<()> {
-    let app_yaml = include_str!("../../firmware/zeroclaw-uno-q-bridge/app.yaml");
-    let sketch_ino = include_str!("../../firmware/zeroclaw-uno-q-bridge/sketch/sketch.ino");
-    let sketch_yaml = include_str!("../../firmware/zeroclaw-uno-q-bridge/sketch/sketch.yaml");
-    let main_py = include_str!("../../firmware/zeroclaw-uno-q-bridge/python/main.py");
-    let requirements = include_str!("../../firmware/zeroclaw-uno-q-bridge/python/requirements.txt");
+    let app_yaml = include_str!("../../firmware/uno-q-bridge/app.yaml");
+    let sketch_ino = include_str!("../../firmware/uno-q-bridge/sketch/sketch.ino");
+    let sketch_yaml = include_str!("../../firmware/uno-q-bridge/sketch/sketch.yaml");
+    let main_py = include_str!("../../firmware/uno-q-bridge/python/main.py");
+    let requirements = include_str!("../../firmware/uno-q-bridge/python/requirements.txt");
 
     std::fs::write(dest.join("app.yaml"), app_yaml)?;
     std::fs::create_dir_all(dest.join("sketch"))?;

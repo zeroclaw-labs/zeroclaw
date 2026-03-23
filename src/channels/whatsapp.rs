@@ -27,6 +27,8 @@ pub struct WhatsAppChannel {
     endpoint_id: String,
     verify_token: String,
     allowed_numbers: Vec<String>,
+    /// Per-channel proxy URL override.
+    proxy_url: Option<String>,
 }
 
 impl WhatsAppChannel {
@@ -41,11 +43,18 @@ impl WhatsAppChannel {
             endpoint_id,
             verify_token,
             allowed_numbers,
+            proxy_url: None,
         }
     }
 
+    /// Set a per-channel proxy URL that overrides the global proxy config.
+    pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_runtime_proxy_client("channel.whatsapp")
+        crate::config::build_channel_proxy_client("channel.whatsapp", self.proxy_url.as_deref())
     }
 
     /// Check if a phone number is allowed (E.164 format: +1234567890)
@@ -142,6 +151,7 @@ impl WhatsAppChannel {
                         channel: "whatsapp".to_string(),
                         timestamp,
                         thread_ts: None,
+                        interruption_scope_id: None,
                     });
                 }
             }
@@ -195,8 +205,7 @@ impl Channel for WhatsAppChannel {
         if !resp.status().is_success() {
             let status = resp.status();
             let error_body = resp.text().await.unwrap_or_default();
-            let sanitized = crate::providers::sanitize_api_error(&error_body);
-            tracing::error!("WhatsApp send failed: {status} — {sanitized}");
+            tracing::error!("WhatsApp send failed: {status} — {error_body}");
             anyhow::bail!("WhatsApp API error: {status}");
         }
 

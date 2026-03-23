@@ -2,6 +2,26 @@
 //!
 //! This module contains reusable helper functions used across the codebase.
 
+/// Allowed serial device path prefixes — reject arbitrary paths for security.
+/// Used by hardware serial transport and peripherals.
+const SERIAL_ALLOWED_PATH_PREFIXES: &[&str] = &[
+    "/dev/ttyACM",
+    "/dev/ttyUSB",
+    "/dev/tty.usbmodem",
+    "/dev/cu.usbmodem",
+    "/dev/tty.usbserial",
+    "/dev/cu.usbserial", // Arduino Uno (FTDI), clones
+    "COM",               // Windows
+];
+
+/// Returns true if the path is an allowed serial device (USB CDC, FTDI, etc.).
+/// Rejects arbitrary paths like /etc/passwd or /dev/sda.
+pub fn is_serial_path_allowed(path: &str) -> bool {
+    SERIAL_ALLOWED_PATH_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
 /// Truncate a string to at most `max_chars` characters, appending "..." if truncated.
 ///
 /// This function safely handles multi-byte UTF-8 characters (emoji, CJK, accented characters)
@@ -41,22 +61,6 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
         }
         None => s.to_string(),
     }
-}
-
-/// Return the greatest valid UTF-8 char boundary at or below `index`.
-///
-/// This mirrors `str::floor_char_boundary` behavior while remaining compatible
-/// with stable toolchains where that API is not available.
-pub fn floor_utf8_char_boundary(s: &str, index: usize) -> usize {
-    if index >= s.len() {
-        return s.len();
-    }
-
-    let mut i = index;
-    while i > 0 && !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
 }
 
 /// Utility enum for handling optional values.
@@ -157,22 +161,5 @@ mod tests {
     fn test_truncate_zero_max_chars() {
         // Edge case: max_chars = 0
         assert_eq!(truncate_with_ellipsis("hello", 0), "...");
-    }
-
-    #[test]
-    fn test_floor_utf8_char_boundary_ascii() {
-        assert_eq!(floor_utf8_char_boundary("hello", 0), 0);
-        assert_eq!(floor_utf8_char_boundary("hello", 3), 3);
-        assert_eq!(floor_utf8_char_boundary("hello", 99), 5);
-    }
-
-    #[test]
-    fn test_floor_utf8_char_boundary_multibyte() {
-        let s = "aé你🦀";
-        assert_eq!(floor_utf8_char_boundary(s, 1), 1);
-        // Index 2 is inside "é" (2-byte char), floor should move back to 1.
-        assert_eq!(floor_utf8_char_boundary(s, 2), 1);
-        // Index 5 is inside "你" (3-byte char), floor should move back to 3.
-        assert_eq!(floor_utf8_char_boundary(s, 5), 3);
     }
 }

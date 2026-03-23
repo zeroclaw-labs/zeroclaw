@@ -41,9 +41,9 @@ def normalize_docs_files(raw: str) -> list[str]:
 def infer_base_sha(provided: str) -> str:
     if commit_exists(provided):
         return provided
-    if run_git(["rev-parse", "--verify", "origin/main"]).returncode != 0:
+    if run_git(["rev-parse", "--verify", "origin/master"]).returncode != 0:
         return ""
-    proc = run_git(["merge-base", "origin/main", "HEAD"])
+    proc = run_git(["merge-base", "origin/master", "HEAD"])
     candidate = proc.stdout.strip()
     return candidate if commit_exists(candidate) else ""
 

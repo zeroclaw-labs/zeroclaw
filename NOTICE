@@ -17,7 +17,7 @@ License
 
 This software is available under a dual-license model:
 
-  1. MIT License — see LICENSE
+  1. MIT License — see LICENSE-MIT
   2. Apache License 2.0 — see LICENSE-APACHE
 
 You may use either license. Contributors grant rights under both.
@@ -41,3 +41,18 @@ This project uses third-party libraries and components,
 each licensed under their respective terms.
 
 See Cargo.lock for a complete dependency list.
+
+Verifiable Intent Specification
+================================
+
+The src/verifiable_intent/ module is a Rust-native reimplementation based on
+the Verifiable Intent open specification and reference implementation:
+
+  Project:  Verifiable Intent (VI)
+  Author:   agent-intent
+  Source:   https://github.com/agent-intent/verifiable-intent
+  License:  Apache License, Version 2.0
+
+This implementation follows the VI specification design (SD-JWT layered
+credentials, constraint model, three-layer chain). No source code was copied
+from the reference implementation.

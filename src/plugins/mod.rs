@@ -1,70 +1,76 @@
-//! Plugin system for ZeroClaw.
+//! WASM plugin system for ZeroClaw.
 //!
-//! Modeled after OpenClaw's plugin architecture, adapted for Rust:
-//!
-//! - **Manifest**: each plugin has a `zeroclaw.plugin.toml` descriptor
-//! - **Discovery**: scans bundled, global (`~/.zeroclaw/extensions/`), and
-//!   workspace (`.zeroclaw/extensions/`) directories
-//! - **Registry**: collects loaded plugins, their tools, hooks, and diagnostics
-//! - **PluginApi**: passed to `Plugin::register()` so plugins can register
-//!   tools, hooks, and services without knowing the host internals
-//! - **Error isolation**: panics inside plugin `register()` are caught and
-//!   recorded as diagnostics rather than crashing the host
-//!
-//! # Quick start
-//!
-//! ```rust,ignore
-//! use zeroclaw::plugins::{Plugin, PluginApi, PluginManifest};
-//!
-//! pub struct MyPlugin { manifest: PluginManifest }
-//!
-//! impl Plugin for MyPlugin {
-//!     fn manifest(&self) -> &PluginManifest { &self.manifest }
-//!     fn register(&self, api: &mut PluginApi) -> anyhow::Result<()> {
-//!         api.register_tool(Box::new(MyTool));
-//!         Ok(())
-//!     }
-//! }
-//! ```
-//!
-//! Then in your `config.toml`:
-//!
-//! ```toml
-//! [plugins]
-//! enabled = true
-//!
-//! [plugins.entries.my-plugin]
-//! enabled = true
-//! ```
+//! Plugins are WebAssembly modules loaded via Extism that can extend
+//! ZeroClaw with custom tools and channels. Enable with `--features plugins-wasm`.
 
-pub mod discovery;
-pub mod loader;
-pub mod manifest;
-pub mod registry;
-pub mod traits;
+pub mod error;
+pub mod host;
+pub mod wasm_channel;
+pub mod wasm_tool;
 
-pub use discovery::discover_plugins;
-pub use loader::load_plugins;
-pub use manifest::{PluginManifest, PLUGIN_MANIFEST_FILENAME};
-pub use registry::{
-    DiagnosticLevel, PluginDiagnostic, PluginHookRegistration, PluginOrigin, PluginRecord,
-    PluginRegistry, PluginStatus, PluginToolRegistration,
-};
-pub use traits::{Plugin, PluginApi, PluginLogger};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A plugin's declared manifest (loaded from manifest.toml alongside the .wasm).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginManifest {
+    /// Plugin name (unique identifier)
+    pub name: String,
+    /// Plugin version
+    pub version: String,
+    /// Human-readable description
+    pub description: Option<String>,
+    /// Author name or organization
+    pub author: Option<String>,
+    /// Path to the .wasm file (relative to manifest)
+    pub wasm_path: String,
+    /// Capabilities this plugin provides
+    pub capabilities: Vec<PluginCapability>,
+    /// Permissions this plugin requests
+    #[serde(default)]
+    pub permissions: Vec<PluginPermission>,
+}
 
-    #[test]
-    fn module_reexports_are_accessible() {
-        let _manifest = PluginManifest {
-            id: "test".into(),
-            name: None,
-            description: None,
-            version: None,
-            config_schema: None,
-        };
-        assert_eq!(PLUGIN_MANIFEST_FILENAME, "zeroclaw.plugin.toml");
-    }
+/// What a plugin can do.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginCapability {
+    /// Provides one or more tools
+    Tool,
+    /// Provides a channel implementation
+    Channel,
+    /// Provides a memory backend
+    Memory,
+    /// Provides an observer/metrics backend
+    Observer,
+}
+
+/// Permissions a plugin may request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginPermission {
+    /// Can make HTTP requests
+    HttpClient,
+    /// Can read from the filesystem (within sandbox)
+    FileRead,
+    /// Can write to the filesystem (within sandbox)
+    FileWrite,
+    /// Can access environment variables
+    EnvRead,
+    /// Can read agent memory
+    MemoryRead,
+    /// Can write agent memory
+    MemoryWrite,
+}
+
+/// Information about a loaded plugin.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginInfo {
+    pub name: String,
+    pub version: String,
+    pub description: Option<String>,
+    pub capabilities: Vec<PluginCapability>,
+    pub permissions: Vec<PluginPermission>,
+    pub wasm_path: PathBuf,
+    pub loaded: bool,
 }

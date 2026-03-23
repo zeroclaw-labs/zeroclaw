@@ -1,6 +1,5 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteConfig};
-use crate::providers::has_provider_credential;
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
 use async_trait::async_trait;
@@ -217,7 +216,10 @@ impl ModelRoutingConfigTool {
             "hint": route.hint,
             "provider": route.provider,
             "model": route.model,
-            "api_key_configured": has_provider_credential(&route.provider, route.api_key.as_deref()),
+            "api_key_configured": route
+                .api_key
+                .as_ref()
+                .is_some_and(|value| !value.trim().is_empty()),
             "classification": classification,
         })
     }
@@ -262,10 +264,10 @@ impl ModelRoutingConfigTool {
                     "provider": agent.provider,
                     "model": agent.model,
                     "system_prompt": agent.system_prompt,
-                    "api_key_configured": has_provider_credential(
-                        &agent.provider,
-                        agent.api_key.as_deref()
-                    ),
+                    "api_key_configured": agent
+                        .api_key
+                        .as_ref()
+                        .is_some_and(|value| !value.trim().is_empty()),
                     "temperature": agent.temperature,
                     "max_depth": agent.max_depth,
                     "agentic": agent.agentic,
@@ -387,6 +389,11 @@ impl ModelRoutingConfigTool {
 
         let mut cfg = self.load_config_without_env()?;
 
+        // Capture previous values for rollback on probe failure.
+        let previous_provider = cfg.default_provider.clone();
+        let previous_model = cfg.default_model.clone();
+        let previous_temperature = cfg.default_temperature;
+
         match provider_update {
             MaybeSet::Set(provider) => cfg.default_provider = Some(provider),
             MaybeSet::Null => cfg.default_provider = None,
@@ -414,6 +421,38 @@ impl ModelRoutingConfigTool {
 
         cfg.save().await?;
 
+        // Probe the new model with a minimal API call to catch invalid model IDs
+        // before the channel hot-reload picks up the change.
+        if let (Some(provider_name), Some(model_name)) =
+            (cfg.default_provider.clone(), cfg.default_model.clone())
+        {
+            if let Err(probe_err) = self.probe_model(&provider_name, &model_name).await {
+                if crate::providers::reliable::is_non_retryable(&probe_err) {
+                    let reverted_model = previous_model.as_deref().unwrap_or("(none)").to_string();
+
+                    // Rollback to previous config.
+                    cfg.default_provider = previous_provider;
+                    cfg.default_model = previous_model;
+                    cfg.default_temperature = previous_temperature;
+                    cfg.save().await?;
+
+                    return Ok(ToolResult {
+                        success: false,
+                        output: format!(
+                            "Model '{model_name}' is not available: {probe_err}. Reverted to '{reverted_model}'.",
+                        ),
+                        error: None,
+                    });
+                }
+                // Retryable errors (e.g. transient network issues) — keep the
+                // new config and let the resilient wrapper handle retries.
+                tracing::warn!(
+                    model = %model_name,
+                    "Model probe returned retryable error (keeping new config): {probe_err}"
+                );
+            }
+        }
+
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
@@ -422,6 +461,36 @@ impl ModelRoutingConfigTool {
             }))?,
             error: None,
         })
+    }
+
+    /// Send a minimal 1-token chat request to verify the model is accessible.
+    /// Returns `Ok(())` if the probe succeeds **or** if no API key is available
+    /// (the probe would fail with an auth error unrelated to model validity).
+    /// Provider construction failures are also treated as non-fatal.
+    async fn probe_model(&self, provider_name: &str, model: &str) -> anyhow::Result<()> {
+        use crate::providers;
+
+        // Use the runtime config's API key (which includes env-sourced keys),
+        // not the on-disk config (which may have no key at all).
+        let api_key = self.config.api_key.as_deref();
+        if api_key.is_none_or(|k| k.trim().is_empty()) {
+            return Ok(());
+        }
+
+        let provider = match providers::create_provider_with_url(
+            provider_name,
+            api_key,
+            self.config.api_url.as_deref(),
+        ) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+
+        provider
+            .chat_with_system(Some("Respond with OK."), "ping", model, 0.0)
+            .await?;
+
+        Ok(())
     }
 
     async fn handle_upsert_scenario(&self, args: &Value) -> anyhow::Result<ToolResult> {
@@ -464,7 +533,6 @@ impl ModelRoutingConfigTool {
             hint: hint.clone(),
             provider: provider.clone(),
             model: model.clone(),
-            max_tokens: None,
             api_key: None,
         });
 
@@ -637,6 +705,9 @@ impl ModelRoutingConfigTool {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
             });
 
         next_agent.provider = provider;
@@ -872,11 +943,11 @@ impl Tool for ModelRoutingConfigTool {
                 }
 
                 match action.as_str() {
-                    "set_default" => self.handle_set_default(&args).await,
-                    "upsert_scenario" => self.handle_upsert_scenario(&args).await,
-                    "remove_scenario" => self.handle_remove_scenario(&args).await,
-                    "upsert_agent" => self.handle_upsert_agent(&args).await,
-                    "remove_agent" => self.handle_remove_agent(&args).await,
+                    "set_default" => Box::pin(self.handle_set_default(&args)).await,
+                    "upsert_scenario" => Box::pin(self.handle_upsert_scenario(&args)).await,
+                    "remove_scenario" => Box::pin(self.handle_remove_scenario(&args)).await,
+                    "upsert_agent" => Box::pin(self.handle_upsert_agent(&args)).await,
+                    "remove_agent" => Box::pin(self.handle_remove_agent(&args)).await,
                     _ => unreachable!("validated above"),
                 }
             }
@@ -900,7 +971,6 @@ impl Tool for ModelRoutingConfigTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -919,39 +989,6 @@ mod tests {
         })
     }
 
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var(key).ok();
-            match value {
-                Some(next) => std::env::set_var(key, next),
-                None => std::env::remove_var(key),
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(original) = self.original.as_deref() {
-                std::env::set_var(self.key, original);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
-    }
-
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
@@ -965,7 +1002,7 @@ mod tests {
     #[tokio::test]
     async fn set_default_updates_provider_model_and_temperature() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({
@@ -996,7 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_scenario_creates_route_and_rule() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let result = tool
             .execute(json!({
@@ -1031,7 +1068,7 @@ mod tests {
     #[tokio::test]
     async fn remove_scenario_also_removes_rule() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let _ = tool
             .execute(json!({
@@ -1063,7 +1100,7 @@ mod tests {
     #[tokio::test]
     async fn upsert_and_remove_delegate_agent() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
         let upsert = tool
             .execute(json!({
@@ -1102,7 +1139,8 @@ mod tests {
     #[tokio::test]
     async fn read_only_mode_blocks_mutating_actions() {
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, readonly_security());
+        let tool =
+            ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, readonly_security());
 
         let result = tool
             .execute(json!({
@@ -1117,49 +1155,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_reports_env_backed_credentials_for_routes_and_agents() {
-        let _env_lock = env_lock();
-        let _provider_guard = EnvGuard::set("TELNYX_API_KEY", Some("test-telnyx-key"));
-        let _generic_guard = EnvGuard::set("ZEROCLAW_API_KEY", None);
-        let _api_key_guard = EnvGuard::set("API_KEY", None);
-
+    async fn set_default_skips_probe_without_api_key() {
+        // When no API key is configured (test_config has none), the probe is
+        // skipped and any model string is accepted. This verifies the probe-
+        // skip path doesn't accidentally reject valid config changes.
         let tmp = TempDir::new().unwrap();
-        let tool = ModelRoutingConfigTool::new(test_config(&tmp).await, test_security());
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
-        let upsert_route = tool
+        let result = tool
             .execute(json!({
-                "action": "upsert_scenario",
-                "hint": "voice",
-                "provider": "telnyx",
-                "model": "telnyx-conversation"
+                "action": "set_default",
+                "provider": "anthropic",
+                "model": "totally-fake-model-12345"
             }))
             .await
             .unwrap();
-        assert!(upsert_route.success, "{:?}", upsert_route.error);
 
-        let upsert_agent = tool
+        assert!(result.success, "{:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            output["config"]["default"]["model"].as_str(),
+            Some("totally-fake-model-12345")
+        );
+    }
+
+    #[tokio::test]
+    async fn set_default_temperature_only_skips_probe() {
+        // Temperature-only changes don't set a new model, so the probe should
+        // not fire at all (no provider/model to probe).
+        let tmp = TempDir::new().unwrap();
+        let tool = ModelRoutingConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
+
+        let result = tool
             .execute(json!({
-                "action": "upsert_agent",
-                "name": "voice_helper",
-                "provider": "telnyx",
-                "model": "telnyx-conversation"
+                "action": "set_default",
+                "temperature": 1.5
             }))
             .await
             .unwrap();
-        assert!(upsert_agent.success, "{:?}", upsert_agent.error);
 
-        let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
-        assert!(get_result.success);
-        let output: Value = serde_json::from_str(&get_result.output).unwrap();
-
-        let route = output["scenarios"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|item| item["hint"] == json!("voice"))
-            .unwrap();
-        assert_eq!(route["api_key_configured"], json!(true));
-
-        assert_eq!(output["agents"]["voice_helper"]["api_key_configured"], json!(true));
+        assert!(result.success, "{:?}", result.error);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            output["config"]["default"]["temperature"].as_f64(),
+            Some(1.5)
+        );
     }
 }

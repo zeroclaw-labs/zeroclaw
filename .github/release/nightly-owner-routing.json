@@ -1,9 +1,0 @@
-{
-  "schema_version": "zeroclaw.nightly-owner-routing.v1",
-  "owners": {
-    "default": "@chumyin",
-    "whatsapp-web": "@chumyin",
-    "browser-native": "@chumyin",
-    "nightly-all-features": "@chumyin"
-  }
-}

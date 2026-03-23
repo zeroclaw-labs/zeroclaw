@@ -1165,7 +1165,6 @@ mod tests {
             hint: "fast".into(),
             provider: "groq".into(),
             model: String::new(),
-            max_tokens: None,
             api_key: None,
         }];
         let mut items = Vec::new();
@@ -1282,6 +1281,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
         config.agents.insert(
@@ -1296,6 +1298,9 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
             },
         );
 

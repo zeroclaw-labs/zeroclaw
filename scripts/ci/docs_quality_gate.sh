@@ -5,8 +5,8 @@ set -euo pipefail
 BASE_SHA="${BASE_SHA:-}"
 DOCS_FILES_RAW="${DOCS_FILES:-}"
 
-if [ -z "$BASE_SHA" ] && git rev-parse --verify origin/main >/dev/null 2>&1; then
-    BASE_SHA="$(git merge-base origin/main HEAD)"
+if [ -z "$BASE_SHA" ] && git rev-parse --verify origin/master >/dev/null 2>&1; then
+    BASE_SHA="$(git merge-base origin/master HEAD)"
 fi
 
 if [ -z "$DOCS_FILES_RAW" ] && [ -n "$BASE_SHA" ] && git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then

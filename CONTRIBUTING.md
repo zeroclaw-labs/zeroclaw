@@ -2,6 +2,42 @@
 
 Thanks for your interest in contributing to ZeroClaw! This guide will help you get started.
 
+---
+
+## ⚠️ Branch Migration Notice (March 2026)
+
+**`master` is the ONLY default branch. The `main` branch no longer exists.**
+
+If you have an existing fork or local clone that tracks `main`, you **must** update it:
+
+```bash
+# Update your local clone to track master
+git checkout master
+git branch -D main 2>/dev/null          # delete local main if it exists
+git remote set-head origin master
+git fetch origin --prune                 # remove stale remote refs
+
+# If your fork still has a main branch, delete it
+git push origin --delete main 2>/dev/null
+```
+
+All PRs must target **`master`**. PRs targeting `main` will be rejected.
+
+**Background:** ZeroClaw previously used `main` in some documentation and scripts, which caused 404 errors, broken CI refs, and contributor confusion (see [#2929](https://github.com/zeroclaw-labs/zeroclaw/issues/2929), [#3061](https://github.com/zeroclaw-labs/zeroclaw/issues/3061), [#3194](https://github.com/zeroclaw-labs/zeroclaw/pull/3194)). As of March 2026, all references have been corrected, stale branches cleaned up, and the `main` branch permanently deleted.
+
+---
+
+## Branching Model
+
+> **`master`** is the single source-of-truth branch.
+>
+> **How contributors should work:**
+> 1. Fork the repository
+> 2. Create a `feat/*` or `fix/*` branch from `master`
+> 3. Open a PR targeting `master`
+>
+> Do **not** create or push to a `main` branch. There is no `main` branch — it will not work.
+
 ## First-Time Contributors
 
 Welcome — contributions of all sizes are valued. If this is your first contribution, here is how to get started:
@@ -15,9 +51,9 @@ Welcome — contributions of all sizes are valued. If this is your first contrib
 
 3. **Follow the fork → branch → change → test → PR workflow:**
    - Fork the repository and clone your fork
-   - Create a feature branch (`git checkout -b fix/my-change`)
+   - Create a feature branch (`git checkout -b feat/my-change` or `git checkout -b fix/my-change`)
    - Make your changes and run `cargo fmt && cargo clippy && cargo test`
-   - Open a PR against `dev` using the PR template
+   - Open a PR against `master` using the PR template
 
 4. **Start with Track A.** ZeroClaw uses three [collaboration tracks](#collaboration-tracks-risk-based) (A/B/C) based on risk. First-time contributors should target **Track A** (docs, tests, chore) — these require lighter review and are the fastest path to a merged PR.
 
@@ -210,20 +246,20 @@ To keep docs useful under high PR volume, we use these rules:
 - **Side-effect visibility**: document blast radius, failure modes, and rollback before merge.
 - **Automation assists, humans decide**: bots triage and label, but merge accountability stays human.
 - **Index-first discoverability**: `docs/README.md` is the first entry point for operational documentation.
-- **Template-first authoring**: start new operational docs from `docs/doc-template.md`.
+- **Template-first authoring**: start new operational docs from `docs/contributing/doc-template.md`.
 
 ### Documentation System Map
 
 | Doc | Primary purpose | When to update |
 |---|---|---|
 | `docs/README.md` | canonical docs index and taxonomy | add/remove docs or change documentation ownership/navigation |
-| `docs/doc-template.md` | standard skeleton for new operational documentation | when required sections or documentation quality bar changes |
+| `docs/contributing/doc-template.md` | standard skeleton for new operational documentation | when required sections or documentation quality bar changes |
 | `CONTRIBUTING.md` | contributor contract and readiness baseline | contributor expectations or policy changes |
-| `docs/pr-workflow.md` | governance logic and merge contract | workflow/risk/merge gate changes |
-| `docs/reviewer-playbook.md` | reviewer operating checklist | review depth or triage behavior changes |
-| `docs/ci-map.md` | CI ownership and triage entry points | workflow trigger/job ownership changes |
-| `docs/network-deployment.md` | runtime deployment and network operating guide | gateway/channel/tunnel/network runtime behavior changes |
-| `docs/proxy-agent-playbook.md` | agent-operable proxy runbook and rollback recipes | proxy scope/selector/tooling behavior changes |
+| `docs/contributing/pr-workflow.md` | governance logic and merge contract | workflow/risk/merge gate changes |
+| `docs/contributing/reviewer-playbook.md` | reviewer operating checklist | review depth or triage behavior changes |
+| `docs/contributing/ci-map.md` | CI ownership and triage entry points | workflow trigger/job ownership changes |
+| `docs/ops/network-deployment.md` | runtime deployment and network operating guide | gateway/channel/tunnel/network runtime behavior changes |
+| `docs/ops/proxy-agent-playbook.md` | agent-operable proxy runbook and rollback recipes | proxy scope/selector/tooling behavior changes |
 
 ## PR Definition of Ready (DoR)
 
@@ -237,7 +273,7 @@ Before requesting review, ensure all of the following are true:
 - Tests/fixtures/examples use neutral project-scoped wording (no identity-specific or first-person phrasing).
 - If identity-like wording is required, use ZeroClaw-centric labels only (for example: `ZeroClawAgent`, `ZeroClawOperator`, `zeroclaw_user`).
 - If docs were changed, update `docs/README.md` navigation and reciprocal links with related docs.
-- If a new operational doc was added, start from `docs/doc-template.md` and keep risk/rollback/troubleshooting sections where applicable.
+- If a new operational doc was added, start from `docs/contributing/doc-template.md` and keep risk/rollback/troubleshooting sections where applicable.
 - Linked issue (or rationale for no issue) is included.
 
 ## PR Definition of Done (DoD)
@@ -265,9 +301,9 @@ When PR traffic is high (especially with AI-assisted contributions), these rules
 - **Identity normalization**: when identity traits are unavoidable, use ZeroClaw/project-native roles instead of personal or real-world identities.
 - **Supersede hygiene**: if your PR replaces an older open PR, add `Supersedes #...` and request maintainers close the outdated one.
 
-Full maintainer workflow: [`docs/pr-workflow.md`](docs/pr-workflow.md).
-CI workflow ownership and triage map: [`docs/ci-map.md`](docs/ci-map.md).
-Reviewer operating checklist: [`docs/reviewer-playbook.md`](docs/reviewer-playbook.md).
+Full maintainer workflow: [`docs/contributing/pr-workflow.md`](docs/contributing/pr-workflow.md).
+CI workflow ownership and triage map: [`docs/contributing/ci-map.md`](docs/contributing/ci-map.md).
+Reviewer operating checklist: [`docs/contributing/reviewer-playbook.md`](docs/contributing/reviewer-playbook.md).
 
 ## Agent Collaboration Guidance
 
