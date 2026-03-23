@@ -169,8 +169,21 @@ async fn handle_socket(
     let mut agent = match crate::agent::Agent::from_config(&config).await {
         Ok(a) => a,
         Err(e) => {
-            let err = serde_json::json!({"type": "error", "message": format!("Failed to initialise agent: {e}")});
+            tracing::error!(error = %e, "Agent initialization failed");
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!("Failed to initialise agent: {e}"),
+                "code": "AGENT_INIT_FAILED"
+            });
             let _ = sender.send(Message::Text(err.to_string().into())).await;
+            let _ = sender
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: axum::extract::ws::Utf8Bytes::from_static(
+                        "Agent initialization failed",
+                    ),
+                })))
+                .await;
             return;
         }
     };
@@ -299,8 +312,12 @@ async fn handle_socket(
         // Parse incoming message
         let parsed: serde_json::Value = match serde_json::from_str(&msg) {
             Ok(v) => v,
-            Err(_) => {
-                let err = serde_json::json!({"type": "error", "message": "Invalid JSON"});
+            Err(e) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Invalid JSON: {}", e),
+                    "code": "INVALID_JSON"
+                });
                 let _ = sender.send(Message::Text(err.to_string().into())).await;
                 continue;
             }
@@ -312,7 +329,8 @@ async fn handle_socket(
                 "type": "error",
                 "message": format!(
                     "Unsupported message type \"{msg_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
-                )
+                ),
+                "code": "UNKNOWN_MESSAGE_TYPE"
             });
             let _ = sender.send(Message::Text(err.to_string().into())).await;
             continue;
@@ -320,6 +338,12 @@ async fn handle_socket(
 
         let content = parsed["content"].as_str().unwrap_or("").to_string();
         if content.is_empty() {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": "Message content cannot be empty",
+                "code": "EMPTY_CONTENT"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
             continue;
         }
 
@@ -378,10 +402,24 @@ async fn process_chat_message(
             }));
         }
         Err(e) => {
+            tracing::error!(error = %e, "Agent turn failed");
             let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+            let error_code = if sanitized.to_lowercase().contains("api key")
+                || sanitized.to_lowercase().contains("authentication")
+                || sanitized.to_lowercase().contains("unauthorized")
+            {
+                "AUTH_ERROR"
+            } else if sanitized.to_lowercase().contains("provider")
+                || sanitized.to_lowercase().contains("model")
+            {
+                "PROVIDER_ERROR"
+            } else {
+                "AGENT_ERROR"
+            };
             let err = serde_json::json!({
                 "type": "error",
                 "message": sanitized,
+                "code": error_code,
             });
             let _ = sender.send(Message::Text(err.to_string().into())).await;
 
