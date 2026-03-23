@@ -54,13 +54,13 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
                     .context(
                         "memory backend 'postgres' requires db_url in [storage.provider.config]",
                     )?;
-                let mem = super::PostgresMemory::new(
+                let mem = super::PostgresMemory::new_lazy(
                     db_url,
                     &sp.schema,
                     &sp.table,
                     sp.connect_timeout_secs,
-                    Some(sp.pgvector_enabled),
-                    Some(sp.pgvector_dimensions),
+                    sp.pool_size,
+                    sp.tls_mode.as_deref(),
                 )?;
                 Ok(Box::new(mem))
             }

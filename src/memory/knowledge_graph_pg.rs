@@ -2,12 +2,12 @@
 //!
 //! Feature-gated behind `memory-postgres`. Uses pure SQL with recursive CTEs
 //! rather than requiring the AGE extension.
+//!
+//! Migrated from sync `postgres` + `run_on_os_thread` to async
+//! `tokio-postgres` via a shared `deadpool-postgres` pool.
 
 use anyhow::{Context, Result};
-use parking_lot::Mutex;
-use postgres::{Client, Row};
-use std::sync::Arc;
-use tokio::sync::oneshot;
+use tokio_postgres::Row;
 
 pub use super::knowledge_graph::{NodeType, Relation};
 
@@ -29,41 +29,33 @@ pub struct PgEdge {
 }
 
 pub struct PgKnowledgeGraph {
-    client: Arc<Mutex<Client>>,
+    pool: deadpool_postgres::Pool,
     schema: String,
 }
 
-async fn run_on_os_thread<F, T>(f: F) -> Result<T>
-where
-    F: FnOnce() -> Result<T> + Send + 'static,
-    T: Send + 'static,
-{
-    let (tx, rx) = oneshot::channel();
-    std::thread::Builder::new()
-        .name("pg-knowledge-graph-op".to_string())
-        .spawn(move || {
-            let _ = tx.send(f());
-        })
-        .context("failed to spawn pg knowledge graph thread")?;
-    rx.await
-        .map_err(|_| anyhow::anyhow!("pg knowledge graph thread terminated unexpectedly"))?
-}
-
 impl PgKnowledgeGraph {
-    pub fn new(client: Arc<Mutex<Client>>, schema: &str) -> Result<Self> {
-        let graph = Self {
-            client,
+    /// Create a new knowledge graph backed by the given connection pool.
+    ///
+    /// Schema initialization is deferred to [`init_schema`] which must be
+    /// awaited before the first query.
+    pub fn new(pool: deadpool_postgres::Pool, schema: &str) -> Self {
+        Self {
+            pool,
             schema: schema.to_string(),
-        };
-        graph.init_schema_sync()?;
-        Ok(graph)
+        }
     }
 
-    fn init_schema_sync(&self) -> Result<()> {
-        let mut client = self.client.lock();
+    /// Create tables and indexes if they do not already exist. Idempotent.
+    pub async fn init_schema(&self) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .context("pool checkout failed for knowledge graph schema init")?;
         let schema = &self.schema;
-        client.batch_execute(&format!(
-            r#"
+        client
+            .batch_execute(&format!(
+                r#"
             CREATE TABLE IF NOT EXISTS "{schema}".kg_nodes (
                 id BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -87,7 +79,9 @@ impl PgKnowledgeGraph {
             CREATE INDEX IF NOT EXISTS idx_kg_edges_source ON "{schema}".kg_edges(source_id);
             CREATE INDEX IF NOT EXISTS idx_kg_edges_target ON "{schema}".kg_edges(target_id);
             "#
-        ))?;
+            ))
+            .await
+            .context("failed to initialize knowledge graph schema")?;
         Ok(())
     }
 
@@ -103,7 +97,6 @@ impl PgKnowledgeGraph {
 
     fn parse_node_type(s: &str) -> NodeType {
         match s {
-            "pattern" => NodeType::Pattern,
             "decision" => NodeType::Decision,
             "lesson" => NodeType::Lesson,
             "expert" => NodeType::Expert,
@@ -124,7 +117,6 @@ impl PgKnowledgeGraph {
 
     fn parse_relation(s: &str) -> Relation {
         match s {
-            "uses" => Relation::Uses,
             "replaces" => Relation::Replaces,
             "extends" => Relation::Extends,
             "authored_by" => Relation::AuthoredBy,
@@ -150,17 +142,20 @@ impl PgKnowledgeGraph {
         content: &str,
         tags: &[String],
     ) -> Result<i64> {
-        let client = self.client.clone();
-        let schema = self.schema.clone();
-        let name = name.to_string();
-        let nt = Self::node_type_str(&node_type).to_string();
-        let content = content.to_string();
-        let tags = tags.to_vec();
-        run_on_os_thread(move || {
-            let mut client = client.lock();
-            let row = client.query_one(&format!(r#"INSERT INTO "{schema}".kg_nodes (name, node_type, content, tags) VALUES ($1, $2, $3, $4) RETURNING id"#), &[&name, &nt, &content, &tags])?;
-            Ok(row.get(0))
-        }).await
+        let client = self.pool.get().await.context("pool checkout failed")?;
+        let schema = &self.schema;
+        let nt = Self::node_type_str(&node_type);
+        let row = client
+            .query_one(
+                &format!(
+                    r#"INSERT INTO "{schema}".kg_nodes (name, node_type, content, tags)
+                       VALUES ($1, $2, $3, $4) RETURNING id"#
+                ),
+                &[&name, &nt, &content, &tags],
+            )
+            .await
+            .context("failed to add knowledge graph node")?;
+        Ok(row.get(0))
     }
 
     pub async fn add_edge(
@@ -170,90 +165,144 @@ impl PgKnowledgeGraph {
         relation: Relation,
         weight: f64,
     ) -> Result<i64> {
-        let client = self.client.clone();
-        let schema = self.schema.clone();
-        let rel = Self::relation_str(&relation).to_string();
-        run_on_os_thread(move || {
-            let mut client = client.lock();
-            let row = client.query_one(&format!(r#"INSERT INTO "{schema}".kg_edges (source_id, target_id, relation, weight) VALUES ($1, $2, $3, $4) RETURNING id"#), &[&source_id, &target_id, &rel, &weight])?;
-            Ok(row.get(0))
-        }).await
+        let client = self.pool.get().await.context("pool checkout failed")?;
+        let schema = &self.schema;
+        let rel = Self::relation_str(&relation);
+        let row = client
+            .query_one(
+                &format!(
+                    r#"INSERT INTO "{schema}".kg_edges (source_id, target_id, relation, weight)
+                       VALUES ($1, $2, $3, $4) RETURNING id"#
+                ),
+                &[&source_id, &target_id, &rel, &weight],
+            )
+            .await
+            .context("failed to add knowledge graph edge")?;
+        Ok(row.get(0))
     }
 
     pub async fn get_node(&self, id: i64) -> Result<Option<PgNode>> {
-        let client = self.client.clone();
-        let schema = self.schema.clone();
-        run_on_os_thread(move || {
-            let mut client = client.lock();
-            let row = client.query_opt(&format!(r#"SELECT id, name, node_type, content, tags FROM "{schema}".kg_nodes WHERE id = $1"#), &[&id])?;
-            Ok(row.as_ref().map(Self::row_to_node))
-        }).await
+        let client = self.pool.get().await.context("pool checkout failed")?;
+        let schema = &self.schema;
+        let row = client
+            .query_opt(
+                &format!(
+                    r#"SELECT id, name, node_type, content, tags
+                       FROM "{schema}".kg_nodes WHERE id = $1"#
+                ),
+                &[&id],
+            )
+            .await
+            .context("failed to get knowledge graph node")?;
+        Ok(row.as_ref().map(Self::row_to_node))
     }
 
     pub async fn query_by_tags(&self, tags: &[String], limit: usize) -> Result<Vec<PgNode>> {
-        let client = self.client.clone();
-        let schema = self.schema.clone();
-        let tags = tags.to_vec();
+        let client = self.pool.get().await.context("pool checkout failed")?;
+        let schema = &self.schema;
         #[allow(clippy::cast_possible_wrap)]
         let limit = limit as i64;
-        run_on_os_thread(move || {
-            let mut client = client.lock();
-            let rows = client.query(&format!(r#"SELECT id, name, node_type, content, tags FROM "{schema}".kg_nodes WHERE tags && $1 LIMIT $2"#), &[&tags, &limit])?;
-            Ok(rows.iter().map(Self::row_to_node).collect())
-        }).await
+        let rows = client
+            .query(
+                &format!(
+                    r#"SELECT id, name, node_type, content, tags
+                       FROM "{schema}".kg_nodes WHERE tags && $1 LIMIT $2"#
+                ),
+                &[&tags, &limit],
+            )
+            .await
+            .context("failed to query knowledge graph by tags")?;
+        Ok(rows.iter().map(Self::row_to_node).collect())
     }
 
     pub async fn query_by_similarity(&self, query: &str, limit: usize) -> Result<Vec<PgNode>> {
-        let client = self.client.clone();
-        let schema = self.schema.clone();
-        let query = query.to_string();
+        let client = self.pool.get().await.context("pool checkout failed")?;
+        let schema = &self.schema;
         #[allow(clippy::cast_possible_wrap)]
         let limit = limit as i64;
-        run_on_os_thread(move || {
-            let mut client = client.lock();
-            let rows = client.query(&format!(r#"SELECT id, name, node_type, content, tags FROM "{schema}".kg_nodes WHERE to_tsvector('simple', name || ' ' || content) @@ plainto_tsquery('simple', $1) LIMIT $2"#), &[&query, &limit])?;
-            Ok(rows.iter().map(Self::row_to_node).collect())
-        }).await
+        let rows = client
+            .query(
+                &format!(
+                    r#"SELECT id, name, node_type, content, tags
+                       FROM "{schema}".kg_nodes
+                       WHERE to_tsvector('simple', name || ' ' || content)
+                             @@ plainto_tsquery('simple', $1)
+                       LIMIT $2"#
+                ),
+                &[&query, &limit],
+            )
+            .await
+            .context("failed to query knowledge graph by similarity")?;
+        Ok(rows.iter().map(Self::row_to_node).collect())
     }
 
     pub async fn find_related(&self, node_id: i64, limit: usize) -> Result<Vec<PgNode>> {
-        let client = self.client.clone();
-        let schema = self.schema.clone();
+        let client = self.pool.get().await.context("pool checkout failed")?;
+        let schema = &self.schema;
         #[allow(clippy::cast_possible_wrap)]
         let limit = limit as i64;
-        run_on_os_thread(move || {
-            let mut client = client.lock();
-            let rows = client.query(&format!(r#"SELECT n.id, n.name, n.node_type, n.content, n.tags FROM "{schema}".kg_nodes n JOIN "{schema}".kg_edges e ON n.id = e.target_id WHERE e.source_id = $1 UNION SELECT n.id, n.name, n.node_type, n.content, n.tags FROM "{schema}".kg_nodes n JOIN "{schema}".kg_edges e ON n.id = e.source_id WHERE e.target_id = $1 LIMIT $2"#), &[&node_id, &limit])?;
-            Ok(rows.iter().map(Self::row_to_node).collect())
-        }).await
+        let rows = client
+            .query(
+                &format!(
+                    r#"SELECT n.id, n.name, n.node_type, n.content, n.tags
+                       FROM "{schema}".kg_nodes n
+                       JOIN "{schema}".kg_edges e ON n.id = e.target_id
+                       WHERE e.source_id = $1
+                       UNION
+                       SELECT n.id, n.name, n.node_type, n.content, n.tags
+                       FROM "{schema}".kg_nodes n
+                       JOIN "{schema}".kg_edges e ON n.id = e.source_id
+                       WHERE e.target_id = $1
+                       LIMIT $2"#
+                ),
+                &[&node_id, &limit],
+            )
+            .await
+            .context("failed to find related knowledge graph nodes")?;
+        Ok(rows.iter().map(Self::row_to_node).collect())
     }
 
     pub async fn get_subgraph(&self, root_id: i64, max_depth: u32) -> Result<Vec<PgNode>> {
-        let client = self.client.clone();
-        let schema = self.schema.clone();
+        let client = self.pool.get().await.context("pool checkout failed")?;
+        let schema = &self.schema;
         #[allow(clippy::cast_possible_wrap)]
         let max_depth = max_depth as i32;
-        run_on_os_thread(move || {
-            let mut client = client.lock();
-            let rows = client.query(&format!(r#"WITH RECURSIVE reachable AS (SELECT id, name, node_type, content, tags, 0 AS depth FROM "{schema}".kg_nodes WHERE id = $1 UNION SELECT n.id, n.name, n.node_type, n.content, n.tags, r.depth + 1 FROM "{schema}".kg_nodes n JOIN "{schema}".kg_edges e ON n.id = e.target_id JOIN reachable r ON e.source_id = r.id WHERE r.depth < $2) SELECT DISTINCT id, name, node_type, content, tags FROM reachable"#), &[&root_id, &max_depth])?;
-            Ok(rows.iter().map(Self::row_to_node).collect())
-        }).await
+        let rows = client
+            .query(
+                &format!(
+                    r#"WITH RECURSIVE reachable AS (
+                         SELECT id, name, node_type, content, tags, 0 AS depth
+                         FROM "{schema}".kg_nodes WHERE id = $1
+                         UNION
+                         SELECT n.id, n.name, n.node_type, n.content, n.tags, r.depth + 1
+                         FROM "{schema}".kg_nodes n
+                         JOIN "{schema}".kg_edges e ON n.id = e.target_id
+                         JOIN reachable r ON e.source_id = r.id
+                         WHERE r.depth < $2
+                       )
+                       SELECT DISTINCT id, name, node_type, content, tags FROM reachable"#
+                ),
+                &[&root_id, &max_depth],
+            )
+            .await
+            .context("failed to get knowledge graph subgraph")?;
+        Ok(rows.iter().map(Self::row_to_node).collect())
     }
 
     pub async fn stats(&self) -> Result<(i64, i64)> {
-        let client = self.client.clone();
-        let schema = self.schema.clone();
-        run_on_os_thread(move || {
-            let mut client = client.lock();
-            let nc: i64 = client
-                .query_one(&format!(r#"SELECT COUNT(*) FROM "{schema}".kg_nodes"#), &[])?
-                .get(0);
-            let ec: i64 = client
-                .query_one(&format!(r#"SELECT COUNT(*) FROM "{schema}".kg_edges"#), &[])?
-                .get(0);
-            Ok((nc, ec))
-        })
-        .await
+        let client = self.pool.get().await.context("pool checkout failed")?;
+        let schema = &self.schema;
+        let nc: i64 = client
+            .query_one(&format!(r#"SELECT COUNT(*) FROM "{schema}".kg_nodes"#), &[])
+            .await
+            .context("failed to count knowledge graph nodes")?
+            .get(0);
+        let ec: i64 = client
+            .query_one(&format!(r#"SELECT COUNT(*) FROM "{schema}".kg_edges"#), &[])
+            .await
+            .context("failed to count knowledge graph edges")?
+            .get(0);
+        Ok((nc, ec))
     }
 }
 

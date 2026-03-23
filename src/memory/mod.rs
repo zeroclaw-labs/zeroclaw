@@ -335,13 +335,13 @@ pub fn create_memory_with_storage_and_routes(
                 "memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)",
             )?;
 
-        let memory = PostgresMemory::new(
+        let memory = PostgresMemory::new_lazy(
             db_url,
             &storage_provider.schema,
             &storage_provider.table,
             storage_provider.connect_timeout_secs,
-            Some(storage_provider.pgvector_enabled),
-            Some(storage_provider.pgvector_dimensions),
+            storage_provider.pool_size,
+            storage_provider.tls_mode.as_deref(),
         )?;
         Ok(Box::new(memory))
     }

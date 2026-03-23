@@ -4540,6 +4540,15 @@ pub struct StorageProviderConfig {
     /// Vector dimensions for pgvector embeddings (default: 1536).
     #[serde(default = "default_pgvector_dimensions")]
     pub pgvector_dimensions: usize,
+
+    /// Connection pool size for pooled providers (e.g. postgres). Default: 4.
+    #[serde(default)]
+    pub pool_size: Option<usize>,
+
+    /// TLS mode for database connections: "disable", "prefer", or "require".
+    /// Default: auto-detect from connection URL sslmode parameter.
+    #[serde(default)]
+    pub tls_mode: Option<String>,
 }
 
 fn default_pgvector_dimensions() -> usize {
@@ -4564,6 +4573,8 @@ impl Default for StorageProviderConfig {
             connect_timeout_secs: None,
             pgvector_enabled: false,
             pgvector_dimensions: default_pgvector_dimensions(),
+            pool_size: None,
+            tls_mode: None,
         }
     }
 }
