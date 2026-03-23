@@ -101,9 +101,10 @@ impl VoicePipeline {
     ///
     /// `file_name` is used for format detection (e.g. `"voice.ogg"`).
     pub async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
-        let stt = self.stt.as_ref().context(
-            "STT is not configured — enable [transcription] in config.toml",
-        )?;
+        let stt = self
+            .stt
+            .as_ref()
+            .context("STT is not configured — enable [transcription] in config.toml")?;
         stt.transcribe(audio_data, file_name).await
     }
 
@@ -114,9 +115,10 @@ impl VoicePipeline {
         file_name: &str,
         provider: &str,
     ) -> Result<String> {
-        let stt = self.stt.as_ref().context(
-            "STT is not configured — enable [transcription] in config.toml",
-        )?;
+        let stt = self
+            .stt
+            .as_ref()
+            .context("STT is not configured — enable [transcription] in config.toml")?;
         stt.transcribe_with_provider(audio_data, file_name, provider)
             .await
     }
@@ -222,7 +224,10 @@ mod tests {
     #[tokio::test]
     async fn transcribe_errors_when_stt_disabled() {
         let pipeline = VoicePipeline::from_config(&base_config()).unwrap();
-        let err = pipeline.transcribe(b"audio", "voice.ogg").await.unwrap_err();
+        let err = pipeline
+            .transcribe(b"audio", "voice.ogg")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("STT is not configured"),
             "unexpected error: {err}"
