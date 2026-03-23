@@ -3265,9 +3265,12 @@ async fn process_channel_message(
         None
     };
 
-    let use_streaming = target_channel
-        .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates());
+    // Disable draft streaming for tmux-routed messages — the live polling task
+    // sends new messages directly instead of editing a draft in-place.
+    let use_streaming = !is_tmux_routed
+        && target_channel
+            .as_ref()
+            .is_some_and(|ch| ch.supports_draft_updates());
 
     tracing::debug!(
         channel = %msg.channel,

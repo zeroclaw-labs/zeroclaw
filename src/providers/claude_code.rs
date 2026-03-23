@@ -414,8 +414,10 @@ impl ClaudeCodeProvider {
 
             let snapshot = Self::tmux_capture_pane(target).await?;
 
-            // Check if output has new content beyond the before snapshot
-            let has_new_content = snapshot.lines().count() > before.lines().count();
+            // Check if the pane content differs from the baseline.
+            // Line-count comparison is unreliable when the terminal scrolls
+            // (pane height stays constant), so compare content directly.
+            let has_new_content = snapshot != before;
 
             // Check if the prompt has reappeared near the end.
             // Claude Code's status bar occupies the last few lines, so check
