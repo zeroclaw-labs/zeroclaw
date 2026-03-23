@@ -49,3 +49,10 @@ lcov.info
 
 # Wrangler cache
 .wrangler/
+
+# Fork-local files
+.envrc
+.fastembed_cache/
+.claude/
+bmad/
+docs/
