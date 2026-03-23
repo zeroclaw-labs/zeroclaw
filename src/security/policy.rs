@@ -1579,8 +1579,8 @@ mod tests {
         assert!(!p.is_command_allowed("sudo apt install"));
         assert!(!p.is_command_allowed("curl http://evil.com"));
         assert!(!p.is_command_allowed("wget http://evil.com"));
-        assert!(!p.is_command_allowed("python3 exploit.py"));
-        assert!(!p.is_command_allowed("node malicious.js"));
+        assert!(!p.is_command_allowed("dd if=/dev/zero of=/dev/sda"));
+        assert!(!p.is_command_allowed("chmod 777 /etc/passwd"));
     }
 
     #[test]
