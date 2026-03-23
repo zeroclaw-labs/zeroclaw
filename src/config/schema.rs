@@ -1328,7 +1328,7 @@ impl Default for AgentConfig {
 /// All fields are optional and default to values that preserve existing
 /// behavior. When set, they extend — not replace — the existing timeout
 /// and loop-detection subsystems.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PacingConfig {
     /// Per-step timeout in seconds: the maximum time allowed for a single
     /// LLM inference turn, independent of the total message budget.
@@ -1356,6 +1356,47 @@ pub struct PacingConfig {
     /// receive a proportionally larger budget without inflating the base timeout.
     #[serde(default)]
     pub message_timeout_scale_max: Option<u64>,
+
+    /// Enable pattern-based loop detection (exact repeat, ping-pong,
+    /// no-progress). Defaults to `true`.
+    #[serde(default = "default_loop_detection_enabled")]
+    pub loop_detection_enabled: bool,
+
+    /// Sliding window size for the pattern-based loop detector.
+    /// Defaults to 20.
+    #[serde(default = "default_loop_detection_window_size")]
+    pub loop_detection_window_size: usize,
+
+    /// Number of consecutive identical tool+args calls before the first
+    /// escalation (Warning). Defaults to 3.
+    #[serde(default = "default_loop_detection_max_repeats")]
+    pub loop_detection_max_repeats: usize,
+}
+
+fn default_loop_detection_enabled() -> bool {
+    true
+}
+
+fn default_loop_detection_window_size() -> usize {
+    20
+}
+
+fn default_loop_detection_max_repeats() -> usize {
+    3
+}
+
+impl Default for PacingConfig {
+    fn default() -> Self {
+        Self {
+            step_timeout_secs: None,
+            loop_detection_min_elapsed_secs: None,
+            loop_ignore_tools: Vec::new(),
+            message_timeout_scale_max: None,
+            loop_detection_enabled: default_loop_detection_enabled(),
+            loop_detection_window_size: default_loop_detection_window_size(),
+            loop_detection_max_repeats: default_loop_detection_max_repeats(),
+        }
+    }
 }
 
 /// Skills loading configuration (`[skills]` section).
@@ -2244,6 +2285,58 @@ pub struct WebFetchConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_web_fetch_timeout_secs")]
     pub timeout_secs: u64,
+    /// Firecrawl fallback configuration (`[web_fetch.firecrawl]`)
+    #[serde(default)]
+    pub firecrawl: FirecrawlConfig,
+}
+
+/// Firecrawl fallback mode: scrape a single page or crawl linked pages.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FirecrawlMode {
+    #[default]
+    Scrape,
+    Crawl,
+}
+
+/// Firecrawl fallback configuration for JS-heavy and bot-blocked sites.
+///
+/// When enabled, if the standard web fetch fails (HTTP error, empty body, or
+/// body shorter than 100 characters suggesting a JS-only page), the tool
+/// falls back to the Firecrawl API for stealth content extraction.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FirecrawlConfig {
+    /// Enable Firecrawl fallback
+    #[serde(default)]
+    pub enabled: bool,
+    /// Environment variable name for the Firecrawl API key
+    #[serde(default = "default_firecrawl_api_key_env")]
+    pub api_key_env: String,
+    /// Firecrawl API base URL
+    #[serde(default = "default_firecrawl_api_url")]
+    pub api_url: String,
+    /// Firecrawl extraction mode
+    #[serde(default)]
+    pub mode: FirecrawlMode,
+}
+
+fn default_firecrawl_api_key_env() -> String {
+    "FIRECRAWL_API_KEY".into()
+}
+
+fn default_firecrawl_api_url() -> String {
+    "https://api.firecrawl.dev/v1".into()
+}
+
+impl Default for FirecrawlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key_env: default_firecrawl_api_key_env(),
+            api_url: default_firecrawl_api_url(),
+            mode: FirecrawlMode::default(),
+        }
+    }
 }
 
 fn default_web_fetch_max_response_size() -> usize {
@@ -2266,6 +2359,7 @@ impl Default for WebFetchConfig {
             blocked_domains: vec![],
             max_response_size: default_web_fetch_max_response_size(),
             timeout_secs: default_web_fetch_timeout_secs(),
+            firecrawl: FirecrawlConfig::default(),
         }
     }
 }
@@ -14297,5 +14391,33 @@ require_otp_to_resume = true
             .await
             .unwrap();
         assert!(identity.contains("IDENTITY.md"));
+    }
+
+    // ── PacingConfig serde defaults ─────────────────────────────
+
+    #[test]
+    async fn pacing_config_serde_defaults_match_manual_default() {
+        // Deserialise an empty TOML table and verify the loop-detection
+        // fields receive the same defaults as `PacingConfig::default()`.
+        let from_toml: PacingConfig = toml::from_str("").unwrap();
+        let manual = PacingConfig::default();
+
+        assert_eq!(
+            from_toml.loop_detection_enabled,
+            manual.loop_detection_enabled
+        );
+        assert_eq!(
+            from_toml.loop_detection_window_size,
+            manual.loop_detection_window_size
+        );
+        assert_eq!(
+            from_toml.loop_detection_max_repeats,
+            manual.loop_detection_max_repeats
+        );
+
+        // Verify concrete values so a silent change to the defaults is caught.
+        assert!(from_toml.loop_detection_enabled, "default should be true");
+        assert_eq!(from_toml.loop_detection_window_size, 20);
+        assert_eq!(from_toml.loop_detection_max_repeats, 3);
     }
 }

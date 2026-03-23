@@ -6705,7 +6705,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             cost_tracking: None,
-            pacing: crate::config::PacingConfig::default(),
+            pacing: crate::config::PacingConfig {
+                loop_detection_enabled: false,
+                ..crate::config::PacingConfig::default()
+            },
         });
 
         process_channel_message(
@@ -6788,7 +6791,10 @@ BTC is currently around $65,000 based on latest tool output."#
             )),
             activated_tools: None,
             cost_tracking: None,
-            pacing: crate::config::PacingConfig::default(),
+            pacing: crate::config::PacingConfig {
+                loop_detection_enabled: false,
+                ..crate::config::PacingConfig::default()
+            },
         });
 
         process_channel_message(
