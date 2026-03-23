@@ -55,6 +55,7 @@ pub mod jira_tool;
 pub mod knowledge_tool;
 pub mod linkedin;
 pub mod linkedin_client;
+pub mod llm_task;
 pub mod mcp_client;
 pub mod mcp_deferred;
 pub mod mcp_protocol;
@@ -69,6 +70,7 @@ pub mod model_switch;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod pdf_read;
+pub mod poll;
 pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
@@ -133,6 +135,7 @@ pub use image_info::ImageInfoTool;
 pub use jira_tool::JiraTool;
 pub use knowledge_tool::KnowledgeTool;
 pub use linkedin::LinkedInTool;
+pub use llm_task::LlmTaskTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
@@ -146,10 +149,11 @@ pub use model_switch::ModelSwitchTool;
 pub use node_tool::NodeTool;
 pub use notion_tool::NotionTool;
 pub use pdf_read::PdfReadTool;
+pub use poll::{ChannelMapHandle, PollTool};
 pub use project_intel::ProjectIntelTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
-pub use reaction::{ChannelMapHandle, ReactionTool};
+pub use reaction::ReactionTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
@@ -291,7 +295,11 @@ pub fn register_skill_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -310,6 +318,7 @@ pub fn all_tools(
     Vec<Box<dyn Tool>>,
     Option<DelegateParentToolsHandle>,
     Option<ChannelMapHandle>,
+    ChannelMapHandle,
 ) {
     all_tools_with_runtime(
         config,
@@ -330,7 +339,11 @@ pub fn all_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio.
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -350,6 +363,7 @@ pub fn all_tools_with_runtime(
     Vec<Box<dyn Tool>>,
     Option<DelegateParentToolsHandle>,
     Option<ChannelMapHandle>,
+    ChannelMapHandle,
 ) {
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
@@ -403,6 +417,40 @@ pub fn all_tools_with_runtime(
                 tracing::warn!("discord_search: failed to open discord.db: {e}");
             }
         }
+    }
+
+    // LLM task tool — always registered when a provider is configured
+    {
+        let llm_task_provider = root_config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string());
+        let llm_task_model = root_config
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "openai/gpt-4o-mini".to_string());
+        let llm_task_runtime_options = crate::providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: root_config.api_url.clone(),
+            zeroclaw_dir: root_config
+                .config_path
+                .parent()
+                .map(std::path::PathBuf::from),
+            secrets_encrypt: root_config.secrets.encrypt,
+            reasoning_enabled: root_config.runtime.reasoning_enabled,
+            reasoning_effort: root_config.runtime.reasoning_effort.clone(),
+            provider_timeout_secs: Some(root_config.provider_timeout_secs),
+            extra_headers: root_config.extra_headers.clone(),
+            api_path: root_config.api_path.clone(),
+        };
+        tool_arcs.push(Arc::new(LlmTaskTool::new(
+            security.clone(),
+            llm_task_provider,
+            llm_task_model,
+            root_config.default_temperature,
+            root_config.api_key.clone(),
+            llm_task_runtime_options,
+        )));
     }
 
     if matches!(
@@ -474,6 +522,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.blocked_domains.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
+            web_fetch_config.firecrawl.clone(),
         )));
     }
 
@@ -646,6 +695,13 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    // Poll tool — always registered; uses late-bound channel map handle
+    let channel_map_handle: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
+    tool_arcs.push(Arc::new(PollTool::new(
+        security.clone(),
+        Arc::clone(&channel_map_handle),
+    )));
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tool_arcs.push(Arc::new(ComposioTool::new(
@@ -691,6 +747,7 @@ pub fn all_tools_with_runtime(
                     boxed_registry_from_arcs(tool_arcs),
                     None,
                     Some(reaction_handle),
+                    channel_map_handle,
                 );
             }
 
@@ -879,6 +936,7 @@ pub fn all_tools_with_runtime(
         boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
         Some(reaction_handle),
+        channel_map_handle,
     )
 }
 
@@ -923,7 +981,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -966,7 +1024,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1120,7 +1178,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1154,7 +1212,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1189,7 +1247,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
@@ -1224,7 +1282,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
