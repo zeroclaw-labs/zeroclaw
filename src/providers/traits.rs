@@ -9,6 +9,9 @@ use std::fmt::Write;
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Tool call ID for tool-role messages (OpenAI-compatible API requirement).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -16,6 +19,7 @@ impl ChatMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            tool_call_id: None,
         }
     }
 
@@ -23,6 +27,7 @@ impl ChatMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            tool_call_id: None,
         }
     }
 
@@ -30,6 +35,7 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            tool_call_id: None,
         }
     }
 
@@ -37,6 +43,15 @@ impl ChatMessage {
         Self {
             role: "tool".into(),
             content: content.into(),
+            tool_call_id: None,
+        }
+    }
+
+    pub fn tool_with_id(content: impl Into<String>, tool_call_id: impl Into<String>) -> Self {
+        Self {
+            role: "tool".into(),
+            content: content.into(),
+            tool_call_id: Some(tool_call_id.into()),
         }
     }
 }

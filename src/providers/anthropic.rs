@@ -1052,14 +1052,17 @@ mod tests {
             ChatMessage {
                 role: "system".to_string(),
                 content: "System prompt".to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
                 content: "Hi".to_string(),
+                tool_call_id: None,
             },
         ];
         // Only 2 non-system messages
@@ -1071,12 +1074,14 @@ mod tests {
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
             content: "System prompt".to_string(),
+            tool_call_id: None,
         }];
         // Add 5 non-system messages
         for i in 0..5 {
             messages.push(ChatMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("Message {i}"),
+                tool_call_id: None,
             });
         }
         assert!(AnthropicProvider::should_cache_conversation(&messages));
@@ -1090,6 +1095,7 @@ mod tests {
             messages.push(ChatMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("Message {i}"),
+                tool_call_id: None,
             });
         }
         assert!(!AnthropicProvider::should_cache_conversation(&messages));
@@ -1098,6 +1104,7 @@ mod tests {
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: "One more".to_string(),
+            tool_call_id: None,
         });
         assert!(AnthropicProvider::should_cache_conversation(&messages));
     }
@@ -1215,6 +1222,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "system".to_string(),
             content: "Short system prompt".to_string(),
+            tool_call_id: None,
         }];
 
         let (system_prompt, _) = AnthropicProvider::convert_messages(&messages);
@@ -1233,6 +1241,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "system".to_string(),
             content: large_content.clone(),
+            tool_call_id: None,
         }];
 
         let (system_prompt, _) = AnthropicProvider::convert_messages(&messages);
@@ -1283,18 +1292,22 @@ mod tests {
             ChatMessage {
                 role: "system".to_string(),
                 content: "You are helpful.".to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "gen a 2 sum in golang".to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
-                content: "```go\nfunc twoSum(nums []int) {}\n```".to_string(),
+                content: "```go\nfunc twoSum(nums []int) {\n}\n```".to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "what's meaning of make here?".to_string(),
+                tool_call_id: None,
             },
         ];
 
@@ -1478,6 +1491,7 @@ mod tests {
             role: "user".to_string(),
             content: "Check this image: [IMAGE:data:image/jpeg;base64,/9j/4AAQ] What do you see?"
                 .to_string(),
+            tool_call_id: None,
         }];
 
         let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
@@ -1516,6 +1530,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "[IMAGE:data:image/png;base64,iVBORw0KGgo]".to_string(),
+            tool_call_id: None,
         }];
 
         let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
@@ -1545,6 +1560,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "Hello, how are you?".to_string(),
+            tool_call_id: None,
         }];
 
         let (_, native_msgs) = AnthropicProvider::convert_messages(&messages);
@@ -1589,10 +1605,12 @@ mod tests {
             ChatMessage {
                 role: "system".to_string(),
                 content: "You are helpful.".to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "Do two things.".to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -1604,6 +1622,7 @@ mod tests {
                     ]
                 })
                 .to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -1612,6 +1631,7 @@ mod tests {
                     "content": "file1.txt\nfile2.txt"
                 })
                 .to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -1620,6 +1640,7 @@ mod tests {
                     "content": "/home/user"
                 })
                 .to_string(),
+                tool_call_id: None,
             },
         ];
 
@@ -1654,6 +1675,7 @@ mod tests {
             ChatMessage {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "assistant".to_string(),
@@ -1664,6 +1686,7 @@ mod tests {
                     ]
                 })
                 .to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "tool".to_string(),
@@ -1672,10 +1695,12 @@ mod tests {
                     "content": "hi"
                 })
                 .to_string(),
+                tool_call_id: None,
             },
             ChatMessage {
                 role: "user".to_string(),
                 content: "Thanks!".to_string(),
+                tool_call_id: None,
             },
         ];
 

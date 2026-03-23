@@ -593,6 +593,12 @@ struct ResponsesRequest {
     instructions: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -648,15 +654,34 @@ struct ResponsesResponse {
 
 #[derive(Debug, Deserialize)]
 struct ResponsesOutput {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
     #[serde(default)]
     content: Vec<ResponsesContent>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ResponsesContent {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     kind: Option<String>,
+    #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 // ---------------------------------------------------------------
@@ -849,7 +874,7 @@ fn build_responses_prompt(messages: &[ChatMessage]) -> (Option<String>, Vec<Resp
     (instructions, input)
 }
 
-fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
+fn extract_responses_text(response: &ResponsesResponse) -> Option<String> {
     if let Some(text) = first_nonempty(response.output_text.as_deref()) {
         return Some(text);
     }
@@ -873,6 +898,84 @@ fn extract_responses_text(response: ResponsesResponse) -> Option<String> {
     }
 
     None
+}
+
+fn extract_responses_tool_calls(response: &ResponsesResponse) -> Vec<ProviderToolCall> {
+    let mut tool_calls = Vec::new();
+
+    for item in &response.output {
+        if matches!(item.kind.as_deref(), Some("function_call" | "tool_call")) {
+            if let Some(name) = item.name.clone() {
+                tool_calls.push(ProviderToolCall {
+                    id: item
+                        .call_id
+                        .clone()
+                        .or_else(|| item.id.clone())
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    name,
+                    arguments: item.arguments.clone().unwrap_or_else(|| "{}".to_string()),
+                });
+            }
+        }
+
+        for content in &item.content {
+            if matches!(content.kind.as_deref(), Some("function_call" | "tool_call")) {
+                if let Some(name) = content.name.clone() {
+                    tool_calls.push(ProviderToolCall {
+                        id: content
+                            .call_id
+                            .clone()
+                            .or_else(|| content.id.clone())
+                            .or_else(|| item.call_id.clone())
+                            .or_else(|| item.id.clone())
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        name,
+                        arguments: content
+                            .arguments
+                            .clone()
+                            .unwrap_or_else(|| "{}".to_string()),
+                    });
+                }
+            }
+        }
+    }
+
+    tool_calls
+}
+
+fn extract_responses_chat_response(response: ResponsesResponse) -> ProviderChatResponse {
+    ProviderChatResponse {
+        text: extract_responses_text(&response),
+        tool_calls: extract_responses_tool_calls(&response),
+        usage: None,
+        reasoning_content: None,
+    }
+}
+
+fn provider_chat_response_to_text(response: ProviderChatResponse) -> anyhow::Result<String> {
+    if !response.tool_calls.is_empty() {
+        let tool_calls = response
+            .tool_calls
+            .into_iter()
+            .map(|tool_call| {
+                serde_json::json!({
+                    "id": tool_call.id,
+                    "name": tool_call.name,
+                    "arguments": tool_call.arguments,
+                })
+            })
+            .collect::<Vec<_>>();
+        return serde_json::to_string(&serde_json::json!({
+            "content": response.text,
+            "tool_calls": tool_calls,
+            "reasoning_content": response.reasoning_content,
+        }))
+        .map_err(Into::into);
+    }
+
+    response
+        .text
+        .ok_or_else(|| anyhow::anyhow!("Responses API returned neither text nor tool calls"))
 }
 
 fn compact_sanitized_body_snippet(body: &str) -> String {
@@ -920,8 +1023,9 @@ impl OpenAiCompatibleProvider {
         &self,
         credential: &str,
         messages: &[ChatMessage],
+        tools: Option<&[crate::tools::ToolSpec]>,
         model: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<ProviderChatResponse> {
         let (instructions, input) = build_responses_prompt(messages);
         if input.is_empty() {
             anyhow::bail!(
@@ -930,11 +1034,15 @@ impl OpenAiCompatibleProvider {
             );
         }
 
+        let converted_tools = Self::convert_tool_specs(tools);
         let request = ResponsesRequest {
             model: model.to_string(),
             input,
             instructions,
             stream: Some(false),
+            tool_choice: converted_tools.as_ref().map(|_| "auto".to_string()),
+            parallel_tool_calls: converted_tools.as_ref().map(|_| true),
+            tools: converted_tools,
         };
 
         let url = self.responses_url();
@@ -952,8 +1060,12 @@ impl OpenAiCompatibleProvider {
         let body = response.text().await?;
         let responses = parse_responses_response_body(&self.name, &body)?;
 
-        extract_responses_text(responses)
-            .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
+        let chat_response = extract_responses_chat_response(responses);
+        if chat_response.text.is_none() && chat_response.tool_calls.is_empty() {
+            anyhow::bail!("No response from {} Responses API", self.name);
+        }
+
+        Ok(chat_response)
     }
 
     fn convert_tool_specs(
@@ -1262,8 +1374,9 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &fallback_messages, model)
+                        .chat_via_responses(credential, &fallback_messages, None, model)
                         .await
+                        .and_then(provider_chat_response_to_text)
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
                                 "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
@@ -1283,8 +1396,9 @@ impl Provider for OpenAiCompatibleProvider {
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &fallback_messages, model)
+                    .chat_via_responses(credential, &fallback_messages, None, model)
                     .await
+                    .and_then(provider_chat_response_to_text)
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
                             "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
@@ -1372,8 +1486,9 @@ impl Provider for OpenAiCompatibleProvider {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
                     return self
-                        .chat_via_responses(credential, &effective_messages, model)
+                        .chat_via_responses(credential, &effective_messages, None, model)
                         .await
+                        .and_then(provider_chat_response_to_text)
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
                                 "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
@@ -1392,8 +1507,9 @@ impl Provider for OpenAiCompatibleProvider {
             // Mirror chat_with_system: 404 may mean this provider uses the Responses API
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
                 return self
-                    .chat_via_responses(credential, &effective_messages, model)
+                    .chat_via_responses(credential, &effective_messages, None, model)
                     .await
+                    .and_then(provider_chat_response_to_text)
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
                             "{} API error (chat completions unavailable; responses fallback failed: {responses_err})",
@@ -1588,15 +1704,14 @@ impl Provider for OpenAiCompatibleProvider {
             Err(chat_error) => {
                 if self.supports_responses_fallback {
                     let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    tracing::warn!(
+                        provider = %self.name,
+                        error = %sanitized,
+                        "native chat transport failed; falling back to responses API"
+                    );
                     return self
-                        .chat_via_responses(credential, &effective_messages, model)
+                        .chat_via_responses(credential, &effective_messages, request.tools, model)
                         .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            usage: None,
-                            reasoning_content: None,
-                        })
                         .map_err(|responses_err| {
                             anyhow::anyhow!(
                                 "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
@@ -1615,6 +1730,29 @@ impl Provider for OpenAiCompatibleProvider {
             let sanitized = super::sanitize_api_error(&error);
 
             if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+                tracing::warn!(
+                    provider = %self.name,
+                    status = %status,
+                    error = %sanitized,
+                    "native tool schema unsupported; trying responses API fallback"
+                );
+                if self.supports_responses_fallback {
+                    match self
+                        .chat_via_responses(credential, &effective_messages, request.tools, model)
+                        .await
+                    {
+                        Ok(response) => return Ok(response),
+                        Err(responses_err) => {
+                            tracing::warn!(
+                                provider = %self.name,
+                                status = %status,
+                                error = %responses_err,
+                                "responses API fallback failed after native tool schema rejection; falling back to prompt-guided history mode"
+                            );
+                        }
+                    }
+                }
+
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
@@ -1629,15 +1767,14 @@ impl Provider for OpenAiCompatibleProvider {
             }
 
             if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
+                tracing::warn!(
+                    provider = %self.name,
+                    status = %status,
+                    "chat completions endpoint unavailable; falling back to responses API"
+                );
                 return self
-                    .chat_via_responses(credential, &effective_messages, model)
+                    .chat_via_responses(credential, &effective_messages, request.tools, model)
                     .await
-                    .map(|text| ProviderChatResponse {
-                        text: Some(text),
-                        tool_calls: vec![],
-                        usage: None,
-                        reasoning_content: None,
-                    })
                     .map_err(|responses_err| {
                         anyhow::anyhow!(
                             "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
@@ -1958,7 +2095,7 @@ mod tests {
         let json = r#"{"output_text":"Hello from top-level","output":[]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Hello from top-level")
         );
     }
@@ -1969,7 +2106,7 @@ mod tests {
             r#"{"output":[{"content":[{"type":"output_text","text":"Hello from nested"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Hello from nested")
         );
     }
@@ -1979,9 +2116,42 @@ mod tests {
         let json = r#"{"output":[{"content":[{"type":"message","text":"Fallback text"}]}]}"#;
         let response: ResponsesResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            extract_responses_text(response).as_deref(),
+            extract_responses_text(&response).as_deref(),
             Some("Fallback text")
         );
+    }
+
+    #[test]
+    fn responses_extracts_top_level_function_call() {
+        let json = r#"{"output":[{"type":"function_call","call_id":"call_1","name":"shell","arguments":"{\"command\":\"pwd\"}"}]}"#;
+        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
+        let tool_calls = extract_responses_tool_calls(&response);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "shell");
+        assert_eq!(tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[test]
+    fn responses_extracts_nested_function_call() {
+        let json = r#"{"output":[{"content":[{"type":"function_call","id":"item_1","name":"file_read","arguments":"{\"path\":\"README.md\"}"}]}]}"#;
+        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
+        let tool_calls = extract_responses_tool_calls(&response);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "item_1");
+        assert_eq!(tool_calls[0].name, "file_read");
+        assert_eq!(tool_calls[0].arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn responses_chat_response_preserves_text_and_tool_calls() {
+        let json = r#"{"output_text":"Need to inspect","output":[{"type":"function_call","call_id":"call_42","name":"shell","arguments":"{\"command\":\"ls\"}"}]}"#;
+        let response: ResponsesResponse = serde_json::from_str(json).unwrap();
+        let parsed = extract_responses_chat_response(response);
+        assert_eq!(parsed.text.as_deref(), Some("Need to inspect"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].id, "call_42");
+        assert_eq!(parsed.tool_calls[0].name, "shell");
     }
 
     #[test]
@@ -2045,13 +2215,161 @@ mod tests {
     async fn chat_via_responses_requires_non_system_message() {
         let provider = make_provider("custom", "https://api.example.com", Some("test-key"));
         let err = provider
-            .chat_via_responses("test-key", &[ChatMessage::system("policy")], "gpt-test")
+            .chat_via_responses(
+                "test-key",
+                &[ChatMessage::system("policy")],
+                None,
+                "gpt-test",
+            )
             .await
             .expect_err("system-only fallback payload should fail");
 
         assert!(err
             .to_string()
             .contains("requires at least one non-system message"));
+    }
+
+    #[tokio::test]
+    async fn chat_falls_back_to_responses_on_404_and_preserves_tool_calls() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output_text": "Using tool",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_resp",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"pwd\"}"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = make_provider("custom", &format!("{}/v1", server.uri()), Some("test-key"));
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let messages = vec![ChatMessage::user("use shell")];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect("404 fallback should succeed");
+
+        assert_eq!(response.text.as_deref(), Some("Using tool"));
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_resp");
+        assert_eq!(response.tool_calls[0].name, "shell");
+        assert_eq!(response.tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[tokio::test]
+    async fn chat_falls_back_to_responses_on_unsupported_tool_schema_and_preserves_tool_calls() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("unknown parameter: tools"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output_text": "Using tool after schema fallback",
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_schema",
+                    "name": "shell",
+                    "arguments": "{\"command\":\"pwd\"}"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = make_provider("custom", &format!("{}/v1", server.uri()), Some("test-key"));
+        let tools = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let messages = vec![ChatMessage::user("use shell")];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect("unsupported tool schema fallback should succeed");
+
+        assert_eq!(
+            response.text.as_deref(),
+            Some("Using tool after schema fallback")
+        );
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_schema");
+        assert_eq!(response.tool_calls[0].name, "shell");
+        assert_eq!(response.tool_calls[0].arguments, r#"{"command":"pwd"}"#);
+    }
+
+    #[tokio::test]
+    async fn chat_via_responses_preserves_tool_calls() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "output": [{
+                    "type": "function_call",
+                    "call_id": "call_direct",
+                    "name": "file_read",
+                    "arguments": "{\"path\":\"Cargo.toml\"}"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = make_provider("custom", &format!("{}/v1", server.uri()), Some("test-key"));
+        let response = provider
+            .chat_via_responses(
+                "test-key",
+                &[ChatMessage::user("read file")],
+                None,
+                "gpt-test",
+            )
+            .await
+            .expect("responses fallback should succeed");
+
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_direct");
+        assert_eq!(response.tool_calls[0].name, "file_read");
+        assert_eq!(response.tool_calls[0].arguments, r#"{"path":"Cargo.toml"}"#);
     }
 
     #[test]
@@ -2703,6 +3021,7 @@ mod tests {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
             content: "hello".to_string(),
+            tool_call_id: None,
         }];
         let tools = vec![serde_json::json!({
             "type": "function",

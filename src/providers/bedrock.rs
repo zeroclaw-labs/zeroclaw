@@ -1398,6 +1398,7 @@ mod tests {
             messages.push(ChatMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("Message {i}"),
+                tool_call_id: None,
             });
         }
         assert!(BedrockProvider::should_cache_conversation(&messages));
@@ -1593,6 +1594,7 @@ mod tests {
             ChatMessage {
                 role: "tool".to_string(),
                 content: "not valid json".to_string(),
+                tool_call_id: None,
             },
         ];
         let (_, msgs) = BedrockProvider::convert_messages(&messages);
@@ -1615,6 +1617,7 @@ mod tests {
             ChatMessage {
                 role: "tool".to_string(),
                 content: "raw output with no json".to_string(),
+                tool_call_id: None,
             },
         ];
         let (_, msgs) = BedrockProvider::convert_messages(&messages);
