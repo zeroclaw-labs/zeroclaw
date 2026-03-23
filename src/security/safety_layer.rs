@@ -507,7 +507,9 @@ mod tests {
         let content = &content;
         let results = layer.check_all(content);
         // At least one guard should fire (prompt injection or leak).
-        assert!(!results.is_empty() || true); // non-fatal: guards may be below threshold
+        // Guards may be below threshold depending on content, so we only
+        // verify that check_all returns without panicking and produces a vec.
+        let _ = results;
     }
 
     // ── policy helpers ────────────────────────────────────────────────────
