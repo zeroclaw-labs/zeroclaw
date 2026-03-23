@@ -90,27 +90,13 @@ export default function AgentChat() {
         }
 
         case 'tool_call':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: `${t('agent.tool_call_prefix')} ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
-              timestamp: new Date(),
-            },
-          ]);
+          // Intermediate tool invocations are not surfaced as chat messages.
+          // The final consolidated response is delivered via the 'done' event.
           break;
 
         case 'tool_result':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              timestamp: new Date(),
-            },
-          ]);
+          // Tool results are internal agent steps; suppress them as chat messages
+          // so the user receives a single consolidated reply per request.
           break;
 
         case 'error':
