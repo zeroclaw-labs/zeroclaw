@@ -102,7 +102,12 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     info!("Phase 2/6: Downloading...");
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let download_path = temp_dir.path().join("zeroclaw_new");
-    download_binary(&download_url, update_info.sha256sums_url.as_deref(), &download_path).await?;
+    download_binary(
+        &download_url,
+        update_info.sha256sums_url.as_deref(),
+        &download_path,
+    )
+    .await?;
 
     // Phase 3: Backup
     info!("Phase 3/6: Creating backup...");
@@ -173,10 +178,7 @@ fn find_sha256sums_url(release: &serde_json::Value) -> Option<String> {
     release["assets"].as_array()?.iter().find_map(|asset| {
         let name = asset["name"].as_str()?;
         let lower = name.to_ascii_lowercase();
-        if lower == "sha256sums"
-            || lower == "sha256sums.txt"
-            || lower.ends_with(".sha256sums")
-        {
+        if lower == "sha256sums" || lower == "sha256sums.txt" || lower.ends_with(".sha256sums") {
             asset["browser_download_url"].as_str().map(String::from)
         } else {
             None
