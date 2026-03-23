@@ -8844,6 +8844,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8877,6 +8878,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8916,6 +8918,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -10483,6 +10486,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
     }
@@ -10499,6 +10503,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: Some("$thread1".into()),
             interruption_scope_id: Some("$thread1".into()),
             attachments: vec![],
+            observe_group: false,
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
     }
@@ -10516,6 +10521,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
             interruption_scope_id: None,                 // but NOT a thread reply
             attachments: vec![],
+            observe_group: false,
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
     }
@@ -10595,6 +10601,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -10609,6 +10616,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: Some("1741234567.200002".to_string()),
                 interruption_scope_id: Some("1741234567.200002".to_string()),
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();

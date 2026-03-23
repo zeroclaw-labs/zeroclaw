@@ -79,7 +79,6 @@ mod tests {
                 recipient: "user".into(),
                 subject: None,
                 thread_ts: None,
-                observe_group: false,
             })
             .await;
         assert!(result.is_ok());
@@ -94,7 +93,6 @@ mod tests {
                 recipient: String::new(),
                 subject: None,
                 thread_ts: None,
-                observe_group: false,
             })
             .await;
         assert!(result.is_ok());

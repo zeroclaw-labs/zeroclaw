@@ -229,6 +229,7 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -247,6 +248,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         let cloned = message.clone();
