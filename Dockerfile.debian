@@ -38,15 +38,18 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
-# Include every workspace member: Cargo.lock is generated for the full workspace.
-# Previously we used sed to drop `crates/robot-kit`, which made the manifest disagree
-# with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
-COPY crates/robot-kit/ crates/robot-kit/
+# Copy workspace member manifests separately to avoid cache busting on source changes.
+COPY crates/robot-kit/Cargo.toml crates/robot-kit/Cargo.toml
+COPY crates/aardvark-sys/Cargo.toml crates/aardvark-sys/Cargo.toml
+
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
-RUN mkdir -p src benches \
+RUN mkdir -p src benches crates/robot-kit/src crates/aardvark-sys/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
-    && echo "fn main() {}" > benches/agent_benchmarks.rs
+    && echo "fn main() {}" > benches/agent_benchmarks.rs \
+    && echo "" > crates/robot-kit/src/lib.rs \
+    && echo "" > crates/aardvark-sys/src/lib.rs
+
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
@@ -55,16 +58,30 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     else \
       cargo build --release --locked; \
     fi
-RUN rm -rf src benches
+RUN rm -rf src benches crates/robot-kit/src crates/aardvark-sys/src
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
 COPY src/ src/
 COPY benches/ benches/
+COPY crates/ crates/
 COPY --from=web-builder /web/dist web/dist
 RUN touch src/main.rs
+
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
+    # Explicitly remove dummy artifacts for the main crate and local workspace members.
+    # This prevents the final build from failing due to linker or metadata conflicts
+    # when using the persistent target cache mount across dummy/real builds.
+    rm -rf target/release/.fingerprint/aardvark_sys-* \
+           target/release/.fingerprint/zeroclawlabs-* \
+           target/release/.fingerprint/zeroclaw_robot_kit-* \
+           target/release/deps/aardvark_sys-* \
+           target/release/deps/zeroclawlabs-* \
+           target/release/deps/zeroclaw_robot_kit-* \
+           target/release/incremental/aardvark_sys-* \
+           target/release/incremental/zeroclawlabs-* \
+           target/release/incremental/zeroclaw_robot_kit-* && \
     if [ -n "$ZEROCLAW_CARGO_FEATURES" ]; then \
       cargo build --release --locked --features "$ZEROCLAW_CARGO_FEATURES"; \
     else \
