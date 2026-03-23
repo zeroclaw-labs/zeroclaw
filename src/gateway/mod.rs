@@ -2380,6 +2380,7 @@ mod tests {
             timestamp: 1,
             thread_ts: None,
             interruption_scope_id: None,
+            observe_group: false,
         };
 
         let key = whatsapp_memory_key(&msg);

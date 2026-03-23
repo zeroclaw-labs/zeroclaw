@@ -209,6 +209,7 @@ mod tests {
                 timestamp: 123,
                 thread_ts: None,
                 interruption_scope_id: None,
+                observe_group: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -226,6 +227,7 @@ mod tests {
             timestamp: 999,
             thread_ts: None,
             interruption_scope_id: None,
+            observe_group: false,
         };
 
         let cloned = message.clone();

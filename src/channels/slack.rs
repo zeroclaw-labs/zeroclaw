@@ -3622,6 +3622,7 @@ mod tests {
             timestamp: 0,
             thread_ts: None, // thread_replies=false → no fallback to ts
             interruption_scope_id: None,
+            observe_group: false,
         };
 
         let msg1 = make_msg("100.000");
@@ -3647,6 +3648,7 @@ mod tests {
             timestamp: 0,
             thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
             interruption_scope_id: None,
+            observe_group: false,
         };
 
         let msg1 = make_msg("100.000");
