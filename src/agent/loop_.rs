@@ -2491,7 +2491,7 @@ async fn execute_one_tool(
             tracing::info!(
                 tool = call_name,
                 success = r.success,
-                duration_ms = duration.as_millis() as u64,
+                duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                 "Tool execution completed"
             );
             observer.record_event(&ObserverEvent::ToolCall {

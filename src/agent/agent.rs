@@ -580,12 +580,7 @@ impl Agent {
 
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
-        let args_preview: String = call
-            .arguments
-            .to_string()
-            .chars()
-            .take(200)
-            .collect();
+        let args_preview: String = call.arguments.to_string().chars().take(200).collect();
         tracing::info!(tool = %call.name, args = %args_preview, "Tool call started");
 
         let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
