@@ -2663,6 +2663,14 @@ pub(crate) async fn run_tool_call_loop(
     let mut consecutive_identical_outputs: usize = 0;
     let mut last_tool_output_hash: Option<u64> = None;
 
+    let mut loop_detector = crate::agent::loop_detector::LoopDetector::new(
+        crate::agent::loop_detector::LoopDetectorConfig {
+            enabled: pacing.loop_detection_enabled,
+            window_size: pacing.loop_detection_window_size,
+            max_repeats: pacing.loop_detection_max_repeats,
+        },
+    );
+
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -3365,9 +3373,54 @@ pub(crate) async fn run_tool_call_loop(
         // Collect tool results and build per-tool output for loop detection.
         // Only non-ignored tool outputs contribute to the identical-output hash.
         let mut detection_relevant_output = String::new();
-        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+        // Use enumerate *before* filter_map so result_index stays aligned with
+        // tool_calls even when some ordered_results entries are None.
+        for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, opt)| opt.map(|v| (i, v)))
+        {
             if !loop_ignore_tools.contains(tool_name.as_str()) {
                 detection_relevant_output.push_str(&outcome.output);
+
+                // Feed the pattern-based loop detector with name + args + result.
+                let args = tool_calls
+                    .get(result_index)
+                    .map(|c| &c.arguments)
+                    .unwrap_or(&serde_json::Value::Null);
+                let det_result = loop_detector.record(&tool_name, args, &outcome.output);
+                match det_result {
+                    crate::agent::loop_detector::LoopDetectionResult::Ok => {}
+                    crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
+                        tracing::warn!(tool = %tool_name, %msg, "loop detector warning");
+                        // Inject a system nudge so the LLM adjusts strategy.
+                        history.push(ChatMessage::system(format!("[Loop Detection] {msg}")));
+                    }
+                    crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
+                        tracing::warn!(tool = %tool_name, %msg, "loop detector blocked tool call");
+                        // Replace the tool output with the block message.
+                        // We still continue the loop so the LLM sees the block feedback.
+                        history.push(ChatMessage::system(format!(
+                            "[Loop Detection — BLOCKED] {msg}"
+                        )));
+                    }
+                    crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
+                        runtime_trace::record_event(
+                            "loop_detector_circuit_breaker",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(false),
+                            Some(&msg),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "tool": tool_name,
+                            }),
+                        );
+                        anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    }
+                }
             }
             individual_results.push((tool_call_id, outcome.output.clone()));
             let _ = writeln!(
