@@ -42,6 +42,7 @@ When `gateway.path_prefix` is set, all routes are nested under that prefix via `
 ## WebSocket Protocol
 
 ### `/ws/chat` (subprotocol: `zeroclaw.v1`)
+
 ```
 Server->Client: {"type":"session_start","session_id":"...","resumed":true,"message_count":42}
 Client->Server: {"type":"connect","session_id":"...","device_name":"...","capabilities":[...]}  (optional first frame)
@@ -54,6 +55,7 @@ Server->Client: {"type":"done","full_response":"..."}
 First frame can be `{"type":"connect",...}` for session/device negotiation or `{"type":"message",...}` (backward-compatible). Session ID from query param `?session_id=` or connect frame. Sessions optionally persisted to SQLite.
 
 ### `/ws/nodes` (subprotocol: `zeroclaw.nodes.v1`)
+
 ```
 Node->Gateway:    {"type":"register","node_id":"phone-1","capabilities":[{"name":"camera.snap",...}]}
 Gateway->Node:    {"type":"registered","node_id":"phone-1","capabilities_count":1}

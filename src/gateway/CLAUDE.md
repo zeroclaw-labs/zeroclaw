@@ -9,6 +9,7 @@
 - Feature-gated code (`plugins-wasm`) must stay behind `#[cfg(feature = ...)]` — test with `cargo check` (no features) to verify.
 
 ## Linked References
+
 - `@AGENTS.md` — primary agent instructions for this subsystem
 - `@docs/contributing/change-playbooks.md` — gateway change checklist
 - `@src/security/` — `PairingGuard`, `SecurityPolicy`, secret store

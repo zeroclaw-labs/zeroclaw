@@ -9,5 +9,6 @@
 - `battle_tests` module runs cross-backend integration tests; do not skip these for backend changes.
 
 ## Linked References
+
 - `@AGENTS.md` — primary agent instructions for this subsystem
 - `@docs/contributing/change-playbooks.md`
