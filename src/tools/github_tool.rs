@@ -944,7 +944,7 @@ impl Tool for GitHubTool {
             "create_issue" | "comment_issue" | "create_pr" | "merge_pr" | "trigger_workflow" => {
                 ToolOperation::Act
             }
-            _ => unreachable!("action should be validated by is_action_allowed"),
+            _ => ToolOperation::Read,
         };
 
         if let Err(error) = self.security.enforce_tool_operation(security_op, "github") {
@@ -969,10 +969,24 @@ impl Tool for GitHubTool {
                         error: Some("owner and repo are required for get_repo".to_string()),
                     });
                 }
-                self.get_repo(owner, repo).await
+                Ok(self
+                    .get_repo(owner, repo)
+                    .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
-            "list_repos" => self.list_repos(owner, args["type"].as_str()).await,
+            "list_repos" => Ok(self
+                .list_repos(owner, args["type"].as_str())
+                .await
+                .unwrap_or_else(|e| ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e.to_string()),
+                })),
 
             "list_issues" => {
                 let owner = owner.unwrap_or_default();
@@ -988,8 +1002,14 @@ impl Tool for GitHubTool {
                 let state = args["state"].as_str();
                 let max_results = args["max_results"].as_u64().map(|n| n as u32);
 
-                self.list_issues(owner, repo, state, labels, max_results)
+                Ok(self
+                    .list_issues(owner, repo, state, labels, max_results)
                     .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             "get_issue" => {
@@ -1005,7 +1025,14 @@ impl Tool for GitHubTool {
                         ),
                     });
                 }
-                self.get_issue(owner, repo, issue_number).await
+                Ok(self
+                    .get_issue(owner, repo, issue_number)
+                    .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             "create_issue" => {
@@ -1030,8 +1057,14 @@ impl Tool for GitHubTool {
                     .as_str()
                     .and_then(|s| serde_json::from_str(s).ok());
 
-                self.create_issue(owner, repo, title, body, labels, assignees)
+                Ok(self
+                    .create_issue(owner, repo, title, body, labels, assignees)
                     .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             "comment_issue" => {
@@ -1049,7 +1082,14 @@ impl Tool for GitHubTool {
                         ),
                     });
                 }
-                self.comment_issue(owner, repo, issue_number, body).await
+                Ok(self
+                    .comment_issue(owner, repo, issue_number, body)
+                    .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             "list_prs" => {
@@ -1063,7 +1103,14 @@ impl Tool for GitHubTool {
                     });
                 }
                 let state = args["state"].as_str();
-                self.list_prs(owner, repo, state).await
+                Ok(self
+                    .list_prs(owner, repo, state)
+                    .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             "get_pr" => {
@@ -1082,7 +1129,14 @@ impl Tool for GitHubTool {
                         ),
                     });
                 }
-                self.get_pr(owner, repo, pr_number).await
+                Ok(self
+                    .get_pr(owner, repo, pr_number)
+                    .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             "merge_pr" => {
@@ -1105,15 +1159,21 @@ impl Tool for GitHubTool {
                 let commit_message = args["commit_message"].as_str().filter(|s| !s.is_empty());
                 let merge_method = args["merge_method"].as_str().filter(|s| !s.is_empty());
 
-                self.merge_pr(
-                    owner,
-                    repo,
-                    pr_number,
-                    commit_title,
-                    commit_message,
-                    merge_method,
-                )
-                .await
+                Ok(self
+                    .merge_pr(
+                        owner,
+                        repo,
+                        pr_number,
+                        commit_title,
+                        commit_message,
+                        merge_method,
+                    )
+                    .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             "list_workflows" => {
@@ -1126,7 +1186,14 @@ impl Tool for GitHubTool {
                         error: Some("owner and repo are required for list_workflows".to_string()),
                     });
                 }
-                self.list_workflows(owner, repo).await
+                Ok(self
+                    .list_workflows(owner, repo)
+                    .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             "list_runs" => {
@@ -1142,7 +1209,14 @@ impl Tool for GitHubTool {
                 let workflow_id = args["workflow_id"].as_str().filter(|s| !s.is_empty());
                 let branch = args["branch"].as_str().filter(|s| !s.is_empty());
 
-                self.list_runs(owner, repo, workflow_id, branch).await
+                Ok(self
+                    .list_runs(owner, repo, workflow_id, branch)
+                    .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             "trigger_workflow" => {
@@ -1164,8 +1238,14 @@ impl Tool for GitHubTool {
                     .as_object()
                     .map(|m| serde_json::Value::Object(m.clone()));
 
-                self.trigger_workflow(owner, repo, workflow_id, ref_, inputs)
+                Ok(self
+                    .trigger_workflow(owner, repo, workflow_id, ref_, inputs)
                     .await
+                    .unwrap_or_else(|e| ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(e.to_string()),
+                    }))
             }
 
             _ => Ok(ToolResult {
@@ -1245,5 +1325,305 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"].as_object().is_some());
         assert!(schema["properties"]["action"].as_object().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_get_repo_success() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let repo_response = json!({
+            "name": "test-repo",
+            "full_name": "test-owner/test-repo",
+            "description": "A test repository",
+            "private": false,
+            "html_url": "https://github.com/test-owner/test-repo",
+            "default_branch": "main",
+            "stargazers_count": 100,
+            "forks_count": 10,
+            "open_issues_count": 5,
+            "language": "Rust",
+            "pushed_at": "2024-01-01T00:00:00Z",
+            "topics": ["rust", "testing"]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/repos/test-owner/test-repo"))
+            .and(header("Authorization", "Bearer test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&repo_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = GitHubConfig {
+            enabled: true,
+            token: "test-token".to_string(),
+            api_url: mock_server.uri(),
+            allowed_actions: vec!["get_repo".to_string()],
+            timeout_secs: 30,
+            default_owner: None,
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = GitHubTool::new(config, security);
+
+        let result = tool
+            .execute(json!({
+                "action": "get_repo",
+                "owner": "test-owner",
+                "repo": "test-repo"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "get_repo should succeed: {:?}",
+            result.error
+        );
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["name"], "test-repo");
+        assert_eq!(output["full_name"], "test-owner/test-repo");
+        assert_eq!(output["stargazers_count"], 100);
+    }
+
+    #[tokio::test]
+    async fn test_get_repo_not_found() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/repos/nonexistent/repo"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "message": "Not Found",
+                "documentation_url": "https://docs.github.com/rest/repos/repos#get-a-repository"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let config = GitHubConfig {
+            enabled: true,
+            token: "test-token".to_string(),
+            api_url: mock_server.uri(),
+            allowed_actions: vec!["get_repo".to_string()],
+            timeout_secs: 30,
+            default_owner: None,
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = GitHubTool::new(config, security);
+
+        let result = tool
+            .execute(json!({
+                "action": "get_repo",
+                "owner": "nonexistent",
+                "repo": "repo"
+            }))
+            .await
+            .expect("execute should return Ok result");
+
+        assert!(
+            !result.success,
+            "get_repo should fail for non-existent repo"
+        );
+        assert!(result.error.unwrap().contains("404"));
+    }
+
+    #[tokio::test]
+    async fn test_action_not_allowed() {
+        let config = GitHubConfig {
+            enabled: true,
+            token: "test-token".to_string(),
+            api_url: "https://api.github.com".to_string(),
+            allowed_actions: vec!["get_repo".to_string()], // create_issue NOT allowed
+            timeout_secs: 30,
+            default_owner: None,
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = GitHubTool::new(config, security);
+
+        let result = tool
+            .execute(json!({
+                "action": "create_issue",
+                "owner": "test-owner",
+                "repo": "test-repo",
+                "title": "Test Issue"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_missing_required_params() {
+        let config = GitHubConfig {
+            enabled: true,
+            token: "test-token".to_string(),
+            api_url: "https://api.github.com".to_string(),
+            allowed_actions: vec!["get_repo".to_string(), "list_issues".to_string()],
+            timeout_secs: 30,
+            default_owner: None,
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = GitHubTool::new(config, security);
+
+        // Missing owner and repo
+        let result = tool.execute(json!({"action": "get_repo"})).await.unwrap();
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .unwrap()
+            .contains("owner and repo are required"));
+    }
+
+    #[tokio::test]
+    async fn test_list_issues_success() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let issues_response = json!([
+            {
+                "number": 1,
+                "title": "Bug: Something is broken",
+                "state": "open",
+                "html_url": "https://github.com/test-owner/test-repo/issues/1",
+                "user": {"login": "testuser"},
+                "labels": [{"name": "bug"}, {"name": "priority"}],
+                "assignees": [{"login": "contributor"}],
+                "created_at": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-02T00:00:00Z",
+                "comments": 5
+            },
+            {
+                "number": 2,
+                "title": "Feature: Add new capability",
+                "state": "closed",
+                "html_url": "https://github.com/test-owner/test-repo/issues/2",
+                "user": {"login": "anotheruser"},
+                "labels": [{"name": "enhancement"}],
+                "assignees": [],
+                "created_at": "2024-01-03T00:00:00Z",
+                "updated_at": "2024-01-04T00:00:00Z",
+                "comments": 0
+            }
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/repos/test-owner/test-repo/issues"))
+            .and(header("Authorization", "Bearer test-token"))
+            .and(query_param("state", "open"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&issues_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = GitHubConfig {
+            enabled: true,
+            token: "test-token".to_string(),
+            api_url: mock_server.uri(),
+            allowed_actions: vec!["list_issues".to_string()],
+            timeout_secs: 30,
+            default_owner: None,
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = GitHubTool::new(config, security);
+
+        let result = tool
+            .execute(json!({
+                "action": "list_issues",
+                "owner": "test-owner",
+                "repo": "test-repo",
+                "state": "open"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "list_issues should succeed: {:?}",
+            result.error
+        );
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output.as_array().unwrap().len(), 2);
+        assert_eq!(output[0]["number"], 1);
+        assert_eq!(output[0]["title"], "Bug: Something is broken");
+    }
+
+    #[tokio::test]
+    async fn test_create_issue_success() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let create_response = json!({
+            "number": 42,
+            "title": "New Issue Title",
+            "html_url": "https://github.com/test-owner/test-repo/issues/42",
+            "state": "open"
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/repos/test-owner/test-repo/issues"))
+            .and(header("Authorization", "Bearer test-token"))
+            .and(header("Content-Type", "application/json"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(&create_response))
+            .mount(&mock_server)
+            .await;
+
+        let config = GitHubConfig {
+            enabled: true,
+            token: "test-token".to_string(),
+            api_url: mock_server.uri(),
+            allowed_actions: vec!["create_issue".to_string()],
+            timeout_secs: 30,
+            default_owner: None,
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = GitHubTool::new(config, security);
+
+        let result = tool
+            .execute(json!({
+                "action": "create_issue",
+                "owner": "test-owner",
+                "repo": "test-repo",
+                "title": "New Issue Title",
+                "body": "Issue description"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "create_issue should succeed: {:?}",
+            result.error
+        );
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["number"], 42);
+        assert_eq!(output["title"], "New Issue Title");
+    }
+
+    #[tokio::test]
+    async fn test_unknown_action() {
+        let config = GitHubConfig {
+            enabled: true,
+            token: "test-token".to_string(),
+            api_url: "https://api.github.com".to_string(),
+            allowed_actions: vec!["get_repo".to_string(), "unknown_action".to_string()],
+            timeout_secs: 30,
+            default_owner: None,
+        };
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = GitHubTool::new(config, security);
+
+        let result = tool
+            .execute(json!({"action": "unknown_action"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Unknown action"));
     }
 }
