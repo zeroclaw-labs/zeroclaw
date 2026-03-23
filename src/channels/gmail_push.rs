@@ -494,6 +494,7 @@ impl GmailPushChannel {
                         timestamp,
                         thread_ts: Some(gmail_msg.thread_id),
                         interruption_scope_id: None,
+                        observe_group: false,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
