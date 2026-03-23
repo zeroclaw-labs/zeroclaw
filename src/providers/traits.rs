@@ -389,6 +389,17 @@ pub trait Provider: Send + Sync {
         self.capabilities().native_tool_calling
     }
 
+    /// Async, model-aware tool support check.
+    ///
+    /// Providers whose tool support varies by model (e.g. Ollama, where each
+    /// model may or may not declare a tool-call parser) override this to query
+    /// capabilities at runtime.  The default delegates to the sync
+    /// [`supports_native_tools`], which is correct for providers with uniform
+    /// tool support (OpenAI, Anthropic, etc.).
+    async fn check_native_tools_for_model(&self, _model: &str) -> bool {
+        self.supports_native_tools()
+    }
+
     /// Whether provider supports multimodal vision input.
     fn supports_vision(&self) -> bool {
         self.capabilities().vision

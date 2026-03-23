@@ -2708,7 +2708,8 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
         }
-        let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+        let use_native_tools =
+            provider.check_native_tools_for_model(model).await && !tool_specs.is_empty();
 
         let image_marker_count = multimodal::count_image_markers(history);
 
@@ -3868,7 +3869,7 @@ pub async fn run(
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider.check_native_tools_for_model(&model_name).await;
     let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,
@@ -4607,7 +4608,7 @@ pub async fn process_message(
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider.check_native_tools_for_model(&model_name).await;
     let mut system_prompt = crate::channels::build_system_prompt_with_mode_and_autonomy(
         &config.workspace_dir,
         &model_name,

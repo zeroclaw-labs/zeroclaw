@@ -641,6 +641,13 @@ impl Provider for ReliableProvider {
             .unwrap_or(false)
     }
 
+    async fn check_native_tools_for_model(&self, model: &str) -> bool {
+        match self.providers.first() {
+            Some((_, p)) => p.check_native_tools_for_model(model).await,
+            None => false,
+        }
+    }
+
     fn supports_vision(&self) -> bool {
         self.providers
             .iter()

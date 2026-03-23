@@ -4549,7 +4549,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     } else {
         None
     };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider.check_native_tools_for_model(&model).await;
     let mut system_prompt = build_system_prompt_with_mode_and_autonomy(
         &workspace,
         &model,

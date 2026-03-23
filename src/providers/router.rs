@@ -158,6 +158,14 @@ impl Provider for RouterProvider {
             .unwrap_or(false)
     }
 
+    async fn check_native_tools_for_model(&self, model: &str) -> bool {
+        let (idx, resolved_model) = self.resolve(model);
+        match self.providers.get(idx) {
+            Some((_, p)) => p.check_native_tools_for_model(&resolved_model).await,
+            None => false,
+        }
+    }
+
     fn supports_vision(&self) -> bool {
         self.providers
             .iter()

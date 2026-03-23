@@ -6,11 +6,15 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::RwLock;
 
 pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
     reasoning_enabled: Option<bool>,
+    /// Per-model cache of native tool support, populated lazily by
+    /// probing Ollama's `/api/show` endpoint.
+    native_tools_cache: RwLock<HashMap<String, bool>>,
 }
 
 // ─── Request Structures ───────────────────────────────────────────────────────
@@ -143,6 +147,7 @@ impl OllamaProvider {
             base_url: Self::normalize_base_url(base_url.unwrap_or("http://localhost:11434")),
             api_key,
             reasoning_enabled,
+            native_tools_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -155,6 +160,101 @@ impl OllamaProvider {
 
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.ollama", 300, 10)
+    }
+
+    /// Probe Ollama's `/api/show` endpoint to determine if a model declares
+    /// native tool-calling support via the `capabilities` array.
+    ///
+    /// Results are cached per normalized model name.  On failure, returns
+    /// `false` (fall back to XML tool calling).
+    async fn probe_model_tool_support(&self, model: &str) -> bool {
+        let normalized = model.strip_suffix(":cloud").unwrap_or(model);
+
+        // Fast path: cache hit (read lock)
+        if let Ok(cache) = self.native_tools_cache.read() {
+            if let Some(&cached) = cache.get(normalized) {
+                tracing::debug!(
+                    model = normalized,
+                    native_tools = cached,
+                    "Ollama native-tools cache hit"
+                );
+                return cached;
+            }
+        }
+
+        // Cache miss — probe /api/show
+        let result = self.probe_show_capabilities(normalized).await;
+
+        if let Ok(mut cache) = self.native_tools_cache.write() {
+            cache.insert(normalized.to_string(), result);
+        }
+
+        if result {
+            tracing::info!(
+                model = normalized,
+                "Ollama model declares tool support — using native tool calling"
+            );
+        } else {
+            tracing::info!(
+                model = normalized,
+                "Ollama model does not declare tool support — using XML tool calling. \
+                 If this model supports tools, try upgrading Ollama: brew upgrade ollama"
+            );
+        }
+
+        result
+    }
+
+    /// Query `/api/show` for a model and check whether `"tools"` appears in
+    /// the `capabilities` array.
+    async fn probe_show_capabilities(&self, model: &str) -> bool {
+        let url = format!("{}/api/show", self.base_url);
+        let mut request = self
+            .http_client()
+            .post(&url)
+            .json(&serde_json::json!({ "name": model }));
+
+        if !self.is_local_endpoint() {
+            if let Some(key) = self.api_key.as_ref() {
+                request = request.bearer_auth(key);
+            }
+        }
+
+        match request.send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(body) => Self::capabilities_include_tools(&body),
+                    Err(e) => {
+                        tracing::warn!(model, error = %e, "Failed to parse /api/show response");
+                        false
+                    }
+                }
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    model,
+                    status = %resp.status(),
+                    "Ollama /api/show returned non-success status, defaulting to XML tools"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(
+                    model,
+                    error = %e,
+                    "Ollama /api/show request failed, defaulting to XML tools"
+                );
+                false
+            }
+        }
+    }
+
+    /// Check whether a parsed `/api/show` response body declares `"tools"` in
+    /// its `capabilities` array.
+    fn capabilities_include_tools(body: &serde_json::Value) -> bool {
+        body.get("capabilities")
+            .and_then(|c| c.as_array())
+            .is_some_and(|caps| caps.iter().any(|v| v.as_str() == Some("tools")))
     }
 
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {
@@ -824,13 +924,14 @@ impl Provider for OllamaProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        // Default to prompt-guided tool calling (XML instructions in system prompt)
-        // because many Ollama-served models do not support Ollama's native
-        // /api/chat tool-calling parameter. Models that lack support silently
-        // ignore the tools array and emit tool-call JSON as plain text, which the
-        // agent loop cannot parse without the XML protocol instructions.
-        // See: https://github.com/zeroclaw-labs/zeroclaw/issues/3999
+        // Sync fallback: returns false (XML mode) for the agent.rs sync path.
+        // The async `check_native_tools_for_model` is the preferred path — it
+        // probes Ollama's /api/show per model and returns the correct answer.
         false
+    }
+
+    async fn check_native_tools_for_model(&self, model: &str) -> bool {
+        self.probe_model_tool_support(model).await
     }
 
     async fn chat(
@@ -1370,5 +1471,119 @@ mod tests {
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));
         assert!(text.contains("date"));
+    }
+
+    // ── /api/show capabilities probe tests ──────────────────────────────
+
+    #[test]
+    fn capabilities_include_tools_with_tools_present() {
+        // Matches actual Ollama /api/show response for qwen3.5:latest
+        let body = serde_json::json!({
+            "capabilities": ["completion", "vision", "tools", "thinking"],
+            "details": {
+                "family": "qwen35",
+                "parameter_size": "9.7B",
+                "quantization_level": "Q4_K_M"
+            }
+        });
+        assert!(OllamaProvider::capabilities_include_tools(&body));
+    }
+
+    #[test]
+    fn capabilities_include_tools_without_tools() {
+        let body = serde_json::json!({
+            "capabilities": ["completion"],
+            "details": { "family": "some-old-model" }
+        });
+        assert!(!OllamaProvider::capabilities_include_tools(&body));
+    }
+
+    #[test]
+    fn capabilities_include_tools_missing_field() {
+        let body = serde_json::json!({
+            "details": { "family": "unknown" }
+        });
+        assert!(!OllamaProvider::capabilities_include_tools(&body));
+    }
+
+    #[test]
+    fn capabilities_include_tools_null_capabilities() {
+        let body = serde_json::json!({ "capabilities": null });
+        assert!(!OllamaProvider::capabilities_include_tools(&body));
+    }
+
+    #[test]
+    fn capabilities_include_tools_empty_array() {
+        let body = serde_json::json!({ "capabilities": [] });
+        assert!(!OllamaProvider::capabilities_include_tools(&body));
+    }
+
+    #[tokio::test]
+    async fn probe_model_tool_support_uses_cache() {
+        let provider = OllamaProvider::new(None, None);
+
+        // Pre-populate cache
+        {
+            let mut cache = provider.native_tools_cache.write().unwrap();
+            cache.insert("cached-model".to_string(), true);
+            cache.insert("cached-no-tools".to_string(), false);
+        }
+
+        // Should return cached values without any HTTP call
+        assert!(provider.probe_model_tool_support("cached-model").await);
+        assert!(!provider.probe_model_tool_support("cached-no-tools").await);
+    }
+
+    #[tokio::test]
+    async fn probe_model_tool_support_normalizes_cloud_suffix() {
+        let provider = OllamaProvider::new(None, None);
+
+        // Insert cache entry for the normalized name (without :cloud)
+        {
+            let mut cache = provider.native_tools_cache.write().unwrap();
+            cache.insert("qwen3.5".to_string(), true);
+        }
+
+        // Querying with :cloud suffix should hit the same cache entry
+        assert!(provider.probe_model_tool_support("qwen3.5:cloud").await);
+    }
+
+    #[tokio::test]
+    async fn probe_model_tool_support_caches_on_miss() {
+        // Point at an unreachable endpoint — probe should fail gracefully
+        // and cache false
+        let provider = OllamaProvider::new(Some("http://127.0.0.1:1"), None);
+
+        let result = provider.probe_model_tool_support("nonexistent").await;
+        assert!(!result, "should default to false on network error");
+
+        // Verify it was cached
+        let cache = provider.native_tools_cache.read().unwrap();
+        assert_eq!(cache.get("nonexistent"), Some(&false));
+    }
+
+    #[tokio::test]
+    async fn check_native_tools_for_model_delegates_to_probe() {
+        let provider = OllamaProvider::new(None, None);
+
+        // Pre-populate cache to avoid HTTP call
+        {
+            let mut cache = provider.native_tools_cache.write().unwrap();
+            cache.insert("test-model".to_string(), true);
+        }
+
+        // The trait method should delegate to probe_model_tool_support
+        assert!(
+            <OllamaProvider as Provider>::check_native_tools_for_model(&provider, "test-model")
+                .await
+        );
+    }
+
+    #[test]
+    fn supports_native_tools_sync_returns_false() {
+        // The sync fallback must return false for backward compatibility
+        // with the agent.rs sync path
+        let provider = OllamaProvider::new(None, None);
+        assert!(!provider.supports_native_tools());
     }
 }
