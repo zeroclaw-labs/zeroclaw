@@ -146,21 +146,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
 }
 
 fn find_asset_url(release: &serde_json::Value) -> Option<String> {
-    let target = if cfg!(target_os = "macos") {
-        if cfg!(target_arch = "aarch64") {
-            "aarch64-apple-darwin"
-        } else {
-            "x86_64-apple-darwin"
-        }
-    } else if cfg!(target_os = "linux") {
-        if cfg!(target_arch = "aarch64") {
-            "aarch64-unknown-linux"
-        } else {
-            "x86_64-unknown-linux"
-        }
-    } else {
-        return None;
-    };
+    let target = current_target_triple();
 
     release["assets"]
         .as_array()?
@@ -172,6 +158,29 @@ fn find_asset_url(release: &serde_json::Value) -> Option<String> {
                 .unwrap_or(false)
         })
         .and_then(|asset| asset["browser_download_url"].as_str().map(String::from))
+}
+
+/// Return the exact Rust target triple for the current platform.
+///
+/// Using full triples (e.g. `aarch64-unknown-linux-gnu` instead of the
+/// shorter `aarch64-unknown-linux`) prevents substring matches from
+/// selecting the wrong asset (e.g. an Android binary on a GNU/Linux host).
+fn current_target_triple() -> &'static str {
+    if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            "aarch64-apple-darwin"
+        } else {
+            "x86_64-apple-darwin"
+        }
+    } else if cfg!(target_os = "linux") {
+        if cfg!(target_arch = "aarch64") {
+            "aarch64-unknown-linux-gnu"
+        } else {
+            "x86_64-unknown-linux-gnu"
+        }
+    } else {
+        "unknown"
+    }
 }
 
 fn version_is_newer(current: &str, candidate: &str) -> bool {
@@ -272,5 +281,61 @@ mod tests {
         assert!(!version_is_newer("0.5.0", "0.4.3"));
         assert!(!version_is_newer("0.4.3", "0.4.3"));
         assert!(version_is_newer("1.0.0", "2.0.0"));
+    }
+
+    #[test]
+    fn current_target_triple_is_not_empty() {
+        let triple = current_target_triple();
+        assert_ne!(triple, "unknown", "unsupported platform");
+        // The triple must contain at least two hyphens (arch-vendor-os or arch-vendor-os-env)
+        assert!(
+            triple.matches('-').count() >= 2,
+            "triple should have at least two hyphens: {triple}"
+        );
+    }
+
+    fn make_release(assets: &[&str]) -> serde_json::Value {
+        let assets: Vec<serde_json::Value> = assets
+            .iter()
+            .map(|name| {
+                serde_json::json!({
+                    "name": name,
+                    "browser_download_url": format!("https://example.com/{name}")
+                })
+            })
+            .collect();
+        serde_json::json!({ "assets": assets })
+    }
+
+    #[test]
+    fn find_asset_url_picks_correct_gnu_over_android() {
+        let release = make_release(&[
+            "zeroclaw-aarch64-linux-android.tar.gz",
+            "zeroclaw-aarch64-unknown-linux-gnu.tar.gz",
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+            "zeroclaw-x86_64-apple-darwin.tar.gz",
+            "zeroclaw-aarch64-apple-darwin.tar.gz",
+        ]);
+
+        let url = find_asset_url(&release);
+        assert!(url.is_some(), "should find an asset");
+        let url = url.unwrap();
+        // Must NOT match the android binary
+        assert!(
+            !url.contains("android"),
+            "should not select android binary, got: {url}"
+        );
+    }
+
+    #[test]
+    fn find_asset_url_returns_none_for_empty_assets() {
+        let release = serde_json::json!({ "assets": [] });
+        assert!(find_asset_url(&release).is_none());
+    }
+
+    #[test]
+    fn find_asset_url_returns_none_for_missing_assets() {
+        let release = serde_json::json!({});
+        assert!(find_asset_url(&release).is_none());
     }
 }
