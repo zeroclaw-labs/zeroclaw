@@ -188,6 +188,15 @@ impl Tool for ShellTool {
             }
         }
 
+        let session_id = crate::agent::loop_::TOOL_LOOP_REPLY_TARGET
+            .try_with(Clone::clone)
+            .ok()
+            .flatten()
+            .or_else(|| std::env::var("ZEROCLAW_SESSION_ID").ok());
+        if let Some(ref sid) = session_id {
+            cmd.env("ZEROCLAW_SESSION_ID", sid);
+        }
+
         let timeout_secs = self.timeout_secs;
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 

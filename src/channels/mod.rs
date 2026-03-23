@@ -57,6 +57,7 @@ pub mod voice_call;
 #[cfg(feature = "voice-wake")]
 pub mod voice_wake;
 pub mod wati;
+pub mod web;
 pub mod webhook;
 pub mod wecom;
 pub mod whatsapp;
@@ -1387,7 +1388,9 @@ fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
         "exceeds the context window",
+        "exceeds model context window",
         "context window of this model",
+        "contextwindowexceedederror",
         "maximum context length",
         "context length exceeded",
         "too many tokens",
@@ -1861,7 +1864,7 @@ async fn handle_runtime_command_if_needed(
     true
 }
 
-async fn build_memory_context(
+pub(crate) async fn build_memory_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
@@ -2077,7 +2080,7 @@ async fn classify_channel_reply_intent(
     Ok(AssistantChannelOutcome::Reply(String::new()))
 }
 
-fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
@@ -5044,6 +5047,19 @@ fn collect_configured_channels(
         });
     }
 
+    if config
+        .channels_config
+        .web
+        .as_ref()
+        .is_some_and(|w| w.enabled)
+    {
+        let web_channel = web::get_or_init_web_channel();
+        channels.push(ConfiguredChannel {
+            display_name: "Web",
+            channel: web_channel,
+        });
+    }
+
     channels
 }
 
@@ -5458,6 +5474,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             max_backoff_secs,
         ));
     }
+    web::set_web_channel_tx(tx.clone());
     drop(tx); // Drop our copy so rx closes when all channels stop
 
     let channels_by_name = Arc::new(

@@ -708,6 +708,13 @@ pub(crate) async fn deliver_announcement(
                 anyhow::bail!("feishu delivery channel requires `channel-lark` feature");
             }
         }
+        "web" => {
+            if let Some(web_channel) = crate::channels::web::get_web_channel() {
+                web_channel.send(&SendMessage::new(safe_output.as_str(), target)).await?;
+            } else {
+                anyhow::bail!("web channel not initialized");
+            }
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 

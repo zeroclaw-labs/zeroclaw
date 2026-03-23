@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod agent_sse;
 pub mod api;
 pub mod api_pairing;
 #[cfg(feature = "plugins-wasm")]
@@ -41,7 +42,7 @@ use anyhow::{Context, Result};
 use axum::{
     Router,
     body::Bytes,
-    extract::{ConnectInfo, Query, State},
+    extract::{ConnectInfo, Query, State, WebSocketUpgrade},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{delete, get, post, put},
@@ -113,6 +114,11 @@ fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+#[derive(serde::Deserialize)]
+struct WebChannelWsQuery {
+    token: Option<String>,
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -899,6 +905,8 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
+        .route("/agent", post(agent_sse::handle_agent_sse))
+        .route("/agent/clear", post(agent_sse::handle_agent_clear))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
         .route("/linq", post(handle_linq_webhook))
@@ -935,6 +943,7 @@ pub async fn run_gateway(
         .route("/api/memory", get(api::handle_api_memory_list))
         .route("/api/memory", post(api::handle_api_memory_store))
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
+        .route("/api/memory/{key}", get(api::handle_api_memory_get))
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
@@ -1013,6 +1022,7 @@ pub async fn run_gateway(
         .route("/ws/canvas/{id}", get(canvas::handle_ws_canvas))
         // ── WebSocket node discovery ──
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
+        .route("/ws/channel", get(handle_ws_channel))
         // ── Static assets (web dashboard) ──
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──
@@ -1185,6 +1195,53 @@ async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
         [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
         body,
     )
+}
+
+async fn handle_ws_channel(
+    State(state): State<AppState>,
+    Query(params): Query<WebChannelWsQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    if state.pairing.require_pairing() {
+        let token = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|auth| auth.strip_prefix("Bearer "))
+            // Fallback: Sec-WebSocket-Protocol "zeroclaw.v1, bearer.<token>"
+            .or_else(|| {
+                headers
+                    .get("sec-websocket-protocol")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|protos| {
+                        protos.split(',').find_map(|part| {
+                            part.trim().strip_prefix("bearer.")
+                        })
+                    })
+            })
+            .or(params.token.as_deref())
+            .unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "Unauthorized — provide Authorization header or ?token= query param",
+            )
+                .into_response();
+        }
+    }
+
+    let Some(message_tx) = crate::channels::web::get_web_channel_tx() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Web channel not initialized",
+        )
+            .into_response();
+    };
+    let web_channel = crate::channels::web::get_or_init_web_channel();
+    ws.on_upgrade(move |socket| {
+        crate::channels::web::handle_ws_connection(socket, web_channel, message_tx)
+    })
+    .into_response()
 }
 
 /// POST /pair — exchange one-time code for bearer token

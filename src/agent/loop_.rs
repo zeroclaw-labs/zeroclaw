@@ -279,6 +279,26 @@ tokio::task_local! {
     pub(crate) static TOOL_CHOICE_OVERRIDE: Option<String>;
 }
 
+tokio::task_local! {
+    pub(crate) static TOOL_LOOP_REPLY_TARGET: Option<String>;
+}
+
+/// Extract a short hint from tool call arguments for progress display.
+fn truncate_tool_args_for_progress(name: &str, args: &serde_json::Value, max_len: usize) -> String {
+    let hint = match name {
+        "shell" => args.get("command").and_then(|v| v.as_str()),
+        "file_read" | "file_write" => args.get("path").and_then(|v| v.as_str()),
+        _ => args
+            .get("action")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("query").and_then(|v| v.as_str())),
+    };
+    match hint {
+        Some(s) => truncate_with_ellipsis(s, max_len),
+        None => String::new(),
+    }
+}
+
 /// Convert a tool registry to OpenAI function-calling format for native tool support.
 fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
     tools_registry

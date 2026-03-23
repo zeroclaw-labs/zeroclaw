@@ -27,7 +27,7 @@ RUN npm run build
 FROM rust:1.94-bookworm AS builder
 
 WORKDIR /app
-ARG ZEROCLAW_CARGO_FEATURES="channel-lark,whatsapp-web"
+ARG ZEROCLAW_CARGO_FEATURES="channel-matrix,channel-lark,whatsapp-web,memory-postgres"
 
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -42,6 +42,7 @@ COPY Cargo.toml Cargo.lock ./
 # Previously we used sed to drop `crates/robot-kit`, which made the manifest disagree
 # with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
 COPY crates/robot-kit/ crates/robot-kit/
+COPY crates/aardvark-sys/ crates/aardvark-sys/
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
 RUN mkdir -p src benches \
     && echo "fn main() {}" > src/main.rs \

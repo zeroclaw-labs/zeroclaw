@@ -50,6 +50,8 @@ pub(super) fn require_auth(
 pub struct MemoryQuery {
     pub query: Option<String>,
     pub category: Option<String>,
+    pub prefix: Option<String>,
+    pub keys_only: Option<bool>,
     /// Filter memories created at or after (RFC 3339 / ISO 8601)
     pub since: Option<String>,
     /// Filter memories created at or before (RFC 3339 / ISO 8601)
@@ -644,6 +646,23 @@ pub async fn handle_api_memory_list(
         return e.into_response();
     }
 
+    if let Some(prefix) = params.prefix.as_deref() {
+        match state.mem.list_by_prefix(prefix, Some(50)).await {
+            Ok(entries) => {
+                if params.keys_only.unwrap_or(false) {
+                    let keys: Vec<String> = entries.into_iter().map(|entry| entry.key).collect();
+                    Json(serde_json::json!({"keys": keys})).into_response()
+                } else {
+                    Json(serde_json::json!({"entries": entries})).into_response()
+                }
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Memory prefix list failed: {e}")})),
+            )
+                .into_response(),
+        }
+    } else
     // Use recall when query or time range is provided
     if params.query.is_some() || params.since.is_some() || params.until.is_some() {
         let query = params.query.as_deref().unwrap_or("");
@@ -674,6 +693,30 @@ pub async fn handle_api_memory_list(
             )
                 .into_response(),
         }
+    }
+}
+
+pub async fn handle_api_memory_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    match state.mem.get(&key).await {
+        Ok(Some(entry)) => Json(serde_json::json!({"entry": entry})).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Memory entry not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Memory get failed: {e}")})),
+        )
+            .into_response(),
     }
 }
 
