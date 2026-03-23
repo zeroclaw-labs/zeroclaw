@@ -180,10 +180,7 @@ impl Memory for PostgresMemory {
         let sid = session_id.map(str::to_string);
 
         client
-            .execute(
-                &stmt,
-                &[&id, &key, &content, &category, &now, &now, &sid],
-            )
+            .execute(&stmt, &[&id, &key, &content, &category, &now, &now, &sid])
             .await
             .context("failed to store memory entry")?;
         Ok(())
