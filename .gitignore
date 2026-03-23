@@ -3,6 +3,10 @@
 firmware/*/target
 web/dist/*
 !web/dist/.gitkeep
+!web/dist/index.html
+!web/dist/logo.png
+!web/dist/zeroclaw-trans.png
+!web/dist/assets/
 *.db
 *.db-journal
 .DS_Store
