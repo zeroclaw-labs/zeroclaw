@@ -491,6 +491,62 @@ condition = "$.value > 85"
     }
 
     #[test]
+    fn step_kind_display() {
+        assert_eq!(SopStepKind::Execute.to_string(), "execute");
+        assert_eq!(SopStepKind::Checkpoint.to_string(), "checkpoint");
+    }
+
+    #[test]
+    fn step_kind_serde_roundtrip() {
+        let json = serde_json::to_string(&SopStepKind::Checkpoint).unwrap();
+        assert_eq!(json, "\"checkpoint\"");
+        let parsed: SopStepKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, SopStepKind::Checkpoint);
+    }
+
+    #[test]
+    fn execution_mode_deterministic_roundtrip() {
+        let json = serde_json::to_string(&SopExecutionMode::Deterministic).unwrap();
+        assert_eq!(json, "\"deterministic\"");
+        let parsed: SopExecutionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, SopExecutionMode::Deterministic);
+    }
+
+    #[test]
+    fn deterministic_run_state_serde() {
+        let state = DeterministicRunState {
+            run_id: "det-001".into(),
+            sop_name: "test-sop".into(),
+            last_completed_step: 2,
+            total_steps: 5,
+            step_outputs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(1, serde_json::json!({"result": "ok"}));
+                m.insert(2, serde_json::json!("step2_done"));
+                m
+            },
+            persisted_at: "2026-03-01T00:00:00Z".into(),
+            llm_calls_saved: 2,
+            paused_at_checkpoint: true,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: DeterministicRunState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.run_id, "det-001");
+        assert_eq!(parsed.last_completed_step, 2);
+        assert_eq!(parsed.llm_calls_saved, 2);
+        assert!(parsed.paused_at_checkpoint);
+        assert_eq!(parsed.step_outputs.len(), 2);
+    }
+
+    #[test]
+    fn run_status_paused_checkpoint_display() {
+        assert_eq!(
+            SopRunStatus::PausedCheckpoint.to_string(),
+            "paused_checkpoint"
+        );
+    }
+
+    #[test]
     fn step_defaults() {
         let step: SopStep =
             serde_json::from_str(r#"{"number": 1, "title": "Check", "body": "Verify readings"}"#)

@@ -860,4 +860,75 @@ type = "manual"
         ));
         assert!(matches!(manifest.triggers[4], SopTrigger::Manual));
     }
+
+    #[test]
+    fn deterministic_flag_overrides_execution_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let sop_dir = dir.path().join("det-sop");
+        fs::create_dir_all(&sop_dir).unwrap();
+
+        fs::write(
+            sop_dir.join("SOP.toml"),
+            r#"
+[sop]
+name = "det-sop"
+description = "A deterministic SOP"
+deterministic = true
+
+[[triggers]]
+type = "manual"
+"#,
+        )
+        .unwrap();
+
+        fs::write(
+            sop_dir.join("SOP.md"),
+            r#"# Det SOP
+
+## Steps
+
+1. **Step one** — First step.
+   - kind: execute
+
+2. **Checkpoint** — Pause for approval.
+   - kind: checkpoint
+
+3. **Step three** — Final step.
+"#,
+        )
+        .unwrap();
+
+        let sops = load_sops_from_directory(dir.path(), SopExecutionMode::Supervised);
+        assert_eq!(sops.len(), 1);
+
+        let sop = &sops[0];
+        assert_eq!(sop.name, "det-sop");
+        assert_eq!(sop.execution_mode, SopExecutionMode::Deterministic);
+        assert!(sop.deterministic);
+        assert_eq!(sop.steps.len(), 3);
+        assert_eq!(sop.steps[0].kind, SopStepKind::Execute);
+        assert_eq!(sop.steps[1].kind, SopStepKind::Checkpoint);
+        assert_eq!(sop.steps[2].kind, SopStepKind::Execute);
+    }
+
+    #[test]
+    fn parse_steps_with_checkpoint_kind() {
+        let md = r#"## Steps
+
+1. **Read data** — Read from sensor.
+   - tools: gpio_read
+   - kind: execute
+
+2. **Review** — Human review checkpoint.
+   - kind: checkpoint
+
+3. **Apply** — Apply changes.
+"#;
+        let steps = parse_steps(md);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(steps[0].kind, SopStepKind::Execute);
+        assert_eq!(steps[1].kind, SopStepKind::Checkpoint);
+        // Default kind should be Execute
+        assert_eq!(steps[2].kind, SopStepKind::Execute);
+    }
 }

@@ -547,8 +547,12 @@ impl SopEngine {
             paused_at_checkpoint: run.status == SopRunStatus::PausedCheckpoint,
         };
 
-        // Write to SOP location directory, or temp dir
-        let dir = sop.location.as_deref().unwrap_or_else(|| Path::new("."));
+        // Write to SOP location directory, or system temp dir
+        let temp_dir = std::env::temp_dir();
+        let dir = sop
+            .location
+            .as_deref()
+            .unwrap_or_else(|| temp_dir.as_path());
         let state_file = dir.join(format!("{run_id}.state.json"));
         let json = serde_json::to_string_pretty(&state)?;
         std::fs::write(&state_file, json)?;
@@ -1915,5 +1919,172 @@ mod tests {
         let run = engine.get_run(&run_id).unwrap();
         assert_eq!(run.status, SopRunStatus::Running);
         assert!(run.waiting_since.is_none());
+    }
+
+    // ── Deterministic execution ─────────────────────────
+
+    fn deterministic_sop(name: &str) -> Sop {
+        Sop {
+            name: name.into(),
+            description: format!("Deterministic SOP: {name}"),
+            version: "1.0.0".into(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![
+                SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Execute,
+                    schema: None,
+                },
+                SopStep {
+                    number: 2,
+                    title: "Checkpoint".into(),
+                    body: "Pause for approval".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Checkpoint,
+                    schema: None,
+                },
+                SopStep {
+                    number: 3,
+                    title: "Step three".into(),
+                    body: "Final step".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::Execute,
+                    schema: None,
+                },
+            ],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+        }
+    }
+
+    #[test]
+    fn deterministic_start_returns_deterministic_step() {
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-sop")]);
+        let action = engine.start_run("det-sop", manual_event()).unwrap();
+        assert!(
+            matches!(action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 1),
+            "First action should be DeterministicStep for step 1"
+        );
+        let run_id = extract_run_id(&action).to_string();
+        assert!(run_id.starts_with("det-"));
+    }
+
+    #[test]
+    fn deterministic_start_routes_through_start_run() {
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-sop")]);
+        // start_run should auto-route to start_deterministic_run
+        let action = engine.start_run("det-sop", manual_event()).unwrap();
+        assert!(matches!(action, SopRunAction::DeterministicStep { .. }));
+    }
+
+    #[test]
+    fn deterministic_advance_pipes_output() {
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-sop")]);
+        let action = engine.start_run("det-sop", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Advance step 1 with output
+        let output = serde_json::json!({"result": "step1_done"});
+        let action = engine
+            .advance_deterministic_step(&run_id, output.clone())
+            .unwrap();
+
+        // Step 2 is a checkpoint — should pause
+        assert!(
+            matches!(action, SopRunAction::CheckpointWait { ref step, .. } if step.number == 2),
+            "Step 2 (checkpoint) should return CheckpointWait"
+        );
+    }
+
+    #[test]
+    fn deterministic_checkpoint_pauses_run() {
+        let mut engine = engine_with_sops(vec![deterministic_sop("det-sop")]);
+        let action = engine.start_run("det-sop", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Complete step 1
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!({"ok": true}))
+            .unwrap();
+
+        // Should be at checkpoint
+        assert!(matches!(action, SopRunAction::CheckpointWait { .. }));
+
+        // Run should be PausedCheckpoint
+        let run = engine.get_run(&run_id).unwrap();
+        assert_eq!(run.status, SopRunStatus::PausedCheckpoint);
+        assert!(run.waiting_since.is_some());
+    }
+
+    #[test]
+    fn deterministic_completion_tracks_savings() {
+        let mut sop = deterministic_sop("det-sop");
+        // Simplify: 2 execute steps, no checkpoint
+        sop.steps = vec![
+            SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do it".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::Execute,
+                schema: None,
+            },
+            SopStep {
+                number: 2,
+                title: "Step two".into(),
+                body: "Do it too".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::Execute,
+                schema: None,
+            },
+        ];
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine.start_run("det-sop", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Complete step 1
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::DeterministicStep { .. }));
+
+        // Complete step 2
+        let action = engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s2"))
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Completed { .. }));
+
+        // Check savings
+        let savings = engine.deterministic_savings();
+        assert_eq!(savings.total_runs, 1);
+        assert_eq!(savings.total_llm_calls_saved, 2);
+    }
+
+    #[test]
+    fn deterministic_non_deterministic_sop_rejected() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let result = engine.start_deterministic_run("s1", manual_event());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not in deterministic mode"));
     }
 }
