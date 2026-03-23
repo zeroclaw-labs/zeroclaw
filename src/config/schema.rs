@@ -349,6 +349,14 @@ pub struct Config {
     #[serde(default)]
     pub jira: JiraConfig,
 
+    /// FatSecret nutrition integration configuration (`[nutrition]`).
+    #[serde(default)]
+    pub nutrition: NutritionConfig,
+
+    /// Apple Health integration via Health Auto Export (`[health]`).
+    #[serde(default)]
+    pub health: HealthConfig,
+
     /// Secure inter-node transport configuration (`[node_transport]`).
     #[serde(default)]
     pub node_transport: NodeTransportConfig,
@@ -6871,6 +6879,120 @@ impl Default for JiraConfig {
     }
 }
 
+/// FatSecret nutrition integration configuration (`[nutrition]`).
+///
+/// When `enabled = true`, registers the `nutrition` tool for food/recipe
+/// search and food diary management via the FatSecret Platform API.
+///
+/// ## Auth
+/// All API calls require `client_id` + `client_secret` (FatSecret app credentials).
+/// Public endpoints (food/recipe search & get) use OAuth 2.0 client_credentials.
+/// Diary endpoints require OAuth 1.0 three-legged auth — set `auth_token` and
+/// `auth_secret` obtained from FatSecret's `profile.create` call.
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `allowed_actions`: `["item.search", "item.get"]` — read-only by default.
+/// - `timeout_secs`: `30`
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct NutritionConfig {
+    /// Enable the `nutrition` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// FatSecret Client ID (also used as OAuth 1.0 consumer key).
+    #[serde(default)]
+    pub client_id: String,
+    /// FatSecret Client Secret. Encrypted at rest. Falls back to `FATSECRET_CLIENT_SECRET` env var.
+    #[serde(default)]
+    pub client_secret: String,
+    /// OAuth 1.0 three-legged auth token for diary operations. Encrypted at rest.
+    #[serde(default)]
+    pub auth_token: String,
+    /// OAuth 1.0 three-legged auth secret for diary operations. Encrypted at rest.
+    #[serde(default)]
+    pub auth_secret: String,
+    /// Actions the agent is permitted to call.
+    /// Valid: `"item.search"`, `"item.get"`, `"recipe.search"`, `"recipe.get"`,
+    /// `"diary.get"`, `"diary.create"`, `"diary.edit"`, `"diary.delete"`.
+    /// Defaults to `["item.search", "item.get"]` (read-only).
+    #[serde(default = "default_nutrition_allowed_actions")]
+    pub allowed_actions: Vec<String>,
+    /// Request timeout in seconds. Default: `30`.
+    #[serde(default = "default_nutrition_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_nutrition_allowed_actions() -> Vec<String> {
+    vec!["item.search".to_string(), "item.get".to_string()]
+}
+
+fn default_nutrition_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for NutritionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: String::new(),
+            client_secret: String::new(),
+            auth_token: String::new(),
+            auth_secret: String::new(),
+            allowed_actions: default_nutrition_allowed_actions(),
+            timeout_secs: default_nutrition_timeout_secs(),
+        }
+    }
+}
+
+/// Apple Health integration via Health Auto Export (`[health]`).
+///
+/// When `enabled = true`, registers the `POST /health` gateway endpoint to
+/// receive webhook exports from the Health Auto Export iOS app, and the
+/// `health_query` tool for the agent to query stored health data.
+///
+/// ## Storage
+/// Incoming metrics are stored in memory with `MemoryCategory::Custom("health")`.
+/// Keys use the format `health:{metric_name}:{iso_date}` and are upserted on
+/// each sync (the latest payload for a given metric+date replaces the previous one).
+///
+/// ## Defaults
+/// - `enabled`: `false`
+/// - `max_points_per_payload`: `5000`
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HealthConfig {
+    /// Enable the Apple Health integration. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Webhook secret for authenticating Health Auto Export payloads.
+    /// Checked via SHA-256 hash comparison against `X-Webhook-Secret` header.
+    /// Encrypted at rest. Falls back to `ZEROCLAW_HEALTH_WEBHOOK_SECRET` env var.
+    #[serde(default)]
+    pub webhook_secret: String,
+    /// Allowed metric names. Empty = accept all metrics.
+    /// Examples: `"heart_rate"`, `"step_count"`, `"sleep_analysis"`, `"weight_&_body_mass"`.
+    #[serde(default)]
+    pub allowed_metrics: Vec<String>,
+    /// Maximum data points to store per webhook payload. Prevents memory exhaustion
+    /// from unexpectedly large exports. Default: `5000`.
+    #[serde(default = "default_health_max_points_per_payload")]
+    pub max_points_per_payload: usize,
+}
+
+fn default_health_max_points_per_payload() -> usize {
+    5000
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            webhook_secret: String::new(),
+            allowed_metrics: Vec::new(),
+            max_points_per_payload: default_health_max_points_per_payload(),
+        }
+    }
+}
+
 ///
 /// Controls the read-only cloud transformation analysis tools:
 /// IaC review, migration assessment, cost analysis, and architecture review.
@@ -7184,6 +7306,8 @@ impl Default for Config {
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            nutrition: NutritionConfig::default(),
+            health: HealthConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -8133,6 +8257,38 @@ impl Config {
                 decrypt_secret(&store, &mut config.jira.api_token, "config.jira.api_token")?;
             }
 
+            // Nutrition (FatSecret) secrets
+            if !config.nutrition.client_secret.is_empty() {
+                decrypt_secret(
+                    &store,
+                    &mut config.nutrition.client_secret,
+                    "config.nutrition.client_secret",
+                )?;
+            }
+            if !config.nutrition.auth_token.is_empty() {
+                decrypt_secret(
+                    &store,
+                    &mut config.nutrition.auth_token,
+                    "config.nutrition.auth_token",
+                )?;
+            }
+            if !config.nutrition.auth_secret.is_empty() {
+                decrypt_secret(
+                    &store,
+                    &mut config.nutrition.auth_secret,
+                    "config.nutrition.auth_secret",
+                )?;
+            }
+
+            // Health (Apple Health Auto Export) secrets
+            if !config.health.webhook_secret.is_empty() {
+                decrypt_secret(
+                    &store,
+                    &mut config.health.webhook_secret,
+                    "config.health.webhook_secret",
+                )?;
+            }
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -8784,6 +8940,67 @@ impl Config {
                         action
                     );
                 }
+            }
+        }
+
+        // Nutrition (FatSecret)
+        if self.nutrition.enabled {
+            if self.nutrition.client_id.trim().is_empty() {
+                anyhow::bail!(
+                    "nutrition.client_id must not be empty when nutrition.enabled = true"
+                );
+            }
+            if self.nutrition.client_secret.trim().is_empty()
+                && std::env::var("FATSECRET_CLIENT_SECRET")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                anyhow::bail!(
+                    "nutrition.client_secret must be set (or FATSECRET_CLIENT_SECRET env var) \
+                     when nutrition.enabled = true"
+                );
+            }
+            let valid_actions = [
+                "item.search",
+                "item.get",
+                "recipe.search",
+                "recipe.get",
+                "diary.get",
+                "diary.create",
+                "diary.edit",
+                "diary.delete",
+            ];
+            for action in &self.nutrition.allowed_actions {
+                if !valid_actions.contains(&action.as_str()) {
+                    anyhow::bail!(
+                        "nutrition.allowed_actions contains unknown action: '{}'. \
+                         Valid: item.search, item.get, recipe.search, recipe.get, \
+                         diary.get, diary.create, diary.edit, diary.delete",
+                        action
+                    );
+                }
+            }
+        }
+
+        // Health (Apple Health Auto Export)
+        if self.health.enabled {
+            if self.health.webhook_secret.trim().is_empty()
+                && std::env::var("ZEROCLAW_HEALTH_WEBHOOK_SECRET")
+                    .unwrap_or_default()
+                    .trim()
+                    .is_empty()
+            {
+                tracing::warn!(
+                    "health.webhook_secret is empty — /health endpoint will accept \
+                     unauthenticated payloads. Set webhook_secret or \
+                     ZEROCLAW_HEALTH_WEBHOOK_SECRET for production use."
+                );
+            }
+            if self.health.max_points_per_payload == 0 {
+                anyhow::bail!(
+                    "health.max_points_per_payload must be > 0 when health.enabled = true"
+                );
             }
         }
 
@@ -9589,6 +9806,38 @@ impl Config {
             )?;
         }
 
+        // Nutrition (FatSecret) secrets
+        if !config_to_save.nutrition.client_secret.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.nutrition.client_secret,
+                "config.nutrition.client_secret",
+            )?;
+        }
+        if !config_to_save.nutrition.auth_token.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.nutrition.auth_token,
+                "config.nutrition.auth_token",
+            )?;
+        }
+        if !config_to_save.nutrition.auth_secret.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.nutrition.auth_secret,
+                "config.nutrition.auth_secret",
+            )?;
+        }
+
+        // Health (Apple Health Auto Export) secrets
+        if !config_to_save.health.webhook_secret.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.health.webhook_secret,
+                "config.health.webhook_secret",
+            )?;
+        }
+
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
@@ -10167,6 +10416,8 @@ default_temperature = 0.7
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            nutrition: NutritionConfig::default(),
+            health: HealthConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),
@@ -10684,6 +10935,8 @@ default_temperature = 0.7
             workspace: WorkspaceConfig::default(),
             notion: NotionConfig::default(),
             jira: JiraConfig::default(),
+            nutrition: NutritionConfig::default(),
+            health: HealthConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),
             linkedin: LinkedInConfig::default(),

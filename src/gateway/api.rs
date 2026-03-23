@@ -1495,6 +1495,10 @@ mod tests {
             pending_pairings: None,
             path_prefix: String::new(),
             canvas_store: crate::tools::canvas::CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         }
     }
 

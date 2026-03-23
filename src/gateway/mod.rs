@@ -362,6 +362,14 @@ pub struct AppState {
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
     /// Shared canvas store for Live Canvas (A2UI) system
     pub canvas_store: CanvasStore,
+    /// SHA-256 hash of the Health Auto Export webhook secret (hex-encoded).
+    pub health_webhook_secret_hash: Option<Arc<str>>,
+    /// Whether the Apple Health webhook endpoint is enabled.
+    pub health_enabled: bool,
+    /// Allowed health metric names (empty = accept all).
+    pub health_allowed_metrics: Vec<String>,
+    /// Maximum data points per health webhook payload.
+    pub health_max_points_per_payload: usize,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -755,6 +763,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if nextcloud_talk_channel.is_some() {
         println!("  POST {pfx}/nextcloud-talk — Nextcloud Talk bot webhook");
     }
+    if config.health.enabled {
+        println!("  POST {pfx}/health/export — Apple Health Auto Export webhook");
+    }
     println!("  GET  {pfx}/api/*     — REST API (bearer token required)");
     println!("  GET  {pfx}/ws/chat   — WebSocket agent chat");
     if config.nodes.enabled {
@@ -799,6 +810,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
+    // Health Auto Export webhook secret
+    // Priority: environment variable > config file
+    let health_webhook_secret_hash: Option<Arc<str>> =
+        std::env::var("ZEROCLAW_HEALTH_WEBHOOK_SECRET")
+            .ok()
+            .and_then(|secret| {
+                let secret = secret.trim().to_owned();
+                (!secret.is_empty()).then_some(secret)
+            })
+            .or_else(|| {
+                let s = config.health.webhook_secret.trim();
+                (!s.is_empty()).then(|| s.to_owned())
+            })
+            .map(|s| Arc::from(hash_webhook_secret(&s)));
+
     let state = AppState {
         config: config_state,
         provider,
@@ -830,12 +856,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         canvas_store,
+        health_webhook_secret_hash,
+        health_enabled: config.health.enabled,
+        health_allowed_metrics: config.health.allowed_metrics.clone(),
+        health_max_points_per_payload: config.health.max_points_per_payload,
     };
 
     // Config PUT needs larger body limit (1MB)
     let config_put_router = Router::new()
         .route("/api/config", put(api::handle_api_config_put))
         .layer(RequestBodyLimitLayer::new(1_048_576));
+
+    // Health Auto Export payloads can be large (full-day metrics), allow up to 5MB
+    let health_export_router = Router::new()
+        .route("/health/export", post(handle_health_export))
+        .layer(RequestBodyLimitLayer::new(5_242_880));
 
     // Build router with middleware
     let inner = Router::new()
@@ -929,6 +964,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/_app/{*path}", get(static_files::handle_static))
         // ── Config PUT with larger body limit ──
         .merge(config_put_router)
+        // ── Apple Health Auto Export (5MB body limit) ──
+        .merge(health_export_router)
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
         .with_state(state)
@@ -1916,6 +1953,253 @@ async fn handle_gmail_push_webhook(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// HEALTH AUTO EXPORT WEBHOOK
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Handle incoming Apple Health data from the Health Auto Export app.
+///
+/// Receives the full-day export payload, parses metrics and workouts, and
+/// upserts each metric+date combination into memory. Existing entries for the
+/// same metric+date are replaced (the latest sync is always the most complete).
+async fn handle_health_export(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    // ── Feature gate ──
+    if !state.health_enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Apple Health integration not enabled"})),
+        );
+    }
+
+    // ── Rate limiting ──
+    let rate_key =
+        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+    if !state.rate_limiter.allow_webhook(&rate_key) {
+        tracing::warn!("/health/export rate limit exceeded");
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many requests. Please retry later.",
+                "retry_after": RATE_LIMIT_WINDOW_SECS,
+            })),
+        );
+    }
+
+    // ── Bearer token auth (pairing) ──
+    if state.pairing.require_pairing() {
+        let auth = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let token = auth.strip_prefix("Bearer ").unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            tracing::warn!("/health/export: rejected — not paired / invalid bearer token");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
+                })),
+            );
+        }
+    }
+
+    // ── Webhook secret auth ──
+    if let Some(ref secret_hash) = state.health_webhook_secret_hash {
+        let header_hash = headers
+            .get("X-Webhook-Secret")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(hash_webhook_secret);
+        match header_hash {
+            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            _ => {
+                tracing::warn!("/health/export: rejected — invalid or missing X-Webhook-Secret");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "Unauthorized — invalid or missing X-Webhook-Secret header"
+                    })),
+                );
+            }
+        }
+    }
+
+    // ── Parse payload ──
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("/health/export: invalid JSON: {e}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            );
+        }
+    };
+
+    let data = match payload.get("data") {
+        Some(d) => d,
+        None => {
+            tracing::warn!("/health/export: missing 'data' field");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Expected top-level 'data' object (Health Auto Export format)"
+                })),
+            );
+        }
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut metrics_stored: usize = 0;
+    let mut total_points: usize = 0;
+    let max_points = state.health_max_points_per_payload;
+
+    // ── Process metrics ──
+    if let Some(metrics) = data.get("metrics").and_then(|m| m.as_array()) {
+        for metric in metrics {
+            if total_points >= max_points {
+                break;
+            }
+
+            let name = match metric.get("name").and_then(|n| n.as_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            // Filter by allowed metrics (empty = accept all)
+            if !state.health_allowed_metrics.is_empty()
+                && !state.health_allowed_metrics.iter().any(|m| m == name)
+            {
+                continue;
+            }
+
+            let units = metric
+                .get("units")
+                .and_then(|u| u.as_str())
+                .unwrap_or("unknown");
+
+            let data_points = match metric.get("data").and_then(|d| d.as_array()) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            // Group data points by date (YYYY-MM-DD)
+            let mut by_date: HashMap<String, Vec<&serde_json::Value>> = HashMap::new();
+            for point in data_points {
+                if total_points >= max_points {
+                    break;
+                }
+                let date_str = point.get("date").and_then(|d| d.as_str()).unwrap_or("");
+                // Extract YYYY-MM-DD from "yyyy-MM-dd HH:mm:ss Z" format
+                let iso_date = if date_str.len() >= 10 {
+                    &date_str[..10]
+                } else {
+                    continue;
+                };
+                by_date.entry(iso_date.to_string()).or_default().push(point);
+                total_points += 1;
+            }
+
+            // Upsert each metric+date entry
+            for (iso_date, points) in &by_date {
+                let key = format!("health:{name}:{iso_date}");
+                let content = serde_json::json!({
+                    "metric": name,
+                    "units": units,
+                    "date": iso_date,
+                    "points": points,
+                    "last_synced": now,
+                });
+
+                // Upsert: forget old entry, store new one
+                let _ = state.mem.forget(&key).await;
+                if let Err(e) = state
+                    .mem
+                    .store(
+                        &key,
+                        &content.to_string(),
+                        MemoryCategory::Custom("health".into()),
+                        None,
+                    )
+                    .await
+                {
+                    tracing::error!("/health/export: failed to store {key}: {e}");
+                } else {
+                    metrics_stored += 1;
+                }
+            }
+        }
+    }
+
+    // ── Process workouts ──
+    if let Some(workouts) = data.get("workouts").and_then(|w| w.as_array()) {
+        for workout in workouts {
+            if total_points >= max_points {
+                break;
+            }
+
+            let id = workout.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            let name = workout
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("workout");
+            let start = workout.get("start").and_then(|s| s.as_str()).unwrap_or("");
+            // Extract YYYY-MM-DD from start timestamp
+            let iso_date = if start.len() >= 10 {
+                &start[..10]
+            } else {
+                continue;
+            };
+
+            let key = if id.is_empty() {
+                format!("health:workout:{iso_date}:{name}")
+            } else {
+                format!("health:workout:{id}")
+            };
+
+            let content = serde_json::json!({
+                "type": "workout",
+                "data": workout,
+                "last_synced": now,
+            });
+
+            let _ = state.mem.forget(&key).await;
+            if let Err(e) = state
+                .mem
+                .store(
+                    &key,
+                    &content.to_string(),
+                    MemoryCategory::Custom("health".into()),
+                    None,
+                )
+                .await
+            {
+                tracing::error!("/health/export: failed to store workout {key}: {e}");
+            } else {
+                metrics_stored += 1;
+                total_points += 1;
+            }
+        }
+    }
+
+    tracing::info!("/health/export: stored {metrics_stored} entries ({total_points} data points)");
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "entries_stored": metrics_stored,
+            "data_points_processed": total_points,
+        })),
+    )
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // ADMIN HANDLERS (for CLI management)
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -2115,6 +2399,10 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2173,6 +2461,10 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2560,6 +2852,10 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         };
 
         let mut headers = HeaderMap::new();
@@ -2632,6 +2928,10 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         };
 
         let headers = HeaderMap::new();
@@ -2716,6 +3016,10 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         };
 
         let response = handle_webhook(
@@ -2772,6 +3076,10 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         };
 
         let mut headers = HeaderMap::new();
@@ -2833,6 +3141,10 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         };
 
         let mut headers = HeaderMap::new();
@@ -2899,6 +3211,10 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -2961,6 +3277,10 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            health_webhook_secret_hash: None,
+            health_enabled: false,
+            health_allowed_metrics: Vec::new(),
+            health_max_points_per_payload: 5000,
         };
 
         let mut headers = HeaderMap::new();

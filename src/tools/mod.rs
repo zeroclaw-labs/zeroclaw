@@ -48,6 +48,7 @@ pub mod hardware_board_info;
 pub mod hardware_memory_map;
 #[cfg(feature = "hardware")]
 pub mod hardware_memory_read;
+pub mod health_tool;
 pub mod http_request;
 pub mod image_gen;
 pub mod image_info;
@@ -68,6 +69,7 @@ pub mod model_routing_config;
 pub mod model_switch;
 pub mod node_tool;
 pub mod notion_tool;
+pub mod nutrition_tool;
 pub mod pdf_read;
 pub mod project_intel;
 pub mod proxy_config;
@@ -372,7 +374,7 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -540,6 +542,56 @@ pub fn all_tools_with_runtime(
                 root_config.jira.timeout_secs,
             )));
         }
+    }
+
+    // Nutrition / FatSecret integration (config-gated)
+    if root_config.nutrition.enabled {
+        let client_secret = if root_config.nutrition.client_secret.trim().is_empty() {
+            std::env::var("FATSECRET_CLIENT_SECRET").unwrap_or_default()
+        } else {
+            root_config.nutrition.client_secret.trim().to_string()
+        };
+        if client_secret.trim().is_empty() {
+            tracing::warn!(
+                "Nutrition tool enabled but no client_secret found \
+                 (set nutrition.client_secret or FATSECRET_CLIENT_SECRET env var)"
+            );
+        } else if root_config.nutrition.client_id.trim().is_empty() {
+            tracing::warn!(
+                "Nutrition tool enabled but nutrition.client_id is empty — skipping registration"
+            );
+        } else {
+            let auth_token = {
+                let t = root_config.nutrition.auth_token.trim();
+                if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            };
+            let auth_secret = {
+                let s = root_config.nutrition.auth_secret.trim();
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            };
+            tool_arcs.push(Arc::new(nutrition_tool::NutritionTool::new(
+                root_config.nutrition.client_id.trim().to_string(),
+                client_secret,
+                auth_token,
+                auth_secret,
+                root_config.nutrition.allowed_actions.clone(),
+                security.clone(),
+                root_config.nutrition.timeout_secs,
+            )));
+        }
+    }
+
+    // Apple Health query tool
+    if root_config.health.enabled {
+        tool_arcs.push(Arc::new(health_tool::HealthQueryTool::new(memory.clone())));
     }
 
     // Project delivery intelligence
