@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::config::schema::TirithScanConfig;
 use crate::runtime::RuntimeAdapter;
 use crate::security::traits::Sandbox;
 use crate::security::SecurityPolicy;
@@ -46,7 +47,7 @@ pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
-    tirith_config: crate::config::schema::TirithScanConfig,
+    tirith_config: TirithScanConfig,
 }
 
 impl ShellTool {
@@ -55,14 +56,14 @@ impl ShellTool {
             security,
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
-            tirith_config: Default::default(),
+            tirith_config: TirithScanConfig::default(),
         }
     }
 
     pub fn new_with_tirith(
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
-        tirith_config: crate::config::schema::TirithScanConfig,
+        tirith_config: TirithScanConfig,
     ) -> Self {
         Self {
             security,
@@ -76,7 +77,7 @@ impl ShellTool {
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
         sandbox: Arc<dyn Sandbox>,
-        tirith_config: crate::config::schema::TirithScanConfig,
+        tirith_config: TirithScanConfig,
     ) -> Self {
         Self {
             security,
@@ -760,7 +761,7 @@ mod tests {
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             sandbox,
-            Default::default(),
+            TirithScanConfig::default(),
         );
         assert_eq!(tool.name(), "shell");
     }
@@ -796,7 +797,7 @@ mod tests {
             test_security(AutonomyLevel::Supervised),
             test_runtime(),
             sandbox,
-            Default::default(),
+            TirithScanConfig::default(),
         );
         let result = tool
             .execute(json!({"command": "echo sandbox_test"}))

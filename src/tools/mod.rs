@@ -257,7 +257,7 @@ pub fn default_tools_with_runtime(
         Box::new(ShellTool::new_with_tirith(
             security.clone(),
             runtime,
-            Default::default(),
+            crate::config::schema::TirithScanConfig::default(),
         )),
         Box::new(FileReadTool::new(security.clone())),
         Box::new(FileWriteTool::new(security.clone())),
