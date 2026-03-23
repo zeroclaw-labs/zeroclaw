@@ -886,9 +886,17 @@ async fn main() -> Result<()> {
 
         // Auto-detect: run the interactive wizard when in a TTY with no
         // provider flags, quick setup otherwise (scriptable path).
+        //
+        // Only stdin needs to be a terminal — the wizard reads user input from
+        // stdin and dialoguer opens /dev/tty directly for rendering, so stdout
+        // being redirected (e.g. `zeroclaw onboard | tee setup.log`) must not
+        // prevent the interactive wizard from launching.  Requiring stdout to
+        // also be a TTY was the root cause of #3658: on some systems and
+        // terminal configurations stdout.is_terminal() returned false even
+        // when the user was sitting at an interactive prompt.
         let has_provider_flags =
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
-        let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let is_tty = std::io::stdin().is_terminal();
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await

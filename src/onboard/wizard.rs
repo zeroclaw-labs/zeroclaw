@@ -2153,7 +2153,13 @@ fn resolve_interactive_onboarding_mode(
         return Ok(InteractiveOnboardingMode::FullOnboarding);
     }
 
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+    // Only stdin needs to be a terminal to determine whether the session is
+    // interactive; stdout may be redirected for logging without affecting our
+    // ability to read user input.  Checking both stdin and stdout with ||
+    // was overly strict: on some systems stdout.is_terminal() returned false
+    // at an interactive prompt, causing the wizard to bail unexpectedly
+    // (#3658).
+    if !std::io::stdin().is_terminal() {
         bail!(
             "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
             config_path.display()
@@ -2206,7 +2212,8 @@ fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<(
 
     #[cfg(not(test))]
     {
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        // Only stdin needs to be a terminal — see #3658.
+        if !std::io::stdin().is_terminal() {
             bail!(
                 "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
                 config_path.display()
