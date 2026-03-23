@@ -10,3 +10,22 @@ default_temperature = 0.7
 port = 42617
 host = "[::]"
 allow_public_bind = true
+
+# Cost tracking and budget enforcement
+# Enable to track API usage costs and enforce spending limits
+[cost]
+enabled = false
+daily_limit_usd = 10.0
+monthly_limit_usd = 100.0
+warn_at_percent = 80
+allow_override = false
+
+# Example model pricing (USD per 1M tokens)
+# Uncomment and adjust based on your provider's pricing
+# [cost.prices."anthropic/claude-sonnet-4"]
+# input = 3.0
+# output = 15.0
+#
+# [cost.prices."openai/gpt-4o"]
+# input = 5.0
+# output = 15.0
