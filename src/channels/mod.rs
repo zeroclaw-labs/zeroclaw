@@ -613,6 +613,16 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
+        "whatsapp" => Some(
+            "When responding on WhatsApp:\n\
+             - Use *bold* for emphasis (WhatsApp formatting)\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
+             - Voice notes must be OGG Opus format (.ogg). Use the tts tool to generate them.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use tool results silently: answer the latest user message directly.\n",
+        ),
         _ => None,
     }
 }
