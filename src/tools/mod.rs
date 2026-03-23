@@ -510,6 +510,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.blocked_domains.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
+            web_fetch_config.firecrawl.clone(),
         )));
     }
 
