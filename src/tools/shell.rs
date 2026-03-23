@@ -51,12 +51,17 @@ pub struct ShellTool {
 }
 
 impl ShellTool {
+    /// Create a ShellTool with tirith scanning disabled.
+    /// Use `new_with_tirith()` to enable tirith with config from the schema.
     pub fn new(security: Arc<SecurityPolicy>, runtime: Arc<dyn RuntimeAdapter>) -> Self {
         Self {
             security,
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
-            tirith_config: TirithScanConfig::default(),
+            tirith_config: TirithScanConfig {
+                enabled: false,
+                ..TirithScanConfig::default()
+            },
         }
     }
 
