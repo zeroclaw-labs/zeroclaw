@@ -591,7 +591,52 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
     println!("   Start with: zeroclaw service start");
+
+    warn_if_linger_disabled();
+
     Ok(())
+}
+
+/// Check whether loginctl linger is enabled for the current user and, if not,
+/// print a prominent warning explaining that the daemon will die on logout.
+///
+/// This is a best-effort check: if `loginctl` is absent or returns an error we
+/// stay silent rather than surfacing a confusing secondary failure.
+pub fn warn_if_linger_disabled() {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "$(whoami)".to_string());
+
+    let Ok(output) = Command::new("loginctl")
+        .args(["show-user", &user, "--property=Linger"])
+        .output()
+    else {
+        return; // loginctl not available â skip silently
+    };
+
+    if !output.status.success() {
+        return; // user not logged in via logind or other transient error
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // loginctl outputs lines like "Linger=no" or "Linger=yes"
+    let linger_enabled = stdout
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("linger=yes"));
+
+    if !linger_enabled {
+        eprintln!();
+        eprintln!(
+            "⚠️  Linger is not enabled for user \"{user}\". \
+             Your daemon will stop when you log out."
+        );
+        eprintln!("   Run:  sudo loginctl enable-linger {user}");
+        eprintln!(
+            "   Without linger, user-level systemd services are stopped \
+             when the last session for that user ends (e.g. SSH disconnect)."
+        );
+        eprintln!();
+    }
 }
 
 /// Check if the current process is running as root (Unix only)
