@@ -1,6 +1,9 @@
 name: Release Stable
 
 on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"   # stable tags only (no -beta suffix)
   workflow_dispatch:
     inputs:
       version:
@@ -33,10 +36,21 @@ jobs:
       - name: Validate semver and Cargo.toml match
         id: check
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version || '' }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          input_version="${{ inputs.version }}"
           cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+
+          # Resolve version from tag push or manual input
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            # Tag push: extract version from tag name (v0.5.9 -> 0.5.9)
+            input_version="${REF_NAME#v}"
+          else
+            input_version="$INPUT_VERSION"
+          fi
 
           if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Version must be semver (X.Y.Z). Got: ${input_version}"
@@ -49,9 +63,13 @@ jobs:
           fi
 
           tag="v${input_version}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "::error::Tag ${tag} already exists."
-            exit 1
+
+          # Only check tag existence for manual dispatch (tag push means it already exists)
+          if [[ "$EVENT_NAME" != "push" ]]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+              echo "::error::Tag ${tag} already exists."
+              exit 1
+            fi
           fi
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
@@ -286,6 +304,14 @@ jobs:
           NOTES: ${{ needs.release-notes.outputs.notes }}
         run: printf '%s\n' "$NOTES" > release-notes.md
 
+      - name: Create tag if manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          git tag -a "$TAG" -m "zeroclaw $TAG"
+          git push origin "$TAG"
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
@@ -456,6 +482,16 @@ jobs:
     needs: [validate, publish]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
     uses: ./.github/workflows/pub-aur.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      dry_run: false
+    secrets: inherit
+
+  homebrew:
+    name: Update Homebrew Core
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-homebrew-core.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       dry_run: false
