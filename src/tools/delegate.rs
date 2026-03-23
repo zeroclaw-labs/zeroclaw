@@ -191,6 +191,15 @@ impl DelegateTool {
     fn results_dir(&self) -> PathBuf {
         self.workspace_dir.join("delegate_results")
     }
+
+    /// Validate that a user-provided task_id is a valid UUID to prevent
+    /// path traversal attacks (e.g. `../../etc/passwd`).
+    fn validate_task_id(task_id: &str) -> Result<(), String> {
+        if uuid::Uuid::parse_str(task_id).is_err() {
+            return Err(format!("Invalid task_id '{task_id}': must be a valid UUID"));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -835,6 +844,14 @@ impl DelegateTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'task_id' parameter for check_result"))?;
 
+        if let Err(e) = Self::validate_task_id(task_id) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
+            });
+        }
+
         let result_path = self.results_dir().join(format!("{task_id}.json"));
         if !result_path.exists() {
             return Ok(ToolResult {
@@ -910,6 +927,14 @@ impl DelegateTool {
             .get("task_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'task_id' parameter for cancel_task"))?;
+
+        if let Err(e) = Self::validate_task_id(task_id) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e),
+            });
+        }
 
         let result_path = self.results_dir().join(format!("{task_id}.json"));
         if !result_path.exists() {
@@ -2498,10 +2523,12 @@ mod tests {
 
         let tool = DelegateTool::new(sample_agents(), None, test_security())
             .with_workspace_dir(workspace.clone());
+        // Use a valid UUID format that doesn't correspond to any real task
+        let fake_uuid = uuid::Uuid::new_v4().to_string();
         let result = tool
             .execute(json!({
                 "action": "check_result",
-                "task_id": "nonexistent-id"
+                "task_id": fake_uuid
             }))
             .await
             .unwrap();
@@ -2597,10 +2624,12 @@ mod tests {
 
         let tool = DelegateTool::new(sample_agents(), None, test_security())
             .with_workspace_dir(workspace.clone());
+        // Use a valid UUID format that doesn't correspond to any real task
+        let fake_uuid = uuid::Uuid::new_v4().to_string();
         let result = tool
             .execute(json!({
                 "action": "cancel_task",
-                "task_id": "nonexistent-id"
+                "task_id": fake_uuid
             }))
             .await
             .unwrap();
@@ -2794,5 +2823,53 @@ mod tests {
                     .unwrap_or("")
                     .contains("Unknown action")
         );
+    }
+
+    #[tokio::test]
+    async fn check_result_rejects_path_traversal() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_traversal_check_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "check_result",
+                "task_id": "../../etc/passwd"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Invalid task_id"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn cancel_task_rejects_path_traversal() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_traversal_cancel_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+        let result = tool
+            .execute(json!({
+                "action": "cancel_task",
+                "task_id": "../../../etc/shadow"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Invalid task_id"));
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
