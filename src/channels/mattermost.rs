@@ -64,6 +64,7 @@ impl MattermostChannel {
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
                 self.transcription_manager = Some(Arc::new(m));
+                self.transcription = Some(config);
             }
             Err(e) => {
                 tracing::warn!(
@@ -71,7 +72,6 @@ impl MattermostChannel {
                 );
             }
         }
-        self.transcription = Some(config);
         self
     }
 
@@ -185,7 +185,15 @@ impl MattermostChannel {
         };
 
         match manager.transcribe(&bytes, file_name).await {
-            Ok(text) => Some(text),
+            Ok(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    tracing::info!("Mattermost: transcription returned empty text, skipping");
+                    None
+                } else {
+                    Some(format!("[Voice] {trimmed}"))
+                }
+            }
             Err(e) => {
                 tracing::warn!("Mattermost audio transcription failed: {e}");
                 None
@@ -1454,7 +1462,7 @@ mod tests {
             });
 
             let result = ch.try_transcribe_audio_attachment(&post).await;
-            assert_eq!(result.as_deref(), Some("test transcript"));
+            assert_eq!(result.as_deref(), Some("[Voice] test transcript"));
         }
 
         #[tokio::test]
