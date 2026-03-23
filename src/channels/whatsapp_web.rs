@@ -458,18 +458,71 @@ impl WhatsAppWebChannel {
     }
 
     /// Send a voice file (from disk) as a WhatsApp PTT voice note.
+    /// Automatically converts non-OGG files to OGG Opus via ffmpeg if available.
     #[cfg(feature = "whatsapp-web")]
     async fn send_voice_file(
         client: &wa_rs::Client,
         to: &wa_rs_binary::jid::Jid,
         path: &std::path::Path,
     ) -> Result<()> {
-        let audio_bytes = tokio::fs::read(path)
-            .await
-            .map_err(|e| anyhow!("Failed to read voice file {}: {e}", path.display()))?;
+        // WhatsApp PTT requires OGG Opus. Convert if the file isn't already.
+        let (audio_bytes, needs_cleanup) = if path
+            .extension()
+            .map_or(true, |ext| ext != "ogg" && ext != "opus")
+        {
+            // Try converting with ffmpeg
+            let ogg_path = path.with_extension("wa.ogg");
+            let convert = tokio::process::Command::new("ffmpeg")
+                .args([
+                    "-i",
+                    &path.to_string_lossy(),
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    "48k",
+                    "-ar",
+                    "48000",
+                    "-ac",
+                    "1",
+                    "-y",
+                    &ogg_path.to_string_lossy(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+
+            match convert {
+                Ok(status) if status.success() => {
+                    tracing::info!(
+                        "WhatsApp Web voice file: converted {} to OGG Opus",
+                        path.display()
+                    );
+                    let bytes = tokio::fs::read(&ogg_path).await.map_err(|e| {
+                        anyhow!("Failed to read converted file {}: {e}", ogg_path.display())
+                    })?;
+                    (bytes, Some(ogg_path))
+                }
+                _ => {
+                    tracing::warn!(
+                        "WhatsApp Web voice file: ffmpeg conversion failed, sending raw (may not play as PTT)"
+                    );
+                    let bytes = tokio::fs::read(path).await.map_err(|e| {
+                        anyhow!("Failed to read voice file {}: {e}", path.display())
+                    })?;
+                    (bytes, None)
+                }
+            }
+        } else {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|e| anyhow!("Failed to read voice file {}: {e}", path.display()))?;
+            (bytes, None)
+        };
+
         let audio_len = audio_bytes.len();
         tracing::info!(
-            "WhatsApp Web voice file: read {} bytes from {}",
+            "WhatsApp Web voice file: {} bytes from {}",
             audio_len,
             path.display()
         );
@@ -483,6 +536,11 @@ impl WhatsAppWebChannel {
             .upload(audio_bytes, MediaType::Audio)
             .await
             .map_err(|e| anyhow!("Failed to upload voice file: {e}"))?;
+
+        // Clean up temp converted file
+        if let Some(ogg_path) = needs_cleanup {
+            let _ = tokio::fs::remove_file(&ogg_path).await;
+        }
 
         tracing::info!(
             "WhatsApp Web voice file: uploaded (url_len={}, file_length={})",
