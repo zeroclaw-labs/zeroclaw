@@ -485,18 +485,15 @@ impl ClaudeCodeProvider {
                 }
                 false
             }) || {
-                // Fallback for non-Claude shells: bare ❯ in last 5 lines,
-                // but only if the echoed command line is NOT in those same lines
-                // (meaning the shell has printed output and returned to prompt).
-                let last_lines: Vec<&str> = snapshot.trim_end().lines().rev().take(5).collect();
-                let has_bare_prompt = last_lines
-                    .iter()
-                    .any(|l| l.trim() == "\u{276F}" || l.trim() == "\u{276F} ");
-                let has_echoed_cmd = last_lines.iter().any(|l| {
-                    let t = l.trim();
-                    t.starts_with("\u{276F} ") && t.len() > 3
-                });
-                has_bare_prompt && !has_echoed_cmd
+                // Fallback for non-Claude shells: the LAST non-empty line
+                // must be a bare ❯ (command finished, shell ready for input).
+                let last_nonempty = snapshot
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("");
+                let t = last_nonempty.trim();
+                t == "\u{276F}" || t == "\u{276F} "
             };
 
             if has_new_content && response_complete && snapshot == last_snapshot {
