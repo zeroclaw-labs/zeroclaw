@@ -869,7 +869,9 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                 if let Some(credential) = resolve_minimax_oauth_refresh_token(name) {
                     return Some(credential);
                 }
-            } else if name == "anthropic" || name == "openai" || name == "groq"
+            } else if name == "anthropic"
+                || name == "openai"
+                || name == "groq"
                 || is_qwen_coding_alias(name)
             {
                 // For well-known providers, prefer provider-specific env vars over the
@@ -880,7 +882,11 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
                     "anthropic" => &["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
                     "openai" => &["OPENAI_API_KEY"],
                     "groq" => &["GROQ_API_KEY"],
-                    name if is_qwen_coding_alias(name) => &["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY", "BAILIAN_API_KEY"],
+                    name if is_qwen_coding_alias(name) => &[
+                        "MODELSTUDIO_API_KEY",
+                        "DASHSCOPE_API_KEY",
+                        "BAILIAN_API_KEY",
+                    ],
                     _ => &[],
                 };
                 for env_var in env_candidates {
