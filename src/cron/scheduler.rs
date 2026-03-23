@@ -599,6 +599,17 @@ async fn run_job_command_with_timeout(
         );
     }
 
+    // Tirith content-level scan (after policy checks, uses Posix since cron uses sh -c)
+    if let Err(msg) = crate::security::tirith::guard(
+        &job.command,
+        crate::security::tirith::ShellKind::Posix,
+        &crate::security::tirith::TirithConfig::default(),
+    )
+    .await
+    {
+        return (false, msg);
+    }
+
     if !security.record_action() {
         return (
             false,

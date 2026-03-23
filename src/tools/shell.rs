@@ -171,6 +171,21 @@ impl Tool for ShellTool {
             });
         }
 
+        // Tirith content-level security gate (after cheap policy checks)
+        if let Err(msg) = crate::security::tirith::guard(
+            command,
+            crate::security::tirith::ShellKind::Native,
+            &crate::security::tirith::TirithConfig::default(),
+        )
+        .await
+        {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(msg),
+            });
+        }
+
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.

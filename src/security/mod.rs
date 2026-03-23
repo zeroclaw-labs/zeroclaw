@@ -40,6 +40,7 @@ pub mod playbook;
 pub mod policy;
 pub mod prompt_guard;
 pub mod secrets;
+pub mod tirith;
 pub mod traits;
 pub mod vulnerability;
 pub mod workspace_boundary;
