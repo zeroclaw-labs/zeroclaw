@@ -27,6 +27,7 @@ pub mod cloud_ops;
 pub mod cloud_patterns;
 pub mod composio;
 pub mod content_search;
+pub mod crm;
 pub mod cron_add;
 pub mod cron_list;
 pub mod cron_remove;
@@ -107,6 +108,7 @@ pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
+pub use crm::CrmTool;
 pub use cron_add::CronAddTool;
 pub use cron_list::CronListTool;
 pub use cron_remove::CronRemoveTool;
@@ -944,7 +946,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -987,7 +989,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1141,7 +1143,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1175,7 +1177,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1210,7 +1212,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
@@ -1245,7 +1247,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
