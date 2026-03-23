@@ -267,8 +267,7 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
 
     let mut file =
         std::fs::File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
-    std::io::copy(&mut resp, &mut file)
-        .map_err(|e| format!("write {}: {e}", dest.display()))?;
+    std::io::copy(&mut resp, &mut file).map_err(|e| format!("write {}: {e}", dest.display()))?;
     Ok(())
 }
 
@@ -298,7 +297,9 @@ fn verify_checksum(
     let actual = hex::encode(Sha256::digest(&data));
 
     if actual != expected {
-        return Err(format!("checksum mismatch: expected {expected}, got {actual}"));
+        return Err(format!(
+            "checksum mismatch: expected {expected}, got {actual}"
+        ));
     }
     Ok(())
 }
