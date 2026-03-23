@@ -11,7 +11,7 @@ import type {
   HealthSnapshot,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
-import { basePath } from './basePath';
+import { apiOrigin, basePath } from './basePath';
 
 // ---------------------------------------------------------------------------
 // Base fetch wrapper
@@ -43,7 +43,7 @@ export async function apiFetch<T = unknown>(
     headers.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(`${basePath}${path}`, { ...options, headers });
+  const response = await fetch(`${apiOrigin}${basePath}${path}`, { ...options, headers });
 
   if (response.status === 401) {
     clearToken();

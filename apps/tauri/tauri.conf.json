@@ -1,10 +1,11 @@
 {
-  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui/main/nicegui/element.py",
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/config.schema.json",
   "productName": "ZeroClaw",
   "version": "0.1.0",
   "identifier": "ai.zeroclawlabs.desktop",
   "build": {
-    "frontendDist": "../../web/dist"
+    "devUrl": "http://127.0.0.1:42617/_app/",
+    "frontendDist": "http://127.0.0.1:42617/_app/"
   },
   "app": {
     "windows": [
@@ -13,11 +14,12 @@
         "width": 1200,
         "height": 800,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "visible": false
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; script-src 'self'; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; script-src 'self' 'unsafe-inline' http://127.0.0.1:*; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; img-src 'self' http://127.0.0.1:* data:"
     }
   },
   "bundle": {

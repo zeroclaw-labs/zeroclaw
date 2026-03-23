@@ -5,6 +5,10 @@
   "permissions": [
     "core:default",
     "shell:allow-open",
-    "shell:allow-execute"
+    "shell:allow-execute",
+    "store:allow-get",
+    "store:allow-set",
+    "store:allow-save",
+    "store:allow-load"
   ]
 }
