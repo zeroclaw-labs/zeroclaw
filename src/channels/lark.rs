@@ -1546,6 +1546,7 @@ impl LarkChannel {
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         }]
     }
 
@@ -1931,7 +1932,7 @@ fn pick_uniform_index(len: usize) -> usize {
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
-            return (value % upper) as usize;
+            return usize::try_from(value % upper).unwrap_or(0);
         }
     }
 }
@@ -3334,7 +3335,7 @@ mod tests {
         let tc = crate::config::TranscriptionConfig {
             enabled: true,
             default_provider: "groq".to_string(),
-            api_key: Some("".to_string()),
+            api_key: Some(String::new()),
             ..Default::default()
         };
         let ch = make_channel().with_transcription(tc);
@@ -3459,11 +3460,31 @@ mod tests {
 
     #[tokio::test]
     async fn lark_audio_file_key_missing_returns_none() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let whisper_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "test"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
         let ch = make_channel();
-        let tc = crate::config::TranscriptionConfig {
-            enabled: false,
+        let mut tc = crate::config::TranscriptionConfig {
+            enabled: true,
             ..Default::default()
         };
+        tc.local_whisper = Some(crate::config::LocalWhisperConfig {
+            url: format!("{}/v1/transcribe", whisper_server.uri()),
+            bearer_token: "test-token".to_string(),
+            max_audio_bytes: 10 * 1024 * 1024,
+            timeout_secs: 30,
+        });
+        tc.default_provider = "local_whisper".to_string();
+
         let ch = ch.with_transcription(tc);
         let manager = ch.transcription_manager.as_deref().unwrap();
 
@@ -3539,6 +3560,7 @@ mod tests {
             .await;
 
         let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true;
         config.local_whisper = Some(crate::config::LocalWhisperConfig {
             url: format!("{}/v1/transcribe", whisper_server.uri()),
             bearer_token: "test-token".to_string(),
@@ -3552,6 +3574,9 @@ mod tests {
         let ch = ch.with_transcription(config);
 
         let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1"
+            },
             "event": {
                 "sender": {
                     "sender_id": { "open_id": "ou_testuser123" }
@@ -3595,7 +3620,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path_regex("/im/v1/messages/.+/resources/.+"))
             .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
-                "code": 99991663,
+                "code": 99_991_663,
                 "msg": "token invalid"
             })))
             .up_to_n_times(1)
