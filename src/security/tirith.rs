@@ -195,9 +195,7 @@ fn zeroclaw_bin_dir() -> PathBuf {
 fn auto_install() -> Result<String, String> {
     let (target, ext) = detect_target()?;
     let archive_name = format!("tirith-{target}{ext}");
-    let base_url = format!(
-        "https://github.com/sheeki03/tirith/releases/latest/download"
-    );
+    let base_url = "https://github.com/sheeki03/tirith/releases/latest/download";
 
     let tmpdir = tempfile::tempdir().map_err(|e| format!("tmpdir: {e}"))?;
 
@@ -206,14 +204,8 @@ fn auto_install() -> Result<String, String> {
 
     tracing::info!("tirith not found — downloading for {target}...");
 
-    download_file(
-        &format!("{base_url}/{archive_name}"),
-        &archive_path,
-    )?;
-    download_file(
-        &format!("{base_url}/checksums.txt"),
-        &checksums_path,
-    )?;
+    download_file(&format!("{base_url}/{archive_name}"), &archive_path)?;
+    download_file(&format!("{base_url}/checksums.txt"), &checksums_path)?;
 
     // Verify SHA-256
     verify_checksum(&archive_path, &checksums_path, &archive_name)?;
@@ -261,10 +253,7 @@ fn detect_target() -> Result<(String, &'static str), String> {
     Ok((format!("{arch}-{plat}"), ext))
 }
 
-fn download_file(
-    url: &str,
-    dest: &std::path::Path,
-) -> Result<(), String> {
+fn download_file(url: &str, dest: &std::path::Path) -> Result<(), String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -321,7 +310,12 @@ fn extract_tar_gz(
 ) -> Result<PathBuf, String> {
     // Use system tar (available on all Darwin/Linux where .tar.gz is used)
     let status = std::process::Command::new("tar")
-        .args(["xzf", &archive.to_string_lossy(), "-C", &dest_dir.to_string_lossy()])
+        .args([
+            "xzf",
+            &archive.to_string_lossy(),
+            "-C",
+            &dest_dir.to_string_lossy(),
+        ])
         .status()
         .map_err(|e| format!("tar: {e}"))?;
     if !status.success() {
