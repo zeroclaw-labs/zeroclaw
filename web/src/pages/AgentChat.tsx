@@ -28,6 +28,7 @@ export default function AgentChat() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const pendingContentRef = useRef('');
+  const [streamingContent, setStreamingContent] = useState('');
 
   // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
@@ -55,6 +56,14 @@ export default function AgentChat() {
         case 'chunk':
           setTyping(true);
           pendingContentRef.current += msg.content ?? '';
+          setStreamingContent(pendingContentRef.current);
+          break;
+
+        case 'chunk_reset':
+          // Server signals that the authoritative done message follows;
+          // clear the draft so it does not duplicate the final content.
+          pendingContentRef.current = '';
+          setStreamingContent('');
           break;
 
         case 'message':
@@ -72,6 +81,7 @@ export default function AgentChat() {
             ]);
           }
           pendingContentRef.current = '';
+          setStreamingContent('');
           setTyping(false);
           break;
         }
@@ -112,6 +122,7 @@ export default function AgentChat() {
           ]);
           setTyping(false);
           pendingContentRef.current = '';
+          setStreamingContent('');
           break;
       }
     };
@@ -126,7 +137,7 @@ export default function AgentChat() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, typing]);
+  }, [messages, typing, streamingContent]);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -289,11 +300,17 @@ export default function AgentChat() {
             <div className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
               <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            <div className="rounded-2xl px-4 py-3 border flex items-center gap-1.5" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
-              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-            </div>
+            {streamingContent ? (
+              <div className="rounded-2xl px-4 py-3 border max-w-[75%]" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }}>
+                <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{streamingContent}</p>
+              </div>
+            ) : (
+              <div className="rounded-2xl px-4 py-3 border flex items-center gap-1.5" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
+                <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+                <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+                <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+              </div>
+            )}
           </div>
         )}
 

@@ -18,6 +18,23 @@ use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Events emitted during a streamed agent turn.
+///
+/// Consumers receive these through a `tokio::sync::mpsc::Sender<TurnEvent>`
+/// passed to [`Agent::turn_streamed`].
+#[derive(Debug, Clone)]
+pub enum TurnEvent {
+    /// A text chunk from the LLM response (may arrive many times).
+    Chunk { delta: String },
+    /// The agent is invoking a tool.
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
+    /// A tool has returned a result.
+    ToolResult { name: String, output: String },
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     tools: Vec<Box<dyn Tool>>,
@@ -795,6 +812,254 @@ impl Agent {
             });
 
             let results = self.execute_tools(&calls).await;
+            let formatted = self.tool_dispatcher.format_results(&results);
+            self.history.push(formatted);
+            self.trim_history();
+        }
+
+        anyhow::bail!(
+            "Agent exceeded maximum tool iterations ({})",
+            self.config.max_tool_iterations
+        )
+    }
+
+    /// Execute a single agent turn while streaming intermediate events.
+    ///
+    /// Behaves identically to [`turn`](Self::turn) but forwards [`TurnEvent`]s
+    /// through the provided channel so callers (e.g. the WebSocket gateway)
+    /// can relay incremental updates to clients.
+    ///
+    /// The returned `String` is the final, complete assistant response — the
+    /// same value that `turn` would return.
+    pub async fn turn_streamed(
+        &mut self,
+        user_message: &str,
+        event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+    ) -> Result<String> {
+        // ── Preamble (identical to turn) ───────────────────────────────
+        if self.history.is_empty() {
+            let system_prompt = self.build_system_prompt()?;
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(
+                    system_prompt,
+                )));
+        }
+
+        let context = self
+            .memory_loader
+            .load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            )
+            .await
+            .unwrap_or_default();
+
+        if self.auto_save {
+            let _ = self
+                .memory
+                .store(
+                    "user_msg",
+                    user_message,
+                    MemoryCategory::Conversation,
+                    self.memory_session_id.as_deref(),
+                )
+                .await;
+        }
+
+        let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
+        let enriched = if context.is_empty() {
+            format!("[{now}] {user_message}")
+        } else {
+            format!("{context}[{now}] {user_message}")
+        };
+
+        self.history
+            .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
+
+        let effective_model = self.classify_model(user_message);
+
+        // ── Turn loop ──────────────────────────────────────────────────
+        for _ in 0..self.config.max_tool_iterations {
+            let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+
+            // Response cache check (same as turn)
+            let cache_key = if self.temperature == 0.0 {
+                self.response_cache.as_ref().map(|_| {
+                    let last_user = messages
+                        .iter()
+                        .rfind(|m| m.role == "user")
+                        .map(|m| m.content.as_str())
+                        .unwrap_or("");
+                    let system = messages
+                        .iter()
+                        .find(|m| m.role == "system")
+                        .map(|m| m.content.as_str());
+                    crate::memory::response_cache::ResponseCache::cache_key(
+                        &effective_model,
+                        system,
+                        last_user,
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let Ok(Some(cached)) = cache.get(key) {
+                    self.observer.record_event(&ObserverEvent::CacheHit {
+                        cache_type: "response".into(),
+                        tokens_saved: 0,
+                    });
+                    self.history
+                        .push(ConversationMessage::Chat(ChatMessage::assistant(
+                            cached.clone(),
+                        )));
+                    self.trim_history();
+                    return Ok(cached);
+                }
+                self.observer.record_event(&ObserverEvent::CacheMiss {
+                    cache_type: "response".into(),
+                });
+            }
+
+            // ── Streaming LLM call ────────────────────────────────────
+            // Try streaming first; if the provider returns content we
+            // forward deltas.  Otherwise fall back to non-streaming chat.
+            use futures_util::StreamExt;
+
+            let stream_opts = crate::providers::traits::StreamOptions::new(true);
+            let mut stream = self.provider.stream_chat_with_history(
+                &messages,
+                &effective_model,
+                self.temperature,
+                stream_opts,
+            );
+
+            let mut streamed_text = String::new();
+            let mut got_stream = false;
+
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        if !chunk.delta.is_empty() {
+                            got_stream = true;
+                            streamed_text.push_str(&chunk.delta);
+                            let _ = event_tx.send(TurnEvent::Chunk { delta: chunk.delta }).await;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Drop the stream so we release the borrow on provider.
+            drop(stream);
+
+            // If streaming produced text, use it as the response and
+            // check for tool calls via the dispatcher.
+            let response = if got_stream {
+                // Build a synthetic ChatResponse from streamed text
+                crate::providers::ChatResponse {
+                    text: Some(streamed_text),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                }
+            } else {
+                // Fall back to non-streaming chat
+                match self
+                    .provider
+                    .chat(
+                        ChatRequest {
+                            messages: &messages,
+                            tools: if self.tool_dispatcher.should_send_tool_specs() {
+                                Some(&self.tool_specs)
+                            } else {
+                                None
+                            },
+                        },
+                        &effective_model,
+                        self.temperature,
+                    )
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(err) => return Err(err),
+                }
+            };
+
+            let (text, calls) = self.tool_dispatcher.parse_response(&response);
+            if calls.is_empty() {
+                let final_text = if text.is_empty() {
+                    response.text.unwrap_or_default()
+                } else {
+                    text
+                };
+
+                // Store in response cache
+                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                    let token_count = response
+                        .usage
+                        .as_ref()
+                        .and_then(|u| u.output_tokens)
+                        .unwrap_or(0);
+                    #[allow(clippy::cast_possible_truncation)]
+                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
+                }
+
+                // If we didn't stream, send the full response as a single chunk
+                if !got_stream && !final_text.is_empty() {
+                    let _ = event_tx
+                        .send(TurnEvent::Chunk {
+                            delta: final_text.clone(),
+                        })
+                        .await;
+                }
+
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        final_text.clone(),
+                    )));
+                self.trim_history();
+
+                return Ok(final_text);
+            }
+
+            // ── Tool calls ─────────────────────────────────────────────
+            if !text.is_empty() {
+                self.history
+                    .push(ConversationMessage::Chat(ChatMessage::assistant(
+                        text.clone(),
+                    )));
+            }
+
+            self.history.push(ConversationMessage::AssistantToolCalls {
+                text: response.text.clone(),
+                tool_calls: response.tool_calls.clone(),
+                reasoning_content: response.reasoning_content.clone(),
+            });
+
+            // Notify about each tool call
+            for call in &calls {
+                let _ = event_tx
+                    .send(TurnEvent::ToolCall {
+                        name: call.name.clone(),
+                        args: call.arguments.clone(),
+                    })
+                    .await;
+            }
+
+            let results = self.execute_tools(&calls).await;
+
+            // Notify about each tool result
+            for result in &results {
+                let _ = event_tx
+                    .send(TurnEvent::ToolResult {
+                        name: result.name.clone(),
+                        output: result.output.clone(),
+                    })
+                    .await;
+            }
+
             let formatted = self.tool_dispatcher.format_results(&results);
             self.history.push(formatted);
             self.trim_history();

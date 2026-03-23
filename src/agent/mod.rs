@@ -12,6 +12,6 @@ pub mod thinking;
 mod tests;
 
 #[allow(unused_imports)]
-pub use agent::{Agent, AgentBuilder};
+pub use agent::{Agent, AgentBuilder, TurnEvent};
 #[allow(unused_imports)]
 pub use loop_::{process_message, run};
