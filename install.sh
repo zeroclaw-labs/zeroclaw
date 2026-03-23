@@ -1416,8 +1416,20 @@ if [[ "$SKIP_BUILD" == false ]]; then
     step_dot "Cleaning stale build cache (upgrade detected)"
     cargo clean --release 2>/dev/null || true
   fi
+
+  # Determine cargo feature flags — disable prometheus on 32-bit targets
+  # (prometheus crate requires AtomicU64, unavailable on armv7l/armv6l)
+  CARGO_FEATURE_FLAGS=""
+  _build_arch="$(uname -m)"
+  case "$_build_arch" in
+    armv7l|armv6l|armhf)
+      step_dot "32-bit ARM detected ($_build_arch) — disabling prometheus (requires 64-bit atomics)"
+      CARGO_FEATURE_FLAGS="--no-default-features --features channel-nostr,skill-creation"
+      ;;
+  esac
+
   step_dot "Building release binary"
-  cargo build --release --locked
+  cargo build --release --locked $CARGO_FEATURE_FLAGS
   step_ok "Release binary built"
 else
   step_dot "Skipping build"
@@ -1436,7 +1448,7 @@ if [[ "$SKIP_INSTALL" == false ]]; then
     fi
   fi
 
-  cargo install --path "$WORK_DIR" --force --locked
+  cargo install --path "$WORK_DIR" --force --locked $CARGO_FEATURE_FLAGS
   step_ok "ZeroClaw installed"
 
   # Sync binary to ~/.local/bin so PATH lookups find the fresh version
