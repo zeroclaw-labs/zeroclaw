@@ -48,4 +48,4 @@ lcov.info
 .idea
 
 # Wrangler cache
-.wrangler/
+.wrangler/.claude/worktrees/

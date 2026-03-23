@@ -1,0 +1,52 @@
+# Multi-stage cross-compilation builder for ZeroClaw.
+# Produces an aarch64 Linux binary. No artifacts remain after extraction.
+#
+# Usage (from repo root):
+#   docker build -f dev/Dockerfile.cross-build --target export --output out/ .
+#   # Binary lands at out/zeroclaw
+#
+# Or build + extract in one shot:
+#   docker build -f dev/Dockerfile.cross-build -t zeroclaw-build .
+#   docker cp $(docker create zeroclaw-build):/out/zeroclaw ./zeroclaw-aarch64
+#   docker rm $(docker ps -lq)
+
+FROM rust:1.94-bookworm AS builder
+
+# Install cross-compilation toolchain for aarch64
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc-aarch64-linux-gnu \
+    g++-aarch64-linux-gnu \
+    libc6-dev-arm64-cross \
+    pkg-config \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add the aarch64 gnu target (not musl — sqlite3 needs glibc for cross-link)
+RUN rustup target add aarch64-unknown-linux-gnu
+
+# Configure cross-compilation linker
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+    PKG_CONFIG_ALLOW_CROSS=1
+
+WORKDIR /src
+
+# Cache dependency build: copy manifests first, build deps, then copy source
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+# Create stub main/lib so cargo can resolve the workspace
+RUN mkdir -p src && echo 'fn main() {}' > src/main.rs && echo '' > src/lib.rs
+RUN cargo build --release --target aarch64-unknown-linux-gnu 2>/dev/null || true
+
+# Now copy the real source and build
+COPY src/ src/
+COPY web/ web/
+COPY migrations/ migrations/
+COPY benches/ benches/
+RUN touch src/main.rs src/lib.rs && \
+    cargo build --release --target aarch64-unknown-linux-gnu
+
+# Export stage — just the binary
+FROM scratch AS export
+COPY --from=builder /src/target/aarch64-unknown-linux-gnu/release/zeroclaw /out/zeroclaw
