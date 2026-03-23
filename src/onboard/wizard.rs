@@ -142,7 +142,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         default_temperature: 0.7,
         provider_timeout_secs: 120,
         extra_headers: std::collections::HashMap::new(),
-        provider_env: std::collections::HashMap::new(),
+
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         backup: crate::config::BackupConfig::default(),
@@ -575,7 +575,7 @@ async fn run_quick_setup_with_home(
         default_temperature: 0.7,
         provider_timeout_secs: 120,
         extra_headers: std::collections::HashMap::new(),
-        provider_env: std::collections::HashMap::new(),
+
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         backup: crate::config::BackupConfig::default(),
@@ -7473,6 +7473,8 @@ mod tests {
         assert_eq!(provider_env_var("qwen-intl"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("dashscope-us"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("qwen-coding-plan"), "DASHSCOPE_API_KEY");
+        assert_eq!(provider_env_var("qwen-coding"), "DASHSCOPE_API_KEY");
+        assert_eq!(provider_env_var("qwen-coding-cn"), "DASHSCOPE_API_KEY");
         assert_eq!(provider_env_var("qwen-code"), "QWEN_OAUTH_TOKEN");
         assert_eq!(provider_env_var("qwen-oauth"), "QWEN_OAUTH_TOKEN");
         assert_eq!(provider_env_var("glm-cn"), "GLM_API_KEY");
