@@ -70,6 +70,7 @@ pub mod model_switch;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod pdf_read;
+pub mod poll;
 pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
@@ -148,10 +149,11 @@ pub use model_switch::ModelSwitchTool;
 pub use node_tool::NodeTool;
 pub use notion_tool::NotionTool;
 pub use pdf_read::PdfReadTool;
+pub use poll::{ChannelMapHandle, PollTool};
 pub use project_intel::ProjectIntelTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
-pub use reaction::{ChannelMapHandle, ReactionTool};
+pub use reaction::ReactionTool;
 pub use read_skill::ReadSkillTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
@@ -293,7 +295,11 @@ pub fn register_skill_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -308,7 +314,12 @@ pub fn all_tools(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
     canvas_store: Option<CanvasStore>,
-) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
+) -> (
+    Vec<Box<dyn Tool>>,
+    Option<DelegateParentToolsHandle>,
+    Option<ChannelMapHandle>,
+    ChannelMapHandle,
+) {
     all_tools_with_runtime(
         config,
         security,
@@ -328,7 +339,11 @@ pub fn all_tools(
 }
 
 /// Create full tool registry including memory tools and optional Composio.
-#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
     security: &Arc<SecurityPolicy>,
@@ -344,7 +359,12 @@ pub fn all_tools_with_runtime(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
     canvas_store: Option<CanvasStore>,
-) -> (Vec<Box<dyn Tool>>, Option<DelegateParentToolsHandle>) {
+) -> (
+    Vec<Box<dyn Tool>>,
+    Option<DelegateParentToolsHandle>,
+    Option<ChannelMapHandle>,
+    ChannelMapHandle,
+) {
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
@@ -675,6 +695,13 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    // Poll tool — always registered; uses late-bound channel map handle
+    let channel_map_handle: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
+    tool_arcs.push(Arc::new(PollTool::new(
+        security.clone(),
+        Arc::clone(&channel_map_handle),
+    )));
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tool_arcs.push(Arc::new(ComposioTool::new(
@@ -720,6 +747,7 @@ pub fn all_tools_with_runtime(
                     boxed_registry_from_arcs(tool_arcs),
                     None,
                     Some(reaction_handle),
+                    channel_map_handle,
                 );
             }
 
@@ -908,6 +936,7 @@ pub fn all_tools_with_runtime(
         boxed_registry_from_arcs(tool_arcs),
         delegate_handle,
         Some(reaction_handle),
+        channel_map_handle,
     )
 }
 
@@ -952,7 +981,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -995,7 +1024,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1149,7 +1178,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1183,7 +1212,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1218,7 +1247,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
@@ -1253,7 +1282,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _) = all_tools(
+        let (tools, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,

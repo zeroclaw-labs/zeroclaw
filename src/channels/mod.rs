@@ -4366,7 +4366,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let (mut built_tools, delegate_handle_ch): (Vec<Box<dyn Tool>>, _) =
+    let (mut built_tools, delegate_handle_ch, reaction_handle_ch, _channel_map_handle) =
         tools::all_tools_with_runtime(
             Arc::new(config.clone()),
             &security,

@@ -440,22 +440,23 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     let canvas_store = tools::CanvasStore::new();
 
-    let (mut tools_registry_raw, delegate_handle_gw) = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        Arc::clone(&mem),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.web_fetch,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-        Some(canvas_store.clone()),
-    );
+    let (mut tools_registry_raw, delegate_handle_gw, _reaction_handle_gw, _channel_map_handle) =
+        tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            runtime,
+            Arc::clone(&mem),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &config.workspace_dir,
+            &config.agents,
+            config.api_key.as_deref(),
+            &config,
+            Some(canvas_store.clone()),
+        );
 
     // ── Wire MCP tools into the gateway tool registry (non-fatal) ───
     // Without this, the `/api/tools` endpoint misses MCP tools.

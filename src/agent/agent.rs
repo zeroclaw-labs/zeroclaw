@@ -359,22 +359,23 @@ impl Agent {
             None
         };
 
-        let (mut tools, delegate_handle, _reaction_handle) = tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            memory.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.workspace_dir,
-            &config.agents,
-            config.api_key.as_deref(),
-            config,
-            None,
-        );
+        let (mut tools, delegate_handle, _reaction_handle, _channel_map_handle) =
+            tools::all_tools_with_runtime(
+                Arc::new(config.clone()),
+                &security,
+                runtime,
+                memory.clone(),
+                composio_key,
+                composio_entity_id,
+                &config.browser,
+                &config.http_request,
+                &config.web_fetch,
+                &config.workspace_dir,
+                &config.agents,
+                config.api_key.as_deref(),
+                config,
+                None,
+            );
 
         // ── Wire MCP tools (non-fatal) ─────────────────────────────
         // Replicates the same MCP initialization logic used in the CLI
