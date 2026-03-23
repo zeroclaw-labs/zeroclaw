@@ -701,6 +701,30 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     normalized
 }
 
+/// Strip the `[Used tools: …]\n` prefix that `extract_tool_context_summary`
+/// prepends to assistant history entries for non-Telegram channels.
+///
+/// This prefix is an internal bookkeeping annotation and must never reach the
+/// LLM as part of the assistant's prior message text; doing so causes the model
+/// to echo the `[Used tools: …]` format verbatim in subsequent responses
+/// (issue #4400).
+fn strip_tool_context_summary_prefix(text: &str) -> &str {
+    // The prefix has the form `[Used tools: tool1, tool2]\n`.
+    // We match it exactly: opening `[Used tools:`, followed by anything up to
+    // the first `]`, then an optional newline.
+    if let Some(rest) = text.strip_prefix("[Used tools:") {
+        if let Some(bracket_end) = rest.find(']') {
+            let after_bracket = &rest[bracket_end + 1..];
+            // Consume at most one trailing newline so we don't over-trim.
+            return after_bracket
+                .strip_prefix('\n')
+                .unwrap_or(after_bracket)
+                .trim_start_matches('\n');
+        }
+    }
+    text
+}
+
 /// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
 /// header, if present) from a conversation-history entry so that stale tool
 /// output is never presented to the LLM without the corresponding `<tool_call>`.
@@ -2227,6 +2251,17 @@ async fn process_channel_message(
     for turn in &mut prior_turns {
         if turn.content.contains("<tool_result") {
             turn.content = strip_tool_result_content(&turn.content);
+        }
+    }
+
+    // Strip the `[Used tools: …]` prefix from assistant history turns.
+    // This annotation is stored alongside the response so the LLM retains
+    // awareness of tool usage in follow-up turns, but it must be removed
+    // before the history is presented to the model again — otherwise the
+    // LLM echoes the prefix verbatim in its own responses (issue #4400).
+    for turn in &mut prior_turns {
+        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
+            turn.content = strip_tool_context_summary_prefix(&turn.content).to_string();
         }
     }
 
@@ -8903,6 +8938,46 @@ Mon Feb 20
 
         let summary = extract_tool_context_summary(&history, 1);
         assert_eq!(summary, "[Used tools: fresh_tool]");
+    }
+
+    // ── strip_tool_context_summary_prefix tests (issue #4400) ──────────────
+
+    #[test]
+    fn strip_tool_context_summary_prefix_removes_single_tool() {
+        let input = "[Used tools: browser_open]\nOpened GitHub homepage.";
+        assert_eq!(
+            strip_tool_context_summary_prefix(input),
+            "Opened GitHub homepage."
+        );
+    }
+
+    #[test]
+    fn strip_tool_context_summary_prefix_removes_multi_tool() {
+        let input = "[Used tools: browser_open, browser_snapshot]\nHere is what I saw on the page.";
+        assert_eq!(
+            strip_tool_context_summary_prefix(input),
+            "Here is what I saw on the page."
+        );
+    }
+
+    #[test]
+    fn strip_tool_context_summary_prefix_leaves_plain_text_unchanged() {
+        let input = "Here is a normal response without any tool prefix.";
+        assert_eq!(strip_tool_context_summary_prefix(input), input);
+    }
+
+    #[test]
+    fn strip_tool_context_summary_prefix_leaves_empty_string_unchanged() {
+        assert_eq!(strip_tool_context_summary_prefix(""), "");
+    }
+
+    #[test]
+    fn strip_tool_context_summary_prefix_handles_prefix_only() {
+        // When the entire content is just the prefix with no trailing text,
+        // the result should be empty.
+        let input = "[Used tools: shell]";
+        let result = strip_tool_context_summary_prefix(input);
+        assert!(result.is_empty(), "expected empty string, got: {result:?}");
     }
 
     #[test]
