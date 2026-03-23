@@ -60,6 +60,7 @@ mod tests {
             namespace: "default".into(),
             importance: None,
             superseded_by: None,
+            metadata: None,
         }
     }
 

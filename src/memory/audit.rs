@@ -223,10 +223,11 @@ impl<M: Memory> Memory for AuditedMemory<M> {
         session_id: Option<&str>,
         namespace: Option<&str>,
         importance: Option<f64>,
+        metadata: Option<&str>,
     ) -> anyhow::Result<()> {
         self.log_audit(AuditOp::Store, Some(key), namespace, session_id, None);
         self.inner
-            .store_with_metadata(key, content, category, session_id, namespace, importance)
+            .store_with_metadata(key, content, category, session_id, namespace, importance, metadata)
             .await
     }
 }

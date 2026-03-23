@@ -32,6 +32,9 @@ pub struct MemoryEntry {
     /// If this entry was superseded by a newer conflicting entry.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// Arbitrary JSON metadata (e.g. group_jid for WhatsApp group messages).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 fn default_namespace() -> String {
@@ -49,6 +52,7 @@ impl std::fmt::Debug for MemoryEntry {
             .field("score", &self.score)
             .field("namespace", &self.namespace)
             .field("importance", &self.importance)
+            .field("metadata", &self.metadata)
             .finish_non_exhaustive()
     }
 }
@@ -204,6 +208,7 @@ pub trait Memory: Send + Sync {
         session_id: Option<&str>,
         _namespace: Option<&str>,
         _importance: Option<f64>,
+        _metadata: Option<&str>,
     ) -> anyhow::Result<()> {
         self.store(key, content, category, session_id).await
     }
@@ -257,6 +262,7 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
+            metadata: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

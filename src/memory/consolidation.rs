@@ -112,6 +112,7 @@ pub async fn consolidate_turn(
                     None,
                     None,
                     Some(imp),
+                    None,
                 )
                 .await?;
         }
