@@ -4389,6 +4389,10 @@ impl Default for AutonomyConfig {
                 "head".into(),
                 "tail".into(),
                 "date".into(),
+                "python".into(),
+                "python3".into(),
+                "pip".into(),
+                "node".into(),
             ],
             forbidden_paths: vec![
                 "/etc".into(),
