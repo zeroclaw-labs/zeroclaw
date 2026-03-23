@@ -25,12 +25,12 @@ const MAX_RECONNECT_DELAY = 30000;
 
 export const SESSION_STORAGE_KEY = 'zeroclaw_session_id';
 
-/** Return a stable session ID, persisted in sessionStorage across reconnects. */
+/** Return a stable session ID, persisted in localStorage across browser restarts. */
 export function getOrCreateSessionId(): string {
-  let id = sessionStorage.getItem(SESSION_STORAGE_KEY);
+  let id = localStorage.getItem(SESSION_STORAGE_KEY);
   if (!id) {
     id = generateUUID();
-    sessionStorage.setItem(SESSION_STORAGE_KEY, id);
+    localStorage.setItem(SESSION_STORAGE_KEY, id);
   }
   return id;
 }

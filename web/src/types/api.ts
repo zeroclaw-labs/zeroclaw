@@ -131,6 +131,11 @@ export interface SSEEvent {
   [key: string]: any;
 }
 
+export interface SessionMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 export interface WsMessage {
   type:
     | 'message'

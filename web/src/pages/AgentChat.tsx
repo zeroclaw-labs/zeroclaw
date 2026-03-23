@@ -1,101 +1,84 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
-import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
+import { WebSocketClient } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 import { getSessionMessages } from '@/lib/api';
-import {
-  loadChatHistory,
-  mapServerMessagesToPersisted,
-  persistedToUiMessages,
-  saveChatHistory,
-  uiMessagesToPersisted,
-} from '@/lib/chatHistoryStorage';
 
 interface ChatMessage {
   id: string;
   role: 'user' | 'agent';
   content: string;
-  thinking?: string;
-  markdown?: boolean;
   timestamp: Date;
 }
 
 const DRAFT_KEY = 'agent-chat';
+const HISTORY_PAGE_SIZE = 10;
 
 export default function AgentChat() {
-  const sessionIdRef = useRef(getOrCreateSessionId());
   const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [historyReady, setHistoryReady] = useState(false);
   const [input, setInput] = useState(draft);
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadedTotal, setLoadedTotal] = useState(0);
 
   const wsRef = useRef<WebSocketClient | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const pendingContentRef = useRef('');
-  const pendingThinkingRef = useRef('');
-  // Snapshot of thinking captured at chunk_reset, so it survives the reset.
-  const capturedThinkingRef = useRef('');
   const [streamingContent, setStreamingContent] = useState('');
-  const [streamingThinking, setStreamingThinking] = useState('');
+  const shouldScrollRef = useRef(true);
+  const isInitialLoadRef = useRef(true);
+
+  const loadMore = useCallback(() => {
+    if (!sessionId || loadingMore) return;
+    setLoadingMore(true);
+
+    // Save scroll position before loading
+    const container = messagesContainerRef.current;
+    const oldScrollHeight = container?.scrollHeight ?? 0;
+    const oldScrollTop = container?.scrollTop ?? 0;
+
+    // Prevent auto-scroll when loading history
+    shouldScrollRef.current = false;
+
+    const nextLimit = loadedTotal + HISTORY_PAGE_SIZE;
+    getSessionMessages(sessionId, nextLimit).then((result) => {
+      setMessages(
+        result.messages.map((m) => ({
+          id: generateUUID(),
+          role: m.role === 'assistant' ? 'agent' : 'user',
+          content: m.content,
+          timestamp: new Date(),
+        })) as ChatMessage[],
+      );
+      setHasMore(result.has_more);
+      setLoadedTotal(result.messages.length);
+
+      // Restore scroll position after DOM update
+      requestAnimationFrame(() => {
+        if (container) {
+          const newScrollHeight = container.scrollHeight;
+          const scrollDelta = newScrollHeight - oldScrollHeight;
+          container.scrollTop = oldScrollTop + scrollDelta;
+        }
+      });
+    }).catch(() => {}).finally(() => setLoadingMore(false));
+  }, [sessionId, loadingMore, loadedTotal]);
 
   // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
-
-  // Hydrate chat from server (preferred) or localStorage fallback
-  useEffect(() => {
-    const sid = sessionIdRef.current;
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const res = await getSessionMessages(sid);
-        if (cancelled) return;
-        if (res.session_persistence && res.messages.length > 0) {
-          setMessages((prev) =>
-            prev.length > 0 ? prev : persistedToUiMessages(mapServerMessagesToPersisted(res.messages)),
-          );
-        } else if (!res.session_persistence) {
-          setMessages((prev) => {
-            if (prev.length > 0) return prev;
-            const ls = loadChatHistory(sid);
-            return ls.length ? persistedToUiMessages(ls) : prev;
-          });
-        }
-      } catch {
-        if (!cancelled) {
-          setMessages((prev) => {
-            if (prev.length > 0) return prev;
-            const ls = loadChatHistory(sid);
-            return ls.length ? persistedToUiMessages(ls) : prev;
-          });
-        }
-      } finally {
-        if (!cancelled) setHistoryReady(true);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
-  useEffect(() => {
-    if (!historyReady) return;
-    saveChatHistory(sessionIdRef.current, uiMessagesToPersisted(messages));
-  }, [messages, historyReady]);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -119,13 +102,28 @@ export default function AgentChat() {
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
         case 'session_start':
-        case 'connected':
+          if (msg.resumed && msg.message_count && msg.message_count > 0 && msg.session_id) {
+            const sid = msg.session_id;
+            setSessionId(sid);
+            // First load should scroll to bottom to show latest messages
+            getSessionMessages(sid, HISTORY_PAGE_SIZE).then((result) => {
+              setMessages(
+                result.messages.map((m) => ({
+                  id: generateUUID(),
+                  role: m.role === 'assistant' ? 'agent' : 'user',
+                  content: m.content,
+                  timestamp: new Date(),
+                })) as ChatMessage[],
+              );
+              setHasMore(result.has_more);
+              setLoadedTotal(result.messages.length);
+            }).catch(() => {});
+          } else if (msg.session_id) {
+            setSessionId(msg.session_id);
+          }
           break;
 
-        case 'thinking':
-          setTyping(true);
-          pendingThinkingRef.current += msg.content ?? '';
-          setStreamingThinking(pendingThinkingRef.current);
+        case 'connected':
           break;
 
         case 'chunk':
@@ -135,19 +133,15 @@ export default function AgentChat() {
           break;
 
         case 'chunk_reset':
-          // Server signals that the authoritative done message follows.
-          // Snapshot thinking before clearing display state.
-          capturedThinkingRef.current = pendingThinkingRef.current;
+          // Server signals that the authoritative done message follows;
+          // clear the draft so it does not duplicate the final content.
           pendingContentRef.current = '';
-          pendingThinkingRef.current = '';
           setStreamingContent('');
-          setStreamingThinking('');
           break;
 
         case 'message':
         case 'done': {
           const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
-          const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
           if (content) {
             setMessages((prev) => [
               ...prev,
@@ -155,17 +149,12 @@ export default function AgentChat() {
                 id: generateUUID(),
                 role: 'agent',
                 content,
-                thinking,
-                markdown: true,
                 timestamp: new Date(),
               },
             ]);
           }
           pendingContentRef.current = '';
-          pendingThinkingRef.current = '';
-          capturedThinkingRef.current = '';
           setStreamingContent('');
-          setStreamingThinking('');
           setTyping(false);
           break;
         }
@@ -211,9 +200,7 @@ export default function AgentChat() {
           }
           setTyping(false);
           pendingContentRef.current = '';
-          pendingThinkingRef.current = '';
           setStreamingContent('');
-          setStreamingThinking('');
           break;
       }
     };
@@ -227,7 +214,18 @@ export default function AgentChat() {
   }, []);
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (shouldScrollRef.current) {
+      // Use instant scroll on initial load (when messages first appear), smooth for subsequent messages
+      const behavior = (isInitialLoadRef.current && messages.length > 0) ? 'auto' : 'smooth';
+      messagesEndRef.current?.scrollIntoView({ behavior: behavior as ScrollBehavior });
+      // Mark initial load as done only when we have messages
+      if (messages.length > 0) {
+        isInitialLoadRef.current = false;
+      }
+    } else {
+      // Re-enable auto-scroll for next new message
+      shouldScrollRef.current = true;
+    }
   }, [messages, typing, streamingContent]);
 
   const handleSend = () => {
@@ -248,7 +246,6 @@ export default function AgentChat() {
       wsRef.current.sendMessage(trimmed);
       setTyping(true);
       pendingContentRef.current = '';
-      pendingThinkingRef.current = '';
     } catch {
       setError(t('agent.send_error'));
     }
@@ -322,7 +319,22 @@ export default function AgentChat() {
       )}
 
       {/* Messages area */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div ref={messagesContainerRef} className="flex-1 overflow-y-auto p-4 space-y-4">
+        {hasMore && (
+          <div className="flex justify-center pt-1 pb-2">
+            <button
+              onClick={loadMore}
+              disabled={loadingMore}
+              className="text-xs px-4 py-1.5 rounded-full border transition-colors disabled:opacity-40"
+              style={{ color: 'var(--pc-text-muted)', borderColor: 'var(--pc-border)' }}
+              onMouseEnter={(e) => { e.currentTarget.style.color = 'var(--pc-accent)'; e.currentTarget.style.borderColor = 'var(--pc-accent-dim)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.color = 'var(--pc-text-muted)'; e.currentTarget.style.borderColor = 'var(--pc-border)'; }}
+            >
+              {loadingMore ? t('agent.loading_more') : t('agent.load_more')}
+            </button>
+          </div>
+        )}
+
         {messages.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-center animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
             <div className="h-16 w-16 rounded-3xl flex items-center justify-center mb-4 animate-float" style={{ background: 'var(--pc-accent-glow)' }}>
@@ -363,17 +375,7 @@ export default function AgentChat() {
                     : { background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)', }
                 }
               >
-                {msg.thinking && (
-                  <details className="mb-2">
-                    <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking</summary>
-                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
-                  </details>
-                )}
-                {msg.markdown ? (
-                  <div className="text-sm break-words leading-relaxed chat-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
-                ) : (
-                  <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
-                )}
+                <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
                 <p
                   className="text-[10px] mt-1.5" style={{ color: msg.role === 'user' ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}>
                   {msg.timestamp.toLocaleTimeString()}
@@ -402,15 +404,9 @@ export default function AgentChat() {
             <div className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
               <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            {streamingContent || streamingThinking ? (
+            {streamingContent ? (
               <div className="rounded-2xl px-4 py-3 border max-w-[75%]" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }}>
-                {streamingThinking && (
-                  <details className="mb-2" open={!streamingContent}>
-                    <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking{!streamingContent && '...'}</summary>
-                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{streamingThinking}</pre>
-                  </details>
-                )}
-                {streamingContent && <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{streamingContent}</p>}
+                <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{streamingContent}</p>
               </div>
             ) : (
               <div className="rounded-2xl px-4 py-3 border flex items-center gap-1.5" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
