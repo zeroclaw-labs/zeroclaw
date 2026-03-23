@@ -262,6 +262,12 @@ impl Channel for DiscordHistoryChannel {
                     "os": "linux",
                     "browser": "zeroclaw",
                     "device": "zeroclaw"
+                },
+                "presence": {
+                    "status": "online",
+                    "since": null,
+                    "activities": [],
+                    "afk": false
                 }
             }
         });

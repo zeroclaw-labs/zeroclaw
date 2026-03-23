@@ -395,18 +395,34 @@ pub(crate) async fn deliver_announcement(
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
-        "discord" => {
-            let dc = config
-                .channels_config
-                .discord
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("discord channel not configured"))?;
+        "discord" | "discord_history" => {
+            let (bot_token, guild_id, allowed_users, listen_to_bots, mention_only) =
+                if let Some(dc) = &config.channels_config.discord {
+                    (
+                        dc.bot_token.clone(),
+                        dc.guild_id.clone(),
+                        dc.allowed_users.clone(),
+                        dc.listen_to_bots,
+                        dc.mention_only,
+                    )
+                } else if let Some(dh) = &config.channels_config.discord_history {
+                    (
+                        dh.bot_token.clone(),
+                        dh.guild_id.clone(),
+                        dh.allowed_users.clone(),
+                        false, // discord_history doesn't have listen_to_bots
+                        true,  // default to mention_only for safety
+                    )
+                } else {
+                    anyhow::bail!("neither discord nor discord_history channel configured");
+                };
+
             let channel = DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
+                bot_token,
+                guild_id,
+                allowed_users,
+                listen_to_bots,
+                mention_only,
             );
             channel.send(&SendMessage::new(output, target)).await?;
         }
@@ -1178,6 +1194,33 @@ mod tests {
         };
         let err = deliver_if_configured(&config, &job, "x").await.unwrap_err();
         assert!(err.to_string().contains("unsupported delivery channel"));
+    }
+
+    #[tokio::test]
+    async fn deliver_announcement_supports_discord_history_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.channels_config.discord_history =
+            Some(crate::config::schema::DiscordHistoryConfig {
+                bot_token: "test-token".into(),
+                guild_id: Some("guild-123".into()),
+                allowed_users: vec!["user-456".into()],
+                channel_ids: vec![],
+                store_dms: true,
+                respond_to_dms: true,
+                proxy_url: None,
+            });
+
+        // This would attempt to actually send a message over HTTP,
+        // so we can't fully run it without mocking DiscordChannel.
+        // But we can verify it doesn't fail early with "unsupported delivery channel".
+        let result =
+            deliver_announcement(&config, "discord_history", "target-channel", "hello").await;
+        // It will likely fail with a connection error because of the fake token,
+        // but the error should NOT be "unsupported delivery channel".
+        if let Err(e) = result {
+            assert!(!e.to_string().contains("unsupported delivery channel"));
+        }
     }
 
     #[test]

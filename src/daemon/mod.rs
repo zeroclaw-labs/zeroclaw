@@ -532,10 +532,12 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                 );
             }
         }
-        "discord" => {
-            if config.channels_config.discord.is_none() {
+        "discord" | "discord_history" => {
+            if config.channels_config.discord.is_none()
+                && config.channels_config.discord_history.is_none()
+            {
                 anyhow::bail!(
-                    "heartbeat.target is set to discord but channels_config.discord is not configured"
+                    "heartbeat.target is set to {channel} but neither discord nor discord_history is configured"
                 );
             }
         }

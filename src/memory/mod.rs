@@ -111,11 +111,11 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct ResolvedEmbeddingConfig {
-    provider: String,
-    model: String,
-    dimensions: usize,
-    api_key: Option<String>,
+pub struct ResolvedEmbeddingConfig {
+    pub provider: String,
+    pub model: String,
+    pub dimensions: usize,
+    pub api_key: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedEmbeddingConfig {
@@ -144,7 +144,7 @@ fn embedding_provider_env_key(provider: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn resolve_embedding_config(
+pub fn resolve_embedding_config(
     config: &MemoryConfig,
     embedding_routes: &[EmbeddingRouteConfig],
     api_key: Option<&str>,
@@ -282,31 +282,6 @@ pub fn create_memory_with_storage_and_routes(
         }
     }
 
-    fn build_sqlite_memory(
-        config: &MemoryConfig,
-        workspace_dir: &Path,
-        resolved_embedding: &ResolvedEmbeddingConfig,
-    ) -> anyhow::Result<SqliteMemory> {
-        let embedder: Arc<dyn embeddings::EmbeddingProvider> =
-            Arc::from(embeddings::create_embedding_provider(
-                &resolved_embedding.provider,
-                resolved_embedding.api_key.as_deref(),
-                &resolved_embedding.model,
-                resolved_embedding.dimensions,
-            ));
-
-        #[allow(clippy::cast_possible_truncation)]
-        let mem = SqliteMemory::with_embedder(
-            workspace_dir,
-            embedder,
-            config.vector_weight as f32,
-            config.keyword_weight as f32,
-            config.embedding_cache_size,
-            config.sqlite_open_timeout_secs,
-        )?;
-        Ok(mem)
-    }
-
     #[cfg(feature = "memory-postgres")]
     fn build_postgres_memory(
         storage_provider: Option<&StorageProviderConfig>,
@@ -410,6 +385,41 @@ pub fn create_memory_with_storage_and_routes(
         || build_postgres_memory(storage_provider),
         "",
     )
+}
+
+pub fn build_sqlite_memory(
+    config: &MemoryConfig,
+    workspace_dir: &Path,
+    resolved_embedding: &ResolvedEmbeddingConfig,
+) -> anyhow::Result<SqliteMemory> {
+    build_sqlite_memory_named(config, workspace_dir, resolved_embedding, "brain")
+}
+
+pub fn build_sqlite_memory_named(
+    config: &MemoryConfig,
+    workspace_dir: &Path,
+    resolved_embedding: &ResolvedEmbeddingConfig,
+    db_name: &str,
+) -> anyhow::Result<SqliteMemory> {
+    let embedder: Arc<dyn embeddings::EmbeddingProvider> =
+        Arc::from(embeddings::create_embedding_provider(
+            &resolved_embedding.provider,
+            resolved_embedding.api_key.as_deref(),
+            &resolved_embedding.model,
+            resolved_embedding.dimensions,
+        ));
+
+    #[allow(clippy::cast_possible_truncation)]
+    let mem = SqliteMemory::with_embedder_named(
+        workspace_dir,
+        db_name,
+        embedder,
+        config.vector_weight as f32,
+        config.keyword_weight as f32,
+        config.embedding_cache_size,
+        config.sqlite_open_timeout_secs,
+    )?;
+    Ok(mem)
 }
 
 pub fn create_memory_for_migration(

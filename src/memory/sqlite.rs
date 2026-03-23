@@ -84,7 +84,28 @@ impl SqliteMemory {
         cache_max: usize,
         open_timeout_secs: Option<u64>,
     ) -> anyhow::Result<Self> {
-        let db_path = workspace_dir.join("memory").join("brain.db");
+        Self::with_embedder_named(
+            workspace_dir,
+            "brain",
+            embedder,
+            vector_weight,
+            keyword_weight,
+            cache_max,
+            open_timeout_secs,
+        )
+    }
+
+    /// Build SQLite memory with custom DB name and optional open timeout.
+    pub fn with_embedder_named(
+        workspace_dir: &Path,
+        db_name: &str,
+        embedder: Arc<dyn EmbeddingProvider>,
+        vector_weight: f32,
+        keyword_weight: f32,
+        cache_max: usize,
+        open_timeout_secs: Option<u64>,
+    ) -> anyhow::Result<Self> {
+        let db_path = workspace_dir.join("memory").join(format!("{db_name}.db"));
 
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;

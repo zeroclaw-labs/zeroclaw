@@ -360,9 +360,21 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
 
-    // Register discord_search if discord_history channel is configured
+    // Register discord_search if discord_history channel is configured.
+    // Use the same embedding config as discord_history so semantic search works
+    // when an embedding provider is configured in [memory].
     if root_config.channels_config.discord_history.is_some() {
-        match crate::memory::SqliteMemory::new_named(workspace_dir, "discord") {
+        let resolved_embedding = crate::memory::resolve_embedding_config(
+            &root_config.memory,
+            &root_config.embedding_routes,
+            fallback_api_key,
+        );
+        match crate::memory::build_sqlite_memory_named(
+            &root_config.memory,
+            workspace_dir,
+            &resolved_embedding,
+            "discord",
+        ) {
             Ok(discord_mem) => {
                 tool_arcs.push(Arc::new(DiscordSearchTool::new(Arc::new(discord_mem))));
             }

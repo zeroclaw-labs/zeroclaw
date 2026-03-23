@@ -706,19 +706,28 @@ fn tool_call_signature(name: &str, arguments: &serde_json::Value) -> (String, St
 }
 
 fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
+    // 1. OpenAI-style: {"function": {"name": "...", "arguments": {...}}}
     if let Some(function) = value.get("function") {
         let tool_call_id = parse_tool_call_id(value, Some(function));
         let name = function
             .get("name")
+            .or_else(|| function.get("tool"))
+            .or_else(|| function.get("action"))
+            .or_else(|| function.get("command"))
+            .or_else(|| function.get("call"))
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .trim()
             .to_string();
+
         if !name.is_empty() {
             let arguments = parse_arguments_value(
                 function
                     .get("arguments")
-                    .or_else(|| function.get("parameters")),
+                    .or_else(|| function.get("parameters"))
+                    .or_else(|| function.get("params"))
+                    .or_else(|| function.get("args"))
+                    .or_else(|| function.get("inputs")),
             );
             return Some(ParsedToolCall {
                 name,
@@ -728,9 +737,14 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         }
     }
 
+    // 2. Generic top-level style: {"tool": "...", "params": {...}}
     let tool_call_id = parse_tool_call_id(value, None);
     let name = value
         .get("name")
+        .or_else(|| value.get("tool"))
+        .or_else(|| value.get("action"))
+        .or_else(|| value.get("command"))
+        .or_else(|| value.get("call"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
@@ -740,8 +754,45 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let arguments =
-        parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
+    // Try to find structured arguments first
+    let args_val = value
+        .get("arguments")
+        .or_else(|| value.get("parameters"))
+        .or_else(|| value.get("params"))
+        .or_else(|| value.get("args"))
+        .or_else(|| value.get("inputs"));
+
+    let arguments = if let Some(a) = args_val {
+        parse_arguments_value(Some(a))
+    } else {
+        // 3. Flat-style: {"action": "discord_search", "channel_name": "...", ...}
+        // Gather all fields that are not tool-name or tool-id aliases into arguments.
+        if let Some(obj) = value.as_object() {
+            let mut flat_args = serde_json::Map::new();
+            let known_keys = [
+                "name",
+                "tool",
+                "action",
+                "command",
+                "call",
+                "call_id",
+                "tool_call_id",
+            ];
+            for (k, v) in obj {
+                if !known_keys.contains(&k.as_str()) {
+                    flat_args.insert(k.clone(), v.clone());
+                }
+            }
+            if flat_args.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::Value::Object(flat_args)
+            }
+        } else {
+            serde_json::json!({})
+        }
+    };
+
     Some(ParsedToolCall {
         name,
         arguments,
@@ -1688,13 +1739,24 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             let inner = &after_open[..close_idx];
             let mut parsed_any = false;
 
-            // Try JSON format first
-            let json_values = extract_json_values(inner);
-            for value in json_values {
-                let parsed_calls = parse_tool_calls_from_json_value(&value);
-                if !parsed_calls.is_empty() {
+            // If the inner content starts with an XML tag, try XML parsing first
+            // to avoid misidentifying JSON argument keys as tool name aliases.
+            if inner.trim().starts_with('<') {
+                if let Some(xml_calls) = parse_xml_tool_calls(inner) {
+                    calls.extend(xml_calls);
                     parsed_any = true;
-                    calls.extend(parsed_calls);
+                }
+            }
+
+            // Try JSON format
+            if !parsed_any {
+                let json_values = extract_json_values(inner);
+                for value in json_values {
+                    let parsed_calls = parse_tool_calls_from_json_value(&value);
+                    if !parsed_calls.is_empty() {
+                        parsed_any = true;
+                        calls.extend(parsed_calls);
+                    }
                 }
             }
 
@@ -6959,6 +7021,78 @@ Final answer."#;
     // ═══════════════════════════════════════════════════════════════════════
     // Recovery Tests - Tool Call Value Parsing
     // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parse_tool_call_value_accepts_action_and_args_aliases() {
+        let value = serde_json::json!({
+            "action": "discord_search",
+            "args": {"channel_name": "cman-kk5", "limit": 10}
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "discord_search");
+        assert_eq!(
+            result
+                .arguments
+                .get("channel_name")
+                .and_then(|v| v.as_str()),
+            Some("cman-kk5")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_handles_flat_format() {
+        let value = serde_json::json!({
+            "command": "discord_search",
+            "channel_name": "cman-kk5",
+            "since": "2026-03-01T00:00:00Z"
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "discord_search");
+        assert_eq!(
+            result
+                .arguments
+                .get("channel_name")
+                .and_then(|v| v.as_str()),
+            Some("cman-kk5")
+        );
+        assert_eq!(
+            result.arguments.get("since").and_then(|v| v.as_str()),
+            Some("2026-03-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_accepts_tool_and_params_aliases() {
+        let value = serde_json::json!({
+            "tool": "discord_search",
+            "params": {"channel_name": "cman-kk5", "limit": 10}
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "discord_search");
+        assert_eq!(
+            result
+                .arguments
+                .get("channel_name")
+                .and_then(|v| v.as_str()),
+            Some("cman-kk5")
+        );
+    }
+
+    #[test]
+    fn parse_tool_call_value_accepts_nested_tool_and_params_aliases() {
+        let value = serde_json::json!({
+            "function": {
+                "tool": "file_read",
+                "params": {"path": "test.txt"}
+            }
+        });
+        let result = parse_tool_call_value(&value).expect("tool call should parse");
+        assert_eq!(result.name, "file_read");
+        assert_eq!(
+            result.arguments.get("path").and_then(|v| v.as_str()),
+            Some("test.txt")
+        );
+    }
 
     #[test]
     fn parse_tool_call_value_handles_missing_name_field() {

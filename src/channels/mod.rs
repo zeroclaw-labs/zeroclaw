@@ -3784,7 +3784,18 @@ fn collect_configured_channels(
     }
 
     if let Some(ref dh) = config.channels_config.discord_history {
-        match crate::memory::SqliteMemory::new_named(&config.workspace_dir, "discord") {
+        let resolved_embedding = crate::memory::resolve_embedding_config(
+            &config.memory,
+            &config.embedding_routes,
+            config.api_key.as_deref(),
+        );
+
+        match crate::memory::build_sqlite_memory_named(
+            &config.memory,
+            &config.workspace_dir,
+            &resolved_embedding,
+            "discord",
+        ) {
             Ok(discord_mem) => {
                 channels.push(ConfiguredChannel {
                     display_name: "Discord History",

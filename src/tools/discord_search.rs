@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::memory::Memory;
+use crate::memory::{Memory, MemoryCategory};
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
@@ -42,6 +42,14 @@ impl Tool for DiscordSearchTool {
                     "type": "string",
                     "description": "Filter results to a specific Discord channel ID"
                 },
+                "channel_name": {
+                    "type": "string",
+                    "description": "Filter by channel name (e.g. 'general', 'development')"
+                },
+                "username": {
+                    "type": "string",
+                    "description": "Filter by sender username"
+                },
                 "since": {
                     "type": "string",
                     "description": "Filter messages at or after this time (RFC 3339, e.g. 2025-03-01T00:00:00Z)"
@@ -59,16 +67,6 @@ impl Tool for DiscordSearchTool {
         let channel_id = args.get("channel_id").and_then(|v| v.as_str());
         let since = args.get("since").and_then(|v| v.as_str());
         let until = args.get("until").and_then(|v| v.as_str());
-
-        if query.trim().is_empty() && since.is_none() && until.is_none() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(
-                    "Provide at least 'query' (keywords) or time range ('since'/'until')".into(),
-                ),
-            });
-        }
 
         if let Some(s) = since {
             if chrono::DateTime::parse_from_rfc3339(s).is_err() {
@@ -107,42 +105,143 @@ impl Tool for DiscordSearchTool {
             }
         }
 
+        let channel_name = args.get("channel_name").and_then(|v| v.as_str());
+        let username = args.get("username").and_then(|v| v.as_str());
+
         #[allow(clippy::cast_possible_truncation)]
         let limit = args
             .get("limit")
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| v as usize);
 
-        match self
-            .discord_memory
-            .recall(query, limit, channel_id, since, until)
-            .await
-        {
-            Ok(entries) if entries.is_empty() => Ok(ToolResult {
-                success: true,
-                output: "No Discord messages found.".into(),
-                error: None,
-            }),
-            Ok(entries) => {
-                let mut output = format!("Found {} Discord messages:\n", entries.len());
-                for entry in &entries {
-                    let score = entry
-                        .score
-                        .map_or_else(String::new, |s| format!(" [{s:.0}%]"));
-                    let _ = writeln!(output, "- {}{score}", entry.content);
+        // When channel_name is given without an explicit channel_id, resolve matching
+        // channel IDs from the channel_cache (content = channel name, session_id = channel_id).
+        // This handles emoji suffixes and other name variations without relying on
+        // post-fetch string matching against message content.
+        let resolved_channel_ids: Vec<String> = if channel_name.is_some() && channel_id.is_none() {
+            let c_name_lower = channel_name
+                .unwrap_or("")
+                .trim_start_matches('#')
+                .to_lowercase();
+            let cache_cat = MemoryCategory::Custom("channel_cache".to_string());
+            self.discord_memory
+                .list(Some(&cache_cat), None)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.content.to_lowercase().contains(&c_name_lower))
+                .filter_map(|e| e.session_id)
+                .collect()
+        } else {
+            vec![]
+        };
+
+        let entries = if resolved_channel_ids.is_empty() {
+            // Fallback: text-based recall. If channel_name or username filters are
+            // active, fetch extra entries to compensate for post-fetch filtering.
+            let fetch_limit = if channel_name.is_some() || username.is_some() {
+                limit * 5
+            } else {
+                limit
+            };
+            match self
+                .discord_memory
+                .recall(query, fetch_limit, channel_id, since, until)
+                .await
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Discord search failed: {e}")),
+                    })
                 }
-                Ok(ToolResult {
-                    success: true,
-                    output,
-                    error: None,
-                })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Discord search failed: {e}")),
-            }),
+        } else {
+            // Recall messages for each matching channel directly by session_id.
+            // Fetch up to limit*2 per channel so truncation doesn't hide results.
+            let per_channel = (limit * 2).max(10);
+            let mut all = Vec::new();
+            for cid in &resolved_channel_ids {
+                if let Ok(ch_entries) = self
+                    .discord_memory
+                    .recall(query, per_channel, Some(cid.as_str()), since, until)
+                    .await
+                {
+                    all.extend(ch_entries);
+                }
+            }
+            // If query-filtered search returned nothing, fall back to all messages
+            // from those channels. This handles cases where the user asks a meta-
+            // question like "what was discussed" rather than searching specific content.
+            if all.is_empty() && !query.trim().is_empty() {
+                for cid in &resolved_channel_ids {
+                    if let Ok(ch_entries) = self
+                        .discord_memory
+                        .recall("", per_channel, Some(cid.as_str()), since, until)
+                        .await
+                    {
+                        all.extend(ch_entries);
+                    }
+                }
+            }
+            // Sort newest-first for consistent output across multiple channels.
+            all.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            all
+        };
+
+        let mut filtered_entries = entries;
+
+        // Apply channel_name text filter only on the fallback path (no cache-resolved IDs).
+        if resolved_channel_ids.is_empty() {
+            if let Some(c_name) = channel_name {
+                let c_name_lower = c_name.trim_start_matches('#').to_lowercase();
+                filtered_entries.retain(|e| {
+                    let key_lower = e.key.to_lowercase();
+                    let content_lower = e.content.to_lowercase();
+                    key_lower.contains(&format!("#{}", c_name_lower))
+                        || key_lower.contains(&c_name_lower)
+                        || content_lower.contains(&format!("#{}", c_name_lower))
+                        || content_lower.contains(&c_name_lower)
+                });
+            }
         }
+
+        if let Some(u_name) = username {
+            let u_name_lower = u_name.to_lowercase();
+            filtered_entries.retain(|e| {
+                e.key.to_lowercase().contains(&u_name_lower)
+                    || e.content.to_lowercase().contains(&u_name_lower)
+            });
+        }
+
+        filtered_entries.truncate(limit);
+
+        if filtered_entries.is_empty() {
+            return Ok(ToolResult {
+                success: true,
+                output: "No Discord messages found matching those filters.".into(),
+                error: None,
+            });
+        }
+
+        let mut output = format!("Found {} Discord messages:\n", filtered_entries.len());
+        for entry in &filtered_entries {
+            let score = entry
+                .score
+                .map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
+            let _ = writeln!(
+                output,
+                "- {} (from {}): {}{score}",
+                entry.timestamp, entry.key, entry.content
+            );
+        }
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
     }
 }
 
@@ -186,12 +285,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_requires_query_or_time() {
+    async fn search_empty_query_allowed() {
         let (_tmp, mem) = seeded_discord_mem();
+        mem.store(
+            "discord_001",
+            "@user1 in #general at 2025-01-01T00:00:00Z: hello world",
+            MemoryCategory::Custom("discord".to_string()),
+            Some("general"),
+        )
+        .await
+        .unwrap();
+
         let tool = DiscordSearchTool::new(mem);
         let result = tool.execute(json!({})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("at least"));
+        assert!(result.success);
+        assert!(result.output.contains("hello world"));
     }
 
     #[test]
@@ -200,5 +308,91 @@ mod tests {
         let tool = DiscordSearchTool::new(mem);
         assert_eq!(tool.name(), "discord_search");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
+    }
+
+    #[tokio::test]
+    async fn search_channel_name_resolves_via_cache() {
+        let (_tmp, mem) = seeded_discord_mem();
+
+        // Simulate channel with emoji suffix in its name
+        mem.store(
+            "cache:channel_name:ch123",
+            "cman-kk5🚚",
+            MemoryCategory::Custom("channel_cache".to_string()),
+            Some("ch123"),
+        )
+        .await
+        .unwrap();
+        mem.store(
+            "discord_001",
+            "@user1 in #cman-kk5🚚 at 2025-01-01T00:00:00Z: loading test message",
+            MemoryCategory::Custom("discord".to_string()),
+            Some("ch123"),
+        )
+        .await
+        .unwrap();
+
+        let tool = DiscordSearchTool::new(mem);
+        // Search without emoji — should still find the message via cache lookup
+        let result = tool
+            .execute(json!({"channel_name": "cman-kk5"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.contains("loading test message"),
+            "should find message via channel_cache lookup: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn search_channel_name_matches_multiple_channels() {
+        let (_tmp, mem) = seeded_discord_mem();
+
+        for (id, suffix, msg) in [
+            ("ch1", "cman-kk5🚚", "msg from loading"),
+            ("ch2", "cman-kk5-office", "msg from office"),
+            ("ch3", "other-channel", "msg from other"),
+        ] {
+            mem.store(
+                &format!("cache:channel_name:{id}"),
+                suffix,
+                MemoryCategory::Custom("channel_cache".to_string()),
+                Some(id),
+            )
+            .await
+            .unwrap();
+            mem.store(
+                &format!("discord_{id}"),
+                &format!("@user in #{suffix} at 2025-01-01T00:00:00Z: {msg}"),
+                MemoryCategory::Custom("discord".to_string()),
+                Some(id),
+            )
+            .await
+            .unwrap();
+        }
+
+        let tool = DiscordSearchTool::new(mem);
+        let result = tool
+            .execute(json!({"channel_name": "cman-kk5", "limit": 10}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(
+            result.output.contains("msg from loading"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("msg from office"),
+            "{}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("msg from other"),
+            "{}",
+            result.output
+        );
     }
 }
