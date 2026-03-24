@@ -4673,15 +4673,13 @@ pub async fn run(
             final_output = response.clone();
             if content_was_streamed.load(std::sync::atomic::Ordering::Relaxed) {
                 println!();
-            } else {
-                if let Err(e) = crate::channels::Channel::send(
-                    &cli,
-                    &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
-                )
-                .await
-                {
-                    eprintln!("\nError sending CLI response: {e}\n");
-                }
+            } else if let Err(e) = crate::channels::Channel::send(
+                &cli,
+                &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
+            )
+            .await
+            {
+                eprintln!("\nError sending CLI response: {e}\n");
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
