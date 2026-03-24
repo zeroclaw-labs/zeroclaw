@@ -558,7 +558,9 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
                 assert!(patterns.iter().any(|p| p.contains("High-entropy")));
                 assert!(redacted.contains("[REDACTED_HIGH_ENTROPY_TOKEN]"));
             }
-            LeakResult::Clean => panic!("Should still detect high-entropy tokens outside media markers"),
+            LeakResult::Clean => {
+                panic!("Should still detect high-entropy tokens outside media markers")
+            }
         }
     }
 
