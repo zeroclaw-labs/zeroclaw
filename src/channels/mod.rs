@@ -7959,6 +7959,7 @@ BTC is currently around $65,000 based on latest tool output."#
             None,
             true,
             crate::config::SkillsPromptInjectionMode::Full,
+            AutonomyLevel::default(),
         );
 
         assert!(
