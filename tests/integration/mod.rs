@@ -4,6 +4,7 @@ mod backup_cron_scheduling;
 mod channel_matrix;
 mod channel_routing;
 mod hooks;
+mod knowledge_client;
 mod memory_comparison;
 mod memory_loop_continuity;
 mod memory_restart;
