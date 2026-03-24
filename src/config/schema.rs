@@ -6227,6 +6227,10 @@ pub struct SlackConfig {
     /// Optional channel ID to restrict the bot to a single channel.
     /// Omit (or set `"*"`) to listen across all accessible channels.
     pub channel_id: Option<String>,
+    /// Optional explicit list of channel IDs to watch.
+    /// When set, this takes precedence over `channel_id`.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -11972,6 +11976,7 @@ allowed_users = ["@ops:matrix.org"]
     async fn slack_config_deserializes_without_allowed_users() {
         let json = r#"{"bot_token":"xoxb-tok"}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.channel_ids.is_empty());
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.thread_replies, None);
@@ -11982,7 +11987,19 @@ allowed_users = ["@ops:matrix.org"]
     async fn slack_config_deserializes_with_allowed_users() {
         let json = r#"{"bot_token":"xoxb-tok","allowed_users":["U111"]}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.channel_ids.is_empty());
         assert_eq!(parsed.allowed_users, vec!["U111"]);
+        assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.thread_replies, None);
+        assert!(!parsed.mention_only);
+    }
+
+    #[test]
+    async fn slack_config_deserializes_with_channel_ids() {
+        let json = r#"{"bot_token":"xoxb-tok","channel_ids":["C111","D222"]}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.channel_ids, vec!["C111", "D222"]);
+        assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.thread_replies, None);
         assert!(!parsed.mention_only);
@@ -12047,11 +12064,27 @@ bot_token = "xoxb-tok"
 channel_id = "C123"
 "#;
         let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.channel_ids.is_empty());
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.thread_replies, None);
         assert!(!parsed.mention_only);
         assert_eq!(parsed.channel_id.as_deref(), Some("C123"));
+    }
+
+    #[test]
+    async fn slack_config_toml_accepts_channel_ids() {
+        let toml_str = r#"
+bot_token = "xoxb-tok"
+channel_ids = ["C123", "D456"]
+"#;
+        let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.channel_ids, vec!["C123", "D456"]);
+        assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.thread_replies, None);
+        assert!(!parsed.mention_only);
+        assert!(parsed.channel_id.is_none());
     }
 
     #[test]
