@@ -156,7 +156,18 @@ impl Tool for SopAdvanceTool {
             }
         }
 
-        match action {
+        // Extract completion info before consuming the action (for downstream SOP chaining)
+        let completion_info = match &action {
+            Ok(SopRunAction::Completed { run_id, sop_name }) => {
+                Some((sop_name.clone(), run_id.clone(), "completed"))
+            }
+            Ok(SopRunAction::Failed {
+                run_id, sop_name, ..
+            }) => Some((sop_name.clone(), run_id.clone(), "failed")),
+            _ => None,
+        };
+
+        let tool_result = match action {
             Ok(action) => {
                 let result_output = match action {
                     SopRunAction::ExecuteStep {
@@ -205,7 +216,23 @@ impl Tool for SopAdvanceTool {
                 output: String::new(),
                 error: Some(format!("Failed to advance step: {e}")),
             }),
+        };
+
+        // Dispatch completion event for downstream SOP chaining (engine lock already released)
+        if let Some((sop_name, run_id, status)) = completion_info {
+            if let Some(ref audit) = self.audit {
+                crate::sop::dispatch::dispatch_completion(
+                    &self.engine,
+                    audit,
+                    &sop_name,
+                    &run_id,
+                    status,
+                )
+                .await;
+            }
         }
+
+        tool_result
     }
 }
 

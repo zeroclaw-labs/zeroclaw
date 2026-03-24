@@ -73,7 +73,7 @@ pub async fn run_mqtt_sop_listener(
                 };
 
                 let results = dispatch_sop_event(&engine, &audit, event).await;
-                process_headless_results(&results).await;
+                process_headless_results(&engine, &audit, &results).await;
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 crate::health::mark_component_ok("mqtt");

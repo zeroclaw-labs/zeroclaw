@@ -622,9 +622,10 @@ impl SopEngine {
 
     // ── Test helpers ──────────────────────────────────────────────
 
-    /// Replace loaded SOPs (for testing from other modules).
-    #[cfg(test)]
-    pub(crate) fn set_sops_for_test(&mut self, sops: Vec<Sop>) {
+    /// Replace loaded SOPs (for testing from other modules and integration tests).
+    /// This is a test helper and should not be used in production code.
+    #[doc(hidden)]
+    pub fn set_sops_for_test(&mut self, sops: Vec<Sop>) {
         self.sops = sops;
     }
 
@@ -722,6 +723,28 @@ fn trigger_matches(trigger: &SopTrigger, event: &SopEvent) -> bool {
         }
 
         (SopTrigger::Manual, SopTriggerSource::Manual) => true,
+
+        (
+            SopTrigger::SopCompletion {
+                sop_name,
+                on_status,
+            },
+            SopTriggerSource::SopCompletion,
+        ) => {
+            let name_match = event.topic.as_deref().map_or(false, |t| t == sop_name);
+            if !name_match {
+                return false;
+            }
+            match on_status {
+                Some(expected_status) => event
+                    .payload
+                    .as_deref()
+                    .and_then(|p| serde_json::from_str::<serde_json::Value>(p).ok())
+                    .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(String::from))
+                    .map_or(false, |actual| actual == *expected_status),
+                None => true,
+            }
+        }
 
         _ => false,
     }
@@ -849,7 +872,7 @@ fn format_step_context(sop: &Sop, run: &SopRun, step: &SopStep) -> String {
 
 // ── Utilities ───────────────────────────────────────────────────
 
-pub(crate) fn now_iso8601() -> String {
+pub fn now_iso8601() -> String {
     // Use chrono if available, otherwise fallback to SystemTime
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2086,5 +2109,106 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not in deterministic mode"));
+    }
+
+    // ── SopCompletion trigger matching ──────────────────────
+
+    #[test]
+    fn sop_completion_trigger_matches_by_name() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::SopCompletion {
+                sop_name: "sop_a".into(),
+                on_status: None,
+            }],
+            ..test_sop("downstream", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop]);
+
+        // Matching event
+        let event = SopEvent {
+            source: SopTriggerSource::SopCompletion,
+            topic: Some("sop_a".into()),
+            payload: Some(r#"{"status": "completed", "run_id": "run-001"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&event).len(), 1);
+
+        // Different SOP name — should NOT match
+        let event = SopEvent {
+            source: SopTriggerSource::SopCompletion,
+            topic: Some("sop_b".into()),
+            payload: Some(r#"{"status": "completed", "run_id": "run-002"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&event).is_empty());
+
+        // Different source — should NOT match
+        let event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: Some("sop_a".into()),
+            payload: None,
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&event).is_empty());
+    }
+
+    #[test]
+    fn sop_completion_trigger_filters_by_status() {
+        let sop_completed = Sop {
+            triggers: vec![SopTrigger::SopCompletion {
+                sop_name: "sop_a".into(),
+                on_status: Some("completed".into()),
+            }],
+            ..test_sop("on-success", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop_completed]);
+
+        // Matching status
+        let event = SopEvent {
+            source: SopTriggerSource::SopCompletion,
+            topic: Some("sop_a".into()),
+            payload: Some(r#"{"status": "completed", "run_id": "run-001"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&event).len(), 1);
+
+        // Different status — should NOT match
+        let event = SopEvent {
+            source: SopTriggerSource::SopCompletion,
+            topic: Some("sop_a".into()),
+            payload: Some(r#"{"status": "failed", "run_id": "run-002"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert!(engine.match_trigger(&event).is_empty());
+    }
+
+    #[test]
+    fn sop_completion_trigger_no_status_matches_any() {
+        let sop = Sop {
+            triggers: vec![SopTrigger::SopCompletion {
+                sop_name: "sop_a".into(),
+                on_status: None,
+            }],
+            ..test_sop("any-status", SopExecutionMode::Auto, SopPriority::Normal)
+        };
+        let engine = engine_with_sops(vec![sop]);
+
+        // Completed — should match
+        let event = SopEvent {
+            source: SopTriggerSource::SopCompletion,
+            topic: Some("sop_a".into()),
+            payload: Some(r#"{"status": "completed"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&event).len(), 1);
+
+        // Failed — should also match
+        let event = SopEvent {
+            source: SopTriggerSource::SopCompletion,
+            topic: Some("sop_a".into()),
+            payload: Some(r#"{"status": "failed"}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        assert_eq!(engine.match_trigger(&event).len(), 1);
     }
 }

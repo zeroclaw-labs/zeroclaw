@@ -424,7 +424,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
-        Arc::new(MemoryPurgeTool::new(memory, security.clone())),
+        Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -786,9 +786,14 @@ pub fn all_tools_with_runtime(
         let sop_engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
             root_config.sop.clone(),
         )));
+        let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(memory.clone()));
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(
+            SopExecuteTool::new(Arc::clone(&sop_engine)).with_audit(sop_audit.clone()),
+        ));
+        tool_arcs.push(Arc::new(
+            SopAdvanceTool::new(Arc::clone(&sop_engine)).with_audit(sop_audit.clone()),
+        ));
         tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
         tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
     }

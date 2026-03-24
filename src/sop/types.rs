@@ -85,6 +85,11 @@ pub enum SopTrigger {
         condition: Option<String>,
     },
     Manual,
+    SopCompletion {
+        sop_name: String,
+        #[serde(default)]
+        on_status: Option<String>,
+    },
 }
 
 impl fmt::Display for SopTrigger {
@@ -95,6 +100,7 @@ impl fmt::Display for SopTrigger {
             Self::Cron { expression } => write!(f, "cron:{expression}"),
             Self::Peripheral { board, signal, .. } => write!(f, "peripheral:{board}/{signal}"),
             Self::Manual => write!(f, "manual"),
+            Self::SopCompletion { sop_name, .. } => write!(f, "sopcompletion:{sop_name}"),
         }
     }
 }
@@ -234,6 +240,7 @@ pub enum SopTriggerSource {
     Cron,
     Peripheral,
     Manual,
+    SopCompletion,
 }
 
 impl fmt::Display for SopTriggerSource {
@@ -244,6 +251,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Cron => write!(f, "cron"),
             Self::Peripheral => write!(f, "peripheral"),
             Self::Manual => write!(f, "manual"),
+            Self::SopCompletion => write!(f, "sopcompletion"),
         }
     }
 }
@@ -553,6 +561,57 @@ condition = "$.value > 85"
                 .unwrap();
         assert!(step.suggested_tools.is_empty());
         assert!(!step.requires_confirmation);
+    }
+
+    #[test]
+    fn sop_completion_trigger_serializes() {
+        let trigger = SopTrigger::SopCompletion {
+            sop_name: "onboarding".into(),
+            on_status: None,
+        };
+        let toml = toml::to_string(&trigger).unwrap();
+        assert!(toml.contains(r#"type = "sopcompletion""#));
+        assert!(toml.contains(r#"sop_name = "onboarding""#));
+
+        let parsed: SopTrigger = toml::from_str(&toml).unwrap();
+        assert!(matches!(
+            parsed,
+            SopTrigger::SopCompletion { ref sop_name, on_status: None } if sop_name == "onboarding"
+        ));
+    }
+
+    #[test]
+    fn sop_completion_trigger_with_status_roundtrip() {
+        let trigger = SopTrigger::SopCompletion {
+            sop_name: "deploy".into(),
+            on_status: Some("completed".into()),
+        };
+        let toml = toml::to_string(&trigger).unwrap();
+        let parsed: SopTrigger = toml::from_str(&toml).unwrap();
+        assert!(matches!(
+            parsed,
+            SopTrigger::SopCompletion {
+                ref sop_name,
+                on_status: Some(ref status)
+            } if sop_name == "deploy" && status == "completed"
+        ));
+    }
+
+    #[test]
+    fn sop_completion_trigger_failed_status() {
+        let trigger = SopTrigger::SopCompletion {
+            sop_name: "test".into(),
+            on_status: Some("failed".into()),
+        };
+        let toml = toml::to_string(&trigger).unwrap();
+        let parsed: SopTrigger = toml::from_str(&toml).unwrap();
+        assert!(matches!(
+            parsed,
+            SopTrigger::SopCompletion {
+                ref sop_name,
+                on_status: Some(ref status)
+            } if sop_name == "test" && status == "failed"
+        ));
     }
 
     #[test]

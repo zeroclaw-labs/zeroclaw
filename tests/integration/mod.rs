@@ -8,5 +8,6 @@ mod memory_comparison;
 mod memory_loop_continuity;
 mod memory_restart;
 mod report_template_tool_test;
+mod sop_chaining;
 mod telegram_attachment_fallback;
 mod telegram_finalize_draft;

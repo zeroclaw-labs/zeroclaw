@@ -152,6 +152,46 @@ pub async fn dispatch_sop_event(
     results
 }
 
+// ── Completion event dispatch ───────────────────────────────────
+
+/// Dispatch a completion event for a finished SOP run.
+///
+/// This creates a `SopEvent` with source `SopCompletion` and dispatches it
+/// to trigger any downstream SOPs that are configured with a matching
+/// `SopCompletion` trigger.
+///
+/// IMPORTANT: This must be called AFTER the engine lock is released to avoid deadlock.
+///
+/// Recursion safety: `dispatch_completion` → `dispatch_sop_event` → `process_headless_results`
+/// → `dispatch_completion` forms a recursive async chain. Depth is bounded by the number of
+/// distinct SOPs in the chain. Circular chains are prevented by per-SOP cooldown (the same
+/// SOP cannot be re-triggered within its cooldown window). `Box::pin` handles the async
+/// recursion without stack overflow for realistic chain depths.
+pub async fn dispatch_completion(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    sop_name: &str,
+    run_id: &str,
+    status: &str,
+) {
+    let event = SopEvent {
+        source: SopTriggerSource::SopCompletion,
+        topic: Some(sop_name.to_string()),
+        payload: Some(
+            serde_json::json!({
+                "status": status,
+                "run_id": run_id,
+                "sop_name": sop_name,
+            })
+            .to_string(),
+        ),
+        timestamp: now_iso8601(),
+    };
+
+    let results = dispatch_sop_event(engine, audit, event).await;
+    Box::pin(process_headless_results(engine, audit, &results)).await;
+}
+
 // ── Headless result processing ──────────────────────────────────
 
 /// Process dispatch results in headless (non-agent-loop) callers.
@@ -161,7 +201,14 @@ pub async fn dispatch_sop_event(
 /// approval timeout polling in the scheduler handles progression.
 /// For `ExecuteStep` actions, the run is started in the engine but steps
 /// cannot be executed without an agent loop — this is logged as a warning.
-pub fn process_headless_results(results: &[DispatchResult]) {
+///
+/// When runs complete or fail immediately, this dispatches completion events
+/// to trigger downstream SOPs.
+pub async fn process_headless_results(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    results: &[DispatchResult],
+) {
     for result in results {
         match result {
             DispatchResult::Started {
@@ -205,9 +252,13 @@ pub fn process_headless_results(results: &[DispatchResult]) {
                     info!(
                         "SOP headless dispatch: run {run_id} ('{sop_name}') completed immediately"
                     );
+                    // Dispatch completion event to trigger downstream SOPs
+                    dispatch_completion(engine, audit, sop_name, run_id, "completed").await;
                 }
                 SopRunAction::Failed { reason, .. } => {
                     warn!("SOP headless dispatch: run {run_id} ('{sop_name}') failed: {reason}");
+                    // Dispatch completion event to trigger downstream SOPs that listen for failures
+                    dispatch_completion(engine, audit, sop_name, run_id, "failed").await;
                 }
             },
             DispatchResult::Skipped { sop_name, reason } => {
