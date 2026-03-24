@@ -4048,6 +4048,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     } else {
                         Some(channel)
                     },
+                    channel_ids: Vec::new(),
                     allowed_users,
                     interrupt_on_new_message: false,
                     thread_replies: None,

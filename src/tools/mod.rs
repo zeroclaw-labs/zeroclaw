@@ -72,6 +72,7 @@ pub mod memory_store;
 pub mod microsoft365;
 pub mod model_routing_config;
 pub mod model_switch;
+pub mod node_capabilities;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod opencode_cli;
@@ -550,6 +551,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
             web_fetch_config.firecrawl.clone(),
+            web_fetch_config.allowed_private_hosts.clone(),
         )));
     }
 

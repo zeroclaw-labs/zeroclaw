@@ -39,6 +39,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.composio",
     "tool.http_request",
     "tool.pushover",
+    "tool.web_search",
     "memory.embeddings",
     "tunnel.custom",
     "transcription.groq",
@@ -1918,6 +1919,10 @@ pub struct GatewayConfig {
     /// Pairing dashboard configuration
     #[serde(default)]
     pub pairing_dashboard: PairingDashboardConfig,
+
+    /// TLS configuration for the gateway server (`[gateway.tls]`).
+    #[serde(default)]
+    pub tls: Option<GatewayTlsConfig>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1974,6 +1979,7 @@ impl Default for GatewayConfig {
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
+            tls: None,
         }
     }
 }
@@ -2024,6 +2030,38 @@ impl Default for PairingDashboardConfig {
             lockout_secs: default_pairing_lockout_secs(),
         }
     }
+}
+
+/// TLS configuration for the gateway server (`[gateway.tls]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayTlsConfig {
+    /// Enable TLS for the gateway (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the PEM-encoded server certificate file.
+    pub cert_path: String,
+    /// Path to the PEM-encoded server private key file.
+    pub key_path: String,
+    /// Client certificate authentication (mutual TLS) settings.
+    #[serde(default)]
+    pub client_auth: Option<GatewayClientAuthConfig>,
+}
+
+/// Client certificate authentication (mTLS) configuration (`[gateway.tls.client_auth]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GatewayClientAuthConfig {
+    /// Enable client certificate verification (default: false).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the PEM-encoded CA certificate used to verify client certs.
+    pub ca_cert_path: String,
+    /// Reject connections that do not present a valid client certificate (default: true).
+    #[serde(default = "default_true")]
+    pub require_client_cert: bool,
+    /// Optional SHA-256 fingerprints for certificate pinning.
+    /// When non-empty, only client certs matching one of these fingerprints are accepted.
+    #[serde(default)]
+    pub pinned_certs: Vec<String>,
 }
 
 /// Secure transport configuration for inter-node communication (`[node_transport]`).
@@ -2379,6 +2417,9 @@ pub struct WebFetchConfig {
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
     pub blocked_domains: Vec<String>,
+    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`)
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
     #[serde(default = "default_web_fetch_max_response_size")]
     pub max_response_size: usize,
@@ -2460,6 +2501,7 @@ impl Default for WebFetchConfig {
             enabled: true,
             allowed_domains: vec!["*".into()],
             blocked_domains: vec![],
+            allowed_private_hosts: vec![],
             max_response_size: default_web_fetch_max_response_size(),
             timeout_secs: default_web_fetch_timeout_secs(),
             firecrawl: FirecrawlConfig::default(),
@@ -6227,6 +6269,10 @@ pub struct SlackConfig {
     /// Optional channel ID to restrict the bot to a single channel.
     /// Omit (or set `"*"`) to listen across all accessible channels.
     pub channel_id: Option<String>,
+    /// Optional explicit list of channel IDs to watch.
+    /// When set, this takes precedence over `channel_id`.
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -7127,6 +7173,9 @@ pub enum SandboxBackend {
     Bubblewrap,
     /// Docker container isolation
     Docker,
+    /// macOS sandbox-exec (Seatbelt)
+    #[serde(alias = "sandbox-exec")]
+    SandboxExec,
     /// No sandboxing (application-layer only)
     None,
 }
@@ -11984,6 +12033,7 @@ allowed_users = ["@ops:matrix.org"]
     async fn slack_config_deserializes_without_allowed_users() {
         let json = r#"{"bot_token":"xoxb-tok"}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.channel_ids.is_empty());
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.thread_replies, None);
@@ -11994,7 +12044,19 @@ allowed_users = ["@ops:matrix.org"]
     async fn slack_config_deserializes_with_allowed_users() {
         let json = r#"{"bot_token":"xoxb-tok","allowed_users":["U111"]}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.channel_ids.is_empty());
         assert_eq!(parsed.allowed_users, vec!["U111"]);
+        assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.thread_replies, None);
+        assert!(!parsed.mention_only);
+    }
+
+    #[test]
+    async fn slack_config_deserializes_with_channel_ids() {
+        let json = r#"{"bot_token":"xoxb-tok","channel_ids":["C111","D222"]}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.channel_ids, vec!["C111", "D222"]);
+        assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.thread_replies, None);
         assert!(!parsed.mention_only);
@@ -12059,11 +12121,27 @@ bot_token = "xoxb-tok"
 channel_id = "C123"
 "#;
         let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.channel_ids.is_empty());
         assert!(parsed.allowed_users.is_empty());
         assert!(!parsed.interrupt_on_new_message);
         assert_eq!(parsed.thread_replies, None);
         assert!(!parsed.mention_only);
         assert_eq!(parsed.channel_id.as_deref(), Some("C123"));
+    }
+
+    #[test]
+    async fn slack_config_toml_accepts_channel_ids() {
+        let toml_str = r#"
+bot_token = "xoxb-tok"
+channel_ids = ["C123", "D456"]
+"#;
+        let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.channel_ids, vec!["C123", "D456"]);
+        assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.thread_replies, None);
+        assert!(!parsed.mention_only);
+        assert!(parsed.channel_id.is_none());
     }
 
     #[test]
@@ -12370,6 +12448,7 @@ channel_id = "C123"
             session_persistence: true,
             session_ttl_hours: 0,
             pairing_dashboard: PairingDashboardConfig::default(),
+            tls: None,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();

@@ -9,6 +9,8 @@ import type {
   CostSummary,
   CliTool,
   HealthSnapshot,
+  Session,
+  ChannelDetail,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
@@ -288,6 +290,30 @@ export function deleteMemory(key: string): Promise<void> {
 export function getCost(): Promise<CostSummary> {
   return apiFetch<CostSummary | { cost: CostSummary }>('/api/cost').then((data) =>
     unwrapField(data, 'cost'),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+export function getSessions(): Promise<Session[]> {
+  return apiFetch<Session[] | { sessions: Session[] }>('/api/sessions').then((data) =>
+    unwrapField(data, 'sessions'),
+  );
+}
+
+export function getSession(id: string): Promise<Session> {
+  return apiFetch<Session>(`/api/sessions/${encodeURIComponent(id)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Channels (detailed)
+// ---------------------------------------------------------------------------
+
+export function getChannels(): Promise<ChannelDetail[]> {
+  return apiFetch<ChannelDetail[] | { channels: ChannelDetail[] }>('/api/channels').then((data) =>
+    unwrapField(data, 'channels'),
   );
 }
 
