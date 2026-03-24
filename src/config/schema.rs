@@ -4532,6 +4532,18 @@ pub struct StorageProviderConfig {
     /// Optional connection timeout in seconds for remote providers.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
+
+    /// Enable pgvector extension for hybrid vector+keyword recall.
+    #[serde(default)]
+    pub pgvector_enabled: bool,
+
+    /// Vector dimensions for pgvector embeddings (default: 1536).
+    #[serde(default = "default_pgvector_dimensions")]
+    pub pgvector_dimensions: usize,
+}
+
+fn default_pgvector_dimensions() -> usize {
+    1536
 }
 
 fn default_storage_schema() -> String {
@@ -4550,6 +4562,8 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
+            pgvector_enabled: false,
+            pgvector_dimensions: default_pgvector_dimensions(),
         }
     }
 }
