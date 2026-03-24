@@ -7,6 +7,7 @@ use crate::i18n::ToolDescriptions;
 use crate::memory::{self, decay, Memory, MemoryCategory};
 use crate::multimodal;
 use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
+use crate::providers::traits::StreamEvent;
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
 };
@@ -15,6 +16,7 @@ use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use futures_util::StreamExt;
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -130,6 +132,8 @@ pub(crate) fn check_tool_loop_budget() -> Option<BudgetCheck> {
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
+/// Rolling window size for detecting streamed tool-call payload markers.
+const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
@@ -360,6 +364,10 @@ pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 /// Sentinel value sent through on_delta to signal the draft updater to clear accumulated text.
 /// Used before streaming the final answer so progress lines are replaced by the clean response.
 pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
+
+/// Sentinel prefix sent through on_delta to convey progress updates (e.g. tool execution status).
+/// Test helpers filter these out when asserting on visible output.
+pub(crate) const DRAFT_PROGRESS_SENTINEL: &str = "\x00PROGRESS\x00";
 
 tokio::task_local! {
     pub(crate) static TOOL_CHOICE_OVERRIDE: Option<String>;
@@ -2291,6 +2299,144 @@ pub(crate) fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, 
         .next()
 }
 
+#[derive(Debug, Default)]
+struct StreamedChatOutcome {
+    response_text: String,
+    tool_calls: Vec<ToolCall>,
+    forwarded_live_deltas: bool,
+}
+
+fn looks_like_streamed_tool_payload(window: &str) -> bool {
+    let lowered = window.to_ascii_lowercase();
+    lowered.contains("<tool_call")
+        || lowered.contains("<toolcall")
+        || lowered.contains("\"tool_calls\"")
+}
+
+async fn call_provider_chat(
+    provider: &dyn Provider,
+    messages: &[ChatMessage],
+    request_tools: Option<&[crate::tools::ToolSpec]>,
+    model: &str,
+    temperature: f64,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<crate::providers::ChatResponse> {
+    let chat_future = provider.chat(
+        ChatRequest {
+            messages,
+            tools: request_tools,
+        },
+        model,
+        temperature,
+    );
+
+    if let Some(token) = cancellation_token {
+        tokio::select! {
+            () = token.cancelled() => Err(ToolLoopCancelled.into()),
+            result = chat_future => result,
+        }
+    } else {
+        chat_future.await
+    }
+}
+
+async fn consume_provider_streaming_response(
+    provider: &dyn Provider,
+    messages: &[ChatMessage],
+    request_tools: Option<&[crate::tools::ToolSpec]>,
+    model: &str,
+    temperature: f64,
+    cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<String>>,
+) -> Result<StreamedChatOutcome> {
+    let mut provider_stream = provider.stream_chat(
+        ChatRequest {
+            messages,
+            tools: request_tools,
+        },
+        model,
+        temperature,
+        crate::providers::traits::StreamOptions::new(true),
+    );
+    let mut outcome = StreamedChatOutcome::default();
+    let mut delta_sender = on_delta;
+    let mut suppress_forwarding = false;
+    let mut marker_window = String::new();
+
+    loop {
+        let next_chunk = if let Some(token) = cancellation_token {
+            tokio::select! {
+                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                chunk = provider_stream.next() => chunk,
+            }
+        } else {
+            provider_stream.next().await
+        };
+
+        let Some(event_result) = next_chunk else {
+            break;
+        };
+
+        let event = event_result.map_err(|err| anyhow::anyhow!("provider stream error: {err}"))?;
+        match event {
+            StreamEvent::Final => break,
+            StreamEvent::ToolCall(tool_call) => {
+                outcome.tool_calls.push(tool_call);
+                suppress_forwarding = true;
+                if outcome.forwarded_live_deltas {
+                    if let Some(tx) = delta_sender {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                    }
+                    outcome.forwarded_live_deltas = false;
+                }
+            }
+            StreamEvent::TextDelta(chunk) => {
+                if chunk.delta.is_empty() {
+                    continue;
+                }
+
+                outcome.response_text.push_str(&chunk.delta);
+                marker_window.push_str(&chunk.delta);
+
+                if marker_window.len() > STREAM_TOOL_MARKER_WINDOW_CHARS {
+                    let keep_from = marker_window.len() - STREAM_TOOL_MARKER_WINDOW_CHARS;
+                    let boundary = marker_window
+                        .char_indices()
+                        .find(|(idx, _)| *idx >= keep_from)
+                        .map_or(0, |(idx, _)| idx);
+                    marker_window.drain(..boundary);
+                }
+
+                if !suppress_forwarding && looks_like_streamed_tool_payload(&marker_window) {
+                    suppress_forwarding = true;
+                    if outcome.forwarded_live_deltas {
+                        if let Some(tx) = delta_sender {
+                            let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                        }
+                        outcome.forwarded_live_deltas = false;
+                    }
+                }
+
+                if suppress_forwarding {
+                    continue;
+                }
+
+                if let Some(tx) = delta_sender {
+                    if !outcome.forwarded_live_deltas {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                        outcome.forwarded_live_deltas = true;
+                    }
+                    if tx.send(chunk.delta).await.is_err() {
+                        delta_sender = None;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 /// When `silent` is true, suppresses stdout (for channel use).
@@ -2826,200 +2972,268 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             None
         };
+        let should_consume_provider_stream = on_delta.is_some()
+            && provider.supports_streaming()
+            && (request_tools.is_none() || provider.supports_streaming_tool_events());
+        let mut streamed_live_deltas = false;
 
-        let chat_future = active_provider.chat(
-            ChatRequest {
-                messages: &prepared_messages.messages,
-                tools: request_tools,
-            },
-            active_model,
-            temperature,
-        );
-
-        // Wrap the LLM call with an optional per-step timeout from pacing config.
-        // This catches a truly hung model response without terminating the overall
-        // task loop (the per-message budget handles that separately).
-        let chat_result = match pacing.step_timeout_secs {
-            Some(step_secs) if step_secs > 0 => {
-                let step_timeout = Duration::from_secs(step_secs);
-                if let Some(token) = cancellation_token.as_ref() {
-                    tokio::select! {
-                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                        result = tokio::time::timeout(step_timeout, chat_future) => {
-                            match result {
-                                Ok(inner) => inner,
-                                Err(_) => anyhow::bail!(
-                                    "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                                ),
-                            }
-                        },
-                    }
-                } else {
-                    match tokio::time::timeout(step_timeout, chat_future).await {
-                        Ok(inner) => inner,
-                        Err(_) => anyhow::bail!(
-                            "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
-                        ),
-                    }
+        let chat_result = if should_consume_provider_stream {
+            match consume_provider_streaming_response(
+                active_provider,
+                &prepared_messages.messages,
+                request_tools,
+                active_model,
+                temperature,
+                cancellation_token.as_ref(),
+                on_delta.as_ref(),
+            )
+            .await
+            {
+                Ok(streamed) => {
+                    streamed_live_deltas = streamed.forwarded_live_deltas;
+                    Ok(crate::providers::ChatResponse {
+                        text: Some(streamed.response_text),
+                        tool_calls: streamed.tool_calls,
+                        usage: None,
+                        reasoning_content: None,
+                    })
                 }
-            }
-            _ => {
-                if let Some(token) = cancellation_token.as_ref() {
-                    tokio::select! {
-                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                        result = chat_future => result,
-                    }
-                } else {
-                    chat_future.await
-                }
-            }
-        };
-
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
-            match chat_result {
-                Ok(resp) => {
-                    let (resp_input_tokens, resp_output_tokens) = resp
-                        .usage
-                        .as_ref()
-                        .map(|u| (u.input_tokens, u.output_tokens))
-                        .unwrap_or((None, None));
-
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: active_provider_name.to_string(),
-                        model: active_model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: true,
-                        error_message: None,
-                        input_tokens: resp_input_tokens,
-                        output_tokens: resp_output_tokens,
-                    });
-
-                    // Record cost via task-local tracker (no-op when not scoped)
-                    let _ = resp.usage.as_ref().and_then(|usage| {
-                        record_tool_loop_cost_usage(active_provider_name, active_model, usage)
-                    });
-
-                    let response_text = resp.text_or_empty().to_string();
-                    // First try native structured tool calls (OpenAI-format).
-                    // Fall back to text-based parsing (XML tags, markdown blocks,
-                    // GLM format) only if the provider returned no native calls —
-                    // this ensures we support both native and prompt-guided models.
-                    let mut calls = parse_structured_tool_calls(&resp.tool_calls);
-                    let mut parsed_text = String::new();
-
-                    if calls.is_empty() {
-                        let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
-                        if !fallback_text.is_empty() {
-                            parsed_text = fallback_text;
-                        }
-                        calls = fallback_calls;
-                    }
-
-                    if let Some(parse_issue) = detect_tool_call_parse_issue(&response_text, &calls)
-                    {
-                        runtime_trace::record_event(
-                            "tool_call_parse_issue",
-                            Some(channel_name),
-                            Some(active_provider_name),
-                            Some(active_model),
-                            Some(&turn_id),
-                            Some(false),
-                            Some(&parse_issue),
-                            serde_json::json!({
-                                "iteration": iteration + 1,
-                                "response_excerpt": truncate_with_ellipsis(
-                                    &scrub_credentials(&response_text),
-                                    600
-                                ),
-                            }),
-                        );
-                    }
-
-                    runtime_trace::record_event(
-                        "llm_response",
-                        Some(channel_name),
-                        Some(active_provider_name),
-                        Some(active_model),
-                        Some(&turn_id),
-                        Some(true),
-                        None,
-                        serde_json::json!({
-                            "iteration": iteration + 1,
-                            "duration_ms": llm_started_at.elapsed().as_millis(),
-                            "input_tokens": resp_input_tokens,
-                            "output_tokens": resp_output_tokens,
-                            "raw_response": scrub_credentials(&response_text),
-                            "native_tool_calls": resp.tool_calls.len(),
-                            "parsed_tool_calls": calls.len(),
-                        }),
+                Err(stream_err) => {
+                    tracing::warn!(
+                        provider = active_provider_name,
+                        model = active_model,
+                        iteration = iteration + 1,
+                        "provider streaming failed, falling back to non-streaming chat: {stream_err}"
                     );
-
-                    // Preserve native tool call IDs in assistant history so role=tool
-                    // follow-up messages can reference the exact call id.
-                    let reasoning_content = resp.reasoning_content.clone();
-                    let assistant_history_content = if resp.tool_calls.is_empty() {
-                        if use_native_tools {
-                            build_native_assistant_history_from_parsed_calls(
-                                &response_text,
-                                &calls,
-                                reasoning_content.as_deref(),
-                            )
-                            .unwrap_or_else(|| response_text.clone())
-                        } else {
-                            response_text.clone()
-                        }
-                    } else {
-                        build_native_assistant_history(
-                            &response_text,
-                            &resp.tool_calls,
-                            reasoning_content.as_deref(),
-                        )
-                    };
-
-                    let native_calls = resp.tool_calls;
-                    (
-                        response_text,
-                        parsed_text,
-                        calls,
-                        assistant_history_content,
-                        native_calls,
-                    )
-                }
-                Err(e) => {
-                    let safe_error = crate::providers::sanitize_api_error(&e.to_string());
-                    observer.record_event(&ObserverEvent::LlmResponse {
-                        provider: active_provider_name.to_string(),
-                        model: active_model.to_string(),
-                        duration: llm_started_at.elapsed(),
-                        success: false,
-                        error_message: Some(safe_error.clone()),
-                        input_tokens: None,
-                        output_tokens: None,
-                    });
                     runtime_trace::record_event(
-                        "llm_response",
+                        "llm_stream_fallback",
                         Some(channel_name),
                         Some(active_provider_name),
                         Some(active_model),
                         Some(&turn_id),
                         Some(false),
-                        Some(&safe_error),
+                        Some("provider stream failed; fallback to non-streaming chat"),
                         serde_json::json!({
                             "iteration": iteration + 1,
-                            "duration_ms": llm_started_at.elapsed().as_millis(),
+                            "error": scrub_credentials(&stream_err.to_string()),
                         }),
                     );
-                    return Err(e);
+                    if let Some(ref tx) = on_delta {
+                        let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
+                    }
+                    call_provider_chat(
+                        active_provider,
+                        &prepared_messages.messages,
+                        request_tools,
+                        active_model,
+                        temperature,
+                        cancellation_token.as_ref(),
+                    )
+                    .await
                 }
-            };
+            }
+        } else {
+            // Non-streaming path: wrap with optional per-step timeout from
+            // pacing config to catch hung model responses.
+            let chat_future = active_provider.chat(
+                ChatRequest {
+                    messages: &prepared_messages.messages,
+                    tools: request_tools,
+                },
+                active_model,
+                temperature,
+            );
 
-        let display_text = resolve_display_text(
-            &response_text,
-            &parsed_text,
-            !tool_calls.is_empty(),
-            !native_tool_calls.is_empty(),
-        );
-        let display_text = strip_tool_result_blocks(&display_text);
+            match pacing.step_timeout_secs {
+                Some(step_secs) if step_secs > 0 => {
+                    let step_timeout = Duration::from_secs(step_secs);
+                    if let Some(token) = cancellation_token.as_ref() {
+                        tokio::select! {
+                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                            result = tokio::time::timeout(step_timeout, chat_future) => {
+                                match result {
+                                    Ok(inner) => inner,
+                                    Err(_) => anyhow::bail!(
+                                        "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                                    ),
+                                }
+                            },
+                        }
+                    } else {
+                        match tokio::time::timeout(step_timeout, chat_future).await {
+                            Ok(inner) => inner,
+                            Err(_) => anyhow::bail!(
+                                "LLM inference step timed out after {step_secs}s (step_timeout_secs)"
+                            ),
+                        }
+                    }
+                }
+                _ => {
+                    if let Some(token) = cancellation_token.as_ref() {
+                        tokio::select! {
+                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                            result = chat_future => result,
+                        }
+                    } else {
+                        chat_future.await
+                    }
+                }
+            }
+        };
+
+        let (
+            response_text,
+            parsed_text,
+            tool_calls,
+            assistant_history_content,
+            native_tool_calls,
+            _parse_issue_detected,
+            response_streamed_live,
+        ) = match chat_result {
+            Ok(resp) => {
+                let (resp_input_tokens, resp_output_tokens) = resp
+                    .usage
+                    .as_ref()
+                    .map(|u| (u.input_tokens, u.output_tokens))
+                    .unwrap_or((None, None));
+
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: true,
+                    error_message: None,
+                    input_tokens: resp_input_tokens,
+                    output_tokens: resp_output_tokens,
+                });
+
+                // Record cost via task-local tracker (no-op when not scoped)
+                let _ = resp
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
+
+                let response_text = resp.text_or_empty().to_string();
+                // First try native structured tool calls (OpenAI-format).
+                // Fall back to text-based parsing (XML tags, markdown blocks,
+                // GLM format) only if the provider returned no native calls —
+                // this ensures we support both native and prompt-guided models.
+                let mut calls = parse_structured_tool_calls(&resp.tool_calls);
+                let mut parsed_text = String::new();
+
+                if calls.is_empty() {
+                    let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
+                    if !fallback_text.is_empty() {
+                        parsed_text = fallback_text;
+                    }
+                    calls = fallback_calls;
+                }
+
+                let parse_issue = detect_tool_call_parse_issue(&response_text, &calls);
+                if let Some(ref issue) = parse_issue {
+                    runtime_trace::record_event(
+                        "tool_call_parse_issue",
+                        Some(channel_name),
+                        Some(provider_name),
+                        Some(model),
+                        Some(&turn_id),
+                        Some(false),
+                        Some(issue.as_str()),
+                        serde_json::json!({
+                            "iteration": iteration + 1,
+                            "response_excerpt": truncate_with_ellipsis(
+                                &scrub_credentials(&response_text),
+                                600
+                            ),
+                        }),
+                    );
+                }
+
+                runtime_trace::record_event(
+                    "llm_response",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "duration_ms": llm_started_at.elapsed().as_millis(),
+                        "input_tokens": resp_input_tokens,
+                        "output_tokens": resp_output_tokens,
+                        "raw_response": scrub_credentials(&response_text),
+                        "native_tool_calls": resp.tool_calls.len(),
+                        "parsed_tool_calls": calls.len(),
+                    }),
+                );
+
+                // Preserve native tool call IDs in assistant history so role=tool
+                // follow-up messages can reference the exact call id.
+                let reasoning_content = resp.reasoning_content.clone();
+                let assistant_history_content = if resp.tool_calls.is_empty() {
+                    if use_native_tools {
+                        build_native_assistant_history_from_parsed_calls(
+                            &response_text,
+                            &calls,
+                            reasoning_content.as_deref(),
+                        )
+                        .unwrap_or_else(|| response_text.clone())
+                    } else {
+                        response_text.clone()
+                    }
+                } else {
+                    build_native_assistant_history(
+                        &response_text,
+                        &resp.tool_calls,
+                        reasoning_content.as_deref(),
+                    )
+                };
+
+                let native_calls = resp.tool_calls;
+                (
+                    response_text,
+                    parsed_text,
+                    calls,
+                    assistant_history_content,
+                    native_calls,
+                    parse_issue.is_some(),
+                    streamed_live_deltas,
+                )
+            }
+            Err(e) => {
+                let safe_error = crate::providers::sanitize_api_error(&e.to_string());
+                observer.record_event(&ObserverEvent::LlmResponse {
+                    provider: provider_name.to_string(),
+                    model: model.to_string(),
+                    duration: llm_started_at.elapsed(),
+                    success: false,
+                    error_message: Some(safe_error.clone()),
+                    input_tokens: None,
+                    output_tokens: None,
+                });
+                runtime_trace::record_event(
+                    "llm_response",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some(&safe_error),
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "duration_ms": llm_started_at.elapsed().as_millis(),
+                    }),
+                );
+                return Err(e);
+            }
+        };
+
+        let display_text = if parsed_text.is_empty() {
+            response_text.clone()
+        } else {
+            parsed_text
+        };
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -3052,6 +3266,12 @@ pub(crate) async fn run_tool_call_loop(
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
+                let should_emit_post_hoc_chunks =
+                    !response_streamed_live || display_text != response_text;
+                if !should_emit_post_hoc_chunks {
+                    history.push(ChatMessage::assistant(response_text.clone()));
+                    return Ok(display_text);
+                }
                 // Clear accumulated progress lines before streaming the final answer.
                 let _ = tx.send(DRAFT_CLEAR_SENTINEL.to_string()).await;
                 // Split on whitespace boundaries, accumulating chunks of at least
@@ -4396,18 +4616,24 @@ pub async fn run(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
-            // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) = auto_compact_history(
-                &mut history,
-                provider.as_ref(),
-                &model_name,
-                config.agent.max_history_messages,
-                config.agent.max_context_tokens,
-            )
-            .await
+            // Context compression before hard trimming to preserve long-context signal.
             {
-                if compacted {
-                    println!("🧹 Auto-compaction complete");
+                let compressor = crate::agent::context_compressor::ContextCompressor::new(
+                    config.agent.context_compression.clone(),
+                    config.agent.max_context_tokens,
+                );
+                if let Ok(result) = compressor
+                    .compress_if_needed(&mut history, provider.as_ref(), &model_name)
+                    .await
+                {
+                    if result.compressed {
+                        tracing::info!(
+                            passes = result.passes_used,
+                            before = result.tokens_before,
+                            after = result.tokens_after,
+                            "Context compression complete"
+                        );
+                    }
                 }
             }
 
@@ -4910,7 +5136,8 @@ mod tests {
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
-    use crate::providers::traits::ProviderCapabilities;
+    use crate::providers::router::{Route, RouterProvider};
+    use crate::providers::traits::{ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions};
     use crate::providers::ChatResponse;
     use tempfile::TempDir;
 
@@ -5039,6 +5266,253 @@ mod tests {
             responses
                 .pop_front()
                 .ok_or_else(|| anyhow::anyhow!("scripted provider exhausted responses"))
+        }
+    }
+
+    struct StreamingScriptedProvider {
+        responses: Arc<Mutex<VecDeque<String>>>,
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    impl StreamingScriptedProvider {
+        fn from_text_responses(responses: Vec<&str>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(
+                    responses.into_iter().map(ToString::to_string).collect(),
+                )),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StreamingScriptedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!(
+                "chat_with_system should not be used in streaming scripted provider tests"
+            );
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("chat should not be called when streaming succeeds")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<StreamChunk>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+
+            let response = self
+                .responses
+                .lock()
+                .expect("responses lock should be valid")
+                .pop_front()
+                .unwrap_or_default();
+
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(response)),
+                Ok(StreamChunk::final_chunk()),
+            ]))
+        }
+    }
+
+    enum NativeStreamTurn {
+        ToolCall(ToolCall),
+        Text(String),
+    }
+
+    struct StreamingNativeToolEventProvider {
+        turns: Arc<Mutex<VecDeque<NativeStreamTurn>>>,
+        stream_calls: Arc<AtomicUsize>,
+        stream_tool_requests: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    impl StreamingNativeToolEventProvider {
+        fn with_turns(turns: Vec<NativeStreamTurn>) -> Self {
+            Self {
+                turns: Arc::new(Mutex::new(turns.into())),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                stream_tool_requests: Arc::new(AtomicUsize::new(0)),
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StreamingNativeToolEventProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!(
+                "chat_with_system should not be used in streaming native tool event provider tests"
+            );
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("chat should not be called when native streaming events succeed")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<StreamEvent>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if request.tools.is_some_and(|tools| !tools.is_empty()) {
+                self.stream_tool_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+
+            let turn = self
+                .turns
+                .lock()
+                .expect("turns lock should be valid")
+                .pop_front()
+                .expect("streaming turns should have scripted output");
+            match turn {
+                NativeStreamTurn::ToolCall(tool_call) => {
+                    Box::pin(futures_util::stream::iter(vec![
+                        Ok(StreamEvent::ToolCall(tool_call)),
+                        Ok(StreamEvent::Final),
+                    ]))
+                }
+                NativeStreamTurn::Text(text) => Box::pin(futures_util::stream::iter(vec![
+                    Ok(StreamEvent::TextDelta(StreamChunk::delta(text))),
+                    Ok(StreamEvent::Final),
+                ])),
+            }
+        }
+    }
+
+    struct RouteAwareStreamingProvider {
+        response: String,
+        stream_calls: Arc<AtomicUsize>,
+        chat_calls: Arc<AtomicUsize>,
+        last_model: Arc<Mutex<String>>,
+    }
+
+    impl RouteAwareStreamingProvider {
+        fn new(response: &str) -> Self {
+            Self {
+                response: response.to_string(),
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                chat_calls: Arc::new(AtomicUsize::new(0)),
+                last_model: Arc::new(Mutex::new(String::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RouteAwareStreamingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in route-aware stream tests");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("chat should not be called when routed streaming succeeds")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            model: &str,
+            _temperature: f64,
+            options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<StreamChunk>,
+        > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            *self
+                .last_model
+                .lock()
+                .expect("last_model lock should be valid") = model.to_string();
+            if !options.enabled {
+                return Box::pin(futures_util::stream::empty());
+            }
+
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta(self.response.clone())),
+                Ok(StreamChunk::final_chunk()),
+            ]))
         }
     }
 
@@ -6401,6 +6875,292 @@ mod tests {
         );
         assert_eq!(result, "Final answer");
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_consumes_provider_stream_for_final_response() {
+        let provider =
+            StreamingScriptedProvider::from_text_responses(vec!["streamed final answer"]);
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("say hi"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("streaming provider should complete");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL {
+                visible_deltas.clear();
+                continue;
+            }
+            if delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "streamed final answer");
+        assert_eq!(
+            visible_deltas, "streamed final answer",
+            "draft should receive upstream deltas once without post-hoc duplication"
+        );
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streaming_path_preserves_tool_loop_semantics() {
+        let provider = StreamingScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#,
+            "done",
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool calls"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("streaming tool loop should execute tool and finish");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL {
+                visible_deltas.clear();
+                continue;
+            }
+            if delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(visible_deltas, "done");
+        assert!(
+            !visible_deltas.contains("<tool_call"),
+            "draft text should not leak streamed tool payload markers"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_streams_native_tool_events_without_chat_fallback() {
+        let provider = StreamingNativeToolEventProvider::with_turns(vec![
+            NativeStreamTurn::ToolCall(ToolCall {
+                id: "call_native_1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: r#"{"value":"A"}"#.to_string(),
+            }),
+            NativeStreamTurn::Text("done".to_string()),
+        ]);
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run native tools"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("native streaming events should preserve tool loop semantics");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL {
+                visible_deltas.clear();
+                continue;
+            }
+            if delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "done");
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.stream_tool_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(visible_deltas, "done");
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_routed_streaming_uses_live_provider_deltas_once() {
+        let default_provider = RouteAwareStreamingProvider::new("default answer");
+        let default_stream_calls = Arc::clone(&default_provider.stream_calls);
+        let default_chat_calls = Arc::clone(&default_provider.chat_calls);
+
+        let routed_provider = RouteAwareStreamingProvider::new("routed streamed answer");
+        let routed_stream_calls = Arc::clone(&routed_provider.stream_calls);
+        let routed_chat_calls = Arc::clone(&routed_provider.chat_calls);
+        let routed_last_model = Arc::clone(&routed_provider.last_model);
+
+        let router = RouterProvider::new(
+            vec![
+                ("default".to_string(), Box::new(default_provider)),
+                ("fast".to_string(), Box::new(routed_provider)),
+            ],
+            vec![(
+                "fast".to_string(),
+                Route {
+                    provider_name: "fast".to_string(),
+                    model: "routed-model".to_string(),
+                },
+            )],
+            "default-model".to_string(),
+        );
+
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("say hi"),
+        ];
+        let observer = NoopObserver;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(32);
+
+        let result = run_tool_call_loop(
+            &router,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "router",
+            "hint:fast",
+            0.0,
+            true,
+            None,
+            "telegram",
+            None,
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            Some(tx),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+        )
+        .await
+        .expect("routed streaming provider should complete");
+
+        let mut visible_deltas = String::new();
+        while let Some(delta) = rx.recv().await {
+            if delta == DRAFT_CLEAR_SENTINEL {
+                visible_deltas.clear();
+                continue;
+            }
+            if delta.starts_with(DRAFT_PROGRESS_SENTINEL) {
+                continue;
+            }
+            visible_deltas.push_str(&delta);
+        }
+
+        assert_eq!(result, "routed streamed answer");
+        assert_eq!(
+            visible_deltas, "routed streamed answer",
+            "routed draft should receive upstream deltas once without post-hoc duplication"
+        );
+        assert_eq!(default_stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(routed_stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(default_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(routed_chat_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            routed_last_model
+                .lock()
+                .expect("routed_last_model lock should be valid")
+                .as_str(),
+            "routed-model"
+        );
     }
 
     #[test]

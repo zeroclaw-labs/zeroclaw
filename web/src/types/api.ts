@@ -106,6 +106,25 @@ export interface CliTool {
   category: string;
 }
 
+export interface Session {
+  id: string;
+  channel: string;
+  started_at: string;
+  last_activity: string;
+  status: 'active' | 'idle' | 'closed';
+  message_count: number;
+}
+
+export interface ChannelDetail {
+  name: string;
+  type: string;
+  enabled: boolean;
+  status: 'active' | 'inactive' | 'error';
+  message_count: number;
+  last_message_at: string | null;
+  health: 'healthy' | 'degraded' | 'down';
+}
+
 export interface SSEEvent {
   type: string;
   timestamp?: string;
