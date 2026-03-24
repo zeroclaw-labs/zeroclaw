@@ -297,6 +297,43 @@ fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Process-global registry of live (connected) channel instances.
+///
+/// Populated by `start_channels()` after building `channels_by_name`.
+/// Used by `deliver_announcement()` to reuse the daemon's connected
+/// channel rather than creating a new disconnected instance (which
+/// fails for stateful channels like WhatsApp Web).
+fn live_channel_registry() -> &'static Mutex<HashMap<String, Arc<dyn Channel>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register live channel instances from the daemon for use by the scheduler.
+pub fn register_live_channels<S: ::std::hash::BuildHasher>(
+    channels: &HashMap<String, Arc<dyn Channel>, S>,
+) {
+    let mut registry = live_channel_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.clear();
+    for (name, ch) in channels {
+        registry.insert(name.clone(), Arc::clone(ch));
+    }
+    tracing::debug!(
+        "Registered {} live channel(s) for cron delivery",
+        registry.len()
+    );
+}
+
+/// Retrieve a live channel instance by name (e.g. "whatsapp", "telegram").
+pub fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    live_channel_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .cloned()
+}
+
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
 const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
@@ -4551,6 +4588,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
             .collect::<HashMap<_, _>>(),
     );
+
+    // Populate the live channel registry so the cron scheduler can reuse
+    // the daemon's connected channel instances (required for stateful
+    // channels like WhatsApp Web that need an active browser session).
+    register_live_channels(&channels_by_name);
+
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
