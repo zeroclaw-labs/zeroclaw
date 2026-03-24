@@ -260,6 +260,16 @@ mod tests {
             *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
         }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            stream::empty().boxed()
+        }
     }
 
     fn make_router(
@@ -313,6 +323,17 @@ mod tests {
             self.as_ref()
                 .chat_with_system(system_prompt, message, model, temperature)
                 .await
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            model: &str,
+            temperature: f64,
+            options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.as_ref()
+                .stream_chat_with_history(messages, model, temperature, options)
         }
     }
 
