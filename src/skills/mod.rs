@@ -613,14 +613,16 @@ pub fn skills_to_prompt_with_mode(
         crate::config::SkillsPromptInjectionMode::Full => String::from(
             "## Available Skills\n\n\
              Skill instructions and tool metadata are preloaded below.\n\
-             Follow these instructions directly; do not read skill files at runtime unless the user asks.\n\
+             Follow these instructions directly; do not read skill files at runtime unless the user asks. \
+             Never make up a script name; you must always follow the instructions and tool definitions provided within the skill file.\n\
              Note: scripts in skills often use relative paths. Either `cd` into the skill's `location` before executing, or resolve relative paths to absolute paths using the `location` provided below.\n\n\
              <available_skills>\n",
         ),
         crate::config::SkillsPromptInjectionMode::Compact => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: read the skill file in `location` only when needed.\n\
+             Skill instructions are loaded on demand: read the skill file in `location` only when needed. \
+             Never make up a script name; you must always follow the instructions and tool definitions provided within the skill file.\n\
              Note: scripts in skills often use relative paths. Either `cd` into the skill's `location` before executing, or resolve relative paths to absolute paths using the `location` provided below.\n\n\
              <available_skills>\n",
         ),

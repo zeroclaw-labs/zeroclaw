@@ -10,7 +10,7 @@ use std::path::Path;
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 pub const TOOL_CALL_INSTRUCTIONS: &str =
-    "Provide ONLY the JSON object inside <tool_call> tags. Do NOT include comments, explanations, or any other text inside the tags. Comments are a waste of context.";
+    "Provide ONLY the JSON object inside <tool_call> tags. Do NOT include comments, explanations, or any other text inside the tags. Comments are a waste of context. Before calling a tool, check your conversation history. If the exact tool and arguments were already used and returned a result, DO NOT call it again. Instead, use the existing result to answer or move to the next step.";
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
