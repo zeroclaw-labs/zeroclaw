@@ -315,7 +315,15 @@ impl LeakDetector {
         let url_re = URL_PATTERN.get_or_init(|| Regex::new(r"https?://\S+").unwrap());
         let content_without_urls = url_re.replace_all(content, "");
 
-        let tokens = extract_candidate_tokens(&content_without_urls);
+        // Strip media markers (e.g. [IMAGE:/path/to/file.png]) before extracting
+        // tokens so that local file paths inside markers are not mistaken for
+        // high-entropy credentials.
+        static MEDIA_MARKER_PATTERN: OnceLock<Regex> = OnceLock::new();
+        let media_re = MEDIA_MARKER_PATTERN
+            .get_or_init(|| Regex::new(r"\[(IMAGE|VIDEO|DOCUMENT|VOICE|AUDIO):[^\]]*\]").unwrap());
+        let content_stripped = media_re.replace_all(&content_without_urls, "");
+
+        let tokens = extract_candidate_tokens(&content_stripped);
 
         for token in tokens {
             if token.len() >= ENTROPY_TOKEN_MIN_LEN {
@@ -516,6 +524,42 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         // '=' is a delimiter, not part of tokens
         assert!(tokens.contains(&"key"));
         assert!(tokens.contains(&"val"));
+    }
+
+    #[test]
+    fn media_marker_image_path_not_redacted() {
+        let detector = LeakDetector::new();
+        let content = "Here is your image: [IMAGE:/Users/matt/.zeroclaw/workspace/skills/image-gen/images/20260324_135911.png]";
+        let result = detector.scan(content);
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "Media marker image paths should not trigger high-entropy detection"
+        );
+    }
+
+    #[test]
+    fn media_marker_video_not_redacted() {
+        let detector = LeakDetector::new();
+        let content = "Attached: [VIDEO:/path/to/long/video/file/name123456.mp4]";
+        let result = detector.scan(content);
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "Media marker video paths should not trigger high-entropy detection"
+        );
+    }
+
+    #[test]
+    fn actual_high_entropy_still_detected() {
+        let detector = LeakDetector::new();
+        let content = "Leaked credential: aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let result = detector.scan(content);
+        match result {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("High-entropy")));
+                assert!(redacted.contains("[REDACTED_HIGH_ENTROPY_TOKEN]"));
+            }
+            LeakResult::Clean => panic!("Should still detect high-entropy tokens outside media markers"),
+        }
     }
 
     #[test]
