@@ -29,7 +29,7 @@ pub struct ClawdTalkChannel {
 }
 
 /// Configuration for ClawdTalk channel from config.toml
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct ClawdTalkConfig {
     /// Telnyx API key
     pub api_key: String,
@@ -47,7 +47,7 @@ pub struct ClawdTalkConfig {
 
 impl ChannelConfig for ClawdTalkConfig {
     fn name() -> &'static str {
-        "ClawdTalk"
+        "clawdtalk"
     }
     fn desc() -> &'static str {
         "ClawdTalk Channel"
@@ -280,7 +280,7 @@ struct VoiceSettings {
 #[async_trait]
 impl Channel for ClawdTalkChannel {
     fn name(&self) -> &str {
-        "ClawdTalk"
+        "clawdtalk"
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn creates_channel() {
         let channel = ClawdTalkChannel::new(test_config());
-        assert_eq!(channel.name(), "ClawdTalk");
+        assert_eq!(channel.name(), "clawdtalk");
     }
 
     #[test]

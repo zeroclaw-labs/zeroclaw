@@ -4071,6 +4071,7 @@ fn classify_health_result(
 }
 
 struct ConfiguredChannel {
+    config_key: &'static str,
     display_name: &'static str,
     channel: Arc<dyn Channel>,
 }
@@ -4087,6 +4088,7 @@ fn collect_configured_channels(
             .ack_reactions
             .unwrap_or(config.channels_config.ack_reactions);
         channels.push(ConfiguredChannel {
+            config_key: "telegram",
             display_name: "Telegram",
             channel: Arc::new(
                 TelegramChannel::new(
@@ -4106,6 +4108,7 @@ fn collect_configured_channels(
 
     if let Some(ref dc) = config.channels_config.discord {
         channels.push(ConfiguredChannel {
+            config_key: "discord",
             display_name: "Discord",
             channel: Arc::new(
                 DiscordChannel::new(
@@ -4125,6 +4128,7 @@ fn collect_configured_channels(
         match crate::memory::SqliteMemory::new_named(&config.workspace_dir, "discord") {
             Ok(discord_mem) => {
                 channels.push(ConfiguredChannel {
+                    config_key: "discord_history",
                     display_name: "Discord History",
                     channel: Arc::new(
                         DiscordHistoryChannel::new(
@@ -4148,6 +4152,7 @@ fn collect_configured_channels(
 
     if let Some(ref sl) = config.channels_config.slack {
         channels.push(ConfiguredChannel {
+            config_key: "slack",
             display_name: "Slack",
             channel: Arc::new(
                 SlackChannel::new(
@@ -4168,6 +4173,7 @@ fn collect_configured_channels(
 
     if let Some(ref mm) = config.channels_config.mattermost {
         channels.push(ConfiguredChannel {
+            config_key: "mattermost",
             display_name: "Mattermost",
             channel: Arc::new(
                 MattermostChannel::new(
@@ -4186,6 +4192,7 @@ fn collect_configured_channels(
 
     if let Some(ref im) = config.channels_config.imessage {
         channels.push(ConfiguredChannel {
+            config_key: "imessage",
             display_name: "iMessage",
             channel: Arc::new(IMessageChannel::new(im.allowed_contacts.clone())),
         });
@@ -4194,6 +4201,7 @@ fn collect_configured_channels(
     #[cfg(feature = "channel-matrix")]
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
+            config_key: "matrix",
             display_name: "Matrix",
             channel: Arc::new(
                 MatrixChannel::new_full(
@@ -4221,6 +4229,7 @@ fn collect_configured_channels(
 
     if let Some(ref sig) = config.channels_config.signal {
         channels.push(ConfiguredChannel {
+            config_key: "signal",
             display_name: "Signal",
             channel: Arc::new(
                 SignalChannel::new(
@@ -4248,6 +4257,7 @@ fn collect_configured_channels(
                 // Cloud API mode: requires phone_number_id, access_token, verify_token
                 if wa.is_cloud_config() {
                     channels.push(ConfiguredChannel {
+                        config_key: "whatsapp",
                         display_name: "WhatsApp",
                         channel: Arc::new(
                             WhatsAppChannel::new(
@@ -4268,6 +4278,7 @@ fn collect_configured_channels(
                 #[cfg(feature = "whatsapp-web")]
                 if wa.is_web_config() {
                     channels.push(ConfiguredChannel {
+                        config_key: "whatsapp",
                         display_name: "WhatsApp",
                         channel: Arc::new(
                             WhatsAppWebChannel::new(
@@ -4302,6 +4313,7 @@ fn collect_configured_channels(
 
     if let Some(ref lq) = config.channels_config.linq {
         channels.push(ConfiguredChannel {
+            config_key: "linq",
             display_name: "Linq",
             channel: Arc::new(LinqChannel::new(
                 lq.api_token.clone(),
@@ -4322,6 +4334,7 @@ fn collect_configured_channels(
         .with_transcription(config.transcription.clone());
 
         channels.push(ConfiguredChannel {
+            config_key: "wati",
             display_name: "WATI",
             channel: Arc::new(wati_channel),
         });
@@ -4329,6 +4342,7 @@ fn collect_configured_channels(
 
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
         channels.push(ConfiguredChannel {
+            config_key: "nextcloud_talk",
             display_name: "Nextcloud Talk",
             channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
                 nc.base_url.clone(),
@@ -4341,6 +4355,7 @@ fn collect_configured_channels(
 
     if let Some(ref email_cfg) = config.channels_config.email {
         channels.push(ConfiguredChannel {
+            config_key: "email",
             display_name: "Email",
             channel: Arc::new(EmailChannel::new(email_cfg.clone())),
         });
@@ -4349,6 +4364,7 @@ fn collect_configured_channels(
     if let Some(ref gp_cfg) = config.channels_config.gmail_push {
         if gp_cfg.enabled {
             channels.push(ConfiguredChannel {
+                config_key: "gmail_push",
                 display_name: "Gmail Push",
                 channel: Arc::new(GmailPushChannel::new(gp_cfg.clone())),
             });
@@ -4357,6 +4373,7 @@ fn collect_configured_channels(
 
     if let Some(ref irc) = config.channels_config.irc {
         channels.push(ConfiguredChannel {
+            config_key: "irc",
             display_name: "IRC",
             channel: Arc::new(IrcChannel::new(irc::IrcChannelConfig {
                 server: irc.server.clone(),
@@ -4385,6 +4402,7 @@ fn collect_configured_channels(
                     "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
                 );
                 channels.push(ConfiguredChannel {
+                    config_key: "lark",
                     display_name: "Feishu",
                     channel: Arc::new(
                         LarkChannel::from_config(lk)
@@ -4394,6 +4412,7 @@ fn collect_configured_channels(
             }
         } else {
             channels.push(ConfiguredChannel {
+                config_key: "lark",
                 display_name: "Lark",
                 channel: Arc::new(
                     LarkChannel::from_lark_config(lk)
@@ -4406,6 +4425,7 @@ fn collect_configured_channels(
     #[cfg(feature = "channel-lark")]
     if let Some(ref fs) = config.channels_config.feishu {
         channels.push(ConfiguredChannel {
+            config_key: "feishu",
             display_name: "Feishu",
             channel: Arc::new(
                 LarkChannel::from_feishu_config(fs)
@@ -4423,6 +4443,7 @@ fn collect_configured_channels(
 
     if let Some(ref dt) = config.channels_config.dingtalk {
         channels.push(ConfiguredChannel {
+            config_key: "dingtalk",
             display_name: "DingTalk",
             channel: Arc::new(
                 DingTalkChannel::new(
@@ -4437,6 +4458,7 @@ fn collect_configured_channels(
 
     if let Some(ref qq) = config.channels_config.qq {
         channels.push(ConfiguredChannel {
+            config_key: "qq",
             display_name: "QQ",
             channel: Arc::new(
                 QQChannel::new(
@@ -4452,6 +4474,7 @@ fn collect_configured_channels(
 
     if let Some(ref tw) = config.channels_config.twitter {
         channels.push(ConfiguredChannel {
+            config_key: "twitter",
             display_name: "X/Twitter",
             channel: Arc::new(TwitterChannel::new(
                 tw.bearer_token.clone(),
@@ -4462,6 +4485,7 @@ fn collect_configured_channels(
 
     if let Some(ref mc) = config.channels_config.mochat {
         channels.push(ConfiguredChannel {
+            config_key: "mochat",
             display_name: "Mochat",
             channel: Arc::new(MochatChannel::new(
                 mc.api_url.clone(),
@@ -4474,6 +4498,7 @@ fn collect_configured_channels(
 
     if let Some(ref wc) = config.channels_config.wecom {
         channels.push(ConfiguredChannel {
+            config_key: "wecom",
             display_name: "WeCom",
             channel: Arc::new(WeComChannel::new(
                 wc.webhook_key.clone(),
@@ -4484,6 +4509,7 @@ fn collect_configured_channels(
 
     if let Some(ref ct) = config.channels_config.clawdtalk {
         channels.push(ConfiguredChannel {
+            config_key: "clawdtalk",
             display_name: "ClawdTalk",
             channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
         });
@@ -4502,6 +4528,7 @@ fn collect_configured_channels(
             );
         } else {
             channels.push(ConfiguredChannel {
+                config_key: "notion",
                 display_name: "Notion",
                 channel: Arc::new(NotionChannel::new(
                     notion_api_key,
@@ -4519,6 +4546,7 @@ fn collect_configured_channels(
 
     if let Some(ref rd) = config.channels_config.reddit {
         channels.push(ConfiguredChannel {
+            config_key: "reddit",
             display_name: "Reddit",
             channel: Arc::new(RedditChannel::new(
                 rd.client_id.clone(),
@@ -4532,6 +4560,7 @@ fn collect_configured_channels(
 
     if let Some(ref bs) = config.channels_config.bluesky {
         channels.push(ConfiguredChannel {
+            config_key: "bluesky",
             display_name: "Bluesky",
             channel: Arc::new(BlueskyChannel::new(
                 bs.handle.clone(),
@@ -4543,6 +4572,7 @@ fn collect_configured_channels(
     #[cfg(feature = "voice-wake")]
     if let Some(ref vw) = config.channels_config.voice_wake {
         channels.push(ConfiguredChannel {
+            config_key: "voice_wake",
             display_name: "VoiceWake",
             channel: Arc::new(VoiceWakeChannel::new(
                 vw.clone(),
@@ -4553,6 +4583,7 @@ fn collect_configured_channels(
 
     if let Some(ref wh) = config.channels_config.webhook {
         channels.push(ConfiguredChannel {
+            config_key: "webhook",
             display_name: "Webhook",
             channel: Arc::new(WebhookChannel::new(
                 wh.port,
@@ -4576,6 +4607,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels_config.nostr {
         channels.push(ConfiguredChannel {
+            config_key: "nostr",
             display_name: "Nostr",
             channel: Arc::new(
                 NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
@@ -4927,19 +4959,23 @@ pub async fn start_channels(
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
     #[allow(unused_mut)]
-    let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup")
-            .into_iter()
-            .map(|configured| configured.channel)
-            .collect();
+    let mut boot_channels: Vec<ConfiguredChannel> =
+        collect_configured_channels(&config, "runtime startup");
 
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels_config.nostr {
-        channels.push(Arc::new(
-            NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
-        ));
+        boot_channels.push(ConfiguredChannel {
+            config_key: "nostr",
+            display_name: "Nostr",
+            channel: Arc::new(
+                NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
+            ),
+        });
     }
-    if channels.is_empty() {
+    let channels: Vec<Arc<dyn Channel>> =
+        boot_channels.iter().map(|c| c.channel.clone()).collect();
+
+    if boot_channels.is_empty() {
         println!("  \u{2139}\u{fe0f}  No channels configured at startup.");
         println!("     Hot-add channels via PUT /api/config.");
     } else {
@@ -4956,9 +4992,9 @@ pub async fn start_channels(
         );
         println!(
             "  📡 Channels: {}",
-            channels
+            boot_channels
                 .iter()
-                .map(|c| c.name())
+                .map(|c| c.display_name)
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -4966,7 +5002,6 @@ pub async fn start_channels(
         println!("  Listening for messages... (Ctrl+C to stop)");
         println!();
     }
-
     crate::health::mark_component_ok("channels");
 
     let initial_backoff_secs = config
@@ -4997,9 +5032,9 @@ pub async fn start_channels(
     drop(tx); // Drop our copy so rx closes when all channels stop
 
     let channels_by_name = Arc::new(ArcSwap::from_pointee(
-        channels
+        boot_channels
             .iter()
-            .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
+            .map(|c| (c.config_key.to_string(), c.channel.clone()))
             .collect::<HashMap<_, _>>(),
     ));
 

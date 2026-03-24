@@ -6101,7 +6101,7 @@ fn default_draft_update_interval_ms() -> u64 {
 }
 
 /// Telegram bot channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TelegramConfig {
     /// Telegram Bot API token (from @BotFather).
     pub bot_token: String,
@@ -6142,7 +6142,7 @@ impl ChannelConfig for TelegramConfig {
 }
 
 /// Discord bot channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DiscordConfig {
     /// Discord bot token (from Discord Developer Portal).
     pub bot_token: String,
@@ -6179,7 +6179,7 @@ impl ChannelConfig for DiscordConfig {
 }
 
 /// Discord history channel — logs ALL messages to discord.db and forwards @mentions to the agent.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DiscordHistoryConfig {
     /// Discord bot token (from Discord Developer Portal).
     pub bot_token: String,
@@ -6212,7 +6212,7 @@ impl ChannelConfig for DiscordHistoryConfig {
 }
 
 /// Slack bot channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SlackConfig {
     /// Slack bot OAuth token (xoxb-...).
     pub bot_token: String,
@@ -6294,7 +6294,7 @@ impl ChannelConfig for MattermostConfig {
 ///
 /// Receives messages via HTTP POST and sends replies to a configurable outbound URL.
 /// This is the "universal adapter" for any system that supports webhooks.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct WebhookConfig {
     /// Port to listen on for incoming webhooks.
     pub port: u16,
@@ -6324,7 +6324,7 @@ impl ChannelConfig for WebhookConfig {
 }
 
 /// iMessage channel configuration (macOS only).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct IMessageConfig {
     /// Allowed iMessage contacts (phone numbers or email addresses). Empty = deny all.
     pub allowed_contacts: Vec<String>,
@@ -6340,7 +6340,7 @@ impl ChannelConfig for IMessageConfig {
 }
 
 /// Matrix channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MatrixConfig {
     /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
     pub homeserver: String,
@@ -6374,7 +6374,7 @@ impl ChannelConfig for MatrixConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SignalConfig {
     /// Base URL for the signal-cli HTTP daemon (e.g. "http://127.0.0.1:8686").
     pub http_url: String,
@@ -6443,7 +6443,7 @@ pub enum WhatsAppChatPolicy {
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct WhatsAppConfig {
     /// Access token from Meta Business Suite (Cloud API mode)
     #[serde(default)]
@@ -6508,7 +6508,7 @@ impl ChannelConfig for WhatsAppConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LinqConfig {
     /// Linq Partner API token (Bearer auth)
     pub api_token: String,
@@ -6532,7 +6532,7 @@ impl ChannelConfig for LinqConfig {
 }
 
 /// WATI WhatsApp Business API channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct WatiConfig {
     /// WATI API token (Bearer auth).
     pub api_token: String,
@@ -6565,7 +6565,7 @@ impl ChannelConfig for WatiConfig {
 }
 
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NextcloudTalkConfig {
     /// Nextcloud base URL (e.g. "https://cloud.example.com").
     pub base_url: String,
@@ -6627,7 +6627,7 @@ impl WhatsAppConfig {
 }
 
 /// IRC channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct IrcConfig {
     /// IRC server hostname
     pub server: String,
@@ -6681,7 +6681,7 @@ pub enum LarkReceiveMode {
 
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LarkConfig {
     /// App ID from Lark/Feishu developer console
     pub app_id: String,
@@ -7248,7 +7248,7 @@ impl ChannelConfig for WeComConfig {
 }
 
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
     /// App ID from QQ Bot developer console
     pub app_id: String,
@@ -7273,7 +7273,7 @@ impl ChannelConfig for QQConfig {
 }
 
 /// X/Twitter channel configuration (Twitter API v2)
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TwitterConfig {
     /// Twitter API v2 Bearer Token (OAuth 2.0)
     pub bearer_token: String,
@@ -7292,7 +7292,7 @@ impl ChannelConfig for TwitterConfig {
 }
 
 /// Mochat channel configuration (Mochat customer service API)
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct MochatConfig {
     /// Mochat API base URL
     pub api_url: String,
@@ -7320,7 +7320,7 @@ impl ChannelConfig for MochatConfig {
 }
 
 /// Reddit channel configuration (OAuth2 bot).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct RedditConfig {
     /// Reddit OAuth2 client ID.
     pub client_id: String,
@@ -7346,7 +7346,7 @@ impl ChannelConfig for RedditConfig {
 }
 
 /// Bluesky channel configuration (AT Protocol).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct BlueskyConfig {
     /// Bluesky handle (e.g. `"mybot.bsky.social"`).
     pub handle: String,
@@ -7369,7 +7369,7 @@ impl ChannelConfig for BlueskyConfig {
 /// then captures the following utterance and transcribes it via the
 /// existing transcription API.
 #[cfg(feature = "voice-wake")]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct VoiceWakeConfig {
     /// Wake word phrase to listen for (case-insensitive substring match).
     /// Default: `"hey zeroclaw"`.
@@ -7433,7 +7433,7 @@ impl ChannelConfig for VoiceWakeConfig {
 
 /// Nostr channel configuration (NIP-04 + NIP-17 private messages)
 #[cfg(feature = "channel-nostr")]
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct NostrConfig {
     /// Private key in hex or nsec bech32 format
     pub private_key: String,
