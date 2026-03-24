@@ -664,7 +664,13 @@ mod tests {
                 blocked_domains.into_iter().map(String::from).collect(),
             ),
         }));
-        WebFetchTool::new(security, domain_rules, 500_000, 30, FirecrawlConfig::default())
+        WebFetchTool::new(
+            security,
+            domain_rules,
+            500_000,
+            30,
+            FirecrawlConfig::default(),
+        )
     }
 
     fn test_tool_with_firecrawl(firecrawl: FirecrawlConfig) -> WebFetchTool {
@@ -771,7 +777,13 @@ mod tests {
             allowed_domains: vec![],
             blocked_domains: vec![],
         }));
-        let tool = WebFetchTool::new(security, domain_rules, 500_000, 30, FirecrawlConfig::default());
+        let tool = WebFetchTool::new(
+            security,
+            domain_rules,
+            500_000,
+            30,
+            FirecrawlConfig::default(),
+        );
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -869,7 +881,13 @@ mod tests {
             allowed_domains: vec!["example.com".into()],
             blocked_domains: vec![],
         }));
-        let tool = WebFetchTool::new(security, domain_rules, 500_000, 30, FirecrawlConfig::default());
+        let tool = WebFetchTool::new(
+            security,
+            domain_rules,
+            500_000,
+            30,
+            FirecrawlConfig::default(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -888,7 +906,13 @@ mod tests {
             allowed_domains: vec!["example.com".into()],
             blocked_domains: vec![],
         }));
-        let tool = WebFetchTool::new(security, domain_rules, 500_000, 30, FirecrawlConfig::default());
+        let tool = WebFetchTool::new(
+            security,
+            domain_rules,
+            500_000,
+            30,
+            FirecrawlConfig::default(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await

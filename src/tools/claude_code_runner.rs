@@ -2,10 +2,10 @@ use super::traits::{Tool, ToolResult};
 use crate::config::ClaudeCodeRunnerConfig;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use arc_swap::ArcSwap;
 use std::sync::Arc;
 use tokio::process::Command;
 

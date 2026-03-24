@@ -10,11 +10,11 @@ use super::traits::{Tool, ToolResult};
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
-use arc_swap::ArcSwap;
 use std::sync::Arc;
 
 /// Shared handle giving tools late-bound access to the live channel map.

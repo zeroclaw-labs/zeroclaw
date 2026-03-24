@@ -8,9 +8,9 @@ use super::traits::{Tool, ToolResult};
 use crate::providers::{self, Provider};
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use serde_json::json;
-use arc_swap::ArcSwap;
 use std::sync::Arc;
 
 /// Tool that runs a single prompt through an LLM and optionally validates
