@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
+    max_tokens: u32,
 }
+
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -187,7 +190,14 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
+            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
         }
+    }
+
+    /// Override the maximum output tokens for API requests.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -577,7 +587,7 @@ impl Provider for AnthropicProvider {
 
         let request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: 4096,
+            max_tokens: self.max_tokens,
             system,
             messages: vec![NativeMessage {
                 role: "user".to_string(),
@@ -653,7 +663,7 @@ impl Provider for AnthropicProvider {
         };
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: 4096,
+            max_tokens: self.max_tokens,
             system: system_prompt,
             messages,
             temperature,
@@ -1441,6 +1451,7 @@ mod tests {
         let provider = AnthropicProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
+            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
