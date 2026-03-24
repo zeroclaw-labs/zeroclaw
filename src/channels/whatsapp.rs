@@ -29,6 +29,10 @@ pub struct WhatsAppChannel {
     allowed_numbers: Vec<String>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// When true, only process messages that @-mention the bot by `bot_name`.
+    mention_only: bool,
+    /// Bot display name used for @-mention detection.
+    bot_name: Option<String>,
 }
 
 impl WhatsAppChannel {
@@ -44,6 +48,8 @@ impl WhatsAppChannel {
             verify_token,
             allowed_numbers,
             proxy_url: None,
+            mention_only: false,
+            bot_name: None,
         }
     }
 
@@ -51,6 +57,84 @@ impl WhatsAppChannel {
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
+    }
+
+    /// Enable mention-only filtering with the given bot name.
+    pub fn with_mention_config(mut self, mention_only: bool, bot_name: Option<String>) -> Self {
+        self.mention_only = mention_only;
+        self.bot_name = bot_name;
+        self
+    }
+
+    fn is_mention_name_char(ch: char) -> bool {
+        ch.is_ascii_alphanumeric() || ch == '_'
+    }
+
+    fn find_bot_mention_spans(text: &str, bot_name: &str) -> Vec<(usize, usize)> {
+        let bot_name = bot_name.trim_start_matches('@');
+        if bot_name.is_empty() {
+            return Vec::new();
+        }
+
+        let mut spans = Vec::new();
+
+        for (at_idx, ch) in text.char_indices() {
+            if ch != '@' {
+                continue;
+            }
+
+            if at_idx > 0 {
+                let prev = text[..at_idx].chars().next_back().unwrap_or(' ');
+                if Self::is_mention_name_char(prev) {
+                    continue;
+                }
+            }
+
+            let name_start = at_idx + 1;
+            let mut name_end = name_start;
+
+            for (rel_idx, candidate_ch) in text[name_start..].char_indices() {
+                if Self::is_mention_name_char(candidate_ch) {
+                    name_end = name_start + rel_idx + candidate_ch.len_utf8();
+                } else {
+                    break;
+                }
+            }
+
+            if name_end == name_start {
+                continue;
+            }
+
+            let mention_name = &text[name_start..name_end];
+            if mention_name.eq_ignore_ascii_case(bot_name) {
+                spans.push((at_idx, name_end));
+            }
+        }
+
+        spans
+    }
+
+    fn contains_bot_mention(text: &str, bot_name: &str) -> bool {
+        !Self::find_bot_mention_spans(text, bot_name).is_empty()
+    }
+
+    fn normalize_incoming_content(text: &str, bot_name: &str) -> Option<String> {
+        let spans = Self::find_bot_mention_spans(text, bot_name);
+        if spans.is_empty() {
+            let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            return (!normalized.is_empty()).then_some(normalized);
+        }
+
+        let mut normalized = String::with_capacity(text.len());
+        let mut cursor = 0;
+        for (start, end) in spans {
+            normalized.push_str(&text[cursor..start]);
+            cursor = end;
+        }
+        normalized.push_str(&text[cursor..]);
+
+        let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!normalized.is_empty()).then_some(normalized)
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -130,6 +214,25 @@ impl WhatsAppChannel {
                     if content.is_empty() {
                         continue;
                     }
+
+                    // Mention-only filtering: if enabled and bot_name is set,
+                    // reject messages that do not @-mention the bot and strip
+                    // the mention tag from the content that is forwarded.
+                    let content = if self.mention_only {
+                        if let Some(ref bot_name) = self.bot_name {
+                            if !Self::contains_bot_mention(&content, bot_name) {
+                                continue;
+                            }
+                            match Self::normalize_incoming_content(&content, bot_name) {
+                                Some(c) => c,
+                                None => continue,
+                            }
+                        } else {
+                            content
+                        }
+                    } else {
+                        content
+                    };
 
                     // Get timestamp
                     let timestamp = msg
@@ -1145,5 +1248,421 @@ mod tests {
             msgs[0].content,
             "<script>alert('xss')</script> & \"quotes\" 'apostrophe'"
         );
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // MENTION SUPPORT — Unit tests
+    // ══════════════════════════════════════════════════════════
+
+    fn make_mention_channel() -> WhatsAppChannel {
+        WhatsAppChannel::new(
+            "test-token".into(),
+            "123456789".into(),
+            "verify-me".into(),
+            vec!["*".into()],
+        )
+        .with_mention_config(true, Some("ZeroClaw".into()))
+    }
+
+    // ── is_mention_name_char ──
+
+    #[test]
+    fn whatsapp_is_mention_name_char_alpha() {
+        assert!(WhatsAppChannel::is_mention_name_char('a'));
+        assert!(WhatsAppChannel::is_mention_name_char('Z'));
+    }
+
+    #[test]
+    fn whatsapp_is_mention_name_char_digit() {
+        assert!(WhatsAppChannel::is_mention_name_char('0'));
+        assert!(WhatsAppChannel::is_mention_name_char('9'));
+    }
+
+    #[test]
+    fn whatsapp_is_mention_name_char_underscore() {
+        assert!(WhatsAppChannel::is_mention_name_char('_'));
+    }
+
+    #[test]
+    fn whatsapp_is_mention_name_char_rejects_special() {
+        assert!(!WhatsAppChannel::is_mention_name_char(' '));
+        assert!(!WhatsAppChannel::is_mention_name_char('-'));
+        assert!(!WhatsAppChannel::is_mention_name_char('@'));
+        assert!(!WhatsAppChannel::is_mention_name_char('!'));
+    }
+
+    // ── contains_bot_mention ──
+
+    #[test]
+    fn whatsapp_contains_bot_mention_at_end() {
+        assert!(WhatsAppChannel::contains_bot_mention(
+            "Hello @ZeroClaw",
+            "ZeroClaw"
+        ));
+    }
+
+    #[test]
+    fn whatsapp_contains_bot_mention_at_start() {
+        assert!(WhatsAppChannel::contains_bot_mention(
+            "@ZeroClaw help",
+            "ZeroClaw"
+        ));
+    }
+
+    #[test]
+    fn whatsapp_contains_bot_mention_mid_sentence() {
+        assert!(WhatsAppChannel::contains_bot_mention(
+            "Hey @ZeroClaw how are you?",
+            "ZeroClaw"
+        ));
+    }
+
+    #[test]
+    fn whatsapp_contains_bot_mention_case_insensitive() {
+        assert!(WhatsAppChannel::contains_bot_mention(
+            "Hello @zeroclaw",
+            "ZeroClaw"
+        ));
+        assert!(WhatsAppChannel::contains_bot_mention(
+            "Hello @ZEROCLAW",
+            "ZeroClaw"
+        ));
+    }
+
+    #[test]
+    fn whatsapp_contains_bot_mention_no_false_positives() {
+        assert!(!WhatsAppChannel::contains_bot_mention(
+            "Hello @otherbot",
+            "ZeroClaw"
+        ));
+        assert!(!WhatsAppChannel::contains_bot_mention(
+            "Hello ZeroClaw",
+            "ZeroClaw"
+        ));
+    }
+
+    #[test]
+    fn whatsapp_contains_bot_mention_rejects_partial_prefix() {
+        // e.g. x@ZeroClaw — '@' preceded by a name char
+        assert!(!WhatsAppChannel::contains_bot_mention(
+            "x@ZeroClaw",
+            "ZeroClaw"
+        ));
+    }
+
+    #[test]
+    fn whatsapp_contains_bot_mention_rejects_partial_suffix() {
+        // @ZeroClaw2 should not match "ZeroClaw"
+        assert!(!WhatsAppChannel::contains_bot_mention(
+            "@ZeroClaw2 hello",
+            "ZeroClaw"
+        ));
+    }
+
+    #[test]
+    fn whatsapp_contains_bot_mention_empty_bot_name() {
+        assert!(!WhatsAppChannel::contains_bot_mention("Hello @", ""));
+    }
+
+    #[test]
+    fn whatsapp_contains_bot_mention_strips_at_prefix_from_bot_name() {
+        assert!(WhatsAppChannel::contains_bot_mention(
+            "Hello @ZeroClaw",
+            "@ZeroClaw"
+        ));
+    }
+
+    #[test]
+    fn whatsapp_contains_bot_mention_only_mention() {
+        assert!(WhatsAppChannel::contains_bot_mention(
+            "@ZeroClaw",
+            "ZeroClaw"
+        ));
+    }
+
+    // ── find_bot_mention_spans ──
+
+    #[test]
+    fn whatsapp_find_bot_mention_spans_single() {
+        let spans = WhatsAppChannel::find_bot_mention_spans("Hello @ZeroClaw", "ZeroClaw");
+        assert_eq!(spans, vec![(6, 15)]);
+    }
+
+    #[test]
+    fn whatsapp_find_bot_mention_spans_multiple() {
+        let spans =
+            WhatsAppChannel::find_bot_mention_spans("@ZeroClaw hello @ZeroClaw", "ZeroClaw");
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0], (0, 9));
+        assert_eq!(spans[1], (16, 25));
+    }
+
+    #[test]
+    fn whatsapp_find_bot_mention_spans_none() {
+        let spans = WhatsAppChannel::find_bot_mention_spans("No mention here", "ZeroClaw");
+        assert!(spans.is_empty());
+    }
+
+    #[test]
+    fn whatsapp_find_bot_mention_spans_empty_bot_name() {
+        let spans = WhatsAppChannel::find_bot_mention_spans("Hello @", "");
+        assert!(spans.is_empty());
+    }
+
+    // ── normalize_incoming_content ──
+
+    #[test]
+    fn whatsapp_normalize_strips_mention() {
+        let result = WhatsAppChannel::normalize_incoming_content(
+            "@ZeroClaw what is the weather?",
+            "ZeroClaw",
+        );
+        assert_eq!(result, Some("what is the weather?".into()));
+    }
+
+    #[test]
+    fn whatsapp_normalize_strips_mention_at_end() {
+        let result = WhatsAppChannel::normalize_incoming_content("Help me @ZeroClaw", "ZeroClaw");
+        assert_eq!(result, Some("Help me".into()));
+    }
+
+    #[test]
+    fn whatsapp_normalize_strips_mention_mid_sentence() {
+        let result =
+            WhatsAppChannel::normalize_incoming_content("Hey @ZeroClaw how are you?", "ZeroClaw");
+        assert_eq!(result, Some("Hey how are you?".into()));
+    }
+
+    #[test]
+    fn whatsapp_normalize_strips_multiple_mentions() {
+        let result =
+            WhatsAppChannel::normalize_incoming_content("@ZeroClaw hello @ZeroClaw", "ZeroClaw");
+        assert_eq!(result, Some("hello".into()));
+    }
+
+    #[test]
+    fn whatsapp_normalize_returns_none_for_mention_only() {
+        let result = WhatsAppChannel::normalize_incoming_content("@ZeroClaw", "ZeroClaw");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn whatsapp_normalize_returns_none_for_mention_with_whitespace() {
+        let result = WhatsAppChannel::normalize_incoming_content("  @ZeroClaw  ", "ZeroClaw");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn whatsapp_normalize_no_mention_passes_through() {
+        let result = WhatsAppChannel::normalize_incoming_content("Hello world", "ZeroClaw");
+        assert_eq!(result, Some("Hello world".into()));
+    }
+
+    #[test]
+    fn whatsapp_normalize_collapses_whitespace() {
+        let result =
+            WhatsAppChannel::normalize_incoming_content("@ZeroClaw   status   please", "ZeroClaw");
+        assert_eq!(result, Some("status please".into()));
+    }
+
+    // ── with_mention_config builder ──
+
+    #[test]
+    fn whatsapp_with_mention_config_sets_fields() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec![])
+            .with_mention_config(true, Some("bot".into()));
+        assert!(ch.mention_only);
+        assert_eq!(ch.bot_name.as_deref(), Some("bot"));
+    }
+
+    #[test]
+    fn whatsapp_default_mention_config() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec![]);
+        assert!(!ch.mention_only);
+        assert!(ch.bot_name.is_none());
+    }
+
+    // ── mention_only integration with parse_webhook_payload ──
+
+    #[test]
+    fn whatsapp_mention_only_rejects_message_without_mention() {
+        let ch = make_mention_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "Hello without mention" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty(), "Should reject messages without mention");
+    }
+
+    #[test]
+    fn whatsapp_mention_only_accepts_message_with_mention() {
+        let ch = make_mention_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "@ZeroClaw what is the weather?" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "what is the weather?");
+    }
+
+    #[test]
+    fn whatsapp_mention_only_strips_mention_from_content() {
+        let ch = make_mention_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "Hey @ZeroClaw tell me a joke" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Hey tell me a joke");
+    }
+
+    #[test]
+    fn whatsapp_mention_only_drops_mention_only_message() {
+        let ch = make_mention_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "@ZeroClaw" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(
+            msgs.is_empty(),
+            "Should drop message that is only a mention"
+        );
+    }
+
+    #[test]
+    fn whatsapp_mention_only_case_insensitive_match() {
+        let ch = make_mention_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "@zeroclaw status" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "status");
+    }
+
+    #[test]
+    fn whatsapp_mention_only_false_passes_all_messages() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()])
+            .with_mention_config(false, Some("ZeroClaw".into()));
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "Hello without mention" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Hello without mention");
+    }
+
+    #[test]
+    fn whatsapp_mention_only_no_bot_name_passes_through() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()])
+            .with_mention_config(true, None);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "Hello without mention" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "Without bot_name, mention_only should pass messages through"
+        );
+    }
+
+    #[test]
+    fn whatsapp_mention_only_mixed_messages() {
+        let ch = make_mention_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [
+                            { "from": "111", "timestamp": "1", "type": "text", "text": { "body": "No mention here" } },
+                            { "from": "222", "timestamp": "2", "type": "text", "text": { "body": "@ZeroClaw help me" } },
+                            { "from": "333", "timestamp": "3", "type": "text", "text": { "body": "Also no mention" } }
+                        ]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "help me");
+        assert_eq!(msgs[0].sender, "+222");
     }
 }
