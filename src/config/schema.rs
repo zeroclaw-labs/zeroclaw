@@ -4652,6 +4652,19 @@ impl Default for QdrantConfig {
     }
 }
 
+/// Search strategy for memory recall.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchMode {
+    /// Pure keyword search (FTS5 BM25)
+    Bm25,
+    /// Pure vector/semantic search
+    Embedding,
+    /// Weighted combination of keyword + vector (default)
+    #[default]
+    Hybrid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
@@ -4689,6 +4702,9 @@ pub struct MemoryConfig {
     /// Weight for keyword BM25 in hybrid search (0.0–1.0)
     #[serde(default = "default_keyword_weight")]
     pub keyword_weight: f64,
+    /// Search strategy: bm25 (keyword only), embedding (vector only), or hybrid (both).
+    #[serde(default)]
+    pub search_mode: SearchMode,
     /// Minimum hybrid score (0.0–1.0) for a memory to be included in context.
     /// Memories scoring below this threshold are dropped to prevent irrelevant
     /// context from bleeding into conversations. Default: 0.4
@@ -4873,6 +4889,7 @@ impl Default for MemoryConfig {
             embedding_dimensions: default_embedding_dims(),
             vector_weight: default_vector_weight(),
             keyword_weight: default_keyword_weight(),
+            search_mode: SearchMode::default(),
             min_relevance_score: default_min_relevance_score(),
             embedding_cache_size: default_cache_size(),
             chunk_max_tokens: default_chunk_size(),
@@ -10857,6 +10874,82 @@ default_temperature = 0.7
         assert_eq!(m.purge_after_days, 30);
         assert_eq!(m.conversation_retention_days, 30);
         assert!(m.sqlite_open_timeout_secs.is_none());
+        assert_eq!(m.search_mode, SearchMode::Hybrid);
+    }
+
+    #[test]
+    async fn search_mode_config_deserialization() {
+        let toml_str = r#"
+workspace_dir = "/tmp/workspace"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+search_mode = "bm25"
+"#;
+        let parsed = parse_test_config(toml_str);
+        assert_eq!(parsed.memory.search_mode, SearchMode::Bm25);
+
+        let toml_str_embedding = r#"
+workspace_dir = "/tmp/workspace"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+search_mode = "embedding"
+"#;
+        let parsed = parse_test_config(toml_str_embedding);
+        assert_eq!(parsed.memory.search_mode, SearchMode::Embedding);
+
+        let toml_str_hybrid = r#"
+workspace_dir = "/tmp/workspace"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+search_mode = "hybrid"
+"#;
+        let parsed = parse_test_config(toml_str_hybrid);
+        assert_eq!(parsed.memory.search_mode, SearchMode::Hybrid);
+    }
+
+    #[test]
+    async fn search_mode_defaults_to_hybrid_when_omitted() {
+        let toml_str = r#"
+workspace_dir = "/tmp/workspace"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+
+[memory]
+backend = "sqlite"
+auto_save = true
+"#;
+        let parsed = parse_test_config(toml_str);
+        assert_eq!(parsed.memory.search_mode, SearchMode::Hybrid);
+    }
+
+    #[test]
+    async fn search_mode_serde_roundtrip() {
+        let json_bm25 = serde_json::to_string(&SearchMode::Bm25).unwrap();
+        assert_eq!(json_bm25, "\"bm25\"");
+        let parsed: SearchMode = serde_json::from_str(&json_bm25).unwrap();
+        assert_eq!(parsed, SearchMode::Bm25);
+
+        let json_embedding = serde_json::to_string(&SearchMode::Embedding).unwrap();
+        assert_eq!(json_embedding, "\"embedding\"");
+        let parsed: SearchMode = serde_json::from_str(&json_embedding).unwrap();
+        assert_eq!(parsed, SearchMode::Embedding);
+
+        let json_hybrid = serde_json::to_string(&SearchMode::Hybrid).unwrap();
+        assert_eq!(json_hybrid, "\"hybrid\"");
+        let parsed: SearchMode = serde_json::from_str(&json_hybrid).unwrap();
+        assert_eq!(parsed, SearchMode::Hybrid);
     }
 
     #[test]
