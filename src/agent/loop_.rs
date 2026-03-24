@@ -2982,6 +2982,30 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             None
         };
+
+        // Run modifying hook before LLM call
+        let (final_messages, final_model);
+        if let Some(hooks) = hooks {
+            match hooks
+                .run_before_llm_call(
+                    prepared_messages.messages.to_vec(),
+                    active_model.to_string(),
+                )
+                .await
+            {
+                crate::hooks::HookResult::Continue((msgs, mdl)) => {
+                    final_messages = msgs;
+                    final_model = mdl;
+                }
+                crate::hooks::HookResult::Cancel(reason) => {
+                    tracing::warn!(reason = %reason, "LLM call cancelled by before_llm_call hook");
+                    return Err(anyhow::anyhow!("LLM call cancelled by hook: {}", reason));
+                }
+            }
+        } else {
+            final_messages = prepared_messages.messages.to_vec();
+            final_model = active_model.to_string();
+        }
         let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
             && (request_tools.is_none() || provider.supports_streaming_tool_events());
@@ -2997,9 +3021,9 @@ pub(crate) async fn run_tool_call_loop(
         let chat_result = if should_consume_provider_stream {
             match consume_provider_streaming_response(
                 active_provider,
-                &prepared_messages.messages,
+                &final_messages,
                 request_tools,
-                active_model,
+                &final_model,
                 temperature,
                 cancellation_token.as_ref(),
                 on_delta.as_ref(),
@@ -3018,7 +3042,7 @@ pub(crate) async fn run_tool_call_loop(
                 Err(stream_err) => {
                     tracing::warn!(
                         provider = active_provider_name,
-                        model = active_model,
+                        model = &final_model,
                         iteration = iteration + 1,
                         "provider streaming failed, falling back to non-streaming chat: {stream_err}"
                     );
@@ -3040,9 +3064,9 @@ pub(crate) async fn run_tool_call_loop(
                     }
                     call_provider_chat(
                         active_provider,
-                        &prepared_messages.messages,
+                        &final_messages,
                         request_tools,
-                        active_model,
+                        &final_model,
                         temperature,
                         cancellation_token.as_ref(),
                     )
@@ -3054,10 +3078,10 @@ pub(crate) async fn run_tool_call_loop(
             // pacing config to catch hung model responses.
             let chat_future = active_provider.chat(
                 ChatRequest {
-                    messages: &prepared_messages.messages,
+                    messages: &final_messages,
                     tools: request_tools,
                 },
-                active_model,
+                &final_model,
                 temperature,
             );
 

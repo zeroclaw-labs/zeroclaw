@@ -3,6 +3,7 @@ mod agent_robustness;
 mod backup_cron_scheduling;
 mod channel_matrix;
 mod channel_routing;
+mod hook_execution_agent;
 mod hooks;
 mod memory_comparison;
 mod memory_restart;
