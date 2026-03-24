@@ -1898,7 +1898,19 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     // Strip isolated tool-call JSON artifacts
     let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
     // Strip leading narration lines that announce tool usage
-    strip_tool_narration(&stripped_json)
+    let sanitized = strip_tool_narration(&stripped_json);
+
+    // Scan for credential leaks before returning to caller
+    match crate::security::LeakDetector::new().scan(&sanitized) {
+        crate::security::LeakResult::Clean => sanitized,
+        crate::security::LeakResult::Detected { patterns, redacted } => {
+            tracing::warn!(
+                patterns = ?patterns,
+                "output guardrail: credential leak detected in outbound channel response"
+            );
+            redacted
+        }
+    }
 }
 
 /// Remove leading lines that narrate tool usage (e.g. "Let me check the weather for you.").
@@ -10554,5 +10566,26 @@ This is an example JSON object for profile settings."#;
             2,
             "both Slack thread messages should complete, got: {sent_messages:?}"
         );
+    }
+
+    #[test]
+    fn sanitize_channel_response_redacts_detected_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+
+        let result = sanitize_channel_response(leaked, &tools);
+
+        assert!(!result.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
+        assert!(result.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_passes_clean_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let clean_text = "This is a normal message with no credentials.";
+
+        let result = sanitize_channel_response(clean_text, &tools);
+
+        assert_eq!(result, clean_text);
     }
 }
