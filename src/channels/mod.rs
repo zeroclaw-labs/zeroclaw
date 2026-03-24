@@ -266,6 +266,7 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    ShowConfig,
     NewSession,
 }
 
@@ -721,7 +722,7 @@ fn strip_tool_result_content(text: &str) -> String {
 }
 
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix")
+    matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -758,6 +759,9 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             } else {
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
+        }
+        "/config" if supports_runtime_model_switch(channel_name) => {
+            Some(ChannelRuntimeCommand::ShowConfig)
         }
         _ => None,
     }
@@ -1436,6 +1440,171 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response
 }
 
+/// Build a plain-text `/config` response for non-Slack channels.
+fn build_config_text_response(
+    current: &ChannelRouteSelection,
+    _workspace_dir: &Path,
+    model_routes: &[crate::config::ModelRouteConfig],
+) -> String {
+    let mut resp = String::new();
+    let _ = writeln!(
+        resp,
+        "Current provider: `{}`\nCurrent model: `{}`",
+        current.provider, current.model
+    );
+    resp.push_str("\nAvailable providers:\n");
+    for p in providers::list_providers() {
+        let _ = writeln!(resp, "- `{}`", p.name);
+    }
+    if !model_routes.is_empty() {
+        resp.push_str("\nConfigured model routes:\n");
+        for route in model_routes {
+            let _ = writeln!(
+                resp,
+                "  `{}` -> {} ({})",
+                route.hint, route.model, route.provider
+            );
+        }
+    }
+    resp.push_str(
+        "\nUse `/models <provider>` to switch provider.\nUse `/model <model-id>` to switch model.",
+    );
+    resp
+}
+
+/// Prefix used to signal that a runtime command response contains raw Block Kit
+/// JSON instead of plain text. [`SlackChannel::send`] detects this and posts
+/// the blocks directly via `chat.postMessage`.
+const BLOCK_KIT_PREFIX: &str = "__ZEROCLAW_BLOCK_KIT__";
+
+/// Build a Slack Block Kit JSON payload for the `/config` interactive UI.
+fn build_config_block_kit(
+    current: &ChannelRouteSelection,
+    workspace_dir: &Path,
+    model_routes: &[crate::config::ModelRouteConfig],
+) -> String {
+    let provider_options: Vec<serde_json::Value> = providers::list_providers()
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "text": { "type": "plain_text", "text": p.display_name },
+                "value": p.name
+            })
+        })
+        .collect();
+
+    // Build model options from model_routes + cached models.
+    let mut model_options: Vec<serde_json::Value> = model_routes
+        .iter()
+        .map(|r| {
+            let label = if r.hint.is_empty() {
+                r.model.clone()
+            } else {
+                format!("{} ({})", r.model, r.hint)
+            };
+            serde_json::json!({
+                "text": { "type": "plain_text", "text": label },
+                "value": r.model
+            })
+        })
+        .collect();
+
+    let cached = load_cached_model_preview(workspace_dir, &current.provider);
+    for model_id in cached {
+        if !model_options.iter().any(|o| {
+            o.get("value")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == model_id)
+        }) {
+            model_options.push(serde_json::json!({
+                "text": { "type": "plain_text", "text": model_id },
+                "value": model_id
+            }));
+        }
+    }
+
+    // If the current model is not in the list, prepend it.
+    if !model_options.iter().any(|o| {
+        o.get("value")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == current.model)
+    }) {
+        model_options.insert(
+            0,
+            serde_json::json!({
+                "text": { "type": "plain_text", "text": &current.model },
+                "value": &current.model
+            }),
+        );
+    }
+
+    // Find initial options matching current selection.
+    let initial_provider = provider_options
+        .iter()
+        .find(|o| {
+            o.get("value")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == current.provider)
+        })
+        .cloned();
+
+    let initial_model = model_options
+        .iter()
+        .find(|o| {
+            o.get("value")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == current.model)
+        })
+        .cloned();
+
+    let mut provider_select = serde_json::json!({
+        "type": "static_select",
+        "action_id": "zeroclaw_config_provider",
+        "placeholder": { "type": "plain_text", "text": "Select provider" },
+        "options": provider_options
+    });
+    if let Some(init) = initial_provider {
+        provider_select["initial_option"] = init;
+    }
+
+    let mut model_select = serde_json::json!({
+        "type": "static_select",
+        "action_id": "zeroclaw_config_model",
+        "placeholder": { "type": "plain_text", "text": "Select model" },
+        "options": model_options
+    });
+    if let Some(init) = initial_model {
+        model_select["initial_option"] = init;
+    }
+
+    let blocks = serde_json::json!([
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!(
+                    "*Model Configuration*\nCurrent: `{}` / `{}`",
+                    current.provider, current.model
+                )
+            }
+        },
+        {
+            "type": "section",
+            "block_id": "config_provider_block",
+            "text": { "type": "mrkdwn", "text": "*Provider*" },
+            "accessory": provider_select
+        },
+        {
+            "type": "section",
+            "block_id": "config_model_block",
+            "text": { "type": "mrkdwn", "text": "*Model*" },
+            "accessory": model_select
+        }
+    ]);
+
+    blocks.to_string()
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -1506,6 +1675,19 @@ async fn handle_runtime_command_if_needed(
                     "Model switched to `{}` (provider: `{}`). Context preserved.",
                     current.model, current.provider
                 )
+            }
+        }
+        ChannelRuntimeCommand::ShowConfig => {
+            if msg.channel == "slack" {
+                let blocks_json = build_config_block_kit(
+                    &current,
+                    ctx.workspace_dir.as_path(),
+                    &ctx.model_routes,
+                );
+                // Use a magic prefix so SlackChannel::send() can detect Block Kit JSON.
+                format!("__ZEROCLAW_BLOCK_KIT__{blocks_json}")
+            } else {
+                build_config_text_response(&current, ctx.workspace_dir.as_path(), &ctx.model_routes)
             }
         }
         ChannelRuntimeCommand::NewSession => {

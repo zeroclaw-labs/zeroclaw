@@ -1778,6 +1778,79 @@ impl SlackChannel {
             .clone()
     }
 
+    /// Parse a Socket Mode `interactive` envelope containing a `block_actions`
+    /// payload from the `/config` Block Kit UI.  Translates provider/model
+    /// dropdown selections into synthetic `/models <provider>` or `/model <id>`
+    /// commands so the existing runtime command handler can apply them.
+    fn parse_block_action_as_command(
+        envelope: &serde_json::Value,
+        _bot_user_id: &str,
+    ) -> Option<ChannelMessage> {
+        let payload = envelope.get("payload")?;
+
+        let payload_type = payload.get("type").and_then(|v| v.as_str())?;
+        if payload_type != "block_actions" {
+            return None;
+        }
+
+        let actions = payload.get("actions").and_then(|v| v.as_array())?;
+        let action = actions.first()?;
+
+        let action_id = action.get("action_id").and_then(|v| v.as_str())?;
+        let selected_value = action
+            .get("selected_option")
+            .and_then(|o| o.get("value"))
+            .and_then(|v| v.as_str())?;
+
+        let command = match action_id {
+            "zeroclaw_config_provider" => format!("/models {selected_value}"),
+            "zeroclaw_config_model" => format!("/model {selected_value}"),
+            _ => return None,
+        };
+
+        let user = payload
+            .get("user")
+            .and_then(|u| u.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let channel_id = payload
+            .get("channel")
+            .and_then(|c| c.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        if channel_id.is_empty() {
+            tracing::warn!("Slack block_actions: missing channel ID in interactive payload");
+            return None;
+        }
+
+        let ts = payload
+            .get("message")
+            .and_then(|m| m.get("ts"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+
+        Some(ChannelMessage {
+            id: format!("slack_{channel_id}_{ts}_action"),
+            sender: user.to_string(),
+            reply_target: channel_id.to_string(),
+            content: command,
+            channel: "slack".to_string(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: payload
+                .get("message")
+                .and_then(|m| m.get("thread_ts"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            interruption_scope_id: None,
+            attachments: vec![],
+        })
+    }
+
     async fn open_socket_mode_url(&self) -> anyhow::Result<String> {
         let app_token = self
             .configured_app_token()
@@ -1912,6 +1985,17 @@ impl SlackChannel {
                     tracing::warn!("Slack Socket Mode: received disconnect event");
                     break;
                 }
+
+                // Handle interactive payloads (block_actions from /config UI).
+                if envelope_type == "interactive" {
+                    if let Some(msg) = Self::parse_block_action_as_command(&envelope, bot_user_id) {
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+
                 if envelope_type != "events_api" {
                     continue;
                 }
@@ -2403,22 +2487,39 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let mut body = serde_json::json!({
-            "channel": message.recipient,
-            "text": message.content
-        });
-
-        // Use Slack's native markdown block for rich formatting when content fits.
-        if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
-            body["blocks"] = serde_json::json!([{
-                "type": "markdown",
+        // Detect Block Kit payloads produced by the `/config` command.
+        let body = if let Some(blocks_json) = message.content.strip_prefix(super::BLOCK_KIT_PREFIX)
+        {
+            let blocks: serde_json::Value = serde_json::from_str(blocks_json)
+                .context("invalid Block Kit JSON in runtime command response")?;
+            let mut body = serde_json::json!({
+                "channel": message.recipient,
+                "text": "Model configuration",
+                "blocks": blocks
+            });
+            if let Some(ts) = self.outbound_thread_ts(message) {
+                body["thread_ts"] = serde_json::json!(ts);
+            }
+            body
+        } else {
+            let mut body = serde_json::json!({
+                "channel": message.recipient,
                 "text": message.content
-            }]);
-        }
+            });
 
-        if let Some(ts) = self.outbound_thread_ts(message) {
-            body["thread_ts"] = serde_json::json!(ts);
-        }
+            // Use Slack's native markdown block for rich formatting when content fits.
+            if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+                body["blocks"] = serde_json::json!([{
+                    "type": "markdown",
+                    "text": message.content
+                }]);
+            }
+
+            if let Some(ts) = self.outbound_thread_ts(message) {
+                body["thread_ts"] = serde_json::json!(ts);
+            }
+            body
+        };
 
         let resp = self
             .http_client()
