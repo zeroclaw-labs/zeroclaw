@@ -1,6 +1,6 @@
 # AGENTS.md — ZeroClaw
 
-> Cross-tool agent instructions. Recognized by Claude Code, GitHub Copilot, Cursor, Windsurf, and other AI coding assistants that support the [AGENTS.md](https://agents.md/) standard.
+Cross-tool agent instructions for any AI coding assistant working on this repository.
 
 ## Commands
 

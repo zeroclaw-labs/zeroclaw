@@ -976,7 +976,9 @@ impl Channel for QQChannel {
         let gw_url = self.get_gateway_url(&token).await?;
 
         tracing::info!("QQ: connecting to gateway WebSocket...");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&gw_url).await?;
+        let (ws_stream, _) =
+            crate::config::ws_connect_with_proxy(&gw_url, "channel.qq", self.proxy_url.as_deref())
+                .await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)
@@ -1139,6 +1141,7 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 interruption_scope_id: None,
+                    attachments: vec![],
                             };
 
                             if tx.send(channel_msg).await.is_err() {
@@ -1178,6 +1181,7 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 interruption_scope_id: None,
+                    attachments: vec![],
                             };
 
                             if tx.send(channel_msg).await.is_err() {

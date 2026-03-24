@@ -13,6 +13,7 @@ use zip::ZipArchive;
 mod audit;
 #[cfg(feature = "skill-creation")]
 pub mod creator;
+pub mod testing;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -93,6 +94,33 @@ fn default_version() -> String {
     "0.1.0".to_string()
 }
 
+/// Emit a user-visible warning when a skill directory is skipped due to audit
+/// findings. When the findings mention blocked scripts and `allow_scripts` is
+/// `false`, the message includes actionable remediation guidance so users know
+/// how to enable their skill.
+fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
+    let scripts_blocked = summary.contains("script-like files are blocked");
+    if scripts_blocked && !allow_scripts {
+        tracing::warn!(
+            "skipping skill directory {}: {summary}. \
+             To allow script files in skills, set `skills.allow_scripts = true` in your config.",
+            path.display(),
+        );
+        eprintln!(
+            "warning: skill '{}' was skipped because it contains script files. \
+             Set `skills.allow_scripts = true` in your zeroclaw config to enable it.",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+        );
+    } else {
+        tracing::warn!(
+            "skipping insecure skill directory {}: {summary}",
+            path.display(),
+        );
+    }
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
     load_skills_with_open_skills_config(workspace_dir, None, None, None)
@@ -169,11 +197,8 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
         ) {
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
-                tracing::warn!(
-                    "skipping insecure skill directory {}: {}",
-                    path.display(),
-                    report.summary()
-                );
+                let summary = report.summary();
+                warn_skipped_skill(&path, &summary, allow_scripts);
                 continue;
             }
             Err(err) => {
@@ -236,11 +261,8 @@ fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Ve
         ) {
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
-                tracing::warn!(
-                    "skipping insecure open-skill directory {}: {}",
-                    path.display(),
-                    report.summary()
-                );
+                let summary = report.summary();
+                warn_skipped_skill(&path, &summary, allow_scripts);
                 continue;
             }
             Err(err) => {
@@ -1415,6 +1437,44 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             );
             Ok(())
         }
+        crate::SkillCommands::Test { name, verbose } => {
+            let results = if let Some(ref skill_name) = name {
+                // Test a single skill
+                let source_path = PathBuf::from(skill_name);
+                let target = if source_path.exists() {
+                    source_path
+                } else {
+                    skills_dir(workspace_dir).join(skill_name)
+                };
+
+                if !target.exists() {
+                    anyhow::bail!("Skill not found: {}", skill_name);
+                }
+
+                let r = testing::test_skill(&target, skill_name, verbose)?;
+                if r.tests_run == 0 {
+                    println!(
+                        "  {} No TEST.sh found for skill '{}'.",
+                        console::style("-").dim(),
+                        skill_name,
+                    );
+                    return Ok(());
+                }
+                vec![r]
+            } else {
+                // Test all skills
+                let dirs = vec![skills_dir(workspace_dir)];
+                testing::test_all_skills(&dirs, verbose)?
+            };
+
+            testing::print_results(&results);
+
+            let any_failed = results.iter().any(|r| !r.failures.is_empty());
+            if any_failed {
+                anyhow::bail!("Some skill tests failed.");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2029,6 +2089,43 @@ description = "Bare minimum"
         assert!(skills[0].tags.iter().any(|tag| tag == "open-skills"));
         assert!(skills[0].prompts[0].contains("# PDF Guide"));
         assert!(!skills[0].prompts[0].contains("description: Use this skill"));
+    }
+
+    #[test]
+    fn skill_with_scripts_skipped_when_allow_scripts_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let skill_dir = skills_dir.join("obsidian");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "obsidian"
+description = "Obsidian vault tool"
+
+[[tools]]
+name = "search"
+description = "Search vault"
+kind = "shell"
+command = "obsidian search {{query}}"
+"#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("setup.sh"), "#!/bin/bash\necho setup\n").unwrap();
+
+        // With allow_scripts=false (default), skill should be skipped
+        let skills = load_skills_from_directory(&skills_dir, false);
+        assert!(
+            skills.is_empty(),
+            "skill with script files should be skipped when allow_scripts=false"
+        );
+
+        // With allow_scripts=true, skill should load
+        let skills = load_skills_from_directory(&skills_dir, true);
+        assert_eq!(skills.len(), 1, "skill should load when allow_scripts=true");
+        assert_eq!(skills[0].name, "obsidian");
     }
 }
 

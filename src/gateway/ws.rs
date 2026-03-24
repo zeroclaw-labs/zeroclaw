@@ -169,8 +169,21 @@ async fn handle_socket(
     let mut agent = match crate::agent::Agent::from_config(&config).await {
         Ok(a) => a,
         Err(e) => {
-            let err = serde_json::json!({"type": "error", "message": format!("Failed to initialise agent: {e}")});
+            tracing::error!(error = %e, "Agent initialization failed");
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!("Failed to initialise agent: {e}"),
+                "code": "AGENT_INIT_FAILED"
+            });
             let _ = sender.send(Message::Text(err.to_string().into())).await;
+            let _ = sender
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011,
+                    reason: axum::extract::ws::Utf8Bytes::from_static(
+                        "Agent initialization failed",
+                    ),
+                })))
+                .await;
             return;
         }
     };
@@ -270,7 +283,22 @@ async fn handle_socket(
                     process_chat_message(&state, &mut agent, &mut sender, &content, &session_key)
                         .await;
                 }
+            } else {
+                let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!(
+                        "Unsupported message type \"{unknown_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
+                    )
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
             }
+        } else {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": "Invalid JSON. Send {\"type\":\"message\",\"content\":\"your text\"}"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
         }
     }
 
@@ -284,8 +312,12 @@ async fn handle_socket(
         // Parse incoming message
         let parsed: serde_json::Value = match serde_json::from_str(&msg) {
             Ok(v) => v,
-            Err(_) => {
-                let err = serde_json::json!({"type": "error", "message": "Invalid JSON"});
+            Err(e) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": format!("Invalid JSON: {}", e),
+                    "code": "INVALID_JSON"
+                });
                 let _ = sender.send(Message::Text(err.to_string().into())).await;
                 continue;
             }
@@ -293,11 +325,25 @@ async fn handle_socket(
 
         let msg_type = parsed["type"].as_str().unwrap_or("");
         if msg_type != "message" {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!(
+                    "Unsupported message type \"{msg_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
+                ),
+                "code": "UNKNOWN_MESSAGE_TYPE"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
             continue;
         }
 
         let content = parsed["content"].as_str().unwrap_or("").to_string();
         if content.is_empty() {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": "Message content cannot be empty",
+                "code": "EMPTY_CONTENT"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
             continue;
         }
 
@@ -312,6 +358,9 @@ async fn handle_socket(
 }
 
 /// Process a single chat message through the agent and send the response.
+///
+/// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
+/// and tool results are forwarded to the WebSocket client in real time.
 async fn process_chat_message(
     state: &AppState,
     agent: &mut crate::agent::Agent,
@@ -319,6 +368,8 @@ async fn process_chat_message(
     content: &str,
     session_key: &str,
 ) {
+    use crate::agent::TurnEvent;
+
     let provider_label = state
         .config
         .lock()
@@ -333,14 +384,50 @@ async fn process_chat_message(
         "model": state.model,
     }));
 
-    // Multi-turn chat via persistent Agent (history is maintained across turns)
-    match agent.turn(content).await {
+    // Channel for streaming turn events from the agent.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+
+    // Run the streamed turn concurrently: the agent produces events
+    // while we forward them to the WebSocket below.  We cannot move
+    // `agent` into a spawned task (it is `&mut`), so we use a join
+    // instead — `turn_streamed` writes to the channel and we drain it
+    // from the other branch.
+    let content_owned = content.to_string();
+    let turn_fut = async { agent.turn_streamed(&content_owned, event_tx).await };
+
+    // Drive both futures concurrently: the agent turn produces events
+    // and we relay them over WebSocket.
+    let forward_fut = async {
+        while let Some(event) = event_rx.recv().await {
+            let ws_msg = match event {
+                TurnEvent::Chunk { delta } => {
+                    serde_json::json!({ "type": "chunk", "content": delta })
+                }
+                TurnEvent::ToolCall { name, args } => {
+                    serde_json::json!({ "type": "tool_call", "name": name, "args": args })
+                }
+                TurnEvent::ToolResult { name, output } => {
+                    serde_json::json!({ "type": "tool_result", "name": name, "output": output })
+                }
+            };
+            let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+        }
+    };
+
+    let (result, ()) = tokio::join!(turn_fut, forward_fut);
+
+    match result {
         Ok(response) => {
             // Persist assistant response
             if let Some(ref backend) = state.session_backend {
                 let assistant_msg = crate::providers::ChatMessage::assistant(&response);
                 let _ = backend.append(session_key, &assistant_msg);
             }
+
+            // Send chunk_reset so the client clears any accumulated draft
+            // before the authoritative done message.
+            let reset = serde_json::json!({ "type": "chunk_reset" });
+            let _ = sender.send(Message::Text(reset.to_string().into())).await;
 
             let done = serde_json::json!({
                 "type": "done",
@@ -356,10 +443,24 @@ async fn process_chat_message(
             }));
         }
         Err(e) => {
+            tracing::error!(error = %e, "Agent turn failed");
             let sanitized = crate::providers::sanitize_api_error(&e.to_string());
+            let error_code = if sanitized.to_lowercase().contains("api key")
+                || sanitized.to_lowercase().contains("authentication")
+                || sanitized.to_lowercase().contains("unauthorized")
+            {
+                "AUTH_ERROR"
+            } else if sanitized.to_lowercase().contains("provider")
+                || sanitized.to_lowercase().contains("model")
+            {
+                "PROVIDER_ERROR"
+            } else {
+                "AGENT_ERROR"
+            };
             let err = serde_json::json!({
                 "type": "error",
                 "message": sanitized,
+                "code": error_code,
             });
             let _ = sender.send(Message::Text(err.to_string().into())).await;
 

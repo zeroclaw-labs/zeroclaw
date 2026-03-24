@@ -20,6 +20,7 @@ Selected allowlist (all actions currently used across Quality Gate, Release Beta
 | `docker/setup-buildx-action@v3` | release, promote-release | Docker Buildx setup |
 | `docker/login-action@v3` | release, promote-release | GHCR authentication |
 | `docker/build-push-action@v6` | release, promote-release | Multi-platform Docker image build and push |
+| `actions/labeler@v5` | pr-path-labeler | Apply path/scope labels from `labeler.yml` |
 
 Equivalent allowlist patterns:
 
@@ -36,6 +37,7 @@ Equivalent allowlist patterns:
 | Quality Gate | `.github/workflows/checks-on-pr.yml` | Pull requests to `master` |
 | Release Beta | `.github/workflows/release-beta-on-push.yml` | Push to `master` |
 | Release Stable | `.github/workflows/release-stable-manual.yml` | Manual `workflow_dispatch` |
+| PR Path Labeler | `.github/workflows/pr-path-labeler.yml` | `pull_request_target` (opened, synchronize, reopened) |
 
 ## Change Control
 
@@ -62,6 +64,7 @@ gh api repos/zeroclaw-labs/zeroclaw/actions/permissions/selected-actions
 
 ## Change Log
 
+- 2026-03-23: Added PR Path Labeler (`pr-path-labeler.yml`) using `actions/labeler@v5`. No allowlist change needed — covered by existing `actions/*` pattern.
 - 2026-03-10: Renamed workflows — CI → Quality Gate (`checks-on-pr.yml`), Beta Release → Release Beta (`release-beta-on-push.yml`), Promote Release → Release Stable (`release-stable-manual.yml`). Added `lint` and `security` jobs to Quality Gate. Added Cross-Platform Build (`cross-platform-build-manual.yml`).
 - 2026-03-05: Complete workflow overhaul — replaced 22 workflows with 3 (CI, Beta Release, Promote Release)
     - Removed patterns no longer in use: `DavidAnson/markdownlint-cli2-action@*`, `lycheeverse/lychee-action@*`, `EmbarkStudios/cargo-deny-action@*`, `rustsec/audit-check@*`, `rhysd/actionlint@*`, `sigstore/cosign-installer@*`, `Checkmarx/vorpal-reviewdog-github-action@*`, `useblacksmith/*`

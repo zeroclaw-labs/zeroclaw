@@ -48,6 +48,8 @@ const LARK_ACK_REACTIONS_JA: &[&str] = &[
     "DONE",
 ];
 
+const MAX_LARK_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LarkAckLocale {
     ZhCn,
@@ -398,6 +400,10 @@ pub struct LarkChannel {
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    #[cfg(test)]
+    api_base_override: Option<String>,
 }
 
 impl LarkChannel {
@@ -442,6 +448,10 @@ impl LarkChannel {
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
+            transcription: None,
+            transcription_manager: None,
+            #[cfg(test)]
+            api_base_override: None,
         }
     }
 
@@ -501,6 +511,24 @@ impl LarkChannel {
         ch
     }
 
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(Arc::new(m));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, audio transcription disabled: {e}"
+                );
+            }
+        }
+        self.transcription = Some(config);
+        self
+    }
+
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_channel_proxy_client(
             self.platform.proxy_service_key(),
@@ -512,7 +540,11 @@ impl LarkChannel {
         self.platform.channel_name()
     }
 
-    fn api_base(&self) -> &'static str {
+    fn api_base(&self) -> &str {
+        #[cfg(test)]
+        if let Some(ref url) = self.api_base_override {
+            return url.as_str();
+        }
         self.platform.api_base()
     }
 
@@ -702,7 +734,12 @@ impl LarkChannel {
             .unwrap_or(0);
         tracing::info!("Lark: connecting to {wss_url}");
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url).await?;
+        let (ws_stream, _) = crate::config::ws_connect_with_proxy(
+            &wss_url,
+            "channel.lark",
+            self.proxy_url.as_deref(),
+        )
+        .await?;
         let (mut write, mut read) = ws_stream.split();
         tracing::info!("Lark: WS connected (service_id={service_id})");
 
@@ -931,6 +968,19 @@ impl LarkChannel {
                                 }
                             }
                         }
+                        "audio" => {
+                            let Some(manager) = self.transcription_manager.as_deref() else {
+                                tracing::debug!("Lark WS: audio message in {} (transcription not configured)", lark_msg.chat_id);
+                                continue;
+                            };
+                            let transcript = self.try_transcribe_audio_message(
+                                &lark_msg.message_id,
+                                &lark_msg.content,
+                                manager,
+                            ).await;
+                            let Some(text) = transcript else { continue; };
+                            (text, Vec::new())
+                        }
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
 
@@ -974,6 +1024,7 @@ impl LarkChannel {
                             .as_secs(),
                         thread_ts: None,
                         interruption_scope_id: None,
+                    attachments: vec![],
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -1306,6 +1357,204 @@ impl LarkChannel {
         }
     }
 
+    async fn stream_audio_bytes(mut resp: reqwest::Response) -> anyhow::Result<Vec<u8>> {
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            body.extend_from_slice(&chunk);
+            if body.len() as u64 > MAX_LARK_AUDIO_BYTES {
+                anyhow::bail!(
+                    "Lark audio download exceeds {} byte limit",
+                    MAX_LARK_AUDIO_BYTES
+                );
+            }
+        }
+        Ok(body)
+    }
+
+    async fn download_audio_resource(
+        &self,
+        message_id: &str,
+        file_key: &str,
+    ) -> anyhow::Result<(Vec<u8>, String)> {
+        let url = format!(
+            "{}/im/v1/messages/{message_id}/resources/{file_key}?type=file",
+            self.api_base()
+        );
+        let token = self.get_tenant_access_token().await?;
+        let resp = self
+            .http_client()
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body_text = resp.text().await.unwrap_or_default();
+            let body: serde_json::Value =
+                serde_json::from_str(&body_text).unwrap_or_else(|_| serde_json::json!({}));
+
+            if should_refresh_lark_tenant_token(status, &body) {
+                self.invalidate_token().await;
+                let token = self.get_tenant_access_token().await?;
+                let resp = self
+                    .http_client()
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {token}"))
+                    .send()
+                    .await?;
+                if !resp.status().is_success() {
+                    anyhow::bail!(
+                        "Lark audio download failed after token refresh: {}",
+                        resp.status()
+                    );
+                }
+                let bytes = Self::stream_audio_bytes(resp).await?;
+                return Ok((bytes, inferred_audio_filename(file_key)));
+            }
+
+            anyhow::bail!("Lark audio download failed: {}", status);
+        }
+        let bytes = Self::stream_audio_bytes(resp).await?;
+        Ok((bytes, inferred_audio_filename(file_key)))
+    }
+
+    async fn try_transcribe_audio_message(
+        &self,
+        message_id: &str,
+        content: &str,
+        manager: &super::transcription::TranscriptionManager,
+    ) -> Option<String> {
+        let file_key = serde_json::from_str::<serde_json::Value>(content)
+            .ok()
+            .and_then(|v| {
+                v.get("file_key")
+                    .and_then(|k| k.as_str())
+                    .map(str::to_owned)
+            })?;
+
+        let (audio_data, filename) = match self.download_audio_resource(message_id, &file_key).await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!("Lark: audio download failed for {message_id}: {e}");
+                return None;
+            }
+        };
+
+        match manager.transcribe(&audio_data, &filename).await {
+            Ok(transcript) => {
+                tracing::debug!("Lark: audio transcribed for {message_id}");
+                Some(transcript)
+            }
+            Err(e) => {
+                tracing::warn!("Lark: transcription failed for {message_id}: {e}");
+                None
+            }
+        }
+    }
+
+    pub async fn parse_event_payload_async(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Vec<ChannelMessage> {
+        let event_type = payload
+            .pointer("/header/event_type")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        if event_type != "im.message.receive_v1" {
+            return vec![];
+        }
+
+        let msg_type = payload
+            .pointer("/event/message/message_type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+
+        if msg_type != "audio" {
+            return self.parse_event_payload(payload).await;
+        }
+
+        let Some(manager) = self.transcription_manager.as_deref() else {
+            tracing::debug!("Lark webhook: audio message (transcription not configured)");
+            return vec![];
+        };
+
+        let open_id = payload
+            .pointer("/event/sender/sender_id/open_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !self.is_user_allowed(open_id) {
+            tracing::warn!("Lark: ignoring audio from unauthorized user: {open_id}");
+            return vec![];
+        }
+
+        let message_id = payload
+            .pointer("/event/message/message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let content = payload
+            .pointer("/event/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let chat_id = payload
+            .pointer("/event/message/chat_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(open_id);
+
+        let chat_type = payload
+            .pointer("/event/message/chat_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mentions = payload
+            .pointer("/event/message/mentions")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let bot_open_id = self.resolved_bot_open_id();
+        if chat_type == "group"
+            && !should_respond_in_group(
+                self.mention_only,
+                bot_open_id.as_deref(),
+                &mentions,
+                &Vec::new(),
+            )
+        {
+            return vec![];
+        }
+
+        let Some(text) = self
+            .try_transcribe_audio_message(message_id, content, manager)
+            .await
+        else {
+            return vec![];
+        };
+
+        let timestamp = payload
+            .pointer("/event/message/create_time")
+            .and_then(|t| t.as_str())
+            .and_then(|t| t.parse::<u64>().ok())
+            .map(|ms| ms / 1000)
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            });
+
+        vec![ChannelMessage {
+            id: Uuid::new_v4().to_string(),
+            sender: chat_id.to_string(),
+            reply_target: chat_id.to_string(),
+            content: text,
+            channel: self.channel_name().to_string(),
+            timestamp,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        }]
+    }
+
     async fn send_text_once(
         &self,
         url: &str,
@@ -1511,6 +1760,7 @@ impl LarkChannel {
             timestamp,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         });
 
         messages
@@ -1609,7 +1859,7 @@ impl LarkChannel {
             }
 
             // Parse event messages
-            let messages = state.channel.parse_event_payload(&payload).await;
+            let messages = state.channel.parse_event_payload_async(&payload).await;
             if !messages.is_empty() {
                 if let Some(message_id) = payload
                     .pointer("/event/message/message_id")
@@ -1666,6 +1916,19 @@ impl LarkChannel {
 // WS helper functions
 // ─────────────────────────────────────────────────────────────────────────────
 
+fn inferred_audio_filename(file_key: &str) -> String {
+    const SUPPORTED_EXTENSIONS: &[&str] = &[".m4a", ".ogg", ".mp3", ".aac", ".wav"];
+    let file_key_lower = file_key.to_lowercase();
+    if SUPPORTED_EXTENSIONS
+        .iter()
+        .any(|ext| file_key_lower.ends_with(ext))
+    {
+        file_key.to_string()
+    } else {
+        "voice.m4a".to_string()
+    }
+}
+
 fn pick_uniform_index(len: usize) -> usize {
     debug_assert!(len > 0);
     let upper = len as u64;
@@ -1674,6 +1937,7 @@ fn pick_uniform_index(len: usize) -> usize {
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
+            #[allow(clippy::cast_possible_truncation)]
             return (value % upper) as usize;
         }
     }
@@ -3054,5 +3318,319 @@ mod tests {
         let text = "abc";
         let chunks = split_markdown_chunks(text, 3);
         assert_eq!(chunks, vec!["abc"]);
+    }
+
+    #[test]
+    fn lark_manager_none_when_transcription_not_configured() {
+        let ch = make_channel();
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn lark_manager_none_when_disabled() {
+        let tc = crate::config::TranscriptionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn lark_manager_none_and_warn_on_init_failure() {
+        let tc = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "groq".to_string(),
+            api_key: Some(String::new()),
+            ..Default::default()
+        };
+        let ch = make_channel().with_transcription(tc);
+        assert!(ch.transcription_manager.is_none());
+        assert!(ch.transcription.is_some());
+    }
+
+    #[test]
+    fn lark_audio_extensionless_file_key_falls_back_to_m4a() {
+        assert_eq!(inferred_audio_filename("abc123"), "voice.m4a");
+        assert_eq!(inferred_audio_filename("file_without_ext"), "voice.m4a");
+    }
+
+    #[test]
+    fn lark_audio_extensionless_file_key_preserves_existing_extension() {
+        assert_eq!(inferred_audio_filename("abc.m4a"), "abc.m4a");
+        assert_eq!(inferred_audio_filename("voice.ogg"), "voice.ogg");
+        assert_eq!(inferred_audio_filename("audio.mp3"), "audio.mp3");
+        assert_eq!(inferred_audio_filename("note.aac"), "note.aac");
+        assert_eq!(inferred_audio_filename("file.wav"), "file.wav");
+    }
+
+    #[tokio::test]
+    async fn lark_parse_audio_message_type_skipped_without_manager() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "open_id": "ou_testuser123"
+                    }
+                },
+                "message": {
+                    "message_id": "om_audio123",
+                    "message_type": "audio",
+                    "content": "{\"file_key\":\"audio_file_key\"}",
+                    "chat_id": "oc_chat123",
+                    "chat_type": "p2p",
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload_async(&payload).await;
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lark_parse_text_still_works_via_async_path() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "open_id": "ou_testuser123"
+                    }
+                },
+                "message": {
+                    "message_id": "om_text123",
+                    "message_type": "text",
+                    "content": "{\"text\":\"Hello async!\"}",
+                    "chat_id": "oc_chat123",
+                    "chat_type": "p2p",
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload_async(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "Hello async!");
+    }
+
+    #[tokio::test]
+    async fn lark_audio_group_without_mention_skips_before_download() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": {
+                        "open_id": "ou_testuser123"
+                    }
+                },
+                "message": {
+                    "message_id": "om_audio_group",
+                    "message_type": "audio",
+                    "content": "{\"file_key\":\"audio_file_key\"}",
+                    "chat_id": "oc_group123",
+                    "chat_type": "group",
+                    "mentions": [],
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload_async(&payload).await;
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn lark_feishu_audio_uses_feishu_api_base() {
+        let ch = LarkChannel::new_with_platform(
+            "app_id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec![],
+            false,
+            LarkPlatform::Feishu,
+        );
+        assert_eq!(ch.api_base(), FEISHU_BASE_URL);
+    }
+
+    #[tokio::test]
+    async fn lark_audio_file_key_missing_returns_none() {
+        let ch = make_channel();
+        let mut tc = crate::config::TranscriptionConfig::default();
+        tc.enabled = true;
+        tc.default_provider = "local_whisper".to_string();
+        tc.local_whisper = Some(crate::config::LocalWhisperConfig {
+            url: "http://localhost:0/v1/transcribe".to_string(),
+            bearer_token: "unused".to_string(),
+            max_audio_bytes: 10 * 1024 * 1024,
+            timeout_secs: 30,
+        });
+        let ch = ch.with_transcription(tc);
+        let manager = ch.transcription_manager.as_deref().unwrap();
+
+        let result = ch
+            .try_transcribe_audio_message("om_123", "{}", manager)
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn lark_audio_skips_when_manager_none() {
+        let ch = make_channel();
+        assert!(ch.transcription_manager.is_none());
+
+        let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_testuser123" }
+                },
+                "message": {
+                    "message_id": "om_audio_1",
+                    "message_type": "audio",
+                    "content": "{\"file_key\":\"fk_abc123\"}",
+                    "chat_id": "oc_chat1",
+                    "chat_type": "p2p",
+                    "mentions": [],
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload_async(&payload).await;
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lark_audio_routes_through_transcription_manager() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock the tenant access token endpoint
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "test-tenant-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock the audio resource download endpoint
+        Mock::given(method("GET"))
+            .and(path_regex("/im/v1/messages/.+/resources/.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 128]))
+            .mount(&mock_server)
+            .await;
+
+        // Mock whisper transcription endpoint
+        let whisper_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "test transcript"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
+        let mut config = crate::config::TranscriptionConfig::default();
+        config.enabled = true;
+        config.local_whisper = Some(crate::config::LocalWhisperConfig {
+            url: format!("{}/v1/transcribe", whisper_server.uri()),
+            bearer_token: "test-token".to_string(),
+            max_audio_bytes: 10 * 1024 * 1024,
+            timeout_secs: 30,
+        });
+        config.default_provider = "local_whisper".to_string();
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(mock_server.uri());
+        let ch = ch.with_transcription(config);
+
+        let payload = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {
+                "sender": {
+                    "sender_id": { "open_id": "ou_testuser123" }
+                },
+                "message": {
+                    "message_id": "om_audio_2",
+                    "message_type": "audio",
+                    "content": "{\"file_key\":\"fk_abc123\"}",
+                    "chat_id": "oc_chat1",
+                    "chat_type": "p2p",
+                    "mentions": [],
+                    "create_time": "1699999999000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload_async(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "test transcript");
+    }
+
+    #[tokio::test]
+    async fn lark_audio_token_refresh_on_invalid_token_response() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Token endpoint always returns valid token
+        Mock::given(method("POST"))
+            .and(path_regex("/auth/v3/tenant_access_token/internal"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0,
+                "tenant_access_token": "refreshed-token",
+                "expire": 7200
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Resource endpoint: first call returns 401, second returns audio bytes
+        Mock::given(method("GET"))
+            .and(path_regex("/im/v1/messages/.+/resources/.+"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "code": 99_991_663,
+                "msg": "token invalid"
+            })))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex("/im/v1/messages/.+/resources/.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
+            .mount(&mock_server)
+            .await;
+
+        let mut ch = make_channel();
+        ch.api_base_override = Some(mock_server.uri());
+
+        let result = ch.download_audio_resource("om_msg_1", "fk_audio_key").await;
+        assert!(result.is_ok());
+        let (bytes, filename) = result.unwrap();
+        assert_eq!(bytes.len(), 64);
+        assert_eq!(filename, "voice.m4a");
     }
 }

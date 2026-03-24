@@ -1,7 +1,19 @@
-# CLAUDE.md — ZeroClaw (Claude Code-specific)
+# CLAUDE.md — ZeroClaw (Claude Code)
 
-> All project conventions, architecture, workflow, and anti-patterns live in `@AGENTS.md`.
-> This file contains only Claude Code-specific directives that don't apply to other AI coding tools.
+> **Shared instructions live in `@AGENTS.md`.**
+> This file contains only Claude Code-specific directives.
+
+## Claude Code Settings
+
+Claude Code should read and follow all instructions in `AGENTS.md` at the repository root for project conventions, commands, risk tiers, workflow rules, and anti-patterns.
+
+## Hooks
+
+_No custom hooks defined yet._
+
+## Slash Commands
+
+_No custom slash commands defined yet._
 
 ## Linked References
 
