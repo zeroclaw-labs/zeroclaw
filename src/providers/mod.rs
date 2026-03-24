@@ -2197,10 +2197,31 @@ pub fn list_providers() -> Vec<ProviderInfo> {
     ]
 }
 
+/// Shared test utilities for provider tests that mutate environment variables.
+///
+/// All provider tests that call `std::env::set_var` or `std::env::remove_var`
+/// must hold `ENV_TEST_LOCK` to prevent races when `cargo test` runs tests in
+/// parallel across threads.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Process-wide lock for tests that mutate environment variables.
+    ///
+    /// Env vars are global state. Without this lock, concurrent tests that
+    /// set/unset the same keys (e.g. `BEDROCK_API_KEY`, `AWS_ACCESS_KEY_ID`)
+    /// observe each other's mutations and fail intermittently.
+    pub fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
 
     struct EnvGuard {
         key: &'static str,
@@ -2230,10 +2251,8 @@ mod tests {
     }
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
+        // Delegate to the shared lock so all provider tests serialize.
+        super::test_util::env_lock()
     }
 
     #[test]
@@ -2281,6 +2300,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
+        let _env_lock = env_lock();
         let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
         let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
         let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", None);
@@ -2295,6 +2315,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_credential_bedrock_returns_bearer_token_from_env() {
+        let _env_lock = env_lock();
         let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", Some("bedrock-bearer-token"));
 
         assert_eq!(
