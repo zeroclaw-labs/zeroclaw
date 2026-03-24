@@ -253,7 +253,7 @@ impl WhatsAppChannel {
                                 "WhatsApp: message from {from} did not match mention patterns, dropping"
                             );
                             continue;
-                        },
+                        }
                     };
 
                     // Get timestamp
