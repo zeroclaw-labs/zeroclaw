@@ -415,7 +415,7 @@ mod tests {
     #[test]
     fn tool_metadata() {
         let tool = LlmTaskTool::new(
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())),
             "openrouter".to_string(),
             "test-model".to_string(),
             0.7,
@@ -441,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn execute_missing_prompt_returns_error() {
         let tool = LlmTaskTool::new(
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())),
             "openrouter".to_string(),
             "test-model".to_string(),
             0.7,
@@ -457,7 +457,7 @@ mod tests {
     #[tokio::test]
     async fn execute_empty_prompt_returns_error() {
         let tool = LlmTaskTool::new(
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())),
             "openrouter".to_string(),
             "test-model".to_string(),
             0.7,
@@ -473,7 +473,7 @@ mod tests {
     #[tokio::test]
     async fn execute_with_invalid_provider_returns_error() {
         let tool = LlmTaskTool::new(
-            Arc::new(SecurityPolicy::default()),
+            Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())),
             "nonexistent_provider_xyz".to_string(),
             "test-model".to_string(),
             0.7,

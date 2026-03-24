@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolResult};
 use crate::memory::Memory;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -9,11 +10,11 @@ use std::sync::Arc;
 /// Let the agent bulk-delete memories by namespace or session
 pub struct MemoryPurgeTool {
     memory: Arc<dyn Memory>,
-    security: Arc<SecurityPolicy>,
+    security: Arc<ArcSwap<SecurityPolicy>>,
 }
 
 impl MemoryPurgeTool {
-    pub fn new(memory: Arc<dyn Memory>, security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(memory: Arc<dyn Memory>, security: Arc<ArcSwap<SecurityPolicy>>) -> Self {
         Self { memory, security }
     }
 }
@@ -57,6 +58,7 @@ impl Tool for MemoryPurgeTool {
 
         if let Err(error) = self
             .security
+            .load()
             .enforce_tool_operation(ToolOperation::Act, "memory_purge")
         {
             return Ok(ToolResult {

@@ -314,7 +314,7 @@ mod tests {
     }
 
     fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> AskUserTool {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())));
         let map: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|(name, ch)| (name.to_string(), ch))
@@ -327,7 +327,7 @@ mod tests {
 
     #[test]
     fn tool_name_and_description() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())));
         assert_eq!(tool.name(), "ask_user");
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("question"));
@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn parameter_schema_validation() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())));
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["question"].is_object());
@@ -352,7 +352,7 @@ mod tests {
 
     #[test]
     fn spec_matches_metadata() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())));
         let spec = tool.spec();
         assert_eq!(spec.name, "ask_user");
         assert_eq!(spec.description, tool.description());
@@ -403,7 +403,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_channels_returns_not_initialized() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())));
         let result = tool.execute(json!({ "question": "Hello?" })).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("not initialized"));
@@ -478,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_map_handle_allows_late_binding() {
-        let tool = AskUserTool::new(Arc::new(SecurityPolicy::default()));
+        let tool = AskUserTool::new(Arc::new(ArcSwap::from_pointee(SecurityPolicy::default())));
         let handle = tool.channel_map_handle();
 
         // Initially empty — tool reports not initialized
