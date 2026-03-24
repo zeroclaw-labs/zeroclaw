@@ -4209,7 +4209,8 @@ fn collect_configured_channels(
                                 wa.self_chat_mode,
                             )
                             .with_transcription(config.transcription.clone())
-                            .with_tts(config.tts.clone()),
+                            .with_tts(config.tts.clone())
+                            .with_mention_patterns(wa.mention_patterns.clone()),
                         ),
                     });
                 } else {

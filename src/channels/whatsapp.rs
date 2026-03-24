@@ -68,7 +68,7 @@ impl WhatsAppChannel {
 
     /// Compile raw pattern strings into case-insensitive regexes.
     /// Invalid or excessively large patterns are logged and skipped.
-    fn compile_mention_patterns(patterns: &[String]) -> Vec<Regex> {
+    pub(crate) fn compile_mention_patterns(patterns: &[String]) -> Vec<Regex> {
         patterns
             .iter()
             .filter_map(|p| {
@@ -95,18 +95,40 @@ impl WhatsAppChannel {
 
     /// Check whether `text` matches any of the compiled mention patterns.
     fn contains_mention(&self, text: &str) -> bool {
-        self.mention_patterns.iter().any(|re| re.is_match(text))
+        Self::text_matches_patterns(&self.mention_patterns, text)
+    }
+
+    /// Check whether `text` matches any pattern in the given slice.
+    pub(crate) fn text_matches_patterns(patterns: &[Regex], text: &str) -> bool {
+        patterns.iter().any(|re| re.is_match(text))
     }
 
     /// Strip all mention-pattern matches from `text`, collapse whitespace,
     /// and return `None` if the result is empty.
     fn strip_mention_patterns(&self, text: &str) -> Option<String> {
+        Self::strip_patterns(&self.mention_patterns, text)
+    }
+
+    /// Strip all pattern matches from `text`, collapse whitespace,
+    /// and return `None` if the result is empty.
+    pub(crate) fn strip_patterns(patterns: &[Regex], text: &str) -> Option<String> {
         let mut result = text.to_string();
-        for re in &self.mention_patterns {
+        for re in patterns {
             result = re.replace_all(&result, " ").into_owned();
         }
         let normalized = result.split_whitespace().collect::<Vec<_>>().join(" ");
         (!normalized.is_empty()).then_some(normalized)
+    }
+
+    /// Detect group messages in the WhatsApp Cloud API webhook payload.
+    ///
+    /// A message is considered a group message when it carries a `context`
+    /// object containing a non-empty `group_id` field.
+    fn is_group_message(msg: &serde_json::Value) -> bool {
+        msg.get("context")
+            .and_then(|ctx| ctx.get("group_id"))
+            .and_then(|g| g.as_str())
+            .is_some_and(|s| !s.is_empty())
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -188,9 +210,11 @@ impl WhatsAppChannel {
                     }
 
                     // Mention-pattern gating: when mention_patterns is
-                    // configured, reject messages that do not match any
-                    // pattern and strip matched fragments from the content.
-                    let content = if self.mention_patterns.is_empty() {
+                    // configured, reject **group** messages that do not match
+                    // any pattern and strip matched fragments from the content.
+                    // DM messages always pass through unfiltered.
+                    let is_group = Self::is_group_message(msg);
+                    let content = if !is_group || self.mention_patterns.is_empty() {
                         content
                     } else {
                         if !self.contains_mention(&content) {
@@ -1410,40 +1434,99 @@ mod tests {
 
     // ── mention_patterns integration with parse_webhook_payload ──
 
+    /// Helper: build a group message payload with optional context.group_id.
+    fn group_msg(from: &str, ts: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "from": from,
+            "timestamp": ts,
+            "type": "text",
+            "text": { "body": body },
+            "context": { "group_id": "120363012345678901@g.us" }
+        })
+    }
+
+    /// Helper: build a DM message payload (no group_id).
+    fn dm_msg(from: &str, ts: &str, body: &str) -> serde_json::Value {
+        serde_json::json!({
+            "from": from,
+            "timestamp": ts,
+            "type": "text",
+            "text": { "body": body }
+        })
+    }
+
     #[test]
-    fn whatsapp_mention_rejects_message_without_match() {
+    fn whatsapp_is_group_message_with_group_id() {
+        let msg = group_msg("111", "1", "Hello");
+        assert!(WhatsAppChannel::is_group_message(&msg));
+    }
+
+    #[test]
+    fn whatsapp_is_group_message_without_context() {
+        let msg = dm_msg("111", "1", "Hello");
+        assert!(!WhatsAppChannel::is_group_message(&msg));
+    }
+
+    #[test]
+    fn whatsapp_is_group_message_empty_group_id() {
+        let msg = serde_json::json!({
+            "from": "111",
+            "timestamp": "1",
+            "type": "text",
+            "text": { "body": "Hi" },
+            "context": { "group_id": "" }
+        });
+        assert!(!WhatsAppChannel::is_group_message(&msg));
+    }
+
+    #[test]
+    fn whatsapp_mention_rejects_group_message_without_match() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
                     "value": {
-                        "messages": [{
-                            "from": "111",
-                            "timestamp": "1",
-                            "type": "text",
-                            "text": { "body": "Hello without mention" }
-                        }]
+                        "messages": [group_msg("111", "1", "Hello without mention")]
                     }
                 }]
             }]
         });
         let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty(), "Should reject messages without mention");
+        assert!(
+            msgs.is_empty(),
+            "Should reject group messages without mention"
+        );
     }
 
     #[test]
-    fn whatsapp_mention_accepts_and_strips() {
+    fn whatsapp_mention_dm_passes_through_without_match() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
                     "value": {
-                        "messages": [{
-                            "from": "111",
-                            "timestamp": "1",
-                            "type": "text",
-                            "text": { "body": "@ZeroClaw what is the weather?" }
-                        }]
+                        "messages": [dm_msg("111", "1", "Hello without mention")]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "DMs should pass through even without a mention"
+        );
+        assert_eq!(msgs[0].content, "Hello without mention");
+    }
+
+    #[test]
+    fn whatsapp_mention_accepts_and_strips_in_group() {
+        let ch = make_mention_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [group_msg("111", "1", "@ZeroClaw what is the weather?")]
                     }
                 }]
             }]
@@ -1454,18 +1537,13 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_strips_from_content() {
+    fn whatsapp_mention_strips_from_group_content() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
                     "value": {
-                        "messages": [{
-                            "from": "111",
-                            "timestamp": "1",
-                            "type": "text",
-                            "text": { "body": "Hey @ZeroClaw tell me a joke" }
-                        }]
+                        "messages": [group_msg("111", "1", "Hey @ZeroClaw tell me a joke")]
                     }
                 }]
             }]
@@ -1476,18 +1554,13 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_drops_mention_only_message() {
+    fn whatsapp_mention_drops_mention_only_group_message() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
                     "value": {
-                        "messages": [{
-                            "from": "111",
-                            "timestamp": "1",
-                            "type": "text",
-                            "text": { "body": "@ZeroClaw" }
-                        }]
+                        "messages": [group_msg("111", "1", "@ZeroClaw")]
                     }
                 }]
             }]
@@ -1495,23 +1568,18 @@ mod tests {
         let msgs = ch.parse_webhook_payload(&payload);
         assert!(
             msgs.is_empty(),
-            "Should drop message that is only a mention"
+            "Should drop group message that is only a mention"
         );
     }
 
     #[test]
-    fn whatsapp_mention_case_insensitive_match() {
+    fn whatsapp_mention_case_insensitive_group_match() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
                     "value": {
-                        "messages": [{
-                            "from": "111",
-                            "timestamp": "1",
-                            "type": "text",
-                            "text": { "body": "@zeroclaw status" }
-                        }]
+                        "messages": [group_msg("111", "1", "@zeroclaw status")]
                     }
                 }]
             }]
@@ -1522,18 +1590,13 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_no_patterns_passes_all_messages() {
+    fn whatsapp_no_patterns_passes_all_group_messages() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
                     "value": {
-                        "messages": [{
-                            "from": "111",
-                            "timestamp": "1",
-                            "type": "text",
-                            "text": { "body": "Hello without mention" }
-                        }]
+                        "messages": [group_msg("111", "1", "Hello without mention")]
                     }
                 }]
             }]
@@ -1544,16 +1607,16 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_mixed_messages() {
+    fn whatsapp_mention_mixed_group_messages() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
                     "value": {
                         "messages": [
-                            { "from": "111", "timestamp": "1", "type": "text", "text": { "body": "No mention here" } },
-                            { "from": "222", "timestamp": "2", "type": "text", "text": { "body": "@ZeroClaw help me" } },
-                            { "from": "333", "timestamp": "3", "type": "text", "text": { "body": "Also no mention" } }
+                            group_msg("111", "1", "No mention here"),
+                            group_msg("222", "2", "@ZeroClaw help me"),
+                            group_msg("333", "3", "Also no mention")
                         ]
                     }
                 }]
@@ -1566,19 +1629,14 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_phone_number_pattern_integration() {
+    fn whatsapp_mention_phone_pattern_in_group() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()])
             .with_mention_patterns(vec![r"\+?15555550123".into()]);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
                     "value": {
-                        "messages": [{
-                            "from": "111",
-                            "timestamp": "1",
-                            "type": "text",
-                            "text": { "body": "+15555550123 tell me a joke" }
-                        }]
+                        "messages": [group_msg("111", "1", "+15555550123 tell me a joke")]
                     }
                 }]
             }]
@@ -1586,5 +1644,26 @@ mod tests {
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "tell me a joke");
+    }
+
+    #[test]
+    fn whatsapp_mention_dm_not_stripped() {
+        // DMs should never have mention patterns stripped, even when configured
+        let ch = make_mention_channel();
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [dm_msg("111", "1", "@ZeroClaw what is the weather?")]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(
+            msgs[0].content, "@ZeroClaw what is the weather?",
+            "DM content should not be stripped"
+        );
     }
 }
