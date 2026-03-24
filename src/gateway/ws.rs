@@ -213,6 +213,11 @@ async fn handle_socket(
         }
     }
 
+    // Fire session_start hook
+    if let Some(ref hooks) = state.hooks {
+        hooks.fire_session_start(&session_id, "websocket").await;
+    }
+
     // Send session_start message to client
     let mut session_start = serde_json::json!({
         "type": "session_start",
@@ -368,6 +373,11 @@ async fn handle_socket(
         }
 
         process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
+    }
+
+    // Fire session_end hook after message loop exits
+    if let Some(ref hooks) = state.hooks {
+        hooks.fire_session_end(&session_id, "websocket").await;
     }
 }
 

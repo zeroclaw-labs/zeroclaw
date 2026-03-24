@@ -171,6 +171,7 @@ pub struct HeartbeatEngine {
     workspace_dir: std::path::PathBuf,
     observer: Arc<dyn Observer>,
     metrics: Arc<ParkingMutex<HeartbeatMetrics>>,
+    hooks: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 impl HeartbeatEngine {
@@ -178,12 +179,14 @@ impl HeartbeatEngine {
         config: HeartbeatConfig,
         workspace_dir: std::path::PathBuf,
         observer: Arc<dyn Observer>,
+        hooks: Option<Arc<crate::hooks::HookRunner>>,
     ) -> Self {
         Self {
             config,
             workspace_dir,
             observer,
             metrics: Arc::new(ParkingMutex::new(HeartbeatMetrics::default())),
+            hooks,
         }
     }
 
@@ -207,6 +210,11 @@ impl HeartbeatEngine {
         loop {
             interval.tick().await;
             self.observer.record_event(&ObserverEvent::HeartbeatTick);
+
+            // Fire heartbeat_tick hook
+            if let Some(ref hooks) = self.hooks {
+                hooks.fire_heartbeat_tick().await;
+            }
 
             match self.tick().await {
                 Ok(tasks) => {
@@ -693,6 +701,7 @@ mod tests {
             },
             dir.clone(),
             observer,
+            None,
         );
         let count = engine.tick().await.unwrap();
         assert_eq!(count, 0);
@@ -719,6 +728,7 @@ mod tests {
             },
             dir.clone(),
             observer,
+            None,
         );
         let count = engine.tick().await.unwrap();
         assert_eq!(count, 3);
@@ -737,6 +747,7 @@ mod tests {
             },
             std::env::temp_dir(),
             observer,
+            None,
         );
         // Should return Ok immediately, not loop forever
         let result = engine.run().await;
@@ -765,6 +776,7 @@ mod tests {
             },
             dir.clone(),
             observer,
+            None,
         );
 
         let tasks = engine.collect_runnable_tasks().await.unwrap();
@@ -845,8 +857,12 @@ mod tests {
     #[test]
     fn engine_exposes_shared_metrics() {
         let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
-        let engine =
-            HeartbeatEngine::new(HeartbeatConfig::default(), std::env::temp_dir(), observer);
+        let engine = HeartbeatEngine::new(
+            HeartbeatConfig::default(),
+            std::env::temp_dir(),
+            observer,
+            None,
+        );
         let metrics = engine.metrics();
         assert_eq!(metrics.lock().total_ticks, 0);
     }

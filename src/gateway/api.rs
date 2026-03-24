@@ -1648,6 +1648,7 @@ mod tests {
             canvas_store: crate::tools::canvas::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         }
     }
 

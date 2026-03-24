@@ -222,10 +222,16 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
     let observer: std::sync::Arc<dyn crate::observability::Observer> =
         std::sync::Arc::from(crate::observability::create_observer(&config.observability));
+    let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
+        Some(std::sync::Arc::new(crate::hooks::HookRunner::new()))
+    } else {
+        None
+    };
     let engine = HeartbeatEngine::new(
         config.heartbeat.clone(),
         config.workspace_dir.clone(),
         observer,
+        hooks,
     );
     let metrics = engine.metrics();
     let delivery = resolve_heartbeat_delivery(&config)?;

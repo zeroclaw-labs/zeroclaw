@@ -272,8 +272,7 @@ impl ContextCompressor {
                 continue;
             }
             let original_len = msg.content.len();
-            msg.content =
-                crate::agent::loop_::truncate_tool_result(&msg.content, max);
+            msg.content = crate::agent::loop_::truncate_tool_result(&msg.content, max);
             saved += original_len - msg.content.len();
         }
         saved

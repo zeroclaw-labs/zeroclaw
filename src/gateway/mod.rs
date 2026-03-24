@@ -373,6 +373,8 @@ pub struct AppState {
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
+    /// Hook runner for lifecycle events
+    pub hooks: Option<Arc<crate::hooks::HookRunner>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -876,6 +878,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         } else {
             None
         },
+        hooks: hooks.clone(),
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -1093,6 +1096,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                 }
                 _ = shutdown_signal.changed() => {
                     tracing::info!("🦀 ZeroClaw Gateway shutting down...");
+                    if let Some(ref h) = hooks {
+                        h.fire_gateway_stop().await;
+                    }
                     break;
                 }
             }
@@ -1106,6 +1112,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .with_graceful_shutdown(async move {
             let _ = shutdown_rx.changed().await;
             tracing::info!("🦀 ZeroClaw Gateway shutting down...");
+            if let Some(ref h) = hooks {
+                h.fire_gateway_stop().await;
+            }
         })
         .await?;
     }
@@ -2342,6 +2351,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2410,6 +2420,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2804,6 +2815,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2882,6 +2894,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         };
 
         let headers = HeaderMap::new();
@@ -2972,6 +2985,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         };
 
         let response = handle_webhook(
@@ -3034,6 +3048,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3101,6 +3116,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3173,6 +3189,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -3242,6 +3259,7 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            hooks: None,
         };
 
         let mut headers = HeaderMap::new();

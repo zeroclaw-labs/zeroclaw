@@ -15,6 +15,7 @@ mod tests {
             HeartbeatConfig::default(),
             temp.path().to_path_buf(),
             Arc::new(NoopObserver),
+            None,
         );
 
         let _ = engine;
