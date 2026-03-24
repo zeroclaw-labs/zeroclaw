@@ -1326,6 +1326,14 @@ pub struct AgentConfig {
     /// Enable context-aware tool filtering (only surface relevant tools per iteration).
     #[serde(default)]
     pub context_aware_tools: bool,
+
+    /// Post-response quality evaluator configuration.
+    #[serde(default)]
+    pub eval: crate::agent::eval::EvalConfig,
+
+    /// Automatic complexity-based classification fallback.
+    #[serde(default)]
+    pub auto_classify: Option<crate::agent::eval::AutoClassifyConfig>,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1363,6 +1371,8 @@ impl Default for AgentConfig {
             thinking: crate::agent::thinking::ThinkingConfig::default(),
             history_pruning: crate::agent::history_pruner::HistoryPrunerConfig::default(),
             context_aware_tools: false,
+            eval: crate::agent::eval::EvalConfig::default(),
+            auto_classify: None,
         }
     }
 }
