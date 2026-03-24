@@ -974,7 +974,9 @@ async fn main() -> Result<()> {
                     info!("🔄 Restarting ZeroClaw Gateway on {addr}");
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(&host, port).await {
+                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref())
+                        .await
+                    {
                         Ok(()) => {
                             info!("   ✓ Existing gateway on {addr} shut down gracefully");
                             // Poll until the port is free (connection refused) or timeout
@@ -1010,7 +1012,9 @@ async fn main() -> Result<()> {
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, new).await {
+                    match fetch_paircode(host, port, new, config.gateway.path_prefix.as_deref())
+                        .await
+                    {
                         Ok(Some(code)) => {
                             println!("🔐 Gateway pairing is enabled.");
                             println!();
@@ -1627,8 +1631,9 @@ fn log_gateway_start(host: &str, port: u16) {
 }
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
-async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
-    let url = format!("http://{host}:{port}/admin/shutdown");
+async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> Result<()> {
+    let prefix = path_prefix.unwrap_or("");
+    let url = format!("http://{host}:{port}{prefix}/admin/shutdown");
     let client = reqwest::Client::new();
 
     match client
@@ -1648,12 +1653,18 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 
 /// Fetch the current pairing code from a running gateway.
 /// If `new` is true, generates a fresh pairing code via POST request.
-async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
+async fn fetch_paircode(
+    host: &str,
+    port: u16,
+    new: bool,
+    path_prefix: Option<&str>,
+) -> Result<Option<String>> {
     let client = reqwest::Client::new();
+    let prefix = path_prefix.unwrap_or("");
 
     let response = if new {
         // Generate a new pairing code via POST
-        let url = format!("http://{host}:{port}/admin/paircode/new");
+        let url = format!("http://{host}:{port}{prefix}/admin/paircode/new");
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -1661,7 +1672,7 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
             .await
     } else {
         // Get existing pairing code via GET
-        let url = format!("http://{host}:{port}/admin/paircode");
+        let url = format!("http://{host}:{port}{prefix}/admin/paircode");
         client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
