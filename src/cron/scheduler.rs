@@ -390,17 +390,25 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     deliver_announcement(config, channel, target, output).await
 }
 
-pub(crate) async fn deliver_announcement(
-    config: &Config,
-    channel: &str,
-    target: &str,
-    output: &str,
-) -> Result<()> {
-    // Scan for credential leaks before delivering cron job output to channel.
+/// Output that has been scanned for credential leaks and redacted if necessary.
+/// All channel dispatch must use this type — constructing it requires going through
+/// `scan_and_redact_output`, which enforces leak detection on every outbound path.
+pub(crate) struct RedactedOutput(String);
+
+impl RedactedOutput {
+    /// Access the safe-to-send content.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Scan cron job output for credential leaks and return redacted output if leaks are detected.
+/// Logs a warning with channel, target, and detected patterns when credentials are found.
+fn scan_and_redact_output(channel: &str, target: &str, output: &str) -> RedactedOutput {
     let leak_detector = crate::security::LeakDetector::new();
     let leak_check = leak_detector.scan(output);
 
-    let safe_output = match leak_check {
+    match leak_check {
         crate::security::LeakResult::Detected { patterns, redacted } => {
             tracing::warn!(
                 channel = %channel,
@@ -408,10 +416,20 @@ pub(crate) async fn deliver_announcement(
                 patterns = ?patterns,
                 "Credential leak detected in cron job output; redacting before delivery"
             );
-            redacted
+            RedactedOutput(redacted)
         }
-        crate::security::LeakResult::Clean => output.to_string(),
-    };
+        crate::security::LeakResult::Clean => RedactedOutput(output.to_string()),
+    }
+}
+
+pub(crate) async fn deliver_announcement(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    output: &str,
+) -> Result<()> {
+    // Scan for credential leaks before delivering cron job output to channel.
+    let safe_output = scan_and_redact_output(channel, target, output);
 
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
@@ -426,7 +444,7 @@ pub(crate) async fn deliver_announcement(
                 tg.mention_only,
             );
             channel
-                .send(&SendMessage::new(&safe_output, target))
+                .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
         }
         "discord" => {
@@ -443,7 +461,7 @@ pub(crate) async fn deliver_announcement(
                 dc.mention_only,
             );
             channel
-                .send(&SendMessage::new(&safe_output, target))
+                .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
         }
         "slack" => {
@@ -461,7 +479,7 @@ pub(crate) async fn deliver_announcement(
             )
             .with_workspace_dir(config.workspace_dir.clone());
             channel
-                .send(&SendMessage::new(&safe_output, target))
+                .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
         }
         "mattermost" => {
@@ -479,7 +497,7 @@ pub(crate) async fn deliver_announcement(
                 mm.mention_only.unwrap_or(false),
             );
             channel
-                .send(&SendMessage::new(&safe_output, target))
+                .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
         }
         "signal" => {
@@ -497,7 +515,7 @@ pub(crate) async fn deliver_announcement(
                 sg.ignore_stories,
             );
             channel
-                .send(&SendMessage::new(&safe_output, target))
+                .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
         }
         "matrix" => {
@@ -519,7 +537,7 @@ pub(crate) async fn deliver_announcement(
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 );
                 channel
-                    .send(&SendMessage::new(&safe_output, target))
+                    .send(&SendMessage::new(safe_output.as_str(), target))
                     .await?;
             }
             #[cfg(not(feature = "channel-matrix"))]
@@ -551,7 +569,7 @@ pub(crate) async fn deliver_announcement(
                     wa.self_chat_mode,
                 );
                 channel
-                    .send(&SendMessage::new(&safe_output, target))
+                    .send(&SendMessage::new(safe_output.as_str(), target))
                     .await?;
             }
             #[cfg(not(feature = "whatsapp-web"))]
@@ -571,7 +589,7 @@ pub(crate) async fn deliver_announcement(
                 qq.allowed_users.clone(),
             );
             channel
-                .send(&SendMessage::new(&safe_output, target))
+                .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
@@ -1362,37 +1380,24 @@ mod tests {
     }
 
     #[test]
-    fn leak_detector_redacts_cron_output_credentials() {
-        let detector = crate::security::LeakDetector::new();
+    fn scan_and_redact_output_redacts_credentials() {
         let leaked_output = "Deployment key: sk_test_FAKE1234567890abcdefgh"; // gitleaks:allow
 
-        let scan_result = detector.scan(leaked_output);
+        let redacted = scan_and_redact_output("telegram", "123456", leaked_output);
 
-        match scan_result {
-            crate::security::LeakResult::Detected { redacted, .. } => {
-                assert!(!redacted.contains("sk_live_"));
-                assert!(redacted.contains("[REDACTED"));
-            }
-            crate::security::LeakResult::Clean => {
-                panic!("Should have detected credential leak");
-            }
-        }
+        assert!(
+            !redacted.as_str().contains("sk_test_FAKE1234567890abcdefgh"), // gitleaks:allow
+            "credentials must be redacted"
+        );
+        assert!(redacted.as_str().contains("[REDACTED"));
     }
 
     #[test]
-    fn leak_detector_passes_clean_cron_output() {
-        let detector = crate::security::LeakDetector::new();
+    fn scan_and_redact_output_preserves_clean_output() {
         let clean_output = "Deployment completed successfully at 2024-03-15 10:00:00";
 
-        let scan_result = detector.scan(clean_output);
+        let redacted = scan_and_redact_output("telegram", "123456", clean_output);
 
-        match scan_result {
-            crate::security::LeakResult::Clean => {
-                // Expected - clean output passes through
-            }
-            crate::security::LeakResult::Detected { .. } => {
-                panic!("Should not flag clean deployment message");
-            }
-        }
+        assert_eq!(redacted.as_str(), clean_output);
     }
 }
