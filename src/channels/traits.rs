@@ -211,6 +211,34 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Create a room/channel/conversation on the platform.
+    ///
+    /// `name` is the human-readable room name.
+    /// `topic` is an optional room description or purpose.
+    /// `invites` is a list of user IDs to invite to the room.
+    /// `visibility` is an optional visibility setting ("public" or "private").
+    /// `encryption` is an optional flag to enable end-to-end encryption.
+    ///
+    /// Returns the platform-scoped room identifier.
+    async fn create_room(
+        &self,
+        _name: Option<&str>,
+        _topic: Option<&str>,
+        _invites: Vec<String>,
+        _visibility: Option<&str>,
+        _encryption: Option<bool>,
+    ) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    /// Invite a user to a room/channel/conversation.
+    ///
+    /// `room_id` is the platform-scoped room identifier.
+    /// `user_id` is the platform-scoped user identifier.
+    async fn invite_user(&self, _room_id: &str, _user_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +368,34 @@ mod tests {
             .is_ok());
         assert!(channel
             .redact_message("chan_1", "msg_2", None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_create_room_returns_success() {
+        let channel = DummyChannel;
+
+        let room_id = channel
+            .create_room(
+                Some("Test Room"),
+                Some("Test Topic"),
+                vec!["@user:example.com".to_string()],
+                Some("private"),
+                Some(true),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(room_id, "");
+    }
+
+    #[tokio::test]
+    async fn default_invite_user_returns_success() {
+        let channel = DummyChannel;
+
+        assert!(channel
+            .invite_user("room_1", "@user:example.com")
             .await
             .is_ok());
     }

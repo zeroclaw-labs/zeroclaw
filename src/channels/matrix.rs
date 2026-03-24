@@ -1760,6 +1760,93 @@ impl Channel for MatrixChannel {
             }
         }
     }
+
+    async fn create_room(
+        &self,
+        name: Option<&str>,
+        topic: Option<&str>,
+        invites: Vec<String>,
+        visibility: Option<&str>,
+        encryption: Option<bool>,
+    ) -> anyhow::Result<String> {
+        use matrix_sdk::ruma::{
+            api::client::room::{create_room::v3::Request as CreateRoomRequest, Visibility},
+            serde::Raw,
+            OwnedUserId,
+        };
+
+        let client = self
+            .sdk_client
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Matrix SDK client not initialized"))?;
+
+        let mut request = CreateRoomRequest::new();
+
+        if let Some(name) = name {
+            request.name = Some(name.to_string());
+        }
+
+        if let Some(topic) = topic {
+            request.topic = Some(topic.to_string());
+        }
+
+        // Parse and add invites
+        for user_id_str in invites {
+            let user_id: OwnedUserId = user_id_str
+                .parse()
+                .map_err(|_| anyhow::anyhow!("Invalid user ID: {}", user_id_str))?;
+            request.invite.push(user_id);
+        }
+
+        // Set visibility
+        if let Some(vis) = visibility {
+            request.visibility = match vis {
+                "private" => Visibility::Private,
+                "public" => Visibility::Public,
+                _ => anyhow::bail!("Invalid visibility: must be 'private' or 'public'"),
+            };
+        }
+
+        // Set encryption via raw JSON to avoid ruma version-dependent type differences
+        if encryption.unwrap_or(false) {
+            let enc_json = serde_json::json!({
+                "type": "m.room.encryption",
+                "state_key": "",
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2"
+                }
+            });
+            let raw = Raw::from_json(serde_json::value::to_raw_value(&enc_json)?);
+            request.initial_state.push(raw);
+        }
+
+        let response = client.create_room(request).await?;
+        Ok(response.room_id().to_string())
+    }
+
+    async fn invite_user(&self, room_id: &str, user_id: &str) -> anyhow::Result<()> {
+        use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
+
+        let client = self
+            .sdk_client
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Matrix SDK client not initialized"))?;
+
+        let room_id: OwnedRoomId = room_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid room ID: {}", room_id))?;
+
+        let room = client
+            .get_room(&room_id)
+            .ok_or_else(|| anyhow::anyhow!("Matrix room not found for invite"))?;
+
+        let user_id: OwnedUserId = user_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid user ID: {}", user_id))?;
+
+        room.invite_user_by_id(&user_id).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
