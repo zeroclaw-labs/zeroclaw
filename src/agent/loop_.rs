@@ -2502,6 +2502,10 @@ pub(crate) async fn agent_turn(
         activated_tools,
         model_switch_callback,
         &crate::config::PacingConfig::default(),
+        None,
+        None,
+        None,
+        None,
     )
     .await
 }
@@ -2600,6 +2604,136 @@ fn maybe_inject_channel_delivery_defaults(
     }
 }
 
+/// Pre-execution security checks (estop → workspace boundary → OTP).
+/// Returns Some(denial_reason) if execution should be denied, None to proceed.
+fn pre_execution_check(
+    call_name: &str,
+    call_arguments: &serde_json::Value,
+    estop_manager: Option<&crate::security::EstopManager>,
+    workspace_boundary: Option<&crate::security::WorkspaceBoundary>,
+    otp_config: Option<&crate::config::OtpConfig>,
+    workspaces_base: Option<&Path>,
+) -> Option<String> {
+    // Check 1: Estop (most critical, hard stop)
+    if let Some(estop) = estop_manager {
+        let status = estop.status();
+
+        if status.kill_all {
+            return Some("Security: estop kill_all is engaged — all tools are blocked".to_string());
+        }
+
+        if status.network_kill && is_network_tool(call_name) {
+            return Some(format!(
+                "Security: estop network_kill is engaged — network tool '{call_name}' is blocked"
+            ));
+        }
+
+        if status
+            .frozen_tools
+            .contains(&call_name.to_ascii_lowercase())
+        {
+            return Some(format!("Security: tool '{call_name}' is frozen by estop"));
+        }
+
+        if !status.blocked_domains.is_empty() {
+            if let Some(domain) = extract_domain(call_arguments) {
+                if domain_matches_any(&status.blocked_domains, &domain) {
+                    return Some(format!(
+                        "Security: estop blocked domain pattern matches '{domain}'"
+                    ));
+                }
+            }
+        }
+    }
+
+    // Check 2: Workspace Boundary (policy)
+    if let Some(boundary) = workspace_boundary {
+        use crate::security::BoundaryVerdict;
+
+        match boundary.check_tool_access(call_name) {
+            BoundaryVerdict::Deny(reason) => return Some(format!("Security: {reason}")),
+            BoundaryVerdict::Allow => {}
+        }
+
+        if let Some(domain) = extract_domain(call_arguments) {
+            match boundary.check_domain_access(&domain) {
+                BoundaryVerdict::Deny(reason) => return Some(format!("Security: {reason}")),
+                BoundaryVerdict::Allow => {}
+            }
+        }
+
+        if let (Some(base), Some(path_str)) = (workspaces_base, extract_path(call_arguments)) {
+            let path = PathBuf::from(path_str);
+            match boundary.check_path_access(&path, base) {
+                BoundaryVerdict::Deny(reason) => return Some(format!("Security: {reason}")),
+                BoundaryVerdict::Allow => {}
+            }
+        }
+    }
+
+    // Check 3: OTP gating (requires interactive challenge, logged)
+    if let Some(otp) = otp_config {
+        if otp.enabled && otp.gated_actions.contains(&call_name.to_string()) {
+            return Some(format!(
+                "Security: tool '{call_name}' requires OTP challenge — execution denied without valid OTP code"
+            ));
+        }
+    }
+
+    None
+}
+
+/// Best-effort domain extraction from tool arguments.
+fn extract_domain(args: &serde_json::Value) -> Option<String> {
+    let url_str = args.get("url").and_then(serde_json::Value::as_str)?;
+
+    // Parse URL and extract host
+    if let Some(domain_start) = url_str.find("://").map(|idx| idx + 3) {
+        let after_scheme = &url_str[domain_start..];
+        let domain = after_scheme
+            .split(&['/', '?', '#', ':'][..])
+            .next()
+            .unwrap_or("");
+        if !domain.is_empty() {
+            return Some(domain.to_string());
+        }
+    }
+    None
+}
+
+/// Best-effort path extraction from tool arguments.
+fn extract_path(args: &serde_json::Value) -> Option<String> {
+    args.get("path")
+        .or_else(|| args.get("file_path"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+}
+
+/// Check if a tool is network-capable (heuristic).
+fn is_network_tool(name: &str) -> bool {
+    let network_tools = [
+        "web_fetch",
+        "web_search",
+        "http_request",
+        "browser",
+        "browser_open",
+        "api_call",
+        "curl",
+        "wget",
+    ];
+    network_tools.contains(&name)
+}
+
+/// Check if a domain matches any glob pattern in the list.
+fn domain_matches_any(patterns: &[String], domain: &str) -> bool {
+    // Create a matcher from patterns and check if domain is gated
+    let matcher = match crate::security::DomainMatcher::new(patterns, &[]) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    matcher.is_gated(domain)
+}
+
 async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
@@ -2607,6 +2741,10 @@ async fn execute_one_tool(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    estop_manager: Option<&crate::security::EstopManager>,
+    workspace_boundary: Option<&crate::security::WorkspaceBoundary>,
+    otp_config: Option<&crate::config::OtpConfig>,
+    workspaces_base: Option<&Path>,
 ) -> Result<ToolExecutionOutcome> {
     let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -2614,6 +2752,34 @@ async fn execute_one_tool(
         arguments: Some(args_summary),
     });
     let start = Instant::now();
+
+    // Pre-execution security checks
+    if let Some(denial_reason) = pre_execution_check(
+        call_name,
+        &call_arguments,
+        estop_manager,
+        workspace_boundary,
+        otp_config,
+        workspaces_base,
+    ) {
+        tracing::warn!(
+            tool = call_name,
+            reason = %denial_reason,
+            "Security check denied tool execution"
+        );
+        let duration = start.elapsed();
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: call_name.to_string(),
+            duration,
+            success: false,
+        });
+        return Ok(ToolExecutionOutcome {
+            output: denial_reason.clone(),
+            success: false,
+            error_reason: Some(denial_reason),
+            duration,
+        });
+    }
 
     let static_tool = find_tool(tools_registry, call_name);
     let activated_arc = if static_tool.is_none() {
@@ -2730,6 +2896,10 @@ async fn execute_tools_parallel(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    estop_manager: Option<&crate::security::EstopManager>,
+    workspace_boundary: Option<&crate::security::WorkspaceBoundary>,
+    otp_config: Option<&crate::config::OtpConfig>,
+    workspaces_base: Option<&Path>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -2741,6 +2911,10 @@ async fn execute_tools_parallel(
                 activated_tools,
                 observer,
                 cancellation_token,
+                estop_manager,
+                workspace_boundary,
+                otp_config,
+                workspaces_base,
             )
         })
         .collect();
@@ -2755,6 +2929,10 @@ async fn execute_tools_sequential(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    estop_manager: Option<&crate::security::EstopManager>,
+    workspace_boundary: Option<&crate::security::WorkspaceBoundary>,
+    otp_config: Option<&crate::config::OtpConfig>,
+    workspaces_base: Option<&Path>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -2767,6 +2945,10 @@ async fn execute_tools_sequential(
                 activated_tools,
                 observer,
                 cancellation_token,
+                estop_manager,
+                workspace_boundary,
+                otp_config,
+                workspaces_base,
             )
             .await?,
         );
@@ -2812,6 +2994,10 @@ pub(crate) async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &crate::config::PacingConfig,
+    estop_manager: Option<&crate::security::EstopManager>,
+    workspace_boundary: Option<&crate::security::WorkspaceBoundary>,
+    otp_config: Option<&crate::config::OtpConfig>,
+    workspaces_base: Option<&Path>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -3563,6 +3749,10 @@ pub(crate) async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                estop_manager,
+                workspace_boundary,
+                otp_config,
+                workspaces_base,
             )
             .await?
         } else {
@@ -3572,6 +3762,10 @@ pub(crate) async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                estop_manager,
+                workspace_boundary,
+                otp_config,
+                workspaces_base,
             )
             .await?
         };
@@ -4341,6 +4535,10 @@ pub async fn run(
                 activated_handle.as_ref(),
                 Some(model_switch_callback.clone()),
                 &config.pacing,
+                None,
+                None,
+                None,
+                None,
             )
             .await
             {
@@ -4642,6 +4840,10 @@ pub async fn run(
                     activated_handle.as_ref(),
                     Some(model_switch_callback.clone()),
                     &config.pacing,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
                 .await
                 {
@@ -5186,8 +5388,19 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let result =
-            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
+        let result = execute_one_tool(
+            "unknown_tool",
+            call_arguments,
+            &[],
+            None,
+            &observer,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
@@ -5215,6 +5428,10 @@ mod tests {
             &[],
             Some(&activated),
             &observer,
+            None,
+            None,
+            None,
+            None,
             None,
         )
         .await
@@ -5857,6 +6074,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5909,6 +6130,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -5954,6 +6179,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5999,6 +6228,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -6051,6 +6284,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -6103,6 +6340,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -6156,6 +6397,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -6207,6 +6452,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -6258,6 +6507,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -6392,6 +6645,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -6463,6 +6720,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6526,6 +6787,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6584,6 +6849,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6654,6 +6923,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6715,6 +6988,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6796,6 +7073,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -6854,6 +7135,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6936,6 +7221,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -7002,6 +7291,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("streaming provider should complete");
@@ -7070,6 +7363,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -7142,6 +7439,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -7223,6 +7524,10 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("routed streaming provider should complete");
@@ -9260,6 +9565,10 @@ Let me check the result."#;
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("tool loop should complete");
@@ -9414,6 +9723,10 @@ Let me check the result."#;
                     None,
                     None,
                     &crate::config::PacingConfig::default(),
+                    None,
+                    None,
+                    None,
+                    None,
                 ),
             )
             .await
@@ -9493,6 +9806,10 @@ Let me check the result."#;
                     None,
                     None,
                     &crate::config::PacingConfig::default(),
+                    None,
+                    None,
+                    None,
+                    None,
                 ),
             )
             .await
@@ -9548,6 +9865,10 @@ Let me check the result."#;
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("should succeed without cost scope");
