@@ -720,6 +720,28 @@ fn strip_tool_result_content(text: &str) -> String {
     cleaned.to_string()
 }
 
+/// Remove a leading `[Used tools: ...]` line from a cached assistant turn.
+///
+/// The tool-context summary is prepended to history entries so the LLM retains
+/// awareness of prior tool usage. However, when these entries are loaded back
+/// into the LLM context, the bracket-format leaks into generated output and
+/// gets forwarded to end users as-is (bug #4400). Stripping the prefix on
+/// reload prevents the model from learning and reproducing this internal format.
+fn strip_tool_summary_prefix(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("[Used tools:") {
+        // Find the closing bracket, then skip it and any leading newline(s).
+        if let Some(bracket_end) = rest.find(']') {
+            let after_bracket = &rest[bracket_end + 1..];
+            let trimmed = after_bracket.trim_start_matches('\n');
+            if trimmed.is_empty() {
+                return String::new();
+            }
+            return trimmed.to_string();
+        }
+    }
+    text.to_string()
+}
+
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord" | "matrix")
 }
@@ -1590,6 +1612,7 @@ async fn build_memory_context(
 /// during `run_tool_call_loop`. Scans assistant messages for `<tool_call>` tags
 /// or native tool-call JSON to collect tool names used.
 /// Returns an empty string when no tools were invoked.
+#[cfg(test)]
 fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
     fn push_unique_tool_name(tool_names: &mut Vec<String>, name: &str) {
         let candidate = name.trim();
@@ -1685,8 +1708,11 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
+    // Strip any [Used tools: ...] prefix that the LLM may have echoed from
+    // history context (#4400).
+    let stripped_summary = strip_tool_summary_prefix(response);
     // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
-    let stripped_xml = strip_tool_call_tags(response);
+    let stripped_xml = strip_tool_call_tags(&stripped_summary);
     // Strip isolated tool-call JSON artifacts
     let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
     // Strip leading narration lines that announce tool usage
@@ -2230,6 +2256,14 @@ async fn process_channel_message(
         }
     }
 
+    // Strip [Used tools: ...] prefixes from cached assistant turns so the
+    // LLM never sees (and reproduces) this internal summary format (#4400).
+    for turn in &mut prior_turns {
+        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
+            turn.content = strip_tool_summary_prefix(&turn.content);
+        }
+    }
+
     // Strip [IMAGE:] markers from *older* history messages when the active
     // provider does not support vision. This prevents "history poisoning"
     // where a previously-sent image marker gets reloaded from the JSONL
@@ -2445,9 +2479,6 @@ async fn process_channel_message(
             }
         }))
     };
-
-    // Record history length before tool loop so we can extract tool context after.
-    let history_len_before_tools = history.len();
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -2704,15 +2735,15 @@ async fn process_channel_message(
                 }),
             );
 
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
-            } else {
-                format!("{tool_summary}\n{delivered_response}")
-            };
+            // Previously we prepended a `[Used tools: …]` summary to the
+            // history entry so the LLM retained awareness of prior tool usage.
+            // This caused the model to learn and reproduce the bracket format
+            // in its own output, which leaked to end-users as raw log lines
+            // instead of meaningful responses (#4400).  The LLM already
+            // receives tool context through the tool-call/result messages in
+            // the conversation history built by `run_tool_call_loop`, so the
+            // extra summary prefix is unnecessary.
+            let history_response = delivered_response.clone();
 
             append_sender_turn(
                 ctx.as_ref(),
@@ -5022,6 +5053,36 @@ mod tests {
             "no tool results here"
         );
         assert_eq!(strip_tool_result_content(""), "");
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_removes_prefix_and_preserves_content() {
+        let input = "[Used tools: browser_open, shell]\nI opened the page successfully.";
+        assert_eq!(
+            strip_tool_summary_prefix(input),
+            "I opened the page successfully."
+        );
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_returns_empty_when_only_prefix() {
+        let input = "[Used tools: browser_open]";
+        assert_eq!(strip_tool_summary_prefix(input), "");
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_preserves_text_without_prefix() {
+        let input = "Here is the result of the search.";
+        assert_eq!(strip_tool_summary_prefix(input), input);
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_handles_multiple_newlines() {
+        let input = "[Used tools: shell]\n\nThe command output is 42.";
+        assert_eq!(
+            strip_tool_summary_prefix(input),
+            "The command output is 42."
+        );
     }
 
     #[test]
