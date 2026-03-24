@@ -8,7 +8,7 @@ pub mod tray;
 
 use gateway_client::GatewayClient;
 use state::shared_state;
-use tauri::Manager;
+use tauri::{Manager, RunEvent};
 
 /// Attempt to auto-pair with the gateway so the WebView has a valid token
 /// before the React frontend mounts. Runs on localhost so the admin endpoints
@@ -58,6 +58,25 @@ fn inject_token_into_webview<R: tauri::Runtime>(window: &tauri::WebviewWindow<R>
     let _ = window.eval(&script);
 }
 
+/// Set the macOS dock icon programmatically so it shows even in dev builds
+/// (which don't have a proper .app bundle).
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AnyThread, MainThreadMarker};
+    use objc2_app_kit::NSApplication;
+    use objc2_app_kit::NSImage;
+    use objc2_foundation::NSData;
+
+    let icon_bytes = include_bytes!("../icons/128x128.png");
+    // Safety: setup() runs on the main thread in Tauri.
+    let mtm = unsafe { MainThreadMarker::new_unchecked() };
+    let data = NSData::with_bytes(icon_bytes);
+    if let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) {
+        let app = NSApplication::sharedApplication(mtm);
+        unsafe { app.setApplicationIconImage(Some(&image)) };
+    }
+}
+
 /// Configure and run the Tauri application.
 pub fn run() {
     let shared = shared_state();
@@ -82,6 +101,10 @@ pub fn run() {
             commands::agent::send_message,
         ])
         .setup(move |app| {
+            // Set macOS dock icon (needed for dev builds without .app bundle).
+            #[cfg(target_os = "macos")]
+            set_dock_icon();
+
             // Set up the system tray.
             let _ = tray::setup_tray(app);
 
@@ -101,6 +124,13 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Keep the app running in the background when all windows are closed.
+            // This is the standard pattern for menu bar / tray apps.
+            if let RunEvent::ExitRequested { api, .. } = event {
+                api.prevent_exit();
+            }
+        });
 }
