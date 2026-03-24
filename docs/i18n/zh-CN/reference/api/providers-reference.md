@@ -2,7 +2,7 @@
 
 本文档映射提供商 ID、别名和凭证环境变量。
 
-最后验证时间：**2026年2月21日**。
+最后验证时间：**2026年3月12日**。
 
 ## 如何列出提供商
 
@@ -60,6 +60,7 @@ zeroclaw providers
 | `vllm` | — | 是 | `VLLM_API_KEY`（可选） |
 | `osaurus` | — | 是 | `OSAURUS_API_KEY`（可选；默认为 `"osaurus"`） |
 | `nvidia` | `nvidia-nim`、`build.nvidia.com` | 否 | `NVIDIA_API_KEY` |
+| `avian` | — | 否 | `AVIAN_API_KEY` |
 
 ### Vercel AI Gateway 说明
 

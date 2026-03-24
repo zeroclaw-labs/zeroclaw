@@ -22,6 +22,61 @@
 | 前台运行时 | `zeroclaw daemon` | 本地调试、短期会话 |
 | 仅前台网关 | `zeroclaw gateway` | webhook 端点测试 |
 | 用户服务 | `zeroclaw service install && zeroclaw service start` | 持久化运维管理的运行时 |
+| Docker / Podman | `docker compose up -d` | 容器化部署 |
+
+## Docker / Podman 运行时
+
+如果你通过 `./install.sh --docker` 安装，容器会在引导完成后退出。要将 ZeroClaw 作为长效容器运行，请使用仓库中的 `docker-compose.yml`，或者针对持久化数据目录手动启动容器。
+
+### 推荐：docker-compose
+
+```bash
+# 启动（后台运行，重启自动恢复）
+docker compose up -d
+
+# 停止
+docker compose down
+
+# 重启
+docker compose up -d
+```
+
+如果使用 Podman，将 `docker` 替换为 `podman`。
+
+### 手动容器生命周期管理
+
+```bash
+# 从引导镜像启动新容器
+docker run -d --name zeroclaw \
+  --restart unless-stopped \
+  -v "$PWD/.zeroclaw-docker/.zeroclaw:/zeroclaw-data/.zeroclaw" \
+  -v "$PWD/.zeroclaw-docker/workspace:/zeroclaw-data/workspace" \
+  -e HOME=/zeroclaw-data \
+  -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+  -p 42617:42617 \
+  zeroclaw-bootstrap:local \
+  gateway
+
+# 停止（保留配置和工作区）
+docker stop zeroclaw
+
+# 重启已停止的容器
+docker start zeroclaw
+
+# 查看日志
+docker logs -f zeroclaw
+
+# 健康检查
+docker exec zeroclaw zeroclaw status
+```
+
+对于 Podman，需要添加 `--userns keep-id --user "$(id -u):$(id -g)"` 并在卷挂载后添加 `:Z`。
+
+### 关键要点：不要重新运行 install.sh 来重启
+
+重新运行 `install.sh --docker` 会重建镜像并重新运行引导。要简单重启，只需要使用 `docker start`、`docker compose up -d` 或 `podman start`。
+
+完整设置说明参见 [one-click-bootstrap.md](../setup-guides/one-click-bootstrap.md#stopping-and-restarting-a-dockerpodman-container)。
 
 ## 运维基线检查清单
 

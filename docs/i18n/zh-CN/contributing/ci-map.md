@@ -38,6 +38,7 @@
 - `.github/workflows/pub-homebrew-core.yml`（`Pub Homebrew Core`）
     - 目的：针对标记发布的手动、机器人拥有的 Homebrew core 公式升级 PR 流程
     - 护栏：发布标签必须匹配 `Cargo.toml` 版本
+- `.github/workflows/pub-scoop.yml` (`Pub Scoop Manifest`)   - 目的：Windows 的 Scoop 仓库清单更新；稳定发布自动调用，也可手动触发   - 护栏：发布标签必须是 `vX.Y.Z` 格式；从 `SHA256SUMS` 中提取 Windows 二进制哈希- `.github/workflows/pub-aur.yml` (`Pub AUR Package`)   - 目的：Arch Linux 的 AUR PKGBUILD 推送；稳定发布自动调用，也可手动触发   - 护栏：发布标签必须是 `vX.Y.Z` 格式；发布时计算源码 tarball SHA256
 - `.github/workflows/pr-label-policy-check.yml`（`Label Policy Sanity`）
     - 目的：验证 `.github/label-policy.json` 中的共享贡献者等级政策，并确保标签工作流使用该政策
 - `.github/workflows/test-rust-build.yml`（`Rust Reusable Job`）
@@ -76,6 +77,8 @@
 - `Docker`：标签推送（`v*`）用于发布，匹配的 `master` PR 用于冒烟构建，手动触发仅用于冒烟测试
 - `Release`：标签推送（`v*`）、每周计划（仅验证）、手动触发（验证或发布）
 - `Pub Homebrew Core`：仅手动触发
+- `Pub Scoop Manifest`：稳定发布自动调用，也可手动触发
+- `Pub AUR Package`：稳定发布自动调用，也可手动触发
 - `Security Audit`：推送到 `master`、针对 `master` 的 PR、每周计划
 - `Sec Vorpal Reviewdog`：仅手动触发
 - `Workflow Sanity`：当 `.github/workflows/**`、`.github/*.yml` 或 `.github/*.yaml` 变更时的 PR/推送
@@ -93,12 +96,14 @@
 2. PR 上的 Docker 失败：检查 `.github/workflows/pub-docker-img.yml` 的 `pr-smoke` 作业。
 3. 发布失败（标签/手动/计划）：检查 `.github/workflows/pub-release.yml` 和 `prepare` 作业输出。
 4. Homebrew 公式发布失败：检查 `.github/workflows/pub-homebrew-core.yml` 摘要输出和机器人令牌/fork 变量。
-5. 安全检查失败：检查 `.github/workflows/sec-audit.yml` 和 `deny.toml`。
-6. 工作流语法/代码检查失败：检查 `.github/workflows/workflow-sanity.yml`。
-7. PR 提交检查失败：检查 `.github/workflows/pr-intake-checks.yml` 的置顶评论和运行日志。
-8. 标签政策一致性失败：检查 `.github/workflows/pr-label-policy-check.yml`。
-9. CI 中的文档检查失败：检查 `.github/workflows/ci-run.yml` 中的 `docs-quality` 作业日志。
-10. CI 中的严格增量代码检查失败：检查 `lint-strict-delta` 作业日志，并与 `BASE_SHA` 差异范围比较。
+5. Scoop 清单发布失败：检查 `.github/workflows/pub-scoop.yml` 摘要输出和 `SCOOP_BUCKET_REPO`/`SCOOP_BUCKET_TOKEN` 设置。
+6. AUR 包发布失败：检查 `.github/workflows/pub-aur.yml` 摘要输出和 `AUR_SSH_KEY` 密钥。
+7. 安全检查失败：检查 `.github/workflows/sec-audit.yml` 和 `deny.toml`。
+8. 工作流语法/代码检查失败：检查 `.github/workflows/workflow-sanity.yml`。
+9. PR 提交检查失败：检查 `.github/workflows/pr-intake-checks.yml` 的置顶评论和运行日志。
+10. 标签政策一致性失败：检查 `.github/workflows/pr-label-policy-check.yml`。
+11. CI 中的文档检查失败：检查 `.github/workflows/ci-run.yml` 中的 `docs-quality` 作业日志。
+12. CI 中的严格增量代码检查失败：检查 `lint-strict-delta` 作业日志，并与 `BASE_SHA` 差异范围比较。
 
 ## 维护规则
 

@@ -31,7 +31,7 @@ ZeroClaw 包含 Arduino Uno Q 所需的一切。**克隆仓库并按照本指南
 
 ### 1.1 通过 App Lab 配置 Uno Q
 
-1. 下载 [Arduino App Lab](https://docs.arduino.cc/software/app-lab/)（Linux 上是 AppImage）。
+1. 下载 [Arduino App Lab](https://docs.arduino.cc/software/app-lab/)（Linux 上是 tar.gz）。
 2. 通过 USB 连接 Uno Q，开机。
 3. 打开 App Lab，连接到开发板。
 4. 按照设置向导操作：

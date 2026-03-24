@@ -93,6 +93,35 @@ runtime_trace_max_entries = 200
 
 ## `[security.otp]`
 
+## `[pacing]`
+
+慢速/本地 LLM 工作负载（Ollama、llama.cpp、vLLM）的流控控制。所有键都是可选的；省略时保留现有行为。
+
+| 键 | 默认值 | 用途 |
+|---|---|---|
+| `step_timeout_secs` | _无_ | 单步超时：单次 LLM 推理回合的最大秒数。捕获真正挂起的模型而不终止整个任务循环 |
+| `loop_detection_min_elapsed_secs` | _无_ | 循环检测激活前的最小经过秒数。在此时间内完成的任务获得激进循环保护；运行时间更长的任务获得宽限期 |
+| `loop_ignore_tools` | `[]` | 从相同输出循环检测中排除的工具名称。对浏览器工作流有用，因为 `browser_screenshot` 在结构上类似循环 |
+| `message_timeout_scale_max` | `4` | 硬编码超时缩放上限的覆盖。渠道消息超时预算为 `message_timeout_secs * min(max_tool_iterations, message_timeout_scale_max)` |
+
+说明：
+
+- 这些设置适用于本地/慢速 LLM 部署。云提供商用户通常不需要它们。
+- `step_timeout_secs` 独立于总的渠道消息超时预算工作。单步超时中止不会消耗总体预算；循环直接停止。
+- `loop_detection_min_elapsed_secs` 延迟循环检测计数，不延迟任务本身。对于短任务循环保护保持完全激活（默认）。
+- `loop_ignore_tools` 仅对列出的工具禁止基于工具输出的循环检测。其他安全功能（最大迭代次数、总体超时）保持激活。
+- `message_timeout_scale_max` 必须 >= 1。设置为大于 `max_tool_iterations` 没有额外效果（公式使用 `min()`）。
+- 慢速本地 Ollama 部署示例配置：
+
+```toml
+[pacing]
+step_timeout_secs = 120
+loop_detection_min_elapsed_secs = 60
+loop_ignore_tools = ["browser_screenshot", "browser_navigate"]
+message_timeout_scale_max = 8
+```
+
+
 | 键 | 默认值 | 用途 |
 |---|---|---|
 | `enabled` | `false` | 为敏感操作/域启用 OTP 门控 |
@@ -362,6 +391,11 @@ methods = ["list", "get", "create", "update"]
 | `port` | `42617` | 网关监听端口 |
 | `require_pairing` | `true` | bearer 认证前需要配对 |
 | `allow_public_bind` | `false` | 阻止意外公共暴露 |
+| `path_prefix` | _（无）_ | 反向代理部署的 URL 路径前缀（例如 `"/zeroclaw"`） |
+
+当部署在反向代理后面将 ZeroClaw 映射到子路径时，
+设置 `path_prefix` 为该子路径（例如 `"/zeroclaw"`）。所有网关
+路由将在此前缀下提供。值必须以 `/` 开头，且不能以 `/` 结尾。
 
 ## `[autonomy]`
 
@@ -510,7 +544,7 @@ priority = 5
 
 | 键 | 默认值 | 用途 |
 |---|---|---|
-| `message_timeout_secs` | `300` | 渠道消息处理的基本超时（秒）；运行时会根据工具循环深度扩展（最多 4 倍） |
+| `message_timeout_secs` | `300` | 渠道消息处理的基本超时（秒）；运行时会根据工具循环深度扩展（最多 4 倍，可通过 `[pacing].message_timeout_scale_max` 覆盖） |
 
 示例：
 
@@ -525,7 +559,7 @@ priority = 5
 注意事项：
 
 - 默认的 `300s` 针对设备上的 LLM（Ollama）进行了优化，这些 LLM 比云 API 慢。
-- 运行时超时预算为 `message_timeout_secs * scale`，其中 `scale = min(max_tool_iterations, 4)`，最小值为 `1`。
+- 运行时超时预算为 `message_timeout_secs * scale`，其中 `scale = min(max_tool_iterations, cap)`，最小值为 `1`。默认上限为 `4`；可以通过 `[pacing].message_timeout_scale_max` 覆盖。
 - 这种缩放避免了第一个 LLM 轮次慢/重试但后续工具循环轮次仍需完成时的错误超时。
 - 如果使用云 API（OpenAI、Anthropic 等），可以将其减少到 `60` 或更低。
 - 低于 `30` 的值会被钳制到 `30`，以避免立即超时波动。

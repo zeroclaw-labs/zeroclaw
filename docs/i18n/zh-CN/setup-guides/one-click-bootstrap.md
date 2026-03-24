@@ -92,6 +92,95 @@ curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 
 如果你添加 `--skip-build` 参数，安装程序会跳过本地镜像构建。它会首先尝试本地 Docker 标签（`ZEROCLAW_DOCKER_IMAGE`，默认：`zeroclaw-bootstrap:local`）；如果不存在，会拉取 `ghcr.io/zeroclaw-labs/zeroclaw:latest` 并在运行前打本地标签。
 
+### 停止和重启 Docker/Podman 容器
+
+`./install.sh --docker` 完成后，容器会退出。你的配置和工作区会持久保存在数据目录中（默认：`./.zeroclaw-docker`，通过 `curl | bash` 引导时为 `~/.zeroclaw-docker`）。你可以通过 `ZEROCLAW_DOCKER_DATA_DIR` 环境变量覆盖此路径。
+
+**不要重新运行 `install.sh` 来重启** — 这会重建镜像并重新运行引导。取而代之的是，从现有镜像启动一个新容器并挂载已持久化的数据目录。
+
+#### 使用仓库中的 docker-compose.yml
+
+在 Docker/Podman 中长期运行 ZeroClaw 最简单的方式是使用仓库根目录提供的 `docker-compose.yml`。它使用命名卷（`zeroclaw-data`）并设置 `restart: unless-stopped`，因此容器可以在重启后自动恢复。
+
+```bash
+# 启动（后台运行，重启自动恢复）
+docker compose up -d
+
+# 停止
+docker compose down
+
+# 停止后重启
+docker compose up -d
+```
+
+如果你使用 Podman，将 `docker` 替换为 `podman`。
+
+#### 手动容器运行（使用 install.sh 数据目录）
+
+如果你通过 `./install.sh --docker` 安装并且想在不使用 compose 的情况下重用 `.zeroclaw-docker` 数据目录：
+
+```bash
+# Docker
+docker run -d --name zeroclaw \
+  --restart unless-stopped \
+  -v "$PWD/.zeroclaw-docker/.zeroclaw:/zeroclaw-data/.zeroclaw" \
+  -v "$PWD/.zeroclaw-docker/workspace:/zeroclaw-data/workspace" \
+  -e HOME=/zeroclaw-data \
+  -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+  -p 42617:42617 \
+  zeroclaw-bootstrap:local \
+  gateway
+
+# Podman（添加 --userns keep-id 和 :Z 卷标签）
+podman run -d --name zeroclaw \
+  --restart unless-stopped \
+  --userns keep-id \
+  --user "$(id -u):$(id -g)" \
+  -v "$PWD/.zeroclaw-docker/.zeroclaw:/zeroclaw-data/.zeroclaw:Z" \
+  -v "$PWD/.zeroclaw-docker/workspace:/zeroclaw-data/workspace:Z" \
+  -e HOME=/zeroclaw-data \
+  -e ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace \
+  -p 42617:42617 \
+  zeroclaw-bootstrap:local \
+  gateway
+```
+
+#### 常用生命周期命令
+
+```bash
+# 停止容器（保留数据）
+docker stop zeroclaw
+
+# 启动已停止的容器（配置和工作区保持完整）
+docker start zeroclaw
+
+# 查看日志
+docker logs -f zeroclaw
+
+# 删除容器（数据保存在 volumes/.zeroclaw-docker 中保留）
+docker rm zeroclaw
+
+# 检查健康状态
+docker exec zeroclaw zeroclaw status
+```
+
+#### 环境变量
+
+手动运行时，如果提供者配置已经保存在持久化的 `config.toml` 中，则不需要传递提供者配置环境变量：
+
+```bash
+docker run -d --name zeroclaw \
+  -e API_KEY="sk-..." \
+  -e PROVIDER="openrouter" \
+  -v "$PWD/.zeroclaw-docker/.zeroclaw:/zeroclaw-data/.zeroclaw" \
+  -v "$PWD/.zeroclaw-docker/workspace:/zeroclaw-data/workspace" \
+  -p 42617:42617 \
+  zeroclaw-bootstrap:local \
+  gateway
+```
+
+如果你在初始安装期间已经运行了 `onboard`，你的 API 密钥和提供者已经保存到 `.zeroclaw-docker/.zeroclaw/config.toml`，不需要再次传递。
+
 ### 快速引导（非交互式）
 
 ```bash

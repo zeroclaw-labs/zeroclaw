@@ -23,6 +23,8 @@
 
 - `.github/workflows/pub-release.yml`
 - `.github/workflows/pub-homebrew-core.yml`（手动 Homebrew 公式 PR，机器人所有）
+- `.github/workflows/pub-scoop.yml`（手动 Scoop 仓库清单更新）
+- `.github/workflows/pub-aur.yml`（手动 AUR PKGBUILD 推送）
 
 模式：
 
@@ -114,6 +116,41 @@ scripts/release/cut_release_tag.sh vX.Y.Z --push
 - 公式源 URL 和 SHA256 从标记的 tarball 更新
 - 公式许可证标准化为 `Apache-2.0 OR MIT`
 - PR 从机器人 fork 提交到 `Homebrew/homebrew-core:master`
+
+### 7) 发布 Scoop 清单（Windows）
+
+手动运行 `Pub Scoop Manifest`：
+
+- `release_tag`: `vX.Y.Z`
+- 先运行 `dry_run`: `true`，再运行 `false`
+
+非试运行所需的仓库设置：
+
+- 密钥：`SCOOP_BUCKET_TOKEN`（具有仓库推送权限的 PAT）
+- 变量：`SCOOP_BUCKET_REPO`（例如 `zeroclaw-labs/scoop-zeroclaw`）
+
+工作流护栏：
+
+- 发布标签必须是 `vX.Y.Z` 格式
+- 从发布资产 `SHA256SUMS` 中提取 Windows 二进制文件的 SHA256
+- 清单推送到 Scoop 仓库的 `bucket/zeroclaw.json`
+
+### 8) 发布 AUR 包（Arch Linux）
+
+手动运行 `Pub AUR Package`：
+
+- `release_tag`: `vX.Y.Z`
+- 先运行 `dry_run`: `true`，再运行 `false`
+
+非试运行所需的仓库设置：
+
+- 密钥：`AUR_SSH_KEY`（在 AUR 注册的 SSH 私钥）
+
+工作流护栏：
+
+- 发布标签必须是 `vX.Y.Z` 格式
+- 从标记的发布计算源 tarball 的 SHA256
+- PKGBUILD 和 .SRCINFO 推送到 AUR 的 `zeroclaw` 包
 
 ## 紧急/恢复路径
 
