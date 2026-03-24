@@ -249,6 +249,13 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
+          # Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556)
+          # Ubuntu 22.04's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
+          # which segfaults on ARMv6 devices (e.g. Raspberry Pi Zero W).
+          if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
+            export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
+          fi
           if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
             cargo build --release --locked --no-default-features --features "${{ env.RELEASE_CARGO_FEATURES }},channel-nostr,skill-creation" --target ${{ matrix.target }}
           else
