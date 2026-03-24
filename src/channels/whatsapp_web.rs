@@ -744,7 +744,7 @@ impl Channel for WhatsAppWebChannel {
 
                                 // ── Personal-mode chat-type policy filtering ──
                                 if wa_mode == crate::config::WhatsAppWebMode::Personal {
-                                    let is_group = chat.contains("@g.us");
+                                    let is_group = info.source.is_group;
                                     // Self-chat: the chat JID user part matches
                                     // the sender's user part (message to "Notes
                                     // to Self").
