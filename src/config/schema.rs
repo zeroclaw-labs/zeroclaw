@@ -1199,6 +1199,9 @@ pub struct ToolFilterGroup {
     /// Ignored when `mode = "always"`.
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// When true, also filter built-in tools (not just MCP tools).
+    #[serde(default)]
+    pub filter_builtins: bool,
 }
 
 /// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
@@ -1315,6 +1318,14 @@ pub struct AgentConfig {
     /// per message. Users can override per-message with `/think:<level>` directives.
     #[serde(default)]
     pub thinking: crate::agent::thinking::ThinkingConfig,
+
+    /// History pruning configuration for token efficiency.
+    #[serde(default)]
+    pub history_pruning: crate::agent::history_pruner::HistoryPrunerConfig,
+
+    /// Enable context-aware tool filtering (only surface relevant tools per iteration).
+    #[serde(default)]
+    pub context_aware_tools: bool,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1350,6 +1361,8 @@ impl Default for AgentConfig {
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::agent::thinking::ThinkingConfig::default(),
+            history_pruning: crate::agent::history_pruner::HistoryPrunerConfig::default(),
+            context_aware_tools: false,
         }
     }
 }
