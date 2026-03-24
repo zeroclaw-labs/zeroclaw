@@ -67,6 +67,7 @@ pub(crate) mod onboard;
 pub mod peripherals;
 pub mod providers;
 pub mod rag;
+pub mod routines;
 pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
