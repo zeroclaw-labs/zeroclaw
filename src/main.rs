@@ -109,6 +109,7 @@ mod skillforge;
 mod skills;
 mod sop;
 mod tools;
+mod trust;
 mod tunnel;
 mod util;
 mod verifiable_intent;
