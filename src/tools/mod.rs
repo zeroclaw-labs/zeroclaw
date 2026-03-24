@@ -67,6 +67,7 @@ pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
 pub mod memory_forget;
+pub mod memory_purge;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod microsoft365;
@@ -159,6 +160,7 @@ pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
+pub use memory_purge::MemoryPurgeTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use microsoft365::Microsoft365Tool;
@@ -412,7 +414,8 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
+        Arc::new(MemoryPurgeTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
