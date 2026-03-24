@@ -753,7 +753,7 @@ impl Channel for WhatsAppWebChannel {
                                         .split_once('@')
                                         .map(|(u, _)| u)
                                         .unwrap_or(&chat);
-                                    let is_self_chat = !is_group && sender_user == chat_user;
+                                    let is_self_chat = !is_group && sender_user == chat_user && info.source.is_from_me;
 
                                     if is_self_chat {
                                         if !wa_self_chat_mode {
