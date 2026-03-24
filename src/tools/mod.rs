@@ -77,6 +77,7 @@ pub mod node_tool;
 pub mod notion_tool;
 pub mod opencode_cli;
 pub mod pdf_read;
+pub mod pipeline;
 pub mod poll;
 pub mod project_intel;
 pub mod proxy_config;
@@ -1016,6 +1017,15 @@ pub fn all_tools_with_runtime(
                 }
             }
         }
+    }
+
+    // Pipeline tool (execute_pipeline) — multi-step tool chaining.
+    if root_config.pipeline.enabled {
+        let pipeline_tools: Vec<Arc<dyn Tool>> = tool_arcs.clone();
+        tool_arcs.push(Arc::new(pipeline::PipelineTool::new(
+            root_config.pipeline.clone(),
+            pipeline_tools,
+        )));
     }
 
     (
