@@ -1,78 +1,12 @@
 import { useState, useEffect, useCallback, type ReactNode } from 'react';
 import { ThemeContext, type ThemeContextValue } from './ThemeContextDef';
 import { loadStored, STORAGE_KEY } from './themeStorage';
-import type { ThemeName, AccentColor, UiFont, MonoFont } from './ThemeContextDef';
+import type { ThemeMode, AccentColor, UiFont, MonoFont } from './ThemeContextDef';
 import { uiFontStacks, monoFontStacks } from './ThemeContextDef';
 import { loadUiFont, loadMonoFont } from './fontLoader';
+import { colorThemeMap, DEFAULT_DARK_THEME, DEFAULT_LIGHT_THEME, type ColorThemeId } from './colorThemes';
 
-type ConcreteTheme = 'dark' | 'light' | 'oled';
-
-const themes: Record<ConcreteTheme, Record<string, string>> = {
-  dark: {
-    '--pc-bg-base': '#1e1e24',
-    '--color-scheme': 'dark',
-    '--pc-bg-surface': '#232329',
-    '--pc-bg-elevated': '#27272a',
-    '--pc-bg-input': '#1a1a20',
-    '--pc-bg-sidebar': 'rgba(30,30,36,0.95)',
-    '--pc-bg-code': '#1a1a20',
-    '--pc-border': 'rgba(255,255,255,0.08)',
-    '--pc-border-strong': 'rgba(255,255,255,0.1)',
-    '--pc-text-primary': '#d4d4d8',
-    '--pc-text-secondary': '#a1a1aa',
-    '--pc-text-muted': '#71717a',
-    '--pc-text-faint': '#52525b',
-    '--pc-scrollbar-thumb': '#52525b',
-    '--pc-scrollbar-track': '#27272a',
-    '--pc-scrollbar-thumb-hover': '#71717a',
-    '--pc-hover': 'rgba(255,255,255,0.05)',
-    '--pc-hover-strong': 'rgba(255,255,255,0.08)',
-    '--pc-separator': 'rgba(255,255,255,0.05)',
-  },
-  light: {
-    '--pc-bg-base': '#f4f4f5',
-    '--color-scheme': 'light',
-    '--pc-bg-surface': '#ffffff',
-    '--pc-bg-elevated': '#e4e4e7',
-    '--pc-bg-input': '#ffffff',
-    '--pc-bg-sidebar': 'rgba(255,255,255,0.95)',
-    '--pc-bg-code': '#f4f4f5',
-    '--pc-border': 'rgba(0,0,0,0.08)',
-    '--pc-border-strong': 'rgba(0,0,0,0.12)',
-    '--pc-text-primary': '#18181b',
-    '--pc-text-secondary': '#3f3f46',
-    '--pc-text-muted': '#71717a',
-    '--pc-text-faint': '#a1a1aa',
-    '--pc-scrollbar-thumb': '#a1a1aa',
-    '--pc-scrollbar-track': '#e4e4e7',
-    '--pc-scrollbar-thumb-hover': '#71717a',
-    '--pc-hover': 'rgba(0,0,0,0.05)',
-    '--pc-hover-strong': 'rgba(0,0,0,0.08)',
-    '--pc-separator': 'rgba(0,0,0,0.08)',
-  },
-  oled: {
-    '--pc-bg-base': '#000000',
-    '--color-scheme': 'dark',
-    '--pc-bg-surface': '#0a0a0a',
-    '--pc-bg-elevated': '#141414',
-    '--pc-bg-input': '#0a0a0a',
-    '--pc-bg-sidebar': 'rgba(0,0,0,0.95)',
-    '--pc-bg-code': '#0a0a0a',
-    '--pc-border': 'rgba(255,255,255,0.06)',
-    '--pc-border-strong': 'rgba(255,255,255,0.08)',
-    '--pc-text-primary': '#d4d4d8',
-    '--pc-text-secondary': '#a1a1aa',
-    '--pc-text-muted': '#71717a',
-    '--pc-text-faint': '#3f3f46',
-    '--pc-scrollbar-thumb': '#3f3f46',
-    '--pc-scrollbar-track': '#0a0a0a',
-    '--pc-scrollbar-thumb-hover': '#52525b',
-    '--pc-hover': 'rgba(255,255,255,0.04)',
-    '--pc-hover-strong': 'rgba(255,255,255,0.06)',
-    '--pc-separator': 'rgba(255,255,255,0.04)',
-  },
-};
-
+/** Accent-only overrides (applied on top of color theme when user picks a custom accent). */
 const accents: Record<AccentColor, Record<string, string>> = {
   cyan: {
     '--pc-accent': '#22d3ee',
@@ -129,16 +63,32 @@ function applyVars(vars: Record<string, string>) {
   }
 }
 
-function resolveTheme(name: ThemeName): 'dark' | 'light' | 'oled' {
-  if (name === 'system') {
-    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+/** Resolve which color theme to use based on the mode. */
+function resolveColorTheme(mode: ThemeMode, colorTheme: ColorThemeId): ColorThemeId {
+  if (mode === 'system') {
+    const preferLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+    const ct = colorThemeMap[colorTheme];
+    // If the selected theme matches system preference, use it; otherwise pick the right default
+    if (ct && ((preferLight && ct.scheme === 'light') || (!preferLight && ct.scheme === 'dark'))) {
+      return colorTheme;
+    }
+    return preferLight ? DEFAULT_LIGHT_THEME : DEFAULT_DARK_THEME;
   }
-  return name;
+  if (mode === 'oled') return 'oled-black';
+  return colorTheme;
+}
+
+function resolveThemeScheme(mode: ThemeMode, colorTheme: ColorThemeId): 'dark' | 'light' | 'oled' {
+  if (mode === 'oled') return 'oled';
+  const resolved = resolveColorTheme(mode, colorTheme);
+  const ct = colorThemeMap[resolved];
+  return ct?.scheme ?? 'dark';
 }
 
 interface ThemeSettings {
-  theme: ThemeName;
+  theme: ThemeMode;
   accent: AccentColor;
+  colorTheme: ColorThemeId;
   uiFont: UiFont;
   monoFont: MonoFont;
   uiFontSize: number;
@@ -156,8 +106,9 @@ function fontVars(uiFont: UiFont, monoFont: MonoFont, uiFontSize: number, monoFo
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [stored] = useState(loadStored);
-  const [theme, setThemeState] = useState<ThemeName>(stored.theme);
+  const [theme, setThemeState] = useState<ThemeMode>(stored.theme);
   const [accent, setAccentState] = useState<AccentColor>(stored.accent);
+  const [colorTheme, setColorThemeState] = useState<ColorThemeId>(stored.colorTheme);
   const [uiFont, setUiFontState] = useState<UiFont>(stored.uiFont);
   const [monoFont, setMonoFontState] = useState<MonoFont>(stored.monoFont);
   const [uiFontSize, setUiFontSizeState] = useState<number>(stored.uiFontSize);
@@ -167,6 +118,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({
       theme: s.theme,
       accent: s.accent,
+      colorTheme: s.colorTheme,
       uiFont: s.uiFont,
       monoFont: s.monoFont,
       uiFontSize: s.uiFontSize,
@@ -175,61 +127,83 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const applyAll = useCallback((s: ThemeSettings) => {
+    const resolvedId = resolveColorTheme(s.theme, s.colorTheme);
+    const ct = colorThemeMap[resolvedId];
+    const themeVars = ct?.vars ?? colorThemeMap[DEFAULT_DARK_THEME].vars;
+    // Color theme provides base + its own accent. User accent overrides on top.
     applyVars({
-      ...themes[resolveTheme(s.theme)],
+      ...themeVars,
       ...accents[s.accent],
       ...fontVars(s.uiFont, s.monoFont, s.uiFontSize, s.monoFontSize),
     });
   }, []);
 
-  const setTheme = useCallback((t: ThemeName) => {
+  const setTheme = useCallback((t: ThemeMode) => {
     setThemeState(t);
-    const next: ThemeSettings = { theme: t, accent, uiFont, monoFont, uiFontSize, monoFontSize };
+    const next: ThemeSettings = { theme: t, accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
-  }, [accent, applyAll, persist, uiFont, monoFont, uiFontSize, monoFontSize]);
+  }, [accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize, applyAll, persist]);
 
   const setAccent = useCallback((a: AccentColor) => {
     setAccentState(a);
-    const next: ThemeSettings = { theme, accent: a, uiFont, monoFont, uiFontSize, monoFontSize };
+    const next: ThemeSettings = { theme, accent: a, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
-  }, [theme, applyAll, persist, uiFont, monoFont, uiFontSize, monoFontSize]);
+  }, [theme, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize, applyAll, persist]);
+
+  const setColorTheme = useCallback((c: ColorThemeId) => {
+    setColorThemeState(c);
+    // Auto-adjust theme mode to match the color theme's scheme
+    const ct = colorThemeMap[c];
+    let newMode = theme;
+    if (ct && theme !== 'system') {
+      if (c === 'oled-black') {
+        newMode = 'oled';
+      } else {
+        newMode = ct.scheme;
+      }
+      setThemeState(newMode);
+    }
+    const next: ThemeSettings = { theme: newMode, accent, colorTheme: c, uiFont, monoFont, uiFontSize, monoFontSize };
+    applyAll(next);
+    persist(next);
+  }, [theme, accent, uiFont, monoFont, uiFontSize, monoFontSize, applyAll, persist]);
 
   const setUiFont = useCallback((f: UiFont) => {
     setUiFontState(f);
     loadUiFont(f);
-    const next: ThemeSettings = { theme, accent, uiFont: f, monoFont, uiFontSize, monoFontSize };
+    const next: ThemeSettings = { theme, accent, colorTheme, uiFont: f, monoFont, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
-  }, [theme, accent, applyAll, persist, monoFont, uiFontSize, monoFontSize]);
+  }, [theme, accent, colorTheme, applyAll, persist, monoFont, uiFontSize, monoFontSize]);
 
   const setMonoFont = useCallback((f: MonoFont) => {
     setMonoFontState(f);
     loadMonoFont(f);
-    const next: ThemeSettings = { theme, accent, uiFont, monoFont: f, uiFontSize, monoFontSize };
+    const next: ThemeSettings = { theme, accent, colorTheme, uiFont, monoFont: f, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
-  }, [theme, accent, applyAll, persist, uiFont, uiFontSize, monoFontSize]);
+  }, [theme, accent, colorTheme, applyAll, persist, uiFont, uiFontSize, monoFontSize]);
 
   const setUiFontSize = useCallback((size: number) => {
     const clamped = Math.min(20, Math.max(12, size));
     setUiFontSizeState(clamped);
-    const next: ThemeSettings = { theme, accent, uiFont, monoFont, uiFontSize: clamped, monoFontSize };
+    const next: ThemeSettings = { theme, accent, colorTheme, uiFont, monoFont, uiFontSize: clamped, monoFontSize };
     applyAll(next);
     persist(next);
-  }, [theme, accent, applyAll, persist, uiFont, monoFont, monoFontSize]);
+  }, [theme, accent, colorTheme, applyAll, persist, uiFont, monoFont, monoFontSize]);
 
   const setMonoFontSize = useCallback((size: number) => {
     const clamped = Math.min(20, Math.max(12, size));
     setMonoFontSizeState(clamped);
-    const next: ThemeSettings = { theme, accent, uiFont, monoFont, uiFontSize, monoFontSize: clamped };
+    const next: ThemeSettings = { theme, accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize: clamped };
     applyAll(next);
     persist(next);
-  }, [theme, accent, applyAll, persist, uiFont, monoFont, uiFontSize]);
+  }, [theme, accent, colorTheme, applyAll, persist, uiFont, monoFont, uiFontSize]);
 
   useEffect(() => {
-    applyAll({ theme, accent, uiFont, monoFont, uiFontSize, monoFontSize });
+    applyAll({ theme, accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize });
     loadUiFont(uiFont);
     loadMonoFont(monoFont);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -237,16 +211,16 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (theme !== 'system') return;
     const mq = window.matchMedia('(prefers-color-scheme: light)');
-    const handler = () => applyAll({ theme: mq.matches ? 'light' : 'dark', accent, uiFont, monoFont, uiFontSize, monoFontSize });
+    const handler = () => applyAll({ theme, accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize });
     mq.addEventListener('change', handler);
     return () => mq.removeEventListener('change', handler);
-  }, [theme, accent, applyAll, uiFont, monoFont, uiFontSize, monoFontSize]);
+  }, [theme, accent, colorTheme, applyAll, uiFont, monoFont, uiFontSize, monoFontSize]);
 
-  const resolvedTheme = resolveTheme(theme);
+  const resolvedTheme = resolveThemeScheme(theme, colorTheme);
 
   const value: ThemeContextValue = {
-    theme, accent, uiFont, monoFont, uiFontSize, monoFontSize,
-    resolvedTheme, setTheme, setAccent, setUiFont, setMonoFont, setUiFontSize, setMonoFontSize,
+    theme, accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize,
+    resolvedTheme, setTheme, setAccent, setColorTheme, setUiFont, setMonoFont, setUiFontSize, setMonoFontSize,
   };
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
