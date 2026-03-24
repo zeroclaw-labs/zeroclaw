@@ -441,6 +441,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         policy: crate::config::MemoryPolicyConfig::default(),
         sqlite_open_timeout_secs: None,
         qdrant: crate::config::QdrantConfig::default(),
+        muninndb: crate::config::MuninndbConfig::default(),
     }
 }
 

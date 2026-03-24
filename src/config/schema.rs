@@ -4726,6 +4726,37 @@ fn default_qdrant_collection() -> String {
     "zeroclaw_memories".into()
 }
 
+/// MuninnDB cognitive memory backend configuration (`[memory.muninndb]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MuninndbConfig {
+    /// MuninnDB REST API URL (e.g. "http://127.0.0.1:8475").
+    /// Falls back to `MUNINNDB_URL` env var, or default "http://127.0.0.1:8475".
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Vault name for storing memories.
+    /// Falls back to `MUNINNDB_VAULT` env var, or default "default".
+    #[serde(default = "default_muninndb_vault")]
+    pub vault: String,
+    /// Optional API key for secured MuninnDB instances.
+    /// Falls back to `MUNINNDB_API_KEY` env var if not set.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+fn default_muninndb_vault() -> String {
+    "default".into()
+}
+
+impl Default for MuninndbConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            vault: default_muninndb_vault(),
+            api_key: None,
+        }
+    }
+}
+
 impl Default for QdrantConfig {
     fn default() -> Self {
         Self {
@@ -4874,6 +4905,12 @@ pub struct MemoryConfig {
     /// Only used when `backend = "qdrant"`.
     #[serde(default)]
     pub qdrant: QdrantConfig,
+
+    // ── MuninnDB backend options ─────────────────────────────
+    /// Configuration for MuninnDB cognitive memory backend.
+    /// Only used when `backend = "muninndb"`.
+    #[serde(default)]
+    pub muninndb: MuninndbConfig,
 }
 
 /// Memory policy configuration (`[memory.policy]` section).
@@ -4995,6 +5032,7 @@ impl Default for MemoryConfig {
             policy: MemoryPolicyConfig::default(),
             sqlite_open_timeout_secs: None,
             qdrant: QdrantConfig::default(),
+            muninndb: MuninndbConfig::default(),
         }
     }
 }
