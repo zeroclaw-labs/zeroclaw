@@ -2502,6 +2502,7 @@ pub(crate) async fn agent_turn(
         activated_tools,
         model_switch_callback,
         &crate::config::PacingConfig::default(),
+        None, // tool_timeout_secs
     )
     .await
 }
@@ -2607,6 +2608,7 @@ async fn execute_one_tool(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    tool_timeout_secs: Option<u64>,
 ) -> Result<ToolExecutionOutcome> {
     let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -2638,13 +2640,74 @@ async fn execute_one_tool(
     };
 
     let tool_future = tool.execute(call_arguments);
-    let tool_result = if let Some(token) = cancellation_token {
-        tokio::select! {
-            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-            result = tool_future => result,
+
+    let tool_result = match tool_timeout_secs {
+        Some(timeout_secs) if timeout_secs > 0 => {
+            let timeout_duration = Duration::from_secs(timeout_secs);
+            if let Some(token) = cancellation_token {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = tokio::time::timeout(timeout_duration, tool_future) => {
+                        match result {
+                            Ok(inner) => inner,
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    tool = %call_name,
+                                    timeout_secs = %timeout_secs,
+                                    "Tool execution exceeded resource limit timeout"
+                                );
+                                let duration = start.elapsed();
+                                observer.record_event(&ObserverEvent::ToolCall {
+                                    tool: call_name.to_string(),
+                                    duration,
+                                    success: false,
+                                });
+                                return Ok(ToolExecutionOutcome {
+                                    output: format!("Tool execution timed out after {timeout_secs}s (resource limit)"),
+                                    success: false,
+                                    error_reason: Some(format!("Tool '{call_name}' exceeded {timeout_secs}s timeout (resource limit)")),
+                                    duration,
+                                });
+                            }
+                        }
+                    }
+                }
+            } else {
+                match tokio::time::timeout(timeout_duration, tool_future).await {
+                    Ok(inner) => inner,
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            tool = %call_name,
+                            timeout_secs = %timeout_secs,
+                            "Tool execution exceeded resource limit timeout"
+                        );
+                        let duration = start.elapsed();
+                        observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call_name.to_string(),
+                            duration,
+                            success: false,
+                        });
+                        return Ok(ToolExecutionOutcome {
+                            output: format!("Tool execution timed out after {timeout_secs}s (resource limit)"),
+                            success: false,
+                            error_reason: Some(format!("Tool '{call_name}' exceeded {timeout_secs}s timeout (resource limit)")),
+                            duration,
+                        });
+                    }
+                }
+            }
         }
-    } else {
-        tool_future.await
+        _ => {
+            // No timeout - existing behavior
+            if let Some(token) = cancellation_token {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = tool_future => result,
+                }
+            } else {
+                tool_future.await
+            }
+        }
     };
 
     match tool_result {
@@ -2730,6 +2793,7 @@ async fn execute_tools_parallel(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    tool_timeout_secs: Option<u64>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -2741,6 +2805,7 @@ async fn execute_tools_parallel(
                 activated_tools,
                 observer,
                 cancellation_token,
+                tool_timeout_secs,
             )
         })
         .collect();
@@ -2755,6 +2820,7 @@ async fn execute_tools_sequential(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    tool_timeout_secs: Option<u64>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -2767,6 +2833,7 @@ async fn execute_tools_sequential(
                 activated_tools,
                 observer,
                 cancellation_token,
+                tool_timeout_secs,
             )
             .await?,
         );
@@ -2812,6 +2879,7 @@ pub(crate) async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &crate::config::PacingConfig,
+    tool_timeout_secs: Option<u64>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -3563,6 +3631,7 @@ pub(crate) async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                tool_timeout_secs,
             )
             .await?
         } else {
@@ -3572,6 +3641,7 @@ pub(crate) async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                tool_timeout_secs,
             )
             .await?
         };
@@ -4341,6 +4411,7 @@ pub async fn run(
                 activated_handle.as_ref(),
                 Some(model_switch_callback.clone()),
                 &config.pacing,
+                Some(config.security.resources.max_cpu_time_seconds),
             )
             .await
             {
@@ -4642,6 +4713,7 @@ pub async fn run(
                     activated_handle.as_ref(),
                     Some(model_switch_callback.clone()),
                     &config.pacing,
+                    Some(config.security.resources.max_cpu_time_seconds),
                 )
                 .await
                 {
@@ -5149,10 +5221,11 @@ mod tests {
     }
 
     use super::*;
+    use crate::tools::{Tool, ToolResult};
     use async_trait::async_trait;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -5186,8 +5259,16 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let result =
-            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
+        let result = execute_one_tool(
+            "unknown_tool",
+            call_arguments,
+            &[],
+            None,
+            &observer,
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
@@ -5215,6 +5296,7 @@ mod tests {
             &[],
             Some(&activated),
             &observer,
+            None,
             None,
         )
         .await
@@ -5857,6 +5939,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5909,6 +5992,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect_err("oversized payload must fail");
@@ -5954,6 +6038,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5999,6 +6084,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -6051,6 +6137,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -6103,6 +6190,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -6156,6 +6244,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -6207,6 +6296,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -6258,6 +6348,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -6392,6 +6483,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("parallel execution should complete");
@@ -6463,6 +6555,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6526,6 +6619,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6584,6 +6678,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6654,6 +6749,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6715,6 +6811,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6796,6 +6893,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("loop should complete");
@@ -6854,6 +6952,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6936,6 +7035,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -7002,6 +7102,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
         )
         .await
         .expect("streaming provider should complete");
@@ -7070,6 +7171,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -7142,6 +7244,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -7223,6 +7326,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None,
         )
         .await
         .expect("routed streaming provider should complete");
@@ -9260,6 +9364,7 @@ Let me check the result."#;
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("tool loop should complete");
@@ -9414,6 +9519,7 @@ Let me check the result."#;
                     None,
                     None,
                     &crate::config::PacingConfig::default(),
+                    None, // tool_timeout_secs
                 ),
             )
             .await
@@ -9493,6 +9599,7 @@ Let me check the result."#;
                     None,
                     None,
                     &crate::config::PacingConfig::default(),
+                    None, // tool_timeout_secs
                 ),
             )
             .await
@@ -9548,10 +9655,341 @@ Let me check the result."#;
             None,
             None,
             &crate::config::PacingConfig::default(),
+            None, // tool_timeout_secs
         )
         .await
         .expect("should succeed without cost scope");
 
         assert_eq!(result, "ok");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════════
+    // Resource limits enforcement tests
+    // ═════════════════════════════════════════════════════════════════════════════
+
+    /// Mock tool that sleeps for a specified duration to simulate slow execution.
+    struct SlowTool {
+        sleep_duration: Duration,
+        executed: Arc<AtomicBool>,
+    }
+
+    impl SlowTool {
+        fn new(sleep_duration: Duration) -> (Self, Arc<AtomicBool>) {
+            let executed = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    sleep_duration,
+                    executed: executed.clone(),
+                },
+                executed,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Tool for SlowTool {
+        fn name(&self) -> &str {
+            "slow_tool"
+        }
+
+        fn description(&self) -> &str {
+            "A tool that sleeps for a specified duration"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            tokio::time::sleep(self.sleep_duration).await;
+            self.executed.store(true, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "Tool completed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    /// Fast tool that completes immediately.
+    struct FastTool {
+        executed: Arc<AtomicBool>,
+    }
+
+    impl FastTool {
+        fn new() -> (Self, Arc<AtomicBool>) {
+            let executed = Arc::new(AtomicBool::new(false));
+            (
+                Self {
+                    executed: executed.clone(),
+                },
+                executed,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FastTool {
+        fn name(&self) -> &str {
+            "fast_tool"
+        }
+
+        fn description(&self) -> &str {
+            "A tool that completes immediately"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {}
+            })
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.executed.store(true, Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "Tool completed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_times_out_when_exceeding_limit() {
+        let (slow_tool, executed) = SlowTool::new(Duration::from_secs(5));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(slow_tool)];
+        let observer = NoopObserver;
+
+        let result = execute_one_tool(
+            "slow_tool",
+            serde_json::json!({}),
+            &tools,
+            None,
+            &observer,
+            None,
+            Some(2), // 2 second timeout
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let outcome = result.unwrap();
+        assert!(!outcome.success, "Tool should have failed due to timeout");
+        assert!(
+            outcome.error_reason.is_some(),
+            "Error reason should be present"
+        );
+        let error = outcome.error_reason.unwrap();
+        assert!(
+            error.contains("timeout") && error.contains("2s"),
+            "Error should mention timeout and duration: {error}"
+        );
+        assert!(
+            outcome.output.contains("timed out after 2s"),
+            "Output should mention timeout: {}",
+            outcome.output
+        );
+        assert!(
+            !executed.load(Ordering::SeqCst),
+            "Tool should not have completed execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_completes_within_limit() {
+        let (fast_tool, executed) = FastTool::new();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(fast_tool)];
+        let observer = NoopObserver;
+
+        let result = execute_one_tool(
+            "fast_tool",
+            serde_json::json!({}),
+            &tools,
+            None,
+            &observer,
+            None,
+            Some(2), // 2 second timeout
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let outcome = result.unwrap();
+        assert!(outcome.success, "Tool should have succeeded");
+        assert!(outcome.error_reason.is_none(), "No error should be present");
+        assert!(
+            executed.load(Ordering::SeqCst),
+            "Tool should have completed execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_timeout_error_includes_duration() {
+        let (slow_tool, _executed) = SlowTool::new(Duration::from_secs(10));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(slow_tool)];
+        let observer = NoopObserver;
+
+        let result = execute_one_tool(
+            "slow_tool",
+            serde_json::json!({}),
+            &tools,
+            None,
+            &observer,
+            None,
+            Some(1), // 1 second timeout
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let outcome = result.unwrap();
+        assert!(!outcome.success);
+        let error = outcome.error_reason.unwrap();
+        assert!(
+            error.contains("1s"),
+            "Error should contain timeout duration: {error}"
+        );
+        assert!(
+            error.contains("slow_tool"),
+            "Error should contain tool name: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_no_timeout_allows_long_running_tool() {
+        let (slow_tool, executed) = SlowTool::new(Duration::from_millis(100));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(slow_tool)];
+        let observer = NoopObserver;
+
+        let result = execute_one_tool(
+            "slow_tool",
+            serde_json::json!({}),
+            &tools,
+            None,
+            &observer,
+            None,
+            None, // No timeout
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let outcome = result.unwrap();
+        assert!(
+            outcome.success,
+            "Tool should have succeeded without timeout"
+        );
+        assert!(
+            executed.load(Ordering::SeqCst),
+            "Tool should have completed execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_zero_timeout_treated_as_no_timeout() {
+        let (slow_tool, executed) = SlowTool::new(Duration::from_millis(100));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(slow_tool)];
+        let observer = NoopObserver;
+
+        let result = execute_one_tool(
+            "slow_tool",
+            serde_json::json!({}),
+            &tools,
+            None,
+            &observer,
+            None,
+            Some(0), // Zero timeout
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let outcome = result.unwrap();
+        assert!(
+            outcome.success,
+            "Tool should have succeeded with zero timeout"
+        );
+        assert!(
+            executed.load(Ordering::SeqCst),
+            "Tool should have completed execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_timeout_coexists_with_cancellation_token() {
+        let (slow_tool, _executed) = SlowTool::new(Duration::from_secs(10));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(slow_tool)];
+        let observer = NoopObserver;
+        let cancellation_token = CancellationToken::new();
+
+        let result = execute_one_tool(
+            "slow_tool",
+            serde_json::json!({}),
+            &tools,
+            None,
+            &observer,
+            Some(&cancellation_token),
+            Some(1), // 1 second timeout
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let outcome = result.unwrap();
+        assert!(
+            !outcome.success,
+            "Tool should have timed out before cancellation"
+        );
+        assert!(
+            outcome.error_reason.unwrap().contains("timeout"),
+            "Error should be timeout, not cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_tools_parallel_times_out_individually() {
+        let (slow_tool, slow_executed) = SlowTool::new(Duration::from_secs(5));
+        let (fast_tool, fast_executed) = FastTool::new();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(slow_tool), Box::new(fast_tool)];
+        let observer = NoopObserver;
+
+        let tool_calls = vec![
+            ParsedToolCall {
+                name: "slow_tool".to_string(),
+                arguments: serde_json::json!({}),
+                tool_call_id: Some("tc1".to_string()),
+            },
+            ParsedToolCall {
+                name: "fast_tool".to_string(),
+                arguments: serde_json::json!({}),
+                tool_call_id: Some("tc2".to_string()),
+            },
+        ];
+
+        let results = execute_tools_parallel(
+            &tool_calls,
+            &tools,
+            None,
+            &observer,
+            None,
+            Some(2), // 2 second timeout
+        )
+        .await;
+
+        assert!(results.is_ok());
+        let outcomes = results.unwrap();
+        assert_eq!(outcomes.len(), 2);
+
+        // First tool (slow) should have timed out
+        assert!(!outcomes[0].success, "Slow tool should have timed out");
+        assert!(
+            !slow_executed.load(Ordering::SeqCst),
+            "Slow tool should not have completed"
+        );
+
+        // Second tool (fast) should have succeeded
+        assert!(outcomes[1].success, "Fast tool should have succeeded");
+        assert!(
+            fast_executed.load(Ordering::SeqCst),
+            "Fast tool should have completed"
+        );
     }
 }

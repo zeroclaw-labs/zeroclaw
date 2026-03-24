@@ -2766,6 +2766,7 @@ async fn process_channel_message(
                         ctx.activated_tools.as_ref(),
                         Some(model_switch_callback.clone()),
                         &ctx.pacing,
+                        Some(ctx.prompt_config.security.resources.max_cpu_time_seconds),
                     ),
                     ),
                 ) => LlmExecutionResult::Completed(result),

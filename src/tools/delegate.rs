@@ -1143,6 +1143,7 @@ impl DelegateTool {
                 None,
                 None,
                 &crate::config::PacingConfig::default(),
+                None, // No tool timeout for delegate (already has agentic_timeout_secs)
             ),
         )
         .await;
