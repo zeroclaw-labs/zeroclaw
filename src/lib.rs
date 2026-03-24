@@ -163,6 +163,15 @@ pub enum ServiceCommands {
     Status,
     /// Uninstall daemon service unit
     Uninstall,
+    /// Tail daemon service logs
+    Logs {
+        /// Number of lines to show (default: 50)
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 /// Channel management subcommands
