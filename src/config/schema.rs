@@ -582,6 +582,12 @@ pub struct DelegateAgentConfig {
     /// When unset or empty, the sub-agent falls back to the default workspace `skills/` directory.
     #[serde(default)]
     pub skills_directory: Option<String>,
+    /// Optional memory namespace for per-agent memory isolation.
+    /// When set, the sub-agent's memory_recall and memory_store operations
+    /// are scoped to this namespace within the shared brain.db.
+    /// Other agents cannot see or modify entries in this namespace.
+    #[serde(default)]
+    pub memory_namespace: Option<String>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -11953,6 +11959,7 @@ default_temperature = 0.7
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
 

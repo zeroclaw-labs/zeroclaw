@@ -68,6 +68,10 @@ pub struct DelegateTool {
     delegate_config: DelegateToolConfig,
     /// Workspace directory inherited from the root agent context.
     workspace_dir: PathBuf,
+    /// Shared memory backend for creating namespace-scoped memory tools.
+    memory: Option<Arc<dyn crate::memory::Memory>>,
+    /// Security policy for constructing namespace-scoped memory_store tools.
+    memory_security: Option<Arc<SecurityPolicy>>,
     /// Cancellation token for cascade control of background tasks.
     cancellation_token: CancellationToken,
 }
@@ -102,6 +106,8 @@ impl DelegateTool {
             multimodal_config: crate::config::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
+            memory: None,
+            memory_security: None,
             cancellation_token: CancellationToken::new(),
         }
     }
@@ -141,6 +147,8 @@ impl DelegateTool {
             multimodal_config: crate::config::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
+            memory: None,
+            memory_security: None,
             cancellation_token: CancellationToken::new(),
         }
     }
@@ -172,6 +180,17 @@ impl DelegateTool {
     /// Attach the workspace directory for system prompt enrichment.
     pub fn with_workspace_dir(mut self, workspace_dir: PathBuf) -> Self {
         self.workspace_dir = workspace_dir;
+        self
+    }
+
+    /// Attach memory backend for namespace-scoped sub-agent memory isolation.
+    pub fn with_memory(
+        mut self,
+        memory: Arc<dyn crate::memory::Memory>,
+        security: Arc<SecurityPolicy>,
+    ) -> Self {
+        self.memory = Some(memory);
+        self.memory_security = Some(security);
         self
     }
 
@@ -625,6 +644,8 @@ impl DelegateTool {
                 multimodal_config,
                 delegate_config,
                 workspace_dir: workspace_dir.clone(),
+                memory: None,
+                memory_security: None,
                 cancellation_token: child_token.clone(),
             };
 
@@ -782,6 +803,8 @@ impl DelegateTool {
                     multimodal_config,
                     delegate_config,
                     workspace_dir,
+                    memory: None,
+                    memory_security: None,
                     cancellation_token,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
@@ -1083,7 +1106,7 @@ impl DelegateTool {
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
-        let sub_tools: Vec<Box<dyn Tool>> = {
+        let mut sub_tools: Vec<Box<dyn Tool>> = {
             let parent_tools = self.parent_tools.read();
             parent_tools
                 .iter()
@@ -1092,6 +1115,53 @@ impl DelegateTool {
                 .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
                 .collect()
         };
+
+        // If a memory namespace is configured, replace memory tools with
+        // namespace-scoped versions so the sub-agent can only see/store
+        // entries within its own namespace.
+        if let Some(ns) = &agent_config.memory_namespace {
+            if let (Some(mem), Some(sec)) = (&self.memory, &self.memory_security) {
+                let scoped: Arc<dyn crate::memory::Memory> = Arc::new(
+                    crate::memory::namespaced::NamespacedMemory::new(Arc::clone(mem), ns.clone()),
+                );
+                let sec = Arc::clone(sec);
+
+                // Memory tool names that should be replaced with scoped versions.
+                let memory_tool_names: std::collections::HashSet<&str> = [
+                    "memory_recall",
+                    "memory_store",
+                    "memory_forget",
+                    "memory_purge",
+                ]
+                .into_iter()
+                .collect();
+
+                // Remove existing memory tools.
+                sub_tools.retain(|t| !memory_tool_names.contains(t.name()));
+
+                // Add scoped replacements for tools in the allowlist.
+                if allowed.contains("memory_recall") {
+                    sub_tools.push(Box::new(crate::tools::MemoryRecallTool::new(
+                        scoped.clone(),
+                    )));
+                }
+                if allowed.contains("memory_store") {
+                    sub_tools.push(Box::new(crate::tools::MemoryStoreTool::new(
+                        scoped.clone(),
+                        sec.clone(),
+                    )));
+                }
+                if allowed.contains("memory_forget") {
+                    sub_tools.push(Box::new(crate::tools::MemoryForgetTool::new(
+                        scoped.clone(),
+                        sec.clone(),
+                    )));
+                }
+                if allowed.contains("memory_purge") {
+                    sub_tools.push(Box::new(crate::tools::MemoryPurgeTool::new(scoped, sec)));
+                }
+            }
+        }
 
         if sub_tools.is_empty() {
             return Ok(ToolResult {
@@ -1257,6 +1327,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         agents.insert(
@@ -1274,6 +1345,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         agents
@@ -1430,6 +1502,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         }
     }
 
@@ -1545,6 +1618,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1654,6 +1728,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1692,6 +1767,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1968,6 +2044,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2021,6 +2098,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
 
         struct MockShellTool;
@@ -2091,6 +2169,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2119,6 +2198,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2152,6 +2232,7 @@ mod tests {
             timeout_secs: Some(60),
             agentic_timeout_secs: Some(600),
             skills_directory: None,
+            memory_namespace: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2207,6 +2288,7 @@ mod tests {
                 timeout_secs: Some(0),
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2234,6 +2316,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2261,6 +2344,7 @@ mod tests {
                 timeout_secs: Some(7200),
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2288,6 +2372,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2315,6 +2400,7 @@ mod tests {
                 timeout_secs: Some(3600),
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2338,6 +2424,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2370,6 +2457,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
+            memory_namespace: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2416,6 +2504,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];

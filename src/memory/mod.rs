@@ -13,6 +13,7 @@ pub mod knowledge_graph;
 pub mod knowledge_graph_pg;
 pub mod lucid;
 pub mod markdown;
+pub mod namespaced;
 pub mod none;
 pub mod policy;
 #[cfg(feature = "memory-postgres")]
