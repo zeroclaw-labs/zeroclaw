@@ -224,12 +224,16 @@ impl Memory for SyncedMemory {
             .store(key, content, category.clone(), session_id)
             .await?;
 
-        // 2. Record the delta in the sync journal (best-effort).
-        {
+        // 2. Record the delta in the sync journal ONLY for long-term categories.
+        //    Short-term (Conversation) memory is NOT synced across devices.
+        //    Sync only triggers when data is promoted to Core/Daily or ontology.
+        if category != MemoryCategory::Conversation {
             let mut engine = self.sync.lock();
             engine.record_store(key, content, &category.to_string());
+            tracing::trace!(key, %category, "Sync: recorded store delta");
+        } else {
+            tracing::trace!(key, %category, "Sync: skipped Conversation category (short-term only)");
         }
-        tracing::trace!(key, %category, "Sync: recorded store delta");
 
         Ok(())
     }

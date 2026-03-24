@@ -1,3 +1,4 @@
+use crate::memory::InteractionCategory;
 use crate::providers::ChatMessage;
 use crate::{
     config::AgentSessionBackend, config::AgentSessionConfig, config::AgentSessionStrategy,
@@ -110,6 +111,31 @@ impl Session {
             .await
     }
 
+    /// Append a single turn with full metadata (category, location, counterpart).
+    pub async fn append_turn_with_metadata(
+        &self,
+        role: &str,
+        content: &str,
+        channel: Option<&str>,
+        sender: Option<&str>,
+        interaction_category: &InteractionCategory,
+        location: Option<&str>,
+        counterpart: Option<&str>,
+    ) -> Result<()> {
+        self.manager
+            .append_turn_with_metadata(
+                &self.id,
+                role,
+                content,
+                channel,
+                sender,
+                interaction_category,
+                location,
+                counterpart,
+            )
+            .await
+    }
+
     /// Load recent turns across sessions for a given sender (for context injection).
     pub async fn recent_turns_for_sender(
         &self,
@@ -142,6 +168,21 @@ pub trait SessionManager: Send + Sync {
         _content: &str,
         _channel: Option<&str>,
         _sender: Option<&str>,
+    ) -> Result<()> {
+        Ok(()) // No-op default for backends without turn storage
+    }
+
+    /// Append a single conversation turn with full metadata to short-term storage.
+    async fn append_turn_with_metadata(
+        &self,
+        _session_id: &str,
+        _role: &str,
+        _content: &str,
+        _channel: Option<&str>,
+        _sender: Option<&str>,
+        _interaction_category: &InteractionCategory,
+        _location: Option<&str>,
+        _counterpart: Option<&str>,
     ) -> Result<()> {
         Ok(()) // No-op default for backends without turn storage
     }
@@ -330,23 +371,43 @@ impl SqliteSessionManager {
         // ── Short-term conversation turns table ──────────────────────
         // Stores individual messages for fine-grained cross-session recall.
         // Supports ~10M tokens of conversation history (~30MB text).
+        // Metadata columns: interaction_category (work type), location, counterpart.
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS conversation_turns (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id  TEXT NOT NULL,
-                role        TEXT NOT NULL,
-                content     TEXT NOT NULL,
-                channel     TEXT,
-                sender      TEXT,
-                created_at  INTEGER NOT NULL
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id            TEXT NOT NULL,
+                role                  TEXT NOT NULL,
+                content               TEXT NOT NULL,
+                channel               TEXT,
+                sender                TEXT,
+                interaction_category  TEXT DEFAULT 'chat',
+                location              TEXT,
+                counterpart           TEXT,
+                created_at            INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS idx_conv_turns_session
              ON conversation_turns(session_id, created_at);
              CREATE INDEX IF NOT EXISTS idx_conv_turns_created
              ON conversation_turns(created_at DESC);
              CREATE INDEX IF NOT EXISTS idx_conv_turns_sender
-             ON conversation_turns(sender, created_at DESC);",
+             ON conversation_turns(sender, created_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_conv_turns_category
+             ON conversation_turns(interaction_category, created_at DESC);",
         )?;
+
+        // ── Migration: add metadata columns if missing ──────────────
+        // Safe ALTER TABLE with IF NOT EXISTS semantics via error ignoring.
+        for col_def in &[
+            "ALTER TABLE conversation_turns ADD COLUMN interaction_category TEXT DEFAULT 'chat'",
+            "ALTER TABLE conversation_turns ADD COLUMN location TEXT",
+            "ALTER TABLE conversation_turns ADD COLUMN counterpart TEXT",
+        ] {
+            let _ = conn.execute_batch(col_def);
+        }
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_conv_turns_category
+             ON conversation_turns(interaction_category, created_at DESC)",
+        );
 
         let mgr = Arc::new(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -387,20 +448,49 @@ impl SqliteSessionManager {
         channel: Option<&str>,
         sender: Option<&str>,
     ) -> Result<()> {
+        self.append_turn_with_metadata(
+            session_id,
+            role,
+            content,
+            channel,
+            sender,
+            &InteractionCategory::Chat,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Append a single conversation turn with full metadata to the short-term store.
+    pub async fn append_turn_with_metadata(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        channel: Option<&str>,
+        sender: Option<&str>,
+        interaction_category: &InteractionCategory,
+        location: Option<&str>,
+        counterpart: Option<&str>,
+    ) -> Result<()> {
         let conn = self.conn.clone();
         let session_id = session_id.to_string();
         let role = role.to_string();
         let content = content.to_string();
         let channel = channel.map(ToString::to_string);
         let sender = sender.map(ToString::to_string);
+        let category_str = interaction_category.to_string();
+        let location = location.map(ToString::to_string);
+        let counterpart = counterpart.map(ToString::to_string);
         let now = unix_seconds_now();
 
         tokio::task::spawn_blocking(move || {
             let conn = conn.lock();
             conn.execute(
-                "INSERT INTO conversation_turns (session_id, role, content, channel, sender, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![session_id, role, content, channel, sender, now],
+                "INSERT INTO conversation_turns
+                 (session_id, role, content, channel, sender, interaction_category, location, counterpart, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![session_id, role, content, channel, sender, category_str, location, counterpart, now],
             )?;
             Ok(())
         })
@@ -646,6 +736,31 @@ impl SessionManager for SqliteSessionManager {
         sender: Option<&str>,
     ) -> Result<()> {
         SqliteSessionManager::append_turn(self, session_id, role, content, channel, sender).await
+    }
+
+    async fn append_turn_with_metadata(
+        &self,
+        session_id: &str,
+        role: &str,
+        content: &str,
+        channel: Option<&str>,
+        sender: Option<&str>,
+        interaction_category: &InteractionCategory,
+        location: Option<&str>,
+        counterpart: Option<&str>,
+    ) -> Result<()> {
+        SqliteSessionManager::append_turn_with_metadata(
+            self,
+            session_id,
+            role,
+            content,
+            channel,
+            sender,
+            interaction_category,
+            location,
+            counterpart,
+        )
+        .await
     }
 
     async fn recent_turns_for_sender(

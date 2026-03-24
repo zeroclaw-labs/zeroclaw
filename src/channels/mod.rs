@@ -3801,7 +3801,7 @@ or tune thresholds in config.",
             .store(
                 &autosave_key,
                 &msg.content,
-                crate::memory::MemoryCategory::Conversation,
+                crate::memory::MemoryCategory::Core,
                 Some(&history_key),
             )
             .await;

@@ -51,6 +51,164 @@ impl std::fmt::Display for MemoryCategory {
     }
 }
 
+/// Interaction categories for systematic memory classification.
+/// Each memory entry is tagged with its work type for structured storage and retrieval.
+/// Used in both short-term (conversation_turns) and long-term (Core) memory storage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionCategory {
+    /// General conversation / chat
+    Chat,
+    /// Document creation, editing, reading (PDF, DOCX, etc.)
+    Document,
+    /// Music creation, playback, playlist management
+    Music,
+    /// Image creation, editing, analysis
+    Image,
+    /// Translation and interpretation
+    Translation,
+    /// Coding and software development
+    Coding,
+    /// Web search and information retrieval
+    Search,
+    /// General / uncategorized interaction
+    General,
+}
+
+impl InteractionCategory {
+    /// Classify an interaction based on message content and tool usage hints.
+    pub fn classify(message: &str, tool_hints: &[&str]) -> Self {
+        let msg_lower = message.to_lowercase();
+
+        // Tool-based classification takes priority
+        for hint in tool_hints {
+            match *hint {
+                "shell" | "file_write" | "file_read" | "file_edit" | "git_operations"
+                | "apply_patch" | "content_search" | "glob_search" => return Self::Coding,
+                "web_search" | "web_fetch" => return Self::Search,
+                "document_process" | "pdf_read" | "docx_read" | "xlsx_read" | "pptx_read" => {
+                    return Self::Document
+                }
+                "screenshot" | "image_info" => return Self::Image,
+                _ => {}
+            }
+        }
+
+        // Keyword-based classification
+        let coding_keywords = [
+            "code",
+            "function",
+            "compile",
+            "debug",
+            "git ",
+            "cargo ",
+            "npm ",
+            "python",
+            "rust",
+            "javascript",
+            "코드",
+            "함수",
+            "컴파일",
+            "디버그",
+            "프로그램",
+        ];
+        let doc_keywords = [
+            "document", "file", "pdf", "docx", "xlsx", "pptx", "hwp", "write", "문서", "파일",
+            "작성", "편집", "읽기",
+        ];
+        let music_keywords = [
+            "music",
+            "song",
+            "playlist",
+            "audio",
+            "mp3",
+            "melody",
+            "compose",
+            "음악",
+            "노래",
+            "재생",
+            "작곡",
+            "멜로디",
+        ];
+        let image_keywords = [
+            "image",
+            "photo",
+            "picture",
+            "draw",
+            "screenshot",
+            "png",
+            "jpg",
+            "이미지",
+            "사진",
+            "그림",
+            "그리기",
+            "스크린샷",
+        ];
+        let translation_keywords = [
+            "translate",
+            "translation",
+            "interpret",
+            "language",
+            "번역",
+            "통역",
+            "언어",
+            "翻訳",
+            "翻译",
+        ];
+        let search_keywords = [
+            "search", "find", "look up", "google", "검색", "찾아", "조회",
+        ];
+
+        if coding_keywords.iter().any(|k| msg_lower.contains(k)) {
+            Self::Coding
+        } else if doc_keywords.iter().any(|k| msg_lower.contains(k)) {
+            Self::Document
+        } else if music_keywords.iter().any(|k| msg_lower.contains(k)) {
+            Self::Music
+        } else if image_keywords.iter().any(|k| msg_lower.contains(k)) {
+            Self::Image
+        } else if translation_keywords.iter().any(|k| msg_lower.contains(k)) {
+            Self::Translation
+        } else if search_keywords.iter().any(|k| msg_lower.contains(k)) {
+            Self::Search
+        } else {
+            Self::Chat
+        }
+    }
+}
+
+impl std::fmt::Display for InteractionCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Chat => write!(f, "chat"),
+            Self::Document => write!(f, "document"),
+            Self::Music => write!(f, "music"),
+            Self::Image => write!(f, "image"),
+            Self::Translation => write!(f, "translation"),
+            Self::Coding => write!(f, "coding"),
+            Self::Search => write!(f, "search"),
+            Self::General => write!(f, "general"),
+        }
+    }
+}
+
+impl InteractionCategory {
+    /// Parse from string, defaulting to General for unknown values.
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "chat" => Self::Chat,
+            "document" => Self::Document,
+            "music" => Self::Music,
+            "image" => Self::Image,
+            "translation" => Self::Translation,
+            "coding" => Self::Coding,
+            "search" => Self::Search,
+            "general" => Self::General,
+            _ => Self::General,
+        }
+    }
+}
+
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
 pub trait Memory: Send + Sync {
@@ -131,6 +289,33 @@ mod tests {
         assert_eq!(core, "\"core\"");
         assert_eq!(daily, "\"daily\"");
         assert_eq!(conversation, "\"conversation\"");
+    }
+
+    #[test]
+    fn interaction_category_classify_detects_coding() {
+        assert_eq!(
+            InteractionCategory::classify("help me write a function", &[]),
+            InteractionCategory::Coding
+        );
+        assert_eq!(
+            InteractionCategory::classify("hello", &["shell"]),
+            InteractionCategory::Coding
+        );
+    }
+
+    #[test]
+    fn interaction_category_classify_defaults_to_chat() {
+        assert_eq!(
+            InteractionCategory::classify("hello there", &[]),
+            InteractionCategory::Chat
+        );
+    }
+
+    #[test]
+    fn interaction_category_display_roundtrip() {
+        let cat = InteractionCategory::Document;
+        assert_eq!(cat.to_string(), "document");
+        assert_eq!(InteractionCategory::from_str_lossy("document"), cat);
     }
 
     #[test]

@@ -37,7 +37,7 @@ pub use sqlite::SqliteMemory;
 pub use synced::SyncedMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
-pub use traits::{MemoryCategory, MemoryEntry};
+pub use traits::{InteractionCategory, MemoryCategory, MemoryEntry};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use anyhow::Context;

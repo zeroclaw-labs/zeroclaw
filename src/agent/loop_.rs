@@ -38,6 +38,7 @@ pub(crate) mod detection;
 mod execution;
 mod history;
 mod parsing;
+mod promotion;
 
 use context::{build_context, build_hardware_context};
 use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
@@ -55,6 +56,7 @@ use parsing::{
     parse_perl_style_tool_calls, parse_structured_tool_calls, parse_tool_call_value,
     parse_tool_calls, parse_tool_calls_from_json_value, tool_call_signature, ParsedToolCall,
 };
+use promotion::{extract_tool_hints_from_history, promote_turn};
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
 const STREAM_CHUNK_MIN_CHARS: usize = 80;
@@ -2433,6 +2435,27 @@ pub async fn run(
         (mem, None)
     };
 
+    // ── Session manager for universal short-term memory ────────────
+    // Creates a session manager so conversation_turns are stored in ALL modes
+    // (interactive, single-message, daemon), not just channel mode.
+    let session_manager =
+        crate::agent::session::create_session_manager(&config.agent.session, &config.workspace_dir)
+            .ok()
+            .flatten();
+    let session = if let Some(ref mgr) = session_manager {
+        let sid = if interactive {
+            "cli_interactive"
+        } else {
+            "cli_single"
+        };
+        mgr.get_or_create(sid).await.ok()
+    } else {
+        None
+    };
+
+    // ── Ontology repo for promotion engine ────────────────────────
+    let ontology_repo = crate::ontology::OntologyRepo::open(&config.workspace_dir).ok();
+
     // ── Peripherals (merge peripheral tools into registry) ─
     if !peripheral_overrides.is_empty() {
         tracing::info!(
@@ -2683,12 +2706,26 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        // Auto-save user message to memory (skip short/trivial messages)
+        // ── Short-term memory: store user turn in conversation_turns ──
+        if let Some(ref sess) = session {
+            let category = crate::memory::InteractionCategory::classify(&msg, &[]);
+            let _ = sess
+                .append_turn_with_metadata(
+                    "user",
+                    &msg,
+                    Some(channel_name),
+                    None,
+                    &category,
+                    None,
+                    None,
+                )
+                .await;
+        }
+
+        // Auto-save user message to long-term Core memory (skip short/trivial messages)
         if config.memory.auto_save && msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let user_key = autosave_memory_key("user_msg");
-            let _ = mem
-                .store(&user_key, &msg, MemoryCategory::Conversation, None)
-                .await;
+            let _ = mem.store(&user_key, &msg, MemoryCategory::Core, None).await;
         }
 
         // Inject memory + hardware RAG context into user message
@@ -2758,10 +2795,20 @@ pub async fn run(
         if config.memory.auto_save && response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
             let assistant_key = autosave_memory_key("assistant_resp");
             let _ = mem
-                .store(
-                    &assistant_key,
+                .store(&assistant_key, &response, MemoryCategory::Core, None)
+                .await;
+        }
+        // ── Short-term memory: store assistant turn ─────────────────
+        if let Some(ref sess) = session {
+            let category = crate::memory::InteractionCategory::classify(&msg, &[]);
+            let _ = sess
+                .append_turn_with_metadata(
+                    "assistant",
                     &response,
-                    MemoryCategory::Conversation,
+                    Some(channel_name),
+                    None,
+                    &category,
+                    None,
                     None,
                 )
                 .await;
@@ -2770,6 +2817,22 @@ pub async fn run(
         // Save coding tool calls from this turn to long-term memory.
         if config.memory.auto_save {
             save_coding_memory_from_history(&history[history_len_before..], &mem).await;
+        }
+        // ── Memory promotion: short-term → Core + ontology ────────
+        if config.memory.auto_save {
+            let tool_hints_owned = extract_tool_hints_from_history(&history[history_len_before..]);
+            let tool_hints: Vec<&str> = tool_hints_owned.iter().map(|s| s.as_str()).collect();
+            promote_turn(
+                &mem,
+                ontology_repo.as_ref(),
+                &msg,
+                &response,
+                channel_name,
+                "user",
+                &tool_hints,
+                "default_user",
+            )
+            .await;
         }
         // ── Multi-model coding review ────────────────────────────
         if let Some(reviewed) = run_coding_review(&response, &config.coding, &history).await {
@@ -2858,11 +2921,27 @@ pub async fn run(
                 _ => {}
             }
 
-            // Auto-save conversation turns (skip short/trivial messages)
+            // ── Short-term memory: store user turn ──────────────────
+            if let Some(ref sess) = session {
+                let category = crate::memory::InteractionCategory::classify(&user_input, &[]);
+                let _ = sess
+                    .append_turn_with_metadata(
+                        "user",
+                        &user_input,
+                        Some("cli"),
+                        None,
+                        &category,
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+
+            // Auto-save conversation turns to Core memory (skip short/trivial messages)
             if config.memory.auto_save && user_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let user_key = autosave_memory_key("user_msg");
                 let _ = mem
-                    .store(&user_key, &user_input, MemoryCategory::Conversation, None)
+                    .store(&user_key, &user_input, MemoryCategory::Core, None)
                     .await;
             }
 
@@ -2975,10 +3054,20 @@ pub async fn run(
             if config.memory.auto_save && response.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let assistant_key = autosave_memory_key("assistant_resp");
                 let _ = mem
-                    .store(
-                        &assistant_key,
+                    .store(&assistant_key, &response, MemoryCategory::Core, None)
+                    .await;
+            }
+            // ── Short-term memory: store assistant turn ─────────────
+            if let Some(ref sess) = session {
+                let category = crate::memory::InteractionCategory::classify(&user_input, &[]);
+                let _ = sess
+                    .append_turn_with_metadata(
+                        "assistant",
                         &response,
-                        MemoryCategory::Conversation,
+                        Some("cli"),
+                        None,
+                        &category,
+                        None,
                         None,
                     )
                     .await;
@@ -2987,6 +3076,23 @@ pub async fn run(
             // Save coding tool calls from this turn to long-term memory.
             if config.memory.auto_save {
                 save_coding_memory_from_history(&history[history_len_before..], &mem).await;
+            }
+            // ── Memory promotion: short-term → Core + ontology ────────
+            if config.memory.auto_save {
+                let tool_hints_owned =
+                    extract_tool_hints_from_history(&history[history_len_before..]);
+                let tool_hints: Vec<&str> = tool_hints_owned.iter().map(|s| s.as_str()).collect();
+                promote_turn(
+                    &mem,
+                    ontology_repo.as_ref(),
+                    &user_input,
+                    &response,
+                    "cli",
+                    "user",
+                    &tool_hints,
+                    "default_user",
+                )
+                .await;
             }
             // ── Multi-model coding review ────────────────────────────
             let display_response = if let Some(reviewed) =
