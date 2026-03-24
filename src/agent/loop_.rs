@@ -2663,6 +2663,14 @@ pub(crate) async fn run_tool_call_loop(
     let mut consecutive_identical_outputs: usize = 0;
     let mut last_tool_output_hash: Option<u64> = None;
 
+    let mut loop_detector = crate::agent::loop_detector::LoopDetector::new(
+        crate::agent::loop_detector::LoopDetectorConfig {
+            enabled: pacing.loop_detection_enabled,
+            window_size: pacing.loop_detection_window_size,
+            max_repeats: pacing.loop_detection_max_repeats,
+        },
+    );
+
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
 
@@ -3076,7 +3084,11 @@ pub(crate) async fn run_tool_call_loop(
         if !display_text.is_empty() {
             if !native_tool_calls.is_empty() {
                 if let Some(ref tx) = on_delta {
-                    let _ = tx.send(display_text.clone()).await;
+                    let mut narration = display_text.clone();
+                    if !narration.ends_with('\n') {
+                        narration.push('\n');
+                    }
+                    let _ = tx.send(narration).await;
                 }
             }
             if !silent {
@@ -3365,9 +3377,54 @@ pub(crate) async fn run_tool_call_loop(
         // Collect tool results and build per-tool output for loop detection.
         // Only non-ignored tool outputs contribute to the identical-output hash.
         let mut detection_relevant_output = String::new();
-        for (tool_name, tool_call_id, outcome) in ordered_results.into_iter().flatten() {
+        // Use enumerate *before* filter_map so result_index stays aligned with
+        // tool_calls even when some ordered_results entries are None.
+        for (result_index, (tool_name, tool_call_id, outcome)) in ordered_results
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, opt)| opt.map(|v| (i, v)))
+        {
             if !loop_ignore_tools.contains(tool_name.as_str()) {
                 detection_relevant_output.push_str(&outcome.output);
+
+                // Feed the pattern-based loop detector with name + args + result.
+                let args = tool_calls
+                    .get(result_index)
+                    .map(|c| &c.arguments)
+                    .unwrap_or(&serde_json::Value::Null);
+                let det_result = loop_detector.record(&tool_name, args, &outcome.output);
+                match det_result {
+                    crate::agent::loop_detector::LoopDetectionResult::Ok => {}
+                    crate::agent::loop_detector::LoopDetectionResult::Warning(ref msg) => {
+                        tracing::warn!(tool = %tool_name, %msg, "loop detector warning");
+                        // Inject a system nudge so the LLM adjusts strategy.
+                        history.push(ChatMessage::system(format!("[Loop Detection] {msg}")));
+                    }
+                    crate::agent::loop_detector::LoopDetectionResult::Block(ref msg) => {
+                        tracing::warn!(tool = %tool_name, %msg, "loop detector blocked tool call");
+                        // Replace the tool output with the block message.
+                        // We still continue the loop so the LLM sees the block feedback.
+                        history.push(ChatMessage::system(format!(
+                            "[Loop Detection — BLOCKED] {msg}"
+                        )));
+                    }
+                    crate::agent::loop_detector::LoopDetectionResult::Break(msg) => {
+                        runtime_trace::record_event(
+                            "loop_detector_circuit_breaker",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(false),
+                            Some(&msg),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "tool": tool_name,
+                            }),
+                        );
+                        anyhow::bail!("Agent loop aborted by loop detector: {msg}");
+                    }
+                }
             }
             individual_results.push((tool_call_id, outcome.output.clone()));
             let _ = writeln!(
@@ -3565,7 +3622,13 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle, _reaction_handle) = tools::all_tools_with_runtime(
+    let (
+        mut tools_registry,
+        delegate_handle,
+        _reaction_handle,
+        _channel_map_handle,
+        _ask_user_handle,
+    ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -3980,6 +4043,14 @@ pub async fn run(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
+
+        // Prune history for token efficiency (when enabled).
+        if config.agent.history_pruning.enabled {
+            let _stats = crate::agent::history_pruner::prune_history(
+                &mut history,
+                &config.agent.history_pruning,
+            );
+        }
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
         let excluded_tools = compute_excluded_mcp_tools(
@@ -4402,23 +4473,28 @@ pub async fn process_message(
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle_pm, _reaction_handle_pm) =
-        tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            mem.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.workspace_dir,
-            &config.agents,
-            config.api_key.as_deref(),
-            &config,
-            None,
-        );
+    let (
+        mut tools_registry,
+        delegate_handle_pm,
+        _reaction_handle_pm,
+        _channel_map_handle_pm,
+        _ask_user_handle_pm,
+    ) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        None,
+    );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
@@ -6306,7 +6382,7 @@ mod tests {
 
         let explanation_idx = deltas
             .iter()
-            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.")
+            .position(|delta| delta == "Task started. Waiting 30 seconds before checking status.\n")
             .expect("native assistant text should be relayed to on_delta");
         let clear_idx = deltas
             .iter()
@@ -8156,6 +8232,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Always,
             tools: vec!["mcp_filesystem_*".into()],
             keywords: vec![],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "anything");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
@@ -8174,6 +8251,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Dynamic,
             tools: vec!["mcp_browser_*".into()],
             keywords: vec!["browse".into(), "website".into()],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "please browse this page");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
@@ -8190,6 +8268,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Dynamic,
             tools: vec!["mcp_browser_*".into()],
             keywords: vec!["browse".into(), "website".into()],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "read the file /etc/hosts");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
@@ -8206,6 +8285,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Dynamic,
             tools: vec!["mcp_browser_*".into()],
             keywords: vec!["Browse".into()],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "BROWSE the site");
         assert_eq!(result.len(), 1);

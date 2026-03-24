@@ -1416,8 +1416,20 @@ if [[ "$SKIP_BUILD" == false ]]; then
     step_dot "Cleaning stale build cache (upgrade detected)"
     cargo clean --release 2>/dev/null || true
   fi
+
+  # Determine cargo feature flags — disable prometheus on 32-bit targets
+  # (prometheus crate requires AtomicU64, unavailable on armv7l/armv6l)
+  CARGO_FEATURE_FLAGS=""
+  _build_arch="$(uname -m)"
+  case "$_build_arch" in
+    armv7l|armv6l|armhf)
+      step_dot "32-bit ARM detected ($_build_arch) — disabling prometheus (requires 64-bit atomics)"
+      CARGO_FEATURE_FLAGS="--no-default-features --features channel-nostr,skill-creation"
+      ;;
+  esac
+
   step_dot "Building release binary"
-  cargo build --release --locked
+  cargo build --release --locked $CARGO_FEATURE_FLAGS
   step_ok "Release binary built"
 else
   step_dot "Skipping build"
@@ -1436,7 +1448,7 @@ if [[ "$SKIP_INSTALL" == false ]]; then
     fi
   fi
 
-  cargo install --path "$WORK_DIR" --force --locked
+  cargo install --path "$WORK_DIR" --force --locked $CARGO_FEATURE_FLAGS
   step_ok "ZeroClaw installed"
 
   # Sync binary to ~/.local/bin so PATH lookups find the fresh version
@@ -1464,6 +1476,65 @@ if [[ "$SKIP_BUILD" == false && -d "$WORK_DIR/web" ]]; then
 else
   if [[ "$SKIP_BUILD" == true ]]; then
     step_dot "Skipping web dashboard build"
+  fi
+fi
+
+# --- Build desktop app (macOS only) ---
+if [[ "$SKIP_BUILD" == false && "$OS_NAME" == "Darwin" && -d "$WORK_DIR/apps/tauri" ]]; then
+  echo
+  echo -e "${BOLD}Desktop app preflight${RESET}"
+
+  _desktop_ok=true
+
+  # Check Rust toolchain
+  if have_cmd cargo && have_cmd rustc; then
+    step_ok "Rust $(rustc --version | awk '{print $2}') found"
+  else
+    step_fail "Rust toolchain not found — required for desktop app"
+    _desktop_ok=false
+  fi
+
+  # Check Xcode CLT (needed for linking native frameworks)
+  if xcode-select -p >/dev/null 2>&1; then
+    step_ok "Xcode Command Line Tools installed"
+  else
+    step_fail "Xcode Command Line Tools not found — run: xcode-select --install"
+    _desktop_ok=false
+  fi
+
+  # Check that the Tauri CLI is available (cargo-tauri or tauri-cli)
+  if have_cmd cargo-tauri; then
+    step_ok "cargo-tauri $(cargo tauri --version 2>/dev/null | awk '{print $NF}') found"
+  else
+    step_dot "cargo-tauri not found — installing"
+    if cargo install tauri-cli --locked 2>/dev/null; then
+      step_ok "cargo-tauri installed"
+    else
+      warn "Failed to install cargo-tauri — desktop app build may fail"
+    fi
+  fi
+
+  # Check node/npm (needed for web frontend that Tauri embeds)
+  if have_cmd node && have_cmd npm; then
+    step_ok "Node.js $(node --version) found"
+  else
+    warn "node/npm not found — desktop app needs the web dashboard built first"
+  fi
+
+  if [[ "$_desktop_ok" == true ]]; then
+    step_dot "Building desktop app (zeroclaw-desktop)"
+    if cargo build -p zeroclaw-desktop --release --locked 2>/dev/null; then
+      step_ok "Desktop app built"
+      # Copy binary to cargo bin for easy access
+      if [[ -x "$WORK_DIR/target/release/zeroclaw-desktop" ]]; then
+        cp -f "$WORK_DIR/target/release/zeroclaw-desktop" "$HOME/.cargo/bin/zeroclaw-desktop" 2>/dev/null && \
+          step_ok "zeroclaw-desktop installed to ~/.cargo/bin" || true
+      fi
+    else
+      warn "Desktop app build failed — you can build later with: cargo build -p zeroclaw-desktop --release"
+    fi
+  else
+    warn "Skipping desktop app build — fix missing dependencies above and re-run"
   fi
 fi
 
@@ -1633,6 +1704,9 @@ echo -e "${BOLD}Next steps:${RESET}"
 echo -e "  ${DIM}zeroclaw status${RESET}"
 echo -e "  ${DIM}zeroclaw agent -m \"Hello, ZeroClaw!\"${RESET}"
 echo -e "  ${DIM}zeroclaw gateway${RESET}"
+if [[ "$OS_NAME" == "Darwin" ]] && have_cmd zeroclaw-desktop; then
+  echo -e "  ${DIM}zeroclaw-desktop${RESET}              ${DIM}# Launch the menu bar app${RESET}"
+fi
 echo
 echo -e "${BOLD}Docs:${RESET} ${BLUE}https://www.zeroclawlabs.ai/docs${RESET}"
 echo

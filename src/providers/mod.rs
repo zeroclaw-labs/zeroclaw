@@ -46,7 +46,7 @@ use reliable::ReliableProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-const MAX_API_ERROR_CHARS: usize = 200;
+const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
 const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
@@ -890,9 +890,18 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         }
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
         name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
-        // Bedrock uses AWS AKSK from env vars (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY),
-        // not a single API key. Credential resolution happens inside BedrockProvider.
-        "bedrock" | "aws-bedrock" => return None,
+        // Bedrock supports Bearer token auth via BEDROCK_API_KEY env var, in addition
+        // to AWS AKSK (SigV4). If BEDROCK_API_KEY is set, return it; otherwise return
+        // None and let BedrockProvider handle SigV4 credential resolution internally.
+        "bedrock" | "aws-bedrock" => {
+            if let Ok(val) = std::env::var("BEDROCK_API_KEY") {
+                let trimmed = val.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+            return None;
+        }
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_doubao_alias(name) => {
             vec!["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"]
@@ -1247,7 +1256,13 @@ fn create_provider_with_url_and_options(
                 api_version.as_deref(),
             )))
         }
-        "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
+        "bedrock" | "aws-bedrock" => {
+            if let Some(api_key) = key {
+                Ok(Box::new(bedrock::BedrockProvider::with_bearer_token(api_key)))
+            } else {
+                Ok(Box::new(bedrock::BedrockProvider::new()))
+            }
+        }
         name if is_qwen_oauth_alias(name) => {
             let base_url = api_url
                 .map(str::trim)
@@ -2268,6 +2283,7 @@ mod tests {
     fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
         let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
         let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
+        let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", None);
 
         assert_eq!(
             resolve_provider_credential("bedrock", Some("explicit")),
@@ -2275,6 +2291,20 @@ mod tests {
         );
         assert!(resolve_provider_credential("bedrock", None).is_none());
         assert!(resolve_provider_credential("aws-bedrock", None).is_none());
+    }
+
+    #[test]
+    fn resolve_provider_credential_bedrock_returns_bearer_token_from_env() {
+        let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", Some("bedrock-bearer-token"));
+
+        assert_eq!(
+            resolve_provider_credential("bedrock", None),
+            Some("bedrock-bearer-token".to_string())
+        );
+        assert_eq!(
+            resolve_provider_credential("aws-bedrock", None),
+            Some("bedrock-bearer-token".to_string())
+        );
     }
 
     #[test]
@@ -3333,18 +3363,18 @@ mod tests {
 
     #[test]
     fn sanitize_truncates_long_error() {
-        let long = "a".repeat(400);
+        let long = "a".repeat(600);
         let result = sanitize_api_error(&long);
-        assert!(result.len() <= 203);
+        assert!(result.len() <= 503);
         assert!(result.ends_with("..."));
     }
 
     #[test]
     fn sanitize_truncates_after_scrub() {
-        let input = format!("{} sk-abcdef123456 {}", "a".repeat(190), "b".repeat(190));
+        let input = format!("{} sk-abcdef123456 {}", "a".repeat(290), "b".repeat(290));
         let result = sanitize_api_error(&input);
         assert!(!result.contains("sk-abcdef123456"));
-        assert!(result.len() <= 203);
+        assert!(result.len() <= 503);
     }
 
     #[test]

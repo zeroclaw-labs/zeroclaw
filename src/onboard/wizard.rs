@@ -172,6 +172,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
+        media_pipeline: crate::config::MediaPipelineConfig::default(),
         web_fetch: crate::config::WebFetchConfig::default(),
         link_enricher: crate::config::LinkEnricherConfig::default(),
         text_browser: crate::config::TextBrowserConfig::default(),
@@ -204,6 +205,12 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         locale: None,
         verifiable_intent: crate::config::VerifiableIntentConfig::default(),
         claude_code: crate::config::ClaudeCodeConfig::default(),
+        claude_code_runner: crate::config::ClaudeCodeRunnerConfig::default(),
+        codex_cli: crate::config::CodexCliConfig::default(),
+        gemini_cli: crate::config::GeminiCliConfig::default(),
+        opencode_cli: crate::config::OpenCodeCliConfig::default(),
+        sop: crate::config::SopConfig::default(),
+        shell_tool: crate::config::ShellToolConfig::default(),
     };
 
     println!(
@@ -606,6 +613,7 @@ async fn run_quick_setup_with_home(
         browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
+        media_pipeline: crate::config::MediaPipelineConfig::default(),
         web_fetch: crate::config::WebFetchConfig::default(),
         link_enricher: crate::config::LinkEnricherConfig::default(),
         text_browser: crate::config::TextBrowserConfig::default(),
@@ -638,6 +646,12 @@ async fn run_quick_setup_with_home(
         locale: None,
         verifiable_intent: crate::config::VerifiableIntentConfig::default(),
         claude_code: crate::config::ClaudeCodeConfig::default(),
+        claude_code_runner: crate::config::ClaudeCodeRunnerConfig::default(),
+        codex_cli: crate::config::CodexCliConfig::default(),
+        gemini_cli: crate::config::GeminiCliConfig::default(),
+        opencode_cli: crate::config::OpenCodeCliConfig::default(),
+        sop: crate::config::SopConfig::default(),
+        shell_tool: crate::config::ShellToolConfig::default(),
     };
 
     config.save().await?;

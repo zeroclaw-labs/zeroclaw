@@ -261,7 +261,13 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.delete_after_run = delete_after_run;
     }
     if let Some(allowed_tools) = patch.allowed_tools {
-        job.allowed_tools = Some(allowed_tools);
+        // Empty list means "clear the allowlist" (all tools available),
+        // not "allow zero tools".
+        if allowed_tools.is_empty() {
+            job.allowed_tools = None;
+        } else {
+            job.allowed_tools = Some(allowed_tools);
+        }
     }
 
     if schedule_changed {

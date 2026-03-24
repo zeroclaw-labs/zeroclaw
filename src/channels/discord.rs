@@ -23,6 +23,7 @@ pub struct DiscordChannel {
     /// Voice transcription config — when set, audio attachments are
     /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
 }
 
 impl DiscordChannel {
@@ -42,6 +43,7 @@ impl DiscordChannel {
             typing_handles: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
+            transcription_manager: None,
         }
     }
 
@@ -53,8 +55,19 @@ impl DiscordChannel {
 
     /// Configure voice transcription for audio attachments.
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
         }
         self
     }
@@ -148,7 +161,7 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
 async fn transcribe_discord_audio_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
-    config: &crate::config::TranscriptionConfig,
+    manager: &super::transcription::TranscriptionManager,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     for att in attachments {
@@ -187,7 +200,7 @@ async fn transcribe_discord_audio_attachments(
             }
         };
 
-        match super::transcription::transcribe_audio(audio_data, name, config).await {
+        match manager.transcribe(&audio_data, name).await {
             Ok(text) => {
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
@@ -835,11 +848,11 @@ impl Channel for DiscordChannel {
                         let mut text_parts = process_attachments(&atts, &client).await;
 
                         // Transcribe audio attachments when transcription is configured
-                        if let Some(ref transcription_config) = self.transcription {
+                        if let Some(ref transcription_manager) = self.transcription_manager {
                             let voice_text = transcribe_discord_audio_attachments(
                                 &atts,
                                 &client,
-                                transcription_config,
+                                transcription_manager,
                             )
                             .await;
                             if !voice_text.is_empty() {
@@ -914,6 +927,7 @@ impl Channel for DiscordChannel {
                             .as_secs(),
                         thread_ts: None,
                         interruption_scope_id: None,
+                    attachments: vec![],
                     };
 
                     if tx.send(channel_msg).await.is_err() {
