@@ -578,6 +578,10 @@ async fn pin_multiple_messages_in_same_channel() {
 // 6. MESSAGE REDACTION SUPPORT
 // ═════════════════════════════════════════════════════════════════════════════
 
+/// Tests that MatrixTestChannel correctly records redaction events.
+/// This validates the mock contract, not the trait default or real implementation.
+/// Trait default coverage: `src/channels/traits.rs::default_redact_message_returns_success`
+/// Real implementation coverage: requires live Matrix integration tests (not in this suite).
 #[tokio::test]
 async fn redact_message_lifecycle() {
     let ch = MatrixTestChannel::new("matrix");
