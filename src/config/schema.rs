@@ -120,6 +120,10 @@ pub struct Config {
     #[serde(default)]
     pub autonomy: AutonomyConfig,
 
+    /// Trust scoring and regression detection configuration (`[trust]`).
+    #[serde(default)]
+    pub trust: crate::trust::TrustConfig,
+
     /// Security subsystem configuration (`[security]`).
     #[serde(default)]
     pub security: SecurityConfig,
@@ -7851,6 +7855,7 @@ impl Default for Config {
             extra_headers: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            trust: crate::trust::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -10853,6 +10858,7 @@ default_temperature = 0.7
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
             },
+            trust: crate::trust::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),
@@ -11435,6 +11441,7 @@ default_temperature = 0.7
             extra_headers: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            trust: crate::trust::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
             cloud_ops: CloudOpsConfig::default(),

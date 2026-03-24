@@ -73,6 +73,7 @@ pub(crate) mod service;
 pub(crate) mod skills;
 pub mod sop;
 pub mod tools;
+pub(crate) mod trust;
 pub(crate) mod tunnel;
 pub(crate) mod util;
 pub mod verifiable_intent;
