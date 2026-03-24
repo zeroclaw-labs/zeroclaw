@@ -854,6 +854,15 @@ impl SecurityPolicy {
 
         let risk = self.command_risk_level(command);
 
+        // When the operator has set `allowed_commands = ["*"]` AND explicitly
+        // disabled `block_high_risk_commands`, they have opted out of all
+        // command-level restrictions.  Short-circuit: skip the risk and
+        // autonomy gates entirely.  See #4485.
+        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        if has_wildcard && !self.block_high_risk_commands {
+            return Ok(risk);
+        }
+
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
@@ -3082,5 +3091,37 @@ mod tests {
             summary.contains("`/opt/tools`"),
             "should list allowed roots"
         );
+    }
+
+    #[test]
+    fn wildcard_with_block_high_risk_false_allows_everything() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p
+            .validate_command_execution("rm -rf /tmp/test", true)
+            .is_ok());
+        assert!(p.validate_command_execution("nohup firefox", true).is_ok());
+        assert!(p
+            .validate_command_execution("ls /usr/bin/firefox", true)
+            .is_ok());
+    }
+
+    #[test]
+    fn wildcard_with_block_high_risk_true_still_blocks() {
+        // Ensure the existing safety net is preserved: wildcard + block_high_risk_commands=true
+        // should still block high-risk commands.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("high-risk"));
     }
 }
