@@ -15,6 +15,7 @@ pub mod canvas;
 pub mod nodes;
 pub mod sse;
 pub mod static_files;
+pub mod tls;
 pub mod ws;
 
 use crate::channels::{
@@ -962,16 +963,81 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         inner
     };
 
-    // Run the server with graceful shutdown
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_rx.changed().await;
-        tracing::info!("🦀 ZeroClaw Gateway shutting down...");
-    })
-    .await?;
+    // ── TLS / mTLS setup ───────────────────────────────────────────
+    let tls_acceptor = match &config.gateway.tls {
+        Some(tls_cfg) if tls_cfg.enabled => {
+            let has_mtls = tls_cfg.client_auth.as_ref().is_some_and(|ca| ca.enabled);
+            if has_mtls {
+                tracing::info!("TLS enabled with mutual TLS (mTLS) client verification");
+            } else {
+                tracing::info!("TLS enabled (no client certificate requirement)");
+            }
+            Some(tls::build_tls_acceptor(tls_cfg)?)
+        }
+        _ => None,
+    };
+
+    if let Some(tls_acceptor) = tls_acceptor {
+        // Manual TLS accept loop — serves each connection via hyper.
+        let app = app.into_make_service_with_connect_info::<SocketAddr>();
+        let mut app = app;
+
+        let mut shutdown_signal = shutdown_rx;
+        loop {
+            tokio::select! {
+                conn = listener.accept() => {
+                    let (tcp_stream, remote_addr) = conn?;
+                    let tls_acceptor = tls_acceptor.clone();
+                    let svc = tower::MakeService::<
+                        SocketAddr,
+                        hyper::Request<hyper::body::Incoming>,
+                    >::make_service(&mut app, remote_addr)
+                    .await
+                    .expect("infallible make_service");
+
+                    tokio::spawn(async move {
+                        let tls_stream = match tls_acceptor.accept(tcp_stream).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::debug!("TLS handshake failed from {remote_addr}: {e}");
+                                return;
+                            }
+                        };
+                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        let hyper_svc = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                            let mut svc = svc.clone();
+                            async move {
+                                tower::Service::call(&mut svc, req).await
+                            }
+                        });
+                        if let Err(e) = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(io, hyper_svc)
+                        .await
+                        {
+                            tracing::debug!("connection error from {remote_addr}: {e}");
+                        }
+                    });
+                }
+                _ = shutdown_signal.changed() => {
+                    tracing::info!("🦀 ZeroClaw Gateway shutting down...");
+                    break;
+                }
+            }
+        }
+    } else {
+        // Plain TCP — use axum's built-in serve.
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown_rx.changed().await;
+            tracing::info!("🦀 ZeroClaw Gateway shutting down...");
+        })
+        .await?;
+    }
 
     Ok(())
 }

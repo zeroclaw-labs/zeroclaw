@@ -1,6 +1,9 @@
-use super::traits::{ChatMessage, ChatRequest, ChatResponse};
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+};
 use super::Provider;
 use async_trait::async_trait;
+use futures_util::stream::BoxStream;
 use std::collections::HashMap;
 
 /// A single route: maps a task hint to a provider + model combo.
@@ -158,6 +161,42 @@ impl Provider for RouterProvider {
             .unwrap_or(false)
     }
 
+    fn supports_streaming(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, provider)| provider.supports_streaming())
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, provider)| provider.supports_streaming_tool_events())
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider.stream_chat(request, &resolved_model, temperature, options)
+    }
+
     fn supports_vision(&self) -> bool {
         self.providers
             .iter()
@@ -178,6 +217,8 @@ impl Provider for RouterProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolSpec;
+    use futures_util::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -271,6 +312,179 @@ mod tests {
             self.as_ref()
                 .chat_with_system(system_prompt, message, model, temperature)
                 .await
+        }
+    }
+
+    struct StreamingMockProvider {
+        stream_calls: Arc<AtomicUsize>,
+        last_stream_model: parking_lot::Mutex<String>,
+        response: &'static str,
+    }
+
+    impl StreamingMockProvider {
+        fn new(response: &'static str) -> Self {
+            Self {
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                last_stream_model: parking_lot::Mutex::new(String::new()),
+                response,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StreamingMockProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_stream_model.lock() = model.to_string();
+            let chunks = vec![
+                Ok(StreamChunk::delta(self.response)),
+                Ok(StreamChunk::final_chunk()),
+            ];
+            futures_util::stream::iter(chunks).boxed()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Arc<StreamingMockProvider> {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.as_ref()
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.as_ref().supports_streaming()
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            model: &str,
+            temperature: f64,
+            options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+            self.as_ref()
+                .stream_chat_with_history(messages, model, temperature, options)
+        }
+    }
+
+    struct ToolEventStreamingMockProvider {
+        stream_calls: Arc<AtomicUsize>,
+        tool_event_calls: Arc<AtomicUsize>,
+        last_stream_model: parking_lot::Mutex<String>,
+    }
+
+    impl ToolEventStreamingMockProvider {
+        fn new() -> Self {
+            Self {
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                tool_event_calls: Arc::new(AtomicUsize::new(0)),
+                last_stream_model: parking_lot::Mutex::new(String::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ToolEventStreamingMockProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if request.tools.is_some_and(|tools| !tools.is_empty()) {
+                self.tool_event_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            *self.last_stream_model.lock() = model.to_string();
+            futures_util::stream::iter(vec![
+                Ok(StreamEvent::ToolCall(crate::providers::ToolCall {
+                    id: "call_router_1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: r#"{"command":"date"}"#.to_string(),
+                })),
+                Ok(StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Arc<ToolEventStreamingMockProvider> {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.as_ref()
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.as_ref().supports_streaming()
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.as_ref().supports_streaming_tool_events()
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: f64,
+            options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            self.as_ref()
+                .stream_chat(request, model, temperature, options)
         }
     }
 
@@ -460,5 +674,138 @@ mod tests {
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
         assert_eq!(mocks[0].call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn supports_streaming_returns_true_when_any_provider_supports_it() {
+        let streaming = Arc::new(StreamingMockProvider::new("stream"));
+        let router = RouterProvider::new(
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockProvider::new("default")) as Box<dyn Provider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(Arc::clone(&streaming)) as Box<dyn Provider>,
+                ),
+            ],
+            vec![(
+                "reasoning".into(),
+                Route {
+                    provider_name: "streaming".into(),
+                    model: "claude-opus".into(),
+                },
+            )],
+            "model".into(),
+        );
+
+        assert!(router.supports_streaming());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_routes_hint_to_correct_provider_and_model() {
+        let streaming = Arc::new(StreamingMockProvider::new("streamed response"));
+        let router = RouterProvider::new(
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockProvider::new("default")) as Box<dyn Provider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(Arc::clone(&streaming)) as Box<dyn Provider>,
+                ),
+            ],
+            vec![(
+                "reasoning".into(),
+                Route {
+                    provider_name: "streaming".into(),
+                    model: "claude-opus".into(),
+                },
+            )],
+            "model".into(),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream = router.stream_chat_with_history(
+            &messages,
+            "hint:reasoning",
+            0.0,
+            StreamOptions::new(true),
+        );
+
+        let mut collected = String::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("stream chunk should be ok");
+            collected.push_str(&chunk.delta);
+        }
+
+        assert_eq!(collected, "streamed response");
+        assert_eq!(streaming.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
+    }
+
+    #[tokio::test]
+    async fn stream_chat_routes_hint_with_structured_tool_events() {
+        let streaming = Arc::new(ToolEventStreamingMockProvider::new());
+        let router = RouterProvider::new(
+            vec![
+                (
+                    "default".into(),
+                    Box::new(MockProvider::new("default")) as Box<dyn Provider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(Arc::clone(&streaming)) as Box<dyn Provider>,
+                ),
+            ],
+            vec![(
+                "reasoning".into(),
+                Route {
+                    provider_name: "streaming".into(),
+                    model: "claude-opus".into(),
+                },
+            )],
+            "model".into(),
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "run shell commands".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            }),
+        }];
+
+        let mut stream = router.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+            },
+            "hint:reasoning",
+            0.0,
+            StreamOptions::new(true),
+        );
+
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        match first {
+            StreamEvent::ToolCall(call) => {
+                assert_eq!(call.name, "shell");
+                assert_eq!(call.arguments, r#"{"command":"date"}"#);
+            }
+            other => panic!("expected tool-call event, got {other:?}"),
+        }
+        assert!(matches!(second, StreamEvent::Final));
+        assert_eq!(streaming.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(streaming.tool_event_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*streaming.last_stream_model.lock(), "claude-opus");
     }
 }

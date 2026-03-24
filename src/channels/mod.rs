@@ -3952,7 +3952,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     sl.bot_token.clone(),
                     sl.app_token.clone(),
                     sl.channel_id.clone(),
-                    Vec::new(),
+                    sl.channel_ids.clone(),
                     sl.allowed_users.clone(),
                 )
                 .with_workspace_dir(config.workspace_dir.clone())
@@ -4081,7 +4081,7 @@ fn collect_configured_channels(
                     sl.bot_token.clone(),
                     sl.app_token.clone(),
                     sl.channel_id.clone(),
-                    Vec::new(),
+                    sl.channel_ids.clone(),
                     sl.allowed_users.clone(),
                 )
                 .with_thread_replies(sl.thread_replies.unwrap_or(true))

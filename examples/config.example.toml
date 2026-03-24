@@ -117,3 +117,14 @@ allow_override = false
 # Also transcribe non-PTT (forwarded / regular) audio on WhatsApp.
 # Default: false (only voice notes are transcribed).
 # transcribe_non_ptt_audio = false
+
+# ── Gateway TLS / mTLS Configuration ──────────────────────────
+# [gateway.tls]
+# enabled = false
+# cert_path = "/path/to/server.crt"
+# key_path = "/path/to/server.key"
+# [gateway.tls.client_auth]
+# enabled = false
+# ca_cert_path = "/path/to/ca.crt"
+# require_client_cert = true
+# pinned_certs = []

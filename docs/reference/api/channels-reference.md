@@ -181,11 +181,13 @@ mention_only = false
 bot_token = "xoxb-..."
 app_token = "xapp-..."             # optional
 channel_id = "C1234567890"         # optional: single channel; omit or "*" for all accessible channels
+channel_ids = ["C1234567890"]      # optional: explicit channel list; takes precedence over channel_id
 allowed_users = ["*"]
 ```
 
 Slack listen behavior:
 
+- `channel_ids = ["C123...", "D456..."]`: listen only on the listed channels/DMs.
 - `channel_id = "C123..."`: listen only on that channel.
 - `channel_id = "*"` or omitted: auto-discover and listen across all accessible channels.
 
