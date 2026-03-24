@@ -80,6 +80,7 @@ pub mod report_templates;
 pub mod schedule;
 pub mod schema;
 pub mod screenshot;
+pub mod secrets_tools;
 pub mod security_ops;
 pub mod sessions;
 pub mod shell;
@@ -159,6 +160,8 @@ pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
+#[allow(unused_imports)]
+pub use secrets_tools::{SecretsGetTool, SecretsListTool, SecretsStoreTool};
 pub use security_ops::SecurityOpsTool;
 pub use sessions::{
     SessionStatusTool, SessionsHistoryTool, SessionsListTool, SessionsSearchTool, SessionsSendTool,
@@ -682,6 +685,26 @@ pub fn all_tools_with_runtime(
             security.clone(),
         )));
         tool_arcs.push(Arc::new(SessionsSearchTool::new(backend, security.clone())));
+    }
+
+    // Secrets management tools (encrypted vault)
+    {
+        let secret_store =
+            crate::security::SecretStore::new(workspace_dir, root_config.secrets.encrypt);
+        tool_arcs.push(Arc::new(SecretsListTool::new(
+            workspace_dir,
+            secret_store.clone(),
+        )));
+        tool_arcs.push(Arc::new(SecretsGetTool::new(
+            workspace_dir,
+            secret_store.clone(),
+            security.clone(),
+        )));
+        tool_arcs.push(Arc::new(SecretsStoreTool::new(
+            workspace_dir,
+            secret_store,
+            security.clone(),
+        )));
     }
 
     // LinkedIn integration (config-gated)
