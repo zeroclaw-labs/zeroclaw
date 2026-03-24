@@ -13,6 +13,7 @@ use zip::ZipArchive;
 mod audit;
 #[cfg(feature = "skill-creation")]
 pub mod creator;
+pub mod testing;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -1434,6 +1435,44 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 console::style("✓").green().bold(),
                 name
             );
+            Ok(())
+        }
+        crate::SkillCommands::Test { name, verbose } => {
+            let results = if let Some(ref skill_name) = name {
+                // Test a single skill
+                let source_path = PathBuf::from(skill_name);
+                let target = if source_path.exists() {
+                    source_path
+                } else {
+                    skills_dir(workspace_dir).join(skill_name)
+                };
+
+                if !target.exists() {
+                    anyhow::bail!("Skill not found: {}", skill_name);
+                }
+
+                let r = testing::test_skill(&target, skill_name, verbose)?;
+                if r.tests_run == 0 {
+                    println!(
+                        "  {} No TEST.sh found for skill '{}'.",
+                        console::style("-").dim(),
+                        skill_name,
+                    );
+                    return Ok(());
+                }
+                vec![r]
+            } else {
+                // Test all skills
+                let dirs = vec![skills_dir(workspace_dir)];
+                testing::test_all_skills(&dirs, verbose)?
+            };
+
+            testing::print_results(&results);
+
+            let any_failed = results.iter().any(|r| !r.failures.is_empty());
+            if any_failed {
+                anyhow::bail!("Some skill tests failed.");
+            }
             Ok(())
         }
     }

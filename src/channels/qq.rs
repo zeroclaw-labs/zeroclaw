@@ -976,7 +976,9 @@ impl Channel for QQChannel {
         let gw_url = self.get_gateway_url(&token).await?;
 
         tracing::info!("QQ: connecting to gateway WebSocket...");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&gw_url).await?;
+        let (ws_stream, _) =
+            crate::config::ws_connect_with_proxy(&gw_url, "channel.qq", self.proxy_url.as_deref())
+                .await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)

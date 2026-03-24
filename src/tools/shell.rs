@@ -8,8 +8,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Maximum shell command execution time before kill.
-const SHELL_TIMEOUT_SECS: u64 = 60;
+/// Default maximum shell command execution time before kill.
+const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
@@ -46,6 +46,7 @@ pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
+    timeout_secs: u64,
 }
 
 impl ShellTool {
@@ -54,6 +55,7 @@ impl ShellTool {
             security,
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
+            timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
         }
     }
 
@@ -66,7 +68,14 @@ impl ShellTool {
             security,
             runtime,
             sandbox,
+            timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
         }
+    }
+
+    /// Override the command execution timeout (in seconds).
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
     }
 }
 
@@ -203,8 +212,8 @@ impl Tool for ShellTool {
             }
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
+        let timeout_secs = self.timeout_secs;
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -248,7 +257,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {timeout_secs}s and was killed"
                 )),
             }),
         }
@@ -607,8 +616,18 @@ mod tests {
     // ── shell timeout enforcement tests ─────────────────
 
     #[test]
-    fn shell_timeout_constant_is_reasonable() {
-        assert_eq!(SHELL_TIMEOUT_SECS, 60, "shell timeout must be 60 seconds");
+    fn shell_timeout_default_is_reasonable() {
+        assert_eq!(
+            DEFAULT_SHELL_TIMEOUT_SECS, 60,
+            "default shell timeout must be 60 seconds"
+        );
+    }
+
+    #[test]
+    fn shell_timeout_can_be_overridden() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_timeout_secs(120);
+        assert_eq!(tool.timeout_secs, 120);
     }
 
     #[test]

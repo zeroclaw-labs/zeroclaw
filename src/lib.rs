@@ -259,6 +259,14 @@ pub enum SkillCommands {
         /// Skill name to remove
         name: String,
     },
+    /// Run TEST.sh validation for a skill (or all skills)
+    Test {
+        /// Skill name to test; omit for all skills
+        name: Option<String>,
+        /// Show verbose output
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 /// Migration subcommands

@@ -27,7 +27,7 @@ RUN npm run build
 FROM rust:1.94-bookworm AS builder
 
 WORKDIR /app
-ARG ZEROCLAW_CARGO_FEATURES="memory-postgres"
+ARG ZEROCLAW_CARGO_FEATURES="memory-postgres,channel-lark"
 
 # Install build dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
@@ -89,6 +89,10 @@ RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace && \
         'port = 42617' \
         'host = "[::]"' \
         'allow_public_bind = true' \
+        '' \
+        '[autonomy]' \
+        'level = "supervised"' \
+        'auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]' \
         > /zeroclaw-data/.zeroclaw/config.toml && \
     chown -R 65534:65534 /zeroclaw-data
 

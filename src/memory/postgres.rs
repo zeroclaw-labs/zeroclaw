@@ -19,6 +19,8 @@ const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 pub struct PostgresMemory {
     client: Arc<Mutex<Client>>,
     qualified_table: String,
+    pgvector_enabled: bool,
+    pgvector_dimensions: usize,
 }
 
 impl PostgresMemory {
@@ -27,6 +29,8 @@ impl PostgresMemory {
         schema: &str,
         table: &str,
         connect_timeout_secs: Option<u64>,
+        pgvector_enabled: Option<bool>,
+        pgvector_dimensions: Option<usize>,
     ) -> Result<Self> {
         validate_identifier(schema, "storage schema")?;
         validate_identifier(table, "storage table")?;
@@ -42,10 +46,34 @@ impl PostgresMemory {
             qualified_table.clone(),
         )?;
 
-        Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-            qualified_table,
-        })
+        let pgvector_enabled = pgvector_enabled.unwrap_or(false);
+        let pgvector_dimensions = pgvector_dimensions.unwrap_or(1536);
+
+        if pgvector_enabled {
+            let client_ref = Arc::new(Mutex::new(client));
+            let ext_ok = {
+                let mut c = client_ref.lock();
+                Self::try_enable_pgvector(&mut c, &qualified_table, pgvector_dimensions).is_ok()
+            };
+            if !ext_ok {
+                tracing::warn!(
+                    "pgvector extension not available; falling back to keyword-only recall"
+                );
+            }
+            Ok(Self {
+                client: client_ref,
+                qualified_table,
+                pgvector_enabled: ext_ok,
+                pgvector_dimensions,
+            })
+        } else {
+            Ok(Self {
+                client: Arc::new(Mutex::new(client)),
+                qualified_table,
+                pgvector_enabled: false,
+                pgvector_dimensions,
+            })
+        }
     }
 
     fn initialize_client(
@@ -126,6 +154,27 @@ impl PostgresMemory {
         }
     }
 
+    fn try_enable_pgvector(
+        client: &mut Client,
+        qualified_table: &str,
+        dimensions: usize,
+    ) -> Result<()> {
+        client.batch_execute("CREATE EXTENSION IF NOT EXISTS vector")?;
+        client.batch_execute(&format!(
+            r#"
+            DO $$ BEGIN
+                ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS namespace TEXT DEFAULT 'default';
+                ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS importance REAL;
+                ALTER TABLE {qualified_table} ADD COLUMN IF NOT EXISTS embedding vector({dimensions});
+            EXCEPTION WHEN OTHERS THEN
+                RAISE NOTICE 'pgvector columns could not be added: %', SQLERRM;
+            END $$;
+            CREATE INDEX IF NOT EXISTS idx_memories_namespace ON {qualified_table}(namespace);
+            "#
+        ))?;
+        Ok(())
+    }
+
     fn row_to_entry(row: &Row) -> Result<MemoryEntry> {
         let timestamp: DateTime<Utc> = row.get(4);
 
@@ -137,8 +186,10 @@ impl PostgresMemory {
             timestamp: timestamp.to_rfc3339(),
             session_id: row.get(5),
             score: row.try_get(6).ok(),
-            namespace: "default".into(),
-            importance: None,
+            namespace: row
+                .try_get::<_, String>(7)
+                .unwrap_or_else(|_| "default".into()),
+            importance: row.try_get(8).ok(),
             superseded_by: None,
         })
     }
@@ -437,6 +488,8 @@ mod tests {
                 "public",
                 "memories",
                 Some(1),
+                None,
+                None,
             )
         });
 

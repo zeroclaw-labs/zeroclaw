@@ -59,6 +59,8 @@ fn create_cli_memory(config: &Config) -> Result<Box<dyn Memory>> {
                     &sp.schema,
                     &sp.table,
                     sp.connect_timeout_secs,
+                    Some(sp.pgvector_enabled),
+                    Some(sp.pgvector_dimensions),
                 )?;
                 Ok(Box::new(mem))
             }

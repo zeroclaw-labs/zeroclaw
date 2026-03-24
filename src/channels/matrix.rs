@@ -42,6 +42,8 @@ pub struct MatrixChannel {
     http_client: Client,
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
     voice_mode: Arc<AtomicBool>,
+    transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -215,7 +217,28 @@ impl MatrixChannel {
             http_client: Client::new(),
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
             voice_mode: Arc::new(AtomicBool::new(false)),
+            transcription: None,
+            transcription_manager: None,
         }
+    }
+
+    /// Configure voice transcription for audio messages.
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
+        }
+        self
     }
 
     fn encode_path_segment(value: &str) -> String {
@@ -763,6 +786,7 @@ impl Channel for MatrixChannel {
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
+        let transcription_mgr_for_handler = self.transcription_manager.clone();
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -774,6 +798,7 @@ impl Channel for MatrixChannel {
             let homeserver = homeserver_for_handler.clone();
             let access_token = access_token_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
+            let transcription_mgr = transcription_mgr_for_handler.clone();
 
             async move {
                 if !MatrixChannel::room_matches_target(
@@ -875,51 +900,36 @@ impl Channel for MatrixChannel {
 
                 // Voice transcription: if this was an audio message, transcribe it
                 let body = if body.starts_with("[audio:") {
-                    if let Some(path_start) = body.find("saved to ") {
+                    if let (Some(path_start), Some(ref manager)) = (body.find("saved to "), &transcription_mgr) {
                         let audio_path = body[path_start + 9..].to_string();
-                        let wav_path = format!("{}.16k.wav", audio_path);
-                        let convert_ok = tokio::process::Command::new("ffmpeg")
-                            .args([
-                                "-y",
-                                "-i",
-                                &audio_path,
-                                "-ar",
-                                "16000",
-                                "-ac",
-                                "1",
-                                "-f",
-                                "wav",
-                                &wav_path,
-                            ])
-                            .stderr(std::process::Stdio::null())
-                            .output()
-                            .await
-                            .map(|o| o.status.success())
-                            .unwrap_or(false);
-                        if convert_ok {
-                            let transcription = tokio::process::Command::new("whisper-cpp")
-                                .args([
-                                    "-m",
-                                    "/tmp/ggml-base.en.bin",
-                                    "-f",
-                                    &wav_path,
-                                    "--no-timestamps",
-                                    "-nt",
-                                ])
-                                .output()
-                                .await
-                                .ok()
-                                .filter(|o| o.status.success())
-                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                                .filter(|s| !s.is_empty());
-                            if let Some(text) = transcription {
-                                voice_mode.store(true, Ordering::Relaxed);
-                                format!("[Voice message]: {}", text)
-                            } else {
+                        let file_name = audio_path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("audio.ogg")
+                            .to_string();
+                        match tokio::fs::read(&audio_path).await {
+                            Ok(audio_data) => {
+                                match manager.transcribe(&audio_data, &file_name).await {
+                                    Ok(text) => {
+                                        let trimmed = text.trim();
+                                        if trimmed.is_empty() {
+                                            tracing::info!("Matrix: voice transcription returned empty text, skipping");
+                                            body
+                                        } else {
+                                            voice_mode.store(true, Ordering::Relaxed);
+                                            format!("[Voice message]: {}", trimmed)
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("Matrix: voice transcription failed: {e}");
+                                        body
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Matrix: failed to read audio file {}: {e}", audio_path);
                                 body
                             }
-                        } else {
-                            body
                         }
                     } else {
                         body
@@ -1224,6 +1234,31 @@ impl Channel for MatrixChannel {
             anyhow::bail!("Matrix unpin_message failed: {err}");
         }
 
+        Ok(())
+    }
+
+    async fn redact_message(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        let client = self
+            .sdk_client
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Matrix SDK client not initialized"))?;
+
+        let target_room_id = self.target_room_id().await?;
+        let target_room: OwnedRoomId = target_room_id.parse()?;
+        let room = client
+            .get_room(&target_room)
+            .ok_or_else(|| anyhow::anyhow!("Matrix room not found for message redaction"))?;
+
+        let event_id: OwnedEventId = message_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid event ID: {}", message_id))?;
+
+        room.redact(&event_id, reason.as_deref(), None).await?;
         Ok(())
     }
 }

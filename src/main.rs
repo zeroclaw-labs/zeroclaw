@@ -536,6 +536,25 @@ Examples:
         shell: CompletionShell,
     },
 
+    /// Launch or install the companion desktop app
+    #[command(long_about = "\
+Launch the ZeroClaw companion desktop app.
+
+The companion app is a lightweight menu bar / system tray application \
+that connects to the same gateway as the CLI. It provides quick access \
+to the dashboard, status monitoring, and device pairing.
+
+Use --install to download the pre-built companion app for your platform.
+
+Examples:
+  zeroclaw desktop              # launch the companion app
+  zeroclaw desktop --install    # download and install it")]
+    Desktop {
+        /// Download and install the companion app
+        #[arg(long)]
+        install: bool,
+    },
+
     /// Manage WASM plugins
     #[cfg(feature = "plugins-wasm")]
     Plugin {
@@ -1323,6 +1342,122 @@ async fn main() -> Result<()> {
                 &config,
             ))
             .await
+        }
+
+        Commands::Desktop {
+            install: do_install,
+        } => {
+            let download_url = "https://www.zeroclawlabs.ai/download";
+
+            if do_install {
+                println!("Download the ZeroClaw companion app:");
+                println!();
+                #[cfg(target_os = "macos")]
+                {
+                    println!("  macOS:  {download_url}");
+                    println!();
+                    println!("Or install via Homebrew (coming soon):");
+                    println!("  brew install --cask zeroclaw");
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    println!("  Linux:  {download_url}");
+                    println!();
+                    println!("  Download the .deb or .AppImage for your architecture.");
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
+                    println!("  {download_url}");
+                }
+                println!();
+
+                // On macOS, open the download page in the browser
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = std::process::Command::new("open").arg(download_url).spawn();
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(download_url)
+                        .spawn();
+                }
+                return Ok(());
+            }
+
+            // Locate the companion app
+            let desktop_bin = {
+                let mut found = None;
+
+                // 1. macOS: check /Applications/ZeroClaw.app
+                #[cfg(target_os = "macos")]
+                {
+                    let app_paths = [
+                        PathBuf::from("/Applications/ZeroClaw.app/Contents/MacOS/ZeroClaw"),
+                        PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                            .join("Applications/ZeroClaw.app/Contents/MacOS/ZeroClaw"),
+                    ];
+                    for app in &app_paths {
+                        if app.is_file() {
+                            found = Some(app.clone());
+                            break;
+                        }
+                    }
+                }
+
+                // 2. Same directory as the current executable
+                if found.is_none() {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let sibling = exe.with_file_name("zeroclaw-desktop");
+                        if sibling.is_file() {
+                            found = Some(sibling);
+                        }
+                    }
+                }
+
+                // 3. ~/.cargo/bin/zeroclaw-desktop or ~/.local/bin/zeroclaw-desktop
+                if found.is_none() {
+                    if let Some(home) = std::env::var_os("HOME") {
+                        let home = PathBuf::from(home);
+                        for dir in &[".cargo/bin", ".local/bin"] {
+                            let candidate = home.join(dir).join("zeroclaw-desktop");
+                            if candidate.is_file() {
+                                found = Some(candidate);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 4. Fallback to PATH lookup
+                if found.is_none() {
+                    if let Ok(path) = which::which("zeroclaw-desktop") {
+                        found = Some(path);
+                    }
+                }
+
+                found
+            };
+
+            match desktop_bin {
+                Some(bin) => {
+                    println!("Launching ZeroClaw companion app...");
+                    let _child = std::process::Command::new(&bin)
+                        .spawn()
+                        .with_context(|| format!("Failed to launch {}", bin.display()))?;
+                    Ok(())
+                }
+                None => {
+                    println!("ZeroClaw companion app is not installed.");
+                    println!();
+                    println!("  Download it at: {download_url}");
+                    println!("  Or run: zeroclaw desktop --install");
+                    println!();
+                    println!("The companion app is a lightweight menu bar app that");
+                    println!("connects to the same gateway as the CLI.");
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Update {
