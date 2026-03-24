@@ -72,6 +72,7 @@ pub mod memory_store;
 pub mod microsoft365;
 pub mod model_routing_config;
 pub mod model_switch;
+pub mod node_capabilities;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod opencode_cli;
