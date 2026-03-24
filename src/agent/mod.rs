@@ -1,7 +1,9 @@
 #[allow(clippy::module_inception)]
 pub mod agent;
 pub mod classifier;
+pub mod context_analyzer;
 pub mod dispatcher;
+pub mod history_pruner;
 pub mod loop_;
 pub mod loop_detector;
 pub mod memory_loader;
