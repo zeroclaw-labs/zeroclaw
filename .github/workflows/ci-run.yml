@@ -7,7 +7,7 @@ on:
     branches: [master]
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.sha }}
+  group: ci-${{ github.event.pull_request.number || 'push-master' }}
   cancel-in-progress: true
 
 permissions:

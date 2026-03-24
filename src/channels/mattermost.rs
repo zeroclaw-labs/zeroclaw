@@ -1212,6 +1212,7 @@ mod tests {
                 assemblyai: None,
                 google: None,
                 local_whisper: None,
+                transcribe_non_ptt_audio: false,
             },
         );
         assert!(ch.transcription_manager.is_some());
@@ -1234,6 +1235,7 @@ mod tests {
                 assemblyai: None,
                 google: None,
                 local_whisper: None,
+                transcribe_non_ptt_audio: false,
             },
         );
         assert!(ch.transcription_manager.is_none());
@@ -1376,6 +1378,7 @@ mod tests {
                 assemblyai: None,
                 google: None,
                 local_whisper: None,
+                transcribe_non_ptt_audio: false,
             },
         );
 
@@ -1448,6 +1451,7 @@ mod tests {
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
                 }),
+                transcribe_non_ptt_audio: false,
             });
 
             let post = json!({
@@ -1497,6 +1501,7 @@ mod tests {
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
                 }),
+                transcribe_non_ptt_audio: false,
             });
 
             let post = json!({

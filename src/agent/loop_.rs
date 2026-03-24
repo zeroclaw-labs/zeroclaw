@@ -3622,23 +3622,28 @@ pub async fn run(
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle, _reaction_handle, _channel_map_handle) =
-        tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            mem.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.workspace_dir,
-            &config.agents,
-            config.api_key.as_deref(),
-            &config,
-            None,
-        );
+    let (
+        mut tools_registry,
+        delegate_handle,
+        _reaction_handle,
+        _channel_map_handle,
+        _ask_user_handle,
+    ) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        None,
+    );
 
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
@@ -4038,6 +4043,14 @@ pub async fn run(
             ChatMessage::system(&system_prompt),
             ChatMessage::user(&enriched),
         ];
+
+        // Prune history for token efficiency (when enabled).
+        if config.agent.history_pruning.enabled {
+            let _stats = crate::agent::history_pruner::prune_history(
+                &mut history,
+                &config.agent.history_pruning,
+            );
+        }
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
         let excluded_tools = compute_excluded_mcp_tools(
@@ -4460,23 +4473,28 @@ pub async fn process_message(
     } else {
         (None, None)
     };
-    let (mut tools_registry, delegate_handle_pm, _reaction_handle_pm, _channel_map_handle_pm) =
-        tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            mem.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &config.workspace_dir,
-            &config.agents,
-            config.api_key.as_deref(),
-            &config,
-            None,
-        );
+    let (
+        mut tools_registry,
+        delegate_handle_pm,
+        _reaction_handle_pm,
+        _channel_map_handle_pm,
+        _ask_user_handle_pm,
+    ) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        mem.clone(),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        None,
+    );
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
@@ -8214,6 +8232,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Always,
             tools: vec!["mcp_filesystem_*".into()],
             keywords: vec![],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "anything");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
@@ -8232,6 +8251,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Dynamic,
             tools: vec!["mcp_browser_*".into()],
             keywords: vec!["browse".into(), "website".into()],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "please browse this page");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
@@ -8248,6 +8268,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Dynamic,
             tools: vec!["mcp_browser_*".into()],
             keywords: vec!["browse".into(), "website".into()],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "read the file /etc/hosts");
         let names: Vec<&str> = result.iter().map(|s| s.name.as_str()).collect();
@@ -8264,6 +8285,7 @@ Let me check the result."#;
             mode: ToolFilterGroupMode::Dynamic,
             tools: vec!["mcp_browser_*".into()],
             keywords: vec!["Browse".into()],
+            filter_builtins: false,
         }];
         let result = filter_tool_specs_for_turn(specs, &groups, "BROWSE the site");
         assert_eq!(result.len(), 1);
