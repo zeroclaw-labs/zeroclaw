@@ -2401,7 +2401,7 @@ pub enum FirecrawlMode {
 /// When enabled, if the standard web fetch fails (HTTP error, empty body, or
 /// body shorter than 100 characters suggesting a JS-only page), the tool
 /// falls back to the Firecrawl API for stealth content extraction.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct FirecrawlConfig {
     /// Enable Firecrawl fallback
     #[serde(default)]

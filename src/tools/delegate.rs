@@ -561,6 +561,7 @@ impl DelegateTool {
 
         if let Err(error) = self
             .security
+            .load()
             .enforce_tool_operation(ToolOperation::Act, "delegate")
         {
             return Ok(ToolResult {

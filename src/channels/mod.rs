@@ -4810,7 +4810,7 @@ pub async fn start_channels(
     // Populate the ask_user tool's channel map now that channels are initialized.
     if let Some(ref handle) = ask_user_handle_ch {
         let mut map = handle.write();
-        for (name, ch) in channels_by_name.as_ref() {
+        for (name, ch) in channels_by_name.load().iter() {
             map.insert(name.clone(), Arc::clone(ch));
         }
     }

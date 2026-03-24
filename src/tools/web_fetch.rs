@@ -1397,6 +1397,7 @@ mod tests {
 
         // Clean up env var
         std::env::remove_var("FIRECRAWL_E2E_TEST_KEY");
+    }
 
     #[test]
     fn domain_rules_swap_takes_effect() {

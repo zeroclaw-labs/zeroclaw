@@ -5,6 +5,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 use tokio::process::Command;
 
@@ -40,7 +41,7 @@ pub struct ClaudeCodeHookEvent {
 /// 3. Returns immediately with the session ID and an SSH attach command
 /// 4. Receives streamed progress via the `/hooks/claude-code` endpoint
 pub struct ClaudeCodeRunnerTool {
-    security: Arc<SecurityPolicy>,
+    security: Arc<ArcSwap<SecurityPolicy>>,
     config: ClaudeCodeRunnerConfig,
     /// Base URL of the ZeroClaw gateway (e.g. "http://localhost:3000").
     gateway_url: String,
@@ -48,7 +49,7 @@ pub struct ClaudeCodeRunnerTool {
 
 impl ClaudeCodeRunnerTool {
     pub fn new(
-        security: Arc<SecurityPolicy>,
+        security: Arc<ArcSwap<SecurityPolicy>>,
         config: ClaudeCodeRunnerConfig,
         gateway_url: String,
     ) -> Self {
@@ -106,7 +107,7 @@ impl Tool for ClaudeCodeRunnerTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         // Rate limit check
-        if self.security.is_rate_limited() {
+        if self.security.load().is_rate_limited() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -117,6 +118,7 @@ impl Tool for ClaudeCodeRunnerTool {
         // Enforce act policy
         if let Err(error) = self
             .security
+            .load()
             .enforce_tool_operation(ToolOperation::Act, "claude_code_runner")
         {
             return Ok(ToolResult {
@@ -135,7 +137,7 @@ impl Tool for ClaudeCodeRunnerTool {
         // Validate working directory
         let work_dir = if let Some(wd) = args.get("working_directory").and_then(|v| v.as_str()) {
             let wd_path = std::path::PathBuf::from(wd);
-            let workspace = &self.security.workspace_dir;
+            let workspace = &self.security.load().workspace_dir;
             let canonical_wd = match wd_path.canonicalize() {
                 Ok(p) => p,
                 Err(_) => {
@@ -175,7 +177,7 @@ impl Tool for ClaudeCodeRunnerTool {
             }
             canonical_wd
         } else {
-            self.security.workspace_dir.clone()
+            self.security.load().workspace_dir.clone()
         };
 
         let slack_channel = args
@@ -184,7 +186,7 @@ impl Tool for ClaudeCodeRunnerTool {
             .map(String::from);
 
         // Record action budget
-        if !self.security.record_action() {
+        if !self.security.load().record_action() {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -356,12 +358,12 @@ mod tests {
         }
     }
 
-    fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
+    fn test_security(autonomy: AutonomyLevel) -> Arc<ArcSwap<SecurityPolicy>> {
+        Arc::new(ArcSwap::from_pointee(SecurityPolicy {
             autonomy,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
-        })
+        }))
     }
 
     #[test]
@@ -428,12 +430,12 @@ mod tests {
 
     #[tokio::test]
     async fn blocks_rate_limited() {
-        let security = Arc::new(SecurityPolicy {
+        let security = Arc::new(ArcSwap::from_pointee(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             max_actions_per_hour: 0,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
-        });
+        }));
         let tool =
             ClaudeCodeRunnerTool::new(security, test_config(), "http://localhost:3000".into());
         let result = tool

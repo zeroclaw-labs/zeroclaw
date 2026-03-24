@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 
 /// Shared handle giving tools late-bound access to the live channel map.
@@ -30,12 +31,12 @@ const MAX_OPTIONS: usize = 10;
 const DEFAULT_DURATION_MINUTES: u64 = 60;
 
 pub struct PollTool {
-    security: Arc<SecurityPolicy>,
+    security: Arc<ArcSwap<SecurityPolicy>>,
     channels: ChannelMapHandle,
 }
 
 impl PollTool {
-    pub fn new(security: Arc<SecurityPolicy>, channels: ChannelMapHandle) -> Self {
+    pub fn new(security: Arc<ArcSwap<SecurityPolicy>>, channels: ChannelMapHandle) -> Self {
         Self { security, channels }
     }
 }
@@ -154,6 +155,7 @@ impl Tool for PollTool {
         // Security gate: Act operation
         if let Err(e) = self
             .security
+            .load()
             .enforce_tool_operation(ToolOperation::Act, "poll")
         {
             return Ok(ToolResult {
@@ -313,7 +315,7 @@ mod tests {
     }
 
     fn default_tool() -> PollTool {
-        let security = Arc::new(SecurityPolicy::default());
+        let security = Arc::new(ArcSwap::from_pointee(SecurityPolicy::default()));
         let stub: Arc<dyn Channel> = Arc::new(StubChannel::new("slack"));
         let channels = make_channel_map(vec![stub]);
         PollTool::new(security, channels)

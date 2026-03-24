@@ -10,13 +10,14 @@ use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 
 /// Tool that runs a single prompt through an LLM and optionally validates
 /// the response against a JSON Schema. No tools are provided to the LLM —
 /// this is a pure text-in, text-out (or JSON-out) call.
 pub struct LlmTaskTool {
-    security: Arc<SecurityPolicy>,
+    security: Arc<ArcSwap<SecurityPolicy>>,
     /// Default provider name from root config (e.g. "openrouter").
     default_provider: String,
     /// Default model from root config.
@@ -31,7 +32,7 @@ pub struct LlmTaskTool {
 
 impl LlmTaskTool {
     pub fn new(
-        security: Arc<SecurityPolicy>,
+        security: Arc<ArcSwap<SecurityPolicy>>,
         default_provider: String,
         default_model: String,
         default_temperature: f64,
@@ -94,6 +95,7 @@ impl Tool for LlmTaskTool {
         // Security gate
         if let Err(error) = self
             .security
+            .load()
             .enforce_tool_operation(ToolOperation::Act, "llm_task")
         {
             return Ok(ToolResult {

@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
+use arc_swap::ArcSwap;
 use std::sync::Arc;
 
 /// Shared handle giving tools late-bound access to the live channel map.
@@ -24,7 +25,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 /// Agent-callable tool for sending a question to a user and waiting for their response.
 pub struct AskUserTool {
-    security: Arc<SecurityPolicy>,
+    security: Arc<ArcSwap<SecurityPolicy>>,
     channels: ChannelMapHandle,
 }
 
@@ -32,7 +33,7 @@ impl AskUserTool {
     /// Create a new ask_user tool with an empty channel map.
     /// Call [`channel_map_handle`] and write to the returned handle once channels
     /// are available.
-    pub fn new(security: Arc<SecurityPolicy>) -> Self {
+    pub fn new(security: Arc<ArcSwap<SecurityPolicy>>) -> Self {
         Self {
             security,
             channels: Arc::new(RwLock::new(HashMap::new())),
@@ -109,6 +110,7 @@ impl Tool for AskUserTool {
         // Security gate: Act operation
         if let Err(e) = self
             .security
+            .load()
             .enforce_tool_operation(ToolOperation::Act, "ask_user")
         {
             return Ok(ToolResult {
