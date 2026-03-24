@@ -1950,6 +1950,7 @@ impl SlackChannel {
                 .map(str::to_string),
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
     }
 

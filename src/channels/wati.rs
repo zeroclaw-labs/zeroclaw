@@ -212,6 +212,7 @@ impl WatiChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         });
 
         messages

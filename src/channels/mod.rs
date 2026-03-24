@@ -6391,7 +6391,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("telegram_chat-telegram_alice")
+            .get("telegram_chat-telegram")
             .expect("telegram history should be stored");
         let assistant_turn = turns
             .iter()
@@ -6665,7 +6665,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
-        let route_key = "telegram_chat-1_alice";
+        let route_key = "telegram_chat-1";
         let route = runtime_ctx
             .route_overrides
             .lock()
@@ -6697,7 +6697,7 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
         provider_cache_seed.insert("openrouter".to_string(), routed_provider);
 
-        let route_key = "telegram_chat-1_alice".to_string();
+        let route_key = "telegram_chat-1".to_string();
         let mut route_overrides = HashMap::new();
         route_overrides.insert(
             route_key,
@@ -8890,7 +8890,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                !histories.contains_key("telegram_chat-refresh_alice"),
+                !histories.contains_key("telegram_chat-refresh"),
                 "/new should clear the cached sender history before the next message"
             );
         }
@@ -8901,7 +8901,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                pending_new_sessions.contains("telegram_chat-refresh_alice"),
+                pending_new_sessions.contains("telegram_chat-refresh"),
                 "/new should mark the sender for a fresh next-message prompt rebuild"
             );
         }
@@ -9048,7 +9048,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_chat-ctx_alice")
+            .get("test-channel_chat-ctx")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
@@ -9066,7 +9066,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let mut histories = HashMap::new();
         histories.insert(
-            "telegram_chat-telegram_alice".to_string(),
+            "telegram_chat-telegram".to_string(),
             vec![
                 ChatMessage::assistant("stale assistant"),
                 ChatMessage::user("earlier user question"),
