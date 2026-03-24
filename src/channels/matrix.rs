@@ -1226,6 +1226,30 @@ impl Channel for MatrixChannel {
 
         Ok(())
     }
+
+    async fn redact_message(
+        &self,
+        _channel_id: &str,
+        message_id: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        let client = self
+            .sdk_client
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("Matrix SDK client not initialized"))?;
+
+        let target_room = self.target_room_id().await?;
+        let room = client
+            .get_room(&target_room.parse()?)
+            .ok_or_else(|| anyhow::anyhow!("Matrix room not found for message redaction"))?;
+
+        let event_id: OwnedEventId = message_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid event ID: {}", message_id))?;
+
+        room.redact(&event_id, reason.as_deref(), None).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
