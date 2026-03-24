@@ -18,6 +18,25 @@ use std::time::Duration;
 use tokio::process::Command;
 use tracing::debug;
 
+/// Build a `Command` for `agent-browser`.
+///
+/// On Windows, npm-installed global packages create `.cmd` shim scripts that
+/// `Command::new("agent-browser")` cannot resolve directly. Wrapping with
+/// `cmd.exe /C` uses the shell's own PATH resolution which handles `.cmd` and
+/// `.bat` extensions automatically.
+fn agent_browser_command() -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "agent-browser"]);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("agent-browser")
+    }
+}
+
 /// Computer-use sidecar settings.
 #[derive(Clone)]
 pub struct ComputerUseConfig {
@@ -241,7 +260,7 @@ impl BrowserTool {
 
     /// Check if agent-browser CLI is available
     pub async fn is_agent_browser_available() -> bool {
-        Command::new("agent-browser")
+        agent_browser_command()
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -438,7 +457,7 @@ impl BrowserTool {
 
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
-        let mut cmd = Command::new("agent-browser");
+        let mut cmd = agent_browser_command();
 
         // When running as a service (systemd/OpenRC), the process may lack
         // HOME which browsers need for profile directories.
