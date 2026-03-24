@@ -611,6 +611,6 @@ fn domains_returns_all_tracked_domains() {
     tracker.get_score("gamma");
 
     let mut domains = tracker.domains();
-    domains.sort();
+    domains.sort_unstable();
     assert_eq!(domains, vec!["alpha", "beta", "gamma"]);
 }
