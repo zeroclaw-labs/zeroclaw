@@ -4184,7 +4184,7 @@ fn collect_configured_channels(
                                 wa.allowed_numbers.clone(),
                             )
                             .with_proxy_url(wa.proxy_url.clone())
-                            .with_mention_config(wa.mention_only, wa.bot_name.clone()),
+                            .with_mention_patterns(wa.mention_patterns.clone()),
                         ),
                     });
                 } else {

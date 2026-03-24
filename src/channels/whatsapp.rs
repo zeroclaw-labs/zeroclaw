@@ -1,5 +1,6 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use regex::Regex;
 use uuid::Uuid;
 
 /// `WhatsApp` channel — uses `WhatsApp` Business Cloud API
@@ -29,10 +30,9 @@ pub struct WhatsAppChannel {
     allowed_numbers: Vec<String>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
-    /// When true, only process messages that @-mention the bot by `bot_name`.
-    mention_only: bool,
-    /// Bot display name used for @-mention detection.
-    bot_name: Option<String>,
+    /// Compiled mention patterns for group-chat mention gating.
+    /// When non-empty, only messages matching at least one pattern are processed.
+    mention_patterns: Vec<Regex>,
 }
 
 impl WhatsAppChannel {
@@ -48,8 +48,7 @@ impl WhatsAppChannel {
             verify_token,
             allowed_numbers,
             proxy_url: None,
-            mention_only: false,
-            bot_name: None,
+            mention_patterns: Vec::new(),
         }
     }
 
@@ -59,81 +58,54 @@ impl WhatsAppChannel {
         self
     }
 
-    /// Enable mention-only filtering with the given bot name.
-    pub fn with_mention_config(mut self, mention_only: bool, bot_name: Option<String>) -> Self {
-        self.mention_only = mention_only;
-        self.bot_name = bot_name;
+    /// Set mention patterns for group-chat mention gating.
+    /// Each pattern string is compiled as a case-insensitive regex.
+    /// Invalid patterns are logged and skipped.
+    pub fn with_mention_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.mention_patterns = Self::compile_mention_patterns(&patterns);
         self
     }
 
-    fn is_mention_name_char(ch: char) -> bool {
-        ch.is_ascii_alphanumeric() || ch == '_'
-    }
-
-    fn find_bot_mention_spans(text: &str, bot_name: &str) -> Vec<(usize, usize)> {
-        let bot_name = bot_name.trim_start_matches('@');
-        if bot_name.is_empty() {
-            return Vec::new();
-        }
-
-        let mut spans = Vec::new();
-
-        for (at_idx, ch) in text.char_indices() {
-            if ch != '@' {
-                continue;
-            }
-
-            if at_idx > 0 {
-                let prev = text[..at_idx].chars().next_back().unwrap_or(' ');
-                if Self::is_mention_name_char(prev) {
-                    continue;
+    /// Compile raw pattern strings into case-insensitive regexes.
+    /// Invalid or excessively large patterns are logged and skipped.
+    fn compile_mention_patterns(patterns: &[String]) -> Vec<Regex> {
+        patterns
+            .iter()
+            .filter_map(|p| {
+                let trimmed = p.trim();
+                if trimmed.is_empty() {
+                    return None;
                 }
-            }
-
-            let name_start = at_idx + 1;
-            let mut name_end = name_start;
-
-            for (rel_idx, candidate_ch) in text[name_start..].char_indices() {
-                if Self::is_mention_name_char(candidate_ch) {
-                    name_end = name_start + rel_idx + candidate_ch.len_utf8();
-                } else {
-                    break;
+                match regex::RegexBuilder::new(trimmed)
+                    .case_insensitive(true)
+                    .size_limit(1 << 16) // 64 KiB — guard against ReDoS
+                    .build()
+                {
+                    Ok(re) => Some(re),
+                    Err(e) => {
+                        tracing::warn!(
+                            "WhatsApp: ignoring invalid mention_pattern {trimmed:?}: {e}"
+                        );
+                        None
+                    }
                 }
-            }
-
-            if name_end == name_start {
-                continue;
-            }
-
-            let mention_name = &text[name_start..name_end];
-            if mention_name.eq_ignore_ascii_case(bot_name) {
-                spans.push((at_idx, name_end));
-            }
-        }
-
-        spans
+            })
+            .collect()
     }
 
-    fn contains_bot_mention(text: &str, bot_name: &str) -> bool {
-        !Self::find_bot_mention_spans(text, bot_name).is_empty()
+    /// Check whether `text` matches any of the compiled mention patterns.
+    fn contains_mention(&self, text: &str) -> bool {
+        self.mention_patterns.iter().any(|re| re.is_match(text))
     }
 
-    fn normalize_incoming_content(text: &str, bot_name: &str) -> Option<String> {
-        let spans = Self::find_bot_mention_spans(text, bot_name);
-        if spans.is_empty() {
-            let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            return (!normalized.is_empty()).then_some(normalized);
+    /// Strip all mention-pattern matches from `text`, collapse whitespace,
+    /// and return `None` if the result is empty.
+    fn strip_mention_patterns(&self, text: &str) -> Option<String> {
+        let mut result = text.to_string();
+        for re in &self.mention_patterns {
+            result = re.replace_all(&result, " ").into_owned();
         }
-
-        let mut normalized = String::with_capacity(text.len());
-        let mut cursor = 0;
-        for (start, end) in spans {
-            normalized.push_str(&text[cursor..start]);
-            cursor = end;
-        }
-        normalized.push_str(&text[cursor..]);
-
-        let normalized = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = result.split_whitespace().collect::<Vec<_>>().join(" ");
         (!normalized.is_empty()).then_some(normalized)
     }
 
@@ -215,23 +187,19 @@ impl WhatsAppChannel {
                         continue;
                     }
 
-                    // Mention-only filtering: if enabled and bot_name is set,
-                    // reject messages that do not @-mention the bot and strip
-                    // the mention tag from the content that is forwarded.
-                    let content = if self.mention_only {
-                        if let Some(ref bot_name) = self.bot_name {
-                            if !Self::contains_bot_mention(&content, bot_name) {
-                                continue;
-                            }
-                            match Self::normalize_incoming_content(&content, bot_name) {
-                                Some(c) => c,
-                                None => continue,
-                            }
-                        } else {
-                            content
-                        }
-                    } else {
+                    // Mention-pattern gating: when mention_patterns is
+                    // configured, reject messages that do not match any
+                    // pattern and strip matched fragments from the content.
+                    let content = if self.mention_patterns.is_empty() {
                         content
+                    } else {
+                        if !self.contains_mention(&content) {
+                            continue;
+                        }
+                        match self.strip_mention_patterns(&content) {
+                            Some(c) => c,
+                            None => continue,
+                        }
                     };
 
                     // Get timestamp
@@ -1251,7 +1219,7 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════
-    // MENTION SUPPORT — Unit tests
+    // MENTION-PATTERN GATING — Unit tests
     // ══════════════════════════════════════════════════════════
 
     fn make_mention_channel() -> WhatsAppChannel {
@@ -1261,231 +1229,189 @@ mod tests {
             "verify-me".into(),
             vec!["*".into()],
         )
-        .with_mention_config(true, Some("ZeroClaw".into()))
+        .with_mention_patterns(vec!["@?ZeroClaw".into()])
     }
 
-    // ── is_mention_name_char ──
+    // ── compile_mention_patterns ──
 
     #[test]
-    fn whatsapp_is_mention_name_char_alpha() {
-        assert!(WhatsAppChannel::is_mention_name_char('a'));
-        assert!(WhatsAppChannel::is_mention_name_char('Z'));
-    }
-
-    #[test]
-    fn whatsapp_is_mention_name_char_digit() {
-        assert!(WhatsAppChannel::is_mention_name_char('0'));
-        assert!(WhatsAppChannel::is_mention_name_char('9'));
+    fn whatsapp_compile_valid_patterns() {
+        let patterns = WhatsAppChannel::compile_mention_patterns(&[
+            "@?ZeroClaw".into(),
+            r"\+?15555550123".into(),
+        ]);
+        assert_eq!(patterns.len(), 2);
     }
 
     #[test]
-    fn whatsapp_is_mention_name_char_underscore() {
-        assert!(WhatsAppChannel::is_mention_name_char('_'));
+    fn whatsapp_compile_skips_invalid_patterns() {
+        let patterns =
+            WhatsAppChannel::compile_mention_patterns(&["@?ZeroClaw".into(), "[invalid".into()]);
+        assert_eq!(patterns.len(), 1);
     }
 
     #[test]
-    fn whatsapp_is_mention_name_char_rejects_special() {
-        assert!(!WhatsAppChannel::is_mention_name_char(' '));
-        assert!(!WhatsAppChannel::is_mention_name_char('-'));
-        assert!(!WhatsAppChannel::is_mention_name_char('@'));
-        assert!(!WhatsAppChannel::is_mention_name_char('!'));
-    }
-
-    // ── contains_bot_mention ──
-
-    #[test]
-    fn whatsapp_contains_bot_mention_at_end() {
-        assert!(WhatsAppChannel::contains_bot_mention(
-            "Hello @ZeroClaw",
-            "ZeroClaw"
-        ));
+    fn whatsapp_compile_skips_empty_patterns() {
+        let patterns =
+            WhatsAppChannel::compile_mention_patterns(&["@?ZeroClaw".into(), "  ".into()]);
+        assert_eq!(patterns.len(), 1);
     }
 
     #[test]
-    fn whatsapp_contains_bot_mention_at_start() {
-        assert!(WhatsAppChannel::contains_bot_mention(
-            "@ZeroClaw help",
-            "ZeroClaw"
-        ));
+    fn whatsapp_compile_empty_vec() {
+        let patterns = WhatsAppChannel::compile_mention_patterns(&[]);
+        assert!(patterns.is_empty());
+    }
+
+    // ── contains_mention ──
+
+    #[test]
+    fn whatsapp_contains_mention_at_name() {
+        let ch = make_mention_channel();
+        assert!(ch.contains_mention("Hello @ZeroClaw"));
     }
 
     #[test]
-    fn whatsapp_contains_bot_mention_mid_sentence() {
-        assert!(WhatsAppChannel::contains_bot_mention(
-            "Hey @ZeroClaw how are you?",
-            "ZeroClaw"
-        ));
+    fn whatsapp_contains_mention_name_only() {
+        let ch = make_mention_channel();
+        assert!(ch.contains_mention("Hello ZeroClaw"));
     }
 
     #[test]
-    fn whatsapp_contains_bot_mention_case_insensitive() {
-        assert!(WhatsAppChannel::contains_bot_mention(
-            "Hello @zeroclaw",
-            "ZeroClaw"
-        ));
-        assert!(WhatsAppChannel::contains_bot_mention(
-            "Hello @ZEROCLAW",
-            "ZeroClaw"
-        ));
+    fn whatsapp_contains_mention_case_insensitive() {
+        let ch = make_mention_channel();
+        assert!(ch.contains_mention("Hello @zeroclaw"));
+        assert!(ch.contains_mention("Hello ZEROCLAW"));
     }
 
     #[test]
-    fn whatsapp_contains_bot_mention_no_false_positives() {
-        assert!(!WhatsAppChannel::contains_bot_mention(
-            "Hello @otherbot",
-            "ZeroClaw"
-        ));
-        assert!(!WhatsAppChannel::contains_bot_mention(
-            "Hello ZeroClaw",
-            "ZeroClaw"
-        ));
+    fn whatsapp_contains_mention_no_match() {
+        let ch = make_mention_channel();
+        assert!(!ch.contains_mention("Hello @otherbot"));
+        assert!(!ch.contains_mention("Hello world"));
     }
 
     #[test]
-    fn whatsapp_contains_bot_mention_rejects_partial_prefix() {
-        // e.g. x@ZeroClaw — '@' preceded by a name char
-        assert!(!WhatsAppChannel::contains_bot_mention(
-            "x@ZeroClaw",
-            "ZeroClaw"
-        ));
+    fn whatsapp_contains_mention_phone_pattern() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()])
+            .with_mention_patterns(vec![r"\+?15555550123".into()]);
+        assert!(ch.contains_mention("Hey +15555550123 help"));
+        assert!(ch.contains_mention("Hey 15555550123 help"));
+        assert!(!ch.contains_mention("Hey +19999999999 help"));
     }
 
     #[test]
-    fn whatsapp_contains_bot_mention_rejects_partial_suffix() {
-        // @ZeroClaw2 should not match "ZeroClaw"
-        assert!(!WhatsAppChannel::contains_bot_mention(
-            "@ZeroClaw2 hello",
-            "ZeroClaw"
-        ));
+    fn whatsapp_contains_mention_multiple_patterns() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()])
+            .with_mention_patterns(vec!["@?ZeroClaw".into(), r"\+?15555550123".into()]);
+        assert!(ch.contains_mention("Hello @ZeroClaw"));
+        assert!(ch.contains_mention("Hey +15555550123"));
+        assert!(!ch.contains_mention("Hello world"));
     }
 
     #[test]
-    fn whatsapp_contains_bot_mention_empty_bot_name() {
-        assert!(!WhatsAppChannel::contains_bot_mention("Hello @", ""));
+    fn whatsapp_contains_mention_empty_patterns() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
+        assert!(!ch.contains_mention("Hello @ZeroClaw"));
     }
 
-    #[test]
-    fn whatsapp_contains_bot_mention_strips_at_prefix_from_bot_name() {
-        assert!(WhatsAppChannel::contains_bot_mention(
-            "Hello @ZeroClaw",
-            "@ZeroClaw"
-        ));
-    }
+    // ── strip_mention_patterns ──
 
     #[test]
-    fn whatsapp_contains_bot_mention_only_mention() {
-        assert!(WhatsAppChannel::contains_bot_mention(
-            "@ZeroClaw",
-            "ZeroClaw"
-        ));
-    }
-
-    // ── find_bot_mention_spans ──
-
-    #[test]
-    fn whatsapp_find_bot_mention_spans_single() {
-        let spans = WhatsAppChannel::find_bot_mention_spans("Hello @ZeroClaw", "ZeroClaw");
-        assert_eq!(spans, vec![(6, 15)]);
-    }
-
-    #[test]
-    fn whatsapp_find_bot_mention_spans_multiple() {
-        let spans =
-            WhatsAppChannel::find_bot_mention_spans("@ZeroClaw hello @ZeroClaw", "ZeroClaw");
-        assert_eq!(spans.len(), 2);
-        assert_eq!(spans[0], (0, 9));
-        assert_eq!(spans[1], (16, 25));
-    }
-
-    #[test]
-    fn whatsapp_find_bot_mention_spans_none() {
-        let spans = WhatsAppChannel::find_bot_mention_spans("No mention here", "ZeroClaw");
-        assert!(spans.is_empty());
-    }
-
-    #[test]
-    fn whatsapp_find_bot_mention_spans_empty_bot_name() {
-        let spans = WhatsAppChannel::find_bot_mention_spans("Hello @", "");
-        assert!(spans.is_empty());
-    }
-
-    // ── normalize_incoming_content ──
-
-    #[test]
-    fn whatsapp_normalize_strips_mention() {
-        let result = WhatsAppChannel::normalize_incoming_content(
-            "@ZeroClaw what is the weather?",
-            "ZeroClaw",
+    fn whatsapp_strip_at_name() {
+        let ch = make_mention_channel();
+        assert_eq!(
+            ch.strip_mention_patterns("@ZeroClaw what is the weather?"),
+            Some("what is the weather?".into())
         );
-        assert_eq!(result, Some("what is the weather?".into()));
     }
 
     #[test]
-    fn whatsapp_normalize_strips_mention_at_end() {
-        let result = WhatsAppChannel::normalize_incoming_content("Help me @ZeroClaw", "ZeroClaw");
-        assert_eq!(result, Some("Help me".into()));
+    fn whatsapp_strip_name_without_at() {
+        let ch = make_mention_channel();
+        assert_eq!(
+            ch.strip_mention_patterns("ZeroClaw what is the weather?"),
+            Some("what is the weather?".into())
+        );
     }
 
     #[test]
-    fn whatsapp_normalize_strips_mention_mid_sentence() {
-        let result =
-            WhatsAppChannel::normalize_incoming_content("Hey @ZeroClaw how are you?", "ZeroClaw");
-        assert_eq!(result, Some("Hey how are you?".into()));
+    fn whatsapp_strip_at_end() {
+        let ch = make_mention_channel();
+        assert_eq!(
+            ch.strip_mention_patterns("Help me @ZeroClaw"),
+            Some("Help me".into())
+        );
     }
 
     #[test]
-    fn whatsapp_normalize_strips_multiple_mentions() {
-        let result =
-            WhatsAppChannel::normalize_incoming_content("@ZeroClaw hello @ZeroClaw", "ZeroClaw");
-        assert_eq!(result, Some("hello".into()));
+    fn whatsapp_strip_mid_sentence() {
+        let ch = make_mention_channel();
+        assert_eq!(
+            ch.strip_mention_patterns("Hey @ZeroClaw how are you?"),
+            Some("Hey how are you?".into())
+        );
     }
 
     #[test]
-    fn whatsapp_normalize_returns_none_for_mention_only() {
-        let result = WhatsAppChannel::normalize_incoming_content("@ZeroClaw", "ZeroClaw");
-        assert_eq!(result, None);
+    fn whatsapp_strip_multiple_occurrences() {
+        let ch = make_mention_channel();
+        assert_eq!(
+            ch.strip_mention_patterns("@ZeroClaw hello @ZeroClaw"),
+            Some("hello".into())
+        );
     }
 
     #[test]
-    fn whatsapp_normalize_returns_none_for_mention_with_whitespace() {
-        let result = WhatsAppChannel::normalize_incoming_content("  @ZeroClaw  ", "ZeroClaw");
-        assert_eq!(result, None);
+    fn whatsapp_strip_returns_none_when_only_mention() {
+        let ch = make_mention_channel();
+        assert_eq!(ch.strip_mention_patterns("@ZeroClaw"), None);
     }
 
     #[test]
-    fn whatsapp_normalize_no_mention_passes_through() {
-        let result = WhatsAppChannel::normalize_incoming_content("Hello world", "ZeroClaw");
-        assert_eq!(result, Some("Hello world".into()));
+    fn whatsapp_strip_returns_none_for_whitespace_only() {
+        let ch = make_mention_channel();
+        assert_eq!(ch.strip_mention_patterns("  @ZeroClaw  "), None);
     }
 
     #[test]
-    fn whatsapp_normalize_collapses_whitespace() {
-        let result =
-            WhatsAppChannel::normalize_incoming_content("@ZeroClaw   status   please", "ZeroClaw");
-        assert_eq!(result, Some("status please".into()));
+    fn whatsapp_strip_collapses_whitespace() {
+        let ch = make_mention_channel();
+        assert_eq!(
+            ch.strip_mention_patterns("@ZeroClaw   status   please"),
+            Some("status please".into())
+        );
     }
 
-    // ── with_mention_config builder ──
+    #[test]
+    fn whatsapp_strip_phone_pattern() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()])
+            .with_mention_patterns(vec![r"\+?15555550123".into()]);
+        assert_eq!(
+            ch.strip_mention_patterns("Hey +15555550123 help me"),
+            Some("Hey help me".into())
+        );
+    }
+
+    // ── with_mention_patterns builder ──
 
     #[test]
-    fn whatsapp_with_mention_config_sets_fields() {
+    fn whatsapp_with_mention_patterns_compiles() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec![])
-            .with_mention_config(true, Some("bot".into()));
-        assert!(ch.mention_only);
-        assert_eq!(ch.bot_name.as_deref(), Some("bot"));
+            .with_mention_patterns(vec!["@?bot".into()]);
+        assert_eq!(ch.mention_patterns.len(), 1);
     }
 
     #[test]
-    fn whatsapp_default_mention_config() {
+    fn whatsapp_default_no_mention_patterns() {
         let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec![]);
-        assert!(!ch.mention_only);
-        assert!(ch.bot_name.is_none());
+        assert!(ch.mention_patterns.is_empty());
     }
 
-    // ── mention_only integration with parse_webhook_payload ──
+    // ── mention_patterns integration with parse_webhook_payload ──
 
     #[test]
-    fn whatsapp_mention_only_rejects_message_without_mention() {
+    fn whatsapp_mention_rejects_message_without_match() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -1506,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_only_accepts_message_with_mention() {
+    fn whatsapp_mention_accepts_and_strips() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -1528,7 +1454,7 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_only_strips_mention_from_content() {
+    fn whatsapp_mention_strips_from_content() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -1550,7 +1476,7 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_only_drops_mention_only_message() {
+    fn whatsapp_mention_drops_mention_only_message() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -1574,7 +1500,7 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_only_case_insensitive_match() {
+    fn whatsapp_mention_case_insensitive_match() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -1596,9 +1522,8 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_only_false_passes_all_messages() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()])
-            .with_mention_config(false, Some("ZeroClaw".into()));
+    fn whatsapp_no_patterns_passes_all_messages() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()]);
         let payload = serde_json::json!({
             "entry": [{
                 "changes": [{
@@ -1619,33 +1544,7 @@ mod tests {
     }
 
     #[test]
-    fn whatsapp_mention_only_no_bot_name_passes_through() {
-        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()])
-            .with_mention_config(true, None);
-        let payload = serde_json::json!({
-            "entry": [{
-                "changes": [{
-                    "value": {
-                        "messages": [{
-                            "from": "111",
-                            "timestamp": "1",
-                            "type": "text",
-                            "text": { "body": "Hello without mention" }
-                        }]
-                    }
-                }]
-            }]
-        });
-        let msgs = ch.parse_webhook_payload(&payload);
-        assert_eq!(
-            msgs.len(),
-            1,
-            "Without bot_name, mention_only should pass messages through"
-        );
-    }
-
-    #[test]
-    fn whatsapp_mention_only_mixed_messages() {
+    fn whatsapp_mention_mixed_messages() {
         let ch = make_mention_channel();
         let payload = serde_json::json!({
             "entry": [{
@@ -1664,5 +1563,28 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "help me");
         assert_eq!(msgs[0].sender, "+222");
+    }
+
+    #[test]
+    fn whatsapp_mention_phone_number_pattern_integration() {
+        let ch = WhatsAppChannel::new("tok".into(), "123".into(), "ver".into(), vec!["*".into()])
+            .with_mention_patterns(vec![r"\+?15555550123".into()]);
+        let payload = serde_json::json!({
+            "entry": [{
+                "changes": [{
+                    "value": {
+                        "messages": [{
+                            "from": "111",
+                            "timestamp": "1",
+                            "type": "text",
+                            "text": { "body": "+15555550123 tell me a joke" }
+                        }]
+                    }
+                }]
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "tell me a joke");
     }
 }
