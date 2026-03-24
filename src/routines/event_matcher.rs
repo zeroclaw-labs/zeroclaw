@@ -7,21 +7,16 @@
 use serde::{Deserialize, Serialize};
 
 /// How a pattern string should be interpreted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchStrategy {
     /// Case-sensitive exact string comparison.
+    #[default]
     Exact,
     /// Unix-style glob (supports `*`, `?`, `[…]`).
     Glob,
     /// Full regular expression (Rust `regex` crate syntax).
     Regex,
-}
-
-impl Default for MatchStrategy {
-    fn default() -> Self {
-        Self::Exact
-    }
 }
 
 /// A single event pattern attached to a routine trigger.
