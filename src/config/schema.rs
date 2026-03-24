@@ -411,6 +411,10 @@ pub struct Config {
     /// Standard Operating Procedures engine configuration (`[sop]`).
     #[serde(default)]
     pub sop: SopConfig,
+
+    /// Shell tool configuration (`[shell_tool]`).
+    #[serde(default)]
+    pub shell_tool: ShellToolConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -2497,6 +2501,32 @@ impl Default for TextBrowserConfig {
             enabled: false,
             preferred_browser: None,
             timeout_secs: default_text_browser_timeout_secs(),
+        }
+    }
+}
+
+// ── Shell tool ───────────────────────────────────────────────────
+
+/// Shell tool configuration (`[shell_tool]` section).
+///
+/// Controls the behaviour of the `shell` execution tool. The main
+/// tunable is `timeout_secs` — the maximum wall-clock time a single
+/// shell command may run before it is killed.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ShellToolConfig {
+    /// Maximum shell command execution time in seconds (default: 60).
+    #[serde(default = "default_shell_tool_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_shell_tool_timeout_secs() -> u64 {
+    60
+}
+
+impl Default for ShellToolConfig {
+    fn default() -> Self {
+        Self {
+            timeout_secs: default_shell_tool_timeout_secs(),
         }
     }
 }
@@ -7533,6 +7563,7 @@ impl Default for Config {
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
+            shell_tool: ShellToolConfig::default(),
         }
     }
 }
@@ -10592,6 +10623,7 @@ default_temperature = 0.7
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
+            shell_tool: ShellToolConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -11115,6 +11147,7 @@ default_temperature = 0.7
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
+            shell_tool: ShellToolConfig::default(),
         };
 
         config.save().await.unwrap();

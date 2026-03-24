@@ -389,11 +389,10 @@ pub fn all_tools_with_runtime(
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new_with_sandbox(
-            security.clone(),
-            runtime,
-            sandbox,
-        )),
+        Arc::new(
+            ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+                .with_timeout_secs(root_config.shell_tool.timeout_secs),
+        ),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
