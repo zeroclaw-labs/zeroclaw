@@ -115,7 +115,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     if let Err(e) = swap_binary(&download_path, &current_exe).await {
         // Rollback
         warn!("Swap failed, rolling back: {e}");
-        if let Err(rollback_err) = tokio::fs::copy(&backup_path, &current_exe).await {
+        if let Err(rollback_err) = rollback_binary(&backup_path, &current_exe).await {
             eprintln!("CRITICAL: Rollback also failed: {rollback_err}");
             eprintln!(
                 "Manual recovery: cp {} {}",
@@ -137,7 +137,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
         }
         Err(e) => {
             warn!("Smoke test failed, rolling back: {e}");
-            tokio::fs::copy(&backup_path, &current_exe)
+            rollback_binary(&backup_path, &current_exe)
                 .await
                 .context("rollback after smoke test failure")?;
             bail!("Update rolled back — smoke test failed: {e}");
@@ -364,9 +364,24 @@ fn host_architecture() -> Option<&'static str> {
 }
 
 async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
+    // On Linux, a running binary cannot be overwritten in place (ETXTBSY).
+    // Remove the old file first, then copy the new one into the now-free path.
+    // This works because the kernel keeps the inode alive until the process exits.
+    tokio::fs::remove_file(target)
+        .await
+        .context("failed to remove old binary")?;
     tokio::fs::copy(new, target)
         .await
-        .context("failed to overwrite binary")?;
+        .context("failed to write new binary")?;
+    Ok(())
+}
+
+async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
+    // Remove-then-copy to avoid ETXTBSY if the target is somehow still mapped.
+    let _ = tokio::fs::remove_file(target).await;
+    tokio::fs::copy(backup, target)
+        .await
+        .context("failed to restore backup binary")?;
     Ok(())
 }
 
