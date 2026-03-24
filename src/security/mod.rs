@@ -22,6 +22,7 @@ pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod detect;
+pub mod dm_pairing;
 pub mod docker;
 
 // Prompt injection defense (contributed from RustyClaw, MIT licensed)
