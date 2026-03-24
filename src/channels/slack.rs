@@ -2021,7 +2021,13 @@ impl SlackChannel {
                 }
             };
 
-            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
+            let (ws_stream, _) = match crate::config::ws_connect_with_proxy(
+                &ws_url,
+                "channel.slack",
+                self.proxy_url.as_deref(),
+            )
+            .await
+            {
                 Ok(connection) => {
                     socket_reconnect_attempt = 0;
                     connection
