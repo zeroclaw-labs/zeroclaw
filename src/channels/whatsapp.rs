@@ -248,7 +248,12 @@ impl WhatsAppChannel {
                         is_group,
                     ) {
                         Some(c) => c,
-                        None => continue,
+                        None => {
+                            tracing::debug!(
+                                "WhatsApp: message from {from} did not match mention patterns, dropping"
+                            );
+                            continue;
+                        },
                     };
 
                     // Get timestamp

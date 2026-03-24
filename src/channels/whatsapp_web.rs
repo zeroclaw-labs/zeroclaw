@@ -890,7 +890,7 @@ impl Channel for WhatsAppWebChannel {
                                         Some(c) => c,
                                         None => {
                                             tracing::debug!(
-                                                "WhatsApp Web: ignoring message without mention match"
+                                                "WhatsApp Web: message from {normalized} did not match mention patterns, dropping"
                                             );
                                             return;
                                         }
