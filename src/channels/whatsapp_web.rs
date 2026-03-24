@@ -84,10 +84,12 @@ pub struct WhatsAppWebChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Chats whose last incoming message was a voice note.
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Compiled mention patterns for DM mention gating.
+    dm_mention_patterns: Arc<Vec<regex::Regex>>,
     /// Compiled mention patterns for group-chat mention gating.
     /// When non-empty, only group messages matching at least one pattern are
     /// processed; matched fragments are stripped from the forwarded content.
-    mention_patterns: Arc<Vec<regex::Regex>>,
+    group_mention_patterns: Arc<Vec<regex::Regex>>,
 }
 
 impl WhatsAppWebChannel {
@@ -131,7 +133,8 @@ impl WhatsAppWebChannel {
             tts_config: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
-            mention_patterns: Arc::new(Vec::new()),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
         }
     }
 
@@ -164,12 +167,23 @@ impl WhatsAppWebChannel {
         self
     }
 
+    /// Set mention patterns for DM mention gating.
+    /// Each pattern string is compiled as a case-insensitive regex.
+    /// Invalid patterns are logged and skipped.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_dm_mention_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.dm_mention_patterns = Arc::new(
+            super::whatsapp::WhatsAppChannel::compile_mention_patterns(&patterns),
+        );
+        self
+    }
+
     /// Set mention patterns for group-chat mention gating.
     /// Each pattern string is compiled as a case-insensitive regex.
     /// Invalid patterns are logged and skipped.
     #[cfg(feature = "whatsapp-web")]
-    pub fn with_mention_patterns(mut self, patterns: Vec<String>) -> Self {
-        self.mention_patterns = Arc::new(
+    pub fn with_group_mention_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.group_mention_patterns = Arc::new(
             super::whatsapp::WhatsAppChannel::compile_mention_patterns(&patterns),
         );
         self
@@ -681,7 +695,8 @@ impl Channel for WhatsAppWebChannel {
             let wa_dm_policy = self.dm_policy.clone();
             let wa_group_policy = self.group_policy.clone();
             let wa_self_chat_mode = self.self_chat_mode;
-            let wa_mention_patterns = self.mention_patterns.clone();
+            let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
+            let wa_group_mention_patterns = self.group_mention_patterns.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -699,7 +714,8 @@ impl Channel for WhatsAppWebChannel {
                     let wa_mode = wa_mode.clone();
                     let wa_dm_policy = wa_dm_policy.clone();
                     let wa_group_policy = wa_group_policy.clone();
-                    let wa_mention_patterns = wa_mention_patterns.clone();
+                    let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
+                    let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -853,22 +869,24 @@ impl Channel for WhatsAppWebChannel {
                                     return;
                                 }
 
-                                // ── Mention-pattern gating for group chats ──
-                                // When mention_patterns is configured, only process
-                                // group messages that match at least one pattern;
-                                // strip matched fragments from the forwarded content.
-                                // DMs always pass through unfiltered.
+                                // ── Mention-pattern gating ──
+                                // Apply dm_mention_patterns for DMs and
+                                // group_mention_patterns for group chats.
+                                // When the applicable pattern set is non-empty,
+                                // messages without a match are dropped and
+                                // matched fragments are stripped.
                                 let is_group = chat.contains("@g.us");
                                 let content =
                                     match super::whatsapp::WhatsAppChannel::apply_mention_gating(
-                                        &wa_mention_patterns,
+                                        &wa_dm_mention_patterns,
+                                        &wa_group_mention_patterns,
                                         &content,
                                         is_group,
                                     ) {
                                         Some(c) => c,
                                         None => {
                                             tracing::debug!(
-                                                "WhatsApp Web: ignoring group message without mention match"
+                                                "WhatsApp Web: ignoring message without mention match"
                                             );
                                             return;
                                         }

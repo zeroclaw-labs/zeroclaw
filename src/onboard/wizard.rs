@@ -4407,7 +4407,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         dm_policy: WhatsAppChatPolicy::default(),
                         group_policy: WhatsAppChatPolicy::default(),
                         self_chat_mode: false,
-                        mention_patterns: vec![],
+                        dm_mention_patterns: vec![],
+                        group_mention_patterns: vec![],
                         proxy_url: None,
                     });
 
@@ -4514,7 +4515,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     dm_policy: WhatsAppChatPolicy::default(),
                     group_policy: WhatsAppChatPolicy::default(),
                     self_chat_mode: false,
-                    mention_patterns: vec![],
+                    dm_mention_patterns: vec![],
+                    group_mention_patterns: vec![],
                     proxy_url: None,
                 });
             }
