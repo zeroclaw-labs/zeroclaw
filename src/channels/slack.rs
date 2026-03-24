@@ -48,7 +48,11 @@ const SLACK_ATTACHMENT_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
 const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
 const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
 const SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS: usize = 12_000;
-const SLACK_MARKDOWN_BLOCK_MAX_CHARS: usize = 12_000;
+/// Max chars for a `section` block's mrkdwn text field (Slack limit: 3000).
+/// The newer `markdown` block type supports 12 000 chars but isn't available
+/// on all workspaces, causing `invalid_blocks` errors. Using the universally
+/// supported `section` block avoids this.
+const SLACK_SECTION_BLOCK_MAX_CHARS: usize = 3_000;
 const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
@@ -2288,11 +2292,16 @@ impl Channel for SlackChannel {
             "text": message.content
         });
 
-        // Use Slack's native markdown block for rich formatting when content fits.
-        if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+        // Use a `section` block with `mrkdwn` for rich formatting when content fits.
+        // The newer `markdown` block type isn't available on all workspaces and causes
+        // `invalid_blocks` errors (#4563). The `section` block is universally supported.
+        if message.content.len() <= SLACK_SECTION_BLOCK_MAX_CHARS {
             body["blocks"] = serde_json::json!([{
-                "type": "markdown",
-                "text": message.content
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": message.content
+                }
             }]);
         }
 
@@ -3655,7 +3664,7 @@ mod tests {
     }
 
     #[test]
-    fn slack_send_uses_markdown_blocks() {
+    fn slack_send_uses_section_blocks() {
         let msg = SendMessage::new("**bold** and _italic_", "C123");
         let ch = SlackChannel::new("xoxb-fake".into(), None, None, vec![], vec![]);
 
@@ -3664,10 +3673,13 @@ mod tests {
             "channel": msg.recipient,
             "text": msg.content
         });
-        if msg.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+        if msg.content.len() <= SLACK_SECTION_BLOCK_MAX_CHARS {
             body["blocks"] = serde_json::json!([{
-                "type": "markdown",
-                "text": msg.content
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": msg.content
+                }
             }]);
         }
 
@@ -3676,8 +3688,9 @@ mod tests {
             .as_array()
             .expect("blocks should be an array");
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0]["type"], "markdown");
-        assert_eq!(blocks[0]["text"], msg.content);
+        assert_eq!(blocks[0]["type"], "section");
+        assert_eq!(blocks[0]["text"]["type"], "mrkdwn");
+        assert_eq!(blocks[0]["text"]["text"], msg.content);
         // text field kept as plaintext fallback.
         assert_eq!(body["text"], msg.content);
         // Suppress unused variable warning.
@@ -3685,18 +3698,21 @@ mod tests {
     }
 
     #[test]
-    fn slack_send_skips_markdown_blocks_for_long_content() {
-        let long_content = "x".repeat(SLACK_MARKDOWN_BLOCK_MAX_CHARS + 1);
+    fn slack_send_skips_blocks_for_long_content() {
+        let long_content = "x".repeat(SLACK_SECTION_BLOCK_MAX_CHARS + 1);
         let msg = SendMessage::new(long_content.clone(), "C123");
 
         let mut body = serde_json::json!({
             "channel": msg.recipient,
             "text": msg.content
         });
-        if msg.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+        if msg.content.len() <= SLACK_SECTION_BLOCK_MAX_CHARS {
             body["blocks"] = serde_json::json!([{
-                "type": "markdown",
-                "text": msg.content
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": msg.content
+                }
             }]);
         }
 
