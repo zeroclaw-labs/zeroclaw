@@ -7953,9 +7953,27 @@ fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
 /// Returns `true` if `path` lives under the OS temp directory.
 fn is_temp_directory(path: &Path) -> bool {
     let temp = std::env::temp_dir();
+
+    // Fast path: exact lexical prefix match.
+    // Handles the case where canonicalization fails but paths match directly.
+    if path.starts_with(&temp) {
+        return true;
+    }
+
     // Canonicalize when possible to handle symlinks (macOS /var → /private/var)
     let canon_temp = temp.canonicalize().unwrap_or_else(|_| temp.clone());
-    let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    // If the path doesn't exist yet, canonicalize() will fail (io::Error NotFound).
+    // In that case, we can try to canonicalize its parent directory to resolve symlinks.
+    let canon_path = path.canonicalize().unwrap_or_else(|_| {
+        if let Some(parent) = path.parent() {
+            if let Ok(canon_parent) = parent.canonicalize() {
+                return canon_parent.join(path.file_name().unwrap_or_default());
+            }
+        }
+        path.to_path_buf()
+    });
+
     canon_path.starts_with(&canon_temp)
 }
 
