@@ -204,7 +204,7 @@ pdf-extract = { version = "0.10", optional = true }
 extism = { version = "1.20", optional = true }
 
 # Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.17", optional = true }
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
