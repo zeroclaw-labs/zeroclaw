@@ -1431,7 +1431,7 @@ impl SecurityPolicy {
             let _ = writeln!(
                 out,
                 "**Allowed shell commands**: {}. \
-                 Commands not on this list will be rejected.",
+                 You may execute these commands freely.",
                 cmds.join(", ")
             );
         }
@@ -1446,7 +1446,7 @@ impl SecurityPolicy {
             let _ = writeln!(
                 out,
                 "**Forbidden paths**: {}. \
-                 Any read/write/exec targeting these paths will be blocked.",
+                 Avoid accessing these paths.",
                 paths.join(", ")
             );
         }
@@ -1455,7 +1455,7 @@ impl SecurityPolicy {
         if self.block_high_risk_commands {
             let _ = writeln!(
                 out,
-                "**High-risk commands** (rm, kill, reboot, etc.) are blocked."
+                "Exercise caution with destructive commands (rm, kill, reboot, etc.)."
             );
         }
         if self.require_approval_for_medium_risk {
