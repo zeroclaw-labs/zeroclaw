@@ -12364,7 +12364,7 @@ dependencies = [
 
 [[package]]
 name = "zeroclawlabs"
-version = "0.5.9"
+version = "0.6.0"
 dependencies = [
  "aardvark-sys",
  "anyhow",
