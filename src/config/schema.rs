@@ -4115,13 +4115,16 @@ impl Unpin for BoxedIo {}
 
 /// Convenience alias for the WebSocket stream returned by the proxy-aware
 /// connect helpers.
-pub type ProxiedWsStream =
-    tokio_tungstenite::WebSocketStream<BoxedIo>;
+pub type ProxiedWsStream = tokio_tungstenite::WebSocketStream<BoxedIo>;
 
 /// Resolve the effective proxy URL for a WebSocket connection to the
 /// given `ws_url`, taking into account the per-channel `proxy_url`
 /// override, the runtime proxy config, scope and no_proxy list.
-fn resolve_ws_proxy_url(service_key: &str, ws_url: &str, channel_proxy_url: Option<&str>) -> Option<String> {
+fn resolve_ws_proxy_url(
+    service_key: &str,
+    ws_url: &str,
+    channel_proxy_url: Option<&str>,
+) -> Option<String> {
     // 1. Explicit per-channel proxy always wins.
     if let Some(url) = normalize_proxy_url_option(channel_proxy_url) {
         return Some(url);
@@ -4149,8 +4152,7 @@ fn resolve_ws_proxy_url(service_key: &str, ws_url: &str, channel_proxy_url: Opti
                     }
                     // Support ".example.com" matching "foo.example.com"
                     if let Some(suffix) = entry.strip_prefix('.') {
-                        return host_lower.ends_with(suffix)
-                            || host_lower == suffix;
+                        return host_lower.ends_with(suffix) || host_lower == suffix;
                     }
                     // Support "example.com" also matching "foo.example.com"
                     host_lower.ends_with(&format!(".{entry}"))
@@ -4186,7 +4188,10 @@ pub async fn ws_connect_with_proxy(
     ws_url: &str,
     service_key: &str,
     channel_proxy_url: Option<&str>,
-) -> anyhow::Result<(ProxiedWsStream, tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>)> {
+) -> anyhow::Result<(
+    ProxiedWsStream,
+    tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+)> {
     let proxy_url = resolve_ws_proxy_url(service_key, ws_url, channel_proxy_url);
 
     match proxy_url {
@@ -4205,9 +4210,7 @@ pub async fn ws_connect_with_proxy(
             .await;
             Ok((ws, resp))
         }
-        Some(proxy) => {
-            ws_connect_via_proxy(ws_url, &proxy).await
-        }
+        Some(proxy) => ws_connect_via_proxy(ws_url, &proxy).await,
     }
 }
 
@@ -4215,17 +4218,22 @@ pub async fn ws_connect_with_proxy(
 async fn ws_connect_via_proxy(
     ws_url: &str,
     proxy_url: &str,
-) -> anyhow::Result<(ProxiedWsStream, tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>)> {
+) -> anyhow::Result<(
+    ProxiedWsStream,
+    tokio_tungstenite::tungstenite::http::Response<Option<Vec<u8>>>,
+)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
     use tokio::net::TcpStream;
 
-    let target = reqwest::Url::parse(ws_url)
-        .with_context(|| format!("Invalid WebSocket URL: {ws_url}"))?;
+    let target =
+        reqwest::Url::parse(ws_url).with_context(|| format!("Invalid WebSocket URL: {ws_url}"))?;
     let target_host = target
         .host_str()
         .ok_or_else(|| anyhow::anyhow!("WebSocket URL has no host: {ws_url}"))?
         .to_string();
-    let target_port = target.port_or_known_default().unwrap_or(if target.scheme() == "wss" { 443 } else { 80 });
+    let target_port = target
+        .port_or_known_default()
+        .unwrap_or(if target.scheme() == "wss" { 443 } else { 80 });
 
     let proxy = reqwest::Url::parse(proxy_url)
         .with_context(|| format!("Invalid proxy URL: {proxy_url}"))?;
@@ -4239,12 +4247,9 @@ async fn ws_connect_via_proxy(
             );
             let target_addr = format!("{target_host}:{target_port}");
             let socks_stream = if proxy.username().is_empty() {
-                tokio_socks::tcp::Socks5Stream::connect(
-                    proxy_addr.as_str(),
-                    target_addr.as_str(),
-                )
-                .await
-                .with_context(|| format!("SOCKS5 connect to {target_addr} via {proxy_addr}"))?
+                tokio_socks::tcp::Socks5Stream::connect(proxy_addr.as_str(), target_addr.as_str())
+                    .await
+                    .with_context(|| format!("SOCKS5 connect to {target_addr} via {proxy_addr}"))?
             } else {
                 let password = proxy.password().unwrap_or("");
                 tokio_socks::tcp::Socks5Stream::connect_with_password(
@@ -4326,7 +4331,9 @@ async fn ws_connect_via_proxy(
         // `stream` is `BoxedIo` — we need a concrete `AsyncRead + AsyncWrite`
         // for `TlsConnector::connect`.  Since `BoxedIo` already satisfies
         // those bounds we can pass it directly.
-        let tls_stream = connector.connect(server_name, stream).await
+        let tls_stream = connector
+            .connect(server_name, stream)
+            .await
             .with_context(|| format!("TLS handshake with {target_host}"))?;
         BoxedIo(Box::new(tls_stream))
     } else {
@@ -4347,18 +4354,16 @@ async fn ws_connect_via_proxy(
         .body(())
         .with_context(|| "Failed to build WebSocket upgrade request")?;
 
-    let (ws_stream, response) =
-        tokio_tungstenite::client_async(ws_request, stream).await
-            .with_context(|| format!("WebSocket handshake failed for {ws_url}"))?;
+    let (ws_stream, response) = tokio_tungstenite::client_async(ws_request, stream)
+        .await
+        .with_context(|| format!("WebSocket handshake failed for {ws_url}"))?;
 
     Ok((ws_stream, response))
 }
 
 /// Find the `\r\n\r\n` boundary marking the end of HTTP headers.
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| p + 4)
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
 fn parse_proxy_scope(raw: &str) -> Option<ProxyScope> {
