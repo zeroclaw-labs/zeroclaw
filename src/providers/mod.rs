@@ -2197,44 +2197,68 @@ pub fn list_providers() -> Vec<ProviderInfo> {
     ]
 }
 
+/// Shared test utilities for provider tests that mutate environment variables.
+///
+/// All provider tests that call `std::env::set_var` or `std::env::remove_var`
+/// must hold [`env_lock`] to prevent races when `cargo test` runs tests in
+/// parallel across threads. Use [`EnvGuard`] for RAII save/restore of
+/// individual variables.
+///
+/// Before this module existed, each provider file had its own independent
+/// `env_lock()` static and/or `EnvGuard` struct. Those per-file locks only
+/// serialized tests within that file; tests across files still raced. This
+/// module is the single source of truth.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Mutex, OnceLock};
+pub(crate) mod test_util {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var(key).ok();
-            match value {
-                Some(next) => std::env::set_var(key, next),
-                None => std::env::remove_var(key),
-            }
-
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(original) = self.original.as_deref() {
-                std::env::set_var(self.key, original);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    /// Process-wide lock for tests that mutate environment variables.
+    ///
+    /// Env vars are global state. Without this lock, concurrent tests that
+    /// set/unset the same keys (e.g. `BEDROCK_API_KEY`, `AWS_ACCESS_KEY_ID`)
+    /// observe each other's mutations and fail intermittently.
+    pub fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock poisoned")
     }
+
+    /// RAII guard that sets or unsets an env var and restores the original
+    /// value on drop. Always acquire [`env_lock`] before creating guards.
+    pub struct EnvGuard {
+        key: String,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        pub fn set(key: &str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+            Self {
+                key: key.to_string(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(v) => std::env::set_var(&self.key, v),
+                None => std::env::remove_var(&self.key),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_util::{env_lock, EnvGuard};
+    use super::*;
 
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {
@@ -2281,6 +2305,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
+        let _env_lock = env_lock();
         let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
         let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
         let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", None);
@@ -2295,6 +2320,7 @@ mod tests {
 
     #[test]
     fn resolve_provider_credential_bedrock_returns_bearer_token_from_env() {
+        let _env_lock = env_lock();
         let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", Some("bedrock-bearer-token"));
 
         assert_eq!(
