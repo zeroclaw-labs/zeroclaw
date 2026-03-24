@@ -9,6 +9,8 @@ Sources consolidated here:
 - `docs/contributing/pr-workflow.md` (size, risk, and triage label definitions)
 - `docs/contributing/ci-map.md` (automation behavior and high-risk path heuristics)
 
+Note: The CI was simplified to 4 workflows (`ci.yml`, `release.yml`, `ci-full.yml`, `promote-release.yml`). Workflows that previously automated size, risk, contributor tier, and triage labels (`pr-labeler.yml`, `pr-auto-response.yml`, `pr-check-stale.yml`, and supporting scripts) were removed. Only path labels via `pr-path-labeler.yml` are currently automated.
+
 ---
 
 ## Path labels
@@ -134,7 +136,7 @@ Defined in `pr-workflow.md` §6.1. Based on effective changed line count, normal
 | `size: L` | <= 1000 lines |
 | `size: XL` | > 1000 lines |
 
-**Applied by:** `pr-labeler.yml` (not yet implemented). Requires custom logic because `actions/labeler` cannot count changed lines.
+**Applied by:** manual. The workflows that previously computed size labels (`pr-labeler.yml` and supporting scripts) were removed during CI simplification.
 
 ---
 
@@ -153,7 +155,7 @@ High-risk paths: `src/security/**`, `src/runtime/**`, `src/gateway/**`, `src/too
 
 The boundary between low and medium is not formally defined beyond "no high-risk paths."
 
-**Applied by:** `pr-labeler.yml` (not yet implemented). Auto-corrected on manual label edits. `risk: manual` exempts a PR from automated recalculation.
+**Applied by:** manual. Previously automated via `pr-labeler.yml`; removed during CI simplification.
 
 ---
 
@@ -168,25 +170,25 @@ Defined in `.github/label-policy.json`. Based on the author's merged PR count qu
 | `principal contributor` | 20 |
 | `distinguished contributor` | 50 |
 
-**Applied by:** `pr-labeler.yml` on PRs, `pr-auto-response.yml` on issues (neither yet implemented). Automation-managed; manual add/remove is auto-corrected.
+**Applied by:** manual. Previously automated via `pr-labeler.yml` and `pr-auto-response.yml`; removed during CI simplification.
 
 ---
 
 ## Response and triage labels
 
-Defined in `pr-workflow.md` §8. Applied manually or by triage automation.
+Defined in `pr-workflow.md` §8. Applied manually.
 
 | Label | Purpose | Applied by |
 |---|---|---|
-| `r:needs-repro` | Incomplete bug report; request deterministic repro | Manual or `pr-auto-response.yml` |
-| `r:support` | Usage/help item better handled outside bug backlog | Manual or `pr-auto-response.yml` |
+| `r:needs-repro` | Incomplete bug report; request deterministic repro | Manual |
+| `r:support` | Usage/help item better handled outside bug backlog | Manual |
 | `invalid` | Not a valid bug/feature request | Manual |
 | `duplicate` | Duplicate of existing issue | Manual |
-| `stale-candidate` | Dormant PR/issue; candidate for closing | Manual or `pr-check-stale.yml` |
+| `stale-candidate` | Dormant PR/issue; candidate for closing | Manual |
 | `superseded` | Replaced by a newer PR | Manual |
 | `no-stale` | Exempt from stale automation; accepted but blocked work | Manual |
 
-**Automation:** `invalid` and `duplicate` trigger issue-only closing automation via `pr-auto-response.yml`. PRs are never auto-closed by route labels.
+**Automation:** none currently. The workflows that handled label-driven issue closing (`pr-auto-response.yml`) and stale detection (`pr-check-stale.yml`) were removed during CI simplification.
 
 ---
 
@@ -196,10 +198,10 @@ Defined in `pr-workflow.md` §8. Applied manually or by triage automation.
 |---|---|---|---|
 | Path (base scope) | 27 | Yes | `pr-path-labeler.yml` |
 | Path (per-component) | 52 | Yes | `pr-path-labeler.yml` |
-| Size | 5 | No | `pr-labeler.yml` (not yet implemented) |
-| Risk | 4 | No | `pr-labeler.yml` (not yet implemented) |
-| Contributor tier | 4 | No | `pr-labeler.yml` / `pr-auto-response.yml` (not yet implemented) |
-| Response/triage | 7 | Partial | Manual + `pr-auto-response.yml` / `pr-check-stale.yml` (not yet implemented) |
+| Size | 5 | No | Manual |
+| Risk | 4 | No | Manual |
+| Contributor tier | 4 | No | Manual |
+| Response/triage | 7 | No | Manual |
 | **Total** | **99** | | |
 
 ---
