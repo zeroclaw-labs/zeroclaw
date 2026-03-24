@@ -4773,24 +4773,31 @@ pub async fn start_channels(
     // the original tx is dropped below).
     let tx_for_manager = tx.clone();
 
-    // Spawn a listener for each channel
-    let mut handles = Vec::new();
-    for ch in &channels {
-        handles.push(spawn_supervised_listener(
-            ch.clone(),
-            tx.clone(),
-            initial_backoff_secs,
-            max_backoff_secs,
-        ));
-    }
-    drop(tx); // Drop our copy so rx closes when all channels stop
-
     let channels_by_name = Arc::new(ArcSwap::from_pointee(
         boot_channels
             .iter()
             .map(|c| (c.config_key.to_string(), c.channel.clone()))
             .collect::<HashMap<_, _>>(),
     ));
+
+    // Create ChannelManager — manages ALL channel lifecycles (boot + hot-reload)
+    let channel_manager = Arc::new(tokio::sync::Mutex::new(
+        crate::channels::manager::ChannelManager::new(
+            tx_for_manager,
+            initial_backoff_secs,
+            max_backoff_secs,
+            channels_by_name.clone(),
+        ),
+    ));
+
+    // Register and spawn all boot channels through ChannelManager
+    {
+        let mut mgr = channel_manager.lock().await;
+        for configured in &boot_channels {
+            mgr.register_boot_channel(configured.config_key, configured.channel.clone());
+        }
+    }
+    drop(tx); // Drop our copy so rx closes when all channels stop
 
     // Populate the reaction tool's channel map now that channels are initialized.
     if let Some(ref handle) = reaction_handle_ch {
@@ -4935,29 +4942,15 @@ pub async fn start_channels(
         pacing: config.pacing.clone(),
     });
 
-    // Hot-reload watcher: handles config changes from PUT /api/config.
-    // Note: channels started above via `spawn_supervised_listener_with_health_interval`
-    // are NOT tracked in the ChannelManager. This means hot-reload reconciliation
-    // only affects channels started/stopped by the watcher itself (after first reload).
-    // A full restart is required to hot-reload channels that were already running at boot.
-    // TODO: migrate initial channel spawns into ChannelManager for full hot-reload coverage.
     if let Some(watch_rx) = config_watch_rx {
         let initial_config = Arc::new(config.clone());
-        let channel_manager = Arc::new(tokio::sync::Mutex::new(
-            crate::channels::manager::ChannelManager::new(
-                tx_for_manager,
-                initial_backoff_secs,
-                max_backoff_secs,
-                channels_by_name.clone(),
-            ),
-        ));
         tokio::spawn(crate::channels::config_watcher::run_config_watcher(
             watch_rx,
             initial_config,
             Arc::clone(&security),
             Arc::clone(&hot_config),
             Arc::clone(&domain_rules),
-            channel_manager,
+            channel_manager.clone(),
         ));
     }
 
@@ -4982,11 +4975,6 @@ pub async fn start_channels(
     }
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
-
-    // Wait for all channel tasks
-    for h in handles {
-        let _ = h.await;
-    }
 
     Ok(())
 }

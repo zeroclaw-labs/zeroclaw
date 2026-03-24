@@ -69,10 +69,8 @@ pub async fn run_config_watcher(
         }
 
         // Channels — per-channel diff across all supported channels
-        let channel_diff = diff_channel_configs(
-            &prev_config.channels_config,
-            &new_config.channels_config,
-        );
+        let channel_diff =
+            diff_channel_configs(&prev_config.channels_config, &new_config.channels_config);
 
         let hot_reloadable: std::collections::HashSet<&str> =
             crate::config::ChannelsConfig::hot_reloadable_channel_names()
@@ -121,11 +119,35 @@ pub fn diff_channel_configs(
     new: &ChannelsConfig,
 ) -> Vec<(String, ChannelChange)> {
     let mut diffs = Vec::new();
-    diff_all_channels!(old, new, &mut diffs,
-        telegram, discord, slack, mattermost, feishu, dingtalk, wecom,
-        irc, nextcloud_talk, qq, email, gmail_push, reddit, bluesky,
-        twitter, mochat, wati, linq, clawdtalk, imessage, matrix,
-        signal, whatsapp, lark, discord_history
+    diff_all_channels!(
+        old,
+        new,
+        &mut diffs,
+        telegram,
+        discord,
+        slack,
+        mattermost,
+        feishu,
+        dingtalk,
+        wecom,
+        irc,
+        nextcloud_talk,
+        qq,
+        email,
+        gmail_push,
+        reddit,
+        bluesky,
+        twitter,
+        mochat,
+        wati,
+        linq,
+        clawdtalk,
+        imessage,
+        matrix,
+        signal,
+        whatsapp,
+        lark,
+        discord_history
     );
     #[cfg(feature = "channel-nostr")]
     diff_option("nostr", &old.nostr, &new.nostr, &mut diffs);

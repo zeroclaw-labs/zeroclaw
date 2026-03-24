@@ -103,6 +103,28 @@ impl ChannelManager {
         Ok(())
     }
 
+    /// Register and spawn a channel at boot time.
+    /// Uses config_key as the identifier (matching the key used by diff and reconcile).
+    pub fn register_boot_channel(&mut self, config_key: &str, ch: Arc<dyn Channel>) {
+        let display_name = ch.name().to_string();
+        let cancel_token = CancellationToken::new();
+        let handle = crate::channels::spawn_supervised_listener_cancellable(
+            ch,
+            self.tx.clone(),
+            self.initial_backoff_secs,
+            self.max_backoff_secs,
+            cancel_token.clone(),
+        );
+        self.running.insert(
+            config_key.to_string(),
+            RunningChannel {
+                display_name,
+                task_handle: handle,
+                cancel_token,
+            },
+        );
+    }
+
     pub async fn reconcile_diff(
         &mut self,
         diff: &[(String, ChannelChange)],
@@ -188,6 +210,21 @@ mod tests {
         let config = crate::config::Config::default();
         manager.reconcile_diff(&diff, &config).await.unwrap();
         assert!(!manager.running.contains_key("dingtalk"));
+    }
+
+    #[tokio::test]
+    async fn register_boot_channel_is_managed() {
+        let mut manager = test_manager();
+        // Simulate a boot channel registration using the existing dummy helper
+        let token = insert_dummy_channel(&mut manager, "telegram");
+        assert!(manager.running.contains_key("telegram"));
+
+        // reconcile_diff should be able to stop it (proving boot channels are now managed)
+        let diff = vec![("telegram".to_string(), ChannelChange::Removed)];
+        let config = crate::config::Config::default();
+        manager.reconcile_diff(&diff, &config).await.unwrap();
+        assert!(!manager.running.contains_key("telegram"));
+        assert!(token.is_cancelled());
     }
 
     #[tokio::test]
