@@ -3628,6 +3628,7 @@ pub async fn run(
         _reaction_handle,
         _channel_map_handle,
         _ask_user_handle,
+        _escalate_handle,
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -4479,6 +4480,7 @@ pub async fn process_message(
         _reaction_handle_pm,
         _channel_map_handle_pm,
         _ask_user_handle_pm,
+        _escalate_handle_pm,
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,

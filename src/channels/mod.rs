@@ -4634,6 +4634,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reaction_handle_ch,
         _channel_map_handle,
         ask_user_handle_ch,
+        escalate_handle_ch,
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -4934,6 +4935,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     // Populate the ask_user tool's channel map now that channels are initialized.
     if let Some(ref handle) = ask_user_handle_ch {
+        let mut map = handle.write();
+        for (name, ch) in channels_by_name.as_ref() {
+            map.insert(name.clone(), Arc::clone(ch));
+        }
+    }
+
+    // Populate the escalate_to_human tool's channel map now that channels are initialized.
+    if let Some(ref handle) = escalate_handle_ch {
         let mut map = handle.write();
         for (name, ch) in channels_by_name.as_ref() {
             map.insert(name.clone(), Arc::clone(ch));
