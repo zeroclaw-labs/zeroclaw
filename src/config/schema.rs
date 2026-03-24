@@ -182,6 +182,10 @@ pub struct Config {
     #[serde(default)]
     pub skills: SkillsConfig,
 
+    /// Pipeline tool configuration (`[pipeline]`).
+    #[serde(default)]
+    pub pipeline: PipelineConfig,
+
     /// Model routing rules — route `hint:<name>` to specific provider+model combos.
     #[serde(default)]
     pub model_routes: Vec<ModelRouteConfig>,
@@ -1517,6 +1521,9 @@ pub struct SkillsConfig {
     /// Autonomous skill creation from successful multi-step task executions.
     #[serde(default)]
     pub skill_creation: SkillCreationConfig,
+    /// Automatic skill self-improvement after successful skill usage.
+    #[serde(default)]
+    pub skill_improvement: SkillImprovementConfig,
 }
 
 /// Autonomous skill creation configuration (`[skills.skill_creation]` section).
@@ -1540,6 +1547,63 @@ impl Default for SkillCreationConfig {
             enabled: false,
             max_skills: 500,
             similarity_threshold: 0.85,
+        }
+    }
+}
+
+/// Skill self-improvement configuration (`[skills.auto_improve]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkillImprovementConfig {
+    /// Enable automatic skill improvement after successful skill usage.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Minimum interval (in seconds) between improvements for the same skill.
+    /// Default: `3600` (1 hour).
+    #[serde(default = "default_skill_improvement_cooldown")]
+    pub cooldown_secs: u64,
+}
+
+fn default_skill_improvement_cooldown() -> u64 {
+    3600
+}
+
+impl Default for SkillImprovementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cooldown_secs: 3600,
+        }
+    }
+}
+
+/// Pipeline tool configuration (`[pipeline]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PipelineConfig {
+    /// Enable the `execute_pipeline` meta-tool.
+    /// Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum number of steps allowed in a single pipeline invocation.
+    /// Default: `20`.
+    #[serde(default = "default_pipeline_max_steps")]
+    pub max_steps: usize,
+    /// Tools allowed in pipeline steps. Steps referencing tools not on this
+    /// list are rejected before execution.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+}
+
+fn default_pipeline_max_steps() -> usize {
+    20
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_steps: 20,
+            allowed_tools: Vec::new(),
         }
     }
 }
@@ -8086,6 +8150,7 @@ impl Default for Config {
             agent: AgentConfig::default(),
             pacing: PacingConfig::default(),
             skills: SkillsConfig::default(),
+            pipeline: PipelineConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
@@ -11187,6 +11252,7 @@ auto_save = true
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
+            pipeline: PipelineConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
@@ -11768,6 +11834,7 @@ default_temperature = 0.7
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             skills: SkillsConfig::default(),
+            pipeline: PipelineConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
