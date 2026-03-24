@@ -1448,13 +1448,14 @@ fn default_param_for_tool(tool: &str) -> &'static str {
         "file_read" | "fileread" | "readfile" | "read_file" | "file" | "file_write"
         | "filewrite" | "writefile" | "write_file" | "file_edit" | "fileedit" | "editfile"
         | "edit_file" | "file_list" | "filelist" | "listfiles" | "list_files" => "path",
-        // Memory recall and forget both default to "query"
+        // Memory recall, forget, and search tools default to "query"
         "memory_recall" | "memoryrecall" | "recall" | "memrecall" | "memory_forget"
-        | "memoryforget" | "forget" | "memforget" => "query",
+        | "memoryforget" | "forget" | "memforget" | "web_search_tool" | "web_search"
+        | "websearch" | "search" => "query",
         "memory_store" | "memorystore" | "store" | "memstore" => "content",
         // HTTP and browser tools default to "url"
         "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser"
-        | "web_search" => "url",
+        | "web_fetch" | "webfetch" => "url",
         _ => "input",
     }
 }
@@ -7548,6 +7549,9 @@ Let me check the result."#;
         assert_eq!(default_param_for_tool("memory_store"), "content");
         assert_eq!(default_param_for_tool("http_request"), "url");
         assert_eq!(default_param_for_tool("browser_open"), "url");
+        assert_eq!(default_param_for_tool("web_search_tool"), "query");
+        assert_eq!(default_param_for_tool("web_search"), "query");
+        assert_eq!(default_param_for_tool("web_fetch"), "url");
         assert_eq!(default_param_for_tool("unknown_tool"), "input");
     }
 
