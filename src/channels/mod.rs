@@ -266,6 +266,7 @@ enum ChannelRuntimeCommand {
     SetProvider(String),
     ShowModel,
     SetModel(String),
+    ShowConfig,
     NewSession,
 }
 
@@ -720,8 +721,30 @@ fn strip_tool_result_content(text: &str) -> String {
     cleaned.to_string()
 }
 
+/// Remove a leading `[Used tools: ...]` line from a cached assistant turn.
+///
+/// The tool-context summary is prepended to history entries so the LLM retains
+/// awareness of prior tool usage. However, when these entries are loaded back
+/// into the LLM context, the bracket-format leaks into generated output and
+/// gets forwarded to end users as-is (bug #4400). Stripping the prefix on
+/// reload prevents the model from learning and reproducing this internal format.
+fn strip_tool_summary_prefix(text: &str) -> String {
+    if let Some(rest) = text.strip_prefix("[Used tools:") {
+        // Find the closing bracket, then skip it and any leading newline(s).
+        if let Some(bracket_end) = rest.find(']') {
+            let after_bracket = &rest[bracket_end + 1..];
+            let trimmed = after_bracket.trim_start_matches('\n');
+            if trimmed.is_empty() {
+                return String::new();
+            }
+            return trimmed.to_string();
+        }
+    }
+    text.to_string()
+}
+
 fn supports_runtime_model_switch(channel_name: &str) -> bool {
-    matches!(channel_name, "telegram" | "discord" | "matrix")
+    matches!(channel_name, "telegram" | "discord" | "matrix" | "slack")
 }
 
 fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
@@ -758,6 +781,9 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             } else {
                 Some(ChannelRuntimeCommand::SetModel(model))
             }
+        }
+        "/config" if supports_runtime_model_switch(channel_name) => {
+            Some(ChannelRuntimeCommand::ShowConfig)
         }
         _ => None,
     }
@@ -1436,6 +1462,171 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
     response
 }
 
+/// Build a plain-text `/config` response for non-Slack channels.
+fn build_config_text_response(
+    current: &ChannelRouteSelection,
+    _workspace_dir: &Path,
+    model_routes: &[crate::config::ModelRouteConfig],
+) -> String {
+    let mut resp = String::new();
+    let _ = writeln!(
+        resp,
+        "Current provider: `{}`\nCurrent model: `{}`",
+        current.provider, current.model
+    );
+    resp.push_str("\nAvailable providers:\n");
+    for p in providers::list_providers() {
+        let _ = writeln!(resp, "- `{}`", p.name);
+    }
+    if !model_routes.is_empty() {
+        resp.push_str("\nConfigured model routes:\n");
+        for route in model_routes {
+            let _ = writeln!(
+                resp,
+                "  `{}` -> {} ({})",
+                route.hint, route.model, route.provider
+            );
+        }
+    }
+    resp.push_str(
+        "\nUse `/models <provider>` to switch provider.\nUse `/model <model-id>` to switch model.",
+    );
+    resp
+}
+
+/// Prefix used to signal that a runtime command response contains raw Block Kit
+/// JSON instead of plain text. [`SlackChannel::send`] detects this and posts
+/// the blocks directly via `chat.postMessage`.
+const BLOCK_KIT_PREFIX: &str = "__ZEROCLAW_BLOCK_KIT__";
+
+/// Build a Slack Block Kit JSON payload for the `/config` interactive UI.
+fn build_config_block_kit(
+    current: &ChannelRouteSelection,
+    workspace_dir: &Path,
+    model_routes: &[crate::config::ModelRouteConfig],
+) -> String {
+    let provider_options: Vec<serde_json::Value> = providers::list_providers()
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "text": { "type": "plain_text", "text": p.display_name },
+                "value": p.name
+            })
+        })
+        .collect();
+
+    // Build model options from model_routes + cached models.
+    let mut model_options: Vec<serde_json::Value> = model_routes
+        .iter()
+        .map(|r| {
+            let label = if r.hint.is_empty() {
+                r.model.clone()
+            } else {
+                format!("{} ({})", r.model, r.hint)
+            };
+            serde_json::json!({
+                "text": { "type": "plain_text", "text": label },
+                "value": r.model
+            })
+        })
+        .collect();
+
+    let cached = load_cached_model_preview(workspace_dir, &current.provider);
+    for model_id in cached {
+        if !model_options.iter().any(|o| {
+            o.get("value")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == model_id)
+        }) {
+            model_options.push(serde_json::json!({
+                "text": { "type": "plain_text", "text": model_id },
+                "value": model_id
+            }));
+        }
+    }
+
+    // If the current model is not in the list, prepend it.
+    if !model_options.iter().any(|o| {
+        o.get("value")
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| v == current.model)
+    }) {
+        model_options.insert(
+            0,
+            serde_json::json!({
+                "text": { "type": "plain_text", "text": &current.model },
+                "value": &current.model
+            }),
+        );
+    }
+
+    // Find initial options matching current selection.
+    let initial_provider = provider_options
+        .iter()
+        .find(|o| {
+            o.get("value")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == current.provider)
+        })
+        .cloned();
+
+    let initial_model = model_options
+        .iter()
+        .find(|o| {
+            o.get("value")
+                .and_then(|v| v.as_str())
+                .is_some_and(|v| v == current.model)
+        })
+        .cloned();
+
+    let mut provider_select = serde_json::json!({
+        "type": "static_select",
+        "action_id": "zeroclaw_config_provider",
+        "placeholder": { "type": "plain_text", "text": "Select provider" },
+        "options": provider_options
+    });
+    if let Some(init) = initial_provider {
+        provider_select["initial_option"] = init;
+    }
+
+    let mut model_select = serde_json::json!({
+        "type": "static_select",
+        "action_id": "zeroclaw_config_model",
+        "placeholder": { "type": "plain_text", "text": "Select model" },
+        "options": model_options
+    });
+    if let Some(init) = initial_model {
+        model_select["initial_option"] = init;
+    }
+
+    let blocks = serde_json::json!([
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!(
+                    "*Model Configuration*\nCurrent: `{}` / `{}`",
+                    current.provider, current.model
+                )
+            }
+        },
+        {
+            "type": "section",
+            "block_id": "config_provider_block",
+            "text": { "type": "mrkdwn", "text": "*Provider*" },
+            "accessory": provider_select
+        },
+        {
+            "type": "section",
+            "block_id": "config_model_block",
+            "text": { "type": "mrkdwn", "text": "*Model*" },
+            "accessory": model_select
+        }
+    ]);
+
+    blocks.to_string()
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &traits::ChannelMessage,
@@ -1506,6 +1697,19 @@ async fn handle_runtime_command_if_needed(
                     "Model switched to `{}` (provider: `{}`). Context preserved.",
                     current.model, current.provider
                 )
+            }
+        }
+        ChannelRuntimeCommand::ShowConfig => {
+            if msg.channel == "slack" {
+                let blocks_json = build_config_block_kit(
+                    &current,
+                    ctx.workspace_dir.as_path(),
+                    &ctx.model_routes,
+                );
+                // Use a magic prefix so SlackChannel::send() can detect Block Kit JSON.
+                format!("__ZEROCLAW_BLOCK_KIT__{blocks_json}")
+            } else {
+                build_config_text_response(&current, ctx.workspace_dir.as_path(), &ctx.model_routes)
             }
         }
         ChannelRuntimeCommand::NewSession => {
@@ -1590,6 +1794,7 @@ async fn build_memory_context(
 /// during `run_tool_call_loop`. Scans assistant messages for `<tool_call>` tags
 /// or native tool-call JSON to collect tool names used.
 /// Returns an empty string when no tools were invoked.
+#[cfg(test)]
 fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
     fn push_unique_tool_name(tool_names: &mut Vec<String>, name: &str) {
         let candidate = name.trim();
@@ -1685,12 +1890,27 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
+    // Strip any [Used tools: ...] prefix that the LLM may have echoed from
+    // history context (#4400).
+    let stripped_summary = strip_tool_summary_prefix(response);
     // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
-    let stripped_xml = strip_tool_call_tags(response);
+    let stripped_xml = strip_tool_call_tags(&stripped_summary);
     // Strip isolated tool-call JSON artifacts
     let stripped_json = strip_isolated_tool_json_artifacts(&stripped_xml, &known_tool_names);
     // Strip leading narration lines that announce tool usage
-    strip_tool_narration(&stripped_json)
+    let sanitized = strip_tool_narration(&stripped_json);
+
+    // Scan for credential leaks before returning to caller
+    match crate::security::LeakDetector::new().scan(&sanitized) {
+        crate::security::LeakResult::Clean => sanitized,
+        crate::security::LeakResult::Detected { patterns, redacted } => {
+            tracing::warn!(
+                patterns = ?patterns,
+                "output guardrail: credential leak detected in outbound channel response"
+            );
+            redacted
+        }
+    }
 }
 
 /// Remove leading lines that narrate tool usage (e.g. "Let me check the weather for you.").
@@ -2230,6 +2450,14 @@ async fn process_channel_message(
         }
     }
 
+    // Strip [Used tools: ...] prefixes from cached assistant turns so the
+    // LLM never sees (and reproduces) this internal summary format (#4400).
+    for turn in &mut prior_turns {
+        if turn.role == "assistant" && turn.content.starts_with("[Used tools:") {
+            turn.content = strip_tool_summary_prefix(&turn.content);
+        }
+    }
+
     // Strip [IMAGE:] markers from *older* history messages when the active
     // provider does not support vision. This prevents "history poisoning"
     // where a previously-sent image marker gets reloaded from the JSONL
@@ -2445,9 +2673,6 @@ async fn process_channel_message(
             }
         }))
     };
-
-    // Record history length before tool loop so we can extract tool context after.
-    let history_len_before_tools = history.len();
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -2704,15 +2929,15 @@ async fn process_channel_message(
                 }),
             );
 
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
-                delivered_response.clone()
-            } else {
-                format!("{tool_summary}\n{delivered_response}")
-            };
+            // Previously we prepended a `[Used tools: …]` summary to the
+            // history entry so the LLM retained awareness of prior tool usage.
+            // This caused the model to learn and reproduce the bracket format
+            // in its own output, which leaked to end-users as raw log lines
+            // instead of meaningful responses (#4400).  The LLM already
+            // receives tool context through the tool-call/result messages in
+            // the conversation history built by `run_tool_call_loop`, so the
+            // extra summary prefix is unnecessary.
+            let history_response = delivered_response.clone();
 
             append_sender_turn(
                 ctx.as_ref(),
@@ -3897,16 +4122,19 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_full(
-                mx.homeserver.clone(),
-                mx.access_token.clone(),
-                mx.room_id.clone(),
-                mx.allowed_users.clone(),
-                mx.allowed_rooms.clone(),
-                mx.user_id.clone(),
-                mx.device_id.clone(),
-                config.config_path.parent().map(|path| path.to_path_buf()),
-            )),
+            channel: Arc::new(
+                MatrixChannel::new_full(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    mx.room_id.clone(),
+                    mx.allowed_users.clone(),
+                    mx.allowed_rooms.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|path| path.to_path_buf()),
+                )
+                .with_transcription(config.transcription.clone()),
+            ),
         });
     }
 
@@ -4400,23 +4628,28 @@ pub async fn start_channels(config: Config) -> Result<()> {
     };
     // Build system prompt from workspace identity files + skills
     let workspace = config.workspace_dir.clone();
-    let (mut built_tools, delegate_handle_ch, reaction_handle_ch, _channel_map_handle) =
-        tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            Arc::clone(&mem),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.web_fetch,
-            &workspace,
-            &config.agents,
-            config.api_key.as_deref(),
-            &config,
-            None,
-        );
+    let (
+        mut built_tools,
+        delegate_handle_ch,
+        reaction_handle_ch,
+        _channel_map_handle,
+        ask_user_handle_ch,
+    ) = tools::all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        Arc::clone(&mem),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &workspace,
+        &config.agents,
+        config.api_key.as_deref(),
+        &config,
+        None,
+    );
 
     // Wire MCP tools into the registry before freezing — non-fatal.
     // When `deferred_loading` is enabled, MCP tools are NOT added eagerly.
@@ -4693,6 +4926,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     // Populate the reaction tool's channel map now that channels are initialized.
     if let Some(ref handle) = reaction_handle_ch {
+        let mut map = handle.write();
+        for (name, ch) in channels_by_name.as_ref() {
+            map.insert(name.clone(), Arc::clone(ch));
+        }
+    }
+
+    // Populate the ask_user tool's channel map now that channels are initialized.
+    if let Some(ref handle) = ask_user_handle_ch {
         let mut map = handle.write();
         for (name, ch) in channels_by_name.as_ref() {
             map.insert(name.clone(), Arc::clone(ch));
@@ -5022,6 +5263,36 @@ mod tests {
             "no tool results here"
         );
         assert_eq!(strip_tool_result_content(""), "");
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_removes_prefix_and_preserves_content() {
+        let input = "[Used tools: browser_open, shell]\nI opened the page successfully.";
+        assert_eq!(
+            strip_tool_summary_prefix(input),
+            "I opened the page successfully."
+        );
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_returns_empty_when_only_prefix() {
+        let input = "[Used tools: browser_open]";
+        assert_eq!(strip_tool_summary_prefix(input), "");
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_preserves_text_without_prefix() {
+        let input = "Here is the result of the search.";
+        assert_eq!(strip_tool_summary_prefix(input), input);
+    }
+
+    #[test]
+    fn strip_tool_summary_prefix_handles_multiple_newlines() {
+        let input = "[Used tools: shell]\n\nThe command output is 42.";
+        assert_eq!(
+            strip_tool_summary_prefix(input),
+            "The command output is 42."
+        );
     }
 
     #[test]
@@ -10308,5 +10579,26 @@ This is an example JSON object for profile settings."#;
             2,
             "both Slack thread messages should complete, got: {sent_messages:?}"
         );
+    }
+
+    #[test]
+    fn sanitize_channel_response_redacts_detected_credentials() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+
+        let result = sanitize_channel_response(leaked, &tools);
+
+        assert!(!result.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
+        assert!(result.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn sanitize_channel_response_passes_clean_text() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let clean_text = "This is a normal message with no credentials.";
+
+        let result = sanitize_channel_response(clean_text, &tools);
+
+        assert_eq!(result, clean_text);
     }
 }

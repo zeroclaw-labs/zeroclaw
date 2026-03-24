@@ -390,12 +390,47 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     deliver_announcement(config, channel, target, output).await
 }
 
+/// Output that has been scanned for credential leaks and redacted if necessary.
+/// All channel dispatch must use this type — constructing it requires going through
+/// `scan_and_redact_output`, which enforces leak detection on every outbound path.
+pub(crate) struct RedactedOutput(String);
+
+impl RedactedOutput {
+    /// Access the safe-to-send content.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Scan cron job output for credential leaks and return redacted output if leaks are detected.
+/// Logs a warning with channel, target, and detected patterns when credentials are found.
+fn scan_and_redact_output(channel: &str, target: &str, output: &str) -> RedactedOutput {
+    let leak_detector = crate::security::LeakDetector::new();
+    let leak_check = leak_detector.scan(output);
+
+    match leak_check {
+        crate::security::LeakResult::Detected { patterns, redacted } => {
+            tracing::warn!(
+                channel = %channel,
+                target = %target,
+                patterns = ?patterns,
+                "Credential leak detected in cron job output; redacting before delivery"
+            );
+            RedactedOutput(redacted)
+        }
+        crate::security::LeakResult::Clean => RedactedOutput(output.to_string()),
+    }
+}
+
 pub(crate) async fn deliver_announcement(
     config: &Config,
     channel: &str,
     target: &str,
     output: &str,
 ) -> Result<()> {
+    // Scan for credential leaks before delivering cron job output to channel.
+    let safe_output = scan_and_redact_output(channel, target, output);
+
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
             let tg = config
@@ -408,7 +443,9 @@ pub(crate) async fn deliver_announcement(
                 tg.allowed_users.clone(),
                 tg.mention_only,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "discord" => {
             let dc = config
@@ -423,7 +460,9 @@ pub(crate) async fn deliver_announcement(
                 dc.listen_to_bots,
                 dc.mention_only,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "slack" => {
             let sl = config
@@ -439,7 +478,9 @@ pub(crate) async fn deliver_announcement(
                 sl.allowed_users.clone(),
             )
             .with_workspace_dir(config.workspace_dir.clone());
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "mattermost" => {
             let mm = config
@@ -455,7 +496,9 @@ pub(crate) async fn deliver_announcement(
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "signal" => {
             let sg = config
@@ -471,7 +514,9 @@ pub(crate) async fn deliver_announcement(
                 sg.ignore_attachments,
                 sg.ignore_stories,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -491,7 +536,9 @@ pub(crate) async fn deliver_announcement(
                     mx.device_id.clone(),
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 );
-                channel.send(&SendMessage::new(output, target)).await?;
+                channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
             }
             #[cfg(not(feature = "channel-matrix"))]
             {
@@ -521,7 +568,9 @@ pub(crate) async fn deliver_announcement(
                     wa.group_policy.clone(),
                     wa.self_chat_mode,
                 );
-                channel.send(&SendMessage::new(output, target)).await?;
+                channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
             }
             #[cfg(not(feature = "whatsapp-web"))]
             {
@@ -539,7 +588,9 @@ pub(crate) async fn deliver_announcement(
                 qq.app_secret.clone(),
                 qq.allowed_users.clone(),
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -1326,5 +1377,27 @@ mod tests {
         // all_overdue_jobs ignores the limit
         let overdue = cron::all_overdue_jobs(&config, far_future).unwrap();
         assert_eq!(overdue.len(), 3, "all_overdue_jobs must return all");
+    }
+
+    #[test]
+    fn scan_and_redact_output_redacts_credentials() {
+        let leaked_output = "Deployment key: sk_test_FAKE1234567890abcdefgh"; // gitleaks:allow
+
+        let redacted = scan_and_redact_output("telegram", "123456", leaked_output);
+
+        assert!(
+            !redacted.as_str().contains("sk_test_FAKE1234567890abcdefgh"), // gitleaks:allow
+            "credentials must be redacted"
+        );
+        assert!(redacted.as_str().contains("[REDACTED"));
+    }
+
+    #[test]
+    fn scan_and_redact_output_preserves_clean_output() {
+        let clean_output = "Deployment completed successfully at 2024-03-15 10:00:00";
+
+        let redacted = scan_and_redact_output("telegram", "123456", clean_output);
+
+        assert_eq!(redacted.as_str(), clean_output);
     }
 }

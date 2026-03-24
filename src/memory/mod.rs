@@ -9,6 +9,8 @@ pub mod embeddings;
 pub mod hygiene;
 pub mod importance;
 pub mod knowledge_graph;
+#[cfg(feature = "memory-postgres")]
+pub mod knowledge_graph_pg;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
@@ -339,6 +341,8 @@ pub fn create_memory_with_storage_and_routes(
             &storage_provider.schema,
             &storage_provider.table,
             storage_provider.connect_timeout_secs,
+            Some(storage_provider.pgvector_enabled),
+            Some(storage_provider.pgvector_dimensions),
         )?;
         Ok(Box::new(memory))
     }

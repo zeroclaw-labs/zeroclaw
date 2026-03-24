@@ -20,6 +20,12 @@ pub struct ConsolidationResult {
     pub history_entry: String,
     /// New facts/preferences/decisions to store long-term, or None.
     pub memory_update: Option<String>,
+    /// Atomic facts extracted from the turn (when consolidation_extract_facts is enabled).
+    #[serde(default)]
+    pub facts: Vec<String>,
+    /// Observed trend or pattern (when consolidation_extract_facts is enabled).
+    #[serde(default)]
+    pub trend: Option<String>,
 }
 
 const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
@@ -141,6 +147,8 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
         ConsolidationResult {
             history_entry: summary,
             memory_update: None,
+            facts: Vec::new(),
+            trend: None,
         }
     })
 }

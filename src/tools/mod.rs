@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod ask_user;
 pub mod backup_tool;
 pub mod browser;
 pub mod browser_delegate;
@@ -22,9 +23,11 @@ pub mod browser_open;
 pub mod calculator;
 pub mod canvas;
 pub mod claude_code;
+pub mod claude_code_runner;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
+pub mod codex_cli;
 pub mod composio;
 pub mod content_search;
 pub mod cron_add;
@@ -39,6 +42,7 @@ pub mod discord_search;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
+pub mod gemini_cli;
 pub mod git_operations;
 pub mod glob_search;
 pub mod google_workspace;
@@ -62,6 +66,7 @@ pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
 pub mod memory_forget;
+pub mod memory_purge;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod microsoft365;
@@ -69,6 +74,7 @@ pub mod model_routing_config;
 pub mod model_switch;
 pub mod node_tool;
 pub mod notion_tool;
+pub mod opencode_cli;
 pub mod pdf_read;
 pub mod poll;
 pub mod project_intel;
@@ -86,6 +92,11 @@ pub mod sessions;
 pub mod shell;
 pub mod skill_http;
 pub mod skill_tool;
+pub mod sop_advance;
+pub mod sop_approve;
+pub mod sop_execute;
+pub mod sop_list;
+pub mod sop_status;
 pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
@@ -97,6 +108,7 @@ mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod workspace_tool;
 
+pub use ask_user::AskUserTool;
 pub use backup_tool::BackupTool;
 pub use browser::{BrowserTool, ComputerUseConfig};
 #[allow(unused_imports)]
@@ -105,8 +117,10 @@ pub use browser_open::BrowserOpenTool;
 pub use calculator::CalculatorTool;
 pub use canvas::{CanvasStore, CanvasTool};
 pub use claude_code::ClaudeCodeTool;
+pub use claude_code_runner::ClaudeCodeRunnerTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
+pub use codex_cli::CodexCliTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -117,10 +131,14 @@ pub use cron_runs::CronRunsTool;
 pub use cron_update::CronUpdateTool;
 pub use data_management::DataManagementTool;
 pub use delegate::DelegateTool;
+// Re-exported for downstream consumers of background delegation results.
+#[allow(unused_imports)]
+pub use delegate::{BackgroundDelegateResult, BackgroundTaskStatus};
 pub use discord_search::DiscordSearchTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use gemini_cli::GeminiCliTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
 pub use google_workspace::GoogleWorkspaceTool;
@@ -141,6 +159,7 @@ pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
 pub use memory_forget::MemoryForgetTool;
+pub use memory_purge::MemoryPurgeTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use microsoft365::Microsoft365Tool;
@@ -149,6 +168,7 @@ pub use model_switch::ModelSwitchTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
 pub use notion_tool::NotionTool;
+pub use opencode_cli::OpenCodeCliTool;
 pub use pdf_read::PdfReadTool;
 pub use poll::{ChannelMapHandle, PollTool};
 pub use project_intel::ProjectIntelTool;
@@ -171,6 +191,11 @@ pub use shell::ShellTool;
 pub use skill_http::SkillHttpTool;
 #[allow(unused_imports)]
 pub use skill_tool::SkillShellTool;
+pub use sop_advance::SopAdvanceTool;
+pub use sop_approve::SopApproveTool;
+pub use sop_execute::SopExecuteTool;
+pub use sop_list::SopListTool;
+pub use sop_status::SopStatusTool;
 pub use swarm::SwarmTool;
 pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
@@ -324,6 +349,7 @@ pub fn all_tools(
     Option<DelegateParentToolsHandle>,
     Option<ChannelMapHandle>,
     ChannelMapHandle,
+    Option<ChannelMapHandle>,
 ) {
     all_tools_with_runtime(
         config,
@@ -369,15 +395,15 @@ pub fn all_tools_with_runtime(
     Option<DelegateParentToolsHandle>,
     Option<ChannelMapHandle>,
     ChannelMapHandle,
+    Option<ChannelMapHandle>,
 ) {
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new_with_sandbox(
-            security.clone(),
-            runtime,
-            sandbox,
-        )),
+        Arc::new(
+            ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
+                .with_timeout_secs(root_config.shell_tool.timeout_secs),
+        ),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
@@ -391,7 +417,8 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory, security.clone())),
+        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
+        Arc::new(MemoryPurgeTool::new(memory, security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -660,6 +687,43 @@ pub fn all_tools_with_runtime(
         )));
     }
 
+    // Claude Code task runner with Slack progress and SSH handoff
+    if root_config.claude_code_runner.enabled {
+        let gateway_url = format!(
+            "http://{}:{}",
+            root_config.gateway.host, root_config.gateway.port
+        );
+        tool_arcs.push(Arc::new(ClaudeCodeRunnerTool::new(
+            security.clone(),
+            root_config.claude_code_runner.clone(),
+            gateway_url,
+        )));
+    }
+
+    // Codex CLI delegation tool
+    if root_config.codex_cli.enabled {
+        tool_arcs.push(Arc::new(CodexCliTool::new(
+            security.clone(),
+            root_config.codex_cli.clone(),
+        )));
+    }
+
+    // Gemini CLI delegation tool
+    if root_config.gemini_cli.enabled {
+        tool_arcs.push(Arc::new(GeminiCliTool::new(
+            security.clone(),
+            root_config.gemini_cli.clone(),
+        )));
+    }
+
+    // OpenCode CLI delegation tool
+    if root_config.opencode_cli.enabled {
+        tool_arcs.push(Arc::new(OpenCodeCliTool::new(
+            security.clone(),
+            root_config.opencode_cli.clone(),
+        )));
+    }
+
     // PDF extraction (feature-gated at compile time via rag-pdf)
     tool_arcs.push(Arc::new(PdfReadTool::new(security.clone())));
 
@@ -735,6 +799,18 @@ pub fn all_tools_with_runtime(
         Arc::clone(&channel_map_handle),
     )));
 
+    // SOP tools (registered when sops_dir is configured)
+    if root_config.sop.sops_dir.is_some() {
+        let sop_engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            root_config.sop.clone(),
+        )));
+        tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
+    }
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tool_arcs.push(Arc::new(ComposioTool::new(
@@ -749,6 +825,11 @@ pub fn all_tools_with_runtime(
     let reaction_tool = ReactionTool::new(security.clone());
     let reaction_handle = reaction_tool.channel_map_handle();
     tool_arcs.push(Arc::new(reaction_tool));
+
+    // Interactive ask_user tool — always registered; channel map populated later by start_channels.
+    let ask_user_tool = AskUserTool::new(security.clone());
+    let ask_user_handle = ask_user_tool.channel_map_handle();
+    tool_arcs.push(Arc::new(ask_user_tool));
 
     // Microsoft 365 Graph API integration
     if root_config.microsoft365.enabled {
@@ -781,6 +862,7 @@ pub fn all_tools_with_runtime(
                     None,
                     Some(reaction_handle),
                     channel_map_handle,
+                    Some(ask_user_handle),
                 );
             }
 
@@ -970,6 +1052,7 @@ pub fn all_tools_with_runtime(
         delegate_handle,
         Some(reaction_handle),
         channel_map_handle,
+        Some(ask_user_handle),
     )
 }
 
@@ -1014,7 +1097,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1057,7 +1140,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1211,7 +1294,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1245,7 +1328,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1280,7 +1363,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
@@ -1315,7 +1398,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _, _) = all_tools(
+        let (tools, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,

@@ -109,3 +109,11 @@ allow_override = false
 # [cost.prices."openai/gpt-4o-mini"]
 # input = 0.15
 # output = 0.60
+
+# ── Voice Transcription ─────────────────────────────────────────
+# [transcription]
+# enabled = true
+# default_provider = "groq"
+# Also transcribe non-PTT (forwarded / regular) audio on WhatsApp.
+# Default: false (only voice notes are transcribed).
+# transcribe_non_ptt_audio = false

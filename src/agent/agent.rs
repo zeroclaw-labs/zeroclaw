@@ -377,7 +377,7 @@ impl Agent {
             None
         };
 
-        let (mut tools, delegate_handle, _reaction_handle, _channel_map_handle) =
+        let (mut tools, delegate_handle, _reaction_handle, _channel_map_handle, _ask_user_handle) =
             tools::all_tools_with_runtime(
                 Arc::new(config.clone()),
                 &security,
@@ -653,6 +653,24 @@ impl Agent {
                 return format!("hint:{}", decision.hint);
             }
         }
+
+        // Fallback: auto-classify by complexity when no rule matched.
+        if let Some(ref ac) = self.config.auto_classify {
+            let tier = super::eval::estimate_complexity(user_message);
+            if let Some(hint) = ac.hint_for(tier) {
+                if self.available_hints.contains(&hint.to_string()) {
+                    tracing::info!(
+                        target: "query_classification",
+                        hint = hint,
+                        complexity = ?tier,
+                        message_length = user_message.len(),
+                        "Auto-classified by complexity"
+                    );
+                    return format!("hint:{hint}");
+                }
+            }
+        }
+
         self.model_name.clone()
     }
 

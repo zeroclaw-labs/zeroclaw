@@ -1153,6 +1153,7 @@ mod tests {
         assert!(config.assemblyai.is_none());
         assert!(config.google.is_none());
         assert!(config.local_whisper.is_none());
+        assert!(!config.transcribe_non_ptt_audio);
     }
 
     // ── LocalWhisperProvider tests (TDD — added below as red/green cycles) ──

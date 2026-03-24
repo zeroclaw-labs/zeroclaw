@@ -12,8 +12,6 @@ SOP 审计条目通过 `SopAuditLogger` 持久化到配置的内存后端的 `so
 - `sop_step_{run_id}_{step_number}`：单步结果
 - `sop_approval_{run_id}_{step_number}`：操作员审批记录
 - `sop_timeout_approve_{run_id}_{step_number}`：超时自动审批记录
-- `sop_gate_decision_{gate_id}_{timestamp_ms}`：门评估器决策记录（启用 `ampersona-gates` 时）
-- `sop_phase_state`：持久化的信任阶段状态快照（启用 `ampersona-gates` 时）
 
 ## 2. 检查路径
 
