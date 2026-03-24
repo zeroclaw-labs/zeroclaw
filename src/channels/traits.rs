@@ -161,6 +161,20 @@ pub trait Channel: Send + Sync {
     async fn unpin_message(&self, _channel_id: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Redact (delete) a message from the channel.
+    ///
+    /// `channel_id` is the platform channel/conversation identifier.
+    /// `message_id` is the platform-scoped message identifier.
+    /// `reason` is an optional reason for the redaction (may be visible in audit logs).
+    async fn redact_message(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -278,5 +292,19 @@ mod tests {
         assert_eq!(received.sender, "tester");
         assert_eq!(received.content, "hello");
         assert_eq!(received.channel, "dummy");
+    }
+
+    #[tokio::test]
+    async fn default_redact_message_returns_success() {
+        let channel = DummyChannel;
+
+        assert!(channel
+            .redact_message("chan_1", "msg_1", Some("spam".to_string()))
+            .await
+            .is_ok());
+        assert!(channel
+            .redact_message("chan_1", "msg_2", None)
+            .await
+            .is_ok());
     }
 }
