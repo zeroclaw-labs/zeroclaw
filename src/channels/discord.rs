@@ -1228,6 +1228,10 @@ impl Channel for DiscordChannel {
         self.stream_mode == crate::config::StreamMode::Partial
     }
 
+    fn supports_multi_message_streaming(&self) -> bool {
+        self.stream_mode == crate::config::StreamMode::MultiMessage
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
         if self.stream_mode != crate::config::StreamMode::Partial {
             return Ok(None);

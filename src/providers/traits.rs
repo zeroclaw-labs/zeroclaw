@@ -443,6 +443,26 @@ pub trait Provider: Send + Sync {
         })
     }
 
+    /// Streaming variant of [`chat`] that forwards text deltas to `text_sink`
+    /// as they arrive, while still returning the complete [`ChatResponse`]
+    /// (including any tool calls) for the agent loop.
+    ///
+    /// Default implementation falls back to non-streaming [`chat`] and sends
+    /// the complete text through the sink in one shot.
+    async fn chat_streaming(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        text_sink: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) -> anyhow::Result<ChatResponse> {
+        let resp = self.chat(request, model, temperature).await?;
+        if let (Some(sink), Some(text)) = (text_sink, &resp.text) {
+            let _ = sink.send(text.clone()).await;
+        }
+        Ok(resp)
+    }
+
     /// Whether provider supports streaming responses.
     /// Default implementation returns false.
     fn supports_streaming(&self) -> bool {

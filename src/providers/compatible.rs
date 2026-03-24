@@ -770,6 +770,7 @@ struct StreamToolCallDelta {
     arguments: Option<String>,
 }
 
+
 #[derive(Debug, Deserialize)]
 struct StreamFunctionDelta {
     #[serde(default)]

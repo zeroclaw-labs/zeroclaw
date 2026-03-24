@@ -59,6 +59,8 @@ struct NativeChatRequest<'a> {
     tools: Option<Vec<NativeToolSpec<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -704,6 +706,146 @@ impl AnthropicProvider {
     }
 }
 
+/// Consume an Anthropic SSE streaming response, forward text deltas to a
+/// sink, and accumulate the full response including any tool calls.
+///
+/// Anthropic SSE events:
+/// - `content_block_start`: `{"type":"content_block_start","index":N,"content_block":{"type":"text"|"tool_use",...}}`
+/// - `content_block_delta`: `{"type":"content_block_delta","index":N,"delta":{"type":"text_delta","text":"..."}}`
+///   or `{"type":"content_block_delta","index":N,"delta":{"type":"input_json_delta","partial_json":"..."}}`
+/// - `message_delta`: `{"type":"message_delta","delta":{"stop_reason":"..."}}`
+/// - `message_stop`: end of message
+async fn anthropic_streaming_complete(
+    response: reqwest::Response,
+    text_sink: Option<&tokio::sync::mpsc::Sender<String>>,
+) -> anyhow::Result<crate::providers::traits::ChatResponse> {
+    use futures_util::StreamExt;
+
+    let mut full_text = String::new();
+    // Tool call accumulation: index → (id, name, arguments_json)
+    let mut tool_calls: std::collections::HashMap<usize, (String, String, String)> =
+        std::collections::HashMap::new();
+    let mut current_block_type: std::collections::HashMap<usize, String> =
+        std::collections::HashMap::new();
+
+    let mut buffer = String::new();
+    let mut bytes_stream = response.bytes_stream();
+
+    while let Some(item) = bytes_stream.next().await {
+        let bytes = item.map_err(|e| anyhow::anyhow!("Stream read error: {e}"))?;
+        let text = String::from_utf8(bytes.to_vec())
+            .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in stream: {e}"))?;
+
+        buffer.push_str(&text);
+
+        while let Some(pos) = buffer.find('\n') {
+            let line: String = buffer[..=pos].to_string();
+            buffer = buffer[pos + 1..].to_string();
+            let line = line.trim();
+
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+
+            // Anthropic uses "event: <type>" lines before "data: <json>" lines.
+            // We only care about the data lines.
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+
+            let event: serde_json::Value = match serde_json::from_str(data) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+            match event_type {
+                "content_block_start" => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    if let Some(block) = event.get("content_block") {
+                        let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        current_block_type.insert(index, block_type.to_string());
+                        if block_type == "tool_use" {
+                            let id = block
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let name = block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            tool_calls.insert(index, (id, name, String::new()));
+                        }
+                    }
+                }
+                "content_block_delta" => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let index = event.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    if let Some(delta) = event.get("delta") {
+                        let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        match delta_type {
+                            "text_delta" => {
+                                if let Some(text_val) = delta.get("text").and_then(|v| v.as_str()) {
+                                    if !text_val.is_empty() {
+                                        full_text.push_str(text_val);
+                                        if let Some(sink) = text_sink {
+                                            let _ = sink.send(text_val.to_string()).await;
+                                        }
+                                    }
+                                }
+                            }
+                            "input_json_delta" => {
+                                if let Some(json_val) =
+                                    delta.get("partial_json").and_then(|v| v.as_str())
+                                {
+                                    if let Some(tc) = tool_calls.get_mut(&index) {
+                                        tc.2.push_str(json_val);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let tool_call_vec: Vec<crate::providers::traits::ToolCall> = tool_calls
+        .into_values()
+        .filter(|(_, name, _)| !name.is_empty())
+        .map(|(id, name, arguments)| crate::providers::traits::ToolCall {
+            id: if id.is_empty() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                id
+            },
+            name,
+            arguments,
+        })
+        .collect();
+
+    Ok(crate::providers::traits::ChatResponse {
+        text: if full_text.is_empty() {
+            None
+        } else {
+            Some(full_text)
+        },
+        tool_calls: tool_call_vec,
+        usage: None,
+        reasoning_content: None,
+    })
+}
+
 #[async_trait]
 impl Provider for AnthropicProvider {
     async fn chat_with_system(
@@ -740,6 +882,7 @@ impl Provider for AnthropicProvider {
             temperature,
             tools: None,
             tool_choice: None,
+            stream: None,
         };
 
         let mut request = self
@@ -810,6 +953,7 @@ impl Provider for AnthropicProvider {
             temperature,
             tools: native_tools,
             tool_choice,
+            stream: None,
         };
 
         let req = self
@@ -838,6 +982,74 @@ impl Provider for AnthropicProvider {
 
     fn supports_native_tools(&self) -> bool {
         true
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    async fn chat_streaming(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        text_sink: Option<&tokio::sync::mpsc::Sender<String>>,
+    ) -> anyhow::Result<ProviderChatResponse> {
+        if text_sink.is_none() {
+            return self.chat(request, model, temperature).await;
+        }
+
+        let credential = self
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Anthropic credentials not set."))?;
+
+        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+        if Self::should_cache_conversation(request.messages) {
+            Self::apply_cache_to_last_message(&mut messages);
+        }
+
+        let tool_choice_override = crate::agent::loop_::TOOL_CHOICE_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let native_tools = Self::convert_tools(request.tools);
+        let tool_choice = if native_tools.is_some() {
+            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+        } else {
+            None
+        };
+
+        let system_prompt = if Self::is_setup_token(credential) {
+            Self::apply_oauth_system_prompt(system_prompt)
+        } else {
+            system_prompt
+        };
+
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            system: system_prompt,
+            messages,
+            temperature,
+            tools: native_tools,
+            tool_choice,
+            stream: Some(true),
+        };
+
+        let req = self
+            .http_client()
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&native_request);
+
+        let response = self.apply_auth(req, credential).send().await?;
+        if !response.status().is_success() {
+            return Err(super::api_error("Anthropic", response).await);
+        }
+
+        anthropic_streaming_complete(response, text_sink).await
     }
 
     async fn chat_with_tools(
@@ -1618,6 +1830,7 @@ mod tests {
             temperature: 0.7,
             tools: None,
             tool_choice: None,
+            stream: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();

@@ -2558,26 +2558,40 @@ async fn process_channel_message(
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
-    let use_streaming = target_channel
+    let use_draft_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
+    let use_multi_message = target_channel
+        .as_ref()
+        .is_some_and(|ch| ch.supports_multi_message_streaming());
 
     tracing::debug!(
         channel = %msg.channel,
         has_target_channel = target_channel.is_some(),
-        use_streaming,
-        supports_draft = target_channel.as_ref().map_or(false, |ch| ch.supports_draft_updates()),
-        "Draft streaming decision"
+        use_draft_streaming,
+        use_multi_message,
+        "Streaming decision"
     );
 
-    let (delta_tx, delta_rx) = if use_streaming {
+    // Partial mode: delta channel for draft updates (progress + text).
+    let (delta_tx, delta_rx) = if use_draft_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<crate::agent::loop_::DraftEvent>(64);
         (Some(tx), Some(rx))
     } else {
         (None, None)
     };
 
-    let draft_message_id = if use_streaming {
+    // MultiMessage mode: separate channel for pure LLM text deltas only.
+    // Keeps progress messages out of the multi-message delivery path.
+    let (stream_text_tx, stream_text_rx) = if use_multi_message {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // Partial mode: send an initial draft message for progressive editing.
+    let draft_message_id = if use_draft_streaming {
         if let Some(channel) = target_channel.as_ref() {
             match channel
                 .send_draft(
@@ -2598,42 +2612,133 @@ async fn process_channel_message(
         None
     };
 
-    let draft_updater = if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) = (
-        delta_rx,
-        draft_message_id.as_deref(),
-        target_channel.as_ref(),
-    ) {
-        let channel = Arc::clone(channel_ref);
-        let reply_target = msg.reply_target.clone();
-        let draft_id = draft_id_ref.to_string();
-        Some(tokio::spawn(async move {
-            use crate::agent::loop_::DraftEvent;
-            let mut accumulated = String::new();
-            while let Some(event) = rx.recv().await {
-                match event {
-                    DraftEvent::Clear => {
-                        accumulated.clear();
-                    }
-                    DraftEvent::Progress(text) => {
-                        if let Err(e) = channel
-                            .update_draft_progress(&reply_target, &draft_id, &text)
-                            .await
-                        {
-                            tracing::debug!("Draft progress update failed: {e}");
+    // Spawn the appropriate handler for the delta channel.
+    let draft_updater = if use_draft_streaming {
+        // Partial: accumulate text and edit a single draft message.
+        if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) = (
+            delta_rx,
+            draft_message_id.as_deref(),
+            target_channel.as_ref(),
+        ) {
+            let channel = Arc::clone(channel_ref);
+            let reply_target = msg.reply_target.clone();
+            let draft_id = draft_id_ref.to_string();
+            Some(tokio::spawn(async move {
+                use crate::agent::loop_::DraftEvent;
+                let mut accumulated = String::new();
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        DraftEvent::Clear => {
+                            accumulated.clear();
                         }
-                    }
-                    DraftEvent::Content(text) => {
-                        accumulated.push_str(&text);
-                        if let Err(e) = channel
-                            .update_draft(&reply_target, &draft_id, &accumulated)
-                            .await
-                        {
-                            tracing::debug!("Draft update failed: {e}");
+                        DraftEvent::Progress(text) => {
+                            if let Err(e) = channel
+                                .update_draft_progress(&reply_target, &draft_id, &text)
+                                .await
+                            {
+                                tracing::debug!("Draft progress update failed: {e}");
+                            }
+                        }
+                        DraftEvent::Content(text) => {
+                            accumulated.push_str(&text);
+                            if let Err(e) = channel
+                                .update_draft(&reply_target, &draft_id, &accumulated)
+                                .await
+                            {
+                                tracing::debug!("Draft update failed: {e}");
+                            }
                         }
                     }
                 }
-            }
-        }))
+            }))
+        } else {
+            None
+        }
+    } else if use_multi_message {
+        // MultiMessage: buffer pure LLM text deltas from stream_text_rx and
+        // send a new message at each paragraph boundary (\n\n outside code
+        // fences). This channel carries ONLY text — no progress messages or
+        // sentinels — because it's fed by a dedicated stream_text_sink in the
+        // agent loop, separate from on_delta.
+        if let (Some(mut rx), Some(channel_ref)) = (stream_text_rx, target_channel.as_ref()) {
+            let channel = Arc::clone(channel_ref);
+            let reply_target = msg.reply_target.clone();
+            let thread_ts = msg.thread_ts.clone();
+            Some(tokio::spawn(async move {
+                let mut buffer = String::new();
+                let mut in_fence = false;
+
+                while let Some(delta) = rx.recv().await {
+                    buffer.push_str(&delta);
+
+                    // Check for paragraph boundaries outside code fences.
+                    loop {
+                        let mut split_pos = None;
+                        let mut fence_state = in_fence;
+                        let mut chars = buffer.char_indices().peekable();
+                        let mut line_start = true;
+                        let mut fence_marker_start = None;
+
+                        while let Some((idx, ch)) = chars.next() {
+                            if line_start && ch == '`' {
+                                if fence_marker_start.is_none() {
+                                    fence_marker_start = Some(idx);
+                                }
+                                if let Some(start) = fence_marker_start {
+                                    if idx - start >= 2 {
+                                        fence_state = !fence_state;
+                                        fence_marker_start = None;
+                                    }
+                                }
+                            } else {
+                                fence_marker_start = None;
+                            }
+
+                            if ch == '\n' {
+                                line_start = true;
+                                if !fence_state {
+                                    if let Some(&(next_idx, '\n')) = chars.peek() {
+                                        split_pos = Some(next_idx + 1);
+                                        break;
+                                    }
+                                }
+                            } else {
+                                line_start = ch == '\r';
+                            }
+                        }
+
+                        if let Some(pos) = split_pos {
+                            let paragraph = buffer[..pos].trim().to_string();
+                            buffer = buffer[pos..].to_string();
+                            in_fence = fence_state;
+
+                            if !paragraph.is_empty() {
+                                let msg = SendMessage::new(&paragraph, &reply_target)
+                                    .in_thread(thread_ts.clone());
+                                if let Err(e) = channel.send(&msg).await {
+                                    tracing::debug!("Multi-message send failed: {e}");
+                                }
+                            }
+                        } else {
+                            in_fence = fence_state;
+                            break;
+                        }
+                    }
+                }
+
+                // Flush any remaining buffered text.
+                let remaining = buffer.trim().to_string();
+                if !remaining.is_empty() {
+                    let msg =
+                        SendMessage::new(&remaining, &reply_target).in_thread(thread_ts.clone());
+                    if let Err(e) = channel.send(&msg).await {
+                        tracing::debug!("Multi-message final flush failed: {e}");
+                    }
+                }
+            }))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -2650,10 +2755,10 @@ async fn process_channel_message(
         }
     }
 
-    // Skip typing when streaming — draft updates provide visual feedback
-    // and Discord does not clear its typing indicator on message edits
-    // (PATCH), only on new message sends (POST).
-    let typing_cancellation = if use_streaming {
+    // Skip typing when draft streaming — draft updates provide visual feedback
+    // and Discord does not clear its typing indicator on message edits (PATCH).
+    // MultiMessage and Off both keep typing active (POST clears it naturally).
+    let typing_cancellation = if use_draft_streaming {
         None
     } else {
         target_channel.as_ref().map(|_| CancellationToken::new())
@@ -2743,6 +2848,7 @@ async fn process_channel_message(
                     ctx.max_tool_iterations,
                     Some(cancellation_token.clone()),
                     delta_tx.clone(),
+                    stream_text_tx.clone(),
                     ctx.hooks.as_deref(),
                     if msg.channel == "cli"
                         || ctx.autonomy_level == AutonomyLevel::Full
@@ -2805,10 +2911,10 @@ async fn process_channel_message(
         break loop_result;
     };
 
-    // Drop the delta sender so the draft updater task can finish
-    // (rx.recv() returns None only when all senders are dropped).
-    tracing::debug!("Post-loop: dropping delta_tx and awaiting draft updater");
+    // Drop all senders so updater tasks can exit (rx.recv() returns None).
+    tracing::debug!("Post-loop: dropping delta_tx/stream_text_tx and awaiting draft updater");
     drop(delta_tx);
+    drop(stream_text_tx);
     if let Some(handle) = draft_updater {
         let _ = handle.await;
     }
@@ -3017,6 +3123,11 @@ async fn process_channel_message(
                             )
                             .await;
                     }
+                } else if use_multi_message {
+                    // MultiMessage: the updater task already delivered the
+                    // response as separate messages via the delta channel.
+                    // No additional send() needed.
+                    tracing::debug!("MultiMessage delivery handled by updater task");
                 } else if let Err(e) = channel
                     .send(
                         &SendMessage::new(&delivered_response, &msg.reply_target)
@@ -5109,22 +5220,41 @@ pub async fn start_channels(config: Config) -> Result<()> {
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
+    // If the last persisted turn is a user message (orphan from a crash mid-query),
+    // close it with a marker so the LLM doesn't try to continue the old request.
     if let Some(ref store) = runtime_ctx.session_store {
         let mut hydrated = 0usize;
+        let mut orphans_closed = 0usize;
         let mut histories = runtime_ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         for key in store.list_sessions() {
-            let msgs = store.load(&key);
-            if !msgs.is_empty() {
-                hydrated += 1;
-                histories.insert(key, msgs);
+            let mut msgs = store.load(&key);
+            if msgs.is_empty() {
+                continue;
             }
+            // Close orphaned user turns from crashed sessions.
+            if msgs.last().is_some_and(|m| m.role == "user") {
+                let closure =
+                    ChatMessage::assistant("[Session interrupted — not continuing this request]");
+                if let Err(e) = store.append(&key, &closure) {
+                    tracing::debug!("Failed to persist orphan closure for {key}: {e}");
+                }
+                msgs.push(closure);
+                orphans_closed += 1;
+            }
+            hydrated += 1;
+            histories.insert(key, msgs);
         }
         drop(histories);
         if hydrated > 0 {
             tracing::info!("📂 Restored {hydrated} session(s) from disk");
+        }
+        if orphans_closed > 0 {
+            tracing::info!(
+                "🔒 Closed {orphans_closed} orphaned session turn(s) from previous crash"
+            );
         }
     }
 

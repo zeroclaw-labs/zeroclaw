@@ -109,6 +109,13 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// Whether this channel supports multi-message streaming delivery, where
+    /// the response is sent as multiple separate messages at paragraph
+    /// boundaries as tokens arrive from the provider.
+    fn supports_multi_message_streaming(&self) -> bool {
+        false
+    }
+
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
     async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
         Ok(None)
