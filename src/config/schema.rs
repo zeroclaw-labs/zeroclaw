@@ -1334,6 +1334,10 @@ pub struct AgentConfig {
     /// Automatic complexity-based classification fallback.
     #[serde(default)]
     pub auto_classify: Option<crate::agent::eval::AutoClassifyConfig>,
+
+    /// Context compression configuration for automatic conversation compaction.
+    #[serde(default)]
+    pub context_compression: crate::agent::context_compressor::ContextCompressionConfig,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1373,6 +1377,8 @@ impl Default for AgentConfig {
             context_aware_tools: false,
             eval: crate::agent::eval::EvalConfig::default(),
             auto_classify: None,
+            context_compression:
+                crate::agent::context_compressor::ContextCompressionConfig::default(),
         }
     }
 }

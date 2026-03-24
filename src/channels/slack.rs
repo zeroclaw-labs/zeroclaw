@@ -53,6 +53,8 @@ const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
 const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
 const SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS: usize = 12_000;
 const SLACK_MARKDOWN_BLOCK_MAX_CHARS: usize = 12_000;
+const SLACK_BLOCK_TEXT_MAX_CHARS: usize = 3_000;
+const SLACK_MAX_BLOCKS_PER_MESSAGE: usize = 50;
 const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
@@ -2588,6 +2590,61 @@ impl SlackChannel {
     }
 }
 
+const SLACK_TRUNCATION_INDICATOR: &str = "\n\n...[message truncated]";
+
+/// Split `text` into chunks of at most `max_chars`, breaking at newline or
+/// space boundaries when possible. Returns at most `max_chunks` pieces; if the
+/// text would require more, the last chunk includes a truncation indicator.
+fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Vec<String> {
+    if text.len() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() && chunks.len() < max_chunks {
+        let is_last_slot = chunks.len() + 1 == max_chunks;
+
+        if remaining.len() <= max_chars && !is_last_slot {
+            chunks.push(remaining.to_string());
+            break;
+        }
+
+        if is_last_slot {
+            // Last allowed slot: if remaining fits, just push it.
+            if remaining.len() <= max_chars {
+                chunks.push(remaining.to_string());
+            } else {
+                // Truncate with indicator.
+                let avail = max_chars - SLACK_TRUNCATION_INDICATOR.len();
+                let break_at = remaining[..avail]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .or_else(|| remaining[..avail].rfind(' ').map(|i| i + 1))
+                    .unwrap_or(avail);
+                let mut chunk = remaining[..break_at].to_string();
+                chunk.push_str(SLACK_TRUNCATION_INDICATOR);
+                chunks.push(chunk);
+            }
+            break;
+        }
+
+        // Normal chunk: find a good break point.
+        let limit = max_chars.min(remaining.len());
+        let break_at = remaining[..limit]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .or_else(|| remaining[..limit].rfind(' ').map(|i| i + 1))
+            .unwrap_or(limit);
+
+        chunks.push(remaining[..break_at].to_string());
+        remaining = &remaining[break_at..];
+    }
+
+    chunks
+}
+
 #[async_trait]
 impl Channel for SlackChannel {
     fn name(&self) -> &str {
@@ -2615,12 +2672,24 @@ impl Channel for SlackChannel {
                 "text": message.content
             });
 
-            // Use Slack's native markdown block for rich formatting when content fits.
+            // Use Slack's native markdown blocks for rich formatting.
+            // Split into multiple blocks to respect the per-block text limit.
             if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
-                body["blocks"] = serde_json::json!([{
-                    "type": "markdown",
-                    "text": message.content
-                }]);
+                let chunks = split_text_into_chunks(
+                    &message.content,
+                    SLACK_BLOCK_TEXT_MAX_CHARS,
+                    SLACK_MAX_BLOCKS_PER_MESSAGE,
+                );
+                let blocks: Vec<serde_json::Value> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        serde_json::json!({
+                            "type": "markdown",
+                            "text": chunk
+                        })
+                    })
+                    .collect();
+                body["blocks"] = serde_json::Value::Array(blocks);
             }
 
             if let Some(ts) = self.outbound_thread_ts(message) {
