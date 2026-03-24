@@ -135,6 +135,20 @@ pub trait Memory: Send + Sync {
     /// Remove a memory by key
     async fn forget(&self, key: &str) -> anyhow::Result<bool>;
 
+    /// Remove all memories in a namespace (category).
+    /// Returns the number of deleted entries.
+    /// Default: returns unsupported error. Backends that support bulk deletion override this.
+    async fn purge_namespace(&self, _namespace: &str) -> anyhow::Result<usize> {
+        anyhow::bail!("purge_namespace not supported by this memory backend")
+    }
+
+    /// Remove all memories in a session.
+    /// Returns the number of deleted entries.
+    /// Default: returns unsupported error. Backends that support bulk deletion override this.
+    async fn purge_session(&self, _session_id: &str) -> anyhow::Result<usize> {
+        anyhow::bail!("purge_session not supported by this memory backend")
+    }
+
     /// Count total memories
     async fn count(&self) -> anyhow::Result<usize>;
 
