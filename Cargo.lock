@@ -12436,6 +12436,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-serial",
+ "tokio-socks",
  "tokio-stream",
  "tokio-tungstenite 0.29.0",
  "tokio-util",

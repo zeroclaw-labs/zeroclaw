@@ -662,7 +662,12 @@ impl Channel for DiscordChannel {
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
         tracing::info!("Discord: connecting to gateway...");
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+        let (ws_stream, _) = crate::config::ws_connect_with_proxy(
+            &ws_url,
+            "channel.discord",
+            self.proxy_url.as_deref(),
+        )
+        .await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)

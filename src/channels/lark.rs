@@ -734,7 +734,12 @@ impl LarkChannel {
             .unwrap_or(0);
         tracing::info!("Lark: connecting to {wss_url}");
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url).await?;
+        let (ws_stream, _) = crate::config::ws_connect_with_proxy(
+            &wss_url,
+            "channel.lark",
+            self.proxy_url.as_deref(),
+        )
+        .await?;
         let (mut write, mut read) = ws_stream.split();
         tracing::info!("Lark: WS connected (service_id={service_id})");
 
