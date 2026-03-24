@@ -74,7 +74,11 @@ impl PluginHost {
                         // Verify plugin signature
                         let manifest_toml =
                             std::fs::read_to_string(&manifest_path).unwrap_or_default();
-                        match self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest) {
+                        match self.verify_plugin_signature(
+                            &manifest.name,
+                            &manifest_toml,
+                            &manifest,
+                        ) {
                             Ok(verification) => {
                                 let wasm_path = path.join(&manifest.wasm_path);
                                 self.loaded.insert(

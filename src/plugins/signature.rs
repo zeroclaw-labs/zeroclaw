@@ -178,8 +178,7 @@ pub fn verify_manifest(
     let canonical = canonical_manifest_bytes(manifest_toml);
 
     // Verify
-    let peer_public_key =
-        signature::UnparsedPublicKey::new(&signature::ED25519, &pub_key_bytes);
+    let peer_public_key = signature::UnparsedPublicKey::new(&signature::ED25519, &pub_key_bytes);
     match peer_public_key.verify(&canonical, &sig_bytes) {
         Ok(()) => VerificationResult::Valid {
             publisher_key: normalized_key,

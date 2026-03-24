@@ -29,7 +29,10 @@ pub enum PluginError {
     UnsignedPlugin(String),
 
     #[error("plugin '{plugin}' signed by untrusted publisher key '{publisher_key}'")]
-    UntrustedPublisher { plugin: String, publisher_key: String },
+    UntrustedPublisher {
+        plugin: String,
+        publisher_key: String,
+    },
 
     #[error("invalid plugin signature: {0}")]
     SignatureInvalid(String),
