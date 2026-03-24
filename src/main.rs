@@ -974,8 +974,7 @@ async fn main() -> Result<()> {
                     info!("🔄 Restarting ZeroClaw Gateway on {addr}");
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref())
-                        .await
+                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
                     {
                         Ok(()) => {
                             info!("   ✓ Existing gateway on {addr} shut down gracefully");
