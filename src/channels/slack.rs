@@ -179,6 +179,94 @@ impl SlackChannel {
         )
     }
 
+    /// Post a new Slack message and return the message timestamp (`ts`).
+    ///
+    /// This is a lower-level helper that exposes the `ts` value needed for
+    /// subsequent `chat.update` calls. For simple sends, use the [`Channel::send`]
+    /// trait method instead.
+    pub async fn post_message(&self, channel: &str, text: &str) -> anyhow::Result<String> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "text": text,
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let raw = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&raw);
+            anyhow::bail!("Slack chat.postMessage failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack chat.postMessage failed: {err}");
+        }
+
+        parsed
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("Slack chat.postMessage response missing 'ts'"))
+    }
+
+    /// Update an existing Slack message in-place using `chat.update`.
+    ///
+    /// `channel` is the channel ID and `ts` is the timestamp of the original
+    /// message (returned by [`post_message`]).
+    pub async fn update_message(&self, channel: &str, ts: &str, text: &str) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "ts": ts,
+            "text": text,
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.update")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let raw = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&raw);
+            anyhow::bail!("Slack chat.update failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack chat.update failed: {err}");
+        }
+
+        Ok(())
+    }
+
     /// Check if a Slack user ID is in the allowlist.
     /// Empty list means deny everyone until explicitly configured.
     /// `"*"` means allow everyone.

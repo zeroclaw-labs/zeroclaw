@@ -22,6 +22,7 @@ pub mod browser_open;
 pub mod calculator;
 pub mod canvas;
 pub mod claude_code;
+pub mod claude_code_runner;
 pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
@@ -112,6 +113,7 @@ pub use browser_open::BrowserOpenTool;
 pub use calculator::CalculatorTool;
 pub use canvas::{CanvasStore, CanvasTool};
 pub use claude_code::ClaudeCodeTool;
+pub use claude_code_runner::ClaudeCodeRunnerTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use codex_cli::CodexCliTool;
@@ -671,6 +673,19 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(ClaudeCodeTool::new(
             security.clone(),
             root_config.claude_code.clone(),
+        )));
+    }
+
+    // Claude Code task runner with Slack progress and SSH handoff
+    if root_config.claude_code_runner.enabled {
+        let gateway_url = format!(
+            "http://{}:{}",
+            root_config.gateway.host, root_config.gateway.port
+        );
+        tool_arcs.push(Arc::new(ClaudeCodeRunnerTool::new(
+            security.clone(),
+            root_config.claude_code_runner.clone(),
+            gateway_url,
         )));
     }
 
