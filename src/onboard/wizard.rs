@@ -4053,6 +4053,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     interrupt_on_new_message: false,
                     thread_replies: None,
                     mention_only: false,
+                    use_markdown_blocks: false,
                     proxy_url: None,
                 });
             }

@@ -6288,6 +6288,11 @@ pub struct SlackConfig {
     /// Direct messages remain allowed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Use the newer Slack `markdown` block type (12 000 char limit, richer formatting).
+    /// Defaults to false (uses universally supported `section` blocks with `mrkdwn`).
+    /// Enable this only if your Slack workspace supports the `markdown` block type.
+    #[serde(default)]
+    pub use_markdown_blocks: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]

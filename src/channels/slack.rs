@@ -32,6 +32,8 @@ pub struct SlackChannel {
     workspace_dir: Option<PathBuf>,
     /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
     active_assistant_thread: Mutex<HashMap<String, String>>,
+    /// Use the newer `markdown` block type (richer formatting, 12k char limit).
+    use_markdown_blocks: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
     /// Voice transcription config — when set, audio file attachments are
@@ -130,6 +132,7 @@ impl SlackChannel {
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
             active_assistant_thread: Mutex::new(HashMap::new()),
+            use_markdown_blocks: false,
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
@@ -161,6 +164,13 @@ impl SlackChannel {
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
+    /// Enable the newer `markdown` block type for richer formatting.
+    /// Only use this if your Slack workspace supports it.
+    pub fn with_markdown_blocks(mut self, enabled: bool) -> Self {
+        self.use_markdown_blocks = enabled;
+        self
+    }
+
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
@@ -2672,21 +2682,38 @@ impl Channel for SlackChannel {
                 "text": message.content
             });
 
-            // Use Slack's native markdown blocks for rich formatting.
-            // Split into multiple blocks to respect the per-block text limit.
+            // Add rich formatting blocks, split into chunks for the per-block limit.
+            // The newer `markdown` block type (12k chars) offers richer formatting but
+            // isn't available on all workspaces, causing `invalid_blocks` errors (#4563).
+            // Default to the universally supported `section` block with `mrkdwn`.
+            let block_limit = if self.use_markdown_blocks {
+                SLACK_MARKDOWN_BLOCK_MAX_CHARS
+            } else {
+                SLACK_BLOCK_TEXT_MAX_CHARS
+            };
             if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
                 let chunks = split_text_into_chunks(
                     &message.content,
-                    SLACK_BLOCK_TEXT_MAX_CHARS,
+                    block_limit,
                     SLACK_MAX_BLOCKS_PER_MESSAGE,
                 );
                 let blocks: Vec<serde_json::Value> = chunks
                     .into_iter()
                     .map(|chunk| {
-                        serde_json::json!({
-                            "type": "markdown",
-                            "text": chunk
-                        })
+                        if self.use_markdown_blocks {
+                            serde_json::json!({
+                                "type": "markdown",
+                                "text": chunk
+                            })
+                        } else {
+                            serde_json::json!({
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": chunk
+                                }
+                            })
+                        }
                     })
                     .collect();
                 body["blocks"] = serde_json::Value::Array(blocks);
