@@ -2380,6 +2380,9 @@ pub struct WebFetchConfig {
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
     pub blocked_domains: Vec<String>,
+    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`)
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
     #[serde(default = "default_web_fetch_max_response_size")]
     pub max_response_size: usize,
@@ -2461,6 +2464,7 @@ impl Default for WebFetchConfig {
             enabled: true,
             allowed_domains: vec!["*".into()],
             blocked_domains: vec![],
+            allowed_private_hosts: vec![],
             max_response_size: default_web_fetch_max_response_size(),
             timeout_secs: default_web_fetch_timeout_secs(),
             firecrawl: FirecrawlConfig::default(),
