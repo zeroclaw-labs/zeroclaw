@@ -3018,8 +3018,8 @@ mod tests {
         assert!(summary.contains("`git`"), "should list allowed commands");
         assert!(summary.contains("`ls`"), "should list allowed commands");
         assert!(
-            summary.contains("not on this list will be rejected"),
-            "should warn about rejection"
+            summary.contains("You may execute these commands freely"),
+            "should mention allowed commands positively"
         );
     }
 
@@ -3058,8 +3058,8 @@ mod tests {
         };
         let summary = p.prompt_summary();
         assert!(
-            summary.contains("High-risk commands"),
-            "should mention high-risk block"
+            summary.contains("Exercise caution with destructive commands"),
+            "should mention high-risk caution"
         );
         assert!(
             summary.contains("Medium-risk commands"),
