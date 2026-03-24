@@ -496,13 +496,35 @@ allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 
 | Key | Default | Purpose |
 |---|---|---|
-| `backend` | `sqlite` | `sqlite`, `lucid`, `markdown`, `none` |
+| `backend` | `sqlite` | `sqlite`, `lucid`, `muninndb`, `markdown`, `none` |
 | `auto_save` | `true` | persist user-stated inputs only (assistant outputs are excluded) |
 | `embedding_provider` | `none` | `none`, `openai`, or custom endpoint |
 | `embedding_model` | `text-embedding-3-small` | embedding model ID, or `hint:<name>` route |
 | `embedding_dimensions` | `1536` | expected vector size for selected embedding model |
 | `vector_weight` | `0.7` | hybrid ranking vector weight |
 | `keyword_weight` | `0.3` | hybrid ranking keyword weight |
+
+### `[memory.muninndb]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `url` | `http://127.0.0.1:8475` | MuninnDB REST API URL. Env: `MUNINNDB_URL` |
+| `vault` | `default` | Vault name for memory isolation. Env: `MUNINNDB_VAULT` |
+| `api_key` | unset | Bearer token for secured vaults. Env: `MUNINNDB_API_KEY` |
+
+MuninnDB handles embeddings, semantic search, Hebbian reinforcement, and Ebbinghaus decay server-side — no local embedder needed. See [MuninnDB setup guide](../../setup-guides/muninndb-setup.md) for installation.
+
+Multi-instance example (one MuninnDB, multiple personas):
+
+```toml
+[memory]
+backend = "muninndb"
+
+[memory.muninndb]
+url = "http://127.0.0.1:8475"
+vault = "researcher"
+api_key = "mk_..."
+```
 
 Notes:
 

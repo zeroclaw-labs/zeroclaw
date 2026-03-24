@@ -27,6 +27,10 @@ For first-time setup and quick orientation.
 - Ollama cloud models (`:cloud`) require a remote `api_url` and API key (for example `api_url = "https://ollama.com"`).
 - Validate environment: `zeroclaw status` + `zeroclaw doctor`
 
+## Memory Backends
+
+- MuninnDB (cognitive memory with semantic search): [muninndb-setup.md](muninndb-setup.md)
+
 ## Next
 
 - Runtime operations: [../ops/README.md](../ops/README.md)
