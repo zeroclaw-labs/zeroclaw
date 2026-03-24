@@ -11,6 +11,8 @@ pub mod api;
 pub mod api_pairing;
 #[cfg(feature = "plugins-wasm")]
 pub mod api_plugins;
+#[cfg(feature = "webauthn")]
+pub mod api_webauthn;
 pub mod canvas;
 pub mod nodes;
 pub mod sse;
@@ -363,6 +365,9 @@ pub struct AppState {
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
     /// Shared canvas store for Live Canvas (A2UI) system
     pub canvas_store: CanvasStore,
+    /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
+    #[cfg(feature = "webauthn")]
+    pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -409,6 +414,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             provider_timeout_secs: Some(config.provider_timeout_secs),
             extra_headers: config.extra_headers.clone(),
             api_path: config.api_path.clone(),
+            provider_max_tokens: config.provider_max_tokens,
         },
     )?);
     let model = config
@@ -839,6 +845,30 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         canvas_store,
+        #[cfg(feature = "webauthn")]
+        webauthn: if config.security.webauthn.enabled {
+            let secret_store = Arc::new(crate::security::SecretStore::new(
+                &config.workspace_dir,
+                true,
+            ));
+            let wa_config = crate::security::webauthn::WebAuthnConfig {
+                enabled: true,
+                rp_id: config.security.webauthn.rp_id.clone(),
+                rp_origin: config.security.webauthn.rp_origin.clone(),
+                rp_name: config.security.webauthn.rp_name.clone(),
+            };
+            Some(Arc::new(api_webauthn::WebAuthnState {
+                manager: crate::security::webauthn::WebAuthnManager::new(
+                    wa_config,
+                    secret_store,
+                    &config.workspace_dir,
+                ),
+                pending_registrations: parking_lot::Mutex::new(std::collections::HashMap::new()),
+                pending_authentications: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            }))
+        } else {
+            None
+        },
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -918,6 +948,34 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/canvas/{id}/history",
             get(canvas::handle_canvas_history),
+        );
+
+    // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
+    #[cfg(feature = "webauthn")]
+    let inner = inner
+        .route(
+            "/api/webauthn/register/start",
+            post(api_webauthn::handle_register_start),
+        )
+        .route(
+            "/api/webauthn/register/finish",
+            post(api_webauthn::handle_register_finish),
+        )
+        .route(
+            "/api/webauthn/auth/start",
+            post(api_webauthn::handle_auth_start),
+        )
+        .route(
+            "/api/webauthn/auth/finish",
+            post(api_webauthn::handle_auth_finish),
+        )
+        .route(
+            "/api/webauthn/credentials",
+            get(api_webauthn::handle_list_credentials),
+        )
+        .route(
+            "/api/webauthn/credentials/{id}",
+            delete(api_webauthn::handle_delete_credential),
         );
 
     // ── Plugin management API (requires plugins-wasm feature) ──
@@ -2202,6 +2260,8 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2260,6 +2320,8 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2648,6 +2710,8 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2720,6 +2784,8 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         };
 
         let headers = HeaderMap::new();
@@ -2804,6 +2870,8 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         };
 
         let response = handle_webhook(
@@ -2860,6 +2928,8 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2921,6 +2991,8 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2987,6 +3059,8 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -3049,6 +3123,8 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         };
 
         let mut headers = HeaderMap::new();

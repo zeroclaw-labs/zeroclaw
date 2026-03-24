@@ -46,6 +46,8 @@ pub struct OpenAiCompatibleProvider {
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
+    /// Maximum output tokens to include in API requests.
+    max_tokens: Option<u32>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -183,6 +185,7 @@ impl OpenAiCompatibleProvider {
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
             api_path: None,
+            max_tokens: None,
         }
     }
 
@@ -217,6 +220,12 @@ impl OpenAiCompatibleProvider {
     /// When set, replaces the default `/chat/completions` path.
     pub fn with_api_path(mut self, api_path: Option<String>) -> Self {
         self.api_path = api_path;
+        self
+    }
+
+    /// Set the maximum output tokens for API requests.
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 
@@ -420,6 +429,8 @@ struct ApiChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -620,6 +631,8 @@ struct NativeChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1506,6 +1519,7 @@ impl Provider for OpenAiCompatibleProvider {
             tool_stream: None,
             tools: None,
             tool_choice: None,
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -1630,6 +1644,7 @@ impl Provider for OpenAiCompatibleProvider {
             tool_stream: None,
             tools: None,
             tool_choice: None,
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -1750,6 +1765,7 @@ impl Provider for OpenAiCompatibleProvider {
             } else {
                 Some("auto".to_string())
             },
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -1850,6 +1866,7 @@ impl Provider for OpenAiCompatibleProvider {
                 .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -2002,6 +2019,7 @@ impl Provider for OpenAiCompatibleProvider {
                 stream: Some(options.enabled),
                 tools: tools.clone(),
                 tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                max_tokens: self.max_tokens,
             })
         } else {
             let messages = effective_messages
@@ -2025,6 +2043,7 @@ impl Provider for OpenAiCompatibleProvider {
                 stream: Some(options.enabled),
                 tools: None,
                 tool_choice: None,
+                max_tokens: self.max_tokens,
             })
         };
 
@@ -2131,6 +2150,7 @@ impl Provider for OpenAiCompatibleProvider {
             tool_stream: None,
             tools: None,
             tool_choice: None,
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -2274,6 +2294,7 @@ mod tests {
             tool_stream: None,
             tools: None,
             tool_choice: None,
+            max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
@@ -3056,6 +3077,7 @@ mod tests {
             tool_stream: None,
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
+            max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -3090,6 +3112,7 @@ mod tests {
                 }
             })]),
             tool_choice: Some("auto".to_string()),
+            max_tokens: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -3123,6 +3146,7 @@ mod tests {
                 }
             })]),
             tool_choice: Some("auto".to_string()),
+            max_tokens: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();

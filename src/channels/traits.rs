@@ -113,6 +113,18 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Show a progress/status update (e.g. tool execution status).
+    /// Channels can display this in a status bar rather than in the message body.
+    /// Default: no-op (progress is ignored).
+    async fn update_draft_progress(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
     async fn finalize_draft(
         &self,

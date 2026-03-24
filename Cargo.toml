@@ -261,6 +261,8 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 voice-wake = ["dep:cpal"]
 # WASM plugin system (extism-based)
 plugins-wasm = ["dep:extism"]
+# WebAuthn / FIDO2 hardware key authentication
+webauthn = []
 # Meta-feature for CI: all features except those requiring system C libraries
 # not available on standard CI runners (e.g., voice-wake needs libasound2-dev).
 ci-all = [

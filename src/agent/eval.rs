@@ -73,7 +73,7 @@ pub fn estimate_complexity(message: &str) -> ComplexityTier {
 /// When the rule-based classifier in `QueryClassificationConfig` produces no
 /// match, the eval layer can fall back to `estimate_complexity` and map the
 /// resulting tier to a routing hint.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutoClassifyConfig {
     /// Hint to use for `Simple` complexity tier (e.g. `"fast"`).
     #[serde(default)]
@@ -84,6 +84,24 @@ pub struct AutoClassifyConfig {
     /// Hint to use for `Complex` complexity tier (e.g. `"reasoning"`).
     #[serde(default)]
     pub complex_hint: Option<String>,
+    /// Hint prefix for cost-optimized routing (default: `"cost-optimized"`).
+    #[serde(default = "default_cost_optimized_hint")]
+    pub cost_optimized_hint: String,
+}
+
+fn default_cost_optimized_hint() -> String {
+    "cost-optimized".to_string()
+}
+
+impl Default for AutoClassifyConfig {
+    fn default() -> Self {
+        Self {
+            simple_hint: None,
+            standard_hint: None,
+            complex_hint: None,
+            cost_optimized_hint: default_cost_optimized_hint(),
+        }
+    }
 }
 
 impl AutoClassifyConfig {
@@ -320,6 +338,7 @@ mod tests {
             simple_hint: Some("fast".into()),
             standard_hint: None,
             complex_hint: Some("reasoning".into()),
+            ..Default::default()
         };
         assert_eq!(ac.hint_for(ComplexityTier::Simple), Some("fast"));
         assert_eq!(ac.hint_for(ComplexityTier::Standard), None);
@@ -386,6 +405,7 @@ mod tests {
             simple_hint: Some("fast".into()),
             standard_hint: Some("default".into()),
             complex_hint: Some("reasoning".into()),
+            ..Default::default()
         };
         // Empty response for a Simple query → should suggest Standard hint
         let result = evaluate_response("hello", "", ComplexityTier::Simple, Some(&ac));
@@ -398,6 +418,7 @@ mod tests {
             simple_hint: Some("fast".into()),
             standard_hint: Some("default".into()),
             complex_hint: Some("reasoning".into()),
+            ..Default::default()
         };
         // Empty response for Complex → no escalation possible
         let result =
@@ -411,5 +432,11 @@ mod tests {
         assert!(!config.enabled);
         assert_eq!(config.max_retries, 1);
         assert!((config.min_quality_score - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cost_optimized_hint_default() {
+        let config = AutoClassifyConfig::default();
+        assert_eq!(config.cost_optimized_hint, "cost-optimized");
     }
 }

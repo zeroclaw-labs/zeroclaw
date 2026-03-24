@@ -44,6 +44,8 @@ pub mod seatbelt;
 pub mod secrets;
 pub mod traits;
 pub mod vulnerability;
+#[cfg(feature = "webauthn")]
+pub mod webauthn;
 pub mod workspace_boundary;
 
 #[allow(unused_imports)]

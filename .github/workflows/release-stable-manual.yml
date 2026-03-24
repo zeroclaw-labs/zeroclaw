@@ -564,13 +564,23 @@ jobs:
       dry_run: false
     secrets: inherit
 
-  # ── Post-publish: tweet after release + website are live ──────────────
-  # Docker push can be slow; don't let it block the tweet.
+  # ── Post-publish: announce after release + website are live ───────────
+  # Docker push can be slow; don't let it block announcements.
   tweet:
     name: Tweet Release
     needs: [validate, publish, redeploy-website]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
     uses: ./.github/workflows/tweet-release.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
+    secrets: inherit
+
+  discord:
+    name: Discord Announcement
+    needs: [validate, publish, redeploy-website]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/discord-release.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}

@@ -470,6 +470,7 @@ pub fn all_tools_with_runtime(
             provider_timeout_secs: Some(root_config.provider_timeout_secs),
             extra_headers: root_config.extra_headers.clone(),
             api_path: root_config.api_path.clone(),
+            provider_max_tokens: root_config.provider_max_tokens,
         };
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
@@ -899,6 +900,7 @@ pub fn all_tools_with_runtime(
         reasoning_enabled: root_config.runtime.reasoning_enabled,
         reasoning_effort: root_config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(root_config.provider_timeout_secs),
+        provider_max_tokens: root_config.provider_max_tokens,
         extra_headers: root_config.extra_headers.clone(),
         api_path: root_config.api_path.clone(),
     };

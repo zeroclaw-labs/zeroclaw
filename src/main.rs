@@ -246,6 +246,29 @@ Examples:
         gateway_command: Option<zeroclaw::GatewayCommands>,
     },
 
+    /// Start ACP (Agent Control Protocol) server over stdio
+    #[command(long_about = "\
+Start the ACP server (JSON-RPC 2.0 over stdio).
+
+Launches a JSON-RPC 2.0 server on stdin/stdout for IDE and tool \
+integration. Supports session management and streaming agent \
+responses as notifications.
+
+Methods: initialize, session/new, session/prompt, session/stop.
+
+Examples:
+  zeroclaw acp                        # start ACP server
+  zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
+    Acp {
+        /// Maximum concurrent sessions (default: 10)
+        #[arg(long)]
+        max_sessions: Option<usize>,
+
+        /// Session inactivity timeout in seconds (default: 3600)
+        #[arg(long)]
+        session_timeout: Option<u64>,
+    },
+
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
     #[command(long_about = "\
 Start the long-running autonomous daemon.
@@ -984,6 +1007,21 @@ async fn main() -> Result<()> {
             ))
             .await
             .map(|_| ())
+        }
+
+        Commands::Acp {
+            max_sessions,
+            session_timeout,
+        } => {
+            let mut acp_config = channels::acp_server::AcpServerConfig::default();
+            if let Some(max) = max_sessions {
+                acp_config.max_sessions = max;
+            }
+            if let Some(timeout) = session_timeout {
+                acp_config.session_timeout_secs = timeout;
+            }
+            let server = channels::acp_server::AcpServer::new(config, acp_config);
+            server.run().await
         }
 
         Commands::Gateway { gateway_command } => {

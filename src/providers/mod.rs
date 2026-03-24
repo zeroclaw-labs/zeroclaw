@@ -697,6 +697,9 @@ pub struct ProviderRuntimeOptions {
     /// Custom API path suffix for OpenAI-compatible providers
     /// (e.g. "/v2/generate" instead of the default "/chat/completions").
     pub api_path: Option<String>,
+    /// Maximum output tokens for LLM provider API requests.
+    /// `None` uses the provider's built-in default.
+    pub provider_max_tokens: Option<u32>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -711,6 +714,7 @@ impl Default for ProviderRuntimeOptions {
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
+            provider_max_tokens: None,
         }
     }
 }
@@ -728,6 +732,7 @@ pub fn provider_runtime_options_from_config(
         provider_timeout_secs: Some(config.provider_timeout_secs),
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
+        provider_max_tokens: config.provider_max_tokens,
     }
 }
 
@@ -1076,6 +1081,7 @@ fn create_provider_with_url_and_options(
         let reasoning_effort = options.reasoning_effort.clone();
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
+        let max_tokens = options.provider_max_tokens;
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
             let mut p = p;
             if let Some(t) = timeout {
@@ -1089,6 +1095,9 @@ fn create_provider_with_url_and_options(
             }
             if api_path.is_some() {
                 p = p.with_api_path(api_path.clone());
+            }
+            if let Some(mt) = max_tokens {
+                p = p.with_max_tokens(Some(mt));
             }
             Box::new(p)
         }
@@ -1141,9 +1150,21 @@ fn create_provider_with_url_and_options(
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(
             key,
             options.provider_timeout_secs,
-        ))),
-        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
+        ).with_max_tokens(options.provider_max_tokens))),
+        "anthropic" => {
+            let mut p = anthropic::AnthropicProvider::new(key);
+            if let Some(mt) = options.provider_max_tokens {
+                p = p.with_max_tokens(mt);
+            }
+            Ok(Box::new(p))
+        }
+        "openai" => {
+            let mut p = openai::OpenAiProvider::with_base_url(api_url, key);
+            if let Some(mt) = options.provider_max_tokens {
+                p = p.with_max_tokens(Some(mt));
+            }
+            Ok(Box::new(p))
+        }
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => {
 
@@ -1257,11 +1278,15 @@ fn create_provider_with_url_and_options(
             )))
         }
         "bedrock" | "aws-bedrock" => {
-            if let Some(api_key) = key {
-                Ok(Box::new(bedrock::BedrockProvider::with_bearer_token(api_key)))
+            let mut p = if let Some(api_key) = key {
+                bedrock::BedrockProvider::with_bearer_token(api_key)
             } else {
-                Ok(Box::new(bedrock::BedrockProvider::new()))
+                bedrock::BedrockProvider::new()
+            };
+            if let Some(mt) = options.provider_max_tokens {
+                p = p.with_max_tokens(mt);
             }
+            Ok(Box::new(p))
         }
         name if is_qwen_oauth_alias(name) => {
             let base_url = api_url
