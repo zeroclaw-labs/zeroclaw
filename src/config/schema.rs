@@ -14745,4 +14745,55 @@ require_otp_to_resume = true
         assert_eq!(from_toml.loop_detection_window_size, 20);
         assert_eq!(from_toml.loop_detection_max_repeats, 3);
     }
+
+    // ── Docker baked config template ────────────────────────────
+
+    /// The TOML template baked into Docker images (Dockerfile + Dockerfile.debian).
+    /// Kept here so changes to the Dockerfiles can be validated by `cargo test`.
+    const DOCKER_CONFIG_TEMPLATE: &str = r#"
+workspace_dir = "/zeroclaw-data/workspace"
+config_path = "/zeroclaw-data/.zeroclaw/config.toml"
+api_key = ""
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4-20250514"
+default_temperature = 0.7
+
+[gateway]
+port = 42617
+host = "[::]"
+allow_public_bind = true
+
+[autonomy]
+level = "supervised"
+auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory_store", "web_search_tool", "web_fetch", "calculator", "glob_search", "content_search", "image_info", "weather", "git_operations"]
+"#;
+
+    #[test]
+    async fn docker_config_template_is_parseable() {
+        let cfg: Config = toml::from_str(DOCKER_CONFIG_TEMPLATE)
+            .expect("Docker baked config.toml must be valid TOML that deserialises into Config");
+
+        // The [autonomy] section must be present and contain the expected tools.
+        let auto = &cfg.autonomy.auto_approve;
+        for tool in &[
+            "file_read",
+            "file_write",
+            "file_edit",
+            "memory_recall",
+            "memory_store",
+            "web_search_tool",
+            "web_fetch",
+            "calculator",
+            "glob_search",
+            "content_search",
+            "image_info",
+            "weather",
+            "git_operations",
+        ] {
+            assert!(
+                auto.iter().any(|t| t == tool),
+                "Docker config auto_approve missing expected tool: {tool}"
+            );
+        }
+    }
 }
