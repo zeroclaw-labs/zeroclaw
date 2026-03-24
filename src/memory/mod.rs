@@ -20,6 +20,7 @@ pub mod response_cache;
 pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
+pub mod structured;
 pub mod traits;
 pub mod vector;
 
