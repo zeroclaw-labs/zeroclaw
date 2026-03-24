@@ -206,9 +206,16 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     }
 
     let bytes = resp.bytes().await.context("failed to read download body")?;
-    tokio::fs::write(dest, &bytes)
-        .await
-        .context("failed to write downloaded binary")?;
+
+    // Release assets are .tar.gz archives containing a single `zeroclaw` binary.
+    // Extract the binary from the archive instead of writing the raw tarball.
+    if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+        extract_tar_gz(&bytes, dest).context("failed to extract binary from tar.gz archive")?;
+    } else {
+        tokio::fs::write(dest, &bytes)
+            .await
+            .context("failed to write downloaded binary")?;
+    }
 
     // Make executable on Unix
     #[cfg(unix)]
@@ -219,6 +226,35 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Extract the `zeroclaw` binary from a `.tar.gz` archive.
+fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use tar::Archive;
+
+    let gz = GzDecoder::new(archive_bytes);
+    let mut archive = Archive::new(gz);
+
+    for entry in archive.entries().context("failed to read tar entries")? {
+        let mut entry = entry.context("failed to read tar entry")?;
+        let path = entry.path().context("failed to read entry path")?;
+
+        // The archive contains a single binary named "zeroclaw" (or "zeroclaw.exe" on Windows).
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if file_name == "zeroclaw" || file_name == "zeroclaw.exe" {
+            let mut buf = Vec::new();
+            entry
+                .read_to_end(&mut buf)
+                .context("failed to read binary from archive")?;
+            std::fs::write(dest, &buf).context("failed to write extracted binary")?;
+            return Ok(());
+        }
+    }
+
+    bail!("archive does not contain a 'zeroclaw' binary")
 }
 
 async fn validate_binary(path: &Path) -> Result<()> {
@@ -470,6 +506,79 @@ mod tests {
         assert!(
             host_architecture().is_some(),
             "host architecture should be detected on CI platforms"
+        );
+    }
+
+    #[test]
+    fn extract_tar_gz_finds_binary() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Build a tar.gz in memory containing a fake "zeroclaw" binary.
+        let fake_binary = b"#!/bin/sh\necho zeroclaw";
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(fake_binary.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "zeroclaw", &fake_binary[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut gz_buf = Vec::new();
+        {
+            let mut encoder = GzEncoder::new(&mut gz_buf, Compression::fast());
+            encoder.write_all(&tar_buf).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("zeroclaw_extracted");
+        extract_tar_gz(&gz_buf, &dest).unwrap();
+
+        let content = std::fs::read(&dest).unwrap();
+        assert_eq!(content, fake_binary);
+    }
+
+    #[test]
+    fn extract_tar_gz_errors_on_missing_binary() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Build a tar.gz with a file that is NOT named "zeroclaw".
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(5);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "README.md", &b"hello"[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut gz_buf = Vec::new();
+        {
+            let mut encoder = GzEncoder::new(&mut gz_buf, Compression::fast());
+            encoder.write_all(&tar_buf).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("zeroclaw_extracted");
+        let result = extract_tar_gz(&gz_buf, &dest);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("does not contain"),
+            "should report missing binary"
         );
     }
 }
