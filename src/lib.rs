@@ -176,7 +176,7 @@ pub enum ServiceCommands {
 }
 
 /// Channel management subcommands
-#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum ChannelCommands {
     /// List all configured channels
     List,
@@ -246,6 +246,67 @@ Examples:
         /// Recipient identifier (platform-specific, e.g. Telegram chat ID)
         #[arg(long)]
         recipient: String,
+    },
+    /// Manage channel-specific agent/model routes
+    Route {
+        #[command(subcommand)]
+        route_command: ChannelRouteCommands,
+    },
+}
+
+/// Channel route management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ChannelRouteCommands {
+    /// List configured channel-agent routes
+    List {
+        /// Filter to a specific channel (e.g. telegram)
+        #[arg(long)]
+        channel: Option<String>,
+    },
+    /// Add or replace a channel-agent route
+    Add {
+        /// Channel ID (currently telegram is the primary target)
+        #[arg(long)]
+        channel: String,
+        /// Reply target (`chat_id` or `chat_id:thread_id`)
+        #[arg(long)]
+        reply_target: String,
+        /// Bind to a named agent profile
+        #[arg(long)]
+        agent: Option<String>,
+        /// Bind to a provider/model pair
+        #[arg(long)]
+        provider: Option<String>,
+        /// Bind to a provider/model pair
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional temperature override for provider/model routes
+        #[arg(long)]
+        temperature: Option<f64>,
+    },
+    /// Remove a configured channel-agent route
+    Remove {
+        /// Channel ID (e.g. telegram)
+        #[arg(long)]
+        channel: String,
+        /// Reply target (`chat_id` or `chat_id:thread_id`)
+        #[arg(long)]
+        reply_target: String,
+    },
+    /// Resolve the configured route for a reply target
+    Resolve {
+        /// Channel ID (e.g. telegram)
+        #[arg(long)]
+        channel: String,
+        /// Reply target (`chat_id` or `chat_id:thread_id`)
+        #[arg(long)]
+        reply_target: String,
+    },
+    /// Show observed reply targets seen at runtime
+    Seen {
+        /// Channel ID (e.g. telegram)
+        #[arg(long)]
+        channel: String,
     },
 }
 

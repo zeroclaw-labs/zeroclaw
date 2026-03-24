@@ -983,6 +983,7 @@ impl Channel for MatrixChannel {
                         .unwrap_or_default()
                         .as_secs(),
                     thread_ts: thread_ts.clone(),
+                    conversation_scope_id: None,
                     interruption_scope_id: thread_ts,
                     attachments: vec![],
                 };

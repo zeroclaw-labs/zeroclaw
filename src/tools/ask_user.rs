@@ -303,6 +303,7 @@ mod tests {
                 channel: self.channel_name.clone(),
                 timestamp: 1000,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             };

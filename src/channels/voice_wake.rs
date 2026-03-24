@@ -237,6 +237,7 @@ impl Channel for VoiceWakeChannel {
                                         channel: "voice_wake".into(),
                                         timestamp: ts,
                                         thread_ts: None,
+                                        conversation_scope_id: None,
                                         interruption_scope_id: None,
                                         attachments: vec![],
                                     };

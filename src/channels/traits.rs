@@ -12,6 +12,10 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Canonical conversation partition identifier distinct from reply anchoring.
+    /// For Telegram forums this is `forum:<thread_id>` so topic history is isolated
+    /// without treating every threaded reply surface as a separate conversation.
+    pub conversation_scope_id: Option<String>,
     /// Thread scope identifier for interruption/cancellation grouping.
     /// Distinct from `thread_ts` (reply anchor): this is `Some` only when the message
     /// is genuinely inside a reply thread and should be isolated from other threads.
@@ -205,6 +209,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             })
@@ -223,6 +228,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };

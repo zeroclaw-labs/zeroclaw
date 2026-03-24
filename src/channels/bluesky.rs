@@ -251,6 +251,7 @@ impl BlueskyChannel {
             channel: "bluesky".to_string(),
             timestamp,
             thread_ts: Some(notif.uri.clone()),
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         })

@@ -117,9 +117,10 @@ use crate::runtime;
 use crate::security::{AutonomyLevel, SecurityPolicy};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
+use crate::ChannelRouteCommands;
 use anyhow::{Context, Result};
 use portable_atomic::{AtomicU64, Ordering};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -254,6 +255,15 @@ fn channel_message_timeout_budget_secs_with_cap(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum ChannelRouteSource {
+    GlobalDefault,
+    ConfiguredChat,
+    ConfiguredReplyTarget,
+    SessionOverride,
+    QueryClassification,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct ChannelRouteSelection {
     provider: String,
     model: String,
@@ -261,6 +271,27 @@ struct ChannelRouteSelection {
     /// the global `api_key` in [`ChannelRuntimeContext`] when creating the
     /// provider for this route.
     api_key: Option<String>,
+    /// Route-specific temperature override. When unset, fall back to the runtime default.
+    temperature: Option<f64>,
+    /// Optional named agent that contributed persona/settings to this route.
+    agent_name: Option<String>,
+    /// Optional route-specific system prompt overlay.
+    system_prompt: Option<String>,
+    /// Optional route-specific skills directory.
+    skills_directory: Option<String>,
+    /// Whether to inject delegation guidance for complex tasks.
+    auto_delegate: bool,
+    /// Preferred swarm to recommend when auto-delegation is encouraged.
+    preferred_swarm: Option<String>,
+    /// Where this route came from.
+    source: ChannelRouteSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ObservedReplyTarget {
+    channel: String,
+    reply_target: String,
+    last_seen_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -309,6 +340,82 @@ struct RuntimeConfigState {
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
     static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn observed_reply_targets_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join("channel_route_seen.jsonl")
+}
+
+fn record_observed_reply_target(workspace_dir: &Path, channel: &str, reply_target: &str) {
+    if channel.trim().is_empty() || reply_target.trim().is_empty() {
+        return;
+    }
+
+    let path = observed_reply_targets_path(workspace_dir);
+    let parent = path.parent().unwrap_or(workspace_dir);
+    if let Err(err) = std::fs::create_dir_all(parent) {
+        tracing::debug!("Failed to create observed-route directory: {err}");
+        return;
+    }
+
+    let entry = ObservedReplyTarget {
+        channel: channel.to_string(),
+        reply_target: reply_target.to_string(),
+        last_seen_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    let Ok(json) = serde_json::to_string(&entry) else {
+        return;
+    };
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = std::io::Write::write_all(&mut file, json.as_bytes());
+        let _ = std::io::Write::write_all(&mut file, b"\n");
+    }
+}
+
+fn load_observed_reply_targets(workspace_dir: &Path, channel: &str) -> Vec<ObservedReplyTarget> {
+    let path = observed_reply_targets_path(workspace_dir);
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+
+    let mut deduped: HashMap<String, ObservedReplyTarget> = HashMap::new();
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<ObservedReplyTarget>(trimmed) else {
+            continue;
+        };
+        if !entry.channel.eq_ignore_ascii_case(channel) {
+            continue;
+        }
+        deduped
+            .entry(entry.reply_target.clone())
+            .and_modify(|existing| {
+                if existing.last_seen_at < entry.last_seen_at {
+                    *existing = entry.clone();
+                }
+            })
+            .or_insert(entry);
+    }
+
+    let mut entries: Vec<_> = deduped.into_values().collect();
+    entries.sort_by(|a, b| {
+        b.last_seen_at
+            .cmp(&a.last_seen_at)
+            .then_with(|| a.reply_target.cmp(&b.reply_target))
+    });
+    entries
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
@@ -427,20 +534,17 @@ impl InFlightTaskCompletion {
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
-    // Include thread_ts for per-topic memory isolation in forum groups
-    match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
+    match &msg.conversation_scope_id {
+        Some(scope) => format!("{}_{}_{}_{}", msg.channel, scope, msg.sender, msg.id),
         None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
     }
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
-    // channels) and thread_ts for per-topic isolation in forum groups.
-    match &msg.thread_ts {
-        Some(tid) => format!(
+    match &msg.conversation_scope_id {
+        Some(scope) => format!(
             "{}_{}_{}_{}",
-            msg.channel, msg.reply_target, tid, msg.sender
+            msg.channel, msg.reply_target, scope, msg.sender
         ),
         None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
     }
@@ -1014,25 +1118,145 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
         provider: defaults.default_provider,
         model: defaults.model,
         api_key: None,
+        temperature: Some(defaults.temperature),
+        agent_name: None,
+        system_prompt: None,
+        skills_directory: None,
+        auto_delegate: false,
+        preferred_swarm: None,
+        source: ChannelRouteSource::GlobalDefault,
     }
 }
 
-fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> ChannelRouteSelection {
+fn chat_level_reply_target(reply_target: &str) -> Option<&str> {
+    reply_target.split_once(':').map(|(chat_id, _)| chat_id)
+}
+
+fn route_selection_matches(lhs: &ChannelRouteSelection, rhs: &ChannelRouteSelection) -> bool {
+    lhs.provider == rhs.provider
+        && lhs.model == rhs.model
+        && lhs.api_key == rhs.api_key
+        && lhs.temperature == rhs.temperature
+        && lhs.agent_name == rhs.agent_name
+        && lhs.system_prompt == rhs.system_prompt
+        && lhs.skills_directory == rhs.skills_directory
+        && lhs.auto_delegate == rhs.auto_delegate
+        && lhs.preferred_swarm == rhs.preferred_swarm
+}
+
+fn route_selection_from_agent(
+    agent_name: &str,
+    agent: &crate::config::DelegateAgentConfig,
+    source: ChannelRouteSource,
+) -> ChannelRouteSelection {
+    ChannelRouteSelection {
+        provider: agent.provider.clone(),
+        model: agent.model.clone(),
+        api_key: agent.api_key.clone(),
+        temperature: agent.temperature,
+        agent_name: Some(agent_name.to_string()),
+        system_prompt: agent.system_prompt.clone(),
+        skills_directory: agent.skills_directory.clone(),
+        auto_delegate: agent.auto_delegate,
+        preferred_swarm: agent.preferred_swarm.clone(),
+        source,
+    }
+}
+
+fn route_selection_from_configured_route(
+    config: &crate::config::Config,
+    route: &crate::config::ChannelAgentRouteConfig,
+    source: ChannelRouteSource,
+) -> Option<ChannelRouteSelection> {
+    if let Some(agent_name) = route
+        .agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let agent = config.agents.get(agent_name)?;
+        return Some(route_selection_from_agent(agent_name, agent, source));
+    }
+
+    let provider = route.provider.as_deref().map(str::trim)?.to_string();
+    let model = route.model.as_deref().map(str::trim)?.to_string();
+    Some(ChannelRouteSelection {
+        provider,
+        model,
+        api_key: route.api_key.clone(),
+        temperature: route.temperature,
+        agent_name: None,
+        system_prompt: None,
+        skills_directory: None,
+        auto_delegate: false,
+        preferred_swarm: None,
+        source,
+    })
+}
+
+fn configured_route_selection(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+) -> ChannelRouteSelection {
+    let config = ctx.prompt_config.as_ref();
+    if let Some(route) = config.channel_agent_routes.iter().find(|route| {
+        route.channel.eq_ignore_ascii_case(&msg.channel)
+            && route.reply_target.trim() == msg.reply_target.trim()
+    }) {
+        if let Some(selection) = route_selection_from_configured_route(
+            config,
+            route,
+            ChannelRouteSource::ConfiguredReplyTarget,
+        ) {
+            return selection;
+        }
+    }
+
+    if let Some(chat_reply_target) = chat_level_reply_target(&msg.reply_target) {
+        if let Some(route) = config.channel_agent_routes.iter().find(|route| {
+            route.channel.eq_ignore_ascii_case(&msg.channel)
+                && route.reply_target.trim() == chat_reply_target.trim()
+        }) {
+            if let Some(selection) = route_selection_from_configured_route(
+                config,
+                route,
+                ChannelRouteSource::ConfiguredChat,
+            ) {
+                return selection;
+            }
+        }
+    }
+
+    default_route_selection(ctx)
+}
+
+fn get_route_selection(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    sender_key: &str,
+) -> ChannelRouteSelection {
+    let configured = configured_route_selection(ctx, msg);
     ctx.route_overrides
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(sender_key)
         .cloned()
-        .unwrap_or_else(|| default_route_selection(ctx))
+        .unwrap_or(configured)
 }
 
-fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
-    let default_route = default_route_selection(ctx);
+fn set_route_selection(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    sender_key: &str,
+    mut next: ChannelRouteSelection,
+) {
+    let default_route = configured_route_selection(ctx, msg);
+    next.source = ChannelRouteSource::SessionOverride;
     let mut routes = ctx
         .route_overrides
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if next == default_route {
+    if route_selection_matches(&next, &default_route) {
         routes.remove(sender_key);
     } else {
         routes.insert(sender_key.to_string(), next);
@@ -1113,6 +1337,107 @@ fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
         ctx.prompt_config.skills.prompt_injection_mode,
     );
     replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
+}
+
+fn should_encourage_auto_delegate(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    let clause_markers = [" and ", "\n", ";", " then ", " also ", ", then "];
+    let distinct_clause_count = clause_markers
+        .iter()
+        .filter(|marker| normalized.contains(**marker))
+        .count();
+    let compare_words = ["compare", "rank", "evaluate", "vs", "versus"];
+    let research_words = ["research", "investigate"];
+    let synthesis_words = ["summarize", "synthesize", "write up", "report"];
+    let coding_words = ["implement", "code", "patch", "fix"];
+    let review_words = ["review", "audit"];
+
+    distinct_clause_count >= 2
+        || compare_words.iter().any(|word| normalized.contains(word))
+        || (research_words.iter().any(|word| normalized.contains(word))
+            && (synthesis_words.iter().any(|word| normalized.contains(word))
+                || coding_words.iter().any(|word| normalized.contains(word))))
+        || (coding_words.iter().any(|word| normalized.contains(word))
+            && review_words.iter().any(|word| normalized.contains(word)))
+        || (normalized.contains("write") && normalized.contains("review"))
+}
+
+fn route_specific_skills_prompt(
+    ctx: &ChannelRuntimeContext,
+    skills_directory: &str,
+) -> Option<String> {
+    let trimmed = skills_directory.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let skills_dir = if Path::new(trimmed).is_absolute() {
+        PathBuf::from(trimmed)
+    } else {
+        ctx.workspace_dir.join(trimmed)
+    };
+
+    let skills = crate::skills::load_skills_from_directory(
+        &skills_dir,
+        ctx.prompt_config.skills.allow_scripts,
+    );
+    if skills.is_empty() {
+        return None;
+    }
+    Some(crate::skills::skills_to_prompt_with_mode(
+        &skills,
+        ctx.workspace_dir.as_ref(),
+        ctx.prompt_config.skills.prompt_injection_mode,
+    ))
+}
+
+fn apply_route_prompt_overrides(
+    ctx: &ChannelRuntimeContext,
+    base_prompt: &str,
+    route: &ChannelRouteSelection,
+    user_message: &str,
+) -> String {
+    let mut prompt = base_prompt.to_string();
+
+    if let Some(skills_directory) = route.skills_directory.as_deref() {
+        if let Some(skills_prompt) = route_specific_skills_prompt(ctx, skills_directory) {
+            prompt = replace_available_skills_section(&prompt, &skills_prompt);
+        }
+    }
+
+    if let Some(agent_prompt) = route
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let _ = write!(
+            prompt,
+            "\n\n## Route Agent Instructions\n\n{}",
+            agent_prompt
+        );
+    }
+
+    if route.auto_delegate && should_encourage_auto_delegate(user_message) {
+        let swarm_line = route
+            .preferred_swarm
+            .as_deref()
+            .map(|swarm| format!("- Prefer the `swarm` tool with swarm=`{swarm}` when that swarm fits the task.\n"))
+            .unwrap_or_default();
+        let _ = write!(
+            prompt,
+            "\n\n## Delegation Policy\n\n\
+             For complex work, do not force everything into a single pass.\n\
+             Use existing `delegate` or `swarm` tools when the request has multiple distinct clauses, \
+             asks for comparison/ranking/evaluation across alternatives, combines research with synthesis or coding, \
+             or combines implementation with review/audit.\n\
+             {swarm_line}\
+             - Otherwise prefer delegating one specialist subtask at a time with `delegate`.\n\
+             - Do not narrate the delegation plan to the user unless they explicitly ask.\n"
+        );
+    }
+
+    prompt
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -1644,7 +1969,7 @@ async fn handle_runtime_command_if_needed(
     };
 
     let sender_key = conversation_history_key(msg);
-    let mut current = get_route_selection(ctx, &sender_key);
+    let mut current = get_route_selection(ctx, msg, &sender_key);
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
@@ -1655,7 +1980,7 @@ async fn handle_runtime_command_if_needed(
                         Ok(_) => {
                             if provider_name != current.provider {
                                 current.provider = provider_name.clone();
-                                set_route_selection(ctx, &sender_key, current.clone());
+                                set_route_selection(ctx, msg, &sender_key, current.clone());
                             }
 
                             format!(
@@ -1694,7 +2019,7 @@ async fn handle_runtime_command_if_needed(
                 } else {
                     current.model = model.clone();
                 }
-                set_route_selection(ctx, &sender_key, current.clone());
+                set_route_selection(ctx, msg, &sender_key, current.clone());
 
                 format!(
                     "Model switched to `{}` (provider: `{}`). Context preserved.",
@@ -1717,6 +2042,10 @@ async fn handle_runtime_command_if_needed(
         }
         ChannelRuntimeCommand::NewSession => {
             clear_sender_history(ctx, &sender_key);
+            ctx.route_overrides
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&sender_key);
             if let Some(ref store) = ctx.session_store {
                 if let Err(e) = store.delete_session(&sender_key) {
                     tracing::warn!("Failed to delete persisted session for {sender_key}: {e}");
@@ -2321,6 +2650,8 @@ async fn process_channel_message(
         }
     }
 
+    record_observed_reply_target(ctx.workspace_dir.as_ref(), &msg.channel, &msg.reply_target);
+
     let target_channel = ctx
         .channels_by_name
         .get(&msg.channel)
@@ -2340,33 +2671,44 @@ async fn process_channel_message(
     }
 
     let history_key = conversation_history_key(&msg);
-    let mut route = get_route_selection(ctx.as_ref(), &history_key);
+    let mut route = get_route_selection(ctx.as_ref(), &msg, &history_key);
 
     // ── Query classification: override route when a rule matches ──
-    if let Some(hint) = crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
-    {
-        if let Some(matched_route) = ctx
-            .model_routes
-            .iter()
-            .find(|r| r.hint.eq_ignore_ascii_case(&hint))
+    if route.source == ChannelRouteSource::GlobalDefault {
+        if let Some(hint) =
+            crate::agent::classifier::classify(&ctx.query_classification, &msg.content)
         {
-            tracing::info!(
-                target: "query_classification",
-                hint = hint.as_str(),
-                provider = matched_route.provider.as_str(),
-                model = matched_route.model.as_str(),
-                channel = %msg.channel,
-                "Channel message classified — overriding route"
-            );
-            route = ChannelRouteSelection {
-                provider: matched_route.provider.clone(),
-                model: matched_route.model.clone(),
-                api_key: matched_route.api_key.clone(),
-            };
+            if let Some(matched_route) = ctx
+                .model_routes
+                .iter()
+                .find(|r| r.hint.eq_ignore_ascii_case(&hint))
+            {
+                tracing::info!(
+                    target: "query_classification",
+                    hint = hint.as_str(),
+                    provider = matched_route.provider.as_str(),
+                    model = matched_route.model.as_str(),
+                    channel = %msg.channel,
+                    "Channel message classified — overriding route"
+                );
+                route = ChannelRouteSelection {
+                    provider: matched_route.provider.clone(),
+                    model: matched_route.model.clone(),
+                    api_key: matched_route.api_key.clone(),
+                    temperature: Some(runtime_defaults_snapshot(ctx.as_ref()).temperature),
+                    agent_name: None,
+                    system_prompt: None,
+                    skills_directory: None,
+                    auto_delegate: false,
+                    preferred_swarm: None,
+                    source: ChannelRouteSource::QueryClassification,
+                };
+            }
         }
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
+    let route_temperature = route.temperature.unwrap_or(runtime_defaults.temperature);
     let mut active_provider = match get_or_create_provider(
         ctx.as_ref(),
         &route.provider,
@@ -2549,8 +2891,10 @@ async fn process_channel_message(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
+    let routed_system_prompt =
+        apply_route_prompt_overrides(ctx.as_ref(), &base_system_prompt, &route, &msg.content);
     let mut system_prompt =
-        build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
+        build_channel_system_prompt(&routed_system_prompt, &msg.channel, &msg.reply_target);
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
     }
@@ -2713,7 +3057,7 @@ async fn process_channel_message(
                     notify_observer.as_ref() as &dyn Observer,
                     route.provider.as_str(),
                     route.model.as_str(),
-                    runtime_defaults.temperature,
+                    route_temperature,
                     true,
                     Some(&*ctx.approval_manager),
                     msg.channel.as_str(),
@@ -3899,6 +4243,9 @@ pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Con
             channel_id,
             recipient,
         } => send_channel_message(config, &channel_id, &recipient, &message).await,
+        crate::ChannelCommands::Route { route_command } => {
+            Box::pin(handle_route_command(route_command, config)).await
+        }
     }
 }
 
@@ -3982,6 +4329,225 @@ async fn send_channel_message(
         .with_context(|| format!("Failed to send message via {channel_id}"))?;
     println!("Message sent via {channel_id}.");
     Ok(())
+}
+
+fn route_source_label(source: ChannelRouteSource) -> &'static str {
+    match source {
+        ChannelRouteSource::GlobalDefault => "global default",
+        ChannelRouteSource::ConfiguredChat => "chat route",
+        ChannelRouteSource::ConfiguredReplyTarget => "exact reply_target route",
+        ChannelRouteSource::SessionOverride => "session override",
+        ChannelRouteSource::QueryClassification => "query classification",
+    }
+}
+
+fn render_route_selection(selection: &ChannelRouteSelection) -> String {
+    let mut details = format!(
+        "provider=`{}` model=`{}`",
+        selection.provider, selection.model
+    );
+    if let Some(agent_name) = selection.agent_name.as_deref() {
+        let _ = write!(details, " agent=`{agent_name}`");
+    }
+    if let Some(temperature) = selection.temperature {
+        let _ = write!(details, " temperature={temperature}");
+    }
+    if let Some(skills_directory) = selection.skills_directory.as_deref() {
+        let _ = write!(details, " skills_directory=`{skills_directory}`");
+    }
+    if selection.auto_delegate {
+        details.push_str(" auto_delegate=true");
+    }
+    if let Some(preferred_swarm) = selection.preferred_swarm.as_deref() {
+        let _ = write!(details, " preferred_swarm=`{preferred_swarm}`");
+    }
+    details
+}
+
+fn resolve_configured_route_for_cli(
+    config: &Config,
+    channel: &str,
+    reply_target: &str,
+) -> Option<ChannelRouteSelection> {
+    if let Some(route) = config.channel_agent_routes.iter().find(|route| {
+        route.channel.eq_ignore_ascii_case(channel)
+            && route.reply_target.trim() == reply_target.trim()
+    }) {
+        return route_selection_from_configured_route(
+            config,
+            route,
+            ChannelRouteSource::ConfiguredReplyTarget,
+        );
+    }
+
+    if let Some(chat_target) = chat_level_reply_target(reply_target) {
+        if let Some(route) = config.channel_agent_routes.iter().find(|route| {
+            route.channel.eq_ignore_ascii_case(channel)
+                && route.reply_target.trim() == chat_target.trim()
+        }) {
+            return route_selection_from_configured_route(
+                config,
+                route,
+                ChannelRouteSource::ConfiguredChat,
+            );
+        }
+    }
+
+    None
+}
+
+async fn handle_route_command(command: ChannelRouteCommands, config: &Config) -> Result<()> {
+    match command {
+        ChannelRouteCommands::List { channel } => {
+            let mut routes: Vec<_> = config
+                .channel_agent_routes
+                .iter()
+                .filter(|route| {
+                    channel
+                        .as_deref()
+                        .map_or(true, |wanted| route.channel.eq_ignore_ascii_case(wanted))
+                })
+                .collect();
+            routes.sort_by(|a, b| {
+                b.reply_target
+                    .contains(':')
+                    .cmp(&a.reply_target.contains(':'))
+                    .then_with(|| a.channel.cmp(&b.channel))
+                    .then_with(|| a.reply_target.cmp(&b.reply_target))
+            });
+
+            if routes.is_empty() {
+                println!("No channel-agent routes configured.");
+                return Ok(());
+            }
+
+            for route in routes {
+                let selection = route_selection_from_configured_route(
+                    config,
+                    route,
+                    if route.reply_target.contains(':') {
+                        ChannelRouteSource::ConfiguredReplyTarget
+                    } else {
+                        ChannelRouteSource::ConfiguredChat
+                    },
+                )
+                .with_context(|| {
+                    format!(
+                        "Route {} {} references missing configuration",
+                        route.channel, route.reply_target
+                    )
+                })?;
+                println!(
+                    "{} {} -> {} ({})",
+                    route.channel,
+                    route.reply_target,
+                    render_route_selection(&selection),
+                    route_source_label(selection.source.clone())
+                );
+            }
+            Ok(())
+        }
+        ChannelRouteCommands::Add {
+            channel,
+            reply_target,
+            agent,
+            provider,
+            model,
+            temperature,
+        } => {
+            let mut next = config.clone();
+            let route = crate::config::ChannelAgentRouteConfig {
+                channel: channel.clone(),
+                reply_target: reply_target.clone(),
+                agent,
+                provider,
+                model,
+                temperature,
+                api_key: None,
+            };
+            if let Some(existing) = next.channel_agent_routes.iter_mut().find(|existing| {
+                existing.channel.eq_ignore_ascii_case(&channel)
+                    && existing.reply_target.trim() == reply_target.trim()
+            }) {
+                *existing = route;
+            } else {
+                next.channel_agent_routes.push(route);
+            }
+            next.validate()?;
+            next.save().await?;
+            println!("Saved route for {} {}.", channel, reply_target);
+            Ok(())
+        }
+        ChannelRouteCommands::Remove {
+            channel,
+            reply_target,
+        } => {
+            let mut next = config.clone();
+            let before = next.channel_agent_routes.len();
+            next.channel_agent_routes.retain(|route| {
+                !(route.channel.eq_ignore_ascii_case(&channel)
+                    && route.reply_target.trim() == reply_target.trim())
+            });
+            if next.channel_agent_routes.len() == before {
+                anyhow::bail!("No route found for {} {}", channel, reply_target);
+            }
+            next.save().await?;
+            println!("Removed route for {} {}.", channel, reply_target);
+            Ok(())
+        }
+        ChannelRouteCommands::Resolve {
+            channel,
+            reply_target,
+        } => {
+            if let Some(selection) =
+                resolve_configured_route_for_cli(config, &channel, &reply_target)
+            {
+                println!(
+                    "{} {} -> {} ({})",
+                    channel,
+                    reply_target,
+                    render_route_selection(&selection),
+                    route_source_label(selection.source)
+                );
+            } else {
+                let defaults = runtime_defaults_from_config(config);
+                println!(
+                    "{} {} -> provider=`{}` model=`{}` temperature={} ({})",
+                    channel,
+                    reply_target,
+                    defaults.default_provider,
+                    defaults.model,
+                    defaults.temperature,
+                    route_source_label(ChannelRouteSource::GlobalDefault)
+                );
+            }
+            Ok(())
+        }
+        ChannelRouteCommands::Seen { channel } => {
+            let seen = load_observed_reply_targets(&config.workspace_dir, &channel);
+            if seen.is_empty() {
+                println!("No observed reply targets for {}.", channel);
+                return Ok(());
+            }
+            for entry in seen {
+                let label = if entry.reply_target.contains(':') {
+                    "topic"
+                } else {
+                    "chat"
+                };
+                let timestamp = chrono::DateTime::<chrono::Local>::from(
+                    SystemTime::UNIX_EPOCH + Duration::from_secs(entry.last_seen_at),
+                );
+                println!(
+                    "{} {} last_seen={}",
+                    label,
+                    entry.reply_target,
+                    timestamp.format("%Y-%m-%d %H:%M:%S %Z")
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6279,6 +6845,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -6364,6 +6931,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -6463,6 +7031,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -6547,6 +7116,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -6641,6 +7211,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -6692,6 +7263,13 @@ BTC is currently around $65,000 based on latest tool output."#
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
                 api_key: None,
+                temperature: Some(0.0),
+                agent_name: None,
+                system_prompt: None,
+                skills_directory: None,
+                auto_delegate: false,
+                preferred_swarm: None,
+                source: ChannelRouteSource::SessionOverride,
             },
         );
 
@@ -6756,6 +7334,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -6852,6 +7431,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -6963,6 +7543,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -7062,6 +7643,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -7151,6 +7733,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -7354,6 +7937,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -7367,6 +7951,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -7462,6 +8047,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             })
@@ -7476,6 +8062,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             })
@@ -7584,6 +8171,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
+                conversation_scope_id: None,
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
             })
@@ -7598,6 +8186,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "slack".to_string(),
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
+                conversation_scope_id: None,
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
             })
@@ -7703,6 +8292,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             })
@@ -7717,6 +8307,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             })
@@ -7804,6 +8395,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -7888,6 +8480,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -8418,11 +9011,33 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
+    }
+
+    #[test]
+    fn conversation_history_key_prefers_conversation_scope_id_over_thread_ts() {
+        let msg = traits::ChannelMessage {
+            id: "msg_abc123".into(),
+            sender: "alice".into(),
+            reply_target: "-100200300:42".into(),
+            content: "hello".into(),
+            channel: "telegram".into(),
+            timestamp: 1,
+            thread_ts: Some("42".into()),
+            conversation_scope_id: Some("forum:42".into()),
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_eq!(
+            conversation_history_key(&msg),
+            "telegram_-100200300:42_forum:42_alice"
+        );
     }
 
     #[test]
@@ -8435,6 +9050,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: Some("1741234567.123456".into()),
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -8455,6 +9071,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "cli".into(),
             timestamp: 1,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -8472,6 +9089,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -8483,6 +9101,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -8491,6 +9110,173 @@ BTC is currently around $65,000 based on latest tool output."#
             conversation_memory_key(&msg1),
             conversation_memory_key(&msg2)
         );
+    }
+
+    #[test]
+    fn resolve_configured_route_prefers_exact_reply_target_over_chat_route() {
+        let mut config = Config::default();
+        config.channel_agent_routes = vec![
+            crate::config::ChannelAgentRouteConfig {
+                channel: "telegram".into(),
+                reply_target: "-100200300".into(),
+                agent: None,
+                provider: Some("openrouter".into()),
+                model: Some("chat-default".into()),
+                temperature: None,
+                api_key: None,
+            },
+            crate::config::ChannelAgentRouteConfig {
+                channel: "telegram".into(),
+                reply_target: "-100200300:42".into(),
+                agent: None,
+                provider: Some("openai".into()),
+                model: Some("gpt-5.4".into()),
+                temperature: Some(0.3),
+                api_key: None,
+            },
+        ];
+
+        let selection = resolve_configured_route_for_cli(&config, "telegram", "-100200300:42")
+            .expect("exact route should resolve");
+
+        assert_eq!(selection.provider, "openai");
+        assert_eq!(selection.model, "gpt-5.4");
+        assert_eq!(selection.temperature, Some(0.3));
+        assert_eq!(selection.source, ChannelRouteSource::ConfiguredReplyTarget);
+    }
+
+    #[test]
+    fn resolve_configured_route_named_agent_uses_agent_settings() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "finance".into(),
+            crate::config::DelegateAgentConfig {
+                provider: "anthropic".into(),
+                model: "claude-sonnet-4.6".into(),
+                system_prompt: Some("You are a finance specialist.".into()),
+                api_key: None,
+                temperature: Some(0.1),
+                auto_delegate: true,
+                preferred_swarm: Some("research_team".into()),
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: vec![],
+                max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: Some("skills/finance".into()),
+            },
+        );
+        config.swarms.insert(
+            "research_team".into(),
+            crate::config::SwarmConfig {
+                agents: vec!["finance".into()],
+                strategy: crate::config::SwarmStrategy::Sequential,
+                router_prompt: None,
+                description: None,
+                timeout_secs: 60,
+            },
+        );
+        config.channel_agent_routes = vec![crate::config::ChannelAgentRouteConfig {
+            channel: "telegram".into(),
+            reply_target: "-100200300:84".into(),
+            agent: Some("finance".into()),
+            provider: None,
+            model: None,
+            temperature: None,
+            api_key: None,
+        }];
+
+        let selection = resolve_configured_route_for_cli(&config, "telegram", "-100200300:84")
+            .expect("agent route should resolve");
+
+        assert_eq!(selection.provider, "anthropic");
+        assert_eq!(selection.model, "claude-sonnet-4.6");
+        assert_eq!(selection.agent_name.as_deref(), Some("finance"));
+        assert_eq!(
+            selection.skills_directory.as_deref(),
+            Some("skills/finance")
+        );
+        assert!(selection.auto_delegate);
+        assert_eq!(selection.preferred_swarm.as_deref(), Some("research_team"));
+    }
+
+    #[test]
+    fn apply_route_prompt_overrides_injects_auto_delegate_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime_ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openrouter".to_string()),
+            prompt_config: Arc::new(Config::default()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("base".to_string()),
+            model: Arc::new("model".to_string()),
+            temperature: 0.7,
+            auto_save_memory: false,
+            max_tool_iterations: 4,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(tmp.path().to_path_buf()),
+            message_timeout_secs: 30,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(vec![]),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(vec![]),
+            model_routes: Arc::new(vec![]),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: false,
+            show_tool_calls: false,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+        };
+        let route = ChannelRouteSelection {
+            provider: "openrouter".into(),
+            model: "model".into(),
+            api_key: None,
+            temperature: Some(0.7),
+            agent_name: Some("finance".into()),
+            system_prompt: Some("You are a finance specialist.".into()),
+            skills_directory: None,
+            auto_delegate: true,
+            preferred_swarm: Some("research_team".into()),
+            source: ChannelRouteSource::ConfiguredReplyTarget,
+        };
+
+        let prompt = apply_route_prompt_overrides(
+            &runtime_ctx,
+            "base prompt",
+            &route,
+            "Research NVDA earnings and compare the result with AMD, then write a short review.",
+        );
+
+        assert!(prompt.contains("finance specialist"));
+        assert!(prompt.contains("Delegation Policy"));
+        assert!(prompt.contains("research_team"));
     }
 
     #[tokio::test]
@@ -8506,6 +9292,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -8517,6 +9304,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -8669,6 +9457,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -8686,6 +9475,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -8805,6 +9595,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -8838,6 +9629,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -8877,6 +9669,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -8982,6 +9775,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -9094,6 +9888,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -9671,6 +10466,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -9761,6 +10557,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -9778,6 +10575,7 @@ This is an example JSON object for profile settings."#;
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -9928,6 +10726,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -10043,6 +10842,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -10150,6 +10950,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -10277,6 +11078,7 @@ This is an example JSON object for profile settings."#;
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             },
@@ -10435,6 +11237,7 @@ This is an example JSON object for profile settings."#;
             channel: "matrix".into(),
             timestamp: 0,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -10451,6 +11254,7 @@ This is an example JSON object for profile settings."#;
             channel: "matrix".into(),
             timestamp: 0,
             thread_ts: Some("$thread1".into()),
+            conversation_scope_id: None,
             interruption_scope_id: Some("$thread1".into()),
             attachments: vec![],
         };
@@ -10468,7 +11272,8 @@ This is an example JSON object for profile settings."#;
             channel: "slack".into(),
             timestamp: 0,
             thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
-            interruption_scope_id: None,                 // but NOT a thread reply
+            conversation_scope_id: None,
+            interruption_scope_id: None, // but NOT a thread reply
             attachments: vec![],
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
@@ -10547,6 +11352,7 @@ This is an example JSON object for profile settings."#;
                 channel: "slack".to_string(),
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
+                conversation_scope_id: None,
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
             })
@@ -10561,6 +11367,7 @@ This is an example JSON object for profile settings."#;
                 channel: "slack".to_string(),
                 timestamp: 2,
                 thread_ts: Some("1741234567.200002".to_string()),
+                conversation_scope_id: None,
                 interruption_scope_id: Some("1741234567.200002".to_string()),
                 attachments: vec![],
             })

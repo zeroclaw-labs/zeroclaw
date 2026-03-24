@@ -48,6 +48,7 @@ impl Channel for CliChannel {
                     .unwrap_or_default()
                     .as_secs(),
                 thread_ts: None,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             };
@@ -113,6 +114,7 @@ mod tests {
             channel: "cli".into(),
             timestamp: 1_234_567_890,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -134,6 +136,7 @@ mod tests {
             channel: "ch".into(),
             timestamp: 0,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };

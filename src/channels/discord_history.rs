@@ -498,6 +498,7 @@ impl Channel for DiscordHistoryChannel {
                                 .unwrap_or_default()
                                 .as_secs(),
                             thread_ts: None,
+                            conversation_scope_id: None,
                             interruption_scope_id: None,
                             attachments: Vec::new(),
                         };

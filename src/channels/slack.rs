@@ -373,6 +373,10 @@ impl SlackChannel {
             .map(str::to_string)
     }
 
+    fn inbound_conversation_scope_id(thread_ts: Option<&str>) -> Option<String> {
+        thread_ts.map(|ts| format!("thread:{ts}"))
+    }
+
     fn normalized_channel_id(input: Option<&str>) -> Option<String> {
         input
             .map(str::trim)
@@ -1945,6 +1949,12 @@ impl SlackChannel {
             .and_then(|v| v.as_str())
             .unwrap_or("0");
 
+        let thread_ts = payload
+            .get("message")
+            .and_then(|m| m.get("thread_ts"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+
         Some(ChannelMessage {
             id: format!("slack_{channel_id}_{ts}_action"),
             sender: user.to_string(),
@@ -1955,11 +1965,8 @@ impl SlackChannel {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            thread_ts: payload
-                .get("message")
-                .and_then(|m| m.get("thread_ts"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
+            thread_ts: thread_ts.clone(),
+            conversation_scope_id: Self::inbound_conversation_scope_id(thread_ts.as_deref()),
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -2215,6 +2222,11 @@ impl SlackChannel {
                 last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
                 let sender = self.resolve_sender_identity(user).await;
 
+                let thread_ts = if self.thread_replies {
+                    Self::inbound_thread_ts(event, ts)
+                } else {
+                    Self::inbound_thread_ts_genuine_only(event)
+                };
                 let channel_msg = ChannelMessage {
                     id: format!("slack_{channel_id}_{ts}"),
                     sender,
@@ -2225,11 +2237,10 @@ impl SlackChannel {
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    thread_ts: if self.thread_replies {
-                        Self::inbound_thread_ts(event, ts)
-                    } else {
-                        Self::inbound_thread_ts_genuine_only(event)
-                    },
+                    thread_ts: thread_ts.clone(),
+                    conversation_scope_id: Self::inbound_conversation_scope_id(
+                        thread_ts.as_deref(),
+                    ),
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                     attachments: vec![],
                 };
@@ -2991,6 +3002,11 @@ impl Channel for SlackChannel {
                         last_ts_by_channel.insert(channel_id.clone(), ts.to_string());
                         let sender = self.resolve_sender_identity(user).await;
 
+                        let thread_ts = if self.thread_replies {
+                            Self::inbound_thread_ts(msg, ts)
+                        } else {
+                            Self::inbound_thread_ts_genuine_only(msg)
+                        };
                         let channel_msg = ChannelMessage {
                             id: format!("slack_{channel_id}_{ts}"),
                             sender,
@@ -3001,11 +3017,10 @@ impl Channel for SlackChannel {
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .unwrap_or_default()
                                 .as_secs(),
-                            thread_ts: if self.thread_replies {
-                                Self::inbound_thread_ts(msg, ts)
-                            } else {
-                                Self::inbound_thread_ts_genuine_only(msg)
-                            },
+                            thread_ts: thread_ts.clone(),
+                            conversation_scope_id: Self::inbound_conversation_scope_id(
+                                thread_ts.as_deref(),
+                            ),
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                             attachments: vec![],
                         };
@@ -3092,6 +3107,9 @@ impl Channel for SlackChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
+                        conversation_scope_id: Self::inbound_conversation_scope_id(Some(
+                            &thread_ts,
+                        )),
                         interruption_scope_id: Some(thread_ts.clone()),
                         attachments: vec![],
                     };
@@ -4045,6 +4063,7 @@ mod tests {
             channel: "slack".into(),
             timestamp: 0,
             thread_ts: None, // thread_replies=false → no fallback to ts
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -4071,6 +4090,7 @@ mod tests {
             channel: "slack".into(),
             timestamp: 0,
             thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
+            conversation_scope_id: Some(format!("thread:{ts}")),
             interruption_scope_id: None,
             attachments: vec![],
         };

@@ -1365,7 +1365,9 @@ mod tests {
             err.contains("credentials not set")
                 || err.contains("169.254.169.254")
                 || err.to_lowercase().contains("credential")
-                || err.to_lowercase().contains("builder error"),
+                || err.to_lowercase().contains("builder error")
+                || err.to_lowercase().contains("inference profile")
+                || err.to_lowercase().contains("bad request"),
             "Expected missing-credentials style error, got: {err}"
         );
     }

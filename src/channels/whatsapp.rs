@@ -151,6 +151,7 @@ impl WhatsAppChannel {
                         channel: "whatsapp".to_string(),
                         timestamp,
                         thread_ts: None,
+                        conversation_scope_id: None,
                         interruption_scope_id: None,
                         attachments: vec![],
                     });

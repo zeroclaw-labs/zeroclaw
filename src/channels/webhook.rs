@@ -237,6 +237,7 @@ impl Channel for WebhookChannel {
                 channel: "webhook".to_string(),
                 timestamp,
                 thread_ts: payload.thread_id,
+                conversation_scope_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             };

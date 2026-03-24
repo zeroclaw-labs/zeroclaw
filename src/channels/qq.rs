@@ -1219,6 +1219,7 @@ impl Channel for QQChannel {
                                     .unwrap_or_default()
                                     .as_secs(),
                                 thread_ts: None,
+                                conversation_scope_id: None,
                                 interruption_scope_id: None,
                     attachments: vec![],
                             };
@@ -1260,6 +1261,7 @@ impl Channel for QQChannel {
                                     .unwrap_or_default()
                                     .as_secs(),
                                 thread_ts: None,
+                                conversation_scope_id: None,
                                 interruption_scope_id: None,
                     attachments: vec![],
                             };

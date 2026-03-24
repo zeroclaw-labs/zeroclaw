@@ -205,6 +205,7 @@ impl NextcloudTalkChannel {
             channel: "nextcloud_talk".to_string(),
             timestamp: Self::now_unix_secs(),
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         });
@@ -308,6 +309,7 @@ impl NextcloudTalkChannel {
             channel: "nextcloud_talk".to_string(),
             timestamp,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         });

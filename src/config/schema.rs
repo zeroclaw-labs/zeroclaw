@@ -186,6 +186,10 @@ pub struct Config {
     #[serde(default)]
     pub query_classification: QueryClassificationConfig,
 
+    /// Channel-specific agent/model bindings keyed by channel + reply target.
+    #[serde(default)]
+    pub channel_agent_routes: Vec<ChannelAgentRouteConfig>,
+
     /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
@@ -540,6 +544,12 @@ pub struct DelegateAgentConfig {
     /// Temperature override
     #[serde(default)]
     pub temperature: Option<f64>,
+    /// Encourage use of `delegate`/`swarm` for complex multi-step tasks.
+    #[serde(default)]
+    pub auto_delegate: bool,
+    /// Preferred swarm to use when auto-delegation is encouraged.
+    #[serde(default)]
+    pub preferred_swarm: Option<String>,
     /// Max recursion depth for nested delegation
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
@@ -572,6 +582,30 @@ fn default_delegate_timeout_secs() -> u64 {
 
 fn default_delegate_agentic_timeout_secs() -> u64 {
     DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS
+}
+
+/// Channel-specific route binding for a chat or topic/forum thread.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct ChannelAgentRouteConfig {
+    /// Channel ID (e.g. "telegram").
+    pub channel: String,
+    /// Canonical reply target (`chat_id` or `chat_id:thread_id`).
+    pub reply_target: String,
+    /// Named agent binding mode.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Provider override binding mode.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model override binding mode.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Optional temperature override for provider/model binding mode.
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Optional API key override for provider/model binding mode.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 // ── Swarms ──────────────────────────────────────────────────────
@@ -8062,6 +8096,7 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
+            channel_agent_routes: Vec::new(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),
@@ -9329,6 +9364,65 @@ impl Config {
             }
         }
 
+        // Channel agent routes
+        for (i, route) in self.channel_agent_routes.iter().enumerate() {
+            if route.channel.trim().is_empty() {
+                anyhow::bail!("channel_agent_routes[{i}].channel must not be empty");
+            }
+            if route.reply_target.trim().is_empty() {
+                anyhow::bail!("channel_agent_routes[{i}].reply_target must not be empty");
+            }
+
+            let has_agent = route
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            let has_provider = route
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            let has_model = route
+                .model
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+
+            if has_agent {
+                if has_provider
+                    || has_model
+                    || route.temperature.is_some()
+                    || route.api_key.is_some()
+                {
+                    anyhow::bail!(
+                        "channel_agent_routes[{i}] must define exactly one binding mode: `agent` or (`provider` + `model`)"
+                    );
+                }
+                let agent_name = route.agent.as_deref().map(str::trim).unwrap_or_default();
+                if !self.agents.contains_key(agent_name) {
+                    anyhow::bail!(
+                        "channel_agent_routes[{i}].agent references unknown agent `{agent_name}`"
+                    );
+                }
+            } else if has_provider || has_model {
+                if !has_provider || !has_model {
+                    anyhow::bail!(
+                        "channel_agent_routes[{i}] provider/model binding must set both `provider` and `model`"
+                    );
+                }
+            } else {
+                anyhow::bail!(
+                    "channel_agent_routes[{i}] must define exactly one binding mode: `agent` or (`provider` + `model`)"
+                );
+            }
+
+            if let Some(temperature) = route.temperature {
+                validate_temperature(temperature)
+                    .map_err(|msg| anyhow::anyhow!("channel_agent_routes[{i}].{msg}"))?;
+            }
+        }
+
         for (profile_key, profile) in &self.model_providers {
             let profile_name = profile_key.trim();
             if profile_name.is_empty() {
@@ -9723,6 +9817,10 @@ impl Config {
         // Delegate agent timeouts
         const MAX_DELEGATE_TIMEOUT_SECS: u64 = 3600;
         for (name, agent) in &self.agents {
+            if let Some(temperature) = agent.temperature {
+                validate_temperature(temperature)
+                    .map_err(|msg| anyhow::anyhow!("agents.{name}.{msg}"))?;
+            }
             if let Some(timeout) = agent.timeout_secs {
                 if timeout == 0 {
                     anyhow::bail!("agents.{name}.timeout_secs must be greater than 0");
@@ -9740,6 +9838,16 @@ impl Config {
                 if timeout > MAX_DELEGATE_TIMEOUT_SECS {
                     anyhow::bail!(
                         "agents.{name}.agentic_timeout_secs exceeds max {MAX_DELEGATE_TIMEOUT_SECS}"
+                    );
+                }
+            }
+            if let Some(preferred_swarm) = agent.preferred_swarm.as_deref().map(str::trim) {
+                if preferred_swarm.is_empty() {
+                    anyhow::bail!("agents.{name}.preferred_swarm must not be empty when present");
+                }
+                if !self.swarms.contains_key(preferred_swarm) {
+                    anyhow::bail!(
+                        "agents.{name}.preferred_swarm references unknown swarm `{preferred_swarm}`"
                     );
                 }
             }
@@ -11107,6 +11215,7 @@ auto_save = true
             default_temperature: 0.5,
             provider_timeout_secs: 120,
             extra_headers: HashMap::new(),
+            channel_agent_routes: Vec::new(),
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -11707,6 +11816,7 @@ default_temperature = 0.7
             default_temperature: 0.9,
             provider_timeout_secs: 120,
             extra_headers: HashMap::new(),
+            channel_agent_routes: Vec::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             backup: BackupConfig::default(),
@@ -11830,6 +11940,8 @@ default_temperature = 0.7
                 system_prompt: None,
                 api_key: Some("agent-credential".into()),
                 temperature: None,
+                auto_delegate: false,
+                preferred_swarm: None,
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
@@ -14983,6 +15095,44 @@ require_otp_to_resume = true
         assert_eq!(config.agents.len(), 2);
         assert_eq!(config.swarms.len(), 1);
         assert!(config.swarms.contains_key("pipeline"));
+    }
+
+    #[test]
+    async fn channel_agent_route_deserializes_with_model_binding() {
+        let toml_str = r#"
+            [[channel_agent_routes]]
+            channel = "telegram"
+            reply_target = "-100200300:42"
+            provider = "openai"
+            model = "gpt-5.4"
+            temperature = 0.2
+        "#;
+        let config = parse_test_config(toml_str);
+        assert_eq!(config.channel_agent_routes.len(), 1);
+        let route = &config.channel_agent_routes[0];
+        assert_eq!(route.channel, "telegram");
+        assert_eq!(route.reply_target, "-100200300:42");
+        assert_eq!(route.provider.as_deref(), Some("openai"));
+        assert_eq!(route.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(route.temperature, Some(0.2));
+    }
+
+    #[test]
+    async fn validate_rejects_invalid_channel_agent_route_binding() {
+        let mut config = Config::default();
+        config.channel_agent_routes.push(ChannelAgentRouteConfig {
+            channel: "telegram".into(),
+            reply_target: "-100200300:42".into(),
+            agent: Some("finance".into()),
+            provider: Some("openai".into()),
+            model: Some("gpt-5.4".into()),
+            temperature: None,
+            api_key: None,
+        });
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("channel_agent_routes[0]"));
+        assert!(err.contains("exactly one binding mode"));
     }
 
     #[tokio::test]

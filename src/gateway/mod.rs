@@ -2527,6 +2527,7 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            conversation_scope_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };

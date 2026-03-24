@@ -459,6 +459,24 @@ impl TelegramChannel {
         }
     }
 
+    fn forum_conversation_scope_id(
+        message: &serde_json::Value,
+        thread_id: Option<&String>,
+    ) -> Option<String> {
+        let thread_id = thread_id?;
+        let chat = message.get("chat")?;
+        let chat_type = chat.get("type").and_then(serde_json::Value::as_str)?;
+        let is_forum = chat
+            .get("is_forum")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if chat_type == "supergroup" && is_forum {
+            Some(format!("forum:{thread_id}"))
+        } else {
+            None
+        }
+    }
+
     fn extract_update_message_target(update: &serde_json::Value) -> Option<(String, i64)> {
         let message = update.get("message")?;
         let chat_id = message
@@ -1168,7 +1186,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            thread_ts: thread_id,
+            thread_ts: thread_id.clone(),
+            conversation_scope_id: Self::forum_conversation_scope_id(message, thread_id.as_ref()),
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -1299,7 +1318,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            thread_ts: thread_id,
+            thread_ts: thread_id.clone(),
+            conversation_scope_id: Self::forum_conversation_scope_id(message, thread_id.as_ref()),
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -1504,7 +1524,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            thread_ts: thread_id,
+            thread_ts: thread_id.clone(),
+            conversation_scope_id: Self::forum_conversation_scope_id(message, thread_id.as_ref()),
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -3412,7 +3433,9 @@ mod tests {
                     "username": "alice"
                 },
                 "chat": {
-                    "id": -100_200_300
+                    "id": -100_200_300,
+                    "type": "supergroup",
+                    "is_forum": true
                 },
                 "message_thread_id": 789
             }
@@ -3424,8 +3447,39 @@ mod tests {
 
         assert_eq!(msg.sender, "alice");
         assert_eq!(msg.reply_target, "-100200300:789");
+        assert_eq!(msg.conversation_scope_id.as_deref(), Some("forum:789"));
         assert_eq!(msg.content, "hello from topic");
         assert_eq!(msg.id, "telegram_-100200300_42");
+    }
+
+    #[test]
+    fn parse_update_message_thread_reply_in_non_forum_chat_does_not_set_forum_scope() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 4,
+            "message": {
+                "message_id": 43,
+                "text": "reply in normal group",
+                "from": {
+                    "id": 555,
+                    "username": "alice"
+                },
+                "chat": {
+                    "id": -100_200_300,
+                    "type": "supergroup",
+                    "is_forum": false
+                },
+                "message_thread_id": 789
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("message with thread_id should parse");
+
+        assert_eq!(msg.reply_target, "-100200300:789");
+        assert_eq!(msg.thread_ts.as_deref(), Some("789"));
+        assert!(msg.conversation_scope_id.is_none());
     }
 
     // ── File sending API URL tests ──────────────────────────────────

@@ -1253,6 +1253,8 @@ mod tests {
                 system_prompt: None,
                 api_key: None,
                 temperature: None,
+                auto_delegate: false,
+                preferred_swarm: None,
                 max_depth: 3,
                 agentic: false,
                 allowed_tools: Vec::new(),
