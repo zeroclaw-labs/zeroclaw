@@ -687,13 +687,6 @@ mod tests {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
-            security: crate::config::SecurityConfig {
-                tirith: crate::config::schema::TirithScanConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
             ..Config::default()
         };
         tokio::fs::create_dir_all(&config.workspace_dir)

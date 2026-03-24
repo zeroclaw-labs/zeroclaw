@@ -6096,7 +6096,7 @@ pub struct TirithScanConfig {
 impl Default for TirithScanConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             bin: "tirith".to_string(),
             timeout_secs: 5,
             fail_open: true,
