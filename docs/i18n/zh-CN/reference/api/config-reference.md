@@ -121,7 +121,6 @@ loop_ignore_tools = ["browser_screenshot", "browser_navigate"]
 message_timeout_scale_max = 8
 ```
 
-
 | 键 | 默认值 | 用途 |
 |---|---|---|
 | `enabled` | `false` | 为敏感操作/域启用 OTP 门控 |
