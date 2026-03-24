@@ -723,6 +723,7 @@ mod tests {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -752,6 +753,7 @@ mod tests {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -794,6 +796,7 @@ mod tests {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -940,6 +943,7 @@ mod tests {
                 max_audio_bytes: 25 * 1024 * 1024,
                 timeout_secs: 300,
             }),
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -992,6 +996,7 @@ mod tests {
                 max_audio_bytes: 25 * 1024 * 1024,
                 timeout_secs: 300,
             }),
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(

@@ -392,6 +392,10 @@ pub struct Config {
     #[serde(default)]
     pub claude_code: ClaudeCodeConfig,
 
+    /// Claude Code task runner with Slack progress and SSH session handoff (`[claude_code_runner]`).
+    #[serde(default)]
+    pub claude_code_runner: ClaudeCodeRunnerConfig,
+
     /// Codex CLI tool configuration (`[codex_cli]`).
     #[serde(default)]
     pub codex_cli: CodexCliConfig,
@@ -827,6 +831,10 @@ pub struct TranscriptionConfig {
     /// Local/self-hosted Whisper-compatible STT provider.
     #[serde(default)]
     pub local_whisper: Option<LocalWhisperConfig>,
+    /// Also transcribe non-PTT (forwarded/regular) audio messages on WhatsApp,
+    /// not just voice notes.  Default: `false` (preserves legacy behavior).
+    #[serde(default)]
+    pub transcribe_non_ptt_audio: bool,
 }
 
 impl Default for TranscriptionConfig {
@@ -845,6 +853,7 @@ impl Default for TranscriptionConfig {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         }
     }
 }
@@ -3308,6 +3317,48 @@ impl Default for ClaudeCodeConfig {
             system_prompt: None,
             max_output_bytes: default_claude_code_max_output_bytes(),
             env_passthrough: Vec::new(),
+        }
+    }
+}
+
+// ── Claude Code Runner ──────────────────────────────────────────
+
+/// Claude Code task runner configuration (`[claude_code_runner]` section).
+///
+/// Spawns Claude Code in a tmux session with HTTP hooks that POST tool
+/// execution events back to ZeroClaw's gateway, updating a Slack message
+/// in-place with progress plus an SSH handoff link.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ClaudeCodeRunnerConfig {
+    /// Enable the `claude_code_runner` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// SSH host for session handoff links (e.g. "myhost.example.com")
+    #[serde(default)]
+    pub ssh_host: Option<String>,
+    /// Prefix for tmux session names (default: "zc-claude-")
+    #[serde(default = "default_claude_code_runner_tmux_prefix")]
+    pub tmux_prefix: String,
+    /// Session time-to-live in seconds before auto-cleanup (default: 3600)
+    #[serde(default = "default_claude_code_runner_session_ttl")]
+    pub session_ttl: u64,
+}
+
+fn default_claude_code_runner_tmux_prefix() -> String {
+    "zc-claude-".into()
+}
+
+fn default_claude_code_runner_session_ttl() -> u64 {
+    3600
+}
+
+impl Default for ClaudeCodeRunnerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ssh_host: None,
+            tmux_prefix: default_claude_code_runner_tmux_prefix(),
+            session_ttl: default_claude_code_runner_session_ttl(),
         }
     }
 }
@@ -7482,6 +7533,7 @@ impl Default for Config {
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
+            claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
@@ -10540,6 +10592,7 @@ default_temperature = 0.7
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
+            claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
@@ -11062,6 +11115,7 @@ default_temperature = 0.7
             locale: None,
             verifiable_intent: VerifiableIntentConfig::default(),
             claude_code: ClaudeCodeConfig::default(),
+            claude_code_runner: ClaudeCodeRunnerConfig::default(),
             codex_cli: CodexCliConfig::default(),
             gemini_cli: GeminiCliConfig::default(),
             opencode_cli: OpenCodeCliConfig::default(),
@@ -13740,6 +13794,7 @@ default_model = "persisted-profile"
         assert_eq!(tc.model, "whisper-large-v3-turbo");
         assert!(tc.language.is_none());
         assert_eq!(tc.max_duration_secs, 120);
+        assert!(!tc.transcribe_non_ptt_audio);
     }
 
     #[test]
