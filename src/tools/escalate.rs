@@ -111,9 +111,10 @@ impl EscalateToHumanTool {
         } else {
             raw
         };
-        unquoted
-            .split_once(" #")
-            .map_or_else(|| unquoted.trim().to_string(), |(value, _)| value.trim().to_string())
+        unquoted.split_once(" #").map_or_else(
+            || unquoted.trim().to_string(),
+            |(value, _)| value.trim().to_string(),
+        )
     }
 
     /// Send a Pushover notification. Logs but does not fail on error.
@@ -430,13 +431,9 @@ mod tests {
         }
     }
 
-    fn make_tool_with_channels(
-        channels: Vec<(&str, Arc<dyn Channel>)>,
-    ) -> EscalateToHumanTool {
-        let tool = EscalateToHumanTool::new(
-            Arc::new(SecurityPolicy::default()),
-            PathBuf::from("/tmp"),
-        );
+    fn make_tool_with_channels(channels: Vec<(&str, Arc<dyn Channel>)>) -> EscalateToHumanTool {
+        let tool =
+            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), PathBuf::from("/tmp"));
         let map: HashMap<String, Arc<dyn Channel>> = channels
             .into_iter()
             .map(|(name, ch)| (name.to_string(), ch))
@@ -449,10 +446,8 @@ mod tests {
 
     #[test]
     fn test_tool_metadata() {
-        let tool = EscalateToHumanTool::new(
-            Arc::new(SecurityPolicy::default()),
-            PathBuf::from("/tmp"),
-        );
+        let tool =
+            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), PathBuf::from("/tmp"));
         assert_eq!(tool.name(), "escalate_to_human");
         assert!(!tool.description().is_empty());
         assert!(tool.description().to_lowercase().contains("escalat"));
@@ -462,10 +457,8 @@ mod tests {
 
     #[test]
     fn test_parameters_schema() {
-        let tool = EscalateToHumanTool::new(
-            Arc::new(SecurityPolicy::default()),
-            PathBuf::from("/tmp"),
-        );
+        let tool =
+            EscalateToHumanTool::new(Arc::new(SecurityPolicy::default()), PathBuf::from("/tmp"));
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["summary"].is_object());
