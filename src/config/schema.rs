@@ -1,6 +1,6 @@
 use crate::config::traits::ChannelConfig;
 use crate::providers::{is_glm_alias, is_zai_alias};
-use crate::security::{AutonomyLevel, DomainMatcher};
+use crate::security::{AutonomyLevel, DomainMatcher, GuardAction};
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
@@ -626,6 +626,10 @@ const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 120;
 
 fn default_provider_timeout_secs() -> u64 {
     DEFAULT_PROVIDER_TIMEOUT_SECS
+}
+
+fn default_prompt_guard_sensitivity() -> f64 {
+    0.7
 }
 
 /// Default delegate tool timeout for non-agentic calls: 120 seconds.
@@ -6791,6 +6795,14 @@ pub struct SecurityConfig {
     /// Nevis IAM integration for SSO/MFA authentication and role-based access.
     #[serde(default)]
     pub nevis: NevisConfig,
+
+    /// Prompt injection guard action (warn/block/sanitize).
+    #[serde(default)]
+    pub prompt_guard_action: GuardAction,
+
+    /// Prompt injection guard sensitivity threshold (0.0-1.0).
+    #[serde(default = "default_prompt_guard_sensitivity")]
+    pub prompt_guard_sensitivity: f64,
 }
 
 /// OTP validation strategy.

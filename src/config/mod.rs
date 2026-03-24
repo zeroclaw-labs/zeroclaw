@@ -35,6 +35,10 @@ pub use schema::{
     WhatsAppChatPolicy, WhatsAppWebMode, WorkspaceConfig, DEFAULT_GWS_SERVICES,
 };
 
+// Re-export security types used in config
+#[allow(unused_imports)]
+pub use crate::security::{GuardAction, GuardResult, PromptGuard};
+
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
     (T::name(), channel.is_some())
 }

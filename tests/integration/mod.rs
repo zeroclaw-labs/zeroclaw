@@ -5,5 +5,6 @@ mod channel_routing;
 mod hooks;
 mod memory_comparison;
 mod memory_restart;
+mod prompt_guard_inbound;
 mod telegram_attachment_fallback;
 mod telegram_finalize_draft;
