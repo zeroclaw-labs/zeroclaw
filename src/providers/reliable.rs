@@ -1079,6 +1079,64 @@ impl Provider for ReliableProvider {
         })
         .boxed()
     }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Try each provider/model combination for streaming with history.
+        // Mirrors stream_chat_with_system but delegates to the underlying
+        // provider's stream_chat_with_history, preserving the full conversation.
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            let provider_clone = provider_name.clone();
+
+            let current_model = match self.model_chain(model).first() {
+                Some(m) => m.to_string(),
+                None => model.to_string(),
+            };
+
+            let stream =
+                provider.stream_chat_with_history(messages, &current_model, temperature, options);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    if let Err(ref e) = chunk {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(chunk).await.is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+            });
+
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            })
+            .boxed();
+        }
+
+        // No streaming support available
+        stream::once(async move {
+            Err(super::traits::StreamError::Provider(
+                "No provider supports streaming".to_string(),
+            ))
+        })
+        .boxed()
+    }
 }
 
 #[cfg(test)]
@@ -2610,5 +2668,150 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
         assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ── stream_chat_with_history failover tests ──────────────────────
+
+    /// Mock provider that supports streaming via stream_chat_with_history.
+    struct StreamingHistoryMock {
+        stream_calls: Arc<AtomicUsize>,
+        supports: bool,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingHistoryMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.supports
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            // Echo the number of messages as the delta to verify history was passed through
+            let msg_count = messages.len().to_string();
+            stream::iter(vec![
+                Ok(StreamChunk::delta(msg_count)),
+                Ok(StreamChunk::final_chunk()),
+            ])
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_delegates_to_streaming_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(StreamingHistoryMock {
+                    stream_calls: Arc::clone(&calls),
+                    supports: true,
+                }) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("msg1"),
+            ChatMessage::assistant("resp1"),
+            ChatMessage::user("msg2"),
+        ];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.delta, "4", "should pass all 4 messages to provider");
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(second.is_final);
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_skips_non_streaming_providers() {
+        let non_streaming_calls = Arc::new(AtomicUsize::new(0));
+        let streaming_calls = Arc::new(AtomicUsize::new(0));
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "non-streaming".into(),
+                    Box::new(StreamingHistoryMock {
+                        stream_calls: Arc::clone(&non_streaming_calls),
+                        supports: false,
+                    }) as Box<dyn Provider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(StreamingHistoryMock {
+                        stream_calls: Arc::clone(&streaming_calls),
+                        supports: true,
+                    }) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.delta, "1");
+        assert_eq!(
+            non_streaming_calls.load(Ordering::SeqCst),
+            0,
+            "non-streaming provider should be skipped"
+        );
+        assert_eq!(
+            streaming_calls.load(Ordering::SeqCst),
+            1,
+            "streaming provider should be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_errors_when_no_provider_supports_streaming() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "non-streaming".into(),
+                Box::new(StreamingHistoryMock {
+                    stream_calls: Arc::new(AtomicUsize::new(0)),
+                    supports: false,
+                }) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap();
+        let err = first.expect_err("should fail when no provider supports streaming");
+        assert!(
+            err.to_string().contains("No provider supports streaming"),
+            "unexpected error: {err}"
+        );
+        assert!(stream.next().await.is_none());
     }
 }
