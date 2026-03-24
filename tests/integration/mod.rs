@@ -1,6 +1,7 @@
 mod agent;
 mod agent_robustness;
 mod backup_cron_scheduling;
+mod calendar_triggers;
 mod channel_matrix;
 mod channel_routing;
 mod hooks;
