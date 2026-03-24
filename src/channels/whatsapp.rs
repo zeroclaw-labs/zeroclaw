@@ -120,6 +120,26 @@ impl WhatsAppChannel {
         (!normalized.is_empty()).then_some(normalized)
     }
 
+    /// Apply mention-pattern gating for a group message.
+    ///
+    /// Returns `Some(content)` (with matched patterns stripped) when the
+    /// message should be processed, or `None` when it should be dropped.
+    /// When `is_group` is false or `patterns` is empty the original content
+    /// is returned unchanged.
+    pub(crate) fn apply_mention_gating(
+        patterns: &[Regex],
+        content: &str,
+        is_group: bool,
+    ) -> Option<String> {
+        if !is_group || patterns.is_empty() {
+            return Some(content.to_string());
+        }
+        if !Self::text_matches_patterns(patterns, content) {
+            return None;
+        }
+        Self::strip_patterns(patterns, content)
+    }
+
     /// Detect group messages in the WhatsApp Cloud API webhook payload.
     ///
     /// A message is considered a group message when it carries a `context`
@@ -214,16 +234,13 @@ impl WhatsAppChannel {
                     // any pattern and strip matched fragments from the content.
                     // DM messages always pass through unfiltered.
                     let is_group = Self::is_group_message(msg);
-                    let content = if !is_group || self.mention_patterns.is_empty() {
-                        content
-                    } else {
-                        if !self.contains_mention(&content) {
-                            continue;
-                        }
-                        match self.strip_mention_patterns(&content) {
-                            Some(c) => c,
-                            None => continue,
-                        }
+                    let content = match Self::apply_mention_gating(
+                        &self.mention_patterns,
+                        &content,
+                        is_group,
+                    ) {
+                        Some(c) => c,
+                        None => continue,
                     };
 
                     // Get timestamp

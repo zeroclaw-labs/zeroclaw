@@ -859,26 +859,20 @@ impl Channel for WhatsAppWebChannel {
                                 // strip matched fragments from the forwarded content.
                                 // DMs always pass through unfiltered.
                                 let is_group = chat.contains("@g.us");
-                                let content = if is_group && !wa_mention_patterns.is_empty() {
-                                    if !super::whatsapp::WhatsAppChannel::text_matches_patterns(
+                                let content =
+                                    match super::whatsapp::WhatsAppChannel::apply_mention_gating(
                                         &wa_mention_patterns,
                                         &content,
-                                    ) {
-                                        tracing::debug!(
-                                            "WhatsApp Web: ignoring group message without mention match"
-                                        );
-                                        return;
-                                    }
-                                    match super::whatsapp::WhatsAppChannel::strip_patterns(
-                                        &wa_mention_patterns,
-                                        &content,
+                                        is_group,
                                     ) {
                                         Some(c) => c,
-                                        None => return,
-                                    }
-                                } else {
-                                    content
-                                };
+                                        None => {
+                                            tracing::debug!(
+                                                "WhatsApp Web: ignoring group message without mention match"
+                                            );
+                                            return;
+                                        }
+                                    };
 
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
