@@ -831,6 +831,10 @@ pub struct TranscriptionConfig {
     /// Local/self-hosted Whisper-compatible STT provider.
     #[serde(default)]
     pub local_whisper: Option<LocalWhisperConfig>,
+    /// Also transcribe non-PTT (forwarded/regular) audio messages on WhatsApp,
+    /// not just voice notes.  Default: `false` (preserves legacy behavior).
+    #[serde(default)]
+    pub transcribe_non_ptt_audio: bool,
 }
 
 impl Default for TranscriptionConfig {
@@ -849,6 +853,7 @@ impl Default for TranscriptionConfig {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         }
     }
 }
@@ -13789,6 +13794,7 @@ default_model = "persisted-profile"
         assert_eq!(tc.model, "whisper-large-v3-turbo");
         assert!(tc.language.is_none());
         assert_eq!(tc.max_duration_secs, 120);
+        assert!(!tc.transcribe_non_ptt_audio);
     }
 
     #[test]

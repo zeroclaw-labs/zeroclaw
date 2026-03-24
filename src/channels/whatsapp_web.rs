@@ -756,9 +756,15 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                 }
 
-                                // Attempt voice note transcription (ptt = push-to-talk = voice note)
+                                // Attempt voice note transcription (ptt = push-to-talk = voice note).
+                                // When `transcribe_non_ptt_audio` is enabled in the transcription
+                                // config, also transcribe forwarded / regular audio messages.
                                 let voice_text = if let Some(ref audio) = msg.audio_message {
-                                    if audio.ptt == Some(true) {
+                                    let is_ptt = audio.ptt == Some(true);
+                                    let non_ptt_enabled = transcription_config
+                                        .as_ref()
+                                        .is_some_and(|c| c.transcribe_non_ptt_audio);
+                                    if is_ptt || non_ptt_enabled {
                                         Self::try_transcribe_voice_note(
                                             &client,
                                             audio,
