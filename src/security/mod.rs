@@ -39,6 +39,8 @@ pub mod pairing;
 pub mod playbook;
 pub mod policy;
 pub mod prompt_guard;
+#[cfg(target_os = "macos")]
+pub mod seatbelt;
 pub mod secrets;
 pub mod traits;
 pub mod vulnerability;
