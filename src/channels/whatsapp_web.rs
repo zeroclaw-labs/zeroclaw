@@ -735,36 +735,44 @@ impl Channel for WhatsAppWebChannel {
                                     mapped_phone.as_deref(),
                                 );
 
-                                let normalized = match sender_candidates
+                                let is_personal_mode = wa_mode == crate::config::WhatsAppWebMode::Personal;
+                                let is_group = chat.contains("@g.us");
+                                // Self-chat: the chat JID user part matches the sender's user part (message to "Notes to Self").
+                                let sender_user = sender_jid.user();
+                                let chat_user = chat.split_once('@').map(|(u, _)| u).unwrap_or(&chat);
+                                let is_self_chat = !is_group && sender_user == chat_user;
+
+                                let normalized = if is_personal_mode && is_self_chat {
+                                    match sender_candidates.first().cloned() {
+                                        Some(n) => n,
+                                        None => {
+                                            tracing::warn!(
+                                                "WhatsApp Web: self-chat message with no recognizable sender candidates"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    match sender_candidates
                                     .iter()
                                     .find(|candidate| {
                                         Self::is_number_allowed_for_list(&allowed_numbers, candidate)
                                     })
                                     .cloned()
-                                {
-                                    Some(n) => n,
-                                    None => {
-                                        tracing::warn!(
-                                            "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
-                                            sender_candidates.len()
-                                        );
-                                        return;
+                                    {
+                                        Some(n) => n,
+                                        None => {
+                                            tracing::warn!(
+                                                "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
+                                                sender_candidates.len()
+                                            );
+                                            return;
+                                        }
                                     }
                                 };
 
                                 // ── Personal-mode chat-type policy filtering ──
-                                if wa_mode == crate::config::WhatsAppWebMode::Personal {
-                                    let is_group = chat.contains("@g.us");
-                                    // Self-chat: the chat JID user part matches
-                                    // the sender's user part (message to "Notes
-                                    // to Self").
-                                    let sender_user = sender_jid.user();
-                                    let chat_user = chat
-                                        .split_once('@')
-                                        .map(|(u, _)| u)
-                                        .unwrap_or(&chat);
-                                    let is_self_chat = !is_group && sender_user == chat_user;
-
+                                if is_personal_mode {
                                     if is_self_chat {
                                         if !wa_self_chat_mode {
                                             tracing::debug!(
