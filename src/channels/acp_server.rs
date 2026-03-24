@@ -125,9 +125,9 @@ impl AcpServer {
     /// Run the ACP server, reading JSON-RPC requests from stdin and writing
     /// responses/notifications to stdout.
     pub async fn run(&self) -> Result<()> {
-        info!("ACP server starting (max_sessions={}, timeout={}s)",
-            self.acp_config.max_sessions,
-            self.acp_config.session_timeout_secs
+        info!(
+            "ACP server starting (max_sessions={}, timeout={}s)",
+            self.acp_config.max_sessions, self.acp_config.session_timeout_secs
         );
 
         let stdin = tokio::io::stdin();
@@ -174,7 +174,8 @@ impl AcpServer {
                 Ok(request) => {
                     if request.jsonrpc != "2.0" {
                         if let Some(id) = request.id {
-                            self.write_error(id, INVALID_REQUEST, "Invalid JSON-RPC version").await;
+                            self.write_error(id, INVALID_REQUEST, "Invalid JSON-RPC version")
+                                .await;
                         }
                         continue;
                     }
@@ -182,11 +183,8 @@ impl AcpServer {
                 }
                 Err(e) => {
                     warn!("Failed to parse JSON-RPC request: {e}");
-                    self.write_error(
-                        Value::Null,
-                        PARSE_ERROR,
-                        &format!("Parse error: {e}"),
-                    ).await;
+                    self.write_error(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
+                        .await;
                 }
             }
         }
@@ -203,13 +201,11 @@ impl AcpServer {
             "session/new" => self.handle_session_new(&request.params).await,
             "session/prompt" => self.handle_session_prompt(&request.params, &id).await,
             "session/stop" => self.handle_session_stop(&request.params).await,
-            _ => {
-                Err(RpcError {
-                    code: METHOD_NOT_FOUND,
-                    message: format!("Method not found: {}", request.method),
-                    data: None,
-                })
-            }
+            _ => Err(RpcError {
+                code: METHOD_NOT_FOUND,
+                message: format!("Method not found: {}", request.method),
+                data: None,
+            }),
         };
 
         // Only send response for requests (with id), not notifications
@@ -376,13 +372,11 @@ impl AcpServer {
         }
 
         // Wait for the turn to complete and recover the session
-        let (mut session, turn_result) = turn_handle
-            .await
-            .map_err(|e| RpcError {
-                code: INTERNAL_ERROR,
-                message: format!("Agent task panicked: {e}"),
-                data: None,
-            })?;
+        let (mut session, turn_result) = turn_handle.await.map_err(|e| RpcError {
+            code: INTERNAL_ERROR,
+            message: format!("Agent task panicked: {e}"),
+            data: None,
+        })?;
 
         let result = turn_result.map_err(|e| RpcError {
             code: INTERNAL_ERROR,
