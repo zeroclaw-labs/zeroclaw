@@ -1379,8 +1379,8 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
     }
 }
 
-fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
+fn build_model_fetch_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .connect_timeout(Duration::from_secs(4))
         .build()
@@ -1463,7 +1463,7 @@ fn parse_ollama_model_ids(payload: &Value) -> Vec<String> {
     normalize_model_ids(ids)
 }
 
-fn fetch_openai_compatible_models(
+async fn fetch_openai_compatible_models(
     endpoint: &str,
     api_key: Option<&str>,
     allow_unauthenticated: bool,
@@ -1479,15 +1479,17 @@ fn fetch_openai_compatible_models(
 
     let payload: Value = request
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .with_context(|| format!("model fetch failed: GET {endpoint}"))?
         .json()
+        .await
         .context("failed to parse model list response")?;
 
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
-fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
+async fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
     let mut request = client.get("https://openrouter.ai/api/v1/models");
     if let Some(api_key) = api_key {
@@ -1496,15 +1498,17 @@ fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
 
     let payload: Value = request
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .context("model fetch failed: GET https://openrouter.ai/api/v1/models")?
         .json()
+        .await
         .context("failed to parse OpenRouter model list response")?;
 
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
-fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
+async fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
         bail!("Anthropic model fetch requires API key or OAuth token");
     };
@@ -1524,22 +1528,24 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
 
     let response = request
         .send()
+        .await
         .context("model fetch failed: GET https://api.anthropic.com/v1/models")?;
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().unwrap_or_default();
+        let body = response.text().await.unwrap_or_default();
         bail!("Anthropic model list request failed (HTTP {status}): {body}");
     }
 
     let payload: Value = response
         .json()
+        .await
         .context("failed to parse Anthropic model list response")?;
 
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
-fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
+async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
         bail!("Gemini model fetch requires API key");
     };
@@ -1549,22 +1555,26 @@ fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
         .get("https://generativelanguage.googleapis.com/v1beta/models")
         .query(&[("key", api_key), ("pageSize", "200")])
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .context("model fetch failed: GET Gemini models")?
         .json()
+        .await
         .context("failed to parse Gemini model list response")?;
 
     Ok(parse_gemini_model_ids(&payload))
 }
 
-fn fetch_ollama_models() -> Result<Vec<String>> {
+async fn fetch_ollama_models() -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
     let payload: Value = client
         .get("http://localhost:11434/api/tags")
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .context("model fetch failed: GET http://localhost:11434/api/tags")?
         .json()
+        .await
         .context("failed to parse Ollama model list response")?;
 
     Ok(parse_ollama_model_ids(&payload))
@@ -1649,7 +1659,7 @@ fn resolve_live_models_endpoint(
     models_endpoint_for_provider(provider_name).map(str::to_string)
 }
 
-fn fetch_live_models_for_provider(
+async fn fetch_live_models_for_provider(
     provider_name: &str,
     api_key: &str,
     provider_api_url: Option<&str>,
@@ -1681,9 +1691,9 @@ fn fetch_live_models_for_provider(
     };
 
     let models = match provider_name {
-        "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
-        "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
-        "gemini" => fetch_gemini_models(api_key.as_deref())?,
+        "openrouter" => fetch_openrouter_models(api_key.as_deref()).await?,
+        "anthropic" => fetch_anthropic_models(api_key.as_deref()).await?,
+        "gemini" => fetch_gemini_models(api_key.as_deref()).await?,
         "ollama" => {
             if ollama_remote {
                 // Remote Ollama endpoints can serve cloud-routed models.
@@ -1702,7 +1712,8 @@ fn fetch_live_models_for_provider(
                 ]
             } else {
                 // Local endpoints should not surface cloud-only suffixes.
-                fetch_ollama_models()?
+                fetch_ollama_models()
+                    .await?
                     .into_iter()
                     .filter(|model_id| !model_id.ends_with(":cloud"))
                     .collect()
@@ -1714,11 +1725,8 @@ fn fetch_live_models_for_provider(
             {
                 let allow_unauthenticated =
                     allows_unauthenticated_model_fetch(requested_provider_name);
-                fetch_openai_compatible_models(
-                    &endpoint,
-                    api_key.as_deref(),
-                    allow_unauthenticated,
-                )?
+                fetch_openai_compatible_models(&endpoint, api_key.as_deref(), allow_unauthenticated)
+                    .await?
             } else {
                 Vec::new()
             }
@@ -1946,7 +1954,8 @@ pub async fn run_models_refresh(
 
     let api_key = config.api_key.clone().unwrap_or_default();
 
-    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
+    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()).await
+    {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
             println!(
@@ -2899,7 +2908,9 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                     provider_name,
                     &api_key,
                     provider_api_url.as_deref(),
-                ) {
+                )
+                .await
+                {
                     Ok(live_model_ids) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
                             workspace_dir,
