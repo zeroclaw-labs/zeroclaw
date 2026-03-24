@@ -37,6 +37,7 @@ pub struct SlackChannel {
     /// Voice transcription config — when set, audio file attachments are
     /// downloaded, transcribed, and their text inlined into the message.
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -129,6 +130,7 @@ impl SlackChannel {
             active_assistant_thread: Mutex::new(HashMap::new()),
             proxy_url: None,
             transcription: None,
+            transcription_manager: None,
         }
     }
 
@@ -164,8 +166,19 @@ impl SlackChannel {
 
     /// Configure voice transcription for audio file attachments.
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
         }
         self
     }
@@ -1597,7 +1610,7 @@ impl SlackChannel {
     /// transcription provider. Returns `None` if transcription is not configured
     /// or if the download/transcription fails.
     async fn try_transcribe_audio_file(&self, file: &serde_json::Value) -> Option<String> {
-        let config = self.transcription.as_ref()?;
+        let manager = self.transcription_manager.as_deref()?;
 
         let url = Self::slack_file_download_url(file)?;
         let file_name = Self::slack_file_name(file);
@@ -1632,7 +1645,8 @@ impl SlackChannel {
             format!("voice.{mime_ext}")
         };
 
-        match super::transcription::transcribe_audio(audio_data, &transcription_filename, config)
+        match manager
+            .transcribe(&audio_data, &transcription_filename)
             .await
         {
             Ok(text) => {

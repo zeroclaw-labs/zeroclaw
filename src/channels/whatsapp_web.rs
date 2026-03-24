@@ -74,6 +74,7 @@ pub struct WhatsAppWebChannel {
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
     /// Voice transcription (STT) config
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     /// Text-to-speech config for voice replies
     tts_config: Option<crate::config::TtsConfig>,
     /// Chats awaiting a voice reply — maps chat JID to the latest substantive
@@ -122,6 +123,7 @@ impl WhatsAppWebChannel {
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
             transcription: None,
+            transcription_manager: None,
             tts_config: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
@@ -131,8 +133,19 @@ impl WhatsAppWebChannel {
     /// Configure voice transcription (STT) for incoming voice notes.
     #[cfg(feature = "whatsapp-web")]
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
         }
         self
     }
@@ -338,8 +351,10 @@ impl WhatsAppWebChannel {
         client: &wa_rs::Client,
         audio: &wa_rs_proto::whatsapp::message::AudioMessage,
         transcription_config: Option<&crate::config::TranscriptionConfig>,
+        transcription_manager: Option<&super::transcription::TranscriptionManager>,
     ) -> Option<String> {
         let config = transcription_config?;
+        let manager = transcription_manager?;
 
         // Enforce duration limit
         if let Some(seconds) = audio.seconds {
@@ -378,7 +393,7 @@ impl WhatsAppWebChannel {
             file_name
         );
 
-        match super::transcription::transcribe_audio(audio_data, file_name, config).await {
+        match manager.transcribe(&audio_data, file_name).await {
             Ok(text) if text.trim().is_empty() => {
                 tracing::info!("WhatsApp Web: voice transcription returned empty text, skipping");
                 None
@@ -644,6 +659,7 @@ impl Channel for WhatsAppWebChannel {
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
             let transcription_config = self.transcription.clone();
+            let transcription_mgr = self.transcription_manager.clone();
             let voice_chats = self.voice_chats.clone();
             let wa_mode = self.mode.clone();
             let wa_dm_policy = self.dm_policy.clone();
@@ -661,6 +677,7 @@ impl Channel for WhatsAppWebChannel {
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
                     let transcription_config = transcription_config.clone();
+                    let transcription_mgr = transcription_mgr.clone();
                     let voice_chats = voice_chats.clone();
                     let wa_mode = wa_mode.clone();
                     let wa_dm_policy = wa_dm_policy.clone();
@@ -769,6 +786,7 @@ impl Channel for WhatsAppWebChannel {
                                             &client,
                                             audio,
                                             transcription_config.as_ref(),
+                                            transcription_mgr.as_deref(),
                                         )
                                         .await
                                     } else {
@@ -1349,9 +1367,11 @@ mod tests {
     fn with_transcription_sets_config_when_enabled() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
 
         let ch = make_channel().with_transcription(tc);
         assert!(ch.transcription.is_some());
+        assert!(ch.transcription_manager.is_some());
     }
 
     #[test]
@@ -1360,6 +1380,7 @@ mod tests {
         let tc = crate::config::TranscriptionConfig::default(); // enabled = false
         let ch = make_channel().with_transcription(tc);
         assert!(ch.transcription.is_none());
+        assert!(ch.transcription_manager.is_none());
     }
 
     #[test]
