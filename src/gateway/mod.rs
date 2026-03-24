@@ -15,6 +15,7 @@ pub mod canvas;
 pub mod nodes;
 pub mod sse;
 pub mod static_files;
+#[cfg(feature = "gateway-tls")]
 pub mod tls;
 pub mod ws;
 
