@@ -39,7 +39,7 @@ pub enum GuardAction {
 }
 
 impl GuardAction {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse_action(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "block" => Self::Block,
             _ => Self::Warn,

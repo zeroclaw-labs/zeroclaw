@@ -26,8 +26,8 @@ fn prompt_guard_blocked_message_rejected() {
     match result {
         GuardResult::Blocked(reason) => {
             assert!(
-                reason.contains("prompt injection"),
-                "Block reason should mention prompt injection, got: {reason}"
+                reason.contains("security_policy_violation"),
+                "Block reason should mention security policy violation, got: {reason}"
             );
         }
         _ => panic!("Expected Blocked result for injection attempt with Block action"),
