@@ -44,10 +44,12 @@ pub mod session_sqlite;
 pub mod session_store;
 pub mod signal;
 pub mod slack;
+pub mod teams;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
 pub mod tts;
+pub mod twitch;
 pub mod twitter;
 #[cfg(feature = "voice-wake")]
 pub mod voice_wake;
@@ -4464,6 +4466,34 @@ fn collect_configured_channels(
                 bs.handle.clone(),
                 bs.app_password.clone(),
             )),
+        });
+    }
+
+    if let Some(ref tm) = config.channels_config.teams {
+        channels.push(ConfiguredChannel {
+            display_name: "Teams",
+            channel: Arc::new(teams::TeamsChannel::new(teams::TeamsConfig {
+                bot_id: tm.bot_id.clone(),
+                bot_secret: tm.bot_secret.clone(),
+                tenant_id: tm.tenant_id.clone(),
+                webhook_url: tm.webhook_url.clone(),
+                service_url: tm.service_url.clone(),
+                conversation_id: tm.conversation_id.clone(),
+                allowed_users: tm.allowed_users.clone(),
+            })),
+        });
+    }
+
+    if let Some(ref tw) = config.channels_config.twitch {
+        channels.push(ConfiguredChannel {
+            display_name: "Twitch",
+            channel: Arc::new(twitch::TwitchChannel::new(twitch::TwitchConfig {
+                username: tw.username.clone(),
+                oauth_token: tw.oauth_token.clone(),
+                client_id: tw.client_id.clone(),
+                channels: tw.channels.clone(),
+                allowed_users: tw.allowed_users.clone(),
+            })),
         });
     }
 

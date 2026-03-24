@@ -110,6 +110,24 @@ allow_override = false
 # input = 0.15
 # output = 0.60
 
+# ── Microsoft Teams ────────────────────────────────────────────
+# [channels_config.teams]
+# bot_id = "your-bot-id"
+# bot_secret = "your-bot-secret"
+# tenant_id = "your-tenant-id"
+# webhook_url = "https://outlook.office.com/webhook/..."
+# service_url = "https://smba.trafficmanager.net/..."
+# conversation_id = "19:abc123@thread.tacv2"
+# allowed_users = []
+
+# ── Twitch ────────────────────────────────────────────────────
+# [channels_config.twitch]
+# username = "my_bot_name"
+# oauth_token = "oauth:abc123..."
+# client_id = "your-client-id"
+# channels = ["#streamer1", "#streamer2"]
+# allowed_users = []
+
 # ── Voice Transcription ─────────────────────────────────────────
 # [transcription]
 # enabled = true
