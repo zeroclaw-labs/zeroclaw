@@ -926,6 +926,38 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn purge_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let namespace = namespace.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE category = ?1",
+                params![namespace],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected as usize)
+        })
+        .await?
+    }
+
+    async fn purge_session(&self, session_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected as usize)
+        })
+        .await?
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
 
@@ -1918,6 +1950,153 @@ mod tests {
         let (_tmp, mem) = temp_sqlite();
         let all = mem.list(None, None).await.unwrap();
         assert!(all.is_empty());
+    }
+
+    // ── Bulk deletion tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn sqlite_purge_namespace_removes_all_matching_entries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a1", "data1", MemoryCategory::Custom("ns1".into()), None)
+            .await
+            .unwrap();
+        mem.store("a2", "data2", MemoryCategory::Custom("ns1".into()), None)
+            .await
+            .unwrap();
+        mem.store("b1", "data3", MemoryCategory::Custom("ns2".into()), None)
+            .await
+            .unwrap();
+
+        let count = mem.purge_namespace("ns1").await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_namespace_preserves_other_namespaces() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a1", "data1", MemoryCategory::Custom("ns1".into()), None)
+            .await
+            .unwrap();
+        mem.store("b1", "data2", MemoryCategory::Custom("ns2".into()), None)
+            .await
+            .unwrap();
+        mem.store("c1", "data3", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("d1", "data4", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let count = mem.purge_namespace("ns1").await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(mem.count().await.unwrap(), 3);
+
+        let remaining = mem.list(None, None).await.unwrap();
+        assert!(remaining
+            .iter()
+            .all(|e| e.category != MemoryCategory::Custom("ns1".into())));
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_namespace_returns_count() {
+        let (_tmp, mem) = temp_sqlite();
+        for i in 0..5 {
+            mem.store(
+                &format!("k{i}"),
+                "data",
+                MemoryCategory::Custom("target".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let count = mem.purge_namespace("target").await.unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_session_removes_all_matching_entries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a1", "data1", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("a2", "data2", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("b1", "data3", MemoryCategory::Core, Some("sess-b"))
+            .await
+            .unwrap();
+
+        let count = mem.purge_session("sess-a").await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_session_preserves_other_sessions() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a1", "data1", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("b1", "data2", MemoryCategory::Core, Some("sess-b"))
+            .await
+            .unwrap();
+        mem.store("c1", "data3", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let count = mem.purge_session("sess-a").await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(mem.count().await.unwrap(), 2);
+
+        let remaining = mem.list(None, None).await.unwrap();
+        assert!(remaining
+            .iter()
+            .all(|e| e.session_id.as_deref() != Some("sess-a")));
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_session_returns_count() {
+        let (_tmp, mem) = temp_sqlite();
+        for i in 0..3 {
+            mem.store(
+                &format!("k{i}"),
+                "data",
+                MemoryCategory::Core,
+                Some("target-sess"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let count = mem.purge_session("target-sess").await.unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_namespace_empty_namespace_is_noop() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let count = mem.purge_namespace("").await.unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_session_empty_session_is_noop() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "data", MemoryCategory::Core, Some("sess"))
+            .await
+            .unwrap();
+
+        let count = mem.purge_session("").await.unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(mem.count().await.unwrap(), 1);
     }
 
     // ── Session isolation ─────────────────────────────────────────
