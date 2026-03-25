@@ -4,10 +4,10 @@ use crate::providers::ChatMessage;
 use std::fmt::Write;
 
 /// Maximum number of long-term memory entries to recall per message.
-const MAX_RECALL_ENTRIES: usize = 50;
+const MAX_RECALL_ENTRIES: usize = 100;
 
 /// Maximum number of ontology objects to search per message.
-const MAX_ONTOLOGY_ENTRIES: usize = 50;
+const MAX_ONTOLOGY_ENTRIES: usize = 100;
 
 /// Build context preamble by searching both long-term memory and ontology
 /// for relevant entries.  No byte-size cap is applied because memory entries
