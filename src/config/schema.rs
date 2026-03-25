@@ -438,6 +438,11 @@ pub struct Config {
     #[serde(default)]
     pub web_search: WebSearchConfig,
 
+    /// Perplexity Search API tool configuration (`[perplexity_search]`).
+    /// Dedicated pure-retrieval search tool separate from the Sonar-based web_search provider.
+    #[serde(default)]
+    pub perplexity_search: PerplexitySearchApiConfig,
+
     /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]`).
     #[serde(default)]
     pub proxy: ProxyConfig,
@@ -2725,9 +2730,9 @@ const BROWSER_OPEN_ALLOWED_VALUES: &[&str] = &[
     "disable", "brave", "chrome", "firefox", "edge", "msedge", "default",
 ];
 const BROWSER_BACKEND_ALLOWED_VALUES: &[&str] =
-    &["agent_browser", "rust_native", "computer_use", "auto"];
+    &["agent_browser", "rust_native", "playwright", "computer_use", "auto"];
 const BROWSER_AUTO_BACKEND_ALLOWED_VALUES: &[&str] =
-    &["agent_browser", "rust_native", "computer_use"];
+    &["agent_browser", "rust_native", "playwright", "computer_use"];
 const WEB_SEARCH_PROVIDER_ALLOWED_VALUES: &[&str] = &[
     "duckduckgo",
     "ddg",
@@ -2739,6 +2744,77 @@ const WEB_SEARCH_PROVIDER_ALLOWED_VALUES: &[&str] = &[
     "jina",
 ];
 const WEB_SEARCH_EXA_SEARCH_TYPE_ALLOWED_VALUES: &[&str] = &["auto", "keyword", "neural"];
+
+// ── Perplexity Search API ─────────────────────────────────────────
+
+/// Dedicated Perplexity Search API configuration (`[perplexity_search]` section).
+///
+/// This is a pure retrieval tool: it returns ranked search results (URLs,
+/// titles, snippets) without generating an LLM answer. The MoA LLM layer
+/// consumes the results as context.
+///
+/// API key is stored locally on the user's device only and never transmitted
+/// to any service other than the Perplexity API endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PerplexitySearchApiConfig {
+    /// Enable the dedicated `perplexity_search` tool
+    #[serde(default)]
+    pub enabled: bool,
+    /// Perplexity API key. Stored locally; never exposed externally.
+    /// Multiple keys can be comma-separated for round-robin load balancing.
+    /// Env: ZEROCLAW_PERPLEXITY_SEARCH_API_KEY or PERPLEXITY_API_KEY
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Perplexity API base URL (default: https://api.perplexity.ai)
+    #[serde(default = "default_perplexity_search_api_url")]
+    pub api_url: String,
+    /// Maximum results per search (1-20, default 5)
+    #[serde(default = "default_perplexity_search_max_results")]
+    pub max_results: usize,
+    /// Request timeout in seconds
+    #[serde(default = "default_perplexity_search_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Region code for localized results (e.g. "KR", "US", "JP")
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Language code for results (e.g. "ko", "en", "ja")
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Recency filter: "day", "week", "month", "year"
+    #[serde(default)]
+    pub recency_filter: Option<String>,
+    /// Domain filter to restrict search to specific domains
+    #[serde(default)]
+    pub domain_filter: Vec<String>,
+}
+
+fn default_perplexity_search_api_url() -> String {
+    "https://api.perplexity.ai".into()
+}
+
+fn default_perplexity_search_max_results() -> usize {
+    5
+}
+
+fn default_perplexity_search_timeout_secs() -> u64 {
+    30
+}
+
+impl Default for PerplexitySearchApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            api_url: default_perplexity_search_api_url(),
+            max_results: default_perplexity_search_max_results(),
+            timeout_secs: default_perplexity_search_timeout_secs(),
+            region: None,
+            language: None,
+            recency_filter: None,
+            domain_filter: Vec::new(),
+        }
+    }
+}
 
 fn normalize_browser_open_choice(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
@@ -2756,6 +2832,7 @@ fn normalize_browser_backend(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "agent_browser" | "agentbrowser" => Some("agent_browser"),
         "rust_native" | "native" => Some("rust_native"),
+        "playwright" => Some("playwright"),
         "computer_use" | "computeruse" => Some("computer_use"),
         "auto" => Some("auto"),
         _ => None,
@@ -2766,6 +2843,7 @@ fn normalize_browser_auto_backend(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "agent_browser" | "agentbrowser" => Some("agent_browser"),
         "rust_native" | "native" => Some("rust_native"),
+        "playwright" => Some("playwright"),
         "computer_use" | "computeruse" => Some("computer_use"),
         _ => None,
     }
@@ -6918,6 +6996,7 @@ impl Default for Config {
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            perplexity_search: PerplexitySearchApiConfig::default(),
             proxy: ProxyConfig::default(),
             identity: IdentityConfig::default(),
             cost: CostConfig::default(),
@@ -7907,6 +7986,11 @@ impl Config {
                 &store,
                 &mut config.web_search.perplexity_api_key,
                 "config.web_search.perplexity_api_key",
+            )?;
+            decrypt_optional_secret(
+                &store,
+                &mut config.perplexity_search.api_key,
+                "config.perplexity_search.api_key",
             )?;
             decrypt_optional_secret(
                 &store,
@@ -9547,6 +9631,18 @@ impl Config {
             let api_key = api_key.trim();
             if !api_key.is_empty() {
                 self.web_search.perplexity_api_key = Some(api_key.to_string());
+                // Also populate the dedicated perplexity_search tool config
+                if self.perplexity_search.api_key.is_none() {
+                    self.perplexity_search.api_key = Some(api_key.to_string());
+                }
+            }
+        }
+
+        // Dedicated Perplexity Search API key: ZEROCLAW_PERPLEXITY_SEARCH_API_KEY
+        if let Ok(api_key) = std::env::var("ZEROCLAW_PERPLEXITY_SEARCH_API_KEY") {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.perplexity_search.api_key = Some(api_key.to_string());
             }
         }
 
@@ -10337,6 +10433,11 @@ impl Config {
             &store,
             &mut config_to_save.web_search.perplexity_api_key,
             "config.web_search.perplexity_api_key",
+        )?;
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.perplexity_search.api_key,
+            "config.perplexity_search.api_key",
         )?;
         encrypt_optional_secret(
             &store,
@@ -11131,6 +11232,7 @@ ws_url = "ws://127.0.0.1:3002"
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            perplexity_search: PerplexitySearchApiConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),
@@ -11520,6 +11622,7 @@ tool_dispatcher = "xml"
             multimodal: MultimodalConfig::default(),
             web_fetch: WebFetchConfig::default(),
             web_search: WebSearchConfig::default(),
+            perplexity_search: PerplexitySearchApiConfig::default(),
             proxy: ProxyConfig::default(),
             agent: AgentConfig::default(),
             identity: IdentityConfig::default(),

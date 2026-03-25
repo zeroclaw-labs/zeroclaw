@@ -82,6 +82,7 @@ pub mod wasm_module;
 pub mod wasm_tool;
 pub mod web_access_config;
 pub mod web_fetch;
+pub mod perplexity_search;
 pub mod web_search_config;
 pub mod web_search_tool;
 pub mod workspace_folder;
@@ -151,6 +152,7 @@ pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
 pub use wasm_module::WasmModuleTool;
+pub use perplexity_search::PerplexitySearchTool;
 pub use web_access_config::WebAccessConfigTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_config::WebSearchConfigTool;
@@ -520,6 +522,25 @@ pub fn all_tools_with_runtime(
             root_config.web_search.exa_search_type.clone(),
             root_config.web_search.exa_include_text,
             root_config.web_search.jina_site_filters.clone(),
+        )));
+    }
+
+    // Dedicated Perplexity Search API tool (pure retrieval, no LLM answer generation)
+    if root_config.perplexity_search.enabled {
+        let pplx_config = perplexity_search::PerplexitySearchConfig {
+            enabled: root_config.perplexity_search.enabled,
+            api_key: root_config.perplexity_search.api_key.clone(),
+            api_url: root_config.perplexity_search.api_url.clone(),
+            max_results: root_config.perplexity_search.max_results,
+            timeout_secs: root_config.perplexity_search.timeout_secs,
+            region: root_config.perplexity_search.region.clone(),
+            language: root_config.perplexity_search.language.clone(),
+            recency_filter: root_config.perplexity_search.recency_filter.clone(),
+            domain_filter: root_config.perplexity_search.domain_filter.clone(),
+        };
+        tool_arcs.push(Arc::new(PerplexitySearchTool::new(
+            security.clone(),
+            &pplx_config,
         )));
     }
 
