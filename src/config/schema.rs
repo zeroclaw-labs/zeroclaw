@@ -4700,10 +4700,10 @@ pub struct StorageProviderSection {
     pub config: StorageProviderConfig,
 }
 
-/// Storage provider backend configuration (e.g. postgres connection details).
+/// Storage provider backend configuration for remote storage backends.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StorageProviderConfig {
-    /// Storage engine key (e.g. "postgres", "sqlite").
+    /// Storage engine key (e.g. "sqlite", "qdrant").
     #[serde(default)]
     pub provider: String,
 
@@ -4728,18 +4728,6 @@ pub struct StorageProviderConfig {
     /// Optional connection timeout in seconds for remote providers.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
-
-    /// Enable pgvector extension for hybrid vector+keyword recall.
-    #[serde(default)]
-    pub pgvector_enabled: bool,
-
-    /// Vector dimensions for pgvector embeddings (default: 1536).
-    #[serde(default = "default_pgvector_dimensions")]
-    pub pgvector_dimensions: usize,
-}
-
-fn default_pgvector_dimensions() -> usize {
-    1536
 }
 
 fn default_storage_schema() -> String {
@@ -4758,8 +4746,6 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
-            pgvector_enabled: false,
-            pgvector_dimensions: default_pgvector_dimensions(),
         }
     }
 }
@@ -4816,9 +4802,8 @@ pub enum SearchMode {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "lucid" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
-    /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
@@ -11686,18 +11671,18 @@ default_temperature = 0.7
 default_temperature = 0.7
 
 [storage.provider.config]
-provider = "postgres"
-dbURL = "postgres://postgres:postgres@localhost:5432/zeroclaw"
+provider = "qdrant"
+dbURL = "http://localhost:6333"
 schema = "public"
 table = "memories"
 connect_timeout_secs = 12
 "#;
 
         let parsed = parse_test_config(raw);
-        assert_eq!(parsed.storage.provider.config.provider, "postgres");
+        assert_eq!(parsed.storage.provider.config.provider, "qdrant");
         assert_eq!(
             parsed.storage.provider.config.db_url.as_deref(),
-            Some("postgres://postgres:postgres@localhost:5432/zeroclaw")
+            Some("http://localhost:6333")
         );
         assert_eq!(parsed.storage.provider.config.schema, "public");
         assert_eq!(parsed.storage.provider.config.table, "memories");
@@ -14113,16 +14098,16 @@ default_model = "persisted-profile"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "postgres");
-        std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "postgres://example/db");
+        std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "qdrant");
+        std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "http://localhost:6333");
         std::env::set_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
 
         config.apply_env_overrides();
 
-        assert_eq!(config.storage.provider.config.provider, "postgres");
+        assert_eq!(config.storage.provider.config.provider, "qdrant");
         assert_eq!(
             config.storage.provider.config.db_url.as_deref(),
-            Some("postgres://example/db")
+            Some("http://localhost:6333")
         );
         assert_eq!(
             config.storage.provider.config.connect_timeout_secs,
