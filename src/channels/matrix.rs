@@ -849,11 +849,19 @@ impl Channel for MatrixChannel {
 
         let _ = client.sync_once(SyncSettings::new()).await;
 
-        tracing::info!(
-            "Matrix channel listening on room {} (configured as {})...",
-            target_room_id,
-            self.room_id
-        );
+        if self.allowed_rooms.is_empty() {
+            tracing::info!(
+                "Matrix channel listening on room {} (configured as {})...",
+                target_room_id,
+                self.room_id
+            );
+        } else {
+            tracing::info!(
+                "Matrix channel listening on {} allowed rooms (default: {})...",
+                self.allowed_rooms.len(),
+                self.room_id
+            );
+        }
 
         let recent_event_cache = Arc::new(Mutex::new((
             std::collections::VecDeque::new(),
@@ -884,17 +892,18 @@ impl Channel for MatrixChannel {
             let transcription_mgr = transcription_mgr_for_handler.clone();
 
             async move {
-                if !MatrixChannel::room_matches_target(
-                    target_room.as_str(),
-                    room.room_id().as_str(),
-                ) {
-                    return;
-                }
-
-                // Room allowlist: skip messages from rooms not in the configured list
-                if !MatrixChannel::is_room_allowed_static(&allowed_rooms, room.room_id().as_ref()) {
+                // Multi-room support: if allowed_rooms is configured, accept
+                // messages from any listed room; otherwise fall back to the
+                // single target room_id for backward compatibility.
+                let incoming = room.room_id().as_str();
+                let room_accepted = if allowed_rooms.is_empty() {
+                    MatrixChannel::room_matches_target(target_room.as_str(), incoming)
+                } else {
+                    MatrixChannel::is_room_allowed_static(&allowed_rooms, incoming)
+                };
+                if !room_accepted {
                     tracing::debug!(
-                        "Matrix: ignoring message from room {} (not in allowed_rooms)",
+                        "Matrix: ignoring message from room {} (not in allowed_rooms / target room)",
                         room.room_id()
                     );
                     return;
