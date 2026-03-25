@@ -943,7 +943,7 @@ impl LarkChannel {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
                                     tracing::warn!("Lark WS: failed to download image {image_key}");
-                                    (format!("[IMAGE:{image_key} | download failed]"), Vec::new())
+                                    (format!("[IMAGE_ERROR:{image_key} | download failed]"), Vec::new())
                                 }
                             }
                         }
@@ -1677,7 +1677,7 @@ impl LarkChannel {
                             Some(m) => m,
                             None => {
                                 tracing::warn!("Lark: failed to download image {key}");
-                                format!("[IMAGE:{key} | download failed]")
+                                format!("[IMAGE_ERROR:{key} | download failed]")
                             }
                         };
                         (marker, Vec::new())
