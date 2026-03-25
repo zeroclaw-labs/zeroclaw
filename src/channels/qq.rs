@@ -116,9 +116,8 @@ fn qq_reqwest_error_class(err: &reqwest::Error) -> &'static str {
         "transient_timeout"
     } else if err.is_connect() {
         "transient_connect"
-    } else if err.is_request() {
-        "permanent_request"
     } else {
+        // Other request-construction/protocol errors are treated as non-retryable.
         "permanent_request"
     }
 }
@@ -683,14 +682,8 @@ impl QQChannel {
             "msg_seq": next_msg_seq(),
         });
 
-        self.post_message_with_retry(
-            &url,
-            &token,
-            &body,
-            "send media message",
-            recipient,
-        )
-        .await
+        self.post_message_with_retry(&url, &token, &body, "send media message", recipient)
+            .await
     }
 
     /// Send a single attachment: resolve local/URL, upload, then send.
@@ -961,14 +954,8 @@ impl QQChannel {
             "msg_seq": next_msg_seq(),
         });
 
-        self.post_message_with_retry(
-            &url,
-            &token,
-            &body,
-            "send message",
-            recipient,
-        )
-        .await
+        self.post_message_with_retry(&url, &token, &body, "send message", recipient)
+            .await
     }
 
     async fn post_message_with_retry(
@@ -1000,12 +987,10 @@ impl QQChannel {
                     let headers = resp.headers().clone();
                     let err_text = resp.text().await.unwrap_or_default();
 
-                    if qq_is_retryable_http_status(status) && attempt < QQ_SEND_RETRY_MAX_ATTEMPTS
-                    {
+                    if qq_is_retryable_http_status(status) && attempt < QQ_SEND_RETRY_MAX_ATTEMPTS {
                         let delay_ms = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                            qq_parse_retry_after_ms(&headers).unwrap_or(
-                                QQ_SEND_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1)),
-                            )
+                            qq_parse_retry_after_ms(&headers)
+                                .unwrap_or(QQ_SEND_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1)))
                         } else {
                             QQ_SEND_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1))
                         };
