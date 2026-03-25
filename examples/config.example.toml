@@ -117,3 +117,23 @@ allow_override = false
 # Also transcribe non-PTT (forwarded / regular) audio on WhatsApp.
 # Default: false (only voice notes are transcribed).
 # transcribe_non_ptt_audio = false
+
+# ── Gateway TLS / mTLS Configuration ──────────────────────────
+# [gateway.tls]
+# enabled = false
+# cert_path = "/path/to/server.crt"
+# key_path = "/path/to/server.key"
+# [gateway.tls.client_auth]
+# enabled = false
+# ca_cert_path = "/path/to/ca.crt"
+# require_client_cert = true
+# pinned_certs = []
+
+# ── ACP (Agent Control Protocol) Server ───────────────────────────
+# JSON-RPC 2.0 server over stdio for IDE and tool integration.
+# Start with: zeroclaw acp
+# [acp]
+# Maximum number of concurrent agent sessions. Default: 10
+# max_sessions = 10
+# Session inactivity timeout in seconds. Default: 3600 (1 hour)
+# session_timeout_secs = 3600

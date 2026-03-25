@@ -1,17 +1,22 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use base64::Engine as _;
+use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
+    max_tokens: u32,
 }
+
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -187,7 +192,14 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
+            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
         }
+    }
+
+    /// Override the maximum output tokens for API requests.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -551,6 +563,145 @@ impl AnthropicProvider {
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.anthropic", 120, 10)
     }
+
+    /// Build a streaming request body from a `NativeChatRequest`.
+    fn build_streaming_request(request: &NativeChatRequest<'_>) -> serde_json::Value {
+        let mut body =
+            serde_json::to_value(request).expect("NativeChatRequest should serialize to JSON");
+        body["stream"] = serde_json::Value::Bool(true);
+        body
+    }
+
+    /// Parse Anthropic SSE lines from `response` and send `StreamEvent`s to `tx`.
+    async fn parse_anthropic_sse(
+        response: reqwest::Response,
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+        use tokio_util::io::StreamReader;
+
+        let byte_stream = response
+            .bytes_stream()
+            .map(|result| result.map_err(std::io::Error::other));
+        let reader = StreamReader::new(byte_stream);
+        let mut lines = reader.lines();
+
+        let mut tool_id: Option<String> = None;
+        let mut tool_name: Option<String> = None;
+        let mut tool_input_json = String::new();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim().to_string();
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let json_str = &line["data: ".len()..];
+
+            let event: serde_json::Value = match serde_json::from_str(json_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let event_type = event
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
+
+            match event_type {
+                "content_block_start" => {
+                    if let Some(block) = event.get("content_block") {
+                        let block_type = block
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default();
+                        if block_type == "tool_use" {
+                            if let Some(id) = tool_id.take() {
+                                let name = tool_name.take().unwrap_or_default();
+                                let input = std::mem::take(&mut tool_input_json);
+                                let _ = tx
+                                    .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
+                                        id,
+                                        name,
+                                        arguments: input,
+                                    })))
+                                    .await;
+                            }
+                            tool_id = block
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string);
+                            tool_name = block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string);
+                            tool_input_json.clear();
+                        }
+                    }
+                }
+                "content_block_delta" => {
+                    if let Some(delta) = event.get("delta") {
+                        let delta_type = delta
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default();
+                        match delta_type {
+                            "text_delta" => {
+                                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty()
+                                        && tx
+                                            .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                                                text.to_string(),
+                                            ))))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            "input_json_delta" => {
+                                if let Some(json) =
+                                    delta.get("partial_json").and_then(|j| j.as_str())
+                                {
+                                    tool_input_json.push_str(json);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "content_block_stop" => {
+                    if let Some(id) = tool_id.take() {
+                        let name = tool_name.take().unwrap_or_default();
+                        let input = std::mem::take(&mut tool_input_json);
+                        let _ = tx
+                            .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
+                                id,
+                                name,
+                                arguments: input,
+                            })))
+                            .await;
+                    }
+                }
+                "message_stop" => {
+                    let _ = tx.send(Ok(StreamEvent::Final)).await;
+                    return;
+                }
+                "error" => {
+                    let msg = event
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown streaming error");
+                    let _ = tx.send(Err(StreamError::Provider(msg.to_string()))).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let _ = tx.send(Ok(StreamEvent::Final)).await;
+    }
 }
 
 #[async_trait]
@@ -577,7 +728,7 @@ impl Provider for AnthropicProvider {
 
         let request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: 4096,
+            max_tokens: self.max_tokens,
             system,
             messages: vec![NativeMessage {
                 role: "user".to_string(),
@@ -653,7 +804,7 @@ impl Provider for AnthropicProvider {
         };
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: 4096,
+            max_tokens: self.max_tokens,
             system: system_prompt,
             messages,
             temperature,
@@ -748,6 +899,124 @@ impl Provider for AnthropicProvider {
             let _ = request.send().await?;
         }
         Ok(())
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+        }
+
+        let credential = match self.credential.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                return stream::once(async {
+                    Err(StreamError::Provider(
+                        "Anthropic credentials not set".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+        };
+
+        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+        if Self::should_cache_conversation(request.messages) {
+            Self::apply_cache_to_last_message(&mut messages);
+        }
+
+        let tool_choice_override = crate::agent::loop_::TOOL_CHOICE_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let native_tools = Self::convert_tools(request.tools);
+        let tool_choice = if native_tools.is_some() {
+            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+        } else {
+            None
+        };
+
+        let system_prompt = if Self::is_setup_token(&credential) {
+            Self::apply_oauth_system_prompt(system_prompt)
+        } else {
+            system_prompt
+        };
+
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            system: system_prompt,
+            messages,
+            temperature,
+            tools: native_tools,
+            tool_choice,
+        };
+
+        let body = Self::build_streaming_request(&native_request);
+        let client = self.http_client();
+        let url = format!("{}/v1/messages", self.base_url);
+        let is_oauth = Self::is_setup_token(&credential);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+
+        tokio::spawn(async move {
+            let mut req = client
+                .post(&url)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body);
+
+            if is_oauth {
+                req = req
+                    .header("Authorization", format!("Bearer {credential}"))
+                    .header(
+                        "anthropic-beta",
+                        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                    )
+                    .header("anthropic-dangerous-direct-browser-access", "true");
+            } else {
+                req = req.header("x-api-key", &credential);
+            }
+
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{status}: {error}"))))
+                    .await;
+                return;
+            }
+
+            Self::parse_anthropic_sse(response, &tx).await;
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed()
     }
 }
 
@@ -1441,6 +1710,7 @@ mod tests {
         let provider = AnthropicProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
+            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)

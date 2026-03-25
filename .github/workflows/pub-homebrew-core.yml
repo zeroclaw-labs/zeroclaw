@@ -103,6 +103,8 @@ jobs:
         env:
           HOMEBREW_CORE_BOT_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
           GH_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
+          TARBALL_URL: ${{ steps.release_meta.outputs.tarball_url }}
+          TARBALL_SHA: ${{ steps.release_meta.outputs.tarball_sha }}
         run: |
           set -euo pipefail
 
@@ -155,8 +157,13 @@ jobs:
             echo "branch_name=$branch_name" >> "$GITHUB_OUTPUT"
           fi
 
-          tarball_url="$(grep 'tarball_url=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2-)"
-          tarball_sha="$(grep 'tarball_sha=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2-)"
+          tarball_url="${TARBALL_URL}"
+          tarball_sha="${TARBALL_SHA}"
+
+          if [[ -z "$tarball_url" || -z "$tarball_sha" ]]; then
+            echo "::error::tarball_url or tarball_sha is empty — release_meta step output not propagated."
+            exit 1
+          fi
 
           perl -0pi -e "s|^  url \".*\"|  url \"${tarball_url}\"|m" "$formula_file"
           perl -0pi -e "s|^  sha256 \".*\"|  sha256 \"${tarball_sha}\"|m" "$formula_file"

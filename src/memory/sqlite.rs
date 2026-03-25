@@ -1,6 +1,7 @@
 use super::embeddings::EmbeddingProvider;
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use super::vector;
+use crate::config::schema::SearchMode;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
@@ -32,6 +33,7 @@ pub struct SqliteMemory {
     vector_weight: f32,
     keyword_weight: f32,
     cache_max: usize,
+    search_mode: SearchMode,
 }
 
 impl SqliteMemory {
@@ -43,6 +45,7 @@ impl SqliteMemory {
             0.3,
             10_000,
             None,
+            SearchMode::default(),
         )
     }
 
@@ -68,6 +71,7 @@ impl SqliteMemory {
             vector_weight: 0.7,
             keyword_weight: 0.3,
             cache_max: 10_000,
+            search_mode: SearchMode::default(),
         })
     }
 
@@ -83,6 +87,7 @@ impl SqliteMemory {
         keyword_weight: f32,
         cache_max: usize,
         open_timeout_secs: Option<u64>,
+        search_mode: SearchMode,
     ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
 
@@ -115,6 +120,7 @@ impl SqliteMemory {
             vector_weight,
             keyword_weight,
             cache_max,
+            search_mode,
         })
     }
 
@@ -610,8 +616,12 @@ impl Memory for SqliteMemory {
                 .await;
         }
 
-        // Compute query embedding (async, before blocking work)
-        let query_embedding = self.get_or_compute_embedding(query).await?;
+        // Compute query embedding only when needed (skip for BM25-only mode)
+        let query_embedding = if self.search_mode == SearchMode::Bm25 {
+            None
+        } else {
+            self.get_or_compute_embedding(query).await?
+        };
 
         let conn = self.conn.clone();
         let query = query.to_string();
@@ -620,6 +630,7 @@ impl Memory for SqliteMemory {
         let until_owned = until.map(String::from);
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
+        let search_mode = self.search_mode.clone();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
@@ -627,17 +638,23 @@ impl Memory for SqliteMemory {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            // FTS5 BM25 keyword search
-            let keyword_results = Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default();
+            // FTS5 BM25 keyword search (skip for embedding-only mode)
+            let keyword_results = if search_mode == SearchMode::Embedding {
+                Vec::new()
+            } else {
+                Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default()
+            };
 
-            // Vector similarity search (if embeddings available)
-            let vector_results = if let Some(ref qe) = query_embedding {
+            // Vector similarity search (skip for BM25-only mode)
+            let vector_results = if search_mode == SearchMode::Bm25 {
+                Vec::new()
+            } else if let Some(ref qe) = query_embedding {
                 Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
             } else {
                 Vec::new()
             };
 
-            // Hybrid merge
+            // Merge results based on search mode
             let merged = if vector_results.is_empty() {
                 keyword_results
                     .iter()
@@ -645,6 +662,16 @@ impl Memory for SqliteMemory {
                         id: id.clone(),
                         vector_score: None,
                         keyword_score: Some(*score),
+                        final_score: *score,
+                    })
+                    .collect::<Vec<_>>()
+            } else if keyword_results.is_empty() {
+                vector_results
+                    .iter()
+                    .map(|(id, score)| vector::ScoredResult {
+                        id: id.clone(),
+                        vector_score: Some(*score),
+                        keyword_score: None,
                         final_score: *score,
                     })
                     .collect::<Vec<_>>()
@@ -1493,7 +1520,15 @@ mod tests {
     fn open_with_timeout_succeeds_when_fast() {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
-        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, Some(5));
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            embedder,
+            0.7,
+            0.3,
+            1000,
+            Some(5),
+            SearchMode::default(),
+        );
         assert!(
             mem.is_ok(),
             "open with 5s timeout should succeed on fast path"
@@ -1511,6 +1546,7 @@ mod tests {
             0.3,
             1000,
             Some(2),
+            SearchMode::default(),
         )
         .unwrap();
         mem.store(
@@ -1531,7 +1567,15 @@ mod tests {
     fn with_embedder_noop() {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
-        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, None);
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            embedder,
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        );
         assert!(mem.is_ok());
         assert_eq!(mem.unwrap().name(), "sqlite");
     }
@@ -2337,5 +2381,93 @@ mod tests {
         mem.reindex().await.unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    // ── SearchMode tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_mode_bm25_only() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Bm25,
+        )
+        .unwrap();
+        mem.store(
+            "lang",
+            "User prefers Rust programming",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("food", "User likes pizza", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        assert!(!results.is_empty(), "BM25 mode should find keyword matches");
+        assert!(
+            results.iter().any(|e| e.content.contains("Rust")),
+            "BM25 should match on keyword 'Rust'"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_mode_embedding_only() {
+        let tmp = TempDir::new().unwrap();
+        // NoopEmbedding returns None, so embedding-only mode will fall back to LIKE
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap();
+        mem.store(
+            "lang",
+            "User prefers Rust programming",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // With NoopEmbedding, vector search returns empty, and FTS is skipped.
+        // The recall method falls back to LIKE search.
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        // LIKE fallback should still find it
+        assert!(
+            results.iter().any(|e| e.content.contains("Rust")),
+            "Embedding mode with noop should fall back to LIKE and still find results"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_mode_hybrid_default() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        // Default search mode should be Hybrid
+        assert_eq!(mem.search_mode, SearchMode::Hybrid);
+
+        mem.store(
+            "lang",
+            "User prefers Rust programming",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        assert!(!results.is_empty(), "Hybrid mode should find results");
     }
 }

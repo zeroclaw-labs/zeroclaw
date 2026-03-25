@@ -16,7 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,memory-postgres
+  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,memory-postgres,whatsapp-web
 
 jobs:
   version:

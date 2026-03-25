@@ -1,5 +1,5 @@
 use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
 use super::Provider;
 use async_trait::async_trait;
@@ -96,7 +96,7 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| lower.contains(hint))
 }
 
-fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+pub(crate) fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     let hints = [
         "exceeds the context window",
@@ -941,6 +941,76 @@ impl Provider for ReliableProvider {
         self.providers.iter().any(|(_, p)| p.supports_streaming())
     }
 
+    fn supports_streaming_tool_events(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, p)| p.supports_streaming_tool_events())
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
+
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            if needs_tool_events && !provider.supports_streaming_tool_events() {
+                continue;
+            }
+
+            let provider_clone = provider_name.clone();
+
+            let current_model = self
+                .model_chain(model)
+                .first()
+                .copied()
+                .unwrap_or(model)
+                .to_string();
+
+            let req = ChatRequest {
+                messages: request.messages,
+                tools: request.tools,
+            };
+            let stream = provider.stream_chat(req, &current_model, temperature, options);
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(event) = stream.next().await {
+                    if let Err(ref e) = event {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed();
+        }
+
+        let message = if needs_tool_events {
+            "No provider supports streaming tool events".to_string()
+        } else {
+            "No provider supports streaming".to_string()
+        };
+        stream::once(async move { Err(super::traits::StreamError::Provider(message)) }).boxed()
+    }
+
     fn stream_chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -1009,11 +1079,71 @@ impl Provider for ReliableProvider {
         })
         .boxed()
     }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Try each provider/model combination for streaming with history.
+        // Mirrors stream_chat_with_system but delegates to the underlying
+        // provider's stream_chat_with_history, preserving the full conversation.
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            let provider_clone = provider_name.clone();
+
+            let current_model = match self.model_chain(model).first() {
+                Some(m) => m.to_string(),
+                None => model.to_string(),
+            };
+
+            let stream =
+                provider.stream_chat_with_history(messages, &current_model, temperature, options);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    if let Err(ref e) = chunk {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(chunk).await.is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+            });
+
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            })
+            .boxed();
+        }
+
+        // No streaming support available
+        stream::once(async move {
+            Err(super::traits::StreamError::Provider(
+                "No provider supports streaming".to_string(),
+            ))
+        })
+        .boxed()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolSpec;
+    use futures_util::StreamExt;
     use std::sync::Arc;
 
     struct MockProvider {
@@ -2358,5 +2488,330 @@ mod tests {
         // A regular 400 error (e.g. invalid API key) should still be non-retryable.
         let err = anyhow::anyhow!("400 Bad Request: invalid api key provided");
         assert!(is_non_retryable(&err));
+    }
+
+    struct StreamingToolEventMock {
+        stream_calls: Arc<AtomicUsize>,
+        supports_tool_events: bool,
+    }
+
+    impl StreamingToolEventMock {
+        fn new(supports_tool_events: bool) -> Self {
+            Self {
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                supports_tool_events,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StreamingToolEventMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.supports_tool_events
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![
+                Ok(StreamEvent::ToolCall(super::super::traits::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: r#"{"command":"date"}"#.to_string(),
+                })),
+                Ok(StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Arc<StreamingToolEventMock> {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.as_ref()
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.as_ref().supports_streaming()
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.as_ref().supports_streaming_tool_events()
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: f64,
+            options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.as_ref()
+                .stream_chat(request, model, temperature, options)
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_prefers_provider_with_tool_event_support() {
+        let primary = Arc::new(StreamingToolEventMock::new(false));
+        let fallback = Arc::new(StreamingToolEventMock::new(true));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(Arc::clone(&fallback)) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "run shell".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            }),
+        }];
+        let mut stream = provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+            },
+            "model",
+            0.0,
+            StreamOptions::new(true),
+        );
+
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        match first {
+            StreamEvent::ToolCall(call) => assert_eq!(call.name, "shell"),
+            other => panic!("expected tool-call event, got {other:?}"),
+        }
+        assert!(matches!(second, StreamEvent::Final));
+        assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.stream_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_errors_when_no_provider_supports_tool_events() {
+        let primary = Arc::new(StreamingToolEventMock::new(false));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "run shell".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let mut stream = provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+            },
+            "model",
+            0.0,
+            StreamOptions::new(true),
+        );
+
+        let first = stream.next().await.unwrap();
+        let err = first.expect_err("stream should fail without tool-event support");
+        assert!(
+            err.to_string()
+                .contains("No provider supports streaming tool events"),
+            "unexpected stream error: {err}"
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ── stream_chat_with_history failover tests ──────────────────────
+
+    /// Mock provider that supports streaming via stream_chat_with_history.
+    struct StreamingHistoryMock {
+        stream_calls: Arc<AtomicUsize>,
+        supports: bool,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingHistoryMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.supports
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            // Echo the number of messages as the delta to verify history was passed through
+            let msg_count = messages.len().to_string();
+            stream::iter(vec![
+                Ok(StreamChunk::delta(msg_count)),
+                Ok(StreamChunk::final_chunk()),
+            ])
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_delegates_to_streaming_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(StreamingHistoryMock {
+                    stream_calls: Arc::clone(&calls),
+                    supports: true,
+                }) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("msg1"),
+            ChatMessage::assistant("resp1"),
+            ChatMessage::user("msg2"),
+        ];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.delta, "4", "should pass all 4 messages to provider");
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(second.is_final);
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_skips_non_streaming_providers() {
+        let non_streaming_calls = Arc::new(AtomicUsize::new(0));
+        let streaming_calls = Arc::new(AtomicUsize::new(0));
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "non-streaming".into(),
+                    Box::new(StreamingHistoryMock {
+                        stream_calls: Arc::clone(&non_streaming_calls),
+                        supports: false,
+                    }) as Box<dyn Provider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(StreamingHistoryMock {
+                        stream_calls: Arc::clone(&streaming_calls),
+                        supports: true,
+                    }) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.delta, "1");
+        assert_eq!(
+            non_streaming_calls.load(Ordering::SeqCst),
+            0,
+            "non-streaming provider should be skipped"
+        );
+        assert_eq!(
+            streaming_calls.load(Ordering::SeqCst),
+            1,
+            "streaming provider should be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_errors_when_no_provider_supports_streaming() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "non-streaming".into(),
+                Box::new(StreamingHistoryMock {
+                    stream_calls: Arc::new(AtomicUsize::new(0)),
+                    supports: false,
+                }) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap();
+        let err = first.expect_err("should fail when no provider supports streaming");
+        assert!(
+            err.to_string().contains("No provider supports streaming"),
+            "unexpected error: {err}"
+        );
+        assert!(stream.next().await.is_none());
     }
 }

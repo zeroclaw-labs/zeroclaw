@@ -23,7 +23,7 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,memory-postgres
+  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,memory-postgres,whatsapp-web
 
 jobs:
   validate:
@@ -248,6 +248,13 @@ jobs:
         run: |
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
+          fi
+          # Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556)
+          # Ubuntu 22.04's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
+          # which segfaults on ARMv6 devices (e.g. Raspberry Pi Zero W).
+          if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
+            export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
           fi
           if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
             cargo build --release --locked --no-default-features --features "${{ env.RELEASE_CARGO_FEATURES }},channel-nostr,skill-creation" --target ${{ matrix.target }}
@@ -557,13 +564,23 @@ jobs:
       dry_run: false
     secrets: inherit
 
-  # ── Post-publish: tweet after release + website are live ──────────────
-  # Docker push can be slow; don't let it block the tweet.
+  # ── Post-publish: announce after release + website are live ───────────
+  # Docker push can be slow; don't let it block announcements.
   tweet:
     name: Tweet Release
     needs: [validate, publish, redeploy-website]
     if: ${{ !cancelled() && needs.publish.result == 'success' }}
     uses: ./.github/workflows/tweet-release.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
+    secrets: inherit
+
+  discord:
+    name: Discord Announcement
+    needs: [validate, publish, redeploy-website]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/discord-release.yml
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
