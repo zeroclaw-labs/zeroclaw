@@ -190,6 +190,10 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
+
+        /// Skip interactive prompts and use quick setup with defaults
+        #[arg(long)]
+        quick: bool,
     },
 
     /// Start the AI agent loop
@@ -853,7 +857,9 @@ async fn main() -> Result<()> {
 
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
     // provider flags were given, it runs the full interactive wizard; otherwise
-    // it runs the quick (scriptable) setup.  This means `curl … | bash` and
+    // it runs the quick (scriptable) setup.  Use --quick to force quick setup,
+    // or set ZEROCLAW_INTERACTIVE=1 to force interactive mode when TTY
+    // detection fails.  This means `curl … | bash` and
     // `zeroclaw onboard --api-key …` both take the fast path, while a bare
     // `zeroclaw onboard` in a terminal launches the wizard.
     if let Commands::Onboard {
@@ -864,6 +870,7 @@ async fn main() -> Result<()> {
         provider,
         model,
         memory,
+        quick,
     } = &cli.command
     {
         let force = *force;
@@ -873,6 +880,7 @@ async fn main() -> Result<()> {
         let provider = provider.clone();
         let model = model.clone();
         let memory = memory.clone();
+        let quick = *quick;
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
@@ -884,6 +892,9 @@ async fn main() -> Result<()> {
         }
         if channels_only && force {
             bail!("--channels-only does not accept --force");
+        }
+        if quick && channels_only {
+            bail!("--quick and --channels-only cannot be used together");
         }
 
         // Handle --reinit: backup and reset configuration
@@ -932,10 +943,20 @@ async fn main() -> Result<()> {
         let has_provider_flags =
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let env_interactive = std::env::var("ZEROCLAW_INTERACTIVE").as_deref() == Ok("1");
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
-        } else if is_tty && !has_provider_flags {
+        } else if quick || has_provider_flags {
+            Box::pin(onboard::run_quick_setup(
+                api_key.as_deref(),
+                provider.as_deref(),
+                model.as_deref(),
+                memory.as_deref(),
+                force,
+            ))
+            .await
+        } else if is_tty || env_interactive {
             Box::pin(onboard::run_wizard(force)).await
         } else {
             Box::pin(onboard::run_quick_setup(
@@ -2647,6 +2668,28 @@ mod tests {
     fn onboard_cli_rejects_removed_interactive_flag() {
         // --interactive was removed; onboard auto-detects TTY instead.
         assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    }
+
+    #[test]
+    fn onboard_cli_parses_quick_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick"])
+            .expect("onboard --quick should parse");
+
+        match cli.command {
+            Commands::Onboard { quick, .. } => assert!(quick),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_quick_and_channels_only_conflict() {
+        // --quick and --channels-only should both parse at the CLI level
+        // (the conflict is checked at runtime), but we verify both flags parse.
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick", "--channels-only"]);
+        assert!(
+            cli.is_ok(),
+            "--quick --channels-only should parse at CLI level"
+        );
     }
 
     #[test]

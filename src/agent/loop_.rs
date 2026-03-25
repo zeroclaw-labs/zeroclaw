@@ -4555,6 +4555,47 @@ pub async fn run(
                 &effective_input,
             );
 
+            // Set up streaming channel so tool progress and response
+            // content are printed progressively instead of buffered.
+            let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(64);
+            let content_was_streamed =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let content_streamed_flag = content_was_streamed.clone();
+            let is_tty = std::io::IsTerminal::is_terminal(&std::io::stderr());
+
+            let consumer_handle = tokio::spawn(async move {
+                use std::io::Write;
+                while let Some(event) = delta_rx.recv().await {
+                    match event {
+                        DraftEvent::Clear => {
+                            let _ = writeln!(std::io::stderr());
+                        }
+                        DraftEvent::Progress(text) => {
+                            if is_tty {
+                                let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
+                            } else {
+                                let _ = write!(std::io::stderr(), "{text}");
+                            }
+                            let _ = std::io::stderr().flush();
+                        }
+                        DraftEvent::Content(text) => {
+                            content_streamed_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                            print!("{text}");
+                            let _ = std::io::stdout().flush();
+                        }
+                    }
+                }
+            });
+
+            // Ctrl+C cancels the in-flight turn instead of killing the process.
+            let cancel_token = CancellationToken::new();
+            let cancel_token_clone = cancel_token.clone();
+            let ctrlc_handle = tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    cancel_token_clone.cancel();
+                }
+            });
+
             let response = loop {
                 match run_tool_call_loop(
                     provider.as_ref(),
@@ -4564,14 +4605,14 @@ pub async fn run(
                     &provider_name,
                     &model_name,
                     turn_temperature,
-                    false,
+                    true,
                     approval_manager.as_ref(),
                     channel_name,
                     None,
                     &config.multimodal,
                     config.agent.max_tool_iterations,
-                    None,
-                    None,
+                    Some(cancel_token.clone()),
+                    Some(delta_tx.clone()),
                     None,
                     &excluded_tools,
                     &config.agent.tool_call_dedup_exempt,
@@ -4583,6 +4624,10 @@ pub async fn run(
                 {
                     Ok(resp) => break resp,
                     Err(e) => {
+                        if is_tool_loop_cancelled(&e) {
+                            eprintln!("\n\x1b[2m(cancelled)\x1b[0m");
+                            break String::new();
+                        }
                         if let Some((new_provider, new_model)) = is_model_switch_requested(&e) {
                             tracing::info!(
                                 "Model switch requested, switching from {} {} to {} {}",
@@ -4619,8 +4664,16 @@ pub async fn run(
                     }
                 }
             };
+
+            // Clean up: stop the Ctrl+C listener and flush streaming events.
+            ctrlc_handle.abort();
+            drop(delta_tx);
+            let _ = consumer_handle.await;
+
             final_output = response.clone();
-            if let Err(e) = crate::channels::Channel::send(
+            if content_was_streamed.load(std::sync::atomic::Ordering::Relaxed) {
+                println!();
+            } else if let Err(e) = crate::channels::Channel::send(
                 &cli,
                 &crate::channels::traits::SendMessage::new(format!("\n{response}\n"), "user"),
             )

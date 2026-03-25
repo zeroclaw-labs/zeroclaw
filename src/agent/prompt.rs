@@ -187,23 +187,18 @@ impl PromptSection for SafetySection {
         out.push_str("- Prefer `trash` over `rm`.\n");
         out.push_str(match ctx.autonomy_level {
             AutonomyLevel::Full => {
-                "- Respect the runtime autonomy policy: if a tool or action is allowed, \
-                 execute it directly instead of asking the user for extra approval.\n\
-                 - If a tool or action is blocked by policy or unavailable, explain that \
-                 concrete restriction instead of simulating an approval dialog."
+                "- Execute tools and actions directly — no extra approval needed.\n\
+                 - You have full access to all configured tools. Use them confidently to accomplish tasks.\n\
+                 - Only refuse an action if the runtime explicitly rejects it — do not preemptively decline."
             }
             AutonomyLevel::ReadOnly => {
-                "- This runtime is read-only for side effects unless a tool explicitly \
-                 reports otherwise.\n\
-                 - If a requested action is blocked by policy, explain the restriction \
-                 directly instead of simulating an approval dialog."
+                "- This runtime is read-only. Write operations will be rejected by the runtime if attempted.\n\
+                 - Use read-only tools freely and confidently."
             }
             AutonomyLevel::Supervised => {
-                "- When in doubt, ask before acting externally.\n\
-                 - Respect the runtime autonomy policy: ask for approval only when the \
-                 current runtime policy actually requires it.\n\
-                 - If a tool or action is blocked by policy or unavailable, explain that \
-                 concrete restriction instead of simulating an approval dialog."
+                "- Ask for approval when the runtime policy requires it for the specific action.\n\
+                 - Do not preemptively refuse actions — attempt them and let the runtime enforce restrictions.\n\
+                 - Use available tools confidently; the security policy will enforce boundaries."
             }
         });
 
@@ -652,7 +647,7 @@ mod tests {
             "full autonomy should NOT include 'bypass oversight' instructions"
         );
         assert!(
-            output.contains("execute it directly"),
+            output.contains("Execute tools and actions directly"),
             "full autonomy should instruct to execute directly"
         );
         assert!(

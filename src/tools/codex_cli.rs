@@ -146,7 +146,12 @@ impl Tool for CodexCliTool {
         }
 
         // Build CLI command
-        let mut cmd = Command::new("codex");
+        let codex_bin = if cfg!(target_os = "windows") {
+            "codex.cmd"
+        } else {
+            "codex"
+        };
+        let mut cmd = Command::new(codex_bin);
         cmd.arg("-q").arg(prompt);
 
         // Environment: clear everything, pass only safe vars + configured passthrough.
