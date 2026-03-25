@@ -30,6 +30,19 @@ const REPLY_TTL_SECS: u64 = 3600;
 /// Maximum entries in the reply tracker before cleanup.
 const REPLY_TRACKER_CAPACITY: usize = 10_000;
 
+/// Internal signal used by the channel supervisor to reconnect QQ immediately
+/// (without applying exponential backoff) after a server-requested resume cycle.
+#[derive(Debug)]
+pub(crate) struct QqReconnectRequested;
+
+impl std::fmt::Display for QqReconnectRequested {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QQ reconnect requested by gateway (op 7)")
+    }
+}
+
+impl std::error::Error for QqReconnectRequested {}
+
 /// QQ API media file types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QQMediaFileType {
@@ -1362,10 +1375,9 @@ impl Channel for QQChannel {
                 )
             }
             ExitReason::Reconnect => {
-                // Session state preserved — supervisor will reconnect and we'll attempt Resume
-                anyhow::bail!(
-                    "QQ WebSocket connection closed: server requested reconnect (resume will be attempted)"
-                )
+                // Session state is preserved. Return a dedicated signal so the
+                // supervisor can reconnect immediately and reduce message-loss windows.
+                return Err(anyhow::Error::new(QqReconnectRequested));
             }
             ExitReason::Close(ref frame) => {
                 let (code, reason) = frame

@@ -2258,6 +2258,10 @@ fn spawn_supervised_listener(
     )
 }
 
+fn should_retry_channel_immediately(channel_name: &str, error: &anyhow::Error) -> bool {
+    channel_name == "qq" && error.downcast_ref::<qq::QqReconnectRequested>().is_some()
+}
+
 fn spawn_supervised_listener_with_health_interval(
     ch: Arc<dyn Channel>,
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
@@ -2298,6 +2302,7 @@ fn spawn_supervised_listener_with_health_interval(
                 break;
             }
 
+            let mut immediate_retry = false;
             match result {
                 Ok(()) => {
                     tracing::warn!("Channel {} exited unexpectedly; restarting", ch.name());
@@ -2306,12 +2311,27 @@ fn spawn_supervised_listener_with_health_interval(
                     backoff = initial_backoff_secs.max(1);
                 }
                 Err(e) => {
-                    tracing::error!("Channel {} error: {e}; restarting", ch.name());
-                    crate::health::mark_component_error(&component, e.to_string());
+                    if should_retry_channel_immediately(ch.name(), &e) {
+                        tracing::info!(
+                            "Channel {} requested immediate reconnect; restarting without backoff",
+                            ch.name()
+                        );
+                        backoff = initial_backoff_secs.max(1);
+                        immediate_retry = true;
+                    } else {
+                        tracing::error!("Channel {} error: {e}; restarting", ch.name());
+                        crate::health::mark_component_error(&component, e.to_string());
+                    }
                 }
             }
 
             crate::health::bump_component_restart(&component);
+            if immediate_retry {
+                // Prevent a hot-spin loop if a channel keeps requesting
+                // immediate reconnect without any I/O wait in between attempts.
+                tokio::task::yield_now().await;
+                continue;
+            }
             tokio::time::sleep(Duration::from_secs(backoff)).await;
             // Double backoff AFTER sleeping so first error uses initial_backoff
             backoff = backoff.saturating_mul(2).min(max_backoff);
@@ -10011,6 +10031,10 @@ This is an example JSON object for profile settings."#;
         calls: Arc<AtomicUsize>,
     }
 
+    struct AlwaysReconnectQqChannel {
+        calls: Arc<AtomicUsize>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for AlwaysFailChannel {
         fn name(&self) -> &str {
@@ -10047,6 +10071,25 @@ This is an example JSON object for profile settings."#;
             self.calls.fetch_add(1, Ordering::SeqCst);
             tx.closed().await;
             Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for AlwaysReconnectQqChannel {
+        fn name(&self) -> &str {
+            "qq"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(qq::QqReconnectRequested))
         }
     }
 
@@ -10122,6 +10165,27 @@ This is an example JSON object for profile settings."#;
         let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(join.is_ok(), "listener should stop after channel shutdown");
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_retries_qq_reconnect_without_backoff_delay() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel: Arc<dyn Channel> = Arc::new(AlwaysReconnectQqChannel {
+            calls: Arc::clone(&calls),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        let handle = spawn_supervised_listener(channel, tx, 1, 60);
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(rx);
+        handle.abort();
+        let _ = handle.await;
+
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "expected immediate reconnect retries without waiting for backoff"
+        );
     }
 
     #[test]
