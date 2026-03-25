@@ -128,6 +128,8 @@ fn merge_channel_repair_updates(
                 port: lark.port,
                 proxy_url: lark.proxy_url.clone(),
             });
+        } else {
+            merged.feishu = None;
         }
         merged.lark = Some(lark);
     }
@@ -6332,6 +6334,50 @@ mod tests {
         assert_eq!(feishu_cfg.receive_mode, LarkReceiveMode::Webhook);
         assert_eq!(feishu_cfg.port, Some(9090));
         assert_eq!(feishu_cfg.proxy_url.as_deref(), Some("https://proxy"));
+    }
+
+    #[test]
+    fn merge_channel_repair_updates_clears_native_feishu_when_switching_back_to_lark() {
+        let mut existing = ChannelsConfig::default();
+        existing.feishu = Some(FeishuConfig {
+            app_id: "feishu-old".to_string(),
+            app_secret: "secret-old".to_string(),
+            encrypt_key: Some("enc-old".to_string()),
+            verification_token: Some("token-old".to_string()),
+            allowed_users: vec!["old-user".to_string()],
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(8080),
+            proxy_url: Some("https://old-proxy".to_string()),
+        });
+
+        let mut updates = ChannelsConfig::default();
+        updates.lark = Some(LarkConfig {
+            app_id: "lark-real".to_string(),
+            app_secret: "secret-real".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["owner".to_string()],
+            mention_only: false,
+            use_feishu: false,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            proxy_url: None,
+        });
+
+        let merged = merge_channel_repair_updates(existing, updates);
+
+        assert_eq!(
+            merged.lark.as_ref().map(|cfg| cfg.app_id.as_str()),
+            Some("lark-real")
+        );
+        assert!(matches!(
+            merged.lark.as_ref().map(|cfg| cfg.use_feishu),
+            Some(false)
+        ));
+        assert!(
+            merged.feishu.is_none(),
+            "expected native feishu config to be cleared when switching back to lark"
+        );
     }
 
     #[tokio::test]
