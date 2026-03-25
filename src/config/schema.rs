@@ -6310,10 +6310,21 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
+    /// Send the response as multiple separate messages at paragraph boundaries.
+    #[serde(rename = "multi_message")]
+    MultiMessage,
 }
 
 fn default_draft_update_interval_ms() -> u64 {
     1000
+}
+
+fn default_multi_message_delay_ms() -> u64 {
+    800
+}
+
+fn default_matrix_draft_update_interval_ms() -> u64 {
+    1500
 }
 
 /// Telegram bot channel configuration.
@@ -6599,6 +6610,17 @@ pub struct MatrixConfig {
     /// Whether to interrupt an in-flight agent response when a new message arrives.
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Streaming mode for progressive response delivery.
+    /// `"off"` (default): single message. `"partial"`: edit-in-place draft.
+    /// `"multi_message"`: paragraph-split delivery.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval (ms) between draft message edits in Partial mode.
+    #[serde(default = "default_matrix_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Delay (ms) between sending each paragraph in MultiMessage mode.
+    #[serde(default = "default_multi_message_delay_ms")]
+    pub multi_message_delay_ms: u64,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -12187,6 +12209,9 @@ default_temperature = 0.7
             allowed_users: vec!["@user:matrix.org".into()],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12209,6 +12234,9 @@ default_temperature = 0.7
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12303,6 +12331,9 @@ allowed_users = ["@ops:matrix.org"]
                 allowed_users: vec!["@u:m".into()],
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: 1500,
+                multi_message_delay_ms: 800,
             }),
             signal: None,
             whatsapp: None,

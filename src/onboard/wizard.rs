@@ -4231,6 +4231,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                     allowed_rooms: vec![],
                     interrupt_on_new_message: false,
+                    stream_mode: StreamMode::Partial,
+                    draft_update_interval_ms: 1500,
+                    multi_message_delay_ms: 800,
                 });
             }
             ChannelMenuChoice::Signal => {
