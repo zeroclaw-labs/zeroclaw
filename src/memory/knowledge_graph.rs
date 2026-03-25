@@ -435,9 +435,7 @@ impl KnowledgeGraph {
         drop(rows);
 
         // Collect all edges where both endpoints are in the subgraph.
-        let mut edge_stmt = conn.prepare(
-            "SELECT from_id, to_id, relation FROM edges",
-        )?;
+        let mut edge_stmt = conn.prepare("SELECT from_id, to_id, relation FROM edges")?;
 
         let mut edges = Vec::new();
         let mut edge_rows = edge_stmt.query([])?;
@@ -647,11 +645,15 @@ mod tests {
 
         // Outbound: from id1 → id2
         let related = graph.find_related(&id1).unwrap();
-        assert!(related.iter().any(|(n, r)| n.id == id2 && *r == Relation::Uses));
+        assert!(related
+            .iter()
+            .any(|(n, r)| n.id == id2 && *r == Relation::Uses));
 
         // Inbound: id2 sees id1 via the same edge
         let related = graph.find_related(&id2).unwrap();
-        assert!(related.iter().any(|(n, r)| n.id == id1 && *r == Relation::Uses));
+        assert!(related
+            .iter()
+            .any(|(n, r)| n.id == id1 && *r == Relation::Uses));
     }
 
     #[test]
