@@ -137,6 +137,7 @@ Environment:
   ZEROCLAW_DOCKER_IMAGE      Docker image tag to build/run (default: zeroclaw-bootstrap:local)
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
+  ZEROCLAW_CARGO_FEATURES    Extra cargo features to enable (e.g. "channel-matrix")
   ZEROCLAW_MODEL             Used when --model is not provided
   ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
   ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
@@ -1473,6 +1474,18 @@ if [[ "$SKIP_BUILD" == false ]]; then
       CARGO_FEATURE_FLAGS="--no-default-features --features channel-nostr,skill-creation"
       ;;
   esac
+
+  # Append user-requested features from ZEROCLAW_CARGO_FEATURES env var
+  # (e.g. ZEROCLAW_CARGO_FEATURES="channel-matrix" to enable Matrix support)
+  if [[ -n "${ZEROCLAW_CARGO_FEATURES:-}" ]]; then
+    if [[ -n "$CARGO_FEATURE_FLAGS" ]]; then
+      # Already using --features (32-bit ARM path) — append to the feature list
+      CARGO_FEATURE_FLAGS="${CARGO_FEATURE_FLAGS},${ZEROCLAW_CARGO_FEATURES}"
+    else
+      CARGO_FEATURE_FLAGS="--features ${ZEROCLAW_CARGO_FEATURES}"
+    fi
+    step_dot "Extra cargo features requested: ${ZEROCLAW_CARGO_FEATURES}"
+  fi
 
   step_dot "Building release binary"
   cargo build --release --locked $CARGO_FEATURE_FLAGS
