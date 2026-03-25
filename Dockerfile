@@ -32,6 +32,8 @@ COPY crates/aardvark-sys/ crates/aardvark-sys/
 # .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
+# apps/tauri is excluded via .dockerignore (desktop-only), so we create a stub
+# workspace member with the same package name so Cargo can resolve the workspace.
 RUN mkdir -p src benches apps/tauri/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
