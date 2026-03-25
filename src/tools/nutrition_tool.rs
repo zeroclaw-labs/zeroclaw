@@ -10,20 +10,11 @@ use sha1::Sha1;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, RwLock};
 
 const BASE_URL: &str = "https://platform.fatsecret.com/rest";
-const TOKEN_URL: &str = "https://oauth.fatsecret.com/connect/token";
 const MAX_ERROR_BODY_CHARS: usize = 500;
 
 type HmacSha1 = Hmac<Sha1>;
-
-// ── OAuth2 token cache ──────────────────────────────────────────
-
-struct OAuth2Token {
-    access_token: String,
-    expires_at: u64, // unix seconds
-}
 
 // ── Tool struct ─────────────────────────────────────────────────
 
@@ -31,10 +22,10 @@ struct OAuth2Token {
 /// FatSecret Platform API.
 ///
 /// Supports eight actions gated by `[nutrition].allowed_actions` in config:
-/// - `item.search`    — search foods by name (OAuth2)
-/// - `item.get`       — get detailed nutrition for a food (OAuth2)
-/// - `recipe.search`  — search recipes (OAuth2)
-/// - `recipe.get`     — get full recipe details (OAuth2)
+/// - `item.search`    — search foods by name (OAuth1 2-legged)
+/// - `item.get`       — get detailed nutrition for a food (OAuth1 2-legged)
+/// - `recipe.search`  — search recipes (OAuth1 2-legged)
+/// - `recipe.get`     — get full recipe details (OAuth1 2-legged)
 /// - `diary.get`      — get food diary entries for a date (OAuth1 3-legged)
 /// - `diary.create`   — add a food diary entry (OAuth1 3-legged)
 /// - `diary.edit`     — edit a food diary entry (OAuth1 3-legged)
@@ -48,8 +39,6 @@ pub struct NutritionTool {
     http: Client,
     security: Arc<SecurityPolicy>,
     timeout_secs: u64,
-    oauth2_token: RwLock<Option<OAuth2Token>>,
-    oauth2_acquire: Mutex<()>,
 }
 
 impl NutritionTool {
@@ -77,8 +66,6 @@ impl NutritionTool {
             http,
             security,
             timeout_secs,
-            oauth2_token: RwLock::new(None),
-            oauth2_acquire: Mutex::new(()),
         }
     }
 
@@ -96,95 +83,51 @@ impl NutritionTool {
                 .is_some_and(|s| !s.trim().is_empty())
     }
 
-    // ── OAuth2 ──────────────────────────────────────────────────
+    // ── OAuth1 ────────────────────────────────────────────────────
 
-    async fn get_oauth2_token(&self) -> anyhow::Result<String> {
-        // Fast path: check if we have a valid cached token.
-        {
-            let guard = self.oauth2_token.read().await;
-            if let Some(tok) = guard.as_ref() {
-                let now = now_unix_secs();
-                if tok.expires_at > now + 60 {
-                    return Ok(tok.access_token.clone());
-                }
-            }
-        }
-
-        // Acquire mutex to prevent thundering herd.
-        let _lock = self.oauth2_acquire.lock().await;
-
-        // Double-check after acquiring.
-        {
-            let guard = self.oauth2_token.read().await;
-            if let Some(tok) = guard.as_ref() {
-                let now = now_unix_secs();
-                if tok.expires_at > now + 60 {
-                    return Ok(tok.access_token.clone());
-                }
-            }
-        }
-
-        let resp = self
-            .http
-            .post(TOKEN_URL)
-            .basic_auth(&self.client_id, Some(&self.client_secret))
-            .form(&[
-                ("grant_type", "client_credentials"),
-                ("scope", "basic premier barcode"),
-            ])
-            .send()
-            .await?;
-
-        let status = resp.status();
-        let body: Value = resp.json().await?;
-
-        if !status.is_success() {
-            let detail = body
-                .get("error_description")
-                .or_else(|| body.get("error"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            anyhow::bail!("OAuth2 token request failed ({status}): {detail}");
-        }
-
-        let access_token = body["access_token"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("missing access_token in OAuth2 response"))?
-            .to_string();
-        let expires_in = body["expires_in"].as_u64().unwrap_or(86400);
-        let expires_at = now_unix_secs() + expires_in;
-
-        {
-            let mut guard = self.oauth2_token.write().await;
-            *guard = Some(OAuth2Token {
-                access_token: access_token.clone(),
-                expires_at,
-            });
-        }
-
-        Ok(access_token)
-    }
-
-    /// Send a GET request to a public endpoint using OAuth2 Bearer auth.
-    async fn oauth2_get(&self, path: &str, params: &[(&str, &str)]) -> anyhow::Result<Value> {
-        let token = self.get_oauth2_token().await?;
+    /// Send an OAuth1 2-legged GET request (no user context).
+    /// Token and token secret are empty strings.
+    async fn oauth1_get(&self, path: &str, params: &[(&str, &str)]) -> anyhow::Result<Value> {
         let url = format!("{BASE_URL}{path}");
+        let timestamp = now_unix_secs().to_string();
+        let nonce = random_base64url(24);
 
-        let mut query: Vec<(&str, &str)> = params.to_vec();
-        query.push(("format", "json"));
+        let mut all_params: BTreeMap<String, String> = BTreeMap::new();
+        all_params.insert("format".to_string(), "json".to_string());
+        for (k, v) in params {
+            all_params.insert((*k).to_string(), (*v).to_string());
+        }
+        all_params.insert("oauth_consumer_key".to_string(), self.client_id.clone());
+        all_params.insert("oauth_nonce".to_string(), nonce);
+        all_params.insert(
+            "oauth_signature_method".to_string(),
+            "HMAC-SHA1".to_string(),
+        );
+        all_params.insert("oauth_timestamp".to_string(), timestamp);
+        all_params.insert("oauth_version".to_string(), "1.0".to_string());
+
+        // 2-legged: empty token secret.
+        let signature =
+            compute_oauth1_signature("GET", &url, &all_params, &self.client_secret, "");
+        all_params.insert("oauth_signature".to_string(), signature);
+
+        let auth_header = build_oauth1_auth_header(&all_params);
+
+        let query_params: Vec<(String, String)> = all_params
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("oauth_"))
+            .collect();
 
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&token)
-            .query(&query)
+            .header("Authorization", &auth_header)
+            .query(&query_params)
             .send()
             .await?;
 
         parse_response(resp).await
     }
-
-    // ── OAuth1 3-legged ─────────────────────────────────────────
 
     /// Send an OAuth1 3-legged request for diary endpoints.
     async fn oauth1_request(
@@ -297,7 +240,7 @@ impl NutritionTool {
             params.push(("generic_description", &generic_desc_val));
         }
 
-        let body = self.oauth2_get("/foods/search/v1", &params).await?;
+        let body = self.oauth1_get("/foods/search/v1", &params).await?;
         let shaped = shape_food_search(&body);
         Ok(ToolResult {
             success: true,
@@ -332,7 +275,7 @@ impl NutritionTool {
             params.push(("include_food_attributes", &include_attrs_val));
         }
 
-        let body = self.oauth2_get("/food/v5", &params).await?;
+        let body = self.oauth1_get("/food/v5", &params).await?;
         let shaped = shape_food_detail(&body);
         Ok(ToolResult {
             success: true,
@@ -391,7 +334,7 @@ impl NutritionTool {
             params.push(("sort_by", &sort_val));
         }
 
-        let body = self.oauth2_get("/recipes/search/v3", &params).await?;
+        let body = self.oauth1_get("/recipes/search/v3", &params).await?;
         let shaped = shape_recipe_search(&body);
         Ok(ToolResult {
             success: true,
@@ -405,7 +348,7 @@ impl NutritionTool {
         validate_numeric_id(&recipe_id, "recipe_id")?;
 
         let body = self
-            .oauth2_get("/recipe/v2", &[("recipe_id", &recipe_id)])
+            .oauth1_get("/recipe/v2", &[("recipe_id", &recipe_id)])
             .await?;
         let shaped = shape_recipe_detail(&body);
         Ok(ToolResult {
