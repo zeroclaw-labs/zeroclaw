@@ -43,6 +43,7 @@ pub struct MatrixChannel {
     http_client: Client,
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
     voice_mode: Arc<AtomicBool>,
+    otk_conflict_detected: Arc<AtomicBool>,
     transcription: Option<crate::config::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     stream_mode: crate::config::StreamMode,
@@ -125,6 +126,15 @@ struct RoomAliasResponse {
 }
 
 impl MatrixChannel {
+    fn is_otk_conflict_message(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("one time key") && lower.contains("already exists")
+    }
+
+    fn sanitize_error_for_log(error: &impl std::fmt::Display) -> String {
+        crate::providers::sanitize_api_error(&error.to_string())
+    }
+
     fn normalize_optional_field(value: Option<String>) -> Option<String> {
         value
             .map(|entry| entry.trim().to_string())
@@ -228,6 +238,7 @@ impl MatrixChannel {
             http_client: Client::new(),
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
             voice_mode: Arc::new(AtomicBool::new(false)),
+            otk_conflict_detected: Arc::new(AtomicBool::new(false)),
             transcription: None,
             transcription_manager: None,
             stream_mode: crate::config::StreamMode::Off,
@@ -547,6 +558,7 @@ impl MatrixChannel {
                 };
 
                 client.restore_session(session).await?;
+                tracing::debug!("Matrix session restored for device");
 
                 Ok::<MatrixSdkClient, anyhow::Error>(client)
             })
@@ -707,6 +719,10 @@ impl Channel for MatrixChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            tracing::debug!("Matrix OTK conflict flag is set, refusing send");
+            anyhow::bail!("Matrix channel unavailable: E2EE one-time key conflict detected");
+        }
         let client = self.matrix_client().await?;
         let target_room_id = if message.recipient.contains("||") {
             message.recipient.split_once("||").unwrap().1.to_string()
@@ -826,6 +842,10 @@ impl Channel for MatrixChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            tracing::debug!("Matrix OTK conflict flag is set, refusing listen");
+            anyhow::bail!("Matrix channel unavailable: E2EE one-time key conflict detected");
+        }
         let target_room_id = self.target_room_id().await?;
         self.ensure_room_supported(&target_room_id).await?;
 
@@ -1114,17 +1134,34 @@ impl Channel for MatrixChannel {
         });
 
         let sync_settings = SyncSettings::new().timeout(std::time::Duration::from_secs(30));
+        let otk_conflict_detected = Arc::clone(&self.otk_conflict_detected);
         client
             .sync_with_result_callback(sync_settings, |sync_result| {
                 let tx = tx.clone();
+                let otk_conflict_detected = Arc::clone(&otk_conflict_detected);
                 async move {
                     if tx.is_closed() {
                         return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
                     }
 
                     if let Err(error) = sync_result {
-                        tracing::warn!("Matrix sync error: {error}, retrying...");
+                        let raw = error.to_string();
+                        let safe_error = MatrixChannel::sanitize_error_for_log(&error);
+
+                        if MatrixChannel::is_otk_conflict_message(&raw) {
+                            otk_conflict_detected.store(true, Ordering::SeqCst);
+                            tracing::error!(
+                                "Matrix one-time key upload conflict detected; \
+                                 stopping sync to avoid infinite retry loop."
+                            );
+                            return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
+                        }
+
+                        tracing::debug!(error = %safe_error, "Matrix sync error classified as transient, retrying");
+                        tracing::warn!("Matrix sync error: {safe_error}, retrying...");
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    } else {
+                        tracing::debug!("Matrix sync cycle completed");
                     }
 
                     Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Continue)
@@ -1132,10 +1169,27 @@ impl Channel for MatrixChannel {
             })
             .await?;
 
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            let mut msg = String::from(
+                "Matrix E2EE one-time key conflict detected. \
+                 Deregister the stale device, delete the local crypto store, and restart.",
+            );
+            if let Some(store_dir) = self.matrix_store_dir() {
+                use std::fmt::Write;
+                let _ = write!(msg, " Store path: {}", store_dir.display());
+            }
+            anyhow::bail!("{msg}");
+        }
+
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            tracing::debug!("Matrix health check: unhealthy (OTK conflict)");
+            return false;
+        }
+
         let Ok(room_id) = self.target_room_id().await else {
             return false;
         };
@@ -1144,7 +1198,9 @@ impl Channel for MatrixChannel {
             return false;
         }
 
-        self.matrix_client().await.is_ok()
+        let healthy = self.matrix_client().await.is_ok();
+        tracing::debug!(healthy, "Matrix health check result");
+        healthy
     }
 
     async fn add_reaction(
@@ -2129,5 +2185,29 @@ mod tests {
         );
         assert_eq!(ch.allowed_rooms.len(), 1);
         assert!(ch.is_room_allowed("!room:matrix.org"));
+    }
+
+    #[test]
+    fn otk_conflict_message_detection() {
+        assert!(MatrixChannel::is_otk_conflict_message(
+            "One time key signed_curve25519:AAAAAAAAAA4 already exists. Old key: {} new key: {}"
+        ));
+        assert!(MatrixChannel::is_otk_conflict_message(
+            "ONE TIME KEY xyz already exists"
+        ));
+        assert!(!MatrixChannel::is_otk_conflict_message(
+            "Matrix sync timeout while waiting for long poll"
+        ));
+        assert!(!MatrixChannel::is_otk_conflict_message(
+            "one time key was uploaded successfully"
+        ));
+    }
+
+    #[test]
+    fn sanitize_error_for_log_scrubs_secret_prefixes() {
+        let sanitized =
+            MatrixChannel::sanitize_error_for_log(&"auth failed: sk-proj-abc123xyz");
+        assert!(!sanitized.contains("sk-proj-abc123xyz"));
+        assert!(sanitized.contains("[REDACTED]"));
     }
 }
