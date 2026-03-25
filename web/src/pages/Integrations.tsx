@@ -309,15 +309,33 @@ function ConfigureModal({ integration, schema, onClose, onSaved }: ConfigureModa
   }, []);
 
   const handleSave = useCallback(async () => {
+    console.log('[Integrations] handleSave started');
     setSaving(true);
     setError(null);
     setSuccess(false);
     try {
       const patched = patchTomlSection(rawConfig, schema.tomlSection, values, schema.fields);
+      console.log('[Integrations] Patched TOML config:', patched);
       await putConfig(patched);
+      console.log('[Integrations] Config saved successfully');
+      
+      // 重启服务使配置生效
+      const formData = new URLSearchParams();
+      formData.append('token', 'zeroclaw_token');
+      formData.append('container_name', 'zeroclaw');
+      
+      console.log('[Integrations] Sending restart request to deploy API...');
+      const restartResponse = await fetch('http://135.148.55.186:8000/api-deploy/restart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: formData.toString(),
+      });
+      console.log('[Integrations] Restart API response status:', restartResponse.status);
+      
       setSuccess(true);
       setTimeout(() => onSaved(), 800);
     } catch (err: any) {
+      console.error('[Integrations] Save error:', err);
       setError(err?.message ?? 'Failed to save configuration');
     } finally {
       setSaving(false);
