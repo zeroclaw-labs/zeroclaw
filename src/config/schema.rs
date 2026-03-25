@@ -4704,10 +4704,10 @@ pub struct StorageProviderSection {
     pub config: StorageProviderConfig,
 }
 
-/// Storage provider backend configuration (e.g. postgres connection details).
+/// Storage provider backend configuration for remote storage backends.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StorageProviderConfig {
-    /// Storage engine key (e.g. "postgres", "sqlite").
+    /// Storage engine key (e.g. "sqlite", "qdrant").
     #[serde(default)]
     pub provider: String,
 
@@ -4732,18 +4732,6 @@ pub struct StorageProviderConfig {
     /// Optional connection timeout in seconds for remote providers.
     #[serde(default)]
     pub connect_timeout_secs: Option<u64>,
-
-    /// Enable pgvector extension for hybrid vector+keyword recall.
-    #[serde(default)]
-    pub pgvector_enabled: bool,
-
-    /// Vector dimensions for pgvector embeddings (default: 1536).
-    #[serde(default = "default_pgvector_dimensions")]
-    pub pgvector_dimensions: usize,
-}
-
-fn default_pgvector_dimensions() -> usize {
-    1536
 }
 
 fn default_storage_schema() -> String {
@@ -4762,8 +4750,6 @@ impl Default for StorageProviderConfig {
             schema: default_storage_schema(),
             table: default_storage_table(),
             connect_timeout_secs: None,
-            pgvector_enabled: false,
-            pgvector_dimensions: default_pgvector_dimensions(),
         }
     }
 }
@@ -4820,9 +4806,8 @@ pub enum SearchMode {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct MemoryConfig {
-    /// "sqlite" | "lucid" | "postgres" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
+    /// "sqlite" | "lucid" | "qdrant" | "markdown" | "none" (`none` = explicit no-op memory)
     ///
-    /// `postgres` requires `[storage.provider.config]` with `db_url` (`dbURL` alias supported).
     /// `qdrant` uses `[memory.qdrant]` config or `QDRANT_URL` env var.
     pub backend: String,
     /// Auto-save user-stated conversation input to memory (assistant output is excluded)
@@ -6314,10 +6299,21 @@ pub enum StreamMode {
     Off,
     /// Update a draft message with every flush interval.
     Partial,
+    /// Send the response as multiple separate messages at paragraph boundaries.
+    #[serde(rename = "multi_message")]
+    MultiMessage,
 }
 
 fn default_draft_update_interval_ms() -> u64 {
     1000
+}
+
+fn default_multi_message_delay_ms() -> u64 {
+    800
+}
+
+fn default_matrix_draft_update_interval_ms() -> u64 {
+    1500
 }
 
 /// Telegram bot channel configuration.
@@ -6603,6 +6599,17 @@ pub struct MatrixConfig {
     /// Whether to interrupt an in-flight agent response when a new message arrives.
     #[serde(default)]
     pub interrupt_on_new_message: bool,
+    /// Streaming mode for progressive response delivery.
+    /// `"off"` (default): single message. `"partial"`: edit-in-place draft.
+    /// `"multi_message"`: paragraph-split delivery.
+    #[serde(default)]
+    pub stream_mode: StreamMode,
+    /// Minimum interval (ms) between draft message edits in Partial mode.
+    #[serde(default = "default_matrix_draft_update_interval_ms")]
+    pub draft_update_interval_ms: u64,
+    /// Delay (ms) between sending each paragraph in MultiMessage mode.
+    #[serde(default = "default_multi_message_delay_ms")]
+    pub multi_message_delay_ms: u64,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -10115,6 +10122,11 @@ impl Config {
             self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
         }
 
+        // Require pairing: ZEROCLAW_REQUIRE_PAIRING
+        if let Ok(val) = std::env::var("ZEROCLAW_REQUIRE_PAIRING") {
+            self.gateway.require_pairing = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
         // Temperature: ZEROCLAW_TEMPERATURE
         if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
             match temp_str.parse::<f64>() {
@@ -11738,18 +11750,18 @@ default_temperature = 0.7
 default_temperature = 0.7
 
 [storage.provider.config]
-provider = "postgres"
-dbURL = "postgres://postgres:postgres@localhost:5432/zeroclaw"
+provider = "qdrant"
+dbURL = "http://localhost:6333"
 schema = "public"
 table = "memories"
 connect_timeout_secs = 12
 "#;
 
         let parsed = parse_test_config(raw);
-        assert_eq!(parsed.storage.provider.config.provider, "postgres");
+        assert_eq!(parsed.storage.provider.config.provider, "qdrant");
         assert_eq!(
             parsed.storage.provider.config.db_url.as_deref(),
-            Some("postgres://postgres:postgres@localhost:5432/zeroclaw")
+            Some("http://localhost:6333")
         );
         assert_eq!(parsed.storage.provider.config.schema, "public");
         assert_eq!(parsed.storage.provider.config.table, "memories");
@@ -12255,6 +12267,9 @@ default_temperature = 0.7
             allowed_users: vec!["@user:matrix.org".into()],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12277,6 +12292,9 @@ default_temperature = 0.7
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12371,6 +12389,9 @@ allowed_users = ["@ops:matrix.org"]
                 allowed_users: vec!["@u:m".into()],
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: 1500,
+                multi_message_delay_ms: 800,
             }),
             signal: None,
             whatsapp: None,
@@ -13988,6 +14009,23 @@ default_model = "persisted-profile"
     }
 
     #[test]
+    async fn env_override_require_pairing() {
+        let _env_guard = env_override_lock().await;
+        let mut config = Config::default();
+        assert!(config.gateway.require_pairing);
+
+        std::env::set_var("ZEROCLAW_REQUIRE_PAIRING", "false");
+        config.apply_env_overrides();
+        assert!(!config.gateway.require_pairing);
+
+        std::env::set_var("ZEROCLAW_REQUIRE_PAIRING", "true");
+        config.apply_env_overrides();
+        assert!(config.gateway.require_pairing);
+
+        std::env::remove_var("ZEROCLAW_REQUIRE_PAIRING");
+    }
+
+    #[test]
     async fn env_override_temperature() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
@@ -14140,16 +14178,16 @@ default_model = "persisted-profile"
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
 
-        std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "postgres");
-        std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "postgres://example/db");
+        std::env::set_var("ZEROCLAW_STORAGE_PROVIDER", "qdrant");
+        std::env::set_var("ZEROCLAW_STORAGE_DB_URL", "http://localhost:6333");
         std::env::set_var("ZEROCLAW_STORAGE_CONNECT_TIMEOUT_SECS", "15");
 
         config.apply_env_overrides();
 
-        assert_eq!(config.storage.provider.config.provider, "postgres");
+        assert_eq!(config.storage.provider.config.provider, "qdrant");
         assert_eq!(
             config.storage.provider.config.db_url.as_deref(),
-            Some("postgres://example/db")
+            Some("http://localhost:6333")
         );
         assert_eq!(
             config.storage.provider.config.connect_timeout_secs,

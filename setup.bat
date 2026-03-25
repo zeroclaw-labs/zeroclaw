@@ -129,7 +129,7 @@ echo %BOLD%[2/5] Choose installation method:%RESET%
 echo.
 echo   1) Prebuilt binary   - Download pre-compiled release (fastest, ~2 min)
 echo   2) Minimal build     - Default features only (~15 min)
-echo   3) Standard build    - Default + Lark/Feishu + Matrix + Postgres (~20 min)
+echo   3) Standard build    - Default + Lark/Feishu + Matrix (~20 min)
 echo   4) Full build        - All features including hardware + browser (~30 min)
 echo.
 set /p "CHOICE=  Select [1-4] (default: 1): "
@@ -195,13 +195,13 @@ goto :do_build
 
 :: ---- Standard build ----
 :build_standard
-set "FEATURES=--features channel-matrix,channel-lark,memory-postgres"
-set "BUILD_DESC=standard (Matrix + Lark/Feishu + Postgres)"
+set "FEATURES=--features channel-matrix,channel-lark"
+set "BUILD_DESC=standard (Matrix + Lark/Feishu)"
 goto :do_build
 
 :: ---- Full build ----
 :build_full
-set "FEATURES=--features channel-matrix,channel-lark,memory-postgres,browser-native,hardware,rag-pdf,observability-otel"
+set "FEATURES=--features channel-matrix,channel-lark,browser-native,hardware,rag-pdf,observability-otel"
 set "BUILD_DESC=full (all features)"
 goto :do_build
 
@@ -306,7 +306,7 @@ echo.
 echo Options:
 echo   --prebuilt    Download pre-compiled binary (fastest)
 echo   --minimal     Build with default features only
-echo   --standard    Build with Matrix + Lark/Feishu + Postgres
+echo   --standard    Build with Matrix + Lark/Feishu
 echo   --full        Build with all features
 echo   --help, -h    Show this help message
 echo.

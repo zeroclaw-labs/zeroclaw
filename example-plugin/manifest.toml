@@ -1,8 +1,0 @@
-name = "weather"
-version = "0.1.0"
-description = "Example weather tool plugin for ZeroClaw"
-author = "ZeroClaw Labs"
-wasm_path = "target/wasm32-wasip1/release/zeroclaw_weather_plugin.wasm"
-
-capabilities = ["tool"]
-permissions = ["http_client"]

@@ -16,7 +16,7 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,memory-postgres,whatsapp-web
+  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,whatsapp-web
 
 jobs:
   version:
@@ -247,6 +247,10 @@ jobs:
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
           cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
+
+      - name: Check binary size
+        shell: bash
+        run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
 
       - name: Package (Unix)
         if: runner.os != 'Windows'

@@ -41,6 +41,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Verify benchmarks compile
+        run: cargo bench --no-run --locked
+
   lint-strict-delta:
     name: Strict Delta Lint
     runs-on: ubuntu-latest

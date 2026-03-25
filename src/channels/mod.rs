@@ -1895,8 +1895,9 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
     // Strip any [Used tools: ...] prefix that the LLM may have echoed from
-    // history context (#4400).
-    let stripped_summary = strip_tool_summary_prefix(response);
+    // history context (#4400). Trim first to handle leading/trailing whitespace.
+    let trimmed_response = response.trim();
+    let stripped_summary = strip_tool_summary_prefix(trimmed_response);
     // Strip XML-style tool-call tags (e.g. <tool_call>...</tool_call>)
     let stripped_xml = strip_tool_call_tags(&stripped_summary);
     // Strip isolated tool-call JSON artifacts
@@ -4160,6 +4161,11 @@ fn collect_configured_channels(
                     mx.device_id.clone(),
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 )
+                .with_streaming(
+                    mx.stream_mode,
+                    mx.draft_update_interval_ms,
+                    mx.multi_message_delay_ms,
+                )
                 .with_transcription(config.transcription.clone()),
             ),
         });
@@ -5321,6 +5327,18 @@ mod tests {
             strip_tool_summary_prefix(input),
             "The command output is 42."
         );
+    }
+
+    #[test]
+    fn sanitize_channel_response_strips_used_tools_with_leading_whitespace() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        // Issue #4478: response with leading whitespace before [Used tools: ...]
+        let input = "  [Used tools: web_search_tool]\nHere is the search result.";
+
+        let result = sanitize_channel_response(input, &tools);
+
+        assert!(!result.contains("[Used tools:"));
+        assert!(result.contains("Here is the search result."));
     }
 
     #[test]
