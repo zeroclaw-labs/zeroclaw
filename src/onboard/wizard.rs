@@ -2,8 +2,8 @@ use crate::cli_input::Input;
 #[cfg(feature = "channel-nostr")]
 use crate::config::schema::{default_nostr_relays, NostrConfig};
 use crate::config::schema::{
-    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NextcloudTalkConfig, QQConfig,
-    SignalConfig, StreamMode, WhatsAppChatPolicy, WhatsAppConfig, WhatsAppWebMode,
+    DingTalkConfig, FeishuConfig, IrcConfig, LarkReceiveMode, LinqConfig, NextcloudTalkConfig,
+    QQConfig, SignalConfig, StreamMode, WhatsAppChatPolicy, WhatsAppConfig, WhatsAppWebMode,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -117,6 +117,18 @@ fn merge_channel_repair_updates(
         merged.irc = Some(irc);
     }
     if let Some(lark) = updates.lark {
+        if lark.use_feishu {
+            merged.feishu = Some(FeishuConfig {
+                app_id: lark.app_id.clone(),
+                app_secret: lark.app_secret.clone(),
+                encrypt_key: lark.encrypt_key.clone(),
+                verification_token: lark.verification_token.clone(),
+                allowed_users: lark.allowed_users.clone(),
+                receive_mode: lark.receive_mode.clone(),
+                port: lark.port,
+                proxy_url: lark.proxy_url.clone(),
+            });
+        }
         merged.lark = Some(lark);
     }
     if let Some(feishu) = updates.feishu {
@@ -6263,6 +6275,55 @@ mod tests {
             merged.matrix.as_ref().map(|cfg| cfg.room_id.as_str()),
             Some("!new:matrix.new")
         );
+    }
+
+    #[test]
+    fn merge_channel_repair_updates_syncs_native_feishu_from_legacy_lark() {
+        let mut existing = ChannelsConfig::default();
+        existing.feishu = Some(FeishuConfig {
+            app_id: "feishu-old".to_string(),
+            app_secret: "secret-old".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["old-user".to_string()],
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            proxy_url: None,
+        });
+
+        let mut updates = ChannelsConfig::default();
+        updates.lark = Some(LarkConfig {
+            app_id: "lark-new".to_string(),
+            app_secret: "secret-new".to_string(),
+            encrypt_key: Some("enc-new".to_string()),
+            verification_token: Some("token-new".to_string()),
+            allowed_users: vec!["owner".to_string()],
+            mention_only: true,
+            use_feishu: true,
+            receive_mode: LarkReceiveMode::Webhook,
+            port: Some(9090),
+            proxy_url: Some("https://proxy".to_string()),
+        });
+
+        let merged = merge_channel_repair_updates(existing, updates);
+
+        assert_eq!(
+            merged.lark.as_ref().map(|cfg| cfg.app_id.as_str()),
+            Some("lark-new")
+        );
+        assert!(matches!(
+            merged.lark.as_ref().map(|cfg| cfg.use_feishu),
+            Some(true)
+        ));
+        let feishu_cfg = merged.feishu.expect("expected feishu config to be rewritten");
+        assert_eq!(feishu_cfg.app_id, "lark-new");
+        assert_eq!(feishu_cfg.app_secret, "secret-new");
+        assert_eq!(feishu_cfg.verification_token.as_deref(), Some("token-new"));
+        assert_eq!(feishu_cfg.encrypt_key.as_deref(), Some("enc-new"));
+        assert_eq!(feishu_cfg.allowed_users, vec!["owner".to_string()]);
+        assert_eq!(feishu_cfg.receive_mode, LarkReceiveMode::Webhook);
+        assert_eq!(feishu_cfg.port, Some(9090));
+        assert_eq!(feishu_cfg.proxy_url.as_deref(), Some("https://proxy"));
     }
 
     #[tokio::test]
