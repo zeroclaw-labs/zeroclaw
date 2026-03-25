@@ -9124,6 +9124,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let context = build_memory_context(&mem, "age", 0.0, None).await;
         assert!(context.contains("[Memory context]"));
+        assert!(context.contains("[/Memory context]"));
         assert!(context.contains("Age is 45"));
     }
 
@@ -9579,6 +9580,7 @@ BTC is currently around $65,000 based on latest tool output."#
         // Memory context is injected into the system prompt, not the user message.
         assert_eq!(calls[0][0].0, "system");
         assert!(calls[0][0].1.contains("[Memory context]"));
+        assert!(calls[0][0].1.contains("[/Memory context]"));
         assert!(calls[0][0].1.contains("Age is 45"));
         assert_eq!(calls[0][1].0, "user");
         assert_eq!(calls[0][1].1, "hello");
