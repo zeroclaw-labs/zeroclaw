@@ -6234,6 +6234,9 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             allowed_rooms: vec!["!old:matrix.old".to_string()],
             interrupt_on_new_message: false,
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
         });
 
         let mut updates = ChannelsConfig::default();
@@ -6256,6 +6259,9 @@ mod tests {
             allowed_users: vec!["@admin:matrix.new".to_string()],
             allowed_rooms: vec!["!new:matrix.new".to_string()],
             interrupt_on_new_message: true,
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
         });
 
         let merged = merge_channel_repair_updates(existing, updates);
@@ -6315,7 +6321,9 @@ mod tests {
             merged.lark.as_ref().map(|cfg| cfg.use_feishu),
             Some(true)
         ));
-        let feishu_cfg = merged.feishu.expect("expected feishu config to be rewritten");
+        let feishu_cfg = merged
+            .feishu
+            .expect("expected feishu config to be rewritten");
         assert_eq!(feishu_cfg.app_id, "lark-new");
         assert_eq!(feishu_cfg.app_secret, "secret-new");
         assert_eq!(feishu_cfg.verification_token.as_deref(), Some("token-new"));
