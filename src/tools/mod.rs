@@ -41,6 +41,7 @@ pub mod file_read;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
+pub mod google;
 pub mod google_workspace;
 #[cfg(feature = "hardware")]
 pub mod hardware_board_info;
@@ -546,22 +547,33 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(CloudPatternsTool::new()));
     }
 
-    // Google Workspace CLI (gws) integration — requires shell access
-    if root_config.google_workspace.enabled && has_shell_access {
-        tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
-            security.clone(),
-            root_config.google_workspace.allowed_services.clone(),
-            root_config.google_workspace.allowed_operations.clone(),
-            root_config.google_workspace.credentials_path.clone(),
-            root_config.google_workspace.default_account.clone(),
-            root_config.google_workspace.rate_limit_per_minute,
-            root_config.google_workspace.timeout_secs,
-            root_config.google_workspace.audit_log,
-        )));
-    } else if root_config.google_workspace.enabled {
-        tracing::warn!(
-            "google_workspace: skipped registration because shell access is unavailable"
-        );
+    // Google Workspace integration — direct API mode or gws CLI fallback.
+    // Direct API mode (oauth_* credentials configured) does not require shell
+    // access. The gws CLI fallback still requires has_shell_access.
+    if root_config.google_workspace.enabled {
+        let has_oauth = root_config.google_workspace.oauth_client_id.is_some()
+            && root_config.google_workspace.oauth_client_secret.is_some()
+            && root_config.google_workspace.oauth_refresh_token.is_some();
+        if has_oauth || has_shell_access {
+            tool_arcs.push(Arc::new(GoogleWorkspaceTool::new(
+                security.clone(),
+                root_config.google_workspace.allowed_services.clone(),
+                root_config.google_workspace.allowed_operations.clone(),
+                root_config.google_workspace.credentials_path.clone(),
+                root_config.google_workspace.default_account.clone(),
+                root_config.google_workspace.oauth_client_id.clone(),
+                root_config.google_workspace.oauth_client_secret.clone(),
+                root_config.google_workspace.oauth_refresh_token.clone(),
+                root_config.google_workspace.rate_limit_per_minute,
+                root_config.google_workspace.timeout_secs,
+                root_config.google_workspace.audit_log,
+            )));
+        } else {
+            tracing::warn!(
+                "google_workspace: skipped registration because shell access is unavailable \
+                 and no OAuth credentials are configured"
+            );
+        }
     }
 
     // Claude Code delegation tool
