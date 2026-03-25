@@ -21,9 +21,12 @@ existing docs linked throughout this page instead of duplicating them here.
 
 Important:
 
-- Published Linux release assets exist for both `aarch64` and `armv7`.
+- Published Linux release assets exist for `aarch64`, `armv7`, and `armv6`
+  (`arm-unknown-linux-gnueabihf` for `armv6l` boards).
 - The release workflows build ARM binaries with the standard release feature set,
-  not `hardware` or `peripheral-rpi`.
+  not `hardware` or `peripheral-rpi`; on 32-bit ARM they drop
+  `observability-prometheus` via `--no-default-features` because Prometheus
+  requires 64-bit atomics.
 - If you need native Pi GPIO or hardware peripheral tooling, plan on a source build.
 
 ## 1. Confirm the Pi Architecture
@@ -31,13 +34,15 @@ Important:
 ```bash
 uname -m
 # aarch64 -> 64-bit Raspberry Pi OS
-# armv7l  -> 32-bit Raspberry Pi OS
+# armv7l  -> 32-bit Raspberry Pi OS on Pi 2/3/4-class boards
+# armv6l  -> 32-bit Raspberry Pi OS on Pi Zero / Pi 1-class boards
 ```
 
 Use the matching Rust target triple when downloading or building:
 
 - `aarch64` -> `aarch64-unknown-linux-gnu`
 - `armv7l` -> `armv7-unknown-linux-gnueabihf`
+- `armv6l` -> `arm-unknown-linux-gnueabihf`
 
 ## 2. Recommended: Install a Published ARM Binary
 
@@ -60,6 +65,7 @@ You can also download the matching release asset directly from
 
 - `zeroclaw-aarch64-unknown-linux-gnu.tar.gz`
 - `zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz`
+- `zeroclaw-arm-unknown-linux-gnueabihf.tar.gz`
 
 Use this path for normal Raspberry Pi agent/daemon deployments that do not need
 `peripheral-rpi` or `hardware`.
@@ -85,8 +91,14 @@ If the deployed binary also needs native Pi GPIO, rebuild with
 `--features peripheral-rpi`. If the same binary also needs USB/serial board
 tooling, use `--features hardware,peripheral-rpi`.
 
-For a 32-bit Raspberry Pi OS target, swap in
-`armv7-unknown-linux-gnueabihf` and the matching cross-compiler/linker.
+For a 32-bit Raspberry Pi OS target, choose the target by userland:
+
+- `armv7l` -> `armv7-unknown-linux-gnueabihf`
+- `armv6l` -> `arm-unknown-linux-gnueabihf`
+
+For local source builds on either 32-bit target, mirror the installer's 32-bit
+baseline feature set with `--no-default-features --features channel-nostr,skill-creation`
+so `observability-prometheus` stays off.
 
 ### macOS / scripted deploy
 
@@ -136,20 +148,31 @@ echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 
 ### Local source-build commands
 
-Start with the default release profile:
+Start with the matching release profile. On 32-bit Pi OS, use the installer's
+32-bit baseline feature set:
 
 ```bash
+# 64-bit Raspberry Pi OS
 cargo build --release --locked
+
+# 32-bit Raspberry Pi OS (armv7l / armv6l)
+cargo build --release --locked --no-default-features --features channel-nostr,skill-creation
 ```
 
 Optional feature builds:
 
 ```bash
-# Native Raspberry Pi GPIO only
+# Native Raspberry Pi GPIO only (64-bit)
 cargo build --release --locked --features peripheral-rpi
 
-# Native Raspberry Pi GPIO plus USB/serial board tooling
+# Native Raspberry Pi GPIO only (32-bit)
+cargo build --release --locked --no-default-features --features channel-nostr,skill-creation,peripheral-rpi
+
+# Native Raspberry Pi GPIO plus USB/serial board tooling (64-bit)
 cargo build --release --locked --features hardware,peripheral-rpi
+
+# Native Raspberry Pi GPIO plus USB/serial board tooling (32-bit)
+cargo build --release --locked --no-default-features --features channel-nostr,skill-creation,hardware,peripheral-rpi
 ```
 
 If you need to reduce local parallelism further:
@@ -208,7 +231,8 @@ duplicating those flows here:
 
 - Re-run `uname -m`.
 - Verify that the installed binary target matches the Pi userland
-  (`aarch64-unknown-linux-gnu` vs `armv7-unknown-linux-gnueabihf`).
+  (`aarch64-unknown-linux-gnu` vs `armv7-unknown-linux-gnueabihf` vs
+  `arm-unknown-linux-gnueabihf`).
 
 ### Native GPIO tools are missing
 
