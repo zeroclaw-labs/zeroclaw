@@ -475,7 +475,8 @@ impl MatrixChannel {
                         if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some()
                         {
                             tracing::warn!(
-                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
+                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}. \
+                                 See docs/security/matrix-e2ee-guide.md section 4C."
                             );
                             None
                         } else {
@@ -498,7 +499,9 @@ impl MatrixChannel {
                 } else {
                     self.session_owner_hint.clone().ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Matrix session restore requires user_id when whoami is unavailable"
+                            "Matrix session restore requires user_id when whoami is unavailable. \
+                             Set channels_config.matrix.user_id in config.toml. \
+                             See docs/security/matrix-e2ee-guide.md section 2."
                         )
                     })?
                 };
@@ -520,13 +523,17 @@ impl MatrixChannel {
                     }
                     (Some(whoami), None) => whoami.device_id.clone().ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Matrix whoami response did not include device_id. Set channels.matrix.device_id to enable E2EE session restore."
+                            "Matrix whoami response did not include device_id. \
+                             Set channels_config.matrix.device_id in config.toml. \
+                             See docs/security/matrix-e2ee-guide.md section 4G for how to find your device_id."
                         )
                     })?,
                     (None, Some(hinted)) => hinted.clone(),
                     (None, None) => {
                         return Err(anyhow::anyhow!(
-                            "Matrix E2EE session restore requires device_id when whoami is unavailable"
+                            "Matrix E2EE session restore requires device_id when whoami is unavailable. \
+                             Set channels_config.matrix.device_id in config.toml. \
+                             See docs/security/matrix-e2ee-guide.md section 4G for how to find your device_id."
                         ));
                     }
                 };
@@ -686,14 +693,17 @@ impl MatrixChannel {
                     );
                 } else {
                     tracing::warn!(
-                        "Matrix device '{}' is not verified. Some clients may label bot messages as unverified until you sign/verify this device from a trusted session.",
+                        "Matrix device '{}' is not verified. Other clients will label bot messages as unverified. \
+                         Verify this device from a trusted session and keep device_id stable across restarts. \
+                         See docs/security/matrix-e2ee-guide.md section 4D.",
                         device.device_id()
                     );
                 }
             }
             Ok(None) => {
                 tracing::warn!(
-                    "Matrix own-device metadata is unavailable; verify/signing status cannot be determined."
+                    "Matrix own-device metadata is unavailable; verify/signing status cannot be determined. \
+                     See docs/security/matrix-e2ee-guide.md section 4D."
                 );
             }
             Err(error) => {
@@ -706,7 +716,9 @@ impl MatrixChannel {
         } else {
             let _ = client.encryption().backups().disable().await;
             tracing::warn!(
-                "Matrix room-key backup is not enabled for this device; automatic backup attempts have been disabled to suppress recurring warnings. To enable backups, configure server-side key backup and recovery for this device."
+                "Matrix room-key backup is not enabled for this device. \
+                 Key backup warnings may appear until recovery is configured. \
+                 See docs/security/matrix-e2ee-guide.md section 4D."
             );
         }
     }
@@ -1172,7 +1184,8 @@ impl Channel for MatrixChannel {
         if self.otk_conflict_detected.load(Ordering::Relaxed) {
             let mut msg = String::from(
                 "Matrix E2EE one-time key conflict detected. \
-                 Deregister the stale device, delete the local crypto store, and restart.",
+                 Deregister the stale device, delete the local crypto store, and restart. \
+                 See docs/security/matrix-e2ee-guide.md section 4H.",
             );
             if let Some(store_dir) = self.matrix_store_dir() {
                 use std::fmt::Write;
