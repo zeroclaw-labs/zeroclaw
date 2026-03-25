@@ -307,8 +307,22 @@ impl MatrixChannel {
         !body.trim().is_empty()
     }
 
-    fn room_matches_target(target_room_id: &str, incoming_room_id: &str) -> bool {
-        target_room_id == incoming_room_id
+    fn room_matches_target(
+        target_room_id: &str,
+        allowed_rooms: &[String],
+        incoming_room_id: &str,
+    ) -> bool {
+        if target_room_id.eq_ignore_ascii_case(incoming_room_id) {
+            return true;
+        }
+
+        // Keep the default listener scope anchored to configured room_id.
+        // Additional rooms are allowed only when explicitly listed.
+        if allowed_rooms.is_empty() {
+            return false;
+        }
+
+        Self::is_room_allowed_static(allowed_rooms, incoming_room_id)
     }
 
     fn cache_event_id(
@@ -803,6 +817,7 @@ impl Channel for MatrixChannel {
             async move {
                 if !MatrixChannel::room_matches_target(
                     target_room.as_str(),
+                    &allowed_rooms,
                     room.room_id().as_str(),
                 ) {
                     return;
@@ -1446,6 +1461,7 @@ mod tests {
     fn room_scope_matches_configured_room() {
         assert!(MatrixChannel::room_matches_target(
             "!ops:matrix.org",
+            &[],
             "!ops:matrix.org"
         ));
     }
@@ -1454,6 +1470,25 @@ mod tests {
     fn room_scope_rejects_other_rooms() {
         assert!(!MatrixChannel::room_matches_target(
             "!ops:matrix.org",
+            &[],
+            "!other:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn room_scope_accepts_explicitly_allowed_room() {
+        assert!(MatrixChannel::room_matches_target(
+            "!ops:matrix.org",
+            &["!other:matrix.org".to_string()],
+            "!other:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn room_scope_rejects_unlisted_room_when_allowlist_present() {
+        assert!(!MatrixChannel::room_matches_target(
+            "!ops:matrix.org",
+            &["!allowed:matrix.org".to_string()],
             "!other:matrix.org"
         ));
     }
