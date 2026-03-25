@@ -10,7 +10,8 @@ use matrix_sdk::{
         events::relation::{Annotation, Thread},
         events::room::member::StrippedRoomMemberEvent,
         events::room::message::{
-            MessageType, OriginalSyncRoomMessageEvent, Relation, RoomMessageEventContent,
+            MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
+            RoomMessageEventContent,
         },
         events::room::MediaSource,
         OwnedEventId, OwnedRoomId, OwnedUserId,
@@ -44,6 +45,14 @@ pub struct MatrixChannel {
     voice_mode: Arc<AtomicBool>,
     transcription: Option<crate::config::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    stream_mode: crate::config::StreamMode,
+    draft_update_interval_ms: u64,
+    multi_message_delay_ms: u64,
+    /// Per-room rate-limit tracking for Partial draft edits.
+    last_draft_edit: Arc<Mutex<HashMap<String, std::time::Instant>>>,
+    /// Tracks how much text has been sent in MultiMessage mode so we can
+    /// detect new paragraphs from the accumulated text passed to `update_draft`.
+    multi_message_sent_len: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -219,7 +228,26 @@ impl MatrixChannel {
             voice_mode: Arc::new(AtomicBool::new(false)),
             transcription: None,
             transcription_manager: None,
+            stream_mode: crate::config::StreamMode::Off,
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+            last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
+            multi_message_sent_len: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Configure streaming mode for progressive draft updates or
+    /// paragraph-split multi-message delivery.
+    pub fn with_streaming(
+        mut self,
+        stream_mode: crate::config::StreamMode,
+        draft_update_interval_ms: u64,
+        multi_message_delay_ms: u64,
+    ) -> Self {
+        self.stream_mode = stream_mode;
+        self.draft_update_interval_ms = draft_update_interval_ms;
+        self.multi_message_delay_ms = multi_message_delay_ms;
+        self
     }
 
     /// Configure voice transcription for audio messages.
@@ -239,6 +267,58 @@ impl MatrixChannel {
             }
         }
         self
+    }
+
+    /// Extract the room ID from a recipient string (handles `sender||room_id` format).
+    fn extract_room_id(recipient: &str, fallback_room_id: &str) -> String {
+        if recipient.contains("||") {
+            recipient.split_once("||").unwrap().1.to_string()
+        } else {
+            fallback_room_id.to_string()
+        }
+    }
+
+    /// Get a joined Matrix room by ID, syncing once if not immediately available.
+    async fn get_joined_room(&self, room_id_str: &str) -> anyhow::Result<matrix_sdk::Room> {
+        let client = self.matrix_client().await?;
+        let target_room: OwnedRoomId = room_id_str.parse()?;
+
+        let mut room = client.get_room(&target_room);
+        if room.is_none() {
+            let _ = client.sync_once(SyncSettings::new()).await;
+            room = client.get_room(&target_room);
+        }
+
+        let room = room.ok_or_else(|| {
+            anyhow::anyhow!("Matrix room '{}' not found in joined rooms", room_id_str)
+        })?;
+
+        if room.state() != RoomState::Joined {
+            anyhow::bail!("Matrix room '{}' is not in joined state", room_id_str);
+        }
+
+        Ok(room)
+    }
+
+    /// Edit an existing message using Matrix's m.replace relation.
+    /// The matrix-sdk handles E2EE transparently — edits in encrypted rooms
+    /// are re-encrypted automatically.
+    async fn edit_message(
+        &self,
+        room_id_str: &str,
+        original_event_id: &str,
+        new_text: &str,
+    ) -> anyhow::Result<()> {
+        let room = self.get_joined_room(room_id_str).await?;
+        let original_id: OwnedEventId = original_event_id
+            .parse()
+            .map_err(|_| anyhow::anyhow!("Invalid event ID for edit: {}", original_event_id))?;
+
+        let replacement = RoomMessageEventContent::text_markdown(new_text)
+            .make_replacement(ReplacementMetadata::new(original_id, None));
+
+        room.send(replacement).await?;
+        Ok(())
     }
 
     fn encode_path_segment(value: &str) -> String {
@@ -1260,6 +1340,238 @@ impl Channel for MatrixChannel {
 
         room.redact(&event_id, reason.as_deref(), None).await?;
         Ok(())
+    }
+
+    // ── Streaming support ──────────────────────────────────────────
+
+    fn supports_draft_updates(&self) -> bool {
+        self.stream_mode != crate::config::StreamMode::Off
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        use crate::config::StreamMode;
+        match self.stream_mode {
+            StreamMode::Off => Ok(None),
+            StreamMode::Partial => {
+                // Send initial "..." draft message; return event_id for later edits.
+                let room_id = Self::extract_room_id(&message.recipient, &self.room_id);
+                let room = self.get_joined_room(&room_id).await?;
+
+                let initial_text = if message.content.is_empty() {
+                    "..."
+                } else {
+                    &message.content
+                };
+
+                let mut content = RoomMessageEventContent::text_markdown(initial_text);
+
+                // Preserve threading if applicable.
+                if let Some(ref thread_ts) = message.thread_ts {
+                    if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
+                        content.relates_to = Some(Relation::Thread(Thread::plain(
+                            thread_root.clone(),
+                            thread_root,
+                        )));
+                    }
+                }
+
+                let response = room.send(content).await?;
+                let event_id = response.event_id.to_string();
+
+                self.last_draft_edit
+                    .lock()
+                    .await
+                    .insert(room_id, std::time::Instant::now());
+
+                Ok(Some(event_id))
+            }
+            StreamMode::MultiMessage => {
+                // MultiMessage: no initial draft — paragraphs are sent as new messages.
+                // Return a synthetic ID so the draft_updater task runs.
+                self.multi_message_sent_len.lock().await.clear();
+                Ok(Some("multi_message_synthetic".to_string()))
+            }
+        }
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        use crate::config::StreamMode;
+        let room_id = Self::extract_room_id(recipient, &self.room_id);
+
+        match self.stream_mode {
+            StreamMode::Off => Ok(()),
+            StreamMode::Partial => {
+                // Rate-limit edits per room.
+                {
+                    let last_edits = self.last_draft_edit.lock().await;
+                    if let Some(last_time) = last_edits.get(&room_id) {
+                        let elapsed =
+                            u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        if elapsed < self.draft_update_interval_ms {
+                            return Ok(());
+                        }
+                    }
+                }
+
+                if let Err(e) = self.edit_message(&room_id, message_id, text).await {
+                    tracing::debug!("Matrix draft update edit failed: {e}");
+                    return Ok(());
+                }
+
+                self.last_draft_edit
+                    .lock()
+                    .await
+                    .insert(room_id, std::time::Instant::now());
+
+                Ok(())
+            }
+            StreamMode::MultiMessage => {
+                // The draft_updater passes the full accumulated text each call.
+                // Track how much we've already sent and only process new content.
+                let mut sent_map = self.multi_message_sent_len.lock().await;
+                let sent_so_far = sent_map.get(&room_id).copied().unwrap_or(0);
+
+                if text.len() <= sent_so_far {
+                    return Ok(());
+                }
+
+                let new_text = &text[sent_so_far..];
+                // Scan for paragraph boundaries (\n\n outside code fences).
+                let mut scan_pos = 0;
+                let mut in_fence = false;
+                let bytes = new_text.as_bytes();
+
+                while scan_pos < bytes.len() {
+                    let ch = bytes[scan_pos];
+
+                    // Detect code fence toggles (``` at start of line).
+                    if ch == b'`'
+                        && scan_pos + 2 < bytes.len()
+                        && bytes[scan_pos + 1] == b'`'
+                        && bytes[scan_pos + 2] == b'`'
+                        && (scan_pos == 0
+                            || bytes[scan_pos - 1] == b'\n'
+                            || (sent_so_far + scan_pos == 0))
+                    {
+                        in_fence = !in_fence;
+                    }
+
+                    // Detect \n\n paragraph boundary outside fences.
+                    if !in_fence
+                        && ch == b'\n'
+                        && scan_pos + 1 < bytes.len()
+                        && bytes[scan_pos + 1] == b'\n'
+                    {
+                        let paragraph = new_text[..scan_pos].trim().to_string();
+                        if !paragraph.is_empty() {
+                            // Send paragraph as a new message (with thread context).
+                            // We don't have thread_ts here, but the recipient encodes it.
+                            let msg = SendMessage::new(&paragraph, recipient);
+                            if let Err(e) = self.send(&msg).await {
+                                tracing::debug!("Multi-message paragraph send failed: {e}");
+                            }
+                            if self.multi_message_delay_ms > 0 {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    self.multi_message_delay_ms,
+                                ))
+                                .await;
+                            }
+                        }
+                        // Advance past the \n\n and update tracking.
+                        let consumed = scan_pos + 2;
+                        *sent_map.entry(room_id.clone()).or_insert(0) += consumed;
+                        // Recurse on remaining text by slicing.
+                        let remaining = &new_text[consumed..];
+                        if !remaining.is_empty() {
+                            drop(sent_map);
+                            return self.update_draft(recipient, message_id, text).await;
+                        }
+                        return Ok(());
+                    }
+
+                    scan_pos += 1;
+                }
+
+                // No paragraph boundary found yet — buffer continues accumulating.
+                Ok(())
+            }
+        }
+    }
+
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Only Partial mode shows progress (via m.replace edit).
+        // MultiMessage ignores progress — no draft message to show it in.
+        if self.stream_mode == crate::config::StreamMode::Partial {
+            self.update_draft(recipient, message_id, text).await
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        use crate::config::StreamMode;
+        let room_id = Self::extract_room_id(recipient, &self.room_id);
+
+        match self.stream_mode {
+            StreamMode::Off => Ok(()),
+            StreamMode::Partial => {
+                // Final m.replace edit with complete text.
+                self.last_draft_edit.lock().await.remove(&room_id);
+                self.edit_message(&room_id, message_id, text).await
+            }
+            StreamMode::MultiMessage => {
+                // Flush any remaining buffered text that didn't hit a \n\n boundary.
+                let mut sent_map = self.multi_message_sent_len.lock().await;
+                let sent_so_far = sent_map.get(&room_id).copied().unwrap_or(0);
+
+                if text.len() > sent_so_far {
+                    let remaining = text[sent_so_far..].trim().to_string();
+                    if !remaining.is_empty() {
+                        let msg = SendMessage::new(&remaining, recipient);
+                        if let Err(e) = self.send(&msg).await {
+                            tracing::debug!("Multi-message final flush failed: {e}");
+                        }
+                    }
+                }
+
+                sent_map.remove(&room_id);
+                Ok(())
+            }
+        }
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        use crate::config::StreamMode;
+        let room_id = Self::extract_room_id(recipient, &self.room_id);
+
+        match self.stream_mode {
+            StreamMode::Off => Ok(()),
+            StreamMode::Partial => {
+                // Redact the draft message.
+                self.last_draft_edit.lock().await.remove(&room_id);
+                self.redact_message(&room_id, message_id, None).await
+            }
+            StreamMode::MultiMessage => {
+                // Paragraphs already sent can't be unsent. Just clean up state.
+                self.multi_message_sent_len.lock().await.remove(&room_id);
+                Ok(())
+            }
+        }
     }
 }
 

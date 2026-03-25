@@ -893,6 +893,9 @@ mod tests {
             allowed_users: vec![],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();

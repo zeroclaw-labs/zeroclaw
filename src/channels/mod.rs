@@ -4160,6 +4160,11 @@ fn collect_configured_channels(
                     mx.device_id.clone(),
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 )
+                .with_streaming(
+                    mx.stream_mode,
+                    mx.draft_update_interval_ms,
+                    mx.multi_message_delay_ms,
+                )
                 .with_transcription(config.transcription.clone()),
             ),
         });

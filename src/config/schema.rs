@@ -12197,6 +12197,9 @@ default_temperature = 0.7
             allowed_users: vec!["@user:matrix.org".into()],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12219,6 +12222,9 @@ default_temperature = 0.7
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
             allowed_rooms: vec![],
             interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12313,6 +12319,9 @@ allowed_users = ["@ops:matrix.org"]
                 allowed_users: vec!["@u:m".into()],
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
+                stream_mode: StreamMode::default(),
+                draft_update_interval_ms: 1500,
+                multi_message_delay_ms: 800,
             }),
             signal: None,
             whatsapp: None,
