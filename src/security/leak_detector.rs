@@ -102,6 +102,11 @@ impl LeakDetector {
                     Regex::new(r"sk-ant-[a-zA-Z0-9-_]{32,}").unwrap(),
                     "Anthropic API key",
                 ),
+                // Groq
+                (
+                    Regex::new(r"gsk_[a-zA-Z0-9]{20,}").unwrap(),
+                    "Groq API key",
+                ),
                 // Google
                 (
                     Regex::new(r"AIza[a-zA-Z0-9_-]{35}").unwrap(),

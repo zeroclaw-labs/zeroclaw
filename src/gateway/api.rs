@@ -1056,7 +1056,25 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(email) = masked.channels_config.email.as_mut() {
         mask_required_secret(&mut email.password);
     }
+
+    // Transcription provider API keys (Groq top-level + sub-providers).
     mask_optional_secret(&mut masked.transcription.api_key);
+    if let Some(openai_stt) = masked.transcription.openai.as_mut() {
+        mask_optional_secret(&mut openai_stt.api_key);
+    }
+    if let Some(deepgram) = masked.transcription.deepgram.as_mut() {
+        mask_optional_secret(&mut deepgram.api_key);
+    }
+    if let Some(assemblyai) = masked.transcription.assemblyai.as_mut() {
+        mask_optional_secret(&mut assemblyai.api_key);
+    }
+    if let Some(google_stt) = masked.transcription.google.as_mut() {
+        mask_optional_secret(&mut google_stt.api_key);
+    }
+    if let Some(local_whisper) = masked.transcription.local_whisper.as_mut() {
+        mask_required_secret(&mut local_whisper.bearer_token);
+    }
+
     masked
 }
 
@@ -1244,10 +1262,42 @@ fn restore_masked_sensitive_fields(
     ) {
         restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
+
+    // Transcription provider API keys (Groq top-level + sub-providers).
     restore_optional_secret(
         &mut incoming.transcription.api_key,
         &current.transcription.api_key,
     );
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.openai.as_mut(),
+        current.transcription.openai.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.deepgram.as_mut(),
+        current.transcription.deepgram.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.assemblyai.as_mut(),
+        current.transcription.assemblyai.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.google.as_mut(),
+        current.transcription.google.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.local_whisper.as_mut(),
+        current.transcription.local_whisper.as_ref(),
+    ) {
+        restore_required_secret(&mut incoming_stt.bearer_token, &current_stt.bearer_token);
+    }
 }
 
 fn hydrate_config_for_save(
