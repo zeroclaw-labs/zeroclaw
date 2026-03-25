@@ -13,11 +13,18 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
 use crate::config::DEFAULT_GWS_SERVICES;
 
-/// Google Workspace CLI (`gws`) integration tool.
+/// Bundled HTTP client and token cache used when direct Google API mode is active.
+struct GoogleApiClient {
+    http: reqwest::Client,
+    tokens: super::google::auth::GoogleTokenCache,
+}
+
+/// Google Workspace integration tool.
 ///
-/// Wraps the `gws` CLI binary to give the agent structured access to
-/// Google Workspace services (Drive, Gmail, Calendar, Sheets, etc.).
-/// Requires `gws` to be installed and authenticated (`gws auth login`).
+/// By default wraps the `gws` CLI binary. When `oauth_client_id`,
+/// `oauth_client_secret`, and `oauth_refresh_token` are all configured,
+/// supported services (currently: `calendar`) bypass the CLI and call the
+/// Google REST APIs directly — no `gws` installation required.
 pub struct GoogleWorkspaceTool {
     security: Arc<SecurityPolicy>,
     allowed_services: Vec<String>,
@@ -27,18 +34,26 @@ pub struct GoogleWorkspaceTool {
     rate_limit_per_minute: u32,
     timeout_secs: u64,
     audit_log: bool,
+    /// Present when OAuth credentials are configured for direct API access.
+    api_client: Option<Arc<GoogleApiClient>>,
 }
 
 impl GoogleWorkspaceTool {
     /// Create a new `GoogleWorkspaceTool`.
     ///
     /// If `allowed_services` is empty, the default service set is used.
+    /// When all three `oauth_*` parameters are `Some`, an HTTP client and
+    /// token cache are initialised for direct Google API access.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         security: Arc<SecurityPolicy>,
         allowed_services: Vec<String>,
         allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
         credentials_path: Option<String>,
         default_account: Option<String>,
+        oauth_client_id: Option<String>,
+        oauth_client_secret: Option<String>,
+        oauth_refresh_token: Option<String>,
         rate_limit_per_minute: u32,
         timeout_secs: u64,
         audit_log: bool,
@@ -65,6 +80,25 @@ impl GoogleWorkspaceTool {
                 methods: op.methods.iter().map(|m| m.trim().to_string()).collect(),
             })
             .collect();
+
+        // Build the direct API client when all OAuth credentials are present.
+        let api_client = match (oauth_client_id, oauth_client_secret, oauth_refresh_token) {
+            (Some(id), Some(secret), Some(refresh)) => {
+                let cache_dir = std::env::var("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".zeroclaw"))
+                    .unwrap_or_else(|_| std::env::temp_dir());
+                let http = crate::config::build_runtime_proxy_client_with_timeouts(
+                    "tool.google_workspace",
+                    timeout_secs,
+                    10,
+                );
+                let tokens =
+                    super::google::auth::GoogleTokenCache::new(id, secret, refresh, &cache_dir);
+                Some(Arc::new(GoogleApiClient { http, tokens }))
+            }
+            _ => None,
+        };
+
         Self {
             security,
             allowed_services: services,
@@ -74,6 +108,7 @@ impl GoogleWorkspaceTool {
             rate_limit_per_minute,
             timeout_secs,
             audit_log,
+            api_client,
         }
     }
 
@@ -107,6 +142,58 @@ impl GoogleWorkspaceTool {
         args
     }
 
+    /// Execute a calendar (or other direct-API) call without spawning gws.
+    async fn execute_via_api(
+        &self,
+        api: &GoogleApiClient,
+        service: &str,
+        resource: &str,
+        method: &str,
+        params: Option<serde_json::Value>,
+        body: Option<serde_json::Value>,
+    ) -> anyhow::Result<ToolResult> {
+        if self.audit_log {
+            tracing::info!(
+                tool = "google_workspace",
+                service,
+                resource,
+                method,
+                "google_api audit: executing direct API call"
+            );
+        }
+
+        let token = api.tokens.get_token(&api.http).await?;
+
+        let result = match service {
+            "calendar" => {
+                super::google::calendar_client::dispatch(
+                    &api.http,
+                    &token,
+                    resource,
+                    method,
+                    params,
+                    body,
+                    self.timeout_secs,
+                )
+                .await
+            }
+            other => anyhow::bail!("direct API not implemented for service '{other}'"),
+        };
+
+        match result {
+            Ok(value) => Ok(ToolResult {
+                success: true,
+                output: serde_json::to_string_pretty(&value).unwrap_or_default(),
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
     fn is_operation_allowed(
         &self,
         service: &str,
@@ -133,8 +220,13 @@ impl Tool for GoogleWorkspaceTool {
     }
 
     fn description(&self) -> &str {
-        "Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) \
-         via the gws CLI. Requires gws to be installed and authenticated."
+        if self.api_client.is_some() {
+            "Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.). \
+             Calendar operations use the Google Calendar API directly; other services use the gws CLI."
+        } else {
+            "Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) \
+             via the gws CLI. Requires gws to be installed and authenticated."
+        }
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -377,6 +469,18 @@ impl Tool for GoogleWorkspaceTool {
             });
         }
 
+        // Route to direct Google API when credentials are configured and the
+        // service has a native implementation (currently: calendar).
+        if let Some(ref api) = self.api_client {
+            if service == "calendar" {
+                let params_val = args.get("params").cloned();
+                let body_val = args.get("body").cloned();
+                return self
+                    .execute_via_api(api, service, resource, method, params_val, body_val)
+                    .await;
+            }
+        }
+
         let mut cmd = tokio::process::Command::new("gws");
         cmd.args(&cmd_args);
         cmd.env_clear();
@@ -477,22 +581,55 @@ mod tests {
 
     #[test]
     fn tool_name() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         assert_eq!(tool.name(), "google_workspace");
     }
 
     #[test]
     fn tool_description_non_empty() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn tool_schema_has_required_fields() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["service"].is_object());
         assert!(schema["properties"]["resource"].is_object());
@@ -507,8 +644,19 @@ mod tests {
 
     #[test]
     fn default_allowed_services_populated() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         assert!(!tool.allowed_services.is_empty());
         assert!(tool.allowed_services.contains(&"drive".to_string()));
         assert!(tool.allowed_services.contains(&"gmail".to_string()));
@@ -521,6 +669,9 @@ mod tests {
             test_security(),
             vec!["drive".into(), "sheets".into()],
             vec![],
+            None,
+            None,
+            None,
             None,
             None,
             60,
@@ -539,6 +690,9 @@ mod tests {
             test_security(),
             vec!["drive".into()],
             vec![],
+            None,
+            None,
+            None,
             None,
             None,
             60,
@@ -569,6 +723,9 @@ mod tests {
             vec![],
             None,
             None,
+            None,
+            None,
+            None,
             60,
             30,
             false,
@@ -591,8 +748,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_shell_injection_in_resource() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -611,8 +779,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_format() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -632,8 +811,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_params() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -653,8 +843,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_body() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -674,8 +875,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_all() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -695,8 +907,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_limit() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -716,8 +939,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_sub_resource() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -737,8 +971,19 @@ mod tests {
 
     #[tokio::test]
     async fn missing_required_param_returns_error() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool.execute(json!({"service": "drive"})).await;
         assert!(result.is_err());
     }
@@ -751,7 +996,19 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = GoogleWorkspaceTool::new(security, vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            security,
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -771,8 +1028,19 @@ mod tests {
 
     #[test]
     fn operation_allowlist_defaults_to_allow_all() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         // Empty allowlist: everything passes regardless of sub_resource
         assert!(tool.is_operation_allowed("gmail", "users", Some("messages"), "send"));
         assert!(tool.is_operation_allowed("drive", "files", None, "list"));
@@ -789,6 +1057,9 @@ mod tests {
                 sub_resource: Some("drafts".into()),
                 methods: vec!["create".into(), "update".into()],
             }],
+            None,
+            None,
+            None,
             None,
             None,
             60,
@@ -820,6 +1091,9 @@ mod tests {
             }],
             None,
             None,
+            None,
+            None,
+            None,
             60,
             30,
             false,
@@ -844,6 +1118,9 @@ mod tests {
                 sub_resource: Some("drafts".into()),
                 methods: vec!["create".into()],
             }],
+            None,
+            None,
+            None,
             None,
             None,
             60,
@@ -881,6 +1158,9 @@ mod tests {
                 sub_resource: Some("drafts".into()),
                 methods: vec!["create".into()],
             }],
+            None,
+            None,
+            None,
             None,
             None,
             60,
@@ -949,6 +1229,9 @@ mod tests {
             }],
             None,
             None,
+            None,
+            None,
+            None,
             60,
             30,
             false,
@@ -986,6 +1269,9 @@ mod tests {
                 sub_resource: Some(" drafts ".into()),
                 methods: vec![" create ".into()],
             }],
+            None,
+            None,
+            None,
             None,
             None,
             60,

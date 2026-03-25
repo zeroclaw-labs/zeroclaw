@@ -2594,13 +2594,29 @@ pub struct GoogleWorkspaceConfig {
     /// When `None`, the currently active `gws` account is used.
     #[serde(default)]
     pub default_account: Option<String>,
-    /// Maximum number of `gws` API calls allowed per minute. Default: `60`.
+    /// OAuth 2.0 client ID for direct Google API access.
+    ///
+    /// When all three `oauth_*` fields are set, the tool calls Google APIs
+    /// directly via HTTP (using the refresh token flow) instead of spawning
+    /// the `gws` CLI binary. Obtain from Google Cloud Console →
+    /// APIs & Services → Credentials → OAuth 2.0 Client IDs.
+    #[serde(default)]
+    pub oauth_client_id: Option<String>,
+    /// OAuth 2.0 client secret corresponding to `oauth_client_id`.
+    #[serde(default)]
+    pub oauth_client_secret: Option<String>,
+    /// OAuth 2.0 refresh token for obtaining access tokens without user
+    /// interaction. Run `gws auth login` once to get a refresh token, then
+    /// store it here to enable the direct-API path.
+    #[serde(default)]
+    pub oauth_refresh_token: Option<String>,
+    /// Maximum number of API calls allowed per minute. Default: `60`.
     #[serde(default = "default_gws_rate_limit")]
     pub rate_limit_per_minute: u32,
-    /// Command execution timeout in seconds. Default: `30`.
+    /// Request timeout in seconds. Default: `30`.
     #[serde(default = "default_gws_timeout_secs")]
     pub timeout_secs: u64,
-    /// Enable audit logging of every `gws` invocation (service, resource,
+    /// Enable audit logging of every API invocation (service, resource,
     /// method, timestamp). Default: `false`.
     #[serde(default)]
     pub audit_log: bool,
@@ -2622,6 +2638,9 @@ impl Default for GoogleWorkspaceConfig {
             allowed_operations: Vec::new(),
             credentials_path: None,
             default_account: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
+            oauth_refresh_token: None,
             rate_limit_per_minute: default_gws_rate_limit(),
             timeout_secs: default_gws_timeout_secs(),
             audit_log: false,
