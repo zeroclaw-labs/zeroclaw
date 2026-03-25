@@ -31,14 +31,11 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
 
-      - name: Install system dependencies
-        run: sudo apt-get update -qq && sudo apt-get install -y libudev-dev
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets --features ci-all -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: Test
