@@ -491,6 +491,11 @@ fn build_ws_system_prompt(
         native_tools,
         config.skills.prompt_injection_mode,
     );
+
+    // Inject API key inventory so the agent knows which providers/tools are available
+    let api_key_inventory = crate::config::build_api_key_inventory(&config);
+    prompt.push_str(&api_key_inventory.to_prompt_section());
+
     if !native_tools {
         prompt.push_str(&build_tool_instructions_from_specs(&tool_specs));
     }

@@ -1821,6 +1821,194 @@ pub fn resolve_provider_access_mode(config: &Config) -> ProviderAccessMode {
     ProviderAccessMode::Platform
 }
 
+// ── API Key Inventory ─────────────────────────────────────────────
+
+/// Summary of which API keys the user has configured.
+///
+/// Built at startup so the agent knows which LLM providers and tools
+/// are available, and can route requests accordingly.
+#[derive(Debug, Clone, Default)]
+pub struct ApiKeyInventory {
+    /// LLM provider keys detected (provider name → true if key present).
+    pub providers: Vec<(String, bool)>,
+    /// Tool-specific keys detected (tool/service name → true if key present).
+    pub tools: Vec<(String, bool)>,
+    /// The primary provider access mode.
+    pub access_mode: Option<ProviderAccessMode>,
+}
+
+impl ApiKeyInventory {
+    /// Format the inventory as a system-prompt section so the agent
+    /// knows which capabilities are available at session start.
+    pub fn to_prompt_section(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(1024);
+        out.push_str("## API Key Status (checked at startup)\n\n");
+        out.push_str("The following shows which API keys the user has configured.\n");
+        out.push_str("Use ONLY the providers/tools whose keys are available.\n");
+        out.push_str("If a key is missing, guide the user to configure it when they need that capability.\n\n");
+
+        // Access mode
+        if let Some(mode) = &self.access_mode {
+            let mode_str = match mode {
+                ProviderAccessMode::UserKey => "UserKey (user's own API key)",
+                ProviderAccessMode::Platform => "Platform (managed, credits charged)",
+            };
+            let _ = writeln!(out, "**Access mode:** {mode_str}\n");
+        }
+
+        // LLM providers
+        out.push_str("### LLM Providers\n");
+        for (name, available) in &self.providers {
+            let status = if *available { "configured" } else { "not configured" };
+            let icon = if *available { "[O]" } else { "[X]" };
+            let _ = writeln!(out, "- {icon} **{name}**: {status}");
+        }
+        out.push('\n');
+
+        // Tools
+        out.push_str("### Tool API Keys\n");
+        for (name, available) in &self.tools {
+            let status = if *available { "configured" } else { "not configured" };
+            let icon = if *available { "[O]" } else { "[X]" };
+            let _ = writeln!(out, "- {icon} **{name}**: {status}");
+        }
+        out.push_str("\n**Note:** Tools without API keys may still work with free fallbacks (e.g., web_search falls back to DuckDuckGo).\n");
+        out.push_str("When the user requests a tool that requires a missing API key, inform them and offer setup guidance.\n\n");
+
+        out
+    }
+}
+
+/// Build an inventory of all API keys the user has configured.
+///
+/// Checks config fields and environment variables for each provider and tool.
+/// Called once at startup; the result is injected into the system prompt so the
+/// agent can make informed routing decisions.
+pub fn build_api_key_inventory(config: &Config) -> ApiKeyInventory {
+    let mut inventory = ApiKeyInventory::default();
+    inventory.access_mode = Some(resolve_provider_access_mode(config));
+
+    // ── LLM provider keys ──────────────────────────────────────
+    let provider_checks: &[(&str, &[&str])] = &[
+        ("anthropic", &["ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN"]),
+        ("openai", &["OPENAI_API_KEY"]),
+        ("gemini", &["GEMINI_API_KEY", "GOOGLE_API_KEY"]),
+        ("openrouter", &["OPENROUTER_API_KEY"]),
+        ("deepseek", &["DEEPSEEK_API_KEY"]),
+        ("xai", &["XAI_API_KEY"]),
+        ("groq", &["GROQ_API_KEY"]),
+        ("mistral", &["MISTRAL_API_KEY"]),
+        ("perplexity", &["PERPLEXITY_API_KEY"]),
+        ("cohere", &["COHERE_API_KEY"]),
+        ("moonshot", &["MOONSHOT_API_KEY"]),
+        ("glm", &["GLM_API_KEY"]),
+        ("qwen", &["DASHSCOPE_API_KEY"]),
+    ];
+
+    for &(name, env_vars) in provider_checks {
+        let has_key = config
+            .provider_api_keys
+            .get(name)
+            .is_some_and(|k| !k.trim().is_empty())
+            || env_vars.iter().any(|var| {
+                std::env::var(var)
+                    .ok()
+                    .is_some_and(|v| !v.trim().is_empty())
+            });
+        inventory.providers.push((name.to_string(), has_key));
+    }
+
+    // ── Tool API keys ──────────────────────────────────────────
+    // Perplexity Search (dedicated tool)
+    let has_perplexity_search = config
+        .perplexity_search
+        .api_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty())
+        || std::env::var("ZEROCLAW_PERPLEXITY_SEARCH_API_KEY")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty())
+        || std::env::var("PERPLEXITY_API_KEY")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
+    inventory
+        .tools
+        .push(("perplexity_search".to_string(), has_perplexity_search));
+
+    // Brave Search
+    let has_brave = config
+        .web_search
+        .brave_api_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty())
+        || std::env::var("BRAVE_API_KEY")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
+    inventory
+        .tools
+        .push(("brave_search".to_string(), has_brave));
+
+    // Exa Search
+    let has_exa = config
+        .web_search
+        .exa_api_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty())
+        || std::env::var("EXA_API_KEY")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
+    inventory
+        .tools
+        .push(("exa_search".to_string(), has_exa));
+
+    // Jina Search
+    let has_jina = config
+        .web_search
+        .jina_api_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty())
+        || std::env::var("JINA_API_KEY")
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
+    inventory
+        .tools
+        .push(("jina_search".to_string(), has_jina));
+
+    // Composio
+    let has_composio = config.composio.enabled
+        && config
+            .composio
+            .api_key
+            .as_ref()
+            .is_some_and(|k| !k.trim().is_empty());
+    inventory
+        .tools
+        .push(("composio".to_string(), has_composio));
+
+    // Web search (Perplexity as web_search provider)
+    let has_web_search_perplexity = config
+        .web_search
+        .perplexity_api_key
+        .as_ref()
+        .is_some_and(|k| !k.trim().is_empty());
+    inventory.tools.push((
+        "web_search_perplexity".to_string(),
+        has_web_search_perplexity,
+    ));
+
+    // Log summary
+    let provider_count = inventory.providers.iter().filter(|(_, v)| *v).count();
+    let tool_count = inventory.tools.iter().filter(|(_, v)| *v).count();
+    tracing::info!(
+        providers_configured = provider_count,
+        tools_configured = tool_count,
+        "API key inventory built"
+    );
+
+    inventory
+}
+
 /// Build default `[[model_routes]]` for platform mode based on task-specific defaults.
 ///
 /// These routes are injected when the user has no API key and no explicit model selection,
@@ -15921,6 +16109,81 @@ reserve_percent = 15
         assert!(config.model_routes.iter().any(|r| r.hint == "daily"));
 
         clear_route_env_vars();
+    }
+
+    // ── API key inventory tests ─────────────────────────────────
+
+    #[test]
+    async fn api_key_inventory_default_config_has_no_keys() {
+        let config = Config::default();
+        let inventory = build_api_key_inventory(&config);
+
+        // Default config has no API keys configured
+        assert!(inventory.providers.iter().all(|(_, v)| !v));
+        assert!(inventory.tools.iter().all(|(_, v)| !v));
+        assert_eq!(
+            inventory.access_mode,
+            Some(ProviderAccessMode::Platform)
+        );
+    }
+
+    #[test]
+    async fn api_key_inventory_detects_perplexity_config_key() {
+        let mut config = Config::default();
+        config.perplexity_search.api_key = Some("pplx-test-key".to_string());
+
+        let inventory = build_api_key_inventory(&config);
+
+        let pplx = inventory
+            .tools
+            .iter()
+            .find(|(name, _)| name == "perplexity_search");
+        assert!(pplx.is_some());
+        assert!(pplx.unwrap().1, "perplexity_search should be detected");
+    }
+
+    #[test]
+    async fn api_key_inventory_detects_provider_api_keys_map() {
+        let mut config = Config::default();
+        config
+            .provider_api_keys
+            .insert("anthropic".to_string(), "sk-ant-test".to_string());
+
+        let inventory = build_api_key_inventory(&config);
+
+        let anthropic = inventory
+            .providers
+            .iter()
+            .find(|(name, _)| name == "anthropic");
+        assert!(anthropic.is_some());
+        assert!(anthropic.unwrap().1, "anthropic should be detected");
+    }
+
+    #[test]
+    async fn api_key_inventory_prompt_section_contains_providers_and_tools() {
+        let config = Config::default();
+        let inventory = build_api_key_inventory(&config);
+        let section = inventory.to_prompt_section();
+
+        assert!(section.contains("API Key Status"));
+        assert!(section.contains("LLM Providers"));
+        assert!(section.contains("Tool API Keys"));
+        assert!(section.contains("perplexity_search"));
+        assert!(section.contains("brave_search"));
+    }
+
+    #[test]
+    async fn api_key_inventory_brave_key_detected() {
+        let mut config = Config::default();
+        config.web_search.brave_api_key = Some("brave-test".to_string());
+
+        let inventory = build_api_key_inventory(&config);
+        let brave = inventory
+            .tools
+            .iter()
+            .find(|(name, _)| name == "brave_search");
+        assert!(brave.is_some());
+        assert!(brave.unwrap().1);
     }
 }
 

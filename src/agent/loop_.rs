@@ -2680,6 +2680,10 @@ pub async fn run(
         config.skills.prompt_injection_mode,
     );
 
+    // Inject API key inventory so the agent knows which providers/tools are available
+    let api_key_inventory = crate::config::build_api_key_inventory(&config);
+    system_prompt.push_str(&api_key_inventory.to_prompt_section());
+
     // Append structured tool-use instructions with schemas (only for non-native providers)
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
@@ -3411,6 +3415,11 @@ pub async fn process_message_with_session(
         native_tools,
         config.skills.prompt_injection_mode,
     );
+
+    // Inject API key inventory so the agent knows which providers/tools are available
+    let api_key_inventory = crate::config::build_api_key_inventory(&config);
+    system_prompt.push_str(&api_key_inventory.to_prompt_section());
+
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
