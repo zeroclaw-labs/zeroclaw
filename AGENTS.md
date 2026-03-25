@@ -6,7 +6,7 @@ Cross-tool agent instructions for any AI coding assistant working on this reposi
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --features ci-all -- -D warnings
 cargo test
 ```
 
