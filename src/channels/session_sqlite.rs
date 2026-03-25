@@ -12,6 +12,13 @@ use parking_lot::Mutex;
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 
+/// A message paired with its creation timestamp, for context injection.
+#[derive(Clone)]
+pub struct TimestampedMessage {
+    pub created_at: String,
+    pub message: ChatMessage,
+}
+
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     pub(crate) conn: Mutex<Connection>,
@@ -86,6 +93,41 @@ impl SqliteSessionBackend {
             conn: Mutex::new(conn),
             db_path,
         })
+    }
+
+    /// Like [`SessionBackend::load_since`] but also returns the `created_at`
+    /// timestamp for each row.  Used by group-context injection so the LLM can
+    /// reason about message recency.
+    pub fn load_since_with_time(
+        &self,
+        session_key: &str,
+        since: DateTime<Utc>,
+    ) -> Vec<TimestampedMessage> {
+        let conn = self.conn.lock();
+        let since_str = since.to_rfc3339();
+        let mut stmt = match conn.prepare(
+            "SELECT role, content, created_at FROM sessions \
+             WHERE session_key = ?1 AND created_at >= ?2 \
+             ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows = match stmt.query_map(params![session_key, since_str], |row| {
+            Ok(TimestampedMessage {
+                message: ChatMessage {
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                },
+                created_at: row.get(2)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        rows.filter_map(|r| r.ok()).collect()
     }
 
     /// Migrate JSONL session files into SQLite. Renames migrated files to `.jsonl.migrated`.

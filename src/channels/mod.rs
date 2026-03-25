@@ -710,11 +710,9 @@ fn load_group_context(
     max_messages: usize,
     max_chars: usize,
 ) -> String {
-    use crate::channels::session_backend::SessionBackend;
-
     let since = chrono::Utc::now() - chrono::Duration::minutes(window_minutes as i64);
     let session_key = format!("observe_whatsapp_{group_jid}");
-    let messages = observe_store.load_since(&session_key, since);
+    let messages = observe_store.load_since_with_time(&session_key, since);
 
     if messages.is_empty() {
         return String::new();
@@ -727,8 +725,22 @@ fn load_group_context(
         messages
     };
 
-    // Build transcript lines, truncating from the front if over char budget
-    let mut lines: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+    // Format with timestamps so the LLM can reason about recency
+    let mut lines: Vec<String> = messages
+        .iter()
+        .map(|m| {
+            let time = chrono::DateTime::parse_from_rfc3339(&m.created_at)
+                .map(|dt| dt.format("%H:%M").to_string())
+                .unwrap_or_default();
+            if time.is_empty() {
+                m.message.content.clone()
+            } else {
+                format!("[{time}] {}", m.message.content)
+            }
+        })
+        .collect();
+
+    // Truncate from the front if over char budget
     let mut total_chars: usize = lines.iter().map(|l| l.len() + 1).sum(); // +1 for newline
     while total_chars > max_chars && lines.len() > 1 {
         total_chars -= lines[0].len() + 1;
@@ -736,8 +748,10 @@ fn load_group_context(
     }
 
     let header = "## Recent Group Conversation\n\n\
-        The following messages were sent recently in this group before you were mentioned. \
-        Use them as background context only. Do not respond to these messages directly.\n";
+        The following messages were sent in this group before you were mentioned \
+        (timestamps in UTC, most recent last). Pay close attention to the last few \
+        messages — they represent the current conversation flow. Reference them when \
+        relevant.\n";
 
     format!("{header}\n{}", lines.join("\n"))
 }
@@ -10776,7 +10790,9 @@ This is an example JSON object for profile settings."#;
 
         let result = load_group_context(&store, "group123@g.us", 15, 30, 2000);
         assert!(result.contains("Recent Group Conversation"));
-        assert!(result.contains("[+111] Hello everyone"));
+        // Timestamps should now be prepended as [HH:MM]
+        let expected_time = recent.format("%H:%M").to_string();
+        assert!(result.contains(&format!("[{expected_time}] [+111] Hello everyone")));
         assert!(result.contains("[+222] Anyone know a plumber?"));
         assert!(result.contains("[+333] Try Pedro"));
     }
