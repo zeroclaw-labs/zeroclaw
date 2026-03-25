@@ -999,6 +999,11 @@ impl Agent {
             // ── Streaming LLM call ────────────────────────────────────
             // Try streaming first; if the provider returns content we
             // forward deltas.  Otherwise fall back to non-streaming chat.
+            //
+            // Use `stream_chat` (not `stream_chat_with_history`) because
+            // providers like Anthropic only implement `stream_chat`; the
+            // default `stream_chat_with_history` returns an empty stream
+            // causing a silent fallback to non-streaming on every turn.
             use futures_util::StreamExt;
 
             let stream_opts = crate::providers::traits::StreamOptions::new(true);
