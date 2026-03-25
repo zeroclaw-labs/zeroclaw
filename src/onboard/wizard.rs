@@ -68,6 +68,79 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
     channels.channels_except_webhook().iter().any(|(_, ok)| *ok)
 }
 
+fn merge_channel_repair_updates(
+    existing: ChannelsConfig,
+    updates: ChannelsConfig,
+) -> ChannelsConfig {
+    let mut merged = existing;
+
+    if let Some(telegram) = updates.telegram {
+        merged.telegram = Some(telegram);
+    }
+    if let Some(discord) = updates.discord {
+        merged.discord = Some(discord);
+    }
+    if let Some(slack) = updates.slack {
+        merged.slack = Some(slack);
+    }
+    if let Some(mattermost) = updates.mattermost {
+        merged.mattermost = Some(mattermost);
+    }
+    if let Some(webhook) = updates.webhook {
+        merged.webhook = Some(webhook);
+    }
+    if let Some(imessage) = updates.imessage {
+        merged.imessage = Some(imessage);
+    }
+    if let Some(matrix) = updates.matrix {
+        merged.matrix = Some(matrix);
+    }
+    if let Some(signal) = updates.signal {
+        merged.signal = Some(signal);
+    }
+    if let Some(whatsapp) = updates.whatsapp {
+        merged.whatsapp = Some(whatsapp);
+    }
+    if let Some(linq) = updates.linq {
+        merged.linq = Some(linq);
+    }
+    if let Some(wati) = updates.wati {
+        merged.wati = Some(wati);
+    }
+    if let Some(nextcloud_talk) = updates.nextcloud_talk {
+        merged.nextcloud_talk = Some(nextcloud_talk);
+    }
+    if let Some(email) = updates.email {
+        merged.email = Some(email);
+    }
+    if let Some(irc) = updates.irc {
+        merged.irc = Some(irc);
+    }
+    if let Some(lark) = updates.lark {
+        merged.lark = Some(lark);
+    }
+    if let Some(feishu) = updates.feishu {
+        merged.feishu = Some(feishu);
+    }
+    if let Some(dingtalk) = updates.dingtalk {
+        merged.dingtalk = Some(dingtalk);
+    }
+    if let Some(wecom) = updates.wecom {
+        merged.wecom = Some(wecom);
+    }
+    if let Some(qq) = updates.qq {
+        merged.qq = Some(qq);
+    }
+    #[cfg(feature = "channel-nostr")]
+    if let Some(nostr) = updates.nostr {
+        merged.nostr = Some(nostr);
+    }
+    if let Some(clawdtalk) = updates.clawdtalk {
+        merged.clawdtalk = Some(clawdtalk);
+    }
+    merged
+}
+
 // ── Main wizard entry point ──────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,7 +347,9 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     let mut config = Box::pin(Config::load_or_init()).await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
-    config.channels_config = setup_channels()?;
+    let updated_channels = setup_channels()?;
+    let existing_channels = std::mem::take(&mut config.channels_config);
+    config.channels_config = merge_channel_repair_updates(existing_channels, updated_channels);
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
 
@@ -6121,6 +6196,73 @@ mod tests {
         );
         assert!(config.api_key.is_none());
         assert!(config.api_url.is_none());
+    }
+
+    #[test]
+    fn merge_channel_repair_updates_preserves_unedited_channels() {
+        let mut existing = ChannelsConfig::default();
+        existing.cli = false;
+        existing.message_timeout_secs = 777;
+        existing.ack_reactions = false;
+        existing.discord = Some(DiscordConfig {
+            bot_token: "discord-old".to_string(),
+            guild_id: Some("guild-1".to_string()),
+            allowed_users: vec!["u1".to_string()],
+            listen_to_bots: false,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            proxy_url: None,
+        });
+        existing.matrix = Some(MatrixConfig {
+            homeserver: "https://matrix.old".to_string(),
+            access_token: "matrix-token-old".to_string(),
+            user_id: Some("@bot:old".to_string()),
+            device_id: Some("OLDDEV".to_string()),
+            room_id: "!old:matrix.old".to_string(),
+            allowed_users: vec!["*".to_string()],
+            allowed_rooms: vec!["!old:matrix.old".to_string()],
+            interrupt_on_new_message: false,
+        });
+
+        let mut updates = ChannelsConfig::default();
+        updates.telegram = Some(TelegramConfig {
+            bot_token: "telegram-new".to_string(),
+            allowed_users: vec!["owner".to_string()],
+            stream_mode: StreamMode::Off,
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
+        });
+        updates.matrix = Some(MatrixConfig {
+            homeserver: "https://matrix.new".to_string(),
+            access_token: "matrix-token-new".to_string(),
+            user_id: Some("@bot:new".to_string()),
+            device_id: Some("NEWDEV".to_string()),
+            room_id: "!new:matrix.new".to_string(),
+            allowed_users: vec!["@admin:matrix.new".to_string()],
+            allowed_rooms: vec!["!new:matrix.new".to_string()],
+            interrupt_on_new_message: true,
+        });
+
+        let merged = merge_channel_repair_updates(existing, updates);
+
+        assert!(!merged.cli);
+        assert_eq!(merged.message_timeout_secs, 777);
+        assert!(!merged.ack_reactions);
+        assert_eq!(
+            merged.discord.as_ref().map(|cfg| cfg.bot_token.as_str()),
+            Some("discord-old")
+        );
+        assert_eq!(
+            merged.telegram.as_ref().map(|cfg| cfg.bot_token.as_str()),
+            Some("telegram-new")
+        );
+        assert_eq!(
+            merged.matrix.as_ref().map(|cfg| cfg.room_id.as_str()),
+            Some("!new:matrix.new")
+        );
     }
 
     #[tokio::test]
