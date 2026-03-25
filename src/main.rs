@@ -1053,7 +1053,8 @@ async fn main() -> Result<()> {
                     info!("🔄 Restarting ZeroClaw Gateway on {addr}");
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(&host, port).await {
+                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
+                    {
                         Ok(()) => {
                             info!("   ✓ Existing gateway on {addr} shut down gracefully");
                             // Poll until the port is free (connection refused) or timeout
@@ -1089,7 +1090,9 @@ async fn main() -> Result<()> {
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, new).await {
+                    match fetch_paircode(host, port, config.gateway.path_prefix.as_deref(), new)
+                        .await
+                    {
                         Ok(Some(code)) => {
                             println!("🔐 Gateway pairing is enabled.");
                             println!();
@@ -1822,8 +1825,8 @@ fn log_gateway_start(host: &str, port: u16) {
 }
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
-async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
-    let url = format!("http://{host}:{port}/admin/shutdown");
+async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> Result<()> {
+    let url = gateway_admin_url(host, port, path_prefix, "/admin/shutdown");
     let client = reqwest::Client::new();
 
     match client
@@ -1843,12 +1846,22 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 
 /// Fetch the current pairing code from a running gateway.
 /// If `new` is true, generates a fresh pairing code via POST request.
-async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
+fn gateway_admin_url(host: &str, port: u16, path_prefix: Option<&str>, route: &str) -> String {
+    let prefix = path_prefix.unwrap_or("");
+    format!("http://{host}:{port}{prefix}{route}")
+}
+
+async fn fetch_paircode(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    new: bool,
+) -> Result<Option<String>> {
     let client = reqwest::Client::new();
 
     let response = if new {
         // Generate a new pairing code via POST
-        let url = format!("http://{host}:{port}/admin/paircode/new");
+        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode/new");
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -1856,7 +1869,7 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
             .await
     } else {
         // Get existing pairing code via GET
-        let url = format!("http://{host}:{port}/admin/paircode");
+        let url = gateway_admin_url(host, port, path_prefix, "/admin/paircode");
         client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -2651,6 +2664,24 @@ mod tests {
             script.contains("zeroclaw"),
             "completion script should reference binary name"
         );
+    }
+
+    #[test]
+    fn gateway_admin_url_without_path_prefix_uses_root_admin_path() {
+        let url = gateway_admin_url("127.0.0.1", 42617, None, "/admin/paircode");
+        assert_eq!(url, "http://127.0.0.1:42617/admin/paircode");
+    }
+
+    #[test]
+    fn gateway_admin_url_with_path_prefix_nests_admin_path() {
+        let url = gateway_admin_url("127.0.0.1", 42617, Some("/zeroclaw"), "/admin/paircode");
+        assert_eq!(url, "http://127.0.0.1:42617/zeroclaw/admin/paircode");
+    }
+
+    #[test]
+    fn gateway_admin_url_with_path_prefix_nests_shutdown_path() {
+        let url = gateway_admin_url("127.0.0.1", 42617, Some("/zeroclaw"), "/admin/shutdown");
+        assert_eq!(url, "http://127.0.0.1:42617/zeroclaw/admin/shutdown");
     }
 
     #[test]
