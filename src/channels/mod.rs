@@ -113,6 +113,7 @@ use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::traits::{ObserverEvent, ObserverMetric};
 use crate::observability::{self, runtime_trace, Observer};
+use crate::providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -2712,90 +2713,95 @@ async fn process_channel_message(
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
-    let llm_result = loop {
-        let loop_result = tokio::select! {
-            () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
-            result = tokio::time::timeout(
-                Duration::from_secs(timeout_budget_secs),
-                crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                    cost_tracking_context.clone(),
-                run_tool_call_loop(
-                    active_provider.as_ref(),
-                    &mut history,
-                    ctx.tools_registry.as_ref(),
-                    notify_observer.as_ref() as &dyn Observer,
-                    route.provider.as_str(),
-                    route.model.as_str(),
-                    runtime_defaults.temperature,
-                    true,
-                    Some(&*ctx.approval_manager),
-                    msg.channel.as_str(),
-                    Some(msg.reply_target.as_str()),
-                    &ctx.multimodal,
-                    ctx.max_tool_iterations,
-                    Some(cancellation_token.clone()),
-                    delta_tx.clone(),
-                    ctx.hooks.as_deref(),
-                    if msg.channel == "cli"
-                        || ctx.autonomy_level == AutonomyLevel::Full
+    let (llm_result, fallback_info) = scope_provider_fallback(async {
+        let llm_result = loop {
+            let loop_result = tokio::select! {
+                () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
+                result = tokio::time::timeout(
+                    Duration::from_secs(timeout_budget_secs),
+                    crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                        cost_tracking_context.clone(),
+                    run_tool_call_loop(
+                        active_provider.as_ref(),
+                        &mut history,
+                        ctx.tools_registry.as_ref(),
+                        notify_observer.as_ref() as &dyn Observer,
+                        route.provider.as_str(),
+                        route.model.as_str(),
+                        runtime_defaults.temperature,
+                        true,
+                        Some(&*ctx.approval_manager),
+                        msg.channel.as_str(),
+                        Some(msg.reply_target.as_str()),
+                        &ctx.multimodal,
+                        ctx.max_tool_iterations,
+                        Some(cancellation_token.clone()),
+                        delta_tx.clone(),
+                        ctx.hooks.as_deref(),
+                        if msg.channel == "cli"
+                            || ctx.autonomy_level == AutonomyLevel::Full
+                        {
+                            &[]
+                        } else {
+                            ctx.non_cli_excluded_tools.as_ref()
+                        },
+                        ctx.tool_call_dedup_exempt.as_ref(),
+                        ctx.activated_tools.as_ref(),
+                        Some(model_switch_callback.clone()),
+                        &ctx.pacing,
+                    ),
+                    ),
+                ) => LlmExecutionResult::Completed(result),
+            };
+
+            // Handle model switch: re-create the provider and retry
+            if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
+                if let Some((new_provider, new_model)) = is_model_switch_requested(e) {
+                    tracing::info!(
+                        "Model switch requested, switching from {} {} to {} {}",
+                        route.provider,
+                        route.model,
+                        new_provider,
+                        new_model
+                    );
+
+                    match create_resilient_provider_nonblocking(
+                        &new_provider,
+                        ctx.api_key.clone(),
+                        ctx.api_url.clone(),
+                        ctx.reliability.as_ref().clone(),
+                        ctx.provider_runtime_options.clone(),
+                    )
+                    .await
                     {
-                        &[]
-                    } else {
-                        ctx.non_cli_excluded_tools.as_ref()
-                    },
-                    ctx.tool_call_dedup_exempt.as_ref(),
-                    ctx.activated_tools.as_ref(),
-                    Some(model_switch_callback.clone()),
-                    &ctx.pacing,
-                ),
-                ),
-            ) => LlmExecutionResult::Completed(result),
-        };
+                        Ok(new_prov) => {
+                            active_provider = Arc::from(new_prov);
+                            route.provider = new_provider;
+                            route.model = new_model;
+                            clear_model_switch_request();
 
-        // Handle model switch: re-create the provider and retry
-        if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result {
-            if let Some((new_provider, new_model)) = is_model_switch_requested(e) {
-                tracing::info!(
-                    "Model switch requested, switching from {} {} to {} {}",
-                    route.provider,
-                    route.model,
-                    new_provider,
-                    new_model
-                );
+                            ctx.observer.record_event(&ObserverEvent::AgentStart {
+                                provider: route.provider.clone(),
+                                model: route.model.clone(),
+                            });
 
-                match create_resilient_provider_nonblocking(
-                    &new_provider,
-                    ctx.api_key.clone(),
-                    ctx.api_url.clone(),
-                    ctx.reliability.as_ref().clone(),
-                    ctx.provider_runtime_options.clone(),
-                )
-                .await
-                {
-                    Ok(new_prov) => {
-                        active_provider = Arc::from(new_prov);
-                        route.provider = new_provider;
-                        route.model = new_model;
-                        clear_model_switch_request();
-
-                        ctx.observer.record_event(&ObserverEvent::AgentStart {
-                            provider: route.provider.clone(),
-                            model: route.model.clone(),
-                        });
-
-                        continue;
-                    }
-                    Err(err) => {
-                        tracing::error!("Failed to create provider after model switch: {err}");
-                        clear_model_switch_request();
-                        // Fall through with the original error
+                            continue;
+                        }
+                        Err(err) => {
+                            tracing::error!("Failed to create provider after model switch: {err}");
+                            clear_model_switch_request();
+                            // Fall through with the original error
+                        }
                     }
                 }
             }
-        }
 
-        break loop_result;
-    };
+            break loop_result;
+        };
+        let fb = take_last_provider_fallback();
+        (llm_result, fb)
+    })
+    .await;
 
     // Drop the delta sender so the draft updater task can finish
     // (rx.recv() returns None only when all senders are dropped).
@@ -2929,13 +2935,32 @@ async fn process_channel_message(
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
-            let delivered_response = if sanitized_response.is_empty()
+            let mut delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
             } else {
                 sanitized_response
             };
+
+            // Append a footer when the response was served by a different provider family.
+            // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
+            if let Some(fb) = fallback_info.as_ref() {
+                let req_base = fb.requested_provider.split(':').next().unwrap_or("");
+                let act_base = fb.actual_provider.split(':').next().unwrap_or("");
+                let same_family = req_base == act_base
+                    || req_base.starts_with(act_base)
+                    || act_base.starts_with(req_base);
+                if !same_family {
+                    use std::fmt::Write as _;
+                    write!(
+                        delivered_response,
+                        "\n\n---\n\u{26A1} `{}` unavailable \u{2014} response from **{}** (`{}`)\nSwitch model: /models",
+                        fb.requested_provider, fb.actual_provider, fb.actual_model,
+                    )
+                    .ok();
+                }
+            }
 
             runtime_trace::record_event(
                 "channel_message_outbound",
