@@ -229,6 +229,38 @@ pub async fn handle_api_tools(
     Json(serde_json::json!({"tools": tools})).into_response()
 }
 
+/// GET /api/channels — list configured channels for the dashboard
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let channels: Vec<serde_json::Value> = config
+        .channels_config
+        .channels()
+        .into_iter()
+        .map(|(channel, enabled)| {
+            let status = if enabled { "active" } else { "inactive" };
+            let health = if enabled { "healthy" } else { "down" };
+            serde_json::json!({
+                "name": channel.name(),
+                "type": channel.desc(),
+                "enabled": enabled,
+                "status": status,
+                "message_count": 0,
+                "last_message_at": serde_json::Value::Null,
+                "health": health,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "channels": channels })).into_response()
+}
+
 /// GET /api/cron — list cron jobs
 pub async fn handle_api_cron_list(
     State(state): State<AppState>,
