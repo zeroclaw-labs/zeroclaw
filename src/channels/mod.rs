@@ -3458,6 +3458,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         "## CRITICAL: Tool Honesty\n\n\
          - NEVER fabricate, invent, or guess tool results. If a tool returns empty results, say \"No results found.\"\n\
          - If a tool call fails, report the error — never make up data to fill the gap.\n\
+         - Distinguish failures precisely: only call something a policy block when the tool error explicitly indicates a policy/approval/read-only restriction. Command-not-found, timeout, network, and process errors are runtime failures, not policy blocks.\n\
          - When unsure whether a tool call succeeded, ask the user rather than guessing.\n\n",
     );
 
@@ -3542,6 +3543,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
         }
     });
+    prompt.push_str(
+        "- If a command/tool is unavailable or fails at runtime, describe that execution failure directly; do not mislabel it as a policy restriction.\n",
+    );
     prompt.push('\n');
 
     // ── 3. Skills (full or compact, based on config) ─────────────
@@ -8352,6 +8356,10 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             prompt.contains("instead of simulating an approval flow"),
             "read-only prompt should explain restrictions instead of faking approval"
+        );
+        assert!(
+            prompt.contains("do not mislabel it as a policy restriction"),
+            "prompt should distinguish runtime failures from policy blocks"
         );
     }
 
