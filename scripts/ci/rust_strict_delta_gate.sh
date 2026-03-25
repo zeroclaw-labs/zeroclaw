@@ -55,6 +55,9 @@ CLIPPY_STDERR_FILE="$(mktemp)"
 FILTERED_OUTPUT_FILE="$(mktemp)"
 trap 'rm -f "$CHANGED_LINES_JSON_FILE" "$CLIPPY_JSON_FILE" "$CLIPPY_STDERR_FILE" "$FILTERED_OUTPUT_FILE"' EXIT
 
+CLIPPY_FEATURE_ARGS="${CLIPPY_FEATURE_ARGS:---features ci-all}"
+read -r -a CLIPPY_FEATURE_ARGS_ARR <<<"$CLIPPY_FEATURE_ARGS"
+
 python3 - "$BASE_SHA" "${EXISTING_FILES[@]}" >"$CHANGED_LINES_JSON_FILE" <<'PY'
 import json
 import re
@@ -88,7 +91,7 @@ print(json.dumps(changed))
 PY
 
 set +e
-cargo clippy --quiet --locked --all-targets --message-format=json -- -D warnings >"$CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
+cargo clippy --quiet --locked --all-targets "${CLIPPY_FEATURE_ARGS_ARR[@]}" --message-format=json -- -D warnings >"$CLIPPY_JSON_FILE" 2>"$CLIPPY_STDERR_FILE"
 CLIPPY_EXIT=$?
 set -e
 
