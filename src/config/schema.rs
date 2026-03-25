@@ -6607,6 +6607,10 @@ pub struct MatrixConfig {
     /// Supports canonical room IDs (`!abc:server`) and aliases (`#room:server`).
     #[serde(default)]
     pub allowed_rooms: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in group rooms.
+    /// Direct messages are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
     /// Whether to interrupt an in-flight agent response when a new message arrives.
     #[serde(default)]
     pub interrupt_on_new_message: bool,
@@ -12201,6 +12205,7 @@ default_temperature = 0.7
             room_id: "!room123:matrix.org".into(),
             allowed_users: vec!["@user:matrix.org".into()],
             allowed_rooms: vec![],
+            mention_only: false,
             interrupt_on_new_message: false,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1500,
@@ -12226,6 +12231,7 @@ default_temperature = 0.7
             room_id: "!abc:synapse.local".into(),
             allowed_users: vec!["@admin:synapse.local".into(), "*".into()],
             allowed_rooms: vec![],
+            mention_only: false,
             interrupt_on_new_message: false,
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1500,
@@ -12323,6 +12329,7 @@ allowed_users = ["@ops:matrix.org"]
                 room_id: "!r:m".into(),
                 allowed_users: vec!["@u:m".into()],
                 allowed_rooms: vec![],
+                mention_only: false,
                 interrupt_on_new_message: false,
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1500,

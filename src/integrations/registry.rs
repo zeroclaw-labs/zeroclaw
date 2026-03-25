@@ -892,6 +892,7 @@ mod tests {
             room_id: "!r:m".into(),
             allowed_users: vec![],
             allowed_rooms: vec![],
+            mention_only: false,
             interrupt_on_new_message: false,
             stream_mode: crate::config::StreamMode::default(),
             draft_update_interval_ms: 1500,

@@ -35,6 +35,7 @@ pub struct MatrixChannel {
     room_id: String,
     allowed_users: Vec<String>,
     allowed_rooms: Vec<String>,
+    mention_only: bool,
     session_owner_hint: Option<String>,
     session_device_id_hint: Option<String>,
     zeroclaw_dir: Option<PathBuf>,
@@ -64,6 +65,7 @@ impl std::fmt::Debug for MatrixChannel {
             .field("room_id", &self.room_id)
             .field("allowed_users", &self.allowed_users)
             .field("allowed_rooms", &self.allowed_rooms)
+            .field("mention_only", &self.mention_only)
             .finish_non_exhaustive()
     }
 }
@@ -143,6 +145,7 @@ impl MatrixChannel {
             room_id,
             allowed_users,
             vec![],
+            false,
             None,
             None,
             None,
@@ -163,6 +166,7 @@ impl MatrixChannel {
             room_id,
             allowed_users,
             vec![],
+            false,
             owner_hint,
             device_id_hint,
             None,
@@ -184,6 +188,7 @@ impl MatrixChannel {
             room_id,
             allowed_users,
             vec![],
+            false,
             owner_hint,
             device_id_hint,
             zeroclaw_dir,
@@ -196,6 +201,7 @@ impl MatrixChannel {
         room_id: String,
         allowed_users: Vec<String>,
         allowed_rooms: Vec<String>,
+        mention_only: bool,
         owner_hint: Option<String>,
         device_id_hint: Option<String>,
         zeroclaw_dir: Option<PathBuf>,
@@ -220,6 +226,7 @@ impl MatrixChannel {
             room_id,
             allowed_users,
             allowed_rooms,
+            mention_only,
             session_owner_hint: Self::normalize_optional_field(owner_hint),
             session_device_id_hint: Self::normalize_optional_field(device_id_hint),
             zeroclaw_dir,
@@ -865,6 +872,7 @@ impl Channel for MatrixChannel {
         let my_user_id_for_handler = my_user_id.clone();
         let allowed_users_for_handler = self.allowed_users.clone();
         let allowed_rooms_for_handler = self.allowed_rooms.clone();
+        let mention_only_for_handler = self.mention_only;
         let dedupe_for_handler = Arc::clone(&recent_event_cache);
         let homeserver_for_handler = self.homeserver.clone();
         let access_token_for_handler = self.access_token.clone();
@@ -907,6 +915,59 @@ impl Channel for MatrixChannel {
                 let sender = event.sender.to_string();
                 if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
                     return;
+                }
+
+                // mention_only filtering: in group rooms, only respond when
+                // the message text mentions the bot's user ID or display name.
+                // Direct messages (rooms with ≤2 joined members) bypass this.
+                if mention_only_for_handler {
+                    let is_dm = room.joined_members_count() <= 2
+                        || room.is_direct().await.unwrap_or(false);
+                    if !is_dm {
+                        let text_body = match &event.content.msgtype {
+                            MessageType::Text(c) => Some(c.body.as_str()),
+                            MessageType::Notice(c) => Some(c.body.as_str()),
+                            _ => None,
+                        };
+                        let mentioned = if let Some(text) = text_body {
+                            let text_lower = text.to_lowercase();
+                            let uid = my_user_id.as_str().to_lowercase();
+                            // Check for full user ID (e.g. @bot:matrix.org)
+                            let has_uid = text_lower.contains(&uid);
+                            // Check for localpart (e.g. "bot" from @bot:matrix.org)
+                            let has_localpart = uid
+                                .strip_prefix('@')
+                                .and_then(|rest| rest.split(':').next())
+                                .map(|local| text_lower.contains(local))
+                                .unwrap_or(false);
+                            // Check display name from room member profile
+                            let has_display_name = match room
+                                .get_member_no_sync(
+                                    &OwnedUserId::try_from(my_user_id.as_str())
+                                        .expect("valid user id"),
+                                )
+                                .await
+                            {
+                                Ok(Some(member)) => member
+                                    .display_name()
+                                    .map(|dn| text_lower.contains(&dn.to_lowercase()))
+                                    .unwrap_or(false),
+                                _ => false,
+                            };
+                            has_uid || has_localpart || has_display_name
+                        } else {
+                            // Non-text messages (images, files, etc.) don't contain
+                            // mentions — skip them in mention_only mode.
+                            false
+                        };
+                        if !mentioned {
+                            tracing::debug!(
+                                "Matrix: mention_only active, ignoring message without bot mention in room {}",
+                                room.room_id()
+                            );
+                            return;
+                        }
+                    }
                 }
 
                 // Helper: extract mxc:// download URL and filename for media types
@@ -2071,6 +2132,7 @@ mod tests {
             "!r:m".to_string(),
             vec!["@user:m".to_string()],
             vec!["!allowed:matrix.org".to_string()],
+            false,
             None,
             None,
             None,
@@ -2090,6 +2152,7 @@ mod tests {
                 "#ops:matrix.org".to_string(),
                 "!direct:matrix.org".to_string(),
             ],
+            false,
             None,
             None,
             None,
@@ -2107,6 +2170,7 @@ mod tests {
             "!r:m".to_string(),
             vec![],
             vec!["!Room:Matrix.org".to_string()],
+            false,
             None,
             None,
             None,
@@ -2123,6 +2187,7 @@ mod tests {
             "!r:m".to_string(),
             vec![],
             vec!["  !room:matrix.org  ".to_string(), "   ".to_string()],
+            false,
             None,
             None,
             None,

@@ -4230,6 +4230,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     room_id,
                     allowed_users,
                     allowed_rooms: vec![],
+                    mention_only: false,
                     interrupt_on_new_message: false,
                     stream_mode: StreamMode::Partial,
                     draft_update_interval_ms: 1500,

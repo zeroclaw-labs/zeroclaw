@@ -4157,6 +4157,7 @@ fn collect_configured_channels(
                     mx.room_id.clone(),
                     mx.allowed_users.clone(),
                     mx.allowed_rooms.clone(),
+                    mx.mention_only,
                     mx.user_id.clone(),
                     mx.device_id.clone(),
                     config.config_path.parent().map(|path| path.to_path_buf()),
