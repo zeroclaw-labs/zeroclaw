@@ -109,6 +109,21 @@ impl Observer for LogObserver {
             } => {
                 info!(hand = %hand_name, error = %error, duration_ms = duration_ms, "hand.failed");
             }
+            ObserverEvent::DeploymentStarted { deploy_id } => {
+                info!(deploy_id = %deploy_id, "deployment.started");
+            }
+            ObserverEvent::DeploymentCompleted {
+                deploy_id,
+                commit_sha,
+            } => {
+                info!(deploy_id = %deploy_id, commit_sha = %commit_sha, "deployment.completed");
+            }
+            ObserverEvent::DeploymentFailed { deploy_id, reason } => {
+                info!(deploy_id = %deploy_id, reason = %reason, "deployment.failed");
+            }
+            ObserverEvent::RecoveryCompleted { deploy_id } => {
+                info!(deploy_id = %deploy_id, "recovery.completed");
+            }
         }
     }
 
@@ -139,6 +154,14 @@ impl Observer for LogObserver {
             }
             ObserverMetric::HandSuccessRate { hand_name, success } => {
                 info!(hand = %hand_name, success = success, "metric.hand_success_rate");
+            }
+            ObserverMetric::DeploymentLeadTime(d) => {
+                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+                info!(lead_time_ms = ms, "metric.deployment_lead_time");
+            }
+            ObserverMetric::RecoveryTime(d) => {
+                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+                info!(recovery_time_ms = ms, "metric.recovery_time");
             }
         }
     }

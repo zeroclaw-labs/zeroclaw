@@ -72,10 +72,12 @@ pub mod memory_store;
 pub mod microsoft365;
 pub mod model_routing_config;
 pub mod model_switch;
+pub mod node_capabilities;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod opencode_cli;
 pub mod pdf_read;
+pub mod pipeline;
 pub mod poll;
 pub mod project_intel;
 pub mod proxy_config;
@@ -469,6 +471,7 @@ pub fn all_tools_with_runtime(
             provider_timeout_secs: Some(root_config.provider_timeout_secs),
             extra_headers: root_config.extra_headers.clone(),
             api_path: root_config.api_path.clone(),
+            provider_max_tokens: root_config.provider_max_tokens,
         };
         tool_arcs.push(Arc::new(LlmTaskTool::new(
             security.clone(),
@@ -550,6 +553,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
             web_fetch_config.firecrawl.clone(),
+            web_fetch_config.allowed_private_hosts.clone(),
         )));
     }
 
@@ -897,6 +901,7 @@ pub fn all_tools_with_runtime(
         reasoning_enabled: root_config.runtime.reasoning_enabled,
         reasoning_effort: root_config.runtime.reasoning_effort.clone(),
         provider_timeout_secs: Some(root_config.provider_timeout_secs),
+        provider_max_tokens: root_config.provider_max_tokens,
         extra_headers: root_config.extra_headers.clone(),
         api_path: root_config.api_path.clone(),
     };
@@ -1012,6 +1017,15 @@ pub fn all_tools_with_runtime(
                 }
             }
         }
+    }
+
+    // Pipeline tool (execute_pipeline) — multi-step tool chaining.
+    if root_config.pipeline.enabled {
+        let pipeline_tools: Vec<Arc<dyn Tool>> = tool_arcs.clone();
+        tool_arcs.push(Arc::new(pipeline::PipelineTool::new(
+            root_config.pipeline.clone(),
+            pipeline_tools,
+        )));
     }
 
     (

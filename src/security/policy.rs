@@ -854,6 +854,15 @@ impl SecurityPolicy {
 
         let risk = self.command_risk_level(command);
 
+        // When the operator has set `allowed_commands = ["*"]` AND explicitly
+        // disabled `block_high_risk_commands`, they have opted out of all
+        // command-level restrictions.  Short-circuit: skip the risk and
+        // autonomy gates entirely.  See #4485.
+        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        if has_wildcard && !self.block_high_risk_commands {
+            return Ok(risk);
+        }
+
         if risk == CommandRiskLevel::High {
             if self.block_high_risk_commands && !self.is_command_explicitly_allowed(command) {
                 return Err("Command blocked: high-risk command is disallowed by policy".into());
@@ -1431,7 +1440,7 @@ impl SecurityPolicy {
             let _ = writeln!(
                 out,
                 "**Allowed shell commands**: {}. \
-                 Commands not on this list will be rejected.",
+                 You may execute these commands freely.",
                 cmds.join(", ")
             );
         }
@@ -1446,7 +1455,7 @@ impl SecurityPolicy {
             let _ = writeln!(
                 out,
                 "**Forbidden paths**: {}. \
-                 Any read/write/exec targeting these paths will be blocked.",
+                 Avoid accessing these paths.",
                 paths.join(", ")
             );
         }
@@ -1455,7 +1464,7 @@ impl SecurityPolicy {
         if self.block_high_risk_commands {
             let _ = writeln!(
                 out,
-                "**High-risk commands** (rm, kill, reboot, etc.) are blocked."
+                "Exercise caution with destructive commands (rm, kill, reboot, etc.)."
             );
         }
         if self.require_approval_for_medium_risk {
@@ -3018,8 +3027,8 @@ mod tests {
         assert!(summary.contains("`git`"), "should list allowed commands");
         assert!(summary.contains("`ls`"), "should list allowed commands");
         assert!(
-            summary.contains("not on this list will be rejected"),
-            "should warn about rejection"
+            summary.contains("You may execute these commands freely"),
+            "should mention allowed commands positively"
         );
     }
 
@@ -3058,8 +3067,8 @@ mod tests {
         };
         let summary = p.prompt_summary();
         assert!(
-            summary.contains("High-risk commands"),
-            "should mention high-risk block"
+            summary.contains("Exercise caution with destructive commands"),
+            "should mention high-risk caution"
         );
         assert!(
             summary.contains("Medium-risk commands"),
@@ -3082,5 +3091,37 @@ mod tests {
             summary.contains("`/opt/tools`"),
             "should list allowed roots"
         );
+    }
+
+    #[test]
+    fn wildcard_with_block_high_risk_false_allows_everything() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            workspace_only: false,
+            ..SecurityPolicy::default()
+        };
+        assert!(p
+            .validate_command_execution("rm -rf /tmp/test", true)
+            .is_ok());
+        assert!(p.validate_command_execution("nohup firefox", true).is_ok());
+        assert!(p
+            .validate_command_execution("ls /usr/bin/firefox", true)
+            .is_ok());
+    }
+
+    #[test]
+    fn wildcard_with_block_high_risk_true_still_blocks() {
+        // Ensure the existing safety net is preserved: wildcard + block_high_risk_commands=true
+        // should still block high-risk commands.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        let result = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("high-risk"));
     }
 }

@@ -230,6 +230,49 @@ detect_release_target() {
   esac
 }
 
+detect_device_class() {
+  # Containers are never desktops
+  if _is_container_runtime; then
+    echo "container"
+    return
+  fi
+
+  # Termux / Android
+  if [[ -n "${TERMUX_VERSION:-}" || -d "/data/data/com.termux" ]]; then
+    echo "mobile"
+    return
+  fi
+
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  case "$os" in
+    Darwin)
+      # macOS is always a desktop
+      echo "desktop"
+      ;;
+    Linux)
+      # Raspberry Pi / ARM SBCs — treat as embedded (typically headless)
+      case "$arch" in
+        armv6l|armv7l)
+          echo "embedded"
+          return
+          ;;
+      esac
+      # Check for a display server (X11 or Wayland)
+      if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" || -n "${XDG_SESSION_TYPE:-}" ]]; then
+        echo "desktop"
+      else
+        echo "server"
+      fi
+      ;;
+    *)
+      echo "server"
+      ;;
+  esac
+}
+
 should_attempt_prebuilt_for_resources() {
   local workspace="${1:-.}"
   local min_ram_mb min_disk_mb total_ram_mb free_disk_mb low_resource
@@ -1155,6 +1198,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 OS_NAME="$(uname -s)"
+DEVICE_CLASS="$(detect_device_class)"
+step_dot "Device: $OS_NAME/$(uname -m) ($DEVICE_CLASS)"
+
 if [[ "$GUIDED_MODE" == "auto" ]]; then
   if [[ "$OS_NAME" == "Linux" && "$ORIGINAL_ARG_COUNT" -eq 0 && -t 0 && -t 1 ]]; then
     GUIDED_MODE="on"
@@ -1479,63 +1525,64 @@ else
   fi
 fi
 
-# --- Build desktop app (macOS only) ---
-if [[ "$SKIP_BUILD" == false && "$OS_NAME" == "Darwin" && -d "$WORK_DIR/apps/tauri" ]]; then
-  echo
-  echo -e "${BOLD}Desktop app preflight${RESET}"
+# --- Companion desktop app (device-class-aware) ---
+# The desktop app is a pre-built download from the website, not built from source.
+# This keeps the one-liner install fast and the CLI binary small.
+DESKTOP_DOWNLOAD_URL="https://www.zeroclawlabs.ai/download"
+DESKTOP_APP_DETECTED=false
 
-  _desktop_ok=true
-
-  # Check Rust toolchain
-  if have_cmd cargo && have_cmd rustc; then
-    step_ok "Rust $(rustc --version | awk '{print $2}') found"
-  else
-    step_fail "Rust toolchain not found — required for desktop app"
-    _desktop_ok=false
-  fi
-
-  # Check Xcode CLT (needed for linking native frameworks)
-  if xcode-select -p >/dev/null 2>&1; then
-    step_ok "Xcode Command Line Tools installed"
-  else
-    step_fail "Xcode Command Line Tools not found — run: xcode-select --install"
-    _desktop_ok=false
-  fi
-
-  # Check that the Tauri CLI is available (cargo-tauri or tauri-cli)
-  if have_cmd cargo-tauri; then
-    step_ok "cargo-tauri $(cargo tauri --version 2>/dev/null | awk '{print $NF}') found"
-  else
-    step_dot "cargo-tauri not found — installing"
-    if cargo install tauri-cli --locked 2>/dev/null; then
-      step_ok "cargo-tauri installed"
-    else
-      warn "Failed to install cargo-tauri — desktop app build may fail"
-    fi
-  fi
-
-  # Check node/npm (needed for web frontend that Tauri embeds)
-  if have_cmd node && have_cmd npm; then
-    step_ok "Node.js $(node --version) found"
-  else
-    warn "node/npm not found — desktop app needs the web dashboard built first"
-  fi
-
-  if [[ "$_desktop_ok" == true ]]; then
-    step_dot "Building desktop app (zeroclaw-desktop)"
-    if cargo build -p zeroclaw-desktop --release --locked 2>/dev/null; then
-      step_ok "Desktop app built"
-      # Copy binary to cargo bin for easy access
-      if [[ -x "$WORK_DIR/target/release/zeroclaw-desktop" ]]; then
-        cp -f "$WORK_DIR/target/release/zeroclaw-desktop" "$HOME/.cargo/bin/zeroclaw-desktop" 2>/dev/null && \
-          step_ok "zeroclaw-desktop installed to ~/.cargo/bin" || true
+if [[ "$DEVICE_CLASS" == "desktop" ]]; then
+  # Check if the companion app is already installed
+  case "$OS_NAME" in
+    Darwin)
+      if [[ -d "/Applications/ZeroClaw.app" ]] || [[ -d "$HOME/Applications/ZeroClaw.app" ]]; then
+        DESKTOP_APP_DETECTED=true
+        step_ok "Companion app found (ZeroClaw.app)"
       fi
-    else
-      warn "Desktop app build failed — you can build later with: cargo build -p zeroclaw-desktop --release"
-    fi
-  else
-    warn "Skipping desktop app build — fix missing dependencies above and re-run"
+      ;;
+    Linux)
+      if have_cmd zeroclaw-desktop; then
+        DESKTOP_APP_DETECTED=true
+        step_ok "Companion app found (zeroclaw-desktop)"
+      elif [[ -x "$HOME/.local/bin/zeroclaw-desktop" ]]; then
+        DESKTOP_APP_DETECTED=true
+        step_ok "Companion app found (~/.local/bin/zeroclaw-desktop)"
+      fi
+      ;;
+  esac
+
+  if [[ "$DESKTOP_APP_DETECTED" == false ]]; then
+    echo
+    echo -e "${BOLD}Companion App${RESET}"
+    echo -e "  Menu bar access to your ZeroClaw agent."
+    echo -e "  Works alongside the CLI — connects to the same gateway."
+    echo
+    case "$OS_NAME" in
+      Darwin)
+        echo -e "  ${BOLD}Download for macOS:${RESET} ${BLUE}${DESKTOP_DOWNLOAD_URL}${RESET}"
+        ;;
+      Linux)
+        echo -e "  ${BOLD}Download for Linux:${RESET} ${BLUE}${DESKTOP_DOWNLOAD_URL}${RESET}"
+        ;;
+    esac
+    echo -e "  ${DIM}Or run: zeroclaw desktop --install${RESET}"
   fi
+elif [[ "$DEVICE_CLASS" != "desktop" ]]; then
+  # Non-desktop device — explain why companion app is not offered
+  case "$DEVICE_CLASS" in
+    mobile)
+      step_dot "Mobile device — use the web dashboard at http://127.0.0.1:42617"
+      ;;
+    embedded)
+      step_dot "Embedded device ($(uname -m)) — use the web dashboard"
+      ;;
+    container)
+      step_dot "Container runtime — use the web dashboard"
+      ;;
+    server)
+      step_dot "Headless server — use the web dashboard"
+      ;;
+  esac
 fi
 
 ZEROCLAW_BIN=""
@@ -1704,8 +1751,12 @@ echo -e "${BOLD}Next steps:${RESET}"
 echo -e "  ${DIM}zeroclaw status${RESET}"
 echo -e "  ${DIM}zeroclaw agent -m \"Hello, ZeroClaw!\"${RESET}"
 echo -e "  ${DIM}zeroclaw gateway${RESET}"
-if [[ "$OS_NAME" == "Darwin" ]] && have_cmd zeroclaw-desktop; then
-  echo -e "  ${DIM}zeroclaw-desktop${RESET}              ${DIM}# Launch the menu bar app${RESET}"
+if [[ "$DEVICE_CLASS" == "desktop" ]]; then
+  if [[ "$DESKTOP_APP_DETECTED" == true ]]; then
+    echo -e "  ${DIM}zeroclaw desktop${RESET}                ${DIM}# Launch the menu bar app${RESET}"
+  else
+    echo -e "  ${DIM}zeroclaw desktop --install${RESET}      ${DIM}# Download the companion app${RESET}"
+  fi
 fi
 echo
 echo -e "${BOLD}Docs:${RESET} ${BLUE}https://www.zeroclawlabs.ai/docs${RESET}"
