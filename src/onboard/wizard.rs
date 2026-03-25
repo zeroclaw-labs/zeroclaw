@@ -3938,7 +3938,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     interrupt_on_new_message: false,
                     mention_only: false,
                     proxy_url: None,
-                    stream_mode: StreamMode::default(),
+                    stream_mode: StreamMode::MultiMessage,
                     draft_update_interval_ms: 1000,
                     multi_message_delay_ms: 800,
                 });
