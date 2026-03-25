@@ -74,7 +74,7 @@ pub async fn dispatch(
         }
         ("events", "insert") => {
             let url = format!("{CALENDAR_BASE}/calendars/{cal_enc}/events");
-            let body = body.unwrap_or(serde_json::Value::Object(Default::default()));
+            let body = body.unwrap_or(serde_json::Value::Object(serde_json::Map::default()));
             post_json(http, token, &url, &query, &body, timeout).await
         }
         ("events", "patch") => {
@@ -82,7 +82,7 @@ pub async fn dispatch(
                 .context("google calendar events patch: 'eventId' is required in params")?;
             let ev_enc = urlencoding::encode(&event_id).into_owned();
             let url = format!("{CALENDAR_BASE}/calendars/{cal_enc}/events/{ev_enc}");
-            let body = body.unwrap_or(serde_json::Value::Object(Default::default()));
+            let body = body.unwrap_or(serde_json::Value::Object(serde_json::Map::default()));
             patch_json(http, token, &url, &query, &body, timeout).await
         }
         ("events", "update") => {
@@ -90,7 +90,7 @@ pub async fn dispatch(
                 .context("google calendar events update: 'eventId' is required in params")?;
             let ev_enc = urlencoding::encode(&event_id).into_owned();
             let url = format!("{CALENDAR_BASE}/calendars/{cal_enc}/events/{ev_enc}");
-            let body = body.unwrap_or(serde_json::Value::Object(Default::default()));
+            let body = body.unwrap_or(serde_json::Value::Object(serde_json::Map::default()));
             put_json(http, token, &url, &query, &body, timeout).await
         }
         ("events", "delete") => {
@@ -111,9 +111,7 @@ pub async fn dispatch(
 
 // ── HTTP helpers ─────────────────────────────────────────────────────────────
 
-fn build_query_pairs(
-    query: &serde_json::Map<String, serde_json::Value>,
-) -> Vec<(String, String)> {
+fn build_query_pairs(query: &serde_json::Map<String, serde_json::Value>) -> Vec<(String, String)> {
     query
         .iter()
         .map(|(k, v)| {
@@ -287,10 +285,7 @@ mod tests {
     fn extract_error_detail_handles_google_error_envelope() {
         let body = r#"{"error": {"code": 403, "message": "Insufficient Permission", "errors": [{"reason": "insufficientPermissions"}]}}"#;
         let detail = extract_error_detail(body);
-        assert!(
-            detail.contains("insufficientPermissions"),
-            "got: {detail}"
-        );
+        assert!(detail.contains("insufficientPermissions"), "got: {detail}");
     }
 
     #[test]
@@ -314,6 +309,8 @@ mod tests {
         map.insert("calendarId".into(), serde_json::json!("primary"));
         let pairs = build_query_pairs(&map);
         assert!(pairs.iter().any(|(k, v)| k == "maxResults" && v == "10"));
-        assert!(pairs.iter().any(|(k, v)| k == "showDeleted" && v == "false"));
+        assert!(pairs
+            .iter()
+            .any(|(k, v)| k == "showDeleted" && v == "false"));
     }
 }

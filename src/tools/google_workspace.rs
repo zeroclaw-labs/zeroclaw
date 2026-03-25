@@ -581,22 +581,55 @@ mod tests {
 
     #[test]
     fn tool_name() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         assert_eq!(tool.name(), "google_workspace");
     }
 
     #[test]
     fn tool_description_non_empty() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn tool_schema_has_required_fields() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["service"].is_object());
         assert!(schema["properties"]["resource"].is_object());
@@ -611,8 +644,19 @@ mod tests {
 
     #[test]
     fn default_allowed_services_populated() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         assert!(!tool.allowed_services.is_empty());
         assert!(tool.allowed_services.contains(&"drive".to_string()));
         assert!(tool.allowed_services.contains(&"gmail".to_string()));
@@ -704,8 +748,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_shell_injection_in_resource() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -724,8 +779,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_format() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -745,8 +811,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_params() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -766,8 +843,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_body() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -787,8 +875,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_all() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -808,8 +907,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_limit() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -829,8 +939,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_sub_resource() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -850,8 +971,19 @@ mod tests {
 
     #[tokio::test]
     async fn missing_required_param_returns_error() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool.execute(json!({"service": "drive"})).await;
         assert!(result.is_err());
     }
@@ -864,7 +996,19 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = GoogleWorkspaceTool::new(security, vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            security,
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -884,8 +1028,19 @@ mod tests {
 
     #[test]
     fn operation_allowlist_defaults_to_allow_all() {
-        let tool =
-            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, None, None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec![],
+            vec![],
+            None,
+            None,
+            None,
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
         // Empty allowlist: everything passes regardless of sub_resource
         assert!(tool.is_operation_allowed("gmail", "users", Some("messages"), "send"));
         assert!(tool.is_operation_allowed("drive", "files", None, "list"));
