@@ -32,6 +32,10 @@ pub struct DiscordChannel {
     multi_message_delay_ms: u64,
     /// Per-channel rate-limit tracking for draft edits.
     last_draft_edit: Mutex<HashMap<String, std::time::Instant>>,
+    /// Tracks how much text has been sent in MultiMessage mode.
+    multi_message_sent_len: Mutex<HashMap<String, usize>>,
+    /// Thread context captured from `send_draft()` for MultiMessage paragraph delivery.
+    multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
 }
 
 impl DiscordChannel {
@@ -56,6 +60,8 @@ impl DiscordChannel {
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             last_draft_edit: Mutex::new(HashMap::new()),
+            multi_message_sent_len: Mutex::new(HashMap::new()),
+            multi_message_thread_ts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1225,7 +1231,7 @@ impl Channel for DiscordChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode == crate::config::StreamMode::Partial
+        self.stream_mode != crate::config::StreamMode::Off
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
@@ -1237,30 +1243,41 @@ impl Channel for DiscordChannel {
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-        if self.stream_mode != crate::config::StreamMode::Partial {
-            return Ok(None);
+        use crate::config::StreamMode;
+        match self.stream_mode {
+            StreamMode::Off => Ok(None),
+            StreamMode::Partial => {
+                let initial_text = if message.content.is_empty() {
+                    "...".to_string()
+                } else {
+                    message.content.clone()
+                };
+
+                let client = self.http_client();
+                let msg_id = send_discord_message_json_with_id(
+                    &client,
+                    &self.bot_token,
+                    &message.recipient,
+                    &initial_text,
+                )
+                .await?;
+
+                self.last_draft_edit
+                    .lock()
+                    .insert(message.recipient.clone(), std::time::Instant::now());
+
+                Ok(Some(msg_id))
+            }
+            StreamMode::MultiMessage => {
+                // No initial draft — paragraphs are sent as new messages.
+                // Store thread context for paragraph delivery.
+                self.multi_message_sent_len.lock().clear();
+                self.multi_message_thread_ts
+                    .lock()
+                    .insert(message.recipient.clone(), message.thread_ts.clone());
+                Ok(Some("multi_message_synthetic".to_string()))
+            }
         }
-
-        let initial_text = if message.content.is_empty() {
-            "...".to_string()
-        } else {
-            message.content.clone()
-        };
-
-        let client = self.http_client();
-        let msg_id = send_discord_message_json_with_id(
-            &client,
-            &self.bot_token,
-            &message.recipient,
-            &initial_text,
-        )
-        .await?;
-
-        self.last_draft_edit
-            .lock()
-            .insert(message.recipient.clone(), std::time::Instant::now());
-
-        Ok(Some(msg_id))
     }
 
     async fn update_draft(
@@ -1269,53 +1286,137 @@ impl Channel for DiscordChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
-        // Rate-limit edits per channel.
-        {
-            let last_edits = self.last_draft_edit.lock();
-            if let Some(last_time) = last_edits.get(recipient) {
-                let elapsed_ms = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
-                if elapsed_ms < self.draft_update_interval_ms {
-                    return Ok(());
+        use crate::config::StreamMode;
+        match self.stream_mode {
+            StreamMode::Off => Ok(()),
+            StreamMode::Partial => {
+                // Rate-limit edits per channel.
+                {
+                    let last_edits = self.last_draft_edit.lock();
+                    if let Some(last_time) = last_edits.get(recipient) {
+                        let elapsed_ms =
+                            u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        if elapsed_ms < self.draft_update_interval_ms {
+                            return Ok(());
+                        }
+                    }
                 }
+
+                // UTF-8 safe truncation to Discord limit.
+                let display_text = if text.len() > DISCORD_MAX_MESSAGE_LENGTH {
+                    let mut end = 0;
+                    for (idx, ch) in text.char_indices() {
+                        let next = idx + ch.len_utf8();
+                        if next > DISCORD_MAX_MESSAGE_LENGTH {
+                            break;
+                        }
+                        end = next;
+                    }
+                    &text[..end]
+                } else {
+                    text
+                };
+
+                let client = self.http_client();
+                match edit_discord_message(
+                    &client,
+                    &self.bot_token,
+                    recipient,
+                    message_id,
+                    display_text,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        self.last_draft_edit
+                            .lock()
+                            .insert(recipient.to_string(), std::time::Instant::now());
+                    }
+                    Err(e) => {
+                        tracing::debug!("Discord draft update failed: {e}");
+                    }
+                }
+
+                Ok(())
+            }
+            StreamMode::MultiMessage => {
+                // Track accumulated text and send new paragraphs at \n\n boundaries.
+                // Extract paragraph (if any) under the lock, then drop it before async work.
+                let (paragraph, thread_ts) = {
+                    let thread_ts = self
+                        .multi_message_thread_ts
+                        .lock()
+                        .get(recipient)
+                        .cloned()
+                        .flatten();
+                    let mut sent_map = self.multi_message_sent_len.lock();
+                    let sent_so_far = sent_map.get(recipient).copied().unwrap_or(0);
+
+                    // DraftEvent::Clear resets accumulated text — reset our counter.
+                    if text.len() < sent_so_far {
+                        sent_map.insert(recipient.to_string(), 0);
+                        return Ok(());
+                    }
+                    if text.len() == sent_so_far {
+                        return Ok(());
+                    }
+
+                    let new_text = &text[sent_so_far..];
+                    let mut scan_pos = 0;
+                    let mut in_fence = false;
+                    let bytes = new_text.as_bytes();
+                    let mut found_paragraph = None;
+
+                    while scan_pos < bytes.len() {
+                        let ch = bytes[scan_pos];
+
+                        if ch == b'`'
+                            && scan_pos + 2 < bytes.len()
+                            && bytes[scan_pos + 1] == b'`'
+                            && bytes[scan_pos + 2] == b'`'
+                            && (scan_pos == 0 || bytes[scan_pos - 1] == b'\n')
+                        {
+                            in_fence = !in_fence;
+                        }
+
+                        if !in_fence
+                            && ch == b'\n'
+                            && scan_pos + 1 < bytes.len()
+                            && bytes[scan_pos + 1] == b'\n'
+                        {
+                            let paragraph = new_text[..scan_pos].trim().to_string();
+                            let consumed = scan_pos + 2;
+                            *sent_map.entry(recipient.to_string()).or_insert(0) += consumed;
+                            if !paragraph.is_empty() {
+                                found_paragraph = Some(paragraph);
+                            }
+                            break;
+                        }
+
+                        scan_pos += 1;
+                    }
+                    // Lock is dropped here at end of block.
+                    (found_paragraph, thread_ts)
+                };
+
+                if let Some(paragraph) = paragraph {
+                    let msg = SendMessage::new(&paragraph, recipient).in_thread(thread_ts.clone());
+                    if let Err(e) = self.send(&msg).await {
+                        tracing::debug!("Discord multi-message paragraph send failed: {e}");
+                    }
+                    if self.multi_message_delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            self.multi_message_delay_ms,
+                        ))
+                        .await;
+                    }
+                    // Recurse to handle remaining text.
+                    return self.update_draft(recipient, message_id, text).await;
+                }
+
+                Ok(())
             }
         }
-
-        // UTF-8 safe truncation to Discord limit.
-        let display_text = if text.len() > DISCORD_MAX_MESSAGE_LENGTH {
-            let mut end = 0;
-            for (idx, ch) in text.char_indices() {
-                let next = idx + ch.len_utf8();
-                if next > DISCORD_MAX_MESSAGE_LENGTH {
-                    break;
-                }
-                end = next;
-            }
-            &text[..end]
-        } else {
-            text
-        };
-
-        let client = self.http_client();
-        match edit_discord_message(
-            &client,
-            &self.bot_token,
-            recipient,
-            message_id,
-            display_text,
-        )
-        .await
-        {
-            Ok(()) => {
-                self.last_draft_edit
-                    .lock()
-                    .insert(recipient.to_string(), std::time::Instant::now());
-            }
-            Err(e) => {
-                tracing::debug!("Discord draft update failed: {e}");
-            }
-        }
-
-        Ok(())
     }
 
     async fn finalize_draft(
@@ -1324,6 +1425,30 @@ impl Channel for DiscordChannel {
         message_id: &str,
         text: &str,
     ) -> anyhow::Result<()> {
+        if self.stream_mode == crate::config::StreamMode::MultiMessage {
+            // Flush remaining buffered text.
+            let thread_ts = self
+                .multi_message_thread_ts
+                .lock()
+                .remove(recipient)
+                .flatten();
+            let sent_so_far = self
+                .multi_message_sent_len
+                .lock()
+                .remove(recipient)
+                .unwrap_or(0);
+            if text.len() > sent_so_far {
+                let remaining = text[sent_so_far..].trim().to_string();
+                if !remaining.is_empty() {
+                    let msg = SendMessage::new(&remaining, recipient).in_thread(thread_ts);
+                    if let Err(e) = self.send(&msg).await {
+                        tracing::debug!("Discord multi-message final flush failed: {e}");
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         // Belt-and-suspenders: kill any typing handles for this channel.
         let _ = self.stop_typing(recipient).await;
         self.last_draft_edit.lock().remove(recipient);
@@ -1392,6 +1517,12 @@ impl Channel for DiscordChannel {
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        if self.stream_mode == crate::config::StreamMode::MultiMessage {
+            self.multi_message_sent_len.lock().remove(recipient);
+            self.multi_message_thread_ts.lock().remove(recipient);
+            return Ok(());
+        }
+
         let _ = self.stop_typing(recipient).await;
         self.last_draft_edit.lock().remove(recipient);
 
@@ -2141,7 +2272,7 @@ mod tests {
             1000,
             600,
         );
-        assert!(!multi.supports_draft_updates());
+        assert!(multi.supports_draft_updates());
         assert_eq!(multi.multi_message_delay_ms, 600);
     }
 
@@ -2159,7 +2290,11 @@ mod tests {
             1000,
             800,
         );
-        assert!(multi.send_draft(&msg).await.unwrap().is_none());
+        // MultiMessage returns a synthetic ID so the draft_updater task runs.
+        assert_eq!(
+            multi.send_draft(&msg).await.unwrap().as_deref(),
+            Some("multi_message_synthetic")
+        );
     }
 
     #[tokio::test]

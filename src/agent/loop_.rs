@@ -2353,7 +2353,6 @@ async fn consume_provider_streaming_response(
     temperature: f64,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
-    stream_text_sink: Option<&tokio::sync::mpsc::Sender<String>>,
 ) -> Result<StreamedChatOutcome> {
     let mut provider_stream = provider.stream_chat(
         ChatRequest {
@@ -2427,19 +2426,6 @@ async fn consume_provider_streaming_response(
                     continue;
                 }
 
-                // Forward to MultiMessage text sink if present.
-                if let Some(sink) = stream_text_sink {
-                    tracing::trace!(
-                        delta_len = chunk.delta.len(),
-                        total_text_len = outcome.response_text.len(),
-                        "Forwarding text delta to stream_text_sink"
-                    );
-                    let _ = sink.send(chunk.delta.clone()).await;
-                    if !outcome.forwarded_live_deltas {
-                        outcome.forwarded_live_deltas = true;
-                    }
-                }
-
                 if let Some(tx) = delta_sender {
                     if !outcome.forwarded_live_deltas {
                         let _ = tx.send(DraftEvent::Clear).await;
@@ -2493,7 +2479,6 @@ pub(crate) async fn agent_turn(
         channel_reply_target,
         multimodal_config,
         max_tool_iterations,
-        None,
         None,
         None,
         None,
@@ -2806,9 +2791,6 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_iterations: usize,
     cancellation_token: Option<CancellationToken>,
     on_delta: Option<tokio::sync::mpsc::Sender<DraftEvent>>,
-    // Separate sink for live LLM text deltas (MultiMessage mode).
-    // When set, raw text deltas are forwarded here for paragraph-split delivery.
-    stream_text_sink: Option<tokio::sync::mpsc::Sender<String>>,
     hooks: Option<&crate::hooks::HookRunner>,
     excluded_tools: &[String],
     dedup_exempt_tools: &[String],
@@ -2995,13 +2977,11 @@ pub(crate) async fn run_tool_call_loop(
         } else {
             None
         };
-        let has_any_stream_sink = on_delta.is_some() || stream_text_sink.is_some();
-        let should_consume_provider_stream = has_any_stream_sink
+        let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
             && (request_tools.is_none() || provider.supports_streaming_tool_events());
         tracing::debug!(
             has_on_delta = on_delta.is_some(),
-            has_stream_text_sink = stream_text_sink.is_some(),
             supports_streaming = provider.supports_streaming(),
             should_consume_provider_stream,
             "Streaming decision for iteration {}",
@@ -3018,7 +2998,6 @@ pub(crate) async fn run_tool_call_loop(
                 temperature,
                 cancellation_token.as_ref(),
                 on_delta.as_ref(),
-                stream_text_sink.as_ref(),
             )
             .await
             {
@@ -3296,22 +3275,9 @@ pub(crate) async fn run_tool_call_loop(
                 }),
             );
             // No tool calls — this is the final response.
-            //
-            // When stream_text_sink is active (MultiMessage), the provider
-            // already forwarded text there in real-time via consume_provider_streaming_response.
-            // Send nothing more unless it was a non-streaming fallback.
-            //
-            // When on_delta is active (Partial), clear progress and either
-            // skip (if provider streamed live) or chunk the text.
-            if stream_text_sink.is_some() {
-                // MultiMessage: streaming path already forwarded text to stream_text_sink.
-                if !streamed_live_deltas {
-                    // Non-streaming fallback: send complete text to stream_text_sink.
-                    if let Some(ref sink) = stream_text_sink {
-                        let _ = sink.send(display_text.clone()).await;
-                    }
-                }
-            } else if let Some(ref tx) = on_delta {
+            // If a streaming sender is provided, relay the text in small chunks
+            // so the channel can progressively update the draft message.
+            if let Some(ref tx) = on_delta {
                 let should_emit_post_hoc_chunks =
                     !response_streamed_live || display_text != response_text;
                 if !should_emit_post_hoc_chunks {
@@ -4354,7 +4320,6 @@ pub async fn run(
                 None,
                 None,
                 None,
-                None,
                 &excluded_tools,
                 &config.agent.tool_call_dedup_exempt,
                 activated_handle.as_ref(),
@@ -4655,7 +4620,6 @@ pub async fn run(
                     config.agent.max_tool_iterations,
                     Some(cancel_token.clone()),
                     Some(delta_tx.clone()),
-                    None,
                     None,
                     &excluded_tools,
                     &config.agent.tool_call_dedup_exempt,
@@ -5871,7 +5835,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -5924,7 +5887,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -5970,7 +5932,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -6013,7 +5974,6 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             3,
-            None,
             None,
             None,
             None,
@@ -6069,7 +6029,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -6119,7 +6078,6 @@ mod tests {
             None,
             &multimodal,
             3,
-            None,
             None,
             None,
             None,
@@ -6176,7 +6134,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -6228,7 +6185,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -6277,7 +6233,6 @@ mod tests {
             None,
             &multimodal,
             3,
-            None,
             None,
             None,
             None,
@@ -6415,7 +6370,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -6487,7 +6441,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -6551,7 +6504,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -6607,7 +6559,6 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             4,
-            None,
             None,
             None,
             None,
@@ -6681,7 +6632,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &[],
             None,
@@ -6740,7 +6690,6 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             4,
-            None,
             None,
             None,
             None,
@@ -6825,7 +6774,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
             &exempt,
             None,
@@ -6881,7 +6829,6 @@ mod tests {
             None,
             &crate::config::MultimodalConfig::default(),
             4,
-            None,
             None,
             None,
             None,
@@ -6967,7 +6914,6 @@ mod tests {
             None,
             Some(tx),
             None,
-            None,
             &[],
             &[],
             None,
@@ -7033,7 +6979,6 @@ mod tests {
             4,
             None,
             Some(tx),
-            None,
             None,
             &[],
             &[],
@@ -7102,7 +7047,6 @@ mod tests {
             5,
             None,
             Some(tx),
-            None,
             None,
             &[],
             &[],
@@ -7175,7 +7119,6 @@ mod tests {
             5,
             None,
             Some(tx),
-            None,
             None,
             &[],
             &[],
@@ -7257,7 +7200,6 @@ mod tests {
             4,
             None,
             Some(tx),
-            None,
             None,
             &[],
             &[],
@@ -9255,7 +9197,6 @@ Let me check the result."#;
             None,
             Some(tx),
             None,
-            None,
             &[],
             &[],
             None,
@@ -9410,7 +9351,6 @@ Let me check the result."#;
                     None,
                     None,
                     None,
-                    None,
                     &[],
                     &[],
                     None,
@@ -9490,7 +9430,6 @@ Let me check the result."#;
                     None,
                     None,
                     None,
-                    None,
                     &[],
                     &[],
                     None,
@@ -9543,7 +9482,6 @@ Let me check the result."#;
             None,
             &crate::config::MultimodalConfig::default(),
             2,
-            None,
             None,
             None,
             None,
