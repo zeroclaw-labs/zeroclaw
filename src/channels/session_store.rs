@@ -23,6 +23,11 @@ impl SessionStore {
         Ok(Self { sessions_dir })
     }
 
+    /// Return the file path for a session key (public, for mtime checks).
+    pub fn session_path_public(&self, session_key: &str) -> PathBuf {
+        self.session_path(session_key)
+    }
+
     /// Compute the file path for a session key, sanitizing for filesystem safety.
     fn session_path(&self, session_key: &str) -> PathBuf {
         let safe_key: String = session_key
@@ -59,6 +64,11 @@ impl SessionStore {
             if let Ok(msg) = serde_json::from_str::<ChatMessage>(trimmed) {
                 messages.push(msg);
             }
+        }
+
+        // Enforce per-sender message cap: keep only the most recent messages.
+        if messages.len() > super::MAX_CHANNEL_HISTORY {
+            messages = messages.split_off(messages.len() - super::MAX_CHANNEL_HISTORY);
         }
 
         messages

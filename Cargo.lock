@@ -3599,6 +3599,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
  "serde",
 ]
@@ -4798,6 +4800,15 @@ dependencies = [
 
 [[package]]
 name = "lru"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f8cc7106155f10bdf99a6f379688f543ad6596a415375b36a59a054ceda1198"
+dependencies = [
+ "hashbrown 0.15.5",
+]
+
+[[package]]
+name = "lru"
 version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a1dc47f592c06f33f8e3aea9591776ec7c9f9e4124778ff8a3c3b87159f7e593"
@@ -5659,7 +5670,7 @@ version = "0.44.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7462c9d8ae5ef6a28d66a192d399ad2530f1f2130b13186296dbb11bdef5b3d1"
 dependencies = [
- "lru",
+ "lru 0.16.3",
  "nostr",
  "tokio",
 ]
@@ -5683,7 +5694,7 @@ dependencies = [
  "async-wsocket",
  "atomic-destructor",
  "hex",
- "lru",
+ "lru 0.16.3",
  "negentropy",
  "nostr",
  "nostr-database",
@@ -12364,6 +12375,7 @@ dependencies = [
  "landlock",
  "lettre",
  "libc",
+ "lru 0.14.0",
  "mail-parser",
  "matrix-sdk",
  "mime_guess",

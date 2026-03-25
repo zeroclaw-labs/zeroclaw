@@ -125,6 +125,7 @@ use portable_atomic::{AtomicU64, Ordering};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
@@ -184,10 +185,12 @@ impl Observer for ChannelNotifyObserver {
     }
 }
 
-/// Per-sender conversation history for channel messages.
-type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
+/// Per-sender conversation history for channel messages (LRU-bounded).
+type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
 /// Senders that requested `/new` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
+/// Maximum distinct senders kept in the conversation history LRU cache.
+const MAX_CONVERSATION_SENDERS: usize = 1024;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -1053,7 +1056,7 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(sender_key);
+        .pop(sender_key);
 }
 
 fn mark_sender_for_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) {
@@ -1208,7 +1211,10 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         .conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let turns = histories.entry(sender_key.to_string()).or_default();
+    if histories.get(sender_key).is_none() {
+        histories.put(sender_key.to_string(), Vec::new());
+    }
+    let turns = histories.get_mut(sender_key).unwrap();
     turns.push(turn);
     while turns.len() > max_history {
         turns.remove(0);
@@ -1321,7 +1327,7 @@ fn rollback_orphan_user_turn(
 
     turns.pop();
     if turns.is_empty() {
-        histories.remove(sender_key);
+        histories.pop(sender_key);
     }
 
     // Also remove the orphan turn from the persisted JSONL session store so
@@ -5412,7 +5418,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -5486,19 +5492,38 @@ pub async fn start_channels(config: Config) -> Result<()> {
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
+    // Sort by modification time (most recent first) and cap at MAX_CONVERSATION_SENDERS.
     // If the last persisted turn is a user message (orphan from a crash mid-query),
     // close it with a marker so the LLM doesn't try to continue the old request.
     if let Some(ref store) = runtime_ctx.session_store {
         let mut hydrated = 0usize;
         let mut orphans_closed = 0usize;
+
+        // Collect sessions with their mtime for sorting.
+        let mut session_keys: Vec<(String, SystemTime)> = store
+            .list_sessions()
+            .into_iter()
+            .filter_map(|key| {
+                let path = store.session_path_public(&key);
+                let mtime = std::fs::metadata(&path).ok()?.modified().ok()?;
+                Some((key, mtime))
+            })
+            .collect();
+        session_keys.sort_by(|a, b| b.1.cmp(&a.1)); // most recent first
+        session_keys.truncate(MAX_CONVERSATION_SENDERS);
+
         let mut histories = runtime_ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for key in store.list_sessions() {
+        for (key, _) in session_keys {
             let mut msgs = store.load(&key);
             if msgs.is_empty() {
                 continue;
+            }
+            // Trim to the last MAX_CHANNEL_HISTORY messages.
+            if msgs.len() > MAX_CHANNEL_HISTORY {
+                msgs = msgs.split_off(msgs.len() - MAX_CHANNEL_HISTORY);
             }
             // Close orphaned user turns from crashed sessions.
             if msgs.last().is_some_and(|m| m.role == "user") {
@@ -5511,7 +5536,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 orphans_closed += 1;
             }
             hydrated += 1;
-            histories.insert(key, msgs);
+            histories.put(key, msgs);
         }
         drop(histories);
         if hydrated > 0 {
@@ -5854,7 +5879,7 @@ mod tests {
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(histories)),
+            conversation_histories: { let mut lru = lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()); for (k, v) in histories { lru.put(k, v); } Arc::new(Mutex::new(lru)) },
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -5897,7 +5922,7 @@ mod tests {
 
         assert!(compact_sender_history(&ctx, &sender));
 
-        let locked_histories = ctx
+        let mut locked_histories = ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -5976,7 +6001,7 @@ mod tests {
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -6019,7 +6044,7 @@ mod tests {
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
 
-        let histories = ctx
+        let mut histories = ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6054,7 +6079,7 @@ mod tests {
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(histories)),
+            conversation_histories: { let mut lru = lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()); for (k, v) in histories { lru.put(k, v); } Arc::new(Mutex::new(lru)) },
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -6097,7 +6122,7 @@ mod tests {
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
 
-        let locked_histories = ctx
+        let mut locked_histories = ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6151,7 +6176,7 @@ mod tests {
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(histories)),
+            conversation_histories: { let mut lru = lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()); for (k, v) in histories { lru.put(k, v); } Arc::new(Mutex::new(lru)) },
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -6199,7 +6224,7 @@ mod tests {
         ));
 
         // In-memory history should have 2 turns remaining.
-        let locked = ctx
+        let mut locked = ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6731,7 +6756,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -6819,7 +6844,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -6882,7 +6907,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let reply = sent_messages.last().unwrap();
         assert!(reply.contains("BTC is currently around"));
 
-        let histories = runtime_ctx
+        let mut histories = runtime_ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -6921,7 +6946,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7008,7 +7033,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7105,7 +7130,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7223,7 +7248,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
@@ -7322,7 +7347,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7433,7 +7458,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7535,7 +7560,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 12,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7627,7 +7652,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 3,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7845,7 +7870,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7955,7 +7980,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -8084,7 +8109,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -8210,7 +8235,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -8314,7 +8339,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -8401,7 +8426,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -9191,7 +9216,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -9330,7 +9355,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -9427,7 +9452,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                !histories.contains_key("telegram_chat-refresh_alice"),
+                !histories.contains(&"telegram_chat-refresh_alice".to_string()),
                 "/new should clear the cached sender history before the next message"
             );
         }
@@ -9512,7 +9537,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -9583,7 +9608,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls[0][1].0, "user");
         assert_eq!(calls[0][1].1, "hello");
 
-        let histories = runtime_ctx
+        let mut histories = runtime_ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -9627,7 +9652,7 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(histories)),
+            conversation_histories: { let mut lru = lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()); for (k, v) in histories { lru.put(k, v); } Arc::new(Mutex::new(lru)) },
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10212,7 +10237,7 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10306,7 +10331,7 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10395,7 +10420,7 @@ This is an example JSON object for profile settings."#;
         );
         drop(sent);
 
-        let histories = runtime_ctx
+        let mut histories = runtime_ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -10606,7 +10631,7 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10724,7 +10749,7 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10834,7 +10859,7 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10964,7 +10989,7 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -11235,7 +11260,7 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap()))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),

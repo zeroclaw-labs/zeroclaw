@@ -94,6 +94,9 @@ tar = "0.4"
 # Zip extraction for ClawhHub / OpenClaw registry installers
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 
+# LRU cache for bounded conversation history
+lru = "0.14"
+
 # Error handling
 anyhow = "1.0"
 thiserror = "2.0"
