@@ -30,6 +30,11 @@ const REPLY_TTL_SECS: u64 = 3600;
 /// Maximum entries in the reply tracker before cleanup.
 const REPLY_TRACKER_CAPACITY: usize = 10_000;
 
+/// Max attempts for transient QQ message send failures.
+const QQ_SEND_RETRY_MAX_ATTEMPTS: u32 = 3;
+/// Base delay for QQ message send retries (exponential backoff).
+const QQ_SEND_RETRY_BASE_DELAY_MS: u64 = 300;
+
 /// QQ API media file types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QQMediaFileType {
@@ -89,6 +94,63 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+fn qq_http_error_class(status: reqwest::StatusCode) -> &'static str {
+    if status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+    {
+        "transient_http"
+    } else {
+        "permanent_http"
+    }
+}
+
+fn qq_is_retryable_http_status(status: reqwest::StatusCode) -> bool {
+    qq_http_error_class(status) == "transient_http"
+}
+
+fn qq_reqwest_error_class(err: &reqwest::Error) -> &'static str {
+    if err.is_timeout() {
+        "transient_timeout"
+    } else if err.is_connect() {
+        "transient_connect"
+    } else if err.is_request() {
+        "permanent_request"
+    } else {
+        "permanent_request"
+    }
+}
+
+fn qq_parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs.saturating_mul(1000));
+    }
+    if let Ok(secs) = value.parse::<f64>() {
+        if secs.is_finite() && secs >= 0.0 {
+            let millis = std::time::Duration::from_secs_f64(secs).as_millis();
+            return u64::try_from(millis).ok();
+        }
+    }
+    None
+}
+
+fn qq_recipient_scope(recipient: &str) -> &'static str {
+    if recipient.starts_with("group:") {
+        "group"
+    } else {
+        "user"
+    }
+}
+
+fn qq_sanitize_reqwest_error(err: &reqwest::Error) -> String {
+    let mut msg = err.to_string();
+    if let Some(url) = err.url() {
+        msg = msg.replace(url.as_str(), "[redacted_url]");
+    }
+    msg
 }
 
 /// Check whether a file extension is a natively supported QQ voice format.
@@ -621,21 +683,14 @@ impl QQChannel {
             "msg_seq": next_msg_seq(),
         });
 
-        let resp = self
-            .http_client()
-            .post(&url)
-            .header("Authorization", format!("QQBot {token}"))
-            .json(&body)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ send media message failed ({status}): {err}");
-        }
-
-        Ok(())
+        self.post_message_with_retry(
+            &url,
+            &token,
+            &body,
+            "send media message",
+            recipient,
+        )
+        .await
     }
 
     /// Send a single attachment: resolve local/URL, upload, then send.
@@ -906,21 +961,101 @@ impl QQChannel {
             "msg_seq": next_msg_seq(),
         });
 
-        let resp = self
-            .http_client()
-            .post(&url)
-            .header("Authorization", format!("QQBot {token}"))
-            .json(&body)
-            .send()
-            .await?;
+        self.post_message_with_retry(
+            &url,
+            &token,
+            &body,
+            "send message",
+            recipient,
+        )
+        .await
+    }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let err = resp.text().await.unwrap_or_default();
-            anyhow::bail!("QQ send message failed ({status}): {err}");
+    async fn post_message_with_retry(
+        &self,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+        operation: &str,
+        recipient: &str,
+    ) -> anyhow::Result<()> {
+        let recipient_scope = qq_recipient_scope(recipient);
+        for attempt in 1..=QQ_SEND_RETRY_MAX_ATTEMPTS {
+            let send_result = self
+                .http_client()
+                .post(url)
+                .header("Authorization", format!("QQBot {token}"))
+                .json(body)
+                .send()
+                .await;
+
+            match send_result {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        return Ok(());
+                    }
+
+                    let status = resp.status();
+                    let class = qq_http_error_class(status);
+                    let headers = resp.headers().clone();
+                    let err_text = resp.text().await.unwrap_or_default();
+
+                    if qq_is_retryable_http_status(status) && attempt < QQ_SEND_RETRY_MAX_ATTEMPTS
+                    {
+                        let delay_ms = if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                            qq_parse_retry_after_ms(&headers).unwrap_or(
+                                QQ_SEND_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1)),
+                            )
+                        } else {
+                            QQ_SEND_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1))
+                        };
+                        tracing::warn!(
+                            operation,
+                            recipient_scope,
+                            status = %status,
+                            class,
+                            attempt,
+                            max_attempts = QQ_SEND_RETRY_MAX_ATTEMPTS,
+                            delay_ms,
+                            "QQ message API request failed; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+
+                    anyhow::bail!(
+                        "QQ {operation} failed ({class}, status={status}, recipient_scope={recipient_scope}): {err_text}"
+                    );
+                }
+                Err(err) => {
+                    let class = qq_reqwest_error_class(&err);
+                    let retryable = class.starts_with("transient_");
+                    let err_msg = qq_sanitize_reqwest_error(&err);
+
+                    if retryable && attempt < QQ_SEND_RETRY_MAX_ATTEMPTS {
+                        let delay_ms = QQ_SEND_RETRY_BASE_DELAY_MS * (1u64 << (attempt - 1));
+                        tracing::warn!(
+                            operation,
+                            recipient_scope,
+                            class,
+                            error = %err_msg,
+                            attempt,
+                            max_attempts = QQ_SEND_RETRY_MAX_ATTEMPTS,
+                            delay_ms,
+                            "QQ message API transport error; retrying"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+
+                    anyhow::bail!(
+                        "QQ {operation} failed ({class}, recipient_scope={recipient_scope}, attempt={attempt}/{QQ_SEND_RETRY_MAX_ATTEMPTS}): {err_msg}"
+                    );
+                }
+            }
         }
 
-        Ok(())
+        anyhow::bail!("QQ message send failed after retries")
     }
 }
 
@@ -1738,6 +1873,61 @@ allowed_users = ["user1"]
         assert_eq!(infer_attachment_marker("", "song.mp3"), "VOICE");
         assert_eq!(infer_attachment_marker("", "clip.mp4"), "VIDEO");
         assert_eq!(infer_attachment_marker("", "unknown.xyz"), "DOCUMENT");
+    }
+
+    #[test]
+    fn test_qq_http_error_classification() {
+        assert_eq!(
+            qq_http_error_class(reqwest::StatusCode::REQUEST_TIMEOUT),
+            "transient_http"
+        );
+        assert_eq!(
+            qq_http_error_class(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            "transient_http"
+        );
+        assert_eq!(
+            qq_http_error_class(reqwest::StatusCode::BAD_GATEWAY),
+            "transient_http"
+        );
+        assert_eq!(
+            qq_http_error_class(reqwest::StatusCode::BAD_REQUEST),
+            "permanent_http"
+        );
+    }
+
+    #[test]
+    fn test_qq_http_retryable_status() {
+        assert!(qq_is_retryable_http_status(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+        assert!(qq_is_retryable_http_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
+        assert!(!qq_is_retryable_http_status(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ));
+    }
+
+    #[test]
+    fn test_qq_retry_after_parsing() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "2".parse().unwrap());
+        assert_eq!(qq_parse_retry_after_ms(&headers), Some(2000));
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "0.5".parse().unwrap());
+        assert_eq!(qq_parse_retry_after_ms(&headers), Some(500));
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "invalid".parse().unwrap());
+        assert_eq!(qq_parse_retry_after_ms(&headers), None);
+    }
+
+    #[test]
+    fn test_qq_recipient_scope() {
+        assert_eq!(qq_recipient_scope("group:abc"), "group");
+        assert_eq!(qq_recipient_scope("user:abc"), "user");
+        assert_eq!(qq_recipient_scope("abc"), "user");
     }
 
     // --- Upload cache tests ---
