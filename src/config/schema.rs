@@ -8387,6 +8387,36 @@ impl Config {
                 )?;
             }
 
+            // X (Twitter) secrets
+            if !config.x.bearer_token.is_empty() {
+                decrypt_secret(
+                    &store,
+                    &mut config.x.bearer_token,
+                    "config.x.bearer_token",
+                )?;
+            }
+            if !config.x.consumer_secret.is_empty() {
+                decrypt_secret(
+                    &store,
+                    &mut config.x.consumer_secret,
+                    "config.x.consumer_secret",
+                )?;
+            }
+            if !config.x.oauth_token.is_empty() {
+                decrypt_secret(
+                    &store,
+                    &mut config.x.oauth_token,
+                    "config.x.oauth_token",
+                )?;
+            }
+            if !config.x.oauth_token_secret.is_empty() {
+                decrypt_secret(
+                    &store,
+                    &mut config.x.oauth_token_secret,
+                    "config.x.oauth_token_secret",
+                )?;
+            }
+
             // Health (Apple Health Auto Export) secrets
             if !config.health.webhook_secret.is_empty() {
                 decrypt_secret(
@@ -9933,6 +9963,36 @@ impl Config {
                 &store,
                 &mut config_to_save.nutrition.auth_secret,
                 "config.nutrition.auth_secret",
+            )?;
+        }
+
+        // X (Twitter) secrets
+        if !config_to_save.x.bearer_token.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.x.bearer_token,
+                "config.x.bearer_token",
+            )?;
+        }
+        if !config_to_save.x.consumer_secret.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.x.consumer_secret,
+                "config.x.consumer_secret",
+            )?;
+        }
+        if !config_to_save.x.oauth_token.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.x.oauth_token,
+                "config.x.oauth_token",
+            )?;
+        }
+        if !config_to_save.x.oauth_token_secret.is_empty() {
+            encrypt_secret(
+                &store,
+                &mut config_to_save.x.oauth_token_secret,
+                "config.x.oauth_token_secret",
             )?;
         }
 

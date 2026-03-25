@@ -1,0 +1,80 @@
+# syntax=docker/dockerfile:1.7
+#
+# Dockerfile.rpi — cross-compile ZeroClaw for Raspberry Pi (aarch64-unknown-linux-gnu).
+#
+# Produces a statically-linked ARM64 binary with hardware + peripheral-rpi features.
+# The binary is exported to the host via a scratch stage.
+#
+# Usage:
+#   docker build -f Dockerfile.rpi -o rpi-build .
+#
+# The resulting binary lands at rpi-build/zeroclaw, ready to scp to your Pi.
+
+# ── Stage 0: Frontend build ─────────────────────────────────────
+FROM node:22-alpine AS web-builder
+WORKDIR /web
+COPY web/package.json web/package-lock.json* ./
+RUN npm ci --ignore-scripts 2>/dev/null || npm install --ignore-scripts
+COPY web/ .
+RUN npm run build
+
+# ── Stage 1: Cross-compile for aarch64 ──────────────────────────
+FROM rust:1.94-slim AS builder
+
+ARG TARGET=aarch64-unknown-linux-gnu
+ARG ZEROCLAW_CARGO_FEATURES="hardware,peripheral-rpi"
+
+WORKDIR /app
+
+# Install cross-compilation toolchain
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y \
+        pkg-config \
+        gcc-aarch64-linux-gnu \
+        libc6-dev-arm64-cross \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add the Rust target
+RUN rustup target add ${TARGET}
+
+# Configure the cross-linker
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+
+# 1. Copy manifests to cache dependencies
+COPY Cargo.toml Cargo.lock ./
+COPY crates/robot-kit/ crates/robot-kit/
+COPY crates/aardvark-sys/ crates/aardvark-sys/
+RUN mkdir -p src benches \
+    && echo "fn main() {}" > src/main.rs \
+    && echo "" > src/lib.rs \
+    && echo "fn main() {}" > benches/agent_benchmarks.rs
+RUN --mount=type=cache,id=rpi-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=rpi-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=rpi-target,target=/app/target,sharing=locked \
+    cargo build --release --locked --target ${TARGET} --features "${ZEROCLAW_CARGO_FEATURES}"
+RUN rm -rf src benches
+
+# 2. Copy source and build the real binary
+COPY src/ src/
+COPY benches/ benches/
+COPY --from=web-builder /web/dist web/dist
+COPY *.rs .
+RUN touch src/main.rs
+RUN --mount=type=cache,id=rpi-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=rpi-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=rpi-target,target=/app/target,sharing=locked \
+    rm -rf target/${TARGET}/release/.fingerprint/zeroclawlabs-* \
+           target/${TARGET}/release/deps/zeroclawlabs-* \
+           target/${TARGET}/release/incremental/zeroclawlabs-* && \
+    cargo build --release --locked --target ${TARGET} --features "${ZEROCLAW_CARGO_FEATURES}" && \
+    cp target/${TARGET}/release/zeroclaw /app/zeroclaw && \
+    aarch64-linux-gnu-strip /app/zeroclaw
+
+# Sanity check: binary should be >1MB
+RUN size=$(stat -c%s /app/zeroclaw) && \
+    if [ "$size" -lt 1000000 ]; then echo "ERROR: binary too small (${size} bytes)" && exit 1; fi
+
+# ── Stage 2: Export binary ───────────────────────────────────────
+FROM scratch
+COPY --from=builder /app/zeroclaw /zeroclaw
