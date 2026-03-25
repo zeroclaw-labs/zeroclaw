@@ -3797,6 +3797,10 @@ pub struct A2aConfig {
     /// Capability tags advertised in the agent card skills list.
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// Telegram chat ID for A2A activity notifications (e.g. a group chat).
+    /// When set, inbound A2A task results are also posted to this chat.
+    #[serde(default)]
+    pub notify_chat_id: Option<i64>,
 }
 
 impl std::fmt::Debug for A2aConfig {
@@ -3809,6 +3813,7 @@ impl std::fmt::Debug for A2aConfig {
             .field("bearer_token", &self.bearer_token.as_ref().map(|_| "***"))
             .field("version", &self.version)
             .field("capabilities", &self.capabilities)
+            .field("notify_chat_id", &self.notify_chat_id)
             .finish()
     }
 }

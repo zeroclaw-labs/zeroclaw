@@ -326,6 +326,13 @@ async fn handle_message_send(
 
     // Process via agent pipeline
     let config = state.config.lock().clone();
+    let telegram_notify = config.a2a.notify_chat_id.and_then(|chat_id| {
+        config
+            .channels_config
+            .telegram
+            .as_ref()
+            .map(|t| (t.bot_token.clone(), chat_id))
+    });
     let session_id = format!("a2a-{task_id}");
     match Box::pin(crate::agent::process_message(
         config,
@@ -335,6 +342,16 @@ async fn handle_message_send(
     .await
     {
         Ok(response) => {
+            // Notify Telegram group about A2A activity
+            if let Some((ref token, chat_id)) = telegram_notify {
+                let notice = format!(
+                    "\u{1f4e8} *A2A received:* _{}_\n\n{}",
+                    message.replace('*', "\\*").replace('_', "\\_"),
+                    response
+                );
+                notify_telegram_chat(token, chat_id, &notice).await;
+            }
+
             let artifact = json!({
                 "artifactId": uuid::Uuid::new_v4().to_string(),
                 "name": "response",
@@ -416,6 +433,28 @@ async fn handle_tasks_get(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Best-effort Telegram notification for A2A activity.
+/// Sends a message to a known chat ID (e.g. a group chat).
+async fn notify_telegram_chat(bot_token: &str, chat_id: i64, text: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+    let _ = client
+        .post(&url)
+        .json(&json!({
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown"
+        }))
+        .send()
+        .await;
+}
 
 fn rpc_error(id: serde_json::Value, code: i32, message: &str) -> serde_json::Value {
     json!({
