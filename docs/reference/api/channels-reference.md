@@ -211,7 +211,19 @@ user_id = "@zeroclaw:matrix.example.com"   # optional, recommended for E2EE
 device_id = "DEVICEID123"                  # optional, recommended for E2EE
 room_id = "!room:matrix.example.com"       # or room alias (#ops:matrix.example.com)
 allowed_users = ["*"]
+stream_mode = "partial"                    # optional: off | partial | multi_message (default: partial via wizard)
+draft_update_interval_ms = 1500            # optional: edit throttle for partial streaming
+multi_message_delay_ms = 800               # optional: delay between paragraph sends in multi_message mode
 ```
+
+Matrix streaming notes:
+
+- `stream_mode = "partial"` sends an editable draft message that updates token-by-token via Matrix `m.replace` edits as the LLM streams its response.
+- `stream_mode = "multi_message"` delivers the response incrementally as separate messages, splitting at paragraph boundaries (`\n\n`) as tokens arrive. Code fences are never split across messages.
+- `draft_update_interval_ms` controls edit throttling in partial mode (default: 1500ms, higher than Telegram to account for E2EE re-encryption overhead and federation latency).
+- `multi_message_delay_ms` controls minimum delay between paragraph sends in multi_message mode (default: 800ms).
+- Both modes work in encrypted and unencrypted rooms — the matrix-sdk handles E2EE transparently.
+- Existing configs without `stream_mode` default to `off` (no behavior change).
 
 See [Matrix E2EE Guide](../../security/matrix-e2ee-guide.md) for encrypted-room troubleshooting.
 
