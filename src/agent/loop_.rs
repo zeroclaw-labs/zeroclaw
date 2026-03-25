@@ -616,7 +616,7 @@ async fn build_context(
             if context == "[Memory context]\n" {
                 context.clear();
             } else {
-                context.push('\n');
+                context.push_str("[/Memory context]\n\n");
             }
         }
     }
