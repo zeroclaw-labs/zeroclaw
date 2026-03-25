@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
+  <img width="2528" height="1684" alt="zeroclaw-banner" src="https://github.com/user-attachments/assets/dc255ff1-4f61-4ed0-b638-eb384a7bb7b5" />
 </p>
 
 <h1 align="center">🦀 ZeroClaw — Personal AI Assistant</h1>
