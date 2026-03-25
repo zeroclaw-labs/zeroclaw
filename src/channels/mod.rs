@@ -6160,6 +6160,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         native_tools,
         config.skills.prompt_injection_mode,
     );
+
+    // Inject API key inventory so the agent knows which providers/tools are available
+    let api_key_inventory = crate::config::build_api_key_inventory(&config);
+    system_prompt.push_str(&api_key_inventory.to_prompt_section());
+
     if !native_tools {
         let filtered_specs = filtered_tool_specs_for_runtime(tools_registry.as_ref(), excluded);
         system_prompt.push_str(&build_tool_instructions_from_specs(&filtered_specs));

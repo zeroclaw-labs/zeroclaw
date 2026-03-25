@@ -13,6 +13,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -277,6 +278,108 @@ impl PerplexitySearchTool {
         Ok(out)
     }
 
+    /// Fallback: search via DuckDuckGo HTML scraping when no Perplexity API
+    /// key is available. Free, no API key required.
+    async fn search_via_duckduckgo(
+        &self,
+        query: &str,
+        num_results: usize,
+    ) -> anyhow::Result<String> {
+        let encoded_query = urlencoding::encode(query);
+        let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent("Mozilla/5.0 (compatible; ZeroClaw/1.0)")
+            .build()?;
+
+        let response = client
+            .get(&search_url)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("DuckDuckGo fallback request failed: {e}"))?;
+
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "DuckDuckGo fallback failed with status: {}",
+                response.status()
+            );
+        }
+
+        let html = response.text().await?;
+        self.parse_duckduckgo_results(&html, query, num_results)
+    }
+
+    /// Parse DuckDuckGo HTML search results into a formatted string.
+    fn parse_duckduckgo_results(
+        &self,
+        html: &str,
+        query: &str,
+        num_results: usize,
+    ) -> anyhow::Result<String> {
+        let link_regex = Regex::new(
+            r#"<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#,
+        )?;
+        let snippet_regex =
+            Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#)?;
+
+        let link_matches: Vec<_> = link_regex
+            .captures_iter(html)
+            .take(num_results + 2)
+            .collect();
+        let snippet_matches: Vec<_> = snippet_regex
+            .captures_iter(html)
+            .take(num_results + 2)
+            .collect();
+
+        if link_matches.is_empty() {
+            return Ok(format!("No search results found for: {}", query));
+        }
+
+        let mut lines = vec![format!(
+            "Search results for: {} (via DuckDuckGo fallback — no Perplexity API key)",
+            query
+        )];
+
+        let count = link_matches.len().min(num_results);
+        for i in 0..count {
+            let caps = &link_matches[i];
+            let url_str = Self::decode_ddg_redirect_url(&caps[1]);
+            let title = Self::strip_html_tags(&caps[2]);
+
+            lines.push(format!("\n[{}] {}", i + 1, title.trim()));
+            lines.push(format!("    URL: {}", url_str.trim()));
+
+            if i < snippet_matches.len() {
+                let snippet = Self::strip_html_tags(&snippet_matches[i][1]);
+                let snippet = snippet.trim();
+                if !snippet.is_empty() {
+                    lines.push(format!("    {}", snippet));
+                }
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    /// Decode DuckDuckGo redirect URLs to extract the actual target URL.
+    fn decode_ddg_redirect_url(raw_url: &str) -> String {
+        if let Some(index) = raw_url.find("uddg=") {
+            let encoded = &raw_url[index + 5..];
+            let encoded = encoded.split('&').next().unwrap_or(encoded);
+            if let Ok(decoded) = urlencoding::decode(encoded) {
+                return decoded.into_owned();
+            }
+        }
+        raw_url.to_string()
+    }
+
+    /// Strip HTML tags from a string.
+    fn strip_html_tags(content: &str) -> String {
+        let re = Regex::new(r"<[^>]+>").unwrap();
+        re.replace_all(content, "").to_string()
+    }
+
     /// Format raw JSON search results into a readable string for the LLM.
     fn format_search_results(
         &self,
@@ -416,16 +519,42 @@ impl Tool for PerplexitySearchTool {
             .map(|n| n as usize)
             .unwrap_or(self.max_results);
 
-        match self.search(query, num_results).await {
+        // If no API key is configured, fall back to DuckDuckGo immediately.
+        let use_ddg_fallback = self.api_keys.is_empty();
+
+        let result = if use_ddg_fallback {
+            self.search_via_duckduckgo(query, num_results).await
+        } else {
+            self.search(query, num_results).await
+        };
+
+        match result {
             Ok(output) => Ok(ToolResult {
                 success: true,
                 output,
                 error: None,
             }),
+            Err(e) if !use_ddg_fallback => {
+                // Perplexity failed — try DuckDuckGo as a last resort.
+                match self.search_via_duckduckgo(query, num_results).await {
+                    Ok(output) => Ok(ToolResult {
+                        success: true,
+                        output,
+                        error: None,
+                    }),
+                    Err(ddg_err) => Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Perplexity Search failed: {e}; DuckDuckGo fallback also failed: {ddg_err}"
+                        )),
+                    }),
+                }
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Perplexity Search failed: {e}")),
+                error: Some(format!("DuckDuckGo fallback search failed: {e}")),
             }),
         }
     }
@@ -503,5 +632,94 @@ mod tests {
         assert!(result.contains("https://example.com"));
         assert!(result.contains("A test snippet"));
         assert!(result.contains("0.95"));
+    }
+
+    // --- DuckDuckGo fallback tests ---
+
+    fn no_key_config() -> PerplexitySearchConfig {
+        PerplexitySearchConfig {
+            enabled: true,
+            api_key: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_api_key_means_ddg_fallback_path() {
+        let tool = PerplexitySearchTool::new(test_security(), &no_key_config());
+        assert!(tool.api_keys.is_empty());
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_empty_html() {
+        let tool = PerplexitySearchTool::new(test_security(), &no_key_config());
+        let result = tool
+            .parse_duckduckgo_results("<html>No results</html>", "test", 5)
+            .unwrap();
+        assert!(result.contains("No search results found"));
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_with_data() {
+        let tool = PerplexitySearchTool::new(test_security(), &no_key_config());
+        let html = r#"
+            <a class="result__a" href="https://example.com">Example Title</a>
+            <a class="result__snippet">A snippet about the topic</a>
+        "#;
+        let result = tool.parse_duckduckgo_results(html, "test", 5).unwrap();
+        assert!(result.contains("[1] Example Title"));
+        assert!(result.contains("https://example.com"));
+        assert!(result.contains("A snippet about the topic"));
+        assert!(result.contains("DuckDuckGo fallback"));
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_decodes_redirect_url() {
+        let tool = PerplexitySearchTool::new(test_security(), &no_key_config());
+        let html = r#"
+            <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example</a>
+        "#;
+        let result = tool.parse_duckduckgo_results(html, "test", 5).unwrap();
+        assert!(result.contains("https://example.com/path?a=1"));
+    }
+
+    #[test]
+    fn decode_ddg_redirect_url_extracts_target() {
+        let url = "https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com&rut=abc";
+        assert_eq!(
+            PerplexitySearchTool::decode_ddg_redirect_url(url),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn decode_ddg_redirect_url_returns_raw_when_no_uddg() {
+        let url = "https://example.com/direct";
+        assert_eq!(
+            PerplexitySearchTool::decode_ddg_redirect_url(url),
+            "https://example.com/direct"
+        );
+    }
+
+    #[test]
+    fn strip_html_tags_removes_tags() {
+        assert_eq!(
+            PerplexitySearchTool::strip_html_tags("<b>bold</b> text"),
+            "bold text"
+        );
+    }
+
+    #[test]
+    fn parse_duckduckgo_results_respects_num_results() {
+        let tool = PerplexitySearchTool::new(test_security(), &no_key_config());
+        let html = r#"
+            <a class="result__a" href="https://a.com">A</a>
+            <a class="result__a" href="https://b.com">B</a>
+            <a class="result__a" href="https://c.com">C</a>
+        "#;
+        let result = tool.parse_duckduckgo_results(html, "test", 2).unwrap();
+        assert!(result.contains("[1] A"));
+        assert!(result.contains("[2] B"));
+        assert!(!result.contains("[3] C"));
     }
 }

@@ -3,13 +3,13 @@ pub mod traits;
 
 #[allow(unused_imports)]
 pub use schema::{
-    apply_runtime_proxy_to_builder, build_runtime_proxy_client,
+    apply_runtime_proxy_to_builder, build_api_key_inventory, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, default_model_fallback_for_provider,
     get_home_timezone, platform_default_classification_rules, platform_default_model_routes,
     resolve_default_model_id, resolve_provider_access_mode, runtime_proxy_config,
     set_runtime_proxy_config, AckReactionChannelsConfig, AckReactionChatType, AckReactionConfig,
     AckReactionRuleAction, AckReactionRuleConfig, AckReactionStrategy, AgentConfig,
-    AgentSessionBackend, AgentSessionConfig, AgentSessionStrategy, AgentsIpcConfig, AuditConfig,
+    AgentSessionBackend, AgentSessionConfig, AgentSessionStrategy, AgentsIpcConfig, ApiKeyInventory, AuditConfig,
     AuthConfig, AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig,
     ChannelsConfig, ClassificationRule, CodingConfig, ComposioConfig, Config, CoordinationConfig,
     CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig, DockerRuntimeConfig,
