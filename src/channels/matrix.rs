@@ -325,6 +325,18 @@ impl MatrixChannel {
         Self::is_room_allowed_static(allowed_rooms, incoming_room_id)
     }
 
+    /// Handler-level inbound room decision.
+    ///
+    /// Keep this as the single place that defines inbound message room scope,
+    /// so later handler gates cannot accidentally negate `room_matches_target()`.
+    fn should_accept_inbound_room_message(
+        target_room_id: &str,
+        allowed_rooms: &[String],
+        incoming_room_id: &str,
+    ) -> bool {
+        Self::room_matches_target(target_room_id, allowed_rooms, incoming_room_id)
+    }
+
     fn cache_event_id(
         event_id: &str,
         recent_order: &mut std::collections::VecDeque<String>,
@@ -815,18 +827,13 @@ impl Channel for MatrixChannel {
             let transcription_mgr = transcription_mgr_for_handler.clone();
 
             async move {
-                if !MatrixChannel::room_matches_target(
+                if !MatrixChannel::should_accept_inbound_room_message(
                     target_room.as_str(),
                     &allowed_rooms,
                     room.room_id().as_str(),
                 ) {
-                    return;
-                }
-
-                // Room allowlist: skip messages from rooms not in the configured list
-                if !MatrixChannel::is_room_allowed_static(&allowed_rooms, room.room_id().as_ref()) {
                     tracing::debug!(
-                        "Matrix: ignoring message from room {} (not in allowed_rooms)",
+                        "Matrix: ignoring message from room {} (outside inbound scope)",
                         room.room_id()
                     );
                     return;
@@ -1490,6 +1497,27 @@ mod tests {
             "!ops:matrix.org",
             &["!allowed:matrix.org".to_string()],
             "!other:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn inbound_handler_room_scope_does_not_require_target_in_allowlist() {
+        let target = "!ops:matrix.org";
+        let allowed_rooms = vec!["!other:matrix.org".to_string()];
+
+        // Handler-level behavior: the configured target room is always in scope, even when an
+        // allowlist is present that does not include it.
+        assert!(MatrixChannel::should_accept_inbound_room_message(
+            target,
+            &allowed_rooms,
+            target
+        ));
+
+        // This would be false for the target room when it's not explicitly listed, which is why
+        // the handler must not apply a second `is_room_allowed_static()` gate.
+        assert!(!MatrixChannel::is_room_allowed_static(
+            &allowed_rooms,
+            target
         ));
     }
 
