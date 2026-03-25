@@ -29,7 +29,8 @@ pub use schema::{
     StorageProviderSection, StreamMode, SyncConfig, SyscallAnomalyConfig, TaskCategory,
     TelegramConfig, TelemetryConfig, TranscriptionConfig, TunnelConfig, UrlAccessConfig,
     VoiceConfig, WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy, WasmRuntimeConfig,
-    WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig, DEFAULT_MODEL_FALLBACK,
+    WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
+    PerplexitySearchApiConfig, DEFAULT_MODEL_FALLBACK,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
