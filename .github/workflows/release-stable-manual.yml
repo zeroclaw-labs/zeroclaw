@@ -262,6 +262,10 @@ jobs:
             cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
           fi
 
+      - name: Check binary size
+        shell: bash
+        run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
