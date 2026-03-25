@@ -274,7 +274,8 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     let mut config = Box::pin(Config::load_or_init()).await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
-    config.channels_config = setup_channels()?;
+    let new_channels = setup_channels()?;
+    config.channels_config.merge_from(new_channels);
     config.save().await?;
     persist_workspace_selection(&config.config_path).await?;
 

@@ -6133,6 +6133,62 @@ pub struct ChannelsConfig {
 }
 
 impl ChannelsConfig {
+    /// Merge `other` into `self`: for every `Option` channel field, if `other`
+    /// has `Some(value)` it overwrites `self`; if `None` the existing value is
+    /// preserved.  Scalar / non-channel fields (`cli`, `message_timeout_secs`,
+    /// etc.) are left untouched so a channels-only repair does not reset them.
+    pub fn merge_from(&mut self, other: ChannelsConfig) {
+        macro_rules! merge_opt {
+            ($($field:ident),* $(,)?) => {
+                $(
+                    if other.$field.is_some() {
+                        self.$field = other.$field;
+                    }
+                )*
+            };
+        }
+
+        merge_opt!(
+            telegram,
+            discord,
+            discord_history,
+            slack,
+            mattermost,
+            webhook,
+            imessage,
+            matrix,
+            signal,
+            whatsapp,
+            linq,
+            wati,
+            nextcloud_talk,
+            email,
+            gmail_push,
+            irc,
+            lark,
+            feishu,
+            dingtalk,
+            wecom,
+            qq,
+            twitter,
+            mochat,
+            clawdtalk,
+            reddit,
+            bluesky,
+            voice_call,
+        );
+
+        #[cfg(feature = "channel-nostr")]
+        if other.nostr.is_some() {
+            self.nostr = other.nostr;
+        }
+
+        #[cfg(feature = "voice-wake")]
+        if other.voice_wake.is_some() {
+            self.voice_wake = other.voice_wake;
+        }
+    }
+
     /// get channels' metadata and `.is_some()`, except webhook
     #[rustfmt::skip]
     pub fn channels_except_webhook(&self) -> Vec<(Box<dyn super::traits::ConfigHandle>, bool)> {
