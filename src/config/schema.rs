@@ -6819,6 +6819,11 @@ pub struct NextcloudTalkConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Display name of the bot in Nextcloud Talk (e.g. "zeroclaw").
+    /// Used to filter out the bot's own messages and prevent feedback loops.
+    /// If not set, defaults to an empty string (no self-message filtering by name).
+    #[serde(default)]
+    pub bot_name: Option<String>,
 }
 
 impl ChannelConfig for NextcloudTalkConfig {
@@ -14497,6 +14502,7 @@ default_model = "persisted-profile"
             webhook_secret: Some("webhook-secret".into()),
             allowed_users: vec!["user_a".into(), "*".into()],
             proxy_url: None,
+            bot_name: None,
         };
 
         let json = serde_json::to_string(&nc).unwrap();

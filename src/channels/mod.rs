@@ -4287,6 +4287,7 @@ fn collect_configured_channels(
             channel: Arc::new(NextcloudTalkChannel::new_with_proxy(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
+                nc.bot_name.clone().unwrap_or_default(),
                 nc.allowed_users.clone(),
                 nc.proxy_url.clone(),
             )),
