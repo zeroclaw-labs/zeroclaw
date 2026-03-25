@@ -355,6 +355,60 @@ impl MatrixChannel {
             .map(|dir| dir.join("state").join("matrix"))
     }
 
+    /// Read a persisted device_id from disk, or generate and persist a new one.
+    async fn auto_generate_device_id(&self) -> anyhow::Result<String> {
+        let state_dir = self.matrix_store_dir().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Matrix E2EE session restore requires device_id but zeroclaw_dir is not set. \
+                 Set channels.matrix.device_id explicitly."
+            )
+        })?;
+        let path = state_dir.join("device_id");
+
+        // Try to read an existing persisted device_id first.
+        if path.is_file() {
+            let existing = tokio::fs::read_to_string(&path).await.map_err(|e| {
+                anyhow::anyhow!("Failed to read persisted Matrix device_id from '{}': {e}", path.display())
+            })?;
+            let existing = existing.trim().to_string();
+            if !existing.is_empty() {
+                tracing::info!(
+                    "Loaded persisted Matrix device_id from '{}'",
+                    path.display()
+                );
+                return Ok(existing);
+            }
+        }
+
+        // Generate a new stable device_id.
+        let id = format!(
+            "ZEROCLAW_{}",
+            &uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
+        );
+
+        // Ensure the directory exists and persist.
+        tokio::fs::create_dir_all(&state_dir).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create Matrix state directory '{}': {e}",
+                state_dir.display()
+            )
+        })?;
+        tokio::fs::write(&path, &id).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to persist Matrix device_id to '{}': {e}",
+                path.display()
+            )
+        })?;
+
+        tracing::info!(
+            "Auto-generated Matrix device_id: {} (persisted to {})",
+            id,
+            path.display()
+        );
+
+        Ok(id)
+    }
+
     fn is_user_allowed(&self, sender: &str) -> bool {
         Self::is_sender_allowed(&self.allowed_users, sender)
     }
@@ -461,7 +515,9 @@ impl MatrixChannel {
                 let whoami = match identity {
                     Ok(whoami) => Some(whoami),
                     Err(error) => {
-                        if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some()
+                        if self.session_owner_hint.is_some()
+                            && (self.session_device_id_hint.is_some()
+                                || self.zeroclaw_dir.is_some())
                         {
                             tracing::warn!(
                                 "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
@@ -507,17 +563,15 @@ impl MatrixChannel {
                             hinted.clone()
                         }
                     }
-                    (Some(whoami), None) => whoami.device_id.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Matrix whoami response did not include device_id. Set channels.matrix.device_id to enable E2EE session restore."
-                        )
-                    })?,
-                    (None, Some(hinted)) => hinted.clone(),
-                    (None, None) => {
-                        return Err(anyhow::anyhow!(
-                            "Matrix E2EE session restore requires device_id when whoami is unavailable"
-                        ));
+                    (Some(whoami), None) => {
+                        if let Some(id) = whoami.device_id.clone() {
+                            id
+                        } else {
+                            self.auto_generate_device_id().await?
+                        }
                     }
+                    (None, Some(hinted)) => hinted.clone(),
+                    (None, None) => self.auto_generate_device_id().await?
                 };
 
                 let mut client_builder = MatrixSdkClient::builder().homeserver_url(&self.homeserver);
