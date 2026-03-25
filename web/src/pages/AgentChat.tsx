@@ -118,8 +118,26 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'history': {
+          // Replay of a persisted message from a resumed session.
+          const role = msg.role === 'user' ? 'user' : 'agent';
+          if (msg.content) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: generateUUID(),
+                role: role as 'user' | 'agent',
+                content: msg.content!,
+                timestamp: new Date(),
+              },
+            ]);
+          }
+          break;
+        }
+        case 'history_end':
         case 'session_start':
         case 'connected':
+          // Informational frames — no action needed.
           break;
 
         case 'thinking':

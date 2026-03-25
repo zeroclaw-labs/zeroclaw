@@ -142,7 +142,9 @@ export interface WsMessage {
     | 'done'
     | 'error'
     | 'session_start'
-    | 'connected';
+    | 'connected'
+    | 'history'
+    | 'history_end';
   content?: string;
   full_response?: string;
   name?: string;
@@ -150,6 +152,7 @@ export interface WsMessage {
   output?: string;
   message?: string;
   code?: string;
+  role?: string;
   session_id?: string;
   resumed?: boolean;
   message_count?: number;
