@@ -9,8 +9,11 @@ import type {
   CostSummary,
   CliTool,
   HealthSnapshot,
+  Session,
+  ChannelDetail,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
+import { apiOrigin, basePath } from './basePath';
 
 // ---------------------------------------------------------------------------
 // Base fetch wrapper
@@ -42,7 +45,7 @@ export async function apiFetch<T = unknown>(
     headers.set('Content-Type', 'application/json');
   }
 
-  const response = await fetch(path, { ...options, headers });
+  const response = await fetch(`${apiOrigin}${basePath}${path}`, { ...options, headers });
 
   if (response.status === 401) {
     clearToken();
@@ -78,7 +81,7 @@ function unwrapField<T>(value: T | Record<string, T>, key: string): T {
 // ---------------------------------------------------------------------------
 
 export async function pair(code: string): Promise<{ token: string }> {
-  const response = await fetch('/pair', {
+  const response = await fetch(`${basePath}/pair`, {
     method: 'POST',
     headers: { 'X-Pairing-Code': code },
   });
@@ -106,7 +109,7 @@ export async function getAdminPairCode(): Promise<{ pairing_code: string | null;
 // ---------------------------------------------------------------------------
 
 export async function getPublicHealth(): Promise<{ require_pairing: boolean; paired: boolean }> {
-  const response = await fetch('/health');
+  const response = await fetch(`${basePath}/health`);
   if (!response.ok) {
     throw new Error(`Health check failed (${response.status})`);
   }
@@ -287,6 +290,30 @@ export function deleteMemory(key: string): Promise<void> {
 export function getCost(): Promise<CostSummary> {
   return apiFetch<CostSummary | { cost: CostSummary }>('/api/cost').then((data) =>
     unwrapField(data, 'cost'),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+export function getSessions(): Promise<Session[]> {
+  return apiFetch<Session[] | { sessions: Session[] }>('/api/sessions').then((data) =>
+    unwrapField(data, 'sessions'),
+  );
+}
+
+export function getSession(id: string): Promise<Session> {
+  return apiFetch<Session>(`/api/sessions/${encodeURIComponent(id)}`);
+}
+
+// ---------------------------------------------------------------------------
+// Channels (detailed)
+// ---------------------------------------------------------------------------
+
+export function getChannels(): Promise<ChannelDetail[]> {
+  return apiFetch<ChannelDetail[] | { channels: ChannelDetail[] }>('/api/channels').then((data) =>
+    unwrapField(data, 'channels'),
   );
 }
 

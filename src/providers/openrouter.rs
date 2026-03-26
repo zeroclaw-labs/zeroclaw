@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenRouterProvider {
     credential: Option<String>,
     timeout_secs: u64,
+    max_tokens: Option<u32>,
 }
 
 const DEFAULT_OPENROUTER_TIMEOUT_SECS: u64 = 120;
@@ -22,6 +23,8 @@ struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -73,6 +76,8 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -157,6 +162,7 @@ impl OpenRouterProvider {
             timeout_secs: timeout_secs
                 .filter(|secs| *secs > 0)
                 .unwrap_or(DEFAULT_OPENROUTER_TIMEOUT_SECS),
+            max_tokens: None,
         }
     }
 
@@ -166,24 +172,34 @@ impl OpenRouterProvider {
         self
     }
 
+    /// Set the maximum output tokens for API requests.
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         let items = tools?;
         if items.is_empty() {
             return None;
         }
-        Some(
-            items
-                .iter()
-                .map(|tool| NativeToolSpec {
-                    kind: "function".to_string(),
-                    function: NativeToolFunctionSpec {
-                        name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
-                    },
-                })
-                .collect(),
-        )
+        let valid: Vec<NativeToolSpec> = items
+            .iter()
+            .filter(|tool| is_valid_openai_tool_name(&tool.name))
+            .map(|tool| NativeToolSpec {
+                kind: "function".to_string(),
+                function: NativeToolFunctionSpec {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.parameters.clone(),
+                },
+            })
+            .collect();
+        if valid.is_empty() {
+            None
+        } else {
+            Some(valid)
+        }
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
@@ -402,6 +418,7 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages,
             temperature,
+            max_tokens: self.max_tokens,
         };
 
         let response = self
@@ -451,6 +468,7 @@ impl Provider for OpenRouterProvider {
             model: model.to_string(),
             messages: api_messages,
             temperature,
+            max_tokens: self.max_tokens,
         };
 
         let response = self
@@ -498,6 +516,7 @@ impl Provider for OpenRouterProvider {
             temperature,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            max_tokens: self.max_tokens,
         };
 
         let response = self
@@ -592,6 +611,7 @@ impl Provider for OpenRouterProvider {
             temperature,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
+            max_tokens: self.max_tokens,
         };
 
         let response = self
@@ -626,6 +646,16 @@ impl Provider for OpenRouterProvider {
         result.usage = usage;
         Ok(result)
     }
+}
+
+/// Check if a tool name is valid for OpenAI-compatible APIs.
+/// Must match `^[a-zA-Z0-9_-]{1,64}$`.
+fn is_valid_openai_tool_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 #[cfg(test)]
@@ -723,6 +753,7 @@ mod tests {
                 },
             ],
             temperature: 0.5,
+            max_tokens: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -756,6 +787,7 @@ mod tests {
                 })
                 .collect(),
             temperature: 0.0,
+            max_tokens: None,
         };
 
         let json = serde_json::to_string(&request).unwrap();
@@ -1136,5 +1168,70 @@ mod tests {
     fn with_timeout_secs_overrides_default() {
         let provider = OpenRouterProvider::new(Some("key"), None).with_timeout_secs(300);
         assert_eq!(provider.timeout_secs, 300);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // tool name validation tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn valid_openai_tool_names() {
+        assert!(is_valid_openai_tool_name("shell"));
+        assert!(is_valid_openai_tool_name("file_read"));
+        assert!(is_valid_openai_tool_name("web-search"));
+        assert!(is_valid_openai_tool_name("Tool123"));
+        assert!(is_valid_openai_tool_name("a"));
+    }
+
+    #[test]
+    fn invalid_openai_tool_names() {
+        assert!(!is_valid_openai_tool_name(""));
+        assert!(!is_valid_openai_tool_name("mcp:server.tool"));
+        assert!(!is_valid_openai_tool_name("node.js"));
+        assert!(!is_valid_openai_tool_name("tool name"));
+        assert!(!is_valid_openai_tool_name(
+            "this_tool_name_is_way_too_long_and_exceeds_the_sixty_four_character_limit_xxxxx"
+        ));
+    }
+
+    #[test]
+    fn convert_tools_skips_invalid_names() {
+        use crate::tools::ToolSpec;
+
+        let tools = vec![
+            ToolSpec {
+                name: "valid_tool".into(),
+                description: "A valid tool".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolSpec {
+                name: "mcp:server.bad".into(),
+                description: "Invalid name".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolSpec {
+                name: "another-valid".into(),
+                description: "Also valid".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+
+        let result = OpenRouterProvider::convert_tools(Some(&tools)).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].function.name, "valid_tool");
+        assert_eq!(result[1].function.name, "another-valid");
+    }
+
+    #[test]
+    fn convert_tools_returns_none_when_all_invalid() {
+        use crate::tools::ToolSpec;
+
+        let tools = vec![ToolSpec {
+            name: "mcp:bad.name".into(),
+            description: "Invalid".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        assert!(OpenRouterProvider::convert_tools(Some(&tools)).is_none());
     }
 }

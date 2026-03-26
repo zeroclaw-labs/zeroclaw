@@ -134,22 +134,24 @@ impl Tool for SubprocessTool {
             })?;
 
         // Write JSON args + newline to stdin, then drop stdin to signal EOF.
+        // BrokenPipe is tolerated — the child may exit before reading stdin
+        // (e.g. tools that only use command-line args or produce fixed output).
         if let Some(mut stdin) = child.stdin.take() {
-            if let Err(e) = stdin.write_all(args_json.as_bytes()).await {
-                let _ = child.kill().await;
-                return Err(anyhow::anyhow!(
-                    "failed to write args to plugin '{}' stdin: {}",
-                    self.manifest.tool.name,
-                    e
-                ));
+            let write_result = async {
+                stdin.write_all(args_json.as_bytes()).await?;
+                stdin.write_all(b"\n").await?;
+                Ok::<(), std::io::Error>(())
             }
-            if let Err(e) = stdin.write_all(b"\n").await {
-                let _ = child.kill().await;
-                return Err(anyhow::anyhow!(
-                    "failed to write newline to plugin '{}' stdin: {}",
-                    self.manifest.tool.name,
-                    e
-                ));
+            .await;
+            if let Err(e) = write_result {
+                if e.kind() != std::io::ErrorKind::BrokenPipe {
+                    let _ = child.kill().await;
+                    return Err(anyhow::anyhow!(
+                        "failed to write args to plugin '{}' stdin: {}",
+                        self.manifest.tool.name,
+                        e
+                    ));
+                }
             }
             // stdin dropped here → child receives EOF
         }
@@ -407,7 +409,11 @@ mod tests {
         // Simpler: write a temp script.
         let dir = tempfile::tempdir().unwrap();
         let script_path = dir.path().join("tool.sh");
-        std::fs::write(&script_path, format!("#!/bin/sh\necho '{}'\n", result_json)).unwrap();
+        std::fs::write(
+            &script_path,
+            format!("#!/bin/sh\ncat > /dev/null\necho '{}'\n", result_json),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -13,6 +13,9 @@ use zip::ZipArchive;
 mod audit;
 #[cfg(feature = "skill-creation")]
 pub mod creator;
+#[cfg(feature = "skill-creation")]
+pub mod improver;
+pub mod testing;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -79,18 +82,44 @@ struct SkillMeta {
     tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 struct SkillMarkdownMeta {
     name: Option<String>,
     description: Option<String>,
     version: Option<String>,
     author: Option<String>,
-    #[serde(default)]
     tags: Vec<String>,
 }
 
 fn default_version() -> String {
     "0.1.0".to_string()
+}
+
+/// Emit a user-visible warning when a skill directory is skipped due to audit
+/// findings. When the findings mention blocked scripts and `allow_scripts` is
+/// `false`, the message includes actionable remediation guidance so users know
+/// how to enable their skill.
+fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
+    let scripts_blocked = summary.contains("script-like files are blocked");
+    if scripts_blocked && !allow_scripts {
+        tracing::warn!(
+            "skipping skill directory {}: {summary}. \
+             To allow script files in skills, set `skills.allow_scripts = true` in your config.",
+            path.display(),
+        );
+        eprintln!(
+            "warning: skill '{}' was skipped because it contains script files. \
+             Set `skills.allow_scripts = true` in your zeroclaw config to enable it.",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string()),
+        );
+    } else {
+        tracing::warn!(
+            "skipping insecure skill directory {}: {summary}",
+            path.display(),
+        );
+    }
 }
 
 /// Load all skills from the workspace skills directory
@@ -169,11 +198,8 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
         ) {
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
-                tracing::warn!(
-                    "skipping insecure skill directory {}: {}",
-                    path.display(),
-                    report.summary()
-                );
+                let summary = report.summary();
+                warn_skipped_skill(&path, &summary, allow_scripts);
                 continue;
             }
             Err(err) => {
@@ -236,11 +262,8 @@ fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Ve
         ) {
             Ok(report) if report.is_clean() => {}
             Ok(report) => {
-                tracing::warn!(
-                    "skipping insecure open-skill directory {}: {}",
-                    path.display(),
-                    report.summary()
-                );
+                let summary = report.summary();
+                warn_skipped_skill(&path, &summary, allow_scripts);
                 continue;
             }
             Err(err) => {
@@ -597,15 +620,64 @@ struct ParsedSkillMarkdown {
 
 fn parse_skill_markdown(content: &str) -> ParsedSkillMarkdown {
     if let Some((frontmatter, body)) = split_skill_frontmatter(content) {
-        if let Ok(meta) = serde_yaml::from_str::<SkillMarkdownMeta>(&frontmatter) {
-            return ParsedSkillMarkdown { meta, body };
-        }
+        let meta = parse_simple_frontmatter(&frontmatter);
+        return ParsedSkillMarkdown { meta, body };
     }
 
     ParsedSkillMarkdown {
         meta: SkillMarkdownMeta::default(),
         body: content.to_string(),
     }
+}
+
+/// Lightweight YAML-like frontmatter parser for simple `key: value` pairs.
+/// Replaces `serde_yaml` to avoid pulling in the full YAML parser (~30KB)
+/// for a struct with only 5 optional string fields.
+fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
+    let mut meta = SkillMarkdownMeta::default();
+    let mut collecting_tags = false;
+    for line in s.lines() {
+        // Handle YAML list items under `tags:` (e.g. "  - parser")
+        if collecting_tags {
+            let trimmed = line.trim();
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let tag = item.trim().trim_matches('"').trim_matches('\'');
+                if !tag.is_empty() {
+                    meta.tags.push(tag.to_string());
+                }
+                continue;
+            }
+            // Non-list-item line → stop collecting tags
+            collecting_tags = false;
+        }
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim().trim_matches('"').trim_matches('\'');
+        match key {
+            "name" => meta.name = Some(val.to_string()),
+            "description" => meta.description = Some(val.to_string()),
+            "version" => meta.version = Some(val.to_string()),
+            "author" => meta.author = Some(val.to_string()),
+            "tags" => {
+                if val.is_empty() {
+                    // YAML block list follows on subsequent lines
+                    collecting_tags = true;
+                } else {
+                    // Inline: [a, b, c] or comma-separated
+                    let val = val.trim_start_matches('[').trim_end_matches(']');
+                    meta.tags = val
+                        .split(',')
+                        .map(|t| t.trim().trim_matches('"').trim_matches('\'').to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                }
+            }
+            _ => {}
+        }
+    }
+    meta
 }
 
 fn split_skill_frontmatter(content: &str) -> Option<(String, String)> {
@@ -738,15 +810,47 @@ pub fn skills_to_prompt_with_mode(
         }
 
         if !skill.tools.is_empty() {
-            let _ = writeln!(prompt, "    <tools>");
-            for tool in &skill.tools {
-                let _ = writeln!(prompt, "      <tool>");
-                write_xml_text_element(&mut prompt, 8, "name", &tool.name);
-                write_xml_text_element(&mut prompt, 8, "description", &tool.description);
-                write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
-                let _ = writeln!(prompt, "      </tool>");
+            // Tools with known kinds (shell, script, http) are registered as
+            // callable tool specs and can be invoked directly via function calling.
+            // We note them here for context but mark them as callable.
+            let registered: Vec<_> = skill
+                .tools
+                .iter()
+                .filter(|t| matches!(t.kind.as_str(), "shell" | "script" | "http"))
+                .collect();
+            let unregistered: Vec<_> = skill
+                .tools
+                .iter()
+                .filter(|t| !matches!(t.kind.as_str(), "shell" | "script" | "http"))
+                .collect();
+
+            if !registered.is_empty() {
+                let _ = writeln!(prompt, "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">");
+                for tool in &registered {
+                    let _ = writeln!(prompt, "      <tool>");
+                    write_xml_text_element(
+                        &mut prompt,
+                        8,
+                        "name",
+                        &format!("{}.{}", skill.name, tool.name),
+                    );
+                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
+                    let _ = writeln!(prompt, "      </tool>");
+                }
+                let _ = writeln!(prompt, "    </callable_tools>");
             }
-            let _ = writeln!(prompt, "    </tools>");
+
+            if !unregistered.is_empty() {
+                let _ = writeln!(prompt, "    <tools>");
+                for tool in &unregistered {
+                    let _ = writeln!(prompt, "      <tool>");
+                    write_xml_text_element(&mut prompt, 8, "name", &tool.name);
+                    write_xml_text_element(&mut prompt, 8, "description", &tool.description);
+                    write_xml_text_element(&mut prompt, 8, "kind", &tool.kind);
+                    let _ = writeln!(prompt, "      </tool>");
+                }
+                let _ = writeln!(prompt, "    </tools>");
+            }
         }
 
         let _ = writeln!(prompt, "  </skill>");
@@ -754,6 +858,47 @@ pub fn skills_to_prompt_with_mode(
 
     prompt.push_str("</available_skills>");
     prompt
+}
+
+/// Convert skill tools into callable `Tool` trait objects.
+///
+/// Each skill's `[[tools]]` entries are converted to either `SkillShellTool`
+/// (for `shell`/`script` kinds) or `SkillHttpTool` (for `http` kind),
+/// enabling them to appear as first-class callable tool specs rather than
+/// only as XML in the system prompt.
+pub fn skills_to_tools(
+    skills: &[Skill],
+    security: std::sync::Arc<crate::security::SecurityPolicy>,
+) -> Vec<Box<dyn crate::tools::traits::Tool>> {
+    let mut tools: Vec<Box<dyn crate::tools::traits::Tool>> = Vec::new();
+    for skill in skills {
+        for tool in &skill.tools {
+            match tool.kind.as_str() {
+                "shell" | "script" => {
+                    tools.push(Box::new(crate::tools::skill_tool::SkillShellTool::new(
+                        &skill.name,
+                        tool,
+                        security.clone(),
+                    )));
+                }
+                "http" => {
+                    tools.push(Box::new(crate::tools::skill_http::SkillHttpTool::new(
+                        &skill.name,
+                        tool,
+                    )));
+                }
+                other => {
+                    tracing::warn!(
+                        "Unknown skill tool kind '{}' for {}.{}, skipping",
+                        other,
+                        skill.name,
+                        tool.name
+                    );
+                }
+            }
+        }
+    }
+    tools
 }
 
 /// Get the skills directory path
@@ -1342,6 +1487,44 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             );
             Ok(())
         }
+        crate::SkillCommands::Test { name, verbose } => {
+            let results = if let Some(ref skill_name) = name {
+                // Test a single skill
+                let source_path = PathBuf::from(skill_name);
+                let target = if source_path.exists() {
+                    source_path
+                } else {
+                    skills_dir(workspace_dir).join(skill_name)
+                };
+
+                if !target.exists() {
+                    anyhow::bail!("Skill not found: {}", skill_name);
+                }
+
+                let r = testing::test_skill(&target, skill_name, verbose)?;
+                if r.tests_run == 0 {
+                    println!(
+                        "  {} No TEST.sh found for skill '{}'.",
+                        console::style("-").dim(),
+                        skill_name,
+                    );
+                    return Ok(());
+                }
+                vec![r]
+            } else {
+                // Test all skills
+                let dirs = vec![skills_dir(workspace_dir)];
+                testing::test_all_skills(&dirs, verbose)?
+            };
+
+            testing::print_results(&results);
+
+            let any_failed = results.iter().any(|r| !r.failures.is_empty());
+            if any_failed {
+                anyhow::bail!("Some skill tests failed.");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1517,10 +1700,10 @@ command = "echo hello"
         assert!(prompt.contains("read_skill(name)"));
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
-        // Compact mode should still include tools so the LLM knows about them
-        assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("<name>run</name>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
+        // Compact mode should still include tools so the LLM knows about them.
+        // Registered tools (shell/script/http) appear under <callable_tools>.
+        assert!(prompt.contains("<callable_tools"));
+        assert!(prompt.contains("<name>test.run</name>"));
     }
 
     #[test]
@@ -1710,9 +1893,11 @@ description = "Bare minimum"
         }];
         let prompt = skills_to_prompt(&skills, Path::new("/tmp"));
         assert!(prompt.contains("weather"));
-        assert!(prompt.contains("<name>get_weather</name>"));
+        // Registered tools (shell kind) now appear under <callable_tools> with
+        // prefixed names (skill_name.tool_name).
+        assert!(prompt.contains("<callable_tools"));
+        assert!(prompt.contains("<name>weather.get_weather</name>"));
         assert!(prompt.contains("<description>Fetch forecast</description>"));
-        assert!(prompt.contains("<kind>shell</kind>"));
     }
 
     #[test]
@@ -1954,6 +2139,43 @@ description = "Bare minimum"
         assert!(skills[0].tags.iter().any(|tag| tag == "open-skills"));
         assert!(skills[0].prompts[0].contains("# PDF Guide"));
         assert!(!skills[0].prompts[0].contains("description: Use this skill"));
+    }
+
+    #[test]
+    fn skill_with_scripts_skipped_when_allow_scripts_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let skill_dir = skills_dir.join("obsidian");
+        fs::create_dir_all(&skill_dir).unwrap();
+
+        fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"
+[skill]
+name = "obsidian"
+description = "Obsidian vault tool"
+
+[[tools]]
+name = "search"
+description = "Search vault"
+kind = "shell"
+command = "obsidian search {{query}}"
+"#,
+        )
+        .unwrap();
+        fs::write(skill_dir.join("setup.sh"), "#!/bin/bash\necho setup\n").unwrap();
+
+        // With allow_scripts=false (default), skill should be skipped
+        let skills = load_skills_from_directory(&skills_dir, false);
+        assert!(
+            skills.is_empty(),
+            "skill with script files should be skipped when allow_scripts=false"
+        );
+
+        // With allow_scripts=true, skill should load
+        let skills = load_skills_from_directory(&skills_dir, true);
+        assert_eq!(skills.len(), 1, "skill should load when allow_scripts=true");
+        assert_eq!(skills[0].name, "obsidian");
     }
 }
 

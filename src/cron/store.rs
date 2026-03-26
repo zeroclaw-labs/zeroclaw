@@ -124,7 +124,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools
+                    allowed_tools, source
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -143,7 +143,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools
+                    allowed_tools, source
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -177,7 +177,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools
+                    allowed_tools, source
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -206,7 +206,8 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output, allowed_tools
+                    enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                    allowed_tools, source
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC",
@@ -260,7 +261,13 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.delete_after_run = delete_after_run;
     }
     if let Some(allowed_tools) = patch.allowed_tools {
-        job.allowed_tools = Some(allowed_tools);
+        // Empty list means "clear the allowlist" (all tools available),
+        // not "allow zero tools".
+        if allowed_tools.is_empty() {
+            job.allowed_tools = None;
+        } else {
+            job.allowed_tools = Some(allowed_tools);
+        }
     }
 
     if schedule_changed {
@@ -488,6 +495,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let last_run_raw: Option<String> = row.get(14)?;
     let created_at_raw: String = row.get(12)?;
     let allowed_tools_raw: Option<String> = row.get(17)?;
+    let source: Option<String> = row.get(18)?;
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -502,6 +510,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         enabled: row.get::<_, i64>(9)? != 0,
         delivery,
         delete_after_run: row.get::<_, i64>(11)? != 0,
+        source: source.unwrap_or_else(|| "imperative".to_string()),
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_conversion_error)?,
         next_run: parse_rfc3339(&next_run_raw).map_err(sql_conversion_error)?,
         last_run: match last_run_raw {
@@ -562,6 +571,277 @@ fn decode_allowed_tools(raw: Option<&str>) -> Result<Option<Vec<String>>> {
         }
     }
     Ok(None)
+}
+
+/// Synchronize declarative cron job definitions from config into the database.
+///
+/// For each declarative job (identified by `id`):
+/// - If the job exists in DB: update it to match the config definition.
+/// - If the job does not exist: insert it.
+///
+/// Jobs created imperatively (via CLI/API) are never modified or deleted.
+/// Declarative jobs that are no longer present in config are removed.
+pub fn sync_declarative_jobs(
+    config: &Config,
+    decls: &[crate::config::schema::CronJobDecl],
+) -> Result<()> {
+    use crate::config::schema::CronScheduleDecl;
+
+    if decls.is_empty() {
+        // If no declarative jobs are defined, clean up any previously
+        // synced declarative jobs that are no longer in config.
+        with_connection(config, |conn| {
+            let deleted = conn
+                .execute("DELETE FROM cron_jobs WHERE source = 'declarative'", [])
+                .context("Failed to remove stale declarative cron jobs")?;
+            if deleted > 0 {
+                tracing::info!(
+                    count = deleted,
+                    "Removed declarative cron jobs no longer in config"
+                );
+            }
+            Ok(())
+        })?;
+        return Ok(());
+    }
+
+    // Validate declarations before touching the DB.
+    for decl in decls {
+        validate_decl(decl)?;
+    }
+
+    let now = Utc::now();
+
+    with_connection(config, |conn| {
+        // Collect IDs of all declarative jobs currently defined in config.
+        let config_ids: std::collections::HashSet<&str> =
+            decls.iter().map(|d| d.id.as_str()).collect();
+
+        // Remove declarative jobs no longer in config.
+        {
+            let mut stmt = conn.prepare("SELECT id FROM cron_jobs WHERE source = 'declarative'")?;
+            let db_ids: Vec<String> = stmt
+                .query_map([], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect();
+
+            for db_id in &db_ids {
+                if !config_ids.contains(db_id.as_str()) {
+                    conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![db_id])
+                        .with_context(|| {
+                            format!("Failed to remove stale declarative cron job '{db_id}'")
+                        })?;
+                    tracing::info!(
+                        job_id = %db_id,
+                        "Removed declarative cron job no longer in config"
+                    );
+                }
+            }
+        }
+
+        for decl in decls {
+            let schedule = convert_schedule_decl(&decl.schedule)?;
+            let expression = schedule_cron_expression(&schedule).unwrap_or_default();
+            let schedule_json = serde_json::to_string(&schedule)?;
+            let job_type = &decl.job_type;
+            let session_target = decl.session_target.as_deref().unwrap_or("isolated");
+            let delivery = match &decl.delivery {
+                Some(d) => convert_delivery_decl(d),
+                None => DeliveryConfig::default(),
+            };
+            let delivery_json = serde_json::to_string(&delivery)?;
+            let allowed_tools_json = encode_allowed_tools(decl.allowed_tools.as_ref())?;
+            let command = decl.command.as_deref().unwrap_or("");
+            let delete_after_run = matches!(decl.schedule, CronScheduleDecl::At { .. });
+
+            // Check if job already exists.
+            let exists: bool = conn
+                .prepare("SELECT COUNT(*) FROM cron_jobs WHERE id = ?1")?
+                .query_row(params![decl.id], |row| row.get::<_, i64>(0))
+                .map(|c| c > 0)
+                .unwrap_or(false);
+
+            if exists {
+                // Update existing declarative job — preserve runtime state
+                // (next_run, last_run, last_status, last_output, created_at).
+                // Only update the schedule's next_run if the schedule itself changed.
+                let current_schedule_raw: Option<String> = conn
+                    .prepare("SELECT schedule FROM cron_jobs WHERE id = ?1")?
+                    .query_row(params![decl.id], |row| row.get(0))
+                    .ok();
+
+                let schedule_changed = current_schedule_raw.as_deref() != Some(&schedule_json);
+
+                if schedule_changed {
+                    let next_run = next_run_for_schedule(&schedule, now)?;
+                    conn.execute(
+                        "UPDATE cron_jobs
+                         SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
+                             prompt = ?5, name = ?6, session_target = ?7, model = ?8,
+                             enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                             allowed_tools = ?12, source = 'declarative', next_run = ?13
+                         WHERE id = ?14",
+                        params![
+                            expression,
+                            command,
+                            schedule_json,
+                            job_type,
+                            decl.prompt,
+                            decl.name,
+                            session_target,
+                            decl.model,
+                            if decl.enabled { 1 } else { 0 },
+                            delivery_json,
+                            if delete_after_run { 1 } else { 0 },
+                            allowed_tools_json,
+                            next_run.to_rfc3339(),
+                            decl.id,
+                        ],
+                    )
+                    .with_context(|| {
+                        format!("Failed to update declarative cron job '{}'", decl.id)
+                    })?;
+                } else {
+                    conn.execute(
+                        "UPDATE cron_jobs
+                         SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
+                             prompt = ?5, name = ?6, session_target = ?7, model = ?8,
+                             enabled = ?9, delivery = ?10, delete_after_run = ?11,
+                             allowed_tools = ?12, source = 'declarative'
+                         WHERE id = ?13",
+                        params![
+                            expression,
+                            command,
+                            schedule_json,
+                            job_type,
+                            decl.prompt,
+                            decl.name,
+                            session_target,
+                            decl.model,
+                            if decl.enabled { 1 } else { 0 },
+                            delivery_json,
+                            if delete_after_run { 1 } else { 0 },
+                            allowed_tools_json,
+                            decl.id,
+                        ],
+                    )
+                    .with_context(|| {
+                        format!("Failed to update declarative cron job '{}'", decl.id)
+                    })?;
+                }
+
+                tracing::debug!(job_id = %decl.id, "Updated declarative cron job");
+            } else {
+                // Insert new declarative job.
+                let next_run = next_run_for_schedule(&schedule, now)?;
+                conn.execute(
+                    "INSERT INTO cron_jobs (
+                        id, expression, command, schedule, job_type, prompt, name,
+                        session_target, model, enabled, delivery, delete_after_run,
+                        allowed_tools, source, created_at, next_run
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15)",
+                    params![
+                        decl.id,
+                        expression,
+                        command,
+                        schedule_json,
+                        job_type,
+                        decl.prompt,
+                        decl.name,
+                        session_target,
+                        decl.model,
+                        if decl.enabled { 1 } else { 0 },
+                        delivery_json,
+                        if delete_after_run { 1 } else { 0 },
+                        allowed_tools_json,
+                        now.to_rfc3339(),
+                        next_run.to_rfc3339(),
+                    ],
+                )
+                .with_context(|| {
+                    format!(
+                        "Failed to insert declarative cron job '{}'",
+                        decl.id
+                    )
+                })?;
+
+                tracing::info!(job_id = %decl.id, "Inserted declarative cron job from config");
+            }
+        }
+
+        Ok(())
+    })
+}
+
+/// Validate a declarative cron job definition.
+fn validate_decl(decl: &crate::config::schema::CronJobDecl) -> Result<()> {
+    if decl.id.trim().is_empty() {
+        anyhow::bail!("Declarative cron job has empty id");
+    }
+
+    match decl.job_type.to_lowercase().as_str() {
+        "shell" => {
+            if decl
+                .command
+                .as_deref()
+                .map_or(true, |c| c.trim().is_empty())
+            {
+                anyhow::bail!(
+                    "Declarative cron job '{}': shell job requires a non-empty 'command'",
+                    decl.id
+                );
+            }
+        }
+        "agent" => {
+            if decl.prompt.as_deref().map_or(true, |p| p.trim().is_empty()) {
+                anyhow::bail!(
+                    "Declarative cron job '{}': agent job requires a non-empty 'prompt'",
+                    decl.id
+                );
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "Declarative cron job '{}': invalid job_type '{}', expected 'shell' or 'agent'",
+                decl.id,
+                other
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a `CronScheduleDecl` to the runtime `Schedule` type.
+fn convert_schedule_decl(decl: &crate::config::schema::CronScheduleDecl) -> Result<Schedule> {
+    use crate::config::schema::CronScheduleDecl;
+    match decl {
+        CronScheduleDecl::Cron { expr, tz } => Ok(Schedule::Cron {
+            expr: expr.clone(),
+            tz: tz.clone(),
+        }),
+        CronScheduleDecl::Every { every_ms } => Ok(Schedule::Every {
+            every_ms: *every_ms,
+        }),
+        CronScheduleDecl::At { at } => {
+            let parsed = DateTime::parse_from_rfc3339(at)
+                .with_context(|| {
+                    format!("Invalid RFC3339 timestamp in declarative cron 'at': {at}")
+                })?
+                .with_timezone(&Utc);
+            Ok(Schedule::At { at: parsed })
+        }
+    }
+}
+
+/// Convert a `DeliveryConfigDecl` to the runtime `DeliveryConfig`.
+fn convert_delivery_decl(decl: &crate::config::schema::DeliveryConfigDecl) -> DeliveryConfig {
+    DeliveryConfig {
+        mode: decl.mode.clone(),
+        channel: decl.channel.clone(),
+        to: decl.to.clone(),
+        best_effort: decl.best_effort,
+    }
 }
 
 fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
@@ -654,6 +934,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "delivery", "TEXT")?;
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "allowed_tools", "TEXT")?;
+    add_column_if_missing(&conn, "source", "TEXT DEFAULT 'imperative'")?;
 
     f(&conn)
 }
@@ -1169,5 +1450,247 @@ mod tests {
         let last_output = stored.last_output.as_deref().unwrap_or_default();
         assert!(last_output.ends_with(TRUNCATED_OUTPUT_MARKER));
         assert!(last_output.len() <= MAX_CRON_OUTPUT_BYTES);
+    }
+
+    // ── Declarative cron job sync tests ──────────────────────────
+
+    fn make_shell_decl(id: &str, expr: &str, cmd: &str) -> crate::config::schema::CronJobDecl {
+        crate::config::schema::CronJobDecl {
+            id: id.to_string(),
+            name: Some(format!("decl-{id}")),
+            job_type: "shell".to_string(),
+            schedule: crate::config::schema::CronScheduleDecl::Cron {
+                expr: expr.to_string(),
+                tz: None,
+            },
+            command: Some(cmd.to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            session_target: None,
+            delivery: None,
+        }
+    }
+
+    fn make_agent_decl(id: &str, expr: &str, prompt: &str) -> crate::config::schema::CronJobDecl {
+        crate::config::schema::CronJobDecl {
+            id: id.to_string(),
+            name: Some(format!("decl-{id}")),
+            job_type: "agent".to_string(),
+            schedule: crate::config::schema::CronScheduleDecl::Cron {
+                expr: expr.to_string(),
+                tz: None,
+            },
+            command: None,
+            prompt: Some(prompt.to_string()),
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            session_target: None,
+            delivery: None,
+        }
+    }
+
+    #[test]
+    fn sync_inserts_new_declarative_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let decls = vec![make_shell_decl("daily-backup", "0 2 * * *", "echo backup")];
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job = get_job(&config, "daily-backup").unwrap();
+        assert_eq!(job.command, "echo backup");
+        assert_eq!(job.source, "declarative");
+        assert_eq!(job.name.as_deref(), Some("decl-daily-backup"));
+    }
+
+    #[test]
+    fn sync_updates_existing_declarative_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let decls = vec![make_shell_decl("updatable", "0 2 * * *", "echo v1")];
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job_v1 = get_job(&config, "updatable").unwrap();
+        assert_eq!(job_v1.command, "echo v1");
+
+        let decls_v2 = vec![make_shell_decl("updatable", "0 3 * * *", "echo v2")];
+        sync_declarative_jobs(&config, &decls_v2).unwrap();
+
+        let job_v2 = get_job(&config, "updatable").unwrap();
+        assert_eq!(job_v2.command, "echo v2");
+        assert_eq!(job_v2.expression, "0 3 * * *");
+        assert_eq!(job_v2.source, "declarative");
+    }
+
+    #[test]
+    fn sync_does_not_delete_imperative_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        // Create an imperative job via the normal API.
+        let imperative = add_job(&config, "*/10 * * * *", "echo imperative").unwrap();
+
+        // Sync declarative jobs (none of which match the imperative job).
+        let decls = vec![make_shell_decl("my-decl", "0 2 * * *", "echo decl")];
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Imperative job should still exist.
+        let still_there = get_job(&config, &imperative.id).unwrap();
+        assert_eq!(still_there.command, "echo imperative");
+        assert_eq!(still_there.source, "imperative");
+
+        // Declarative job should also exist.
+        let decl_job = get_job(&config, "my-decl").unwrap();
+        assert_eq!(decl_job.command, "echo decl");
+    }
+
+    #[test]
+    fn sync_removes_stale_declarative_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        // Insert two declarative jobs.
+        let decls = vec![
+            make_shell_decl("keeper", "0 2 * * *", "echo keep"),
+            make_shell_decl("stale", "0 3 * * *", "echo stale"),
+        ];
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Now sync with only "keeper" — "stale" should be removed.
+        let decls_v2 = vec![make_shell_decl("keeper", "0 2 * * *", "echo keep")];
+        sync_declarative_jobs(&config, &decls_v2).unwrap();
+
+        assert!(get_job(&config, "stale").is_err());
+        assert!(get_job(&config, "keeper").is_ok());
+    }
+
+    #[test]
+    fn sync_empty_removes_all_declarative_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let decls = vec![make_shell_decl("to-remove", "0 2 * * *", "echo bye")];
+        sync_declarative_jobs(&config, &decls).unwrap();
+        assert!(get_job(&config, "to-remove").is_ok());
+
+        // Sync with empty list.
+        sync_declarative_jobs(&config, &[]).unwrap();
+        assert!(get_job(&config, "to-remove").is_err());
+    }
+
+    #[test]
+    fn sync_validates_shell_job_requires_command() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let mut decl = make_shell_decl("bad", "0 2 * * *", "echo ok");
+        decl.command = None;
+
+        let result = sync_declarative_jobs(&config, &[decl]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("command"));
+    }
+
+    #[test]
+    fn sync_validates_agent_job_requires_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let mut decl = make_agent_decl("bad-agent", "0 2 * * *", "do stuff");
+        decl.prompt = None;
+
+        let result = sync_declarative_jobs(&config, &[decl]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("prompt"));
+    }
+
+    #[test]
+    fn sync_agent_job_inserts_correctly() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let decls = vec![make_agent_decl(
+            "agent-check",
+            "*/15 * * * *",
+            "check health",
+        )];
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job = get_job(&config, "agent-check").unwrap();
+        assert_eq!(job.job_type, JobType::Agent);
+        assert_eq!(job.prompt.as_deref(), Some("check health"));
+        assert_eq!(job.source, "declarative");
+    }
+
+    #[test]
+    fn sync_every_schedule_works() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let decl = crate::config::schema::CronJobDecl {
+            id: "interval-job".to_string(),
+            name: None,
+            job_type: "shell".to_string(),
+            schedule: crate::config::schema::CronScheduleDecl::Every { every_ms: 60000 },
+            command: Some("echo interval".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            session_target: None,
+            delivery: None,
+        };
+
+        sync_declarative_jobs(&config, &[decl]).unwrap();
+
+        let job = get_job(&config, "interval-job").unwrap();
+        assert!(matches!(job.schedule, Schedule::Every { every_ms: 60000 }));
+        assert_eq!(job.command, "echo interval");
+    }
+
+    #[test]
+    fn declarative_config_parses_from_toml() {
+        let toml_str = r#"
+enabled = true
+
+[[jobs]]
+id = "daily-report"
+name = "Daily Report"
+job_type = "shell"
+command = "echo report"
+schedule = { kind = "cron", expr = "0 9 * * *" }
+
+[[jobs]]
+id = "health-check"
+job_type = "agent"
+prompt = "Check server health"
+schedule = { kind = "every", every_ms = 300000 }
+        "#;
+
+        let parsed: crate::config::schema::CronConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.enabled);
+        assert_eq!(parsed.jobs.len(), 2);
+
+        assert_eq!(parsed.jobs[0].id, "daily-report");
+        assert_eq!(parsed.jobs[0].command.as_deref(), Some("echo report"));
+        assert!(matches!(
+            parsed.jobs[0].schedule,
+            crate::config::schema::CronScheduleDecl::Cron { ref expr, .. } if expr == "0 9 * * *"
+        ));
+
+        assert_eq!(parsed.jobs[1].id, "health-check");
+        assert_eq!(parsed.jobs[1].job_type, "agent");
+        assert_eq!(
+            parsed.jobs[1].prompt.as_deref(),
+            Some("Check server health")
+        );
+        assert!(matches!(
+            parsed.jobs[1].schedule,
+            crate::config::schema::CronScheduleDecl::Every { every_ms: 300_000 }
+        ));
     }
 }

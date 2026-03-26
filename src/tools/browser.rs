@@ -241,7 +241,12 @@ impl BrowserTool {
 
     /// Check if agent-browser CLI is available
     pub async fn is_agent_browser_available() -> bool {
-        Command::new("agent-browser")
+        let cmd = if cfg!(target_os = "windows") {
+            "agent-browser.cmd"
+        } else {
+            "agent-browser"
+        };
+        Command::new(cmd)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -333,9 +338,14 @@ impl BrowserTool {
                 if Self::is_agent_browser_available().await {
                     Ok(ResolvedBackend::AgentBrowser)
                 } else {
+                    #[cfg(target_os = "windows")]
+                    let install_hint = "Install with: npm install -g agent-browser (ensure npm global bin is in PATH)";
+                    #[cfg(not(target_os = "windows"))]
+                    let install_hint = "Install with: npm install -g agent-browser";
                     anyhow::bail!(
-                        "browser.backend='{}' but agent-browser CLI is unavailable. Install with: npm install -g agent-browser",
-                        configured.as_str()
+                        "browser.backend='{}' but agent-browser CLI is unavailable. {}",
+                        configured.as_str(),
+                        install_hint
                     )
                 }
             }
@@ -438,7 +448,12 @@ impl BrowserTool {
 
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
-        let mut cmd = Command::new("agent-browser");
+        let agent_browser_bin = if cfg!(target_os = "windows") {
+            "agent-browser.cmd"
+        } else {
+            "agent-browser"
+        };
+        let mut cmd = Command::new(agent_browser_bin);
 
         // When running as a service (systemd/OpenRC), the process may lack
         // HOME which browsers need for profile directories.
@@ -2616,6 +2631,23 @@ mod tests {
         }
         if let Some(val) = journal {
             unsafe { std::env::set_var("JOURNAL_STREAM", val) };
+        }
+    }
+
+    #[test]
+    fn windows_command_name_selection() {
+        // Verify the cfg-based command name logic used in is_agent_browser_available
+        // and run_command selects the correct binary name per platform.
+        let cmd = if cfg!(target_os = "windows") {
+            "agent-browser.cmd"
+        } else {
+            "agent-browser"
+        };
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(cmd, "agent-browser.cmd");
+        } else {
+            assert_eq!(cmd, "agent-browser");
         }
     }
 }

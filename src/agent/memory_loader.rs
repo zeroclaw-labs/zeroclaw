@@ -1,4 +1,4 @@
-use crate::memory::{self, Memory};
+use crate::memory::{self, decay, Memory};
 use async_trait::async_trait;
 use std::fmt::Write;
 
@@ -43,12 +43,15 @@ impl MemoryLoader for DefaultMemoryLoader {
         user_message: &str,
         session_id: Option<&str>,
     ) -> anyhow::Result<String> {
-        let entries = memory
+        let mut entries = memory
             .recall(user_message, self.limit, session_id, None, None)
             .await?;
         if entries.is_empty() {
             return Ok(String::new());
         }
+
+        // Apply time decay: older non-Core memories score lower
+        decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
 
         let mut context = String::from("[Memory context]\n");
         for entry in entries {
@@ -71,7 +74,7 @@ impl MemoryLoader for DefaultMemoryLoader {
             return Ok(String::new());
         }
 
-        context.push('\n');
+        context.push_str("[/Memory context]\n\n");
         Ok(context)
     }
 }
@@ -118,6 +121,9 @@ mod tests {
                 timestamp: "now".into(),
                 session_id: None,
                 score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
             }])
         }
 
@@ -226,6 +232,9 @@ mod tests {
                     timestamp: "now".into(),
                     session_id: None,
                     score: Some(0.95),
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
                 },
                 MemoryEntry {
                     id: "2".into(),
@@ -235,6 +244,9 @@ mod tests {
                     timestamp: "now".into(),
                     session_id: None,
                     score: Some(0.9),
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
                 },
             ]),
         };

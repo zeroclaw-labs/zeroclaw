@@ -91,6 +91,9 @@ impl MarkdownMemory {
                     timestamp: filename.to_string(),
                     session_id: None,
                     score: None,
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
                 }
             })
             .collect()

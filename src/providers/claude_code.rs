@@ -303,6 +303,19 @@ mod tests {
             .expect("env lock poisoned")
     }
 
+    /// Serialize tests that spawn the echo-provider script.
+    ///
+    /// On Linux, writing a shell script and exec'ing it from parallel threads
+    /// can trigger `ETXTBSY` ("Text file busy") even with unique file paths,
+    /// because the kernel briefly holds `deny_write_access` on the interpreter
+    /// page cache. Serializing these tests eliminates the race.
+    ///
+    /// Uses `tokio::sync::Mutex` so the guard can be held across `.await`.
+    fn script_mutex() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[test]
     fn new_uses_env_override() {
         let _guard = env_lock();
@@ -397,22 +410,23 @@ mod tests {
 
     /// Helper: create a provider that uses a shell script echoing stdin back.
     /// The script ignores CLI flags (`--print`, `--model`, `-`) and just cats stdin.
+    ///
+    /// Each invocation places the script in its own unique directory and writes
+    /// the file atomically via `std::fs::write` to avoid `ETXTBSY` ("Text file
+    /// busy") races that occur when parallel test threads create and exec
+    /// scripts concurrently on the same filesystem.
     fn echo_provider() -> ClaudeCodeProvider {
-        use std::io::Write;
-
         static SCRIPT_ID: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join("zeroclaw_test_claude_code");
-        std::fs::create_dir_all(&dir).unwrap();
-
         let script_id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            "fake_claude_{}_{}.sh",
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_claude_code_{}_{}",
             std::process::id(),
             script_id
         ));
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
-        drop(f);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("fake_claude.sh");
+        std::fs::write(&path, "#!/bin/sh\ncat /dev/stdin\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -430,6 +444,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_single_user_message() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
@@ -441,6 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_single_user_with_system() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![
             ChatMessage::system("You are helpful."),
@@ -455,6 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_multi_turn_includes_all_messages() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![
             ChatMessage::system("Be concise."),
@@ -475,6 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_multi_turn_without_system() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![
             ChatMessage::user("hi"),
@@ -493,6 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_clamps_bad_temperature() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![ChatMessage::user("test")];
         let result = provider.chat_with_history(&messages, "default", 0.5).await;

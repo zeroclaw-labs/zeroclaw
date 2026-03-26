@@ -23,7 +23,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
-fn require_auth(
+pub(super) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -1280,12 +1280,16 @@ pub async fn handle_api_sessions_list(
         .into_iter()
         .filter_map(|meta| {
             let session_id = meta.key.strip_prefix("gw_")?;
-            Some(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "session_id": session_id,
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
-            }))
+            });
+            if let Some(name) = meta.name {
+                entry["name"] = serde_json::Value::String(name);
+            }
+            Some(entry)
         })
         .collect();
 
@@ -1324,6 +1328,84 @@ pub async fn handle_api_session_delete(
         )
             .into_response(),
     }
+}
+
+/// PUT /api/sessions/{id} — rename a gateway session
+pub async fn handle_api_session_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let name = body["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name is required"})),
+        )
+            .into_response();
+    }
+
+    let session_key = format!("gw_{id}");
+
+    // Verify the session exists before renaming
+    let sessions = backend.list_sessions();
+    if !sessions.contains(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
+    match backend.set_session_name(&session_key, name) {
+        Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+// ── Claude Code hook endpoint ────────────────────────────────────
+
+/// POST /hooks/claude-code — receives HTTP hook events from Claude Code
+/// sessions spawned by [`ClaudeCodeRunnerTool`].
+///
+/// Claude Code posts structured JSON describing tool executions, completions,
+/// and errors. This handler logs the event and (when a Slack channel is
+/// configured) could be wired to update a Slack message in-place.
+pub async fn handle_claude_code_hook(
+    State(state): State<AppState>,
+    Json(payload): Json<crate::tools::claude_code_runner::ClaudeCodeHookEvent>,
+) -> impl IntoResponse {
+    // Do not require bearer-token auth: Claude Code subprocesses cannot easily
+    // obtain a pairing token, and the hook carries a session_id that ties it
+    // back to a session we spawned.
+    let _ = &state; // retained for future Slack update wiring
+
+    tracing::info!(
+        session_id = %payload.session_id,
+        event_type = %payload.event_type,
+        tool_name = ?payload.tool_name,
+        summary = ?payload.summary,
+        "Claude Code hook event received"
+    );
+
+    Json(serde_json::json!({ "ok": true }))
 }
 
 #[cfg(test)]
@@ -1429,6 +1511,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            gmail_push: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -1438,6 +1521,10 @@ mod tests {
             session_backend: None,
             device_registry: None,
             pending_pairings: None,
+            path_prefix: String::new(),
+            canvas_store: crate::tools::canvas::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         }
     }
 

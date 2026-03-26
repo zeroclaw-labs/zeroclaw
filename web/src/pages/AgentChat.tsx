@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
 import { WebSocketClient } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
@@ -10,6 +12,8 @@ interface ChatMessage {
   id: string;
   role: 'user' | 'agent';
   content: string;
+  thinking?: string;
+  markdown?: boolean;
   timestamp: Date;
 }
 
@@ -28,6 +32,11 @@ export default function AgentChat() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const pendingContentRef = useRef('');
+  const pendingThinkingRef = useRef('');
+  // Snapshot of thinking captured at chunk_reset, so it survives the reset.
+  const capturedThinkingRef = useRef('');
+  const [streamingContent, setStreamingContent] = useState('');
+  const [streamingThinking, setStreamingThinking] = useState('');
 
   // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
@@ -42,8 +51,11 @@ export default function AgentChat() {
       setError(null);
     };
 
-    ws.onClose = () => {
+    ws.onClose = (ev: CloseEvent) => {
       setConnected(false);
+      if (ev.code !== 1000 && ev.code !== 1001) {
+        setError(`Connection closed unexpectedly (code: ${ev.code}). Please check your configuration.`);
+      }
     };
 
     ws.onError = () => {
@@ -52,14 +64,32 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'thinking':
+          setTyping(true);
+          pendingThinkingRef.current += msg.content ?? '';
+          setStreamingThinking(pendingThinkingRef.current);
+          break;
+
         case 'chunk':
           setTyping(true);
           pendingContentRef.current += msg.content ?? '';
+          setStreamingContent(pendingContentRef.current);
+          break;
+
+        case 'chunk_reset':
+          // Server signals that the authoritative done message follows.
+          // Snapshot thinking before clearing display state.
+          capturedThinkingRef.current = pendingThinkingRef.current;
+          pendingContentRef.current = '';
+          pendingThinkingRef.current = '';
+          setStreamingContent('');
+          setStreamingThinking('');
           break;
 
         case 'message':
         case 'done': {
           const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+          const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
           if (content) {
             setMessages((prev) => [
               ...prev,
@@ -67,11 +97,17 @@ export default function AgentChat() {
                 id: generateUUID(),
                 role: 'agent',
                 content,
+                thinking,
+                markdown: true,
                 timestamp: new Date(),
               },
             ]);
           }
           pendingContentRef.current = '';
+          pendingThinkingRef.current = '';
+          capturedThinkingRef.current = '';
+          setStreamingContent('');
+          setStreamingThinking('');
           setTyping(false);
           break;
         }
@@ -110,8 +146,16 @@ export default function AgentChat() {
               timestamp: new Date(),
             },
           ]);
+          if (msg.code === 'AGENT_INIT_FAILED' || msg.code === 'AUTH_ERROR' || msg.code === 'PROVIDER_ERROR') {
+            setError(`Configuration error: ${msg.message}. Please check your provider settings (API key, model, etc.).`);
+          } else if (msg.code === 'INVALID_JSON' || msg.code === 'UNKNOWN_MESSAGE_TYPE' || msg.code === 'EMPTY_CONTENT') {
+            setError(`Message error: ${msg.message}`);
+          }
           setTyping(false);
           pendingContentRef.current = '';
+          pendingThinkingRef.current = '';
+          setStreamingContent('');
+          setStreamingThinking('');
           break;
       }
     };
@@ -126,7 +170,7 @@ export default function AgentChat() {
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, typing]);
+  }, [messages, typing, streamingContent]);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -146,6 +190,7 @@ export default function AgentChat() {
       wsRef.current.sendMessage(trimmed);
       setTyping(true);
       pendingContentRef.current = '';
+      pendingThinkingRef.current = '';
     } catch {
       setError(t('agent.send_error'));
     }
@@ -260,7 +305,17 @@ export default function AgentChat() {
                     : { background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)', }
                 }
               >
-                <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
+                {msg.thinking && (
+                  <details className="mb-2">
+                    <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking</summary>
+                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
+                  </details>
+                )}
+                {msg.markdown ? (
+                  <div className="text-sm break-words leading-relaxed chat-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
+                ) : (
+                  <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
+                )}
                 <p
                   className="text-[10px] mt-1.5" style={{ color: msg.role === 'user' ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}>
                   {msg.timestamp.toLocaleTimeString()}
@@ -289,11 +344,23 @@ export default function AgentChat() {
             <div className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
               <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            <div className="rounded-2xl px-4 py-3 border flex items-center gap-1.5" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
-              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-              <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
-            </div>
+            {streamingContent || streamingThinking ? (
+              <div className="rounded-2xl px-4 py-3 border max-w-[75%]" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }}>
+                {streamingThinking && (
+                  <details className="mb-2" open={!streamingContent}>
+                    <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking{!streamingContent && '...'}</summary>
+                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{streamingThinking}</pre>
+                  </details>
+                )}
+                {streamingContent && <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{streamingContent}</p>}
+              </div>
+            ) : (
+              <div className="rounded-2xl px-4 py-3 border flex items-center gap-1.5" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
+                <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+                <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+                <span className="bounce-dot w-1.5 h-1.5 rounded-full" style={{ background: 'var(--pc-accent)' }} />
+              </div>
+            )}
           </div>
         )}
 

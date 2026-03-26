@@ -19,6 +19,7 @@ struct CachedSlackDisplayName {
 }
 
 /// Slack channel — polls conversations.history via Web API
+#[allow(clippy::struct_excessive_bools)]
 pub struct SlackChannel {
     bot_token: String,
     app_token: Option<String>,
@@ -32,8 +33,24 @@ pub struct SlackChannel {
     workspace_dir: Option<PathBuf>,
     /// Maps channel_id -> thread_ts for active assistant threads (used for status indicators).
     active_assistant_thread: Mutex<HashMap<String, String>>,
+    /// Use the newer `markdown` block type (richer formatting, 12k char limit).
+    use_markdown_blocks: bool,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Voice transcription config — when set, audio file attachments are
+    /// downloaded, transcribed, and their text inlined into the message.
+    transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
+    /// Enable progressive draft message updates via `chat.update`.
+    stream_drafts: bool,
+    /// Minimum interval (ms) between draft edits to stay within Slack rate limits.
+    draft_update_interval_ms: u64,
+    /// Per-channel rate-limit tracker for draft edits.
+    last_draft_edit: Mutex<HashMap<String, Instant>>,
+    /// Maps lazy placeholder IDs to real Slack message timestamps.
+    /// `send_draft` returns a placeholder without posting; the real message
+    /// is created on the first `update_draft` call.
+    lazy_draft_ts: tokio::sync::Mutex<HashMap<String, String>>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -49,6 +66,8 @@ const SLACK_ATTACHMENT_IMAGE_INLINE_FALLBACK_MAX_BYTES: usize = 512 * 1024;
 const SLACK_ATTACHMENT_TEXT_DOWNLOAD_MAX_BYTES: usize = 256 * 1024;
 const SLACK_ATTACHMENT_TEXT_INLINE_MAX_CHARS: usize = 12_000;
 const SLACK_MARKDOWN_BLOCK_MAX_CHARS: usize = 12_000;
+const SLACK_BLOCK_TEXT_MAX_CHARS: usize = 3_000;
+const SLACK_MAX_BLOCKS_PER_MESSAGE: usize = 50;
 const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
@@ -90,6 +109,16 @@ fn unicode_emoji_to_slack_name(emoji: &str) -> &str {
         _ => emoji.trim_matches(':'),
     }
 }
+/// Default minimum interval between Slack draft edits.
+/// Slack's `chat.update` is rate-limited to ~1 req/sec per channel.
+const SLACK_DRAFT_UPDATE_INTERVAL_MS: u64 = 1200;
+
+/// Maximum text length for a single Slack message (approx 40k chars).
+const SLACK_MESSAGE_MAX_CHARS: usize = 40_000;
+
+/// Prefix for lazy draft IDs that haven't been posted to Slack yet.
+const LAZY_DRAFT_PREFIX: &str = "lazy:";
+
 const SLACK_ATTACHMENT_RENDER_CONCURRENCY: usize = 3;
 const SLACK_POLL_ACTIVE_THREAD_MAX: usize = 50;
 const SLACK_POLL_THREAD_EXPIRE_SECS: u64 = 24 * 60 * 60;
@@ -124,7 +153,14 @@ impl SlackChannel {
             user_display_name_cache: Mutex::new(HashMap::new()),
             workspace_dir: None,
             active_assistant_thread: Mutex::new(HashMap::new()),
+            use_markdown_blocks: false,
             proxy_url: None,
+            transcription: None,
+            transcription_manager: None,
+            stream_drafts: false,
+            draft_update_interval_ms: SLACK_DRAFT_UPDATE_INTERVAL_MS,
+            last_draft_edit: Mutex::new(HashMap::new()),
+            lazy_draft_ts: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -153,9 +189,173 @@ impl SlackChannel {
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
+    /// Enable the newer `markdown` block type for richer formatting.
+    /// Only use this if your Slack workspace supports it.
+    pub fn with_markdown_blocks(mut self, enabled: bool) -> Self {
+        self.use_markdown_blocks = enabled;
+        self
+    }
+
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
+    }
+
+    /// Configure voice transcription for audio file attachments.
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
+        }
+        self
+    }
+
+    /// Enable progressive draft message streaming via `chat.update`.
+    pub fn with_streaming(mut self, enabled: bool, interval_ms: u64) -> Self {
+        self.stream_drafts = enabled;
+        if interval_ms > 0 {
+            self.draft_update_interval_ms = interval_ms;
+        }
+        self
+    }
+
+    /// Delete a Slack message by channel + timestamp.
+    async fn delete_message(&self, channel_id: &str, ts: &str) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "ts": ts,
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.delete")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let resp_body: serde_json::Value = resp.json().await?;
+        if resp_body.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let err = resp_body
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            tracing::debug!("Slack chat.delete failed: {err}");
+        }
+
+        Ok(())
+    }
+
+    /// Resolve a possibly-lazy draft ID to a real Slack message ts.
+    /// If the ID starts with `LAZY_DRAFT_PREFIX`, the message hasn't been
+    /// posted yet — this method returns `None`. Otherwise returns the ID as-is,
+    /// or the previously resolved real ts from the lazy map.
+    async fn resolve_draft_ts(&self, message_id: &str) -> Option<String> {
+        if !message_id.starts_with(LAZY_DRAFT_PREFIX) {
+            return Some(message_id.to_string());
+        }
+        self.lazy_draft_ts.lock().await.get(message_id).cloned()
+    }
+
+    /// Post the initial draft message and store the mapping from
+    /// lazy placeholder ID to real Slack ts.
+    async fn materialize_lazy_draft(
+        &self,
+        lazy_id: &str,
+        text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        // Parse channel + thread_ts from the lazy ID: "lazy:{channel}:{thread_ts}"
+        let rest = lazy_id.strip_prefix(LAZY_DRAFT_PREFIX).unwrap_or(lazy_id);
+        let (channel_id, thread_ts) = match rest.find(':') {
+            Some(pos) => {
+                let ts = &rest[pos + 1..];
+                (&rest[..pos], if ts.is_empty() { None } else { Some(ts) })
+            }
+            None => (rest, None),
+        };
+
+        let mut body = serde_json::json!({
+            "channel": channel_id,
+            "text": text,
+        });
+        if text.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": text
+            }]);
+        }
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = serde_json::json!(ts);
+        }
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let resp_body: serde_json::Value = resp.json().await?;
+        if resp_body.get("ok") != Some(&serde_json::Value::Bool(true)) {
+            let err = resp_body
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack chat.postMessage (lazy draft) failed: {err}");
+        }
+
+        let ts = resp_body
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+
+        if let Some(ref real_ts) = ts {
+            self.lazy_draft_ts
+                .lock()
+                .await
+                .insert(lazy_id.to_string(), real_ts.clone());
+        }
+
+        Ok(ts)
+    }
+
+    /// Set the Assistants API status bar text for a channel's active thread.
+    async fn set_assistant_status(&self, channel_id: &str, status: &str) {
+        let thread_ts = {
+            let map = match self.active_assistant_thread.lock() {
+                Ok(m) => m,
+                Err(_) => return,
+            };
+            match map.get(channel_id) {
+                Some(ts) => ts.clone(),
+                None => return,
+            }
+        };
+
+        let body = serde_json::json!({
+            "channel_id": channel_id,
+            "thread_ts": thread_ts,
+            "status": status,
+        });
+
+        let _ = self
+            .http_client()
+            .post("https://slack.com/api/assistant.threads.setStatus")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await;
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -165,6 +365,94 @@ impl SlackChannel {
             30,
             10,
         )
+    }
+
+    /// Post a new Slack message and return the message timestamp (`ts`).
+    ///
+    /// This is a lower-level helper that exposes the `ts` value needed for
+    /// subsequent `chat.update` calls. For simple sends, use the [`Channel::send`]
+    /// trait method instead.
+    pub async fn post_message(&self, channel: &str, text: &str) -> anyhow::Result<String> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "text": text,
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let raw = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&raw);
+            anyhow::bail!("Slack chat.postMessage failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack chat.postMessage failed: {err}");
+        }
+
+        parsed
+            .get("ts")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("Slack chat.postMessage response missing 'ts'"))
+    }
+
+    /// Update an existing Slack message in-place using `chat.update`.
+    ///
+    /// `channel` is the channel ID and `ts` is the timestamp of the original
+    /// message (returned by [`post_message`]).
+    pub async fn update_message(&self, channel: &str, ts: &str, text: &str) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "channel": channel,
+            "ts": ts,
+            "text": text,
+        });
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.update")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        let raw = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&raw);
+            anyhow::bail!("Slack chat.update failed ({status}): {sanitized}");
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if parsed.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = parsed
+                .get("error")
+                .and_then(|e| e.as_str())
+                .unwrap_or("unknown");
+            anyhow::bail!("Slack chat.update failed: {err}");
+        }
+
+        Ok(())
     }
 
     /// Check if a Slack user ID is in the allowlist.
@@ -458,11 +746,9 @@ impl SlackChannel {
             return None;
         }
 
-        Some(if require_mention {
-            Self::strip_bot_mentions(text, bot_user_id)
-        } else {
-            text.trim().to_string()
-        })
+        // Always strip bot mentions so the model sees clean text,
+        // even in threads where the mention wasn't required.
+        Some(Self::strip_bot_mentions(text, bot_user_id))
     }
 
     fn normalize_incoming_content(
@@ -558,6 +844,13 @@ impl SlackChannel {
             .await
             .unwrap_or_else(|| raw_file.clone());
 
+        // Voice / audio transcription: if transcription is configured and the
+        // file looks like an audio attachment, download and transcribe it.
+        if Self::is_audio_file(&file) {
+            if let Some(transcribed) = self.try_transcribe_audio_file(&file).await {
+                return Some(transcribed);
+            }
+        }
         if Self::is_image_file(&file) {
             if let Some(marker) = self.fetch_image_marker(&file).await {
                 return Some(marker);
@@ -1449,6 +1742,107 @@ impl SlackChannel {
             .is_some_and(|ext| Self::mime_from_extension(ext).is_some())
     }
 
+    /// Audio file extensions accepted for voice transcription.
+    const AUDIO_EXTENSIONS: &[&str] = &[
+        "flac", "mp3", "mpeg", "mpga", "mp4", "m4a", "ogg", "oga", "opus", "wav", "webm",
+    ];
+
+    /// Check whether a Slack file object looks like an audio attachment
+    /// (voice memo, audio message, or uploaded audio file).
+    fn is_audio_file(file: &serde_json::Value) -> bool {
+        // Slack voice messages use subtype "slack_audio"
+        if let Some(subtype) = file.get("subtype").and_then(|v| v.as_str()) {
+            if subtype == "slack_audio" {
+                return true;
+            }
+        }
+
+        if Self::slack_file_mime(file)
+            .as_deref()
+            .is_some_and(|mime| mime.starts_with("audio/"))
+        {
+            return true;
+        }
+
+        if let Some(ft) = file
+            .get("filetype")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_ascii_lowercase())
+        {
+            if Self::AUDIO_EXTENSIONS.contains(&ft.as_str()) {
+                return true;
+            }
+        }
+
+        Self::file_extension(&Self::slack_file_name(file))
+            .as_deref()
+            .is_some_and(|ext| Self::AUDIO_EXTENSIONS.contains(&ext))
+    }
+
+    /// Download an audio file attachment and transcribe it using the configured
+    /// transcription provider. Returns `None` if transcription is not configured
+    /// or if the download/transcription fails.
+    async fn try_transcribe_audio_file(&self, file: &serde_json::Value) -> Option<String> {
+        let manager = self.transcription_manager.as_deref()?;
+
+        let url = Self::slack_file_download_url(file)?;
+        let file_name = Self::slack_file_name(file);
+        let redacted_url = Self::redact_raw_slack_url(url);
+
+        let resp = self.fetch_slack_private_file(url).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::warn!(
+                "Slack voice file download failed for {} ({status})",
+                redacted_url
+            );
+            return None;
+        }
+
+        let audio_data = match resp.bytes().await {
+            Ok(bytes) => bytes.to_vec(),
+            Err(e) => {
+                tracing::warn!("Slack voice file read failed for {}: {e}", redacted_url);
+                return None;
+            }
+        };
+
+        // Determine a filename with extension for the transcription API.
+        let transcription_filename = if Self::file_extension(&file_name).is_some() {
+            file_name.clone()
+        } else {
+            // Fall back to extension from mimetype or default to .ogg
+            let mime_ext = Self::slack_file_mime(file)
+                .and_then(|mime| mime.rsplit('/').next().map(|s| s.to_string()))
+                .unwrap_or_else(|| "ogg".to_string());
+            format!("voice.{mime_ext}")
+        };
+
+        match manager
+            .transcribe(&audio_data, &transcription_filename)
+            .await
+        {
+            Ok(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    tracing::info!("Slack voice transcription returned empty text, skipping");
+                    None
+                } else {
+                    tracing::info!(
+                        "Slack: transcribed voice file {} ({} chars)",
+                        file_name,
+                        trimmed.len()
+                    );
+                    Some(format!("[Voice] {trimmed}"))
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Slack voice transcription failed for {}: {e}", file_name);
+                Some(Self::format_attachment_summary(file))
+            }
+        }
+    }
+
     async fn download_text_snippet(&self, file: &serde_json::Value) -> Option<String> {
         let url = Self::slack_file_download_url(file)?;
         let redacted_url = Self::redact_raw_slack_url(url);
@@ -1659,6 +2053,79 @@ impl SlackChannel {
             .clone()
     }
 
+    /// Parse a Socket Mode `interactive` envelope containing a `block_actions`
+    /// payload from the `/config` Block Kit UI.  Translates provider/model
+    /// dropdown selections into synthetic `/models <provider>` or `/model <id>`
+    /// commands so the existing runtime command handler can apply them.
+    fn parse_block_action_as_command(
+        envelope: &serde_json::Value,
+        _bot_user_id: &str,
+    ) -> Option<ChannelMessage> {
+        let payload = envelope.get("payload")?;
+
+        let payload_type = payload.get("type").and_then(|v| v.as_str())?;
+        if payload_type != "block_actions" {
+            return None;
+        }
+
+        let actions = payload.get("actions").and_then(|v| v.as_array())?;
+        let action = actions.first()?;
+
+        let action_id = action.get("action_id").and_then(|v| v.as_str())?;
+        let selected_value = action
+            .get("selected_option")
+            .and_then(|o| o.get("value"))
+            .and_then(|v| v.as_str())?;
+
+        let command = match action_id {
+            "zeroclaw_config_provider" => format!("/models {selected_value}"),
+            "zeroclaw_config_model" => format!("/model {selected_value}"),
+            _ => return None,
+        };
+
+        let user = payload
+            .get("user")
+            .and_then(|u| u.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let channel_id = payload
+            .get("channel")
+            .and_then(|c| c.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+
+        if channel_id.is_empty() {
+            tracing::warn!("Slack block_actions: missing channel ID in interactive payload");
+            return None;
+        }
+
+        let ts = payload
+            .get("message")
+            .and_then(|m| m.get("ts"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("0");
+
+        Some(ChannelMessage {
+            id: format!("slack_{channel_id}_{ts}_action"),
+            sender: user.to_string(),
+            reply_target: channel_id.to_string(),
+            content: command,
+            channel: "slack".to_string(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            thread_ts: payload
+                .get("message")
+                .and_then(|m| m.get("thread_ts"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            interruption_scope_id: None,
+            attachments: vec![],
+        })
+    }
+
     async fn open_socket_mode_url(&self) -> anyhow::Result<String> {
         let app_token = self
             .configured_app_token()
@@ -1727,7 +2194,13 @@ impl SlackChannel {
                 }
             };
 
-            let (ws_stream, _) = match tokio_tungstenite::connect_async(&ws_url).await {
+            let (ws_stream, _) = match crate::config::ws_connect_with_proxy(
+                &ws_url,
+                "channel.slack",
+                self.proxy_url.as_deref(),
+            )
+            .await
+            {
                 Ok(connection) => {
                     socket_reconnect_attempt = 0;
                     connection
@@ -1793,6 +2266,17 @@ impl SlackChannel {
                     tracing::warn!("Slack Socket Mode: received disconnect event");
                     break;
                 }
+
+                // Handle interactive payloads (block_actions from /config UI).
+                if envelope_type == "interactive" {
+                    if let Some(msg) = Self::parse_block_action_as_command(&envelope, bot_user_id) {
+                        if tx.send(msg).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+
                 if envelope_type != "events_api" {
                     continue;
                 }
@@ -1877,10 +2361,13 @@ impl SlackChannel {
                 }
 
                 let is_group_message = Self::is_group_channel_id(&channel_id);
+                let is_thread_reply = event.get("thread_ts").and_then(|v| v.as_str()).is_some();
                 let allow_sender_without_mention =
                     is_group_message && self.is_group_sender_trigger_enabled(user);
-                let require_mention =
-                    self.mention_only && is_group_message && !allow_sender_without_mention;
+                let require_mention = self.mention_only
+                    && is_group_message
+                    && !allow_sender_without_mention
+                    && !is_thread_reply;
 
                 let Some(normalized_text) = self
                     .build_incoming_content(event, require_mention, bot_user_id)
@@ -1908,6 +2395,7 @@ impl SlackChannel {
                         Self::inbound_thread_ts_genuine_only(event)
                     },
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
+                    attachments: vec![],
                 };
 
                 // Track thread context so start_typing can set assistant status.
@@ -2276,6 +2764,61 @@ impl SlackChannel {
     }
 }
 
+const SLACK_TRUNCATION_INDICATOR: &str = "\n\n...[message truncated]";
+
+/// Split `text` into chunks of at most `max_chars`, breaking at newline or
+/// space boundaries when possible. Returns at most `max_chunks` pieces; if the
+/// text would require more, the last chunk includes a truncation indicator.
+fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Vec<String> {
+    if text.len() <= max_chars {
+        return vec![text.to_string()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() && chunks.len() < max_chunks {
+        let is_last_slot = chunks.len() + 1 == max_chunks;
+
+        if remaining.len() <= max_chars && !is_last_slot {
+            chunks.push(remaining.to_string());
+            break;
+        }
+
+        if is_last_slot {
+            // Last allowed slot: if remaining fits, just push it.
+            if remaining.len() <= max_chars {
+                chunks.push(remaining.to_string());
+            } else {
+                // Truncate with indicator.
+                let avail = max_chars - SLACK_TRUNCATION_INDICATOR.len();
+                let break_at = remaining[..avail]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .or_else(|| remaining[..avail].rfind(' ').map(|i| i + 1))
+                    .unwrap_or(avail);
+                let mut chunk = remaining[..break_at].to_string();
+                chunk.push_str(SLACK_TRUNCATION_INDICATOR);
+                chunks.push(chunk);
+            }
+            break;
+        }
+
+        // Normal chunk: find a good break point.
+        let limit = max_chars.min(remaining.len());
+        let break_at = remaining[..limit]
+            .rfind('\n')
+            .map(|i| i + 1)
+            .or_else(|| remaining[..limit].rfind(' ').map(|i| i + 1))
+            .unwrap_or(limit);
+
+        chunks.push(remaining[..break_at].to_string());
+        remaining = &remaining[break_at..];
+    }
+
+    chunks
+}
+
 #[async_trait]
 impl Channel for SlackChannel {
     fn name(&self) -> &str {
@@ -2283,22 +2826,68 @@ impl Channel for SlackChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let mut body = serde_json::json!({
-            "channel": message.recipient,
-            "text": message.content
-        });
-
-        // Use Slack's native markdown block for rich formatting when content fits.
-        if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
-            body["blocks"] = serde_json::json!([{
-                "type": "markdown",
+        // Detect Block Kit payloads produced by the `/config` command.
+        let body = if let Some(blocks_json) = message.content.strip_prefix(super::BLOCK_KIT_PREFIX)
+        {
+            let blocks: serde_json::Value = serde_json::from_str(blocks_json)
+                .context("invalid Block Kit JSON in runtime command response")?;
+            let mut body = serde_json::json!({
+                "channel": message.recipient,
+                "text": "Model configuration",
+                "blocks": blocks
+            });
+            if let Some(ts) = self.outbound_thread_ts(message) {
+                body["thread_ts"] = serde_json::json!(ts);
+            }
+            body
+        } else {
+            let mut body = serde_json::json!({
+                "channel": message.recipient,
                 "text": message.content
-            }]);
-        }
+            });
 
-        if let Some(ts) = self.outbound_thread_ts(message) {
-            body["thread_ts"] = serde_json::json!(ts);
-        }
+            // Add rich formatting blocks, split into chunks for the per-block limit.
+            // The newer `markdown` block type (12k chars) offers richer formatting but
+            // isn't available on all workspaces, causing `invalid_blocks` errors (#4563).
+            // Default to the universally supported `section` block with `mrkdwn`.
+            let block_limit = if self.use_markdown_blocks {
+                SLACK_MARKDOWN_BLOCK_MAX_CHARS
+            } else {
+                SLACK_BLOCK_TEXT_MAX_CHARS
+            };
+            if message.content.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+                let chunks = split_text_into_chunks(
+                    &message.content,
+                    block_limit,
+                    SLACK_MAX_BLOCKS_PER_MESSAGE,
+                );
+                let blocks: Vec<serde_json::Value> = chunks
+                    .into_iter()
+                    .map(|chunk| {
+                        if self.use_markdown_blocks {
+                            serde_json::json!({
+                                "type": "markdown",
+                                "text": chunk
+                            })
+                        } else {
+                            serde_json::json!({
+                                "type": "section",
+                                "text": {
+                                    "type": "mrkdwn",
+                                    "text": chunk
+                                }
+                            })
+                        }
+                    })
+                    .collect();
+                body["blocks"] = serde_json::Value::Array(blocks);
+            }
+
+            if let Some(ts) = self.outbound_thread_ts(message) {
+                body["thread_ts"] = serde_json::json!(ts);
+            }
+            body
+        };
 
         let resp = self
             .http_client()
@@ -2330,6 +2919,217 @@ impl Channel for SlackChannel {
         }
 
         Ok(())
+    }
+
+    fn supports_draft_updates(&self) -> bool {
+        self.stream_drafts
+    }
+
+    async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+        if !self.stream_drafts {
+            return Ok(None);
+        }
+
+        // Return a lazy placeholder — the real message is posted on the
+        // first update_draft call so we don't show "..." before any output.
+        let thread_ts = self.outbound_thread_ts(message).unwrap_or_default();
+        let lazy_id = format!("{LAZY_DRAFT_PREFIX}{}:{}", message.recipient, thread_ts);
+        Ok(Some(lazy_id))
+    }
+
+    async fn update_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // with the first real content (instead of showing "...").
+        if message_id.starts_with(LAZY_DRAFT_PREFIX)
+            && self.resolve_draft_ts(message_id).await.is_none()
+        {
+            // First call — post the message. This blocks intentionally so the
+            // ts is stored before any subsequent update_draft or finalize_draft.
+            let _ = self.materialize_lazy_draft(message_id, text).await;
+            self.last_draft_edit
+                .lock()
+                .expect("last_draft_edit lock")
+                .insert(recipient.to_string(), Instant::now());
+            return Ok(());
+        }
+
+        // Resolve the real ts (may be a lazy ID that was already materialized).
+        let real_ts = match self.resolve_draft_ts(message_id).await {
+            Some(ts) => ts,
+            None => return Ok(()),
+        };
+
+        // Rate-limit edits per channel
+        {
+            let last_edits = self.last_draft_edit.lock().expect("last_draft_edit lock");
+            if let Some(last_time) = last_edits.get(recipient) {
+                let elapsed_ms = u64::try_from(last_time.elapsed().as_millis()).unwrap_or(u64::MAX);
+                if elapsed_ms < self.draft_update_interval_ms {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Mark as sent NOW (before the HTTP call) to prevent queuing
+        // another update while this one is in flight.
+        self.last_draft_edit
+            .lock()
+            .expect("last_draft_edit lock")
+            .insert(recipient.to_string(), Instant::now());
+
+        // Fire-and-forget: spawn the HTTP call so we don't block the
+        // draft updater task (which would back-pressure the tool loop).
+        let display_text = if text.len() > SLACK_MESSAGE_MAX_CHARS {
+            text[..text
+                .char_indices()
+                .take_while(|(idx, _)| *idx < SLACK_MESSAGE_MAX_CHARS)
+                .last()
+                .map_or(0, |(idx, ch)| idx + ch.len_utf8())]
+                .to_string()
+        } else {
+            text.to_string()
+        };
+
+        let client = self.http_client();
+        let token = self.bot_token.clone();
+        let channel = recipient.to_string();
+        tokio::spawn(async move {
+            let mut body = serde_json::json!({
+                "channel": channel,
+                "ts": real_ts,
+                "text": &display_text,
+            });
+            if display_text.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+                body["blocks"] = serde_json::json!([{
+                    "type": "markdown",
+                    "text": &display_text
+                }]);
+            }
+            match client
+                .post("https://slack.com/api/chat.update")
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    if let Ok(resp_body) = resp.json::<serde_json::Value>().await {
+                        if resp_body.get("ok") != Some(&serde_json::Value::Bool(true)) {
+                            let err = resp_body
+                                .get("error")
+                                .and_then(|e| e.as_str())
+                                .unwrap_or("unknown");
+                            tracing::debug!("Slack chat.update (draft) failed: {err}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("Slack chat.update (draft) HTTP error: {e}");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        _message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let status_line = text.trim().lines().last().unwrap_or("").trim();
+        // Skip "Thinking..." — the typing indicator already conveys that.
+        // Only show tool-related progress in the status bar.
+        if status_line.is_empty() || status_line.starts_with("\u{1f914}") {
+            return Ok(());
+        }
+        self.set_assistant_status(recipient, status_line).await;
+        Ok(())
+    }
+
+    async fn finalize_draft(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        // Clean up rate-limit tracking and lazy draft map
+        self.last_draft_edit
+            .lock()
+            .expect("last_draft_edit lock")
+            .remove(recipient);
+
+        let real_ts = self.resolve_draft_ts(message_id).await;
+        // Clean up lazy mapping
+        self.lazy_draft_ts.lock().await.remove(message_id);
+
+        let Some(real_ts) = real_ts else {
+            // Draft was never materialized — just send as a fresh message
+            return self.send(&SendMessage::new(text, recipient)).await;
+        };
+
+        // If text exceeds Slack limit, delete draft and send as regular message
+        if text.len() > SLACK_MESSAGE_MAX_CHARS {
+            let _ = self.delete_message(recipient, &real_ts).await;
+            return self.send(&SendMessage::new(text, recipient)).await;
+        }
+
+        // Edit the draft with the final formatted content
+        let mut body = serde_json::json!({
+            "channel": recipient,
+            "ts": real_ts,
+            "text": text,
+        });
+
+        // Use markdown blocks for rich formatting when it fits
+        if text.len() <= SLACK_MARKDOWN_BLOCK_MAX_CHARS {
+            body["blocks"] = serde_json::json!([{
+                "type": "markdown",
+                "text": text
+            }]);
+        }
+
+        let resp = self
+            .http_client()
+            .post("https://slack.com/api/chat.update")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await?;
+
+        let resp_body: serde_json::Value = resp.json().await?;
+        if resp_body.get("ok") == Some(&serde_json::Value::Bool(true)) {
+            return Ok(());
+        }
+
+        // Fallback: delete draft and send fresh
+        let err = resp_body
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("unknown");
+        tracing::debug!("Slack chat.update (finalize) failed: {err}; falling back to delete+send");
+
+        let _ = self.delete_message(recipient, &real_ts).await;
+        self.send(&SendMessage::new(text, recipient)).await
+    }
+
+    async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+        self.last_draft_edit
+            .lock()
+            .expect("last_draft_edit lock")
+            .remove(recipient);
+        let real_ts = self.resolve_draft_ts(message_id).await;
+        self.lazy_draft_ts.lock().await.remove(message_id);
+        if let Some(ts) = real_ts {
+            self.delete_message(recipient, &ts).await
+        } else {
+            Ok(())
+        }
     }
 
     async fn add_reaction(
@@ -2552,10 +3352,14 @@ impl Channel for SlackChannel {
                         }
 
                         let is_group_message = Self::is_group_channel_id(&channel_id);
+                        let is_thread_reply =
+                            msg.get("thread_ts").and_then(|v| v.as_str()).is_some();
                         let allow_sender_without_mention =
                             is_group_message && self.is_group_sender_trigger_enabled(user);
-                        let require_mention =
-                            self.mention_only && is_group_message && !allow_sender_without_mention;
+                        let require_mention = self.mention_only
+                            && is_group_message
+                            && !allow_sender_without_mention
+                            && !is_thread_reply;
                         let Some(normalized_text) = self
                             .build_incoming_content(msg, require_mention, &bot_user_id)
                             .await
@@ -2582,6 +3386,7 @@ impl Channel for SlackChannel {
                                 Self::inbound_thread_ts_genuine_only(msg)
                             },
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
+                            attachments: vec![],
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -2633,11 +3438,9 @@ impl Channel for SlackChannel {
                         continue;
                     }
 
-                    let is_group_message = Self::is_group_channel_id(&thread_channel_id);
-                    let allow_sender_without_mention =
-                        is_group_message && self.is_group_sender_trigger_enabled(user);
-                    let require_mention =
-                        self.mention_only && is_group_message && !allow_sender_without_mention;
+                    // Thread replies never require a mention — we always respond
+                    // inside threads the bot is already participating in.
+                    let require_mention = false;
                     let Some(normalized_text) = self
                         .build_incoming_content(reply, require_mention, &bot_user_id)
                         .await
@@ -2667,6 +3470,7 @@ impl Channel for SlackChannel {
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
                         interruption_scope_id: Some(thread_ts.clone()),
+                        attachments: vec![],
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -2739,8 +3543,13 @@ impl Channel for SlackChannel {
         Ok(())
     }
 
-    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
-        // Status auto-clears when the bot sends a message via chat.postMessage.
+    async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        // When using draft streaming, the final response is delivered via
+        // chat.update (not chat.postMessage), so the Assistants API status
+        // does not auto-clear. Explicitly clear it.
+        if self.stream_drafts {
+            self.set_assistant_status(recipient, "").await;
+        }
         Ok(())
     }
 }
@@ -3619,6 +4428,7 @@ mod tests {
             timestamp: 0,
             thread_ts: None, // thread_replies=false → no fallback to ts
             interruption_scope_id: None,
+            attachments: vec![],
         };
 
         let msg1 = make_msg("100.000");
@@ -3644,6 +4454,7 @@ mod tests {
             timestamp: 0,
             thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
             interruption_scope_id: None,
+            attachments: vec![],
         };
 
         let msg1 = make_msg("100.000");

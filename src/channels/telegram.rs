@@ -330,6 +330,7 @@ pub struct TelegramChannel {
     /// Override for local Bot API servers or testing.
     api_base: String,
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
@@ -375,6 +376,7 @@ impl TelegramChannel {
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
+            transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
@@ -423,8 +425,19 @@ impl TelegramChannel {
 
     /// Configure voice transcription.
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
         }
         self
     }
@@ -1140,6 +1153,11 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content = format!("{quote}\n\n{content}");
         }
 
+        // Prepend forwarding attribution when the message was forwarded
+        if let Some(attr) = Self::format_forward_attribution(message) {
+            content = format!("{attr}{content}");
+        }
+
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
@@ -1152,6 +1170,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            attachments: vec![],
         })
     }
 
@@ -1161,6 +1180,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// or the message exceeds duration limits.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let config = self.transcription.as_ref()?;
+        let manager = self.transcription_manager.as_deref()?;
         let message = update.get("message")?;
 
         let (file_id, duration) = Self::parse_voice_metadata(message)?;
@@ -1229,14 +1249,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text =
-            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Voice transcription failed: {e}");
-                    return None;
-                }
-            };
+        let text = match manager.transcribe(&audio_data, &file_name).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Voice transcription failed: {e}");
+                return None;
+            }
+        };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");
@@ -1263,6 +1282,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             format!("[Voice] {text}")
         };
 
+        // Prepend forwarding attribution when the message was forwarded
+        let content = if let Some(attr) = Self::format_forward_attribution(message) {
+            format!("{attr}{content}")
+        } else {
+            content
+        };
+
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
@@ -1275,6 +1301,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            attachments: vec![],
         })
     }
 
@@ -1297,6 +1324,41 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             username.clone()
         };
         (username, sender_id, sender_identity)
+    }
+
+    /// Build a forwarding attribution prefix from Telegram forward fields.
+    ///
+    /// Returns `Some("[Forwarded from ...] ")` when the message is forwarded,
+    /// `None` otherwise.
+    fn format_forward_attribution(message: &serde_json::Value) -> Option<String> {
+        if let Some(from_chat) = message.get("forward_from_chat") {
+            // Forwarded from a channel or group
+            let title = from_chat
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown channel");
+            Some(format!("[Forwarded from channel: {title}] "))
+        } else if let Some(from_user) = message.get("forward_from") {
+            // Forwarded from a user (privacy allows identity)
+            let label = from_user
+                .get("username")
+                .and_then(serde_json::Value::as_str)
+                .map(|u| format!("@{u}"))
+                .or_else(|| {
+                    from_user
+                        .get("first_name")
+                        .and_then(serde_json::Value::as_str)
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            Some(format!("[Forwarded from {label}] "))
+        } else {
+            // Forwarded from a user who hides their identity
+            message
+                .get("forward_sender_name")
+                .and_then(serde_json::Value::as_str)
+                .map(|name| format!("[Forwarded from {name}] "))
+        }
     }
 
     /// Extract reply context from a Telegram `reply_to_message`, if present.
@@ -1420,6 +1482,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             content
         };
 
+        // Prepend forwarding attribution when the message was forwarded
+        let content = if let Some(attr) = Self::format_forward_attribution(message) {
+            format!("{attr}{content}")
+        } else {
+            content
+        };
+
         // Exit voice-chat mode when user switches back to typing
         if let Ok(mut vc) = self.voice_chats.lock() {
             vc.remove(&reply_target);
@@ -1437,6 +1506,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            attachments: vec![],
         })
     }
 
@@ -4291,10 +4361,12 @@ mod tests {
     fn with_transcription_sets_config_when_enabled() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
 
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
         assert!(ch.transcription.is_some());
+        assert!(ch.transcription_manager.is_some());
     }
 
     #[test]
@@ -4303,6 +4375,7 @@ mod tests {
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
         assert!(ch.transcription.is_none());
+        assert!(ch.transcription_manager.is_none());
     }
 
     #[tokio::test]
@@ -4325,6 +4398,7 @@ mod tests {
     async fn try_parse_voice_message_skips_when_duration_exceeds_limit() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
         tc.max_duration_secs = 5;
 
         let ch =
@@ -4346,6 +4420,7 @@ mod tests {
     async fn try_parse_voice_message_rejects_unauthorized_sender_before_download() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
         tc.max_duration_secs = 120;
 
         let ch = TelegramChannel::new("token".into(), vec!["alice".into()], false)
@@ -4396,15 +4471,17 @@ mod tests {
             audio_data.len()
         );
 
-        // 2. Call transcribe_audio() — real Groq Whisper API
+        // 2. Call TranscriptionManager.transcribe() — real Groq Whisper API
         let config = crate::config::TranscriptionConfig {
             enabled: true,
             ..Default::default()
         };
-        let transcript: String =
-            crate::channels::transcription::transcribe_audio(audio_data, "hello.mp3", &config)
-                .await
-                .expect("transcribe_audio should succeed with valid GROQ_API_KEY");
+        let manager = crate::channels::transcription::TranscriptionManager::new(&config)
+            .expect("TranscriptionManager::new should succeed with valid GROQ_API_KEY");
+        let transcript: String = manager
+            .transcribe(&audio_data, "hello.mp3")
+            .await
+            .expect("transcribe should succeed with valid GROQ_API_KEY");
 
         // 3. Verify Whisper actually recognized "hello"
         assert!(
@@ -4870,5 +4947,154 @@ mod tests {
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_ack_reactions(true);
         assert!(ch.ack_reactions);
+    }
+
+    // ── Forwarded message tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_update_message_forwarded_from_user_with_username() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 100,
+            "message": {
+                "message_id": 50,
+                "text": "Check this out",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_from": {
+                    "id": 42,
+                    "first_name": "Bob",
+                    "username": "bob"
+                },
+                "forward_date": 1_700_000_000
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("forwarded message should parse");
+        assert_eq!(msg.content, "[Forwarded from @bob] Check this out");
+    }
+
+    #[test]
+    fn parse_update_message_forwarded_from_channel() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 101,
+            "message": {
+                "message_id": 51,
+                "text": "Breaking news",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_from_chat": {
+                    "id": -1_001_234_567_890_i64,
+                    "title": "Daily News",
+                    "username": "dailynews",
+                    "type": "channel"
+                },
+                "forward_date": 1_700_000_000
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("channel-forwarded message should parse");
+        assert_eq!(
+            msg.content,
+            "[Forwarded from channel: Daily News] Breaking news"
+        );
+    }
+
+    #[test]
+    fn parse_update_message_forwarded_hidden_sender() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 102,
+            "message": {
+                "message_id": 52,
+                "text": "Secret tip",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_sender_name": "Hidden User",
+                "forward_date": 1_700_000_000
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("hidden-sender forwarded message should parse");
+        assert_eq!(msg.content, "[Forwarded from Hidden User] Secret tip");
+    }
+
+    #[test]
+    fn parse_update_message_non_forwarded_unaffected() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 103,
+            "message": {
+                "message_id": 53,
+                "text": "Normal message",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 }
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("non-forwarded message should parse");
+        assert_eq!(msg.content, "Normal message");
+    }
+
+    #[test]
+    fn parse_update_message_forwarded_from_user_no_username() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "update_id": 104,
+            "message": {
+                "message_id": 54,
+                "text": "Hello there",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 999 },
+                "forward_from": {
+                    "id": 77,
+                    "first_name": "Charlie"
+                },
+                "forward_date": 1_700_000_000
+            }
+        });
+
+        let msg = ch
+            .parse_update_message(&update)
+            .expect("forwarded message without username should parse");
+        assert_eq!(msg.content, "[Forwarded from Charlie] Hello there");
+    }
+
+    #[test]
+    fn forwarded_photo_attachment_has_attribution() {
+        // Verify that format_forward_attribution produces correct prefix
+        // for a photo message (the actual download is async, so we test the
+        // helper directly with a photo-bearing message structure).
+        let message = serde_json::json!({
+            "message_id": 60,
+            "from": { "id": 1, "username": "alice" },
+            "chat": { "id": 999 },
+            "photo": [
+                { "file_id": "abc123", "file_unique_id": "u1", "width": 320, "height": 240 }
+            ],
+            "forward_from": {
+                "id": 42,
+                "username": "bob"
+            },
+            "forward_date": 1_700_000_000
+        });
+
+        let attr =
+            TelegramChannel::format_forward_attribution(&message).expect("should detect forward");
+        assert_eq!(attr, "[Forwarded from @bob] ");
+
+        // Simulate what try_parse_attachment_message does after building content
+        let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
+        let content = format!("{attr}{photo_content}");
+        assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
     }
 }

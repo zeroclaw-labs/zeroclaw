@@ -8,6 +8,8 @@
 //! This two-phase approach replaces the naive raw-message auto-save with
 //! semantic extraction, similar to Nanobot's `save_memory` tool call pattern.
 
+use crate::memory::conflict;
+use crate::memory::importance;
 use crate::memory::traits::{Memory, MemoryCategory};
 use crate::providers::traits::Provider;
 
@@ -18,6 +20,12 @@ pub struct ConsolidationResult {
     pub history_entry: String,
     /// New facts/preferences/decisions to store long-term, or None.
     pub memory_update: Option<String>,
+    /// Atomic facts extracted from the turn (when consolidation_extract_facts is enabled).
+    #[serde(default)]
+    pub facts: Vec<String>,
+    /// Observed trend or pattern (when consolidation_extract_facts is enabled).
+    #[serde(default)]
+    pub trend: Option<String>,
 }
 
 const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
@@ -78,8 +86,33 @@ pub async fn consolidate_turn(
     if let Some(ref update) = result.memory_update {
         if !update.trim().is_empty() {
             let mem_key = format!("core_{}", uuid::Uuid::new_v4());
+
+            // Compute importance score heuristically.
+            let imp = importance::compute_importance(update, &MemoryCategory::Core);
+
+            // Check for conflicts with existing Core memories.
+            if let Err(e) = conflict::check_and_resolve_conflicts(
+                memory,
+                &mem_key,
+                update,
+                &MemoryCategory::Core,
+                0.85,
+            )
+            .await
+            {
+                tracing::debug!("conflict check skipped: {e}");
+            }
+
+            // Store with importance metadata.
             memory
-                .store(&mem_key, update, MemoryCategory::Core, None)
+                .store_with_metadata(
+                    &mem_key,
+                    update,
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    Some(imp),
+                )
                 .await?;
         }
     }
@@ -114,6 +147,8 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
         ConsolidationResult {
             history_entry: summary,
             memory_update: None,
+            facts: Vec::new(),
+            trend: None,
         }
     })
 }

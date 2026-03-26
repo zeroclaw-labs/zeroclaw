@@ -34,6 +34,7 @@ image_info = "Read image file metadata (format, dimensions, size) and optionally
 jira = "Interact with Jira and Confluence (Atlassian). Manage Jira tickets and Confluence pages."
 knowledge = "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats."
 linkedin = "Manage LinkedIn: create posts, list your posts, comment, react, delete posts, view engagement, get profile info, and read the configured content strategy. Requires LINKEDIN_* credentials in .env file."
+discord_search = "Search Discord message history stored in discord.db. Use to find past messages, summarize channel activity, or look up what users said. Supports keyword search and optional filters: channel_id, since, until."
 memory_forget = "Remove a memory by key. Use to delete outdated facts or sensitive data. Returns whether the memory was found and removed."
 memory_recall = "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance."
 memory_store = "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name."

@@ -46,7 +46,7 @@ use reliable::ReliableProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-const MAX_API_ERROR_CHARS: usize = 200;
+const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
 const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
@@ -697,6 +697,9 @@ pub struct ProviderRuntimeOptions {
     /// Custom API path suffix for OpenAI-compatible providers
     /// (e.g. "/v2/generate" instead of the default "/chat/completions").
     pub api_path: Option<String>,
+    /// Maximum output tokens for LLM provider API requests.
+    /// `None` uses the provider's built-in default.
+    pub provider_max_tokens: Option<u32>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -711,6 +714,7 @@ impl Default for ProviderRuntimeOptions {
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
+            provider_max_tokens: None,
         }
     }
 }
@@ -728,6 +732,7 @@ pub fn provider_runtime_options_from_config(
         provider_timeout_secs: Some(config.provider_timeout_secs),
         extra_headers: config.extra_headers.clone(),
         api_path: config.api_path.clone(),
+        provider_max_tokens: config.provider_max_tokens,
     }
 }
 
@@ -890,9 +895,18 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         }
         name if is_glm_alias(name) => vec!["GLM_API_KEY"],
         name if is_minimax_alias(name) => vec![MINIMAX_OAUTH_TOKEN_ENV, MINIMAX_API_KEY_ENV],
-        // Bedrock uses AWS AKSK from env vars (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY),
-        // not a single API key. Credential resolution happens inside BedrockProvider.
-        "bedrock" | "aws-bedrock" => return None,
+        // Bedrock supports Bearer token auth via BEDROCK_API_KEY env var, in addition
+        // to AWS AKSK (SigV4). If BEDROCK_API_KEY is set, return it; otherwise return
+        // None and let BedrockProvider handle SigV4 credential resolution internally.
+        "bedrock" | "aws-bedrock" => {
+            if let Ok(val) = std::env::var("BEDROCK_API_KEY") {
+                let trimmed = val.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
+                }
+            }
+            return None;
+        }
         name if is_qianfan_alias(name) => vec!["QIANFAN_API_KEY"],
         name if is_doubao_alias(name) => {
             vec!["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"]
@@ -1067,6 +1081,7 @@ fn create_provider_with_url_and_options(
         let reasoning_effort = options.reasoning_effort.clone();
         let extra_headers = options.extra_headers.clone();
         let api_path = options.api_path.clone();
+        let max_tokens = options.provider_max_tokens;
         move |p: OpenAiCompatibleProvider| -> Box<dyn Provider> {
             let mut p = p;
             if let Some(t) = timeout {
@@ -1080,6 +1095,9 @@ fn create_provider_with_url_and_options(
             }
             if api_path.is_some() {
                 p = p.with_api_path(api_path.clone());
+            }
+            if let Some(mt) = max_tokens {
+                p = p.with_max_tokens(Some(mt));
             }
             Box::new(p)
         }
@@ -1132,9 +1150,21 @@ fn create_provider_with_url_and_options(
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(
             key,
             options.provider_timeout_secs,
-        ))),
-        "anthropic" => Ok(Box::new(anthropic::AnthropicProvider::new(key))),
-        "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
+        ).with_max_tokens(options.provider_max_tokens))),
+        "anthropic" => {
+            let mut p = anthropic::AnthropicProvider::new(key);
+            if let Some(mt) = options.provider_max_tokens {
+                p = p.with_max_tokens(mt);
+            }
+            Ok(Box::new(p))
+        }
+        "openai" => {
+            let mut p = openai::OpenAiProvider::with_base_url(api_url, key);
+            if let Some(mt) = options.provider_max_tokens {
+                p = p.with_max_tokens(Some(mt));
+            }
+            Ok(Box::new(p))
+        }
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => {
 
@@ -1247,7 +1277,17 @@ fn create_provider_with_url_and_options(
                 api_version.as_deref(),
             )))
         }
-        "bedrock" | "aws-bedrock" => Ok(Box::new(bedrock::BedrockProvider::new())),
+        "bedrock" | "aws-bedrock" => {
+            let mut p = if let Some(api_key) = key {
+                bedrock::BedrockProvider::with_bearer_token(api_key)
+            } else {
+                bedrock::BedrockProvider::new()
+            };
+            if let Some(mt) = options.provider_max_tokens {
+                p = p.with_max_tokens(mt);
+            }
+            Ok(Box::new(p))
+        }
         name if is_qwen_oauth_alias(name) => {
             let base_url = api_url
                 .map(str::trim)
@@ -2268,6 +2308,7 @@ mod tests {
     fn resolve_provider_credential_bedrock_uses_internal_credential_path() {
         let _generic_guard = EnvGuard::set("API_KEY", Some("generic-key"));
         let _override_guard = EnvGuard::set("OPENROUTER_API_KEY", Some("openrouter-key"));
+        let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", None);
 
         assert_eq!(
             resolve_provider_credential("bedrock", Some("explicit")),
@@ -2275,6 +2316,20 @@ mod tests {
         );
         assert!(resolve_provider_credential("bedrock", None).is_none());
         assert!(resolve_provider_credential("aws-bedrock", None).is_none());
+    }
+
+    #[test]
+    fn resolve_provider_credential_bedrock_returns_bearer_token_from_env() {
+        let _bedrock_guard = EnvGuard::set("BEDROCK_API_KEY", Some("bedrock-bearer-token"));
+
+        assert_eq!(
+            resolve_provider_credential("bedrock", None),
+            Some("bedrock-bearer-token".to_string())
+        );
+        assert_eq!(
+            resolve_provider_credential("aws-bedrock", None),
+            Some("bedrock-bearer-token".to_string())
+        );
     }
 
     #[test]
@@ -3333,18 +3388,18 @@ mod tests {
 
     #[test]
     fn sanitize_truncates_long_error() {
-        let long = "a".repeat(400);
+        let long = "a".repeat(600);
         let result = sanitize_api_error(&long);
-        assert!(result.len() <= 203);
+        assert!(result.len() <= 503);
         assert!(result.ends_with("..."));
     }
 
     #[test]
     fn sanitize_truncates_after_scrub() {
-        let input = format!("{} sk-abcdef123456 {}", "a".repeat(190), "b".repeat(190));
+        let input = format!("{} sk-abcdef123456 {}", "a".repeat(290), "b".repeat(290));
         let result = sanitize_api_error(&input);
         assert!(!result.contains("sk-abcdef123456"));
-        assert!(result.len() <= 203);
+        assert!(result.len() <= 503);
     }
 
     #[test]
