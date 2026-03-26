@@ -6,6 +6,7 @@ use crate::channels::{
     Channel, DiscordChannel, MattermostChannel, QQChannel, SendMessage, SignalChannel,
     SlackChannel, TelegramChannel,
 };
+use crate::config::schema::{CronJobDecl, CronScheduleDecl};
 use crate::config::Config;
 use crate::cron::{
     all_overdue_jobs, due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job,
@@ -37,11 +38,36 @@ pub async fn run(config: Config) -> Result<()> {
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
     // ── Declarative job sync: reconcile config-defined jobs with the DB.
-    match sync_declarative_jobs(&config, &config.cron.jobs) {
+    let mut jobs_with_builtin = config.cron.jobs.clone();
+    if let Some(ref schedule_cron) = config.backup.schedule_cron {
+        let backup_job = CronJobDecl {
+            id: "__builtin_backup".to_string(),
+            name: Some("Scheduled backup".to_string()),
+            job_type: "shell".to_string(),
+            schedule: CronScheduleDecl::Cron {
+                expr: schedule_cron.clone(),
+                tz: config.backup.schedule_timezone.clone(),
+            },
+            command: Some("backup create".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            session_target: None,
+            delivery: None,
+        };
+        tracing::debug!(
+            schedule = %schedule_cron,
+            "Synthesizing builtin backup cron job from config.backup.schedule_cron"
+        );
+        jobs_with_builtin.push(backup_job);
+    }
+
+    match sync_declarative_jobs(&config, &jobs_with_builtin) {
         Ok(()) => {
-            if !config.cron.jobs.is_empty() {
+            if !jobs_with_builtin.is_empty() {
                 tracing::info!(
-                    count = config.cron.jobs.len(),
+                    count = jobs_with_builtin.len(),
                     "Synced declarative cron jobs from config"
                 );
             }

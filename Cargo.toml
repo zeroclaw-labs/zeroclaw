@@ -52,8 +52,6 @@ matrix-sdk = { version = "0.16", optional = true, default-features = false, feat
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-serde_ignored = "0.1"
-serde_yaml = "0.9"
 
 # Config
 directories = "6.0"
@@ -89,8 +87,12 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
+# Tar/gzip extraction (update pipeline)
+flate2 = "1.1"
+tar = "0.4"
+
 # Zip extraction for ClawhHub / OpenClaw registry installers
-zip = { version = "8.1", default-features = false, features = ["deflate"] }
+zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 
 # Error handling
 anyhow = "1.0"
@@ -227,7 +229,7 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["observability-prometheus", "channel-nostr", "channel-lark", "skill-creation"]
+default = ["observability-prometheus", "skill-creation"]
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]

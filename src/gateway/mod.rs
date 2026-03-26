@@ -453,6 +453,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         _reaction_handle_gw,
         _channel_map_handle,
         _ask_user_handle_gw,
+        _escalate_handle_gw,
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,

@@ -43,6 +43,7 @@ pub struct MatrixChannel {
     http_client: Client,
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
     voice_mode: Arc<AtomicBool>,
+    otk_conflict_detected: Arc<AtomicBool>,
     transcription: Option<crate::config::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     stream_mode: crate::config::StreamMode,
@@ -125,6 +126,15 @@ struct RoomAliasResponse {
 }
 
 impl MatrixChannel {
+    fn is_otk_conflict_message(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("one time key") && lower.contains("already exists")
+    }
+
+    fn sanitize_error_for_log(error: &impl std::fmt::Display) -> String {
+        crate::providers::sanitize_api_error(&error.to_string())
+    }
+
     fn normalize_optional_field(value: Option<String>) -> Option<String> {
         value
             .map(|entry| entry.trim().to_string())
@@ -228,6 +238,7 @@ impl MatrixChannel {
             http_client: Client::new(),
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
             voice_mode: Arc::new(AtomicBool::new(false)),
+            otk_conflict_detected: Arc::new(AtomicBool::new(false)),
             transcription: None,
             transcription_manager: None,
             stream_mode: crate::config::StreamMode::Off,
@@ -355,6 +366,44 @@ impl MatrixChannel {
             .map(|dir| dir.join("state").join("matrix"))
     }
 
+    fn device_id_path(&self) -> Option<PathBuf> {
+        self.matrix_store_dir().map(|dir| dir.join("device_id"))
+    }
+
+    async fn load_or_generate_device_id(&self) -> anyhow::Result<String> {
+        // Try to load a previously persisted device_id
+        if let Some(path) = self.device_id_path() {
+            if path.exists() {
+                let stored = tokio::fs::read_to_string(&path).await?;
+                let stored = stored.trim().to_string();
+                if !stored.is_empty() {
+                    tracing::info!("Matrix using persisted device_id from {}", path.display());
+                    return Ok(stored);
+                }
+            }
+        }
+
+        // Generate a new device_id
+        let device_id = format!("ZEROCLAW_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        tracing::info!(
+            "Matrix auto-generated device_id '{}'. \
+             To keep this device stable, it has been saved locally. \
+             You can also set channels_config.matrix.device_id in config.toml.",
+            device_id
+        );
+
+        // Persist it so restarts reuse the same device
+        if let Some(path) = self.device_id_path() {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&path, &device_id).await?;
+            tracing::debug!("Matrix persisted device_id to {}", path.display());
+        }
+
+        Ok(device_id)
+    }
+
     fn is_user_allowed(&self, sender: &str) -> bool {
         Self::is_sender_allowed(&self.allowed_users, sender)
     }
@@ -464,7 +513,8 @@ impl MatrixChannel {
                         if self.session_owner_hint.is_some() && self.session_device_id_hint.is_some()
                         {
                             tracing::warn!(
-                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}"
+                                "Matrix whoami failed; falling back to configured session hints for E2EE session restore: {error}. \
+                                 See docs/security/matrix-e2ee-guide.md section 4C."
                             );
                             None
                         } else {
@@ -487,7 +537,9 @@ impl MatrixChannel {
                 } else {
                     self.session_owner_hint.clone().ok_or_else(|| {
                         anyhow::anyhow!(
-                            "Matrix session restore requires user_id when whoami is unavailable"
+                            "Matrix session restore requires user_id when whoami is unavailable. \
+                             Set channels_config.matrix.user_id in config.toml. \
+                             See docs/security/matrix-e2ee-guide.md section 2."
                         )
                     })?
                 };
@@ -507,16 +559,18 @@ impl MatrixChannel {
                             hinted.clone()
                         }
                     }
-                    (Some(whoami), None) => whoami.device_id.clone().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Matrix whoami response did not include device_id. Set channels.matrix.device_id to enable E2EE session restore."
-                        )
-                    })?,
+                    (Some(whoami), None) => {
+                        if let Some(device_id) = whoami.device_id.clone() {
+                            device_id
+                        } else {
+                            tracing::debug!("Matrix whoami did not include device_id, auto-generating");
+                            self.load_or_generate_device_id().await?
+                        }
+                    }
                     (None, Some(hinted)) => hinted.clone(),
                     (None, None) => {
-                        return Err(anyhow::anyhow!(
-                            "Matrix E2EE session restore requires device_id when whoami is unavailable"
-                        ));
+                        tracing::debug!("Matrix no device_id from whoami or config, auto-generating");
+                        self.load_or_generate_device_id().await?
                     }
                 };
 
@@ -547,6 +601,7 @@ impl MatrixChannel {
                 };
 
                 client.restore_session(session).await?;
+                tracing::debug!("Matrix session restored for device");
 
                 Ok::<MatrixSdkClient, anyhow::Error>(client)
             })
@@ -674,14 +729,17 @@ impl MatrixChannel {
                     );
                 } else {
                     tracing::warn!(
-                        "Matrix device '{}' is not verified. Some clients may label bot messages as unverified until you sign/verify this device from a trusted session.",
+                        "Matrix device '{}' is not verified. Other clients will label bot messages as unverified. \
+                         Verify this device from a trusted session and keep device_id stable across restarts. \
+                         See docs/security/matrix-e2ee-guide.md section 4D.",
                         device.device_id()
                     );
                 }
             }
             Ok(None) => {
                 tracing::warn!(
-                    "Matrix own-device metadata is unavailable; verify/signing status cannot be determined."
+                    "Matrix own-device metadata is unavailable; verify/signing status cannot be determined. \
+                     See docs/security/matrix-e2ee-guide.md section 4D."
                 );
             }
             Err(error) => {
@@ -694,7 +752,9 @@ impl MatrixChannel {
         } else {
             let _ = client.encryption().backups().disable().await;
             tracing::warn!(
-                "Matrix room-key backup is not enabled for this device; automatic backup attempts have been disabled to suppress recurring warnings. To enable backups, configure server-side key backup and recovery for this device."
+                "Matrix room-key backup is not enabled for this device. \
+                 Key backup warnings may appear until recovery is configured. \
+                 See docs/security/matrix-e2ee-guide.md section 4D."
             );
         }
     }
@@ -707,6 +767,10 @@ impl Channel for MatrixChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            tracing::debug!("Matrix OTK conflict flag is set, refusing send");
+            anyhow::bail!("Matrix channel unavailable: E2EE one-time key conflict detected");
+        }
         let client = self.matrix_client().await?;
         let target_room_id = if message.recipient.contains("||") {
             message.recipient.split_once("||").unwrap().1.to_string()
@@ -826,6 +890,10 @@ impl Channel for MatrixChannel {
     }
 
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            tracing::debug!("Matrix OTK conflict flag is set, refusing listen");
+            anyhow::bail!("Matrix channel unavailable: E2EE one-time key conflict detected");
+        }
         let target_room_id = self.target_room_id().await?;
         self.ensure_room_supported(&target_room_id).await?;
 
@@ -1114,17 +1182,34 @@ impl Channel for MatrixChannel {
         });
 
         let sync_settings = SyncSettings::new().timeout(std::time::Duration::from_secs(30));
+        let otk_conflict_detected = Arc::clone(&self.otk_conflict_detected);
         client
             .sync_with_result_callback(sync_settings, |sync_result| {
                 let tx = tx.clone();
+                let otk_conflict_detected = Arc::clone(&otk_conflict_detected);
                 async move {
                     if tx.is_closed() {
                         return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
                     }
 
                     if let Err(error) = sync_result {
-                        tracing::warn!("Matrix sync error: {error}, retrying...");
+                        let raw = error.to_string();
+                        let safe_error = MatrixChannel::sanitize_error_for_log(&error);
+
+                        if MatrixChannel::is_otk_conflict_message(&raw) {
+                            otk_conflict_detected.store(true, Ordering::SeqCst);
+                            tracing::error!(
+                                "Matrix one-time key upload conflict detected; \
+                                 stopping sync to avoid infinite retry loop."
+                            );
+                            return Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Break);
+                        }
+
+                        tracing::debug!(error = %safe_error, "Matrix sync error classified as transient, retrying");
+                        tracing::warn!("Matrix sync error: {safe_error}, retrying...");
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    } else {
+                        tracing::debug!("Matrix sync cycle completed");
                     }
 
                     Ok::<LoopCtrl, matrix_sdk::Error>(LoopCtrl::Continue)
@@ -1132,10 +1217,28 @@ impl Channel for MatrixChannel {
             })
             .await?;
 
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            let mut msg = String::from(
+                "Matrix E2EE one-time key conflict detected. \
+                 Deregister the stale device, delete the local crypto store, and restart. \
+                 See docs/security/matrix-e2ee-guide.md section 4H.",
+            );
+            if let Some(store_dir) = self.matrix_store_dir() {
+                use std::fmt::Write;
+                let _ = write!(msg, " Store path: {}", store_dir.display());
+            }
+            anyhow::bail!("{msg}");
+        }
+
         Ok(())
     }
 
     async fn health_check(&self) -> bool {
+        if self.otk_conflict_detected.load(Ordering::Relaxed) {
+            tracing::debug!("Matrix health check: unhealthy (OTK conflict)");
+            return false;
+        }
+
         let Ok(room_id) = self.target_room_id().await else {
             return false;
         };
@@ -1144,7 +1247,9 @@ impl Channel for MatrixChannel {
             return false;
         }
 
-        self.matrix_client().await.is_ok()
+        let healthy = self.matrix_client().await.is_ok();
+        tracing::debug!(healthy, "Matrix health check result");
+        healthy
     }
 
     async fn add_reaction(
@@ -2129,5 +2234,28 @@ mod tests {
         );
         assert_eq!(ch.allowed_rooms.len(), 1);
         assert!(ch.is_room_allowed("!room:matrix.org"));
+    }
+
+    #[test]
+    fn otk_conflict_message_detection() {
+        assert!(MatrixChannel::is_otk_conflict_message(
+            "One time key signed_curve25519:AAAAAAAAAA4 already exists. Old key: {} new key: {}"
+        ));
+        assert!(MatrixChannel::is_otk_conflict_message(
+            "ONE TIME KEY xyz already exists"
+        ));
+        assert!(!MatrixChannel::is_otk_conflict_message(
+            "Matrix sync timeout while waiting for long poll"
+        ));
+        assert!(!MatrixChannel::is_otk_conflict_message(
+            "one time key was uploaded successfully"
+        ));
+    }
+
+    #[test]
+    fn sanitize_error_for_log_scrubs_secret_prefixes() {
+        let sanitized = MatrixChannel::sanitize_error_for_log(&"auth failed: sk-proj-abc123xyz");
+        assert!(!sanitized.contains("sk-proj-abc123xyz"));
+        assert!(sanitized.contains("[REDACTED]"));
     }
 }

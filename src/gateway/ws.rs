@@ -403,6 +403,9 @@ async fn process_chat_message(
                 TurnEvent::Chunk { delta } => {
                     serde_json::json!({ "type": "chunk", "content": delta })
                 }
+                TurnEvent::Thinking { delta } => {
+                    serde_json::json!({ "type": "thinking", "content": delta })
+                }
                 TurnEvent::ToolCall { name, args } => {
                     serde_json::json!({ "type": "tool_call", "name": name, "args": args })
                 }
