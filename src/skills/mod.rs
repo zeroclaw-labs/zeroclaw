@@ -82,13 +82,12 @@ struct SkillMeta {
     tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 struct SkillMarkdownMeta {
     name: Option<String>,
     description: Option<String>,
     version: Option<String>,
     author: Option<String>,
-    #[serde(default)]
     tags: Vec<String>,
 }
 
@@ -621,15 +620,64 @@ struct ParsedSkillMarkdown {
 
 fn parse_skill_markdown(content: &str) -> ParsedSkillMarkdown {
     if let Some((frontmatter, body)) = split_skill_frontmatter(content) {
-        if let Ok(meta) = serde_yaml::from_str::<SkillMarkdownMeta>(&frontmatter) {
-            return ParsedSkillMarkdown { meta, body };
-        }
+        let meta = parse_simple_frontmatter(&frontmatter);
+        return ParsedSkillMarkdown { meta, body };
     }
 
     ParsedSkillMarkdown {
         meta: SkillMarkdownMeta::default(),
         body: content.to_string(),
     }
+}
+
+/// Lightweight YAML-like frontmatter parser for simple `key: value` pairs.
+/// Replaces `serde_yaml` to avoid pulling in the full YAML parser (~30KB)
+/// for a struct with only 5 optional string fields.
+fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
+    let mut meta = SkillMarkdownMeta::default();
+    let mut collecting_tags = false;
+    for line in s.lines() {
+        // Handle YAML list items under `tags:` (e.g. "  - parser")
+        if collecting_tags {
+            let trimmed = line.trim();
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let tag = item.trim().trim_matches('"').trim_matches('\'');
+                if !tag.is_empty() {
+                    meta.tags.push(tag.to_string());
+                }
+                continue;
+            }
+            // Non-list-item line → stop collecting tags
+            collecting_tags = false;
+        }
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim().trim_matches('"').trim_matches('\'');
+        match key {
+            "name" => meta.name = Some(val.to_string()),
+            "description" => meta.description = Some(val.to_string()),
+            "version" => meta.version = Some(val.to_string()),
+            "author" => meta.author = Some(val.to_string()),
+            "tags" => {
+                if val.is_empty() {
+                    // YAML block list follows on subsequent lines
+                    collecting_tags = true;
+                } else {
+                    // Inline: [a, b, c] or comma-separated
+                    let val = val.trim_start_matches('[').trim_end_matches(']');
+                    meta.tags = val
+                        .split(',')
+                        .map(|t| t.trim().trim_matches('"').trim_matches('\'').to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                }
+            }
+            _ => {}
+        }
+    }
+    meta
 }
 
 fn split_skill_frontmatter(content: &str) -> Option<(String, String)> {

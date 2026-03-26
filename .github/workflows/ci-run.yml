@@ -7,8 +7,8 @@ on:
     branches: [master]
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || 'push-master' }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -40,6 +40,20 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  bench-compile:
+    name: Verify Benchmarks Compile
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Ensure web/dist placeholder exists
+        run: mkdir -p web/dist && touch web/dist/.gitkeep
 
       - name: Verify benchmarks compile
         run: cargo bench --no-run --locked
@@ -183,7 +197,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [lint, lint-strict-delta, test, build, docs-quality, check-all-features]
+    needs: [lint, bench-compile, lint-strict-delta, test, build, docs-quality, check-all-features]
     runs-on: ubuntu-latest
     steps:
       - name: Check upstream job results

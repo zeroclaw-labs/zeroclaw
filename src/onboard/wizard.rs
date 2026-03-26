@@ -145,6 +145,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         extra_headers: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        trust: crate::trust::TrustConfig::default(),
         backup: crate::config::BackupConfig::default(),
         data_retention: crate::config::DataRetentionConfig::default(),
         cloud_ops: crate::config::CloudOpsConfig::default(),
@@ -589,6 +590,7 @@ async fn run_quick_setup_with_home(
         extra_headers: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        trust: crate::trust::TrustConfig::default(),
         backup: crate::config::BackupConfig::default(),
         data_retention: crate::config::DataRetentionConfig::default(),
         cloud_ops: crate::config::CloudOpsConfig::default(),
@@ -3940,6 +3942,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     interrupt_on_new_message: false,
                     mention_only: false,
                     proxy_url: None,
+                    stream_mode: StreamMode::MultiMessage,
+                    draft_update_interval_ms: 1000,
+                    multi_message_delay_ms: 800,
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -4432,6 +4437,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         dm_policy: WhatsAppChatPolicy::default(),
                         group_policy: WhatsAppChatPolicy::default(),
                         self_chat_mode: false,
+                        dm_mention_patterns: vec![],
+                        group_mention_patterns: vec![],
                         proxy_url: None,
                     });
 
@@ -4538,6 +4545,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     dm_policy: WhatsAppChatPolicy::default(),
                     group_policy: WhatsAppChatPolicy::default(),
                     self_chat_mode: false,
+                    dm_mention_patterns: vec![],
+                    group_mention_patterns: vec![],
                     proxy_url: None,
                 });
             }

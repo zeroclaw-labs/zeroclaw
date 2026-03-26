@@ -860,6 +860,44 @@ fn parse_sse_chunk(line: &str) -> StreamResult<Option<StreamChunkResponse>> {
         .map_err(StreamError::Json)
 }
 
+/// Parse custom proxy tool events from SSE lines.
+/// These are emitted by proxies like claude-max-api-proxy that execute tools
+/// internally and forward observability events via custom SSE fields.
+fn parse_proxy_tool_event(line: &str) -> Option<StreamEvent> {
+    let data = line.trim().strip_prefix("data:")?.trim();
+    let obj: serde_json::Value = serde_json::from_str(data).ok()?;
+
+    if let Some(ts) = obj.get("x_tool_start") {
+        let Some(name) = ts.get("name").and_then(|v| v.as_str()) else {
+            tracing::debug!("proxy x_tool_start event missing required 'name' field");
+            return None;
+        };
+        let name = name.to_string();
+        let args = ts
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}")
+            .to_string();
+        return Some(StreamEvent::PreExecutedToolCall { name, args });
+    }
+
+    if let Some(tr) = obj.get("x_tool_result") {
+        let name = tr
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let output = tr
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(StreamEvent::PreExecutedToolResult { name, output });
+    }
+
+    None
+}
+
 fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
     if let Some(content) = &choice.delta.content {
         if !content.is_empty() {
@@ -877,9 +915,30 @@ fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
 
 /// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
 /// Handles the `data: {...}` format and `[DONE]` sentinel.
-fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
-    Ok(parse_sse_chunk(line)?
-        .and_then(|chunk| chunk.choices.first().and_then(extract_sse_text_delta)))
+///
+/// Returns a `StreamChunk` that distinguishes content from reasoning:
+/// - Content deltas → `StreamChunk::delta`
+/// - Reasoning deltas → `StreamChunk::reasoning`
+fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
+    let chunk = match parse_sse_chunk(line)? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    if let Some(choice) = chunk.choices.first() {
+        if let Some(content) = &choice.delta.content {
+            if !content.is_empty() {
+                return Ok(Some(StreamChunk::delta(content.clone())));
+            }
+        }
+        if let Some(reasoning) = &choice.delta.reasoning_content {
+            if !reasoning.is_empty() {
+                return Ok(Some(StreamChunk::reasoning(reasoning.clone())));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Convert SSE byte stream to text chunks.
@@ -925,11 +984,12 @@ fn sse_bytes_to_chunks(
                         buffer.drain(..=pos);
 
                         match parse_sse_line(&line) {
-                            Ok(Some(content)) => {
-                                let mut chunk = StreamChunk::delta(content);
-                                if count_tokens {
-                                    chunk = chunk.with_token_estimate();
-                                }
+                            Ok(Some(chunk)) => {
+                                let chunk = if count_tokens {
+                                    chunk.with_token_estimate()
+                                } else {
+                                    chunk
+                                };
                                 if tx.send(Ok(chunk)).await.is_err() {
                                     return; // Receiver dropped
                                 }
@@ -1000,6 +1060,15 @@ fn sse_bytes_to_events(
                     while let Some(pos) = buffer.find('\n') {
                         let line = buffer[..pos].to_string();
                         buffer.drain(..=pos);
+
+                        // Custom proxy events for pre-executed tool calls
+                        // (e.g. claude-max-api-proxy streaming x_tool_start/x_tool_result)
+                        if let Some(event) = parse_proxy_tool_event(&line) {
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
 
                         let chunk = match parse_sse_chunk(&line) {
                             Ok(Some(chunk)) => chunk,
@@ -2214,6 +2283,109 @@ impl Provider for OpenAiCompatibleProvider {
         .boxed()
     }
 
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let credential = match self.credential.as_ref() {
+            Some(value) => value.clone(),
+            None => {
+                let provider_name = self.name.clone();
+                return stream::once(async move {
+                    Err(StreamError::Provider(format!(
+                        "{} API key not set",
+                        provider_name
+                    )))
+                })
+                .boxed();
+            }
+        };
+
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(messages)
+        } else {
+            messages.to_vec()
+        };
+        let api_messages: Vec<Message> = effective_messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: Self::to_message_content(
+                    &m.role,
+                    &m.content,
+                    !self.merge_system_into_user,
+                ),
+            })
+            .collect();
+
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+            stream: Some(options.enabled),
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: self.max_tokens,
+        };
+
+        let url = self.chat_completions_url();
+        let client = self.http_client();
+        let auth_header = self.auth_header.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        tokio::spawn(async move {
+            let mut req_builder = client.post(&url).json(&request);
+
+            req_builder = match &auth_header {
+                AuthStyle::Bearer => {
+                    req_builder.header("Authorization", format!("Bearer {}", credential))
+                }
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
+            };
+
+            req_builder = req_builder.header("Accept", "text/event-stream");
+
+            let response = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = match response.text().await {
+                    Ok(e) => e,
+                    Err(_) => format!("HTTP error: {}", status),
+                };
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
+                return;
+            }
+
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            while let Some(chunk) = chunk_stream.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
             // Hit the chat completions URL with a GET to establish the connection pool.
@@ -3399,37 +3571,41 @@ mod tests {
     #[test]
     fn parse_sse_line_with_content() {
         let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("hello".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(result.delta, "hello");
+        assert!(result.reasoning.is_none());
     }
 
     #[test]
     fn parse_sse_line_with_reasoning_content() {
         let line = r#"data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
     fn parse_sse_line_with_both_prefers_content() {
         let line = r#"data: {"choices":[{"delta":{"content":"real answer","reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("real answer".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(result.delta, "real answer");
+        assert!(result.reasoning.is_none());
     }
 
     #[test]
-    fn parse_sse_line_with_empty_content_falls_back_to_reasoning_content() {
+    fn parse_sse_line_with_empty_content_falls_back_to_reasoning() {
         let line =
             r#"data: {"choices":[{"delta":{"content":"","reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
     fn parse_sse_line_done_sentinel() {
         let line = "data: [DONE]";
         let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, None);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -3735,5 +3911,79 @@ mod tests {
         assert!(!json.as_object().unwrap().contains_key("type"));
         assert!(!json.as_object().unwrap().contains_key("function"));
         assert!(!json.as_object().unwrap().contains_key("parameters"));
+    }
+
+    // ── parse_proxy_tool_event tests ──
+
+    #[test]
+    fn proxy_tool_start_valid() {
+        let line = r#"data: {"x_tool_start":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolCall { ref name, ref args })
+            if name == "bash" && args == r#"{"cmd":"ls"}"#
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_start_missing_name_returns_none() {
+        let line = r#"data: {"x_tool_start":{"arguments":"{}"}}"#;
+        assert!(parse_proxy_tool_event(line).is_none());
+    }
+
+    #[test]
+    fn proxy_tool_start_missing_arguments_defaults() {
+        let line = r#"data: {"x_tool_start":{"name":"read"}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolCall { ref name, ref args })
+            if name == "read" && args == "{}"
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_result_valid() {
+        let line = r#"data: {"x_tool_result":{"name":"bash","output":"hello world"}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolResult { ref name, ref output })
+            if name == "bash" && output == "hello world"
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_result_missing_fields_uses_defaults() {
+        let line = r#"data: {"x_tool_result":{}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolResult { ref name, ref output })
+            if name == "unknown" && output.is_empty()
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_event_non_json_returns_none() {
+        assert!(parse_proxy_tool_event("data: not json").is_none());
+    }
+
+    #[test]
+    fn proxy_tool_event_no_data_prefix_returns_none() {
+        let line = r#"{"x_tool_start":{"name":"bash"}}"#;
+        assert!(parse_proxy_tool_event(line).is_none());
+    }
+
+    #[test]
+    fn proxy_tool_event_standard_openai_chunk_returns_none() {
+        let line = r#"data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"hi"}}]}"#;
+        assert!(parse_proxy_tool_event(line).is_none());
+    }
+
+    #[test]
+    fn proxy_tool_event_done_sentinel_returns_none() {
+        assert!(parse_proxy_tool_event("data: [DONE]").is_none());
     }
 }

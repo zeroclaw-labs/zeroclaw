@@ -616,7 +616,7 @@ async fn build_context(
             if context == "[Memory context]\n" {
                 context.clear();
             } else {
-                context.push('\n');
+                context.push_str("[/Memory context]\n\n");
             }
         }
     }
@@ -2395,6 +2395,11 @@ async fn consume_provider_streaming_response(
                     outcome.forwarded_live_deltas = false;
                 }
             }
+            StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
+                // Pre-executed tool events are for observability only.
+                // They are forwarded to the gateway via turn_streamed but
+                // do not affect the agent's tool dispatch loop.
+            }
             StreamEvent::TextDelta(chunk) => {
                 if chunk.delta.is_empty() {
                     continue;
@@ -2980,6 +2985,13 @@ pub(crate) async fn run_tool_call_loop(
         let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
             && (request_tools.is_none() || provider.supports_streaming_tool_events());
+        tracing::debug!(
+            has_on_delta = on_delta.is_some(),
+            supports_streaming = provider.supports_streaming(),
+            should_consume_provider_stream,
+            "Streaming decision for iteration {}",
+            iteration + 1,
+        );
         let mut streamed_live_deltas = false;
 
         let chat_result = if should_consume_provider_stream {
@@ -3862,6 +3874,7 @@ pub async fn run(
         _reaction_handle,
         _channel_map_handle,
         _ask_user_handle,
+        _escalate_handle,
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -4772,6 +4785,7 @@ pub async fn process_message(
         _reaction_handle_pm,
         _channel_map_handle_pm,
         _ask_user_handle_pm,
+        _escalate_handle_pm,
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,

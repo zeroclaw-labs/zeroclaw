@@ -106,9 +106,16 @@ jobs:
         id: notes
         shell: bash
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ inputs.version || '' }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+
+          # Resolve version from tag push or manual input
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            INPUT_VERSION="${REF_NAME#v}"
+          fi
 
           # Find the previous stable tag (exclude beta tags)
           PREV_TAG=$(git tag --sort=-creatordate | grep -vE '\-beta\.' | grep -v "^v${INPUT_VERSION}$" | head -1 || echo "")

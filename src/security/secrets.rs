@@ -191,7 +191,14 @@ impl SecretStore {
             #[cfg(windows)]
             {
                 // On Windows, use icacls to restrict permissions to current user only
-                let username = std::env::var("USERNAME").unwrap_or_default();
+                // Use whoami command to get full user identity (COMPUTER\User or DOMAIN\User)
+                // which is required by icacls for correct parsing
+                let username = std::process::Command::new("whoami")
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default());
                 let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
                     tracing::warn!(
                         "USERNAME environment variable is empty; \

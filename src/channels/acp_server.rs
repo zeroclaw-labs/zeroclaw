@@ -367,6 +367,15 @@ impl AcpServer {
                         "output": output,
                     }),
                 },
+                TurnEvent::Thinking { delta } => JsonRpcNotification {
+                    jsonrpc: "2.0",
+                    method: "session/event",
+                    params: serde_json::json!({
+                        "session_id": session_id,
+                        "type": "thinking",
+                        "content": delta,
+                    }),
+                },
             };
             self.write_notification(&notification).await;
         }

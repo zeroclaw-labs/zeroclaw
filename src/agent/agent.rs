@@ -26,6 +26,8 @@ use std::time::Instant;
 pub enum TurnEvent {
     /// A text chunk from the LLM response (may arrive many times).
     Chunk { delta: String },
+    /// A reasoning/thinking chunk from a thinking model (may arrive many times).
+    Thinking { delta: String },
     /// The agent is invoking a tool.
     ToolCall {
         name: String,
@@ -377,23 +379,29 @@ impl Agent {
             None
         };
 
-        let (mut tools, delegate_handle, _reaction_handle, _channel_map_handle, _ask_user_handle) =
-            tools::all_tools_with_runtime(
-                Arc::new(config.clone()),
-                &security,
-                runtime,
-                memory.clone(),
-                composio_key,
-                composio_entity_id,
-                &config.browser,
-                &config.http_request,
-                &config.web_fetch,
-                &config.workspace_dir,
-                &config.agents,
-                config.api_key.as_deref(),
-                config,
-                None,
-            );
+        let (
+            mut tools,
+            delegate_handle,
+            _reaction_handle,
+            _channel_map_handle,
+            _ask_user_handle,
+            _escalate_handle,
+        ) = tools::all_tools_with_runtime(
+            Arc::new(config.clone()),
+            &security,
+            runtime,
+            memory.clone(),
+            composio_key,
+            composio_entity_id,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &config.workspace_dir,
+            &config.agents,
+            config.api_key.as_deref(),
+            config,
+            None,
+        );
 
         // ── Wire MCP tools (non-fatal) ─────────────────────────────
         // Replicates the same MCP initialization logic used in the CLI
@@ -947,25 +955,72 @@ impl Agent {
             use futures_util::StreamExt;
 
             let stream_opts = crate::providers::traits::StreamOptions::new(true);
-            let mut stream = self.provider.stream_chat_with_history(
-                &messages,
+            let mut stream = self.provider.stream_chat(
+                crate::providers::ChatRequest {
+                    messages: &messages,
+                    // tools: None — turn_streamed is used by the gateway WS handler
+                    // for dashboard chat. Tool dispatch is handled by the main agent
+                    // loop (run_tool_call_loop) for channel messages. Passing tools
+                    // here would change behavior for all providers, not just proxies.
+                    tools: None,
+                },
                 &effective_model,
                 self.temperature,
                 stream_opts,
             );
 
             let mut streamed_text = String::new();
+            let mut streamed_tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
 
             while let Some(item) = stream.next().await {
                 match item {
-                    Ok(chunk) => {
-                        if !chunk.delta.is_empty() {
-                            got_stream = true;
-                            streamed_text.push_str(&chunk.delta);
-                            let _ = event_tx.send(TurnEvent::Chunk { delta: chunk.delta }).await;
+                    Ok(event) => match event {
+                        crate::providers::traits::StreamEvent::TextDelta(chunk) => {
+                            if let Some(reasoning) = chunk.reasoning {
+                                if !reasoning.is_empty() {
+                                    let _ = event_tx
+                                        .send(TurnEvent::Thinking { delta: reasoning })
+                                        .await;
+                                }
+                            }
+                            if !chunk.delta.is_empty() {
+                                got_stream = true;
+                                streamed_text.push_str(&chunk.delta);
+                                let _ =
+                                    event_tx.send(TurnEvent::Chunk { delta: chunk.delta }).await;
+                            }
                         }
-                    }
+                        crate::providers::traits::StreamEvent::ToolCall(tc) => {
+                            got_stream = true;
+                            let _ = event_tx
+                                .send(TurnEvent::ToolCall {
+                                    name: tc.name.clone(),
+                                    args: serde_json::from_str(&tc.arguments).unwrap_or_default(),
+                                })
+                                .await;
+                            streamed_tool_calls.push(tc);
+                        }
+                        crate::providers::traits::StreamEvent::PreExecutedToolCall {
+                            name,
+                            args,
+                        } => {
+                            let _ = event_tx
+                                .send(TurnEvent::ToolCall {
+                                    name,
+                                    args: serde_json::from_str(&args).unwrap_or_default(),
+                                })
+                                .await;
+                            // NOT pushed to streamed_tool_calls — already executed by proxy
+                        }
+                        crate::providers::traits::StreamEvent::PreExecutedToolResult {
+                            name,
+                            output,
+                        } => {
+                            let _ = event_tx.send(TurnEvent::ToolResult { name, output }).await;
+                        }
+                        crate::providers::traits::StreamEvent::Final => break,
+                    },
                     Err(_) => break,
                 }
             }
@@ -978,7 +1033,7 @@ impl Agent {
                 // Build a synthetic ChatResponse from streamed text
                 crate::providers::ChatResponse {
                     text: Some(streamed_text),
-                    tool_calls: Vec::new(),
+                    tool_calls: streamed_tool_calls,
                     usage: None,
                     reasoning_content: None,
                 }

@@ -3472,7 +3472,7 @@ mod tests {
         tc.default_provider = "local_whisper".to_string();
         tc.local_whisper = Some(crate::config::LocalWhisperConfig {
             url: "http://localhost:0/v1/transcribe".to_string(),
-            bearer_token: "unused".to_string(),
+            bearer_token: Some("unused".to_string()),
             max_audio_bytes: 10 * 1024 * 1024,
             timeout_secs: 30,
         });
@@ -3554,7 +3554,7 @@ mod tests {
         config.enabled = true;
         config.local_whisper = Some(crate::config::LocalWhisperConfig {
             url: format!("{}/v1/transcribe", whisper_server.uri()),
-            bearer_token: "test-token".to_string(),
+            bearer_token: Some("test-token".to_string()),
             max_audio_bytes: 10 * 1024 * 1024,
             timeout_secs: 30,
         });
