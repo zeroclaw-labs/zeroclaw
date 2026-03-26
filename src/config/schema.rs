@@ -15891,4 +15891,225 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         assert_eq!(config.enforcement.mode, "warn");
         assert_eq!(config.enforcement.reserve_percent, 10);
     }
+
+    // ── HasSecrets macro tests ──
+
+    #[test]
+    async fn matrix_secret_fields_discovered() {
+        let mx = MatrixConfig {
+            homeserver: "https://m.org".into(),
+            access_token: "tok".into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!r:m".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+        };
+        let fields = mx.secret_fields();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].name, "channels.matrix.access-token");
+        assert_eq!(fields[0].category, "Channels");
+        assert!(fields[0].is_set);
+    }
+
+    #[test]
+    async fn matrix_secret_fields_empty_not_set() {
+        let mx = MatrixConfig {
+            homeserver: "https://m.org".into(),
+            access_token: String::new(),
+            user_id: None,
+            device_id: None,
+            room_id: "!r:m".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+        };
+        let fields = mx.secret_fields();
+        assert!(!fields[0].is_set);
+    }
+
+    #[test]
+    async fn set_secret_updates_field() {
+        let mut mx = MatrixConfig {
+            homeserver: "https://m.org".into(),
+            access_token: "old".into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!r:m".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+        };
+        mx.set_secret("channels.matrix.access-token", "new-token".into()).unwrap();
+        assert_eq!(mx.access_token, "new-token");
+    }
+
+    #[test]
+    async fn set_secret_unknown_name_fails() {
+        let mut mx = MatrixConfig {
+            homeserver: "https://m.org".into(),
+            access_token: "tok".into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!r:m".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+        };
+        assert!(mx.set_secret("channels.matrix.nonexistent", "val".into()).is_err());
+    }
+
+    #[test]
+    async fn config_tree_traversal_discovers_nested_secrets() {
+        let mut config = Config::default();
+        config.api_key = Some("test-key".into());
+        config.channels_config.matrix = Some(MatrixConfig {
+            homeserver: "https://m.org".into(),
+            access_token: "mx-tok".into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!r:m".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+        });
+
+        let fields = config.secret_fields();
+        let names: Vec<&str> = fields.iter().map(|f| f.name).collect();
+        assert!(names.contains(&"api-key"));
+        assert!(names.contains(&"channels.matrix.access-token"));
+    }
+
+    #[test]
+    async fn config_set_secret_dispatches_to_child() {
+        let mut config = Config::default();
+        config.channels_config.matrix = Some(MatrixConfig {
+            homeserver: "https://m.org".into(),
+            access_token: "old".into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!r:m".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+        });
+
+        config.set_secret("channels.matrix.access-token", "new".into()).unwrap();
+        assert_eq!(
+            config.channels_config.matrix.as_ref().unwrap().access_token,
+            "new"
+        );
+    }
+
+    #[test]
+    async fn config_set_secret_top_level() {
+        let mut config = Config::default();
+        config.set_secret("api-key", "sk-test".into()).unwrap();
+        assert_eq!(config.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    async fn config_set_secret_unknown_fails() {
+        let mut config = Config::default();
+        assert!(config.set_secret("nonexistent.field", "val".into()).is_err());
+    }
+
+    #[test]
+    async fn encrypt_decrypt_roundtrip_via_macro() {
+        let dir = TempDir::new().unwrap();
+        let store = crate::security::SecretStore::new(dir.path(), true);
+
+        let mut mx = MatrixConfig {
+            homeserver: "https://m.org".into(),
+            access_token: "plaintext-token".into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!r:m".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+        };
+
+        // Encrypt
+        mx.encrypt_secrets(&store).unwrap();
+        assert!(crate::security::SecretStore::is_encrypted(&mx.access_token));
+        assert_ne!(mx.access_token, "plaintext-token");
+
+        // Decrypt
+        mx.decrypt_secrets(&store).unwrap();
+        assert_eq!(mx.access_token, "plaintext-token");
+    }
+
+    #[test]
+    async fn encrypt_skips_already_encrypted() {
+        let dir = TempDir::new().unwrap();
+        let store = crate::security::SecretStore::new(dir.path(), true);
+
+        let mut mx = MatrixConfig {
+            homeserver: "https://m.org".into(),
+            access_token: "plaintext-token".into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!r:m".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+        };
+
+        mx.encrypt_secrets(&store).unwrap();
+        let first_encrypted = mx.access_token.clone();
+
+        // Encrypt again — should be idempotent
+        mx.encrypt_secrets(&store).unwrap();
+        assert_eq!(mx.access_token, first_encrypted);
+    }
+
+    #[test]
+    async fn encrypt_no_op_on_disabled_store() {
+        let dir = TempDir::new().unwrap();
+        let store = crate::security::SecretStore::new(dir.path(), false);
+
+        let mut mx = MatrixConfig {
+            homeserver: "https://m.org".into(),
+            access_token: "plaintext-token".into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!r:m".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+        };
+
+        mx.encrypt_secrets(&store).unwrap();
+        // With encryption disabled, value should stay plaintext
+        assert_eq!(mx.access_token, "plaintext-token");
+    }
 }
