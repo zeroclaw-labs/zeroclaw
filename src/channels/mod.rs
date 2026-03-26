@@ -1185,13 +1185,24 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         }
     }
 
+    // Use the user-configured max_history_messages (fall back to
+    // MAX_CHANNEL_HISTORY when the config value is 0 or absent).
+    let max_history = {
+        let configured = ctx.prompt_config.agent.max_history_messages;
+        if configured > 0 {
+            configured
+        } else {
+            MAX_CHANNEL_HISTORY
+        }
+    };
+
     let mut histories = ctx
         .conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let turns = histories.entry(sender_key.to_string()).or_default();
     turns.push(turn);
-    while turns.len() > MAX_CHANNEL_HISTORY {
+    while turns.len() > max_history {
         turns.remove(0);
     }
 }
