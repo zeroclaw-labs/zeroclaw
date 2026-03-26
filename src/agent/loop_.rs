@@ -2593,6 +2593,7 @@ pub(crate) async fn agent_turn(
         model_switch_callback,
         &crate::config::PacingConfig::default(),
         0, // max_tool_result_chars: 0 = disabled (legacy callers)
+        0, // context_token_budget: 0 = disabled (legacy callers)
     )
     .await
 }
@@ -2904,6 +2905,7 @@ pub(crate) async fn run_tool_call_loop(
     model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &crate::config::PacingConfig,
     max_tool_result_chars: usize,
+    context_token_budget: usize,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2937,6 +2939,43 @@ pub(crate) async fn run_tool_call_loop(
             .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(ToolLoopCancelled.into());
+        }
+
+        // Preemptive context management: trim history before it overflows
+        if context_token_budget > 0 {
+            let estimated = estimate_history_tokens(history);
+            if estimated > context_token_budget {
+                tracing::info!(
+                    estimated,
+                    budget = context_token_budget,
+                    iteration = iteration + 1,
+                    "Preemptive context trim: estimated tokens exceed budget"
+                );
+                let chars_saved = fast_trim_tool_results(history, 4);
+                if chars_saved > 0 {
+                    tracing::info!(chars_saved, "Preemptive fast-trim applied");
+                }
+                // If still over budget, use the history pruner for deeper cleanup
+                let recheck = estimate_history_tokens(history);
+                if recheck > context_token_budget {
+                    let stats = crate::agent::history_pruner::prune_history(
+                        history,
+                        &crate::agent::history_pruner::HistoryPrunerConfig {
+                            enabled: true,
+                            max_tokens: context_token_budget,
+                            keep_recent: 4,
+                            collapse_tool_results: true,
+                        },
+                    );
+                    if stats.dropped_messages > 0 || stats.collapsed_pairs > 0 {
+                        tracing::info!(
+                            collapsed = stats.collapsed_pairs,
+                            dropped = stats.dropped_messages,
+                            "Preemptive history prune applied"
+                        );
+                    }
+                }
+            }
         }
 
         // Check if model switch was requested via model_switch tool
@@ -4464,6 +4503,7 @@ pub async fn run(
                 Some(model_switch_callback.clone()),
                 &config.pacing,
                 config.agent.max_tool_result_chars,
+                config.agent.max_context_tokens,
             )
             .await
             {
@@ -4766,6 +4806,7 @@ pub async fn run(
                     Some(model_switch_callback.clone()),
                     &config.pacing,
                     config.agent.max_tool_result_chars,
+                    config.agent.max_context_tokens,
                 )
                 .await
                 {
@@ -5230,8 +5271,8 @@ pub async fn process_message(
 mod tests {
     use super::{
         apply_compaction_summary, build_compaction_transcript, emergency_history_trim,
-        fast_trim_tool_results, load_interactive_session_history, save_interactive_session_history,
-        truncate_tool_result, InteractiveSessionState,
+        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
+        save_interactive_session_history, truncate_tool_result, InteractiveSessionState,
     };
     use crate::providers::ChatMessage;
     use tempfile::tempdir;
@@ -5411,6 +5452,45 @@ mod tests {
         // target_drop = 2/3 = 0 → nothing dropped
         let dropped = emergency_history_trim(&mut history, 1);
         assert_eq!(dropped, 0);
+    }
+
+    // ── estimate_history_tokens tests ─────────────────────────────
+
+    #[test]
+    fn estimate_tokens_empty_history() {
+        let history: Vec<ChatMessage> = vec![];
+        assert_eq!(estimate_history_tokens(&history), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_single_message() {
+        // 40 chars → 40.div_ceil(4) + 4 = 10 + 4 = 14 tokens
+        let msg = "a".repeat(40);
+        let history = vec![ChatMessage::user(&msg)];
+        let est = estimate_history_tokens(&history);
+        assert_eq!(est, 14);
+    }
+
+    #[test]
+    fn estimate_tokens_multiple_messages() {
+        let history = vec![
+            ChatMessage::system("system prompt here"), // 18 chars → 18/4=4 +4=8 (div_ceil: 5+4=9)
+            ChatMessage::user("hello"),                // 5 chars → 5/4=1 +4=5 (div_ceil: 2+4=6)
+            ChatMessage::assistant("world"),           // 5 chars → 5/4=1 +4=5 (div_ceil: 2+4=6)
+        ];
+        let est = estimate_history_tokens(&history);
+        // Each message: content_len.div_ceil(4) + 4
+        // 18.div_ceil(4)=5, 5.div_ceil(4)=2, 5.div_ceil(4)=2 → 5+4 + 2+4 + 2+4 = 21
+        assert_eq!(est, 21);
+    }
+
+    #[test]
+    fn estimate_tokens_large_tool_result() {
+        let big = "x".repeat(40_000);
+        let history = vec![ChatMessage::tool(&big)];
+        let est = estimate_history_tokens(&history);
+        // 40000.div_ceil(4) + 4 = 10000 + 4 = 10004
+        assert_eq!(est, 10_004);
     }
 
     // ── existing tests ────────────────────────────────────────────
@@ -6162,6 +6242,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -6215,6 +6296,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -6261,6 +6343,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -6306,6 +6389,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -6360,6 +6444,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -6412,6 +6497,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -6467,6 +6553,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -6519,6 +6606,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -6570,6 +6658,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -6706,6 +6795,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect("parallel execution should complete");
@@ -6778,6 +6868,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6842,6 +6933,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6900,6 +6992,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -6972,6 +7065,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -7033,6 +7127,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -7116,6 +7211,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect("loop should complete");
@@ -7174,6 +7270,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -7258,6 +7355,7 @@ mod tests {
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -7324,6 +7422,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -7393,6 +7492,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -7466,6 +7566,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -7548,6 +7649,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await
@@ -9587,6 +9689,7 @@ Let me check the result."#;
             None,
             &crate::config::PacingConfig::default(),
             0,
+            0,
         )
         .await
         .expect("tool loop should complete");
@@ -9742,6 +9845,7 @@ Let me check the result."#;
                     None,
                     &crate::config::PacingConfig::default(),
                     0,
+                    0,
                 ),
             )
             .await
@@ -9822,6 +9926,7 @@ Let me check the result."#;
                     None,
                     &crate::config::PacingConfig::default(),
                     0,
+                    0,
                 ),
             )
             .await
@@ -9877,6 +9982,7 @@ Let me check the result."#;
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
             0,
         )
         .await

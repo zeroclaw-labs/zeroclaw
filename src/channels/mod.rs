@@ -394,6 +394,7 @@ struct ChannelRuntimeContext {
     cost_tracking: Option<ChannelCostTrackingState>,
     pacing: crate::config::PacingConfig,
     max_tool_result_chars: usize,
+    context_token_budget: usize,
 }
 
 #[derive(Clone)]
@@ -2768,6 +2769,7 @@ async fn process_channel_message(
                         Some(model_switch_callback.clone()),
                         &ctx.pacing,
                         ctx.max_tool_result_chars,
+                        ctx.context_token_budget,
                     ),
                     ),
                 ) => LlmExecutionResult::Completed(result),
@@ -5248,6 +5250,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }),
         pacing: config.pacing.clone(),
         max_tool_result_chars: config.agent.max_tool_result_chars,
+        context_token_budget: config.agent.max_context_tokens,
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -5656,6 +5659,7 @@ mod tests {
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -5776,6 +5780,7 @@ mod tests {
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -5852,6 +5857,7 @@ mod tests {
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -5947,6 +5953,7 @@ mod tests {
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -6492,6 +6499,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -6578,6 +6586,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -6678,6 +6687,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -6763,6 +6773,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -6858,6 +6869,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -6974,6 +6986,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -7071,6 +7084,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -7183,6 +7197,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -7283,6 +7298,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..crate::config::PacingConfig::default()
             },
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -7373,6 +7389,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 ..crate::config::PacingConfig::default()
             },
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -7578,6 +7595,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -7686,6 +7704,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7809,6 +7828,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7929,6 +7949,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8031,6 +8052,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -8116,6 +8138,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -8898,6 +8921,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -9035,6 +9059,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -9213,6 +9238,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -9326,6 +9352,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -9903,6 +9930,7 @@ This is an example JSON object for profile settings."#;
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -9995,6 +10023,7 @@ This is an example JSON object for profile settings."#;
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -10163,6 +10192,7 @@ This is an example JSON object for profile settings."#;
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -10279,6 +10309,7 @@ This is an example JSON object for profile settings."#;
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -10387,6 +10418,7 @@ This is an example JSON object for profile settings."#;
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -10515,6 +10547,7 @@ This is an example JSON object for profile settings."#;
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         process_channel_message(
@@ -10784,6 +10817,7 @@ This is an example JSON object for profile settings."#;
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
             max_tool_result_chars: 0,
+            context_token_budget: 0,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
