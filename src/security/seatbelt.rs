@@ -192,8 +192,6 @@ fn generate_policy(workspace: &Path) -> String {
 ;; Allow localhost connections only (for local dev servers)
 (allow network-outbound
     (remote ip "localhost:*"))
-(allow network-outbound
-    (remote ip "127.0.0.1:*"))
 
 ;; ── Mach / IPC ─────────────────────────────────────────────
 ;; Allow basic mach services needed for process execution
@@ -261,7 +259,7 @@ mod tests {
         let workspace = PathBuf::from("/tmp/workspace");
         let policy = generate_policy(&workspace);
         assert!(policy.contains("localhost"));
-        assert!(policy.contains("127.0.0.1"));
+        assert!(!policy.contains("127.0.0.1"));
         assert!(!policy.contains("(allow network*)"));
     }
 
