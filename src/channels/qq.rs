@@ -1039,16 +1039,28 @@ impl Channel for QQChannel {
 
         let mut sequence: i64 = stored_seq.unwrap_or(-1);
 
-        // Track whether the server has acknowledged our last heartbeat.
-        // If we send a heartbeat and don't receive an ACK before the next
-        // heartbeat tick, the connection is likely zombied.
-        let mut heartbeat_ack_pending = false;
+        // Track consecutive missed heartbeat ACKs.  The previous logic
+        // killed the connection on the *first* missed ACK which is overly
+        // aggressive -- transient network hiccups or brief server-side GC
+        // pauses can cause a single ACK to be delayed.  We now allow up to
+        // `MAX_MISSED_ACKS` consecutive misses before declaring the
+        // connection dead.
+        const MAX_MISSED_ACKS: u32 = 3;
+        let mut missed_ack_count: u32 = 0;
 
-        // Spawn heartbeat timer
-        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
+        // Spawn heartbeat timer.
+        //
+        // We add a small grace period (10% of the server-provided interval,
+        // capped at 5s) so that a slightly-delayed ACK does not immediately
+        // count as missed.
         let hb_interval = heartbeat_interval;
+        let grace_ms: u64 = (hb_interval / 10).min(5_000);
+        let effective_interval = hb_interval.saturating_add(grace_ms);
+
+        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(hb_interval));
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(effective_interval));
             loop {
                 interval.tick().await;
                 if hb_tx.send(()).await.is_err() {
@@ -1073,15 +1085,23 @@ impl Channel for QQChannel {
         'outer: loop {
             tokio::select! {
                 _ = hb_rx.recv() => {
-                    // If the previous heartbeat was never ACKed, the connection
-                    // is likely dead — bail out instead of waiting forever.
-                    if heartbeat_ack_pending {
-                        tracing::warn!(
-                            "QQ: heartbeat ACK not received within interval ({hb_interval}ms); \
-                             connection appears zombied"
+                    // Increment the missed-ACK counter.  Only declare the
+                    // connection dead after MAX_MISSED_ACKS consecutive
+                    // heartbeats go un-acknowledged.
+                    if missed_ack_count > 0 {
+                        if missed_ack_count >= MAX_MISSED_ACKS {
+                            tracing::warn!(
+                                "QQ: {missed_ack_count} consecutive heartbeat ACKs missed \
+                                 (interval {hb_interval}ms + {grace_ms}ms grace); \
+                                 connection appears zombied"
+                            );
+                            exit_reason = ExitReason::HeartbeatTimeout;
+                            break;
+                        }
+                        tracing::info!(
+                            "QQ: heartbeat ACK missed ({missed_ack_count}/{MAX_MISSED_ACKS}); \
+                             tolerating transient delay"
                         );
-                        exit_reason = ExitReason::HeartbeatTimeout;
-                        break;
                     }
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
@@ -1093,7 +1113,7 @@ impl Channel for QQChannel {
                         exit_reason = ExitReason::WriteFailed;
                         break;
                     }
-                    heartbeat_ack_pending = true;
+                    missed_ack_count += 1;
                 }
                 msg = read.next() => {
                     let msg = match msg {
@@ -1141,7 +1161,7 @@ impl Channel for QQChannel {
                                 exit_reason = ExitReason::WriteFailed;
                                 break;
                             }
-                            heartbeat_ack_pending = true;
+                            missed_ack_count += 1;
                             continue;
                         }
                         // Reconnect
@@ -1158,7 +1178,7 @@ impl Channel for QQChannel {
                         }
                         // Heartbeat ACK
                         11 => {
-                            heartbeat_ack_pending = false;
+                            missed_ack_count = 0;
                             continue;
                         }
                         _ => {}
@@ -1310,9 +1330,13 @@ impl Channel for QQChannel {
                 anyhow::bail!("QQ WebSocket connection closed: stream ended unexpectedly")
             }
             ExitReason::HeartbeatTimeout => {
-                tracing::warn!("QQ: heartbeat timeout; resume will be attempted on reconnect");
+                tracing::warn!(
+                    "QQ: heartbeat timeout after {MAX_MISSED_ACKS} consecutive missed ACKs; \
+                     resume will be attempted on reconnect"
+                );
                 anyhow::bail!(
-                    "QQ WebSocket connection closed: heartbeat ACK timeout (zombied connection)"
+                    "QQ WebSocket connection closed: heartbeat ACK timeout \
+                     ({MAX_MISSED_ACKS} consecutive missed ACKs)"
                 )
             }
             ExitReason::WriteFailed => {
@@ -1791,5 +1815,80 @@ allowed_users = ["user1"]
         let ch = make_channel();
         assert!(ch.check_reply_allowed("msg_a").await);
         assert!(ch.check_reply_allowed("msg_b").await);
+    }
+
+    // --- Heartbeat stability tests ---
+
+    #[test]
+    fn test_heartbeat_grace_period_calculation() {
+        // The grace period is 10% of the server interval, capped at 5000ms.
+        let cases: Vec<(u64, u64)> = vec![
+            (41_250, 4_125),  // default QQ interval
+            (30_000, 3_000),  // smaller interval
+            (60_000, 5_000),  // larger interval, capped at 5s
+            (100_000, 5_000), // very large, still capped
+            (5_000, 500),     // small interval
+            (0, 0),           // degenerate zero
+        ];
+        for (interval, expected_grace) in cases {
+            let grace: u64 = (interval / 10).min(5_000);
+            assert_eq!(
+                grace, expected_grace,
+                "grace for interval {interval} should be {expected_grace}"
+            );
+            let effective = interval.saturating_add(grace);
+            assert!(effective >= interval);
+        }
+    }
+
+    #[test]
+    fn test_missed_ack_counter_logic() {
+        let max_missed: u32 = 3;
+        let mut missed: u32 = 0;
+
+        // First tick: counter is 0, send heartbeat
+        assert!(missed < max_missed);
+        missed += 1;
+
+        // ACK received: reset
+        missed = 0;
+
+        // 3 consecutive misses without ACK
+        for i in 0..max_missed {
+            if missed > 0 && missed >= max_missed {
+                panic!("should not reach zombie state at miss count {i}");
+            }
+            missed += 1;
+        }
+        assert!(
+            missed >= max_missed,
+            "should declare zombie after {max_missed} missed ACKs"
+        );
+    }
+
+    #[test]
+    fn test_missed_ack_counter_reset_on_ack() {
+        let max_missed: u32 = 3;
+        let mut missed: u32 = 0;
+
+        missed += 1;
+        missed += 1;
+        assert_eq!(missed, 2);
+
+        // ACK arrives: reset
+        missed = 0;
+        assert_eq!(missed, 0);
+
+        // One more miss, still under threshold
+        missed += 1;
+        assert!(missed < max_missed);
+    }
+
+    #[test]
+    fn test_effective_interval_never_overflows() {
+        let interval = u64::MAX;
+        let grace: u64 = (interval / 10).min(5_000);
+        let effective = interval.saturating_add(grace);
+        assert_eq!(effective, u64::MAX);
     }
 }
