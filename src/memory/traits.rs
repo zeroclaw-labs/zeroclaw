@@ -1,6 +1,18 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Filter criteria for bulk memory export (GDPR Art. 20 data portability).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExportFilter {
+    pub namespace: Option<String>,
+    pub session_id: Option<String>,
+    pub category: Option<MemoryCategory>,
+    /// RFC 3339 lower bound (inclusive) on created_at.
+    pub since: Option<String>,
+    /// RFC 3339 upper bound (inclusive) on created_at.
+    pub until: Option<String>,
+}
+
 /// A single message in a conversation trace for procedural memory.
 ///
 /// Used to capture "how to" patterns from tool-calling turns so that
@@ -188,6 +200,42 @@ pub trait Memory: Send + Sync {
             .into_iter()
             .filter(|e| e.namespace == namespace)
             .take(limit)
+            .collect();
+        Ok(filtered)
+    }
+
+    /// Bulk-export memories matching the given filter criteria.
+    ///
+    /// Intended for GDPR Art. 20 data portability. Returns entries ordered by
+    /// creation time (ascending). Embeddings are excluded.
+    ///
+    /// Default implementation delegates to `list()` and post-filters on
+    /// namespace and time range. Backends with native query support should
+    /// override for efficiency.
+    async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self
+            .list(filter.category.as_ref(), filter.session_id.as_deref())
+            .await?;
+        let filtered: Vec<MemoryEntry> = entries
+            .into_iter()
+            .filter(|e| {
+                if let Some(ref ns) = filter.namespace {
+                    if e.namespace != *ns {
+                        return false;
+                    }
+                }
+                if let Some(ref since) = filter.since {
+                    if e.timestamp.as_str() < since.as_str() {
+                        return false;
+                    }
+                }
+                if let Some(ref until) = filter.until {
+                    if e.timestamp.as_str() > until.as_str() {
+                        return false;
+                    }
+                }
+                true
+            })
             .collect();
         Ok(filtered)
     }
