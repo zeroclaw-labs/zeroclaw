@@ -70,6 +70,10 @@ impl BroadcastObserver {
     ) -> Self {
         Self { inner, tx }
     }
+
+    pub fn inner(&self) -> &dyn crate::observability::Observer {
+        self.inner.as_ref()
+    }
 }
 
 impl crate::observability::Observer for BroadcastObserver {

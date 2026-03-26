@@ -892,6 +892,7 @@ mod tests {
             webhook_secret: None,
             allowed_users: vec!["*".into()],
             proxy_url: None,
+            bot_name: None,
         });
         assert!(has_supervised_channels(&config));
     }

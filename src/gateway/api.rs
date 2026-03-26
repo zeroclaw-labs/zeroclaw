@@ -1056,6 +1056,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(email) = masked.channels_config.email.as_mut() {
         mask_required_secret(&mut email.password);
     }
+    mask_optional_secret(&mut masked.transcription.api_key);
     masked
 }
 
@@ -1243,6 +1244,10 @@ fn restore_masked_sensitive_fields(
     ) {
         restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
+    restore_optional_secret(
+        &mut incoming.transcription.api_key,
+        &current.transcription.api_key,
+    );
 }
 
 fn hydrate_config_for_save(
@@ -1294,6 +1299,40 @@ pub async fn handle_api_sessions_list(
         .collect();
 
     Json(serde_json::json!({ "sessions": gw_sessions })).into_response()
+}
+
+/// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
+pub async fn handle_api_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "session_id": id,
+            "messages": [],
+            "session_persistence": false,
+        }))
+        .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    let msgs = backend.load(&session_key);
+    let messages: Vec<serde_json::Value> = msgs
+        .into_iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+
+    Json(serde_json::json!({
+        "session_id": id,
+        "messages": messages,
+        "session_persistence": true,
+    }))
+    .into_response()
 }
 
 /// DELETE /api/sessions/{id} — delete a gateway session
@@ -1378,6 +1417,34 @@ pub async fn handle_api_session_rename(
         )
             .into_response(),
     }
+}
+
+// ── Claude Code hook endpoint ────────────────────────────────────
+
+/// POST /hooks/claude-code — receives HTTP hook events from Claude Code
+/// sessions spawned by [`ClaudeCodeRunnerTool`].
+///
+/// Claude Code posts structured JSON describing tool executions, completions,
+/// and errors. This handler logs the event and (when a Slack channel is
+/// configured) could be wired to update a Slack message in-place.
+pub async fn handle_claude_code_hook(
+    State(state): State<AppState>,
+    Json(payload): Json<crate::tools::claude_code_runner::ClaudeCodeHookEvent>,
+) -> impl IntoResponse {
+    // Do not require bearer-token auth: Claude Code subprocesses cannot easily
+    // obtain a pairing token, and the hook carries a session_id that ties it
+    // back to a session we spawned.
+    let _ = &state; // retained for future Slack update wiring
+
+    tracing::info!(
+        session_id = %payload.session_id,
+        event_type = %payload.event_type,
+        tool_name = ?payload.tool_name,
+        summary = ?payload.summary,
+        "Claude Code hook event received"
+    );
+
+    Json(serde_json::json!({ "ok": true }))
 }
 
 #[cfg(test)]
@@ -1475,6 +1542,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(crate::gateway::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -1495,6 +1563,8 @@ mod tests {
             pending_pairings: None,
             path_prefix: String::new(),
             canvas_store: crate::tools::canvas::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         }
     }
 

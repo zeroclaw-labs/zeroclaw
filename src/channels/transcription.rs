@@ -597,7 +597,7 @@ impl TranscriptionProvider for GoogleSttProvider {
 /// Self-hosted faster-whisper-compatible STT provider.
 ///
 /// POSTs audio as `multipart/form-data` (field name `file`) to a configurable
-/// HTTP endpoint (e.g. faster-whisper on GEX44 over WireGuard). The endpoint
+/// HTTP endpoint (e.g. `http://localhost:8000` or a private network host). The endpoint
 /// must return `{"text": "..."}`. No cloud API key required. Size limit is
 /// configurable — not constrained by the 25 MB cloud API cap.
 pub struct LocalWhisperProvider {
@@ -623,11 +623,11 @@ impl LocalWhisperProvider {
             parsed.scheme()
         );
 
-        let bearer_token = config.bearer_token.trim().to_string();
-        anyhow::ensure!(
-            !bearer_token.is_empty(),
-            "local_whisper: `bearer_token` must not be empty"
-        );
+        let bearer_token = match config.bearer_token.as_deref().map(str::trim) {
+            None => anyhow::bail!("local_whisper: `bearer_token` must be set"),
+            Some("") => anyhow::bail!("local_whisper: `bearer_token` must not be empty"),
+            Some(t) => t.to_string(),
+        };
 
         anyhow::ensure!(
             config.max_audio_bytes > 0,
@@ -1153,6 +1153,7 @@ mod tests {
         assert!(config.assemblyai.is_none());
         assert!(config.google.is_none());
         assert!(config.local_whisper.is_none());
+        assert!(!config.transcribe_non_ptt_audio);
     }
 
     // ── LocalWhisperProvider tests (TDD — added below as red/green cycles) ──
@@ -1160,7 +1161,7 @@ mod tests {
     fn local_whisper_config(url: &str) -> crate::config::LocalWhisperConfig {
         crate::config::LocalWhisperConfig {
             url: url.to_string(),
-            bearer_token: "test-token".to_string(),
+            bearer_token: Some("test-token".to_string()),
             max_audio_bytes: 10 * 1024 * 1024,
             timeout_secs: 30,
         }
@@ -1196,10 +1197,21 @@ mod tests {
     #[test]
     fn local_whisper_rejects_empty_bearer_token() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        cfg.bearer_token = String::new();
+        cfg.bearer_token = Some(String::new());
         let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
         assert!(
             err.to_string().contains("`bearer_token` must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_whisper_rejects_missing_bearer_token() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.bearer_token = None;
+        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        assert!(
+            err.to_string().contains("`bearer_token` must be set"),
             "got: {err}"
         );
     }
@@ -1250,7 +1262,7 @@ mod tests {
         // surfaces the error: "not configured".
         let mut config = TranscriptionConfig::default();
         let mut bad_cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        bad_cfg.bearer_token = String::new();
+        bad_cfg.bearer_token = Some(String::new());
         config.local_whisper = Some(bad_cfg);
         config.enabled = true;
         config.default_provider = "local_whisper".to_string();
