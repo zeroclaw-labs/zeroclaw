@@ -1232,6 +1232,17 @@ fn rollback_orphan_user_turn(
     true
 }
 
+fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<providers::ProviderCapabilityError>()
+        .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"))
+    {
+        return true;
+    }
+
+    crate::providers::reliable::is_non_retryable(error)
+}
+
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
     if memory::is_assistant_autosave_key(key) {
         return true;
@@ -3149,9 +3160,7 @@ async fn process_channel_message(
                         "elapsed_ms": started_at.elapsed().as_millis(),
                     }),
                 );
-                let should_rollback_user_turn = e
-                    .downcast_ref::<providers::ProviderCapabilityError>()
-                    .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
+                let should_rollback_user_turn = should_rollback_failed_user_turn(&e);
                 let rolled_back = should_rollback_user_turn
                     && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
 
@@ -5978,6 +5987,39 @@ mod tests {
             _model: &str,
             _temperature: f64,
         ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+    }
+
+    struct FormatErrorProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for FormatErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if messages
+                .iter()
+                .any(|msg| msg.content.contains("trigger format error"))
+            {
+                anyhow::bail!(
+                    "All providers/models failed. Attempts:\nprovider=custom:https://api.scnet.cn/api/llm/v1 model=MiniMax-M2.5 attempt 1/3: non_retryable; error=Custom API error (400 Bad Request): {{\"error\":{{\"message\":\"Format Error\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"400\"}},\"request_id\":\"test-request-id\"}}"
+                );
+            }
+
             Ok("ok".to_string())
         }
     }
@@ -10031,6 +10073,129 @@ This is an example JSON object for profile settings."#;
         assert!(
             turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
             "failed vision turn must not persist image marker content"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_failed_non_retryable_turn_does_not_poison_follow_up_text_turn() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(FormatErrorProvider),
+            default_provider: Arc::new("dummy".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+        });
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            traits::ChannelMessage {
+                id: "msg-bad-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-format".to_string(),
+                content: "trigger format error".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            traits::ChannelMessage {
+                id: "msg-text-2".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-format".to_string(),
+                content: "What is WAL?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2, "expected one error and one successful reply");
+        assert!(
+            sent[0].contains("Format Error"),
+            "first reply must mention the request format error, got: {}",
+            sent[0]
+        );
+        assert!(
+            sent[1].ends_with(":ok"),
+            "second reply should succeed for follow-up text, got: {}",
+            sent[1]
+        );
+        drop(sent);
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get("test-channel_chat-format_zeroclaw_user")
+            .expect("history should exist for sender");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "What is WAL?");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "ok");
+        assert!(
+            turns
+                .iter()
+                .all(|turn| turn.content != "trigger format error"),
+            "failed non-retryable turn must not persist in history"
         );
     }
 
