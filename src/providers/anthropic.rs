@@ -59,6 +59,8 @@ struct NativeChatRequest<'a> {
     tools: Option<Vec<NativeToolSpec<'a>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -740,6 +742,7 @@ impl Provider for AnthropicProvider {
             temperature,
             tools: None,
             tool_choice: None,
+            stream: None,
         };
 
         let mut request = self
@@ -810,6 +813,7 @@ impl Provider for AnthropicProvider {
             temperature,
             tools: native_tools,
             tool_choice,
+            stream: None,
         };
 
         let req = self
@@ -962,6 +966,7 @@ impl Provider for AnthropicProvider {
             temperature,
             tools: native_tools,
             tool_choice,
+            stream: Some(true),
         };
 
         let body = Self::build_streaming_request(&native_request);
@@ -1618,6 +1623,7 @@ mod tests {
             temperature: 0.7,
             tools: None,
             tool_choice: None,
+            stream: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();

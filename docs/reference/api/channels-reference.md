@@ -172,7 +172,18 @@ guild_id = "123456789012345678"   # optional
 allowed_users = ["*"]
 listen_to_bots = false
 mention_only = false
+stream_mode = "multi_message"     # optional: off | partial | multi_message (default: multi_message via wizard)
+draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
+multi_message_delay_ms = 800      # optional: delay between paragraph sends in multi_message mode
 ```
+
+Discord notes:
+
+- `stream_mode = "partial"` sends an editable draft message that updates token-by-token as the LLM streams its response, then finalizes with the complete text.
+- `stream_mode = "multi_message"` delivers the response incrementally as separate messages, splitting at paragraph boundaries (`\n\n`) as tokens arrive from the provider. Each paragraph appears in Discord as soon as it completes.
+- `draft_update_interval_ms` controls edit throttling in partial mode (default: 1000ms).
+- `multi_message_delay_ms` controls minimum delay between paragraph sends in multi_message mode to avoid Discord rate limits (default: 800ms).
+- Code fences are never split across messages in multi_message mode.
 
 ### 4.3 Slack
 

@@ -2980,6 +2980,13 @@ pub(crate) async fn run_tool_call_loop(
         let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
             && (request_tools.is_none() || provider.supports_streaming_tool_events());
+        tracing::debug!(
+            has_on_delta = on_delta.is_some(),
+            supports_streaming = provider.supports_streaming(),
+            should_consume_provider_stream,
+            "Streaming decision for iteration {}",
+            iteration + 1,
+        );
         let mut streamed_live_deltas = false;
 
         let chat_result = if should_consume_provider_stream {
