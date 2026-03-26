@@ -58,3 +58,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git merge upstream/master --no-edit
           git push origin master
+
+      - name: 触发编译
+        if: steps.check.outputs.has_update == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run build-browser-release.yml
