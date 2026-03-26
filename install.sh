@@ -958,12 +958,32 @@ You are **${agent_name}**. Built in Rust. 3MB binary. Zero bloat.
   unset -f _write_if_missing
 }
 
+_is_wsl() {
+  # Detect Windows Subsystem for Linux (WSL)
+  # WSL typically has microsoft-standard or microsoft in the kernel release
+  if [[ -f /proc/version ]] && grep -qi 'microsoft' /proc/version; then
+    return 0
+  fi
+  # WSL2 sets WSL_DISTRO_NAME or WSL_INTEROP environment variables
+  if [[ -n "${WSL_DISTRO_NAME:-}" || -n "${WSL_INTEROP:-}" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 resolve_container_cli() {
   local requested_cli
   requested_cli="${ZEROCLAW_CONTAINER_CLI:-docker}"
 
   if have_cmd "$requested_cli"; then
     CONTAINER_CLI="$requested_cli"
+    return 0
+  fi
+
+  # WSL: try docker.exe (Docker Desktop for Windows) if docker is not found
+  if [[ "$requested_cli" == "docker" ]] && _is_wsl && have_cmd docker.exe; then
+    info "Detected WSL environment with Docker Desktop"
+    CONTAINER_CLI="docker.exe"
     return 0
   fi
 
