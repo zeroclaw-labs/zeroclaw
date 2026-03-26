@@ -220,10 +220,12 @@ jobs:
             artifact: zeroclaw
             ext: tar.gz
             ndk: true
+            experimental: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
             ext: zip
+    continue-on-error: ${{ matrix.experimental || false }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
