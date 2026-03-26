@@ -12,6 +12,7 @@ jobs:
     permissions:
       contents: write
       actions: write
+      workflows: write
 
     steps:
       - name: 拉取代码
