@@ -16,10 +16,10 @@ jobs:
 
     steps:
       - name: 获取当前日期时间
-        run: echo "DATETIME=$(date -u '+%Y%m%d%H%M')" >> $GITHUB_ENV
+        run: echo "DATETIME=$(date -u '+%Y%m%d%H%M%S')" >> $GITHUB_ENV
 
       - name: 拉取代码
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: 缓存 Rust 编译文件（加速）
         uses: actions/cache@v5
@@ -79,7 +79,7 @@ jobs:
           cd dist && tar -czf zeroclaw-linux-amd64-${{ env.DATETIME }}.tar.gz zeroclaw-linux-amd64
 
       - name: 上传 Artifact（备用）
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: zeroclaw-linux-amd64-${{ env.DATETIME }}
           path: dist/zeroclaw-linux-amd64-${{ env.DATETIME }}.tar.gz
