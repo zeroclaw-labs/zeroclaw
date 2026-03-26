@@ -848,8 +848,11 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Initialize logging - respects RUST_LOG env var, defaults to INFO
+    // Initialize logging - respects RUST_LOG env var, defaults to INFO.
+    // Write to stderr so that stdout remains clean for machine-readable
+    // output (e.g. `zeroclaw config schema | jq`).
     let subscriber = fmt::Subscriber::builder()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
