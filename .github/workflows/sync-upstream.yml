@@ -22,9 +22,9 @@ jobs:
         run: |
           git remote add upstream https://github.com/zeroclaw-labs/zeroclaw.git
           git fetch upstream
-          LOCAL=$(git rev-parse HEAD)
+          MERGE_BASE=$(git merge-base HEAD upstream/master)
           UPSTREAM=$(git rev-parse upstream/master)
-          if [ "$LOCAL" = "$UPSTREAM" ]; then
+          if [ "$MERGE_BASE" = "$UPSTREAM" ]; then
             echo "无更新，跳过同步"
             echo "has_update=false" >> $GITHUB_OUTPUT
           else
