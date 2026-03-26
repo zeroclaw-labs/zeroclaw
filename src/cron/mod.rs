@@ -27,7 +27,11 @@ pub use types::{
 /// Returns `Ok(())` if the command passes all checks, or an error describing
 /// why it was blocked.
 pub fn validate_shell_command(config: &Config, command: &str, approved: bool) -> Result<()> {
-    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    let security = SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+        config.security.enabled,
+    );
     validate_shell_command_with_security(&security, command, approved)
 }
 
@@ -498,11 +502,12 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
     }
@@ -682,7 +687,11 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let security = SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+            config.security.enabled,
+        );
         assert!(security.is_command_allowed("echo safe"));
     }
 
@@ -865,7 +874,11 @@ mod tests {
         config.autonomy.allowed_commands = vec!["echo".into()];
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let security = SecurityPolicy::from_config(
+            &config.autonomy,
+            &config.workspace_dir,
+            config.security.enabled,
+        );
         // Simulate scheduler validation path
         let result =
             validate_shell_command_with_security(&security, "curl https://example.com", false);

@@ -382,11 +382,12 @@ mod tests {
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
@@ -397,6 +398,7 @@ mod tests {
         Arc::new(SecurityPolicy::from_config(
             &cfg.autonomy,
             &cfg.workspace_dir,
+            cfg.security.enabled,
         ))
     }
 
@@ -456,6 +458,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.autonomy.allowed_commands = vec!["echo".into()];
         config.autonomy.level = AutonomyLevel::Supervised;
         tokio::fs::create_dir_all(&config.workspace_dir)
@@ -485,6 +488,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = Arc::new(config);
@@ -512,6 +516,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.autonomy.level = AutonomyLevel::Full;
         config.autonomy.max_actions_per_hour = 0;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
@@ -543,6 +548,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.autonomy.allowed_commands = vec!["touch".into()];
         config.autonomy.level = AutonomyLevel::Supervised;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
@@ -752,6 +758,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::from_config(
             &cfg.autonomy,
             &cfg.workspace_dir,
+            cfg.security.enabled,
         ));
         let tool = CronAddTool::new(cfg, security);
         let schema = tool.parameters_schema();

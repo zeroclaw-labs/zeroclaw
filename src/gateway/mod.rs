@@ -437,6 +437,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let security = Arc::new(SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
+        config.security.enabled,
     ));
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {

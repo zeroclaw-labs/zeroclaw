@@ -373,6 +373,7 @@ impl Agent {
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            config.security.enabled,
         ));
 
         let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes(

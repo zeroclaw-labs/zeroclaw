@@ -249,11 +249,12 @@ mod tests {
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
@@ -264,6 +265,7 @@ mod tests {
         Arc::new(SecurityPolicy::from_config(
             &cfg.autonomy,
             &cfg.workspace_dir,
+            cfg.security.enabled,
         ))
     }
 
@@ -294,6 +296,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.autonomy.allowed_commands = vec!["echo".into()];
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
@@ -321,6 +324,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
         config.autonomy.level = AutonomyLevel::ReadOnly;
@@ -346,6 +350,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.autonomy.level = AutonomyLevel::Supervised;
         config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
@@ -388,6 +393,7 @@ mod tests {
         let security = Arc::new(SecurityPolicy::from_config(
             &cfg.autonomy,
             &cfg.workspace_dir,
+            cfg.security.enabled,
         ));
         let tool = CronUpdateTool::new(cfg, security);
         let schema = tool.parameters_schema();
@@ -486,6 +492,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.autonomy.level = AutonomyLevel::Full;
         config.autonomy.max_actions_per_hour = 0;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();

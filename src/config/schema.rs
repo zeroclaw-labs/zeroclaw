@@ -7069,6 +7069,12 @@ impl ChannelConfig for FeishuConfig {
 /// Security configuration for sandboxing, resource limits, and audit logging
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct SecurityConfig {
+    /// Global security enable switch. When set to `false`, all security restrictions
+    /// are disabled (sandboxing, filesystem limits, command allowlists, etc.).
+    /// Use with caution — disabling security removes all safety boundaries.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
     /// Sandbox configuration
     #[serde(default)]
     pub sandbox: SandboxConfig,

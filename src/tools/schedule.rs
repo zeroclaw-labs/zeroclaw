@@ -440,17 +440,19 @@ mod tests {
 
     async fn test_setup() -> (TempDir, Config, Arc<SecurityPolicy>) {
         let tmp = TempDir::new().unwrap();
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            config.security.enabled,
         ));
         (tmp, config, security)
     }
@@ -552,7 +554,7 @@ mod tests {
     #[tokio::test]
     async fn readonly_blocks_mutating_actions() {
         let tmp = TempDir::new().unwrap();
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             autonomy: crate::config::AutonomyConfig {
@@ -561,12 +563,14 @@ mod tests {
             },
             ..Config::default()
         };
+        config.security.enabled = true;
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            config.security.enabled,
         ));
 
         let tool = ScheduleTool::new(security, config);
@@ -589,7 +593,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_blocks_create_action() {
         let tmp = TempDir::new().unwrap();
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             autonomy: crate::config::AutonomyConfig {
@@ -599,12 +603,14 @@ mod tests {
             },
             ..Config::default()
         };
+        config.security.enabled = true;
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            config.security.enabled,
         ));
         let tool = ScheduleTool::new(security, config);
 
@@ -631,7 +637,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_blocks_cancel_and_keeps_job() {
         let tmp = TempDir::new().unwrap();
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             autonomy: crate::config::AutonomyConfig {
@@ -641,12 +647,14 @@ mod tests {
             },
             ..Config::default()
         };
+        config.security.enabled = true;
         tokio::fs::create_dir_all(&config.workspace_dir)
             .await
             .unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            config.security.enabled,
         ));
         let tool = ScheduleTool::new(security, config);
 
@@ -698,11 +706,13 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.cron.enabled = false;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            config.security.enabled,
         ));
         let tool = ScheduleTool::new(security, config);
 
@@ -731,12 +741,14 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.autonomy.level = AutonomyLevel::Supervised;
         config.autonomy.allowed_commands = vec!["echo".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            config.security.enabled,
         ));
         let tool = ScheduleTool::new(security, config);
 
@@ -765,12 +777,14 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.security.enabled = true;
         config.autonomy.level = AutonomyLevel::Supervised;
         config.autonomy.allowed_commands = vec!["touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let security = Arc::new(SecurityPolicy::from_config(
             &config.autonomy,
             &config.workspace_dir,
+            config.security.enabled,
         ));
         let tool = ScheduleTool::new(security, config);
 
