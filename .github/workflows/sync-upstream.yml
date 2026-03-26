@@ -79,4 +79,4 @@ jobs:
         if: steps.check.outputs.has_update == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh workflow run build-browser-release.yml
+        run: gh workflow run build-browser-release.yml --repo ${{ github.repository }}
