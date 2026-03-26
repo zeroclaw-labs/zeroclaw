@@ -68,6 +68,7 @@ const QWEN_INTL_BASE_URL: &str = "https://dashscope-intl.aliyuncs.com/compatible
 const QWEN_US_BASE_URL: &str = "https://dashscope-us.aliyuncs.com/compatible-mode/v1";
 const QWEN_OAUTH_BASE_FALLBACK_URL: &str = QWEN_CN_BASE_URL;
 const BAILIAN_BASE_URL: &str = "https://coding.dashscope.aliyuncs.com/v1";
+const QIANFAN_BASE_URL: &str = "https://qianfan.baidubce.com/v2";
 const QWEN_OAUTH_TOKEN_ENDPOINT: &str = "https://chat.qwen.ai/api/v1/oauth2/token";
 const QWEN_OAUTH_PLACEHOLDER: &str = "qwen-oauth";
 const QWEN_OAUTH_TOKEN_ENV: &str = "QWEN_OAUTH_TOKEN";
@@ -678,6 +679,14 @@ fn zai_base_url(name: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn qianfan_base_url(api_url: Option<&str>) -> String {
+    api_url
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| QIANFAN_BASE_URL.to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -1306,9 +1315,15 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
-        name if is_qianfan_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
-            "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
-        ))),
+        name if is_qianfan_alias(name) => {
+            let base_url = qianfan_base_url(api_url);
+            Ok(compat(OpenAiCompatibleProvider::new(
+                "Qianfan",
+                &base_url,
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
         name if is_doubao_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
             "Doubao",
             "https://ark.cn-beijing.volces.com/api/v3",
@@ -2506,6 +2521,13 @@ mod tests {
         assert_eq!(zai_base_url("z.ai-global"), Some(ZAI_GLOBAL_BASE_URL));
         assert_eq!(zai_base_url("zai-cn"), Some(ZAI_CN_BASE_URL));
         assert_eq!(zai_base_url("z.ai-cn"), Some(ZAI_CN_BASE_URL));
+
+        assert_eq!(qianfan_base_url(None), QIANFAN_BASE_URL);
+        assert_eq!(
+            qianfan_base_url(Some("https://qianfan.baidubce.com/v2/coding")),
+            "https://qianfan.baidubce.com/v2/coding"
+        );
+        assert_eq!(qianfan_base_url(Some("   ")), QIANFAN_BASE_URL);
     }
 
     // ── Primary providers ────────────────────────────────────
