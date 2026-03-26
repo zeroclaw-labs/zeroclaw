@@ -9,10 +9,13 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
 
     steps:
       - name: 拉取代码
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -56,7 +59,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git merge upstream/master --no-edit
+          git merge upstream/master --no-edit || {
+            echo "❌ 合并冲突，中止同步"
+            git merge --abort
+            exit 1
+          }
           git push origin master
 
       - name: 触发编译
