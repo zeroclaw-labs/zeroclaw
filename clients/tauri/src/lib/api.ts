@@ -834,7 +834,10 @@ export class MoAClient {
 
     if (hasSelectedProviderKey) {
       // ════════════════════════════════════════════════════════════
-      // MODE 1 — LOCAL: User has their own API key → local only
+      // MODE 1 — LOCAL: User has their own API key
+      // Try local gateway first → if unreachable, fall back to relay
+      // WITH user's own API key (no credits charged — relay uses
+      // the user's key directly, not the operator's key).
       // ════════════════════════════════════════════════════════════
       const res = await this.tryChatRequest(this.serverUrl, body);
 
@@ -842,8 +845,14 @@ export class MoAClient {
         return this.parseChatResponse(res);
       }
 
-      // Local gateway unreachable — do NOT fall back to relay
+      // Local gateway unreachable — try relay with user's own API key
       this.gatewayAlive = false;
+      const relayRes = await this.tryChatRequest(this.relayUrl, body);
+      if (relayRes !== null) {
+        return this.parseChatResponse(relayRes);
+      }
+
+      // Both failed
       throw new Error(
         "로컬에 저장하신 LLM 모델의 API key가 유효한 key인지 확인해 주세요.\n" +
           "만약 key를 수정해도 다시 접속에 실패하면 API key를 제거하시고 " +
