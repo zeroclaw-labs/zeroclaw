@@ -60,6 +60,21 @@ jobs:
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
+  setup:
+    name: Setup Build Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Generate build matrix
+        id: set-matrix
+        run: |
+          if [ "${{ inputs.macos_only }}" = "true" ]; then
+            echo 'matrix={"include":[{"os":"macos-14","target":"aarch64-apple-darwin","artifact":"zeroclaw","ext":"tar.gz"}]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'matrix={"include":[{"os":"ubuntu-latest","target":"x86_64-unknown-linux-gnu","artifact":"zeroclaw","ext":"tar.gz"},{"os":"ubuntu-latest","target":"aarch64-unknown-linux-gnu","artifact":"zeroclaw","ext":"tar.gz","cross_compiler":"gcc-aarch64-linux-gnu","linker_env":"CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER","linker":"aarch64-linux-gnu-gcc"},{"os":"macos-14","target":"aarch64-apple-darwin","artifact":"zeroclaw","ext":"tar.gz"},{"os":"windows-latest","target":"x86_64-pc-windows-msvc","artifact":"zeroclaw.exe","ext":"zip"}]}' >> "$GITHUB_OUTPUT"
+          fi
+
   web:
     name: Build Web Dashboard
     runs-on: ubuntu-latest
@@ -81,33 +96,12 @@ jobs:
 
   build:
     name: Build ${{ matrix.target }}
-    needs: [validate, web]
-    if: ${{ !inputs.macos_only || matrix.target == 'aarch64-apple-darwin' }}
+    needs: [validate, setup, web]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: zeroclaw
-            ext: tar.gz
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact: zeroclaw
-            ext: tar.gz
-            cross_compiler: gcc-aarch64-linux-gnu
-            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
-            linker: aarch64-linux-gnu-gcc
-          - os: macos-14
-            target: aarch64-apple-darwin
-            artifact: zeroclaw
-            ext: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: zeroclaw.exe
-            ext: zip
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
