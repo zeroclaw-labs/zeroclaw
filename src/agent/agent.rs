@@ -67,6 +67,10 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// Activated MCP tools for deferred loading mode.
+    /// When MCP deferred loading is enabled, tools are activated via `tool_search`
+    /// and stored here for lookup during tool execution.
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 }
 
 pub struct AgentBuilder {
@@ -94,6 +98,7 @@ pub struct AgentBuilder {
     tool_descriptions: Option<ToolDescriptions>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 }
 
 impl AgentBuilder {
@@ -123,6 +128,7 @@ impl AgentBuilder {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: None,
+            activated_tools: None,
         }
     }
 
@@ -255,6 +261,14 @@ impl AgentBuilder {
         self
     }
 
+    pub fn activated_tools(
+        mut self,
+        activated: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>>,
+    ) -> Self {
+        self.activated_tools = activated;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -310,6 +324,7 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            activated_tools: self.activated_tools,
         })
     }
 }
@@ -407,6 +422,7 @@ impl Agent {
         // Replicates the same MCP initialization logic used in the CLI
         // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
         // path also has access to MCP tools.
+        let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             tracing::info!(
                 "Initializing MCP client — {} server(s) configured",
@@ -425,9 +441,9 @@ impl Agent {
                             deferred_set.len(),
                             registry.server_count()
                         );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            tools::ActivatedToolSet::new(),
-                        ));
+                        let activated =
+                            Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
+                        activated_tools = Some(Arc::clone(&activated));
                         tools.push(Box::new(tools::ToolSearchTool::new(
                             deferred_set,
                             activated,
@@ -539,6 +555,7 @@ impl Agent {
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
+            .activated_tools(activated_tools)
             .build()
     }
 
@@ -589,6 +606,7 @@ impl Agent {
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
+        // First try to find tool in static registry, then in activated MCP tools.
         let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
             match tool.execute(call.arguments.clone()).await {
                 Ok(r) => {
@@ -611,6 +629,35 @@ impl Agent {
                     });
                     format!("Error executing {}: {e}", call.name)
                 }
+            }
+        } else if let Some(activated_arc) = self.activated_tools.as_ref() {
+            // Try to find in activated MCP tools.
+            let activated_opt = activated_arc.lock().unwrap().get_resolved(&call.name);
+            if let Some(tool) = activated_opt {
+                match tool.execute(call.arguments.clone()).await {
+                    Ok(r) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: r.success,
+                        });
+                        if r.success {
+                            r.output
+                        } else {
+                            format!("Error: {}", r.error.unwrap_or(r.output))
+                        }
+                    }
+                    Err(e) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: false,
+                        });
+                        format!("Error executing {}: {e}", call.name)
+                    }
+                }
+            } else {
+                format!("Unknown tool: {}", call.name)
             }
         } else {
             format!("Unknown tool: {}", call.name)
