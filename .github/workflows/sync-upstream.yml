@@ -12,14 +12,13 @@ jobs:
     permissions:
       contents: write
       actions: write
-      workflows: write
 
     steps:
       - name: 拉取代码
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: 检查上游是否有更新
         id: check
