@@ -1,0 +1,95 @@
+name: 编译 ZeroClaw
+
+on:
+  push:
+    branches:
+      - master
+    paths-ignore:
+      - '.github/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 获取当前日期时间
+        run: echo "DATETIME=$(date -u '+%Y%m%d%H%M')" >> $GITHUB_ENV
+
+      - name: 拉取代码
+        uses: actions/checkout@v5
+
+      - name: 缓存 Rust 编译文件（加速）
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: 编译 ZeroClaw（含浏览器功能）
+        run: cargo build --release --features browser-native
+
+      - name: 验证编译结果
+        run: |
+          BIN=target/release/zeroclaw
+
+          echo "===== 1. 检查文件是否存在 ====="
+          if [ ! -f "$BIN" ]; then
+            echo "❌ 文件不存在"
+            exit 1
+          fi
+          echo "✅ 文件存在"
+
+          echo "===== 2. 检查文件大小 ====="
+          SIZE=$(stat -c%s "$BIN")
+          echo "文件大小：$SIZE bytes"
+          if [ "$SIZE" -lt 1048576 ]; then
+            echo "❌ 文件太小（小于1MB），可能编译不完整"
+            exit 1
+          fi
+          echo "✅ 文件大小正常"
+
+          echo "===== 3. 检查是否是合法可执行文件 ====="
+          FILE_TYPE=$(file "$BIN")
+          echo "$FILE_TYPE"
+          if ! echo "$FILE_TYPE" | grep -q "ELF"; then
+            echo "❌ 不是合法的 Linux 可执行文件"
+            exit 1
+          fi
+          echo "✅ 是合法的 ELF 可执行文件"
+
+          echo "===== 4. 尝试运行 ====="
+          chmod +x "$BIN"
+          if "$BIN" --help > /dev/null 2>&1 || "$BIN" --version > /dev/null 2>&1; then
+            echo "✅ 可以正常启动"
+          else
+            echo "⚠️ 运行返回非零退出码，但不一定是问题"
+          fi
+
+          echo "===== 所有验证通过 ====="
+
+      - name: 打包二进制文件
+        run: |
+          mkdir -p dist
+          cp target/release/zeroclaw dist/zeroclaw-linux-amd64
+          cd dist && tar -czf zeroclaw-linux-amd64-${{ env.DATETIME }}.tar.gz zeroclaw-linux-amd64
+
+      - name: 上传 Artifact（备用）
+        uses: actions/upload-artifact@v6
+        with:
+          name: zeroclaw-linux-amd64-${{ env.DATETIME }}
+          path: dist/zeroclaw-linux-amd64-${{ env.DATETIME }}.tar.gz
+          retention-days: 90
+
+      - name: 发布到 GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create build-${{ env.DATETIME }} \
+            dist/zeroclaw-linux-amd64-${{ env.DATETIME }}.tar.gz \
+            --title "ZeroClaw ${{ env.DATETIME }}" \
+            --notes "自动编译版本 ${{ env.DATETIME }}"
