@@ -1,0 +1,90 @@
+name: 同步上游代码
+
+on:
+  schedule:
+    # 东京时间凌晨 1:00 (UTC 16:00)
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 添加上游 remote
+        run: git remote add upstream https://github.com/zeroclaw-labs/zeroclaw.git || true
+
+      - name: 获取上游代码
+        run: git fetch upstream master
+
+      - name: 检查上游是否有更新
+        id: check_updates
+        run: |
+          LOCAL=$(git rev-parse HEAD)
+          # 找到本地和上游的共同祖先
+          MERGE_BASE=$(git merge-base HEAD upstream/master)
+          UPSTREAM=$(git rev-parse upstream/master)
+
+          if [ "$MERGE_BASE" = "$UPSTREAM" ]; then
+            echo "✅ 已经是最新的，无需同步"
+            echo "has_updates=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "🔄 检测到上游有更新"
+            echo "has_updates=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 检查上游是否有与我们 Action 同名的文件
+        if: steps.check_updates.outputs.has_updates == 'true'
+        run: |
+          OUR_FILES=(
+            ".github/workflows/sync-upstream.yml"
+            ".github/workflows/build-browser-release.yml"
+          )
+
+          echo "🔍 检查上游是否存在与我们 Action 同名的文件..."
+
+          for f in "${OUR_FILES[@]}"; do
+            if git cat-file -e "upstream/master:$f" 2>/dev/null; then
+              echo "❌ 错误：上游存在同名文件 '$f'，停止同步以避免冲突！"
+              exit 1
+            fi
+          done
+
+          echo "✅ 上游没有同名文件，可以安全同步"
+
+      - name: 合并上游代码
+        if: steps.check_updates.outputs.has_updates == 'true'
+        run: |
+          # 使用 merge 合并上游代码
+          # -X theirs 表示所有冲突都以上游为准
+          git merge upstream/master --no-edit -X theirs || {
+            echo "❌ 合并失败"
+            git merge --abort
+            exit 1
+          }
+
+          # 确保我们的 Action 文件保持不变（恢复本地版本）
+          git checkout HEAD~1 -- .github/workflows/sync-upstream.yml 2>/dev/null || true
+          git checkout HEAD~1 -- .github/workflows/build-browser-release.yml 2>/dev/null || true
+
+          # 如果恢复了文件，提交修正
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
+
+      - name: 推送合并后的代码
+        if: steps.check_updates.outputs.has_updates == 'true'
+        run: git push origin master
