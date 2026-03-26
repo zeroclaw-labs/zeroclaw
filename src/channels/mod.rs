@@ -4031,7 +4031,101 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms),
             ))
         }
-        other => anyhow::bail!("Unknown channel '{other}'. Supported: telegram, discord, slack"),
+        "mattermost" => {
+            let mm = config
+                .channels_config
+                .mattermost
+                .as_ref()
+                .context("Mattermost channel is not configured")?;
+            Ok(Arc::new(
+                MattermostChannel::new(
+                    mm.url.clone(),
+                    mm.bot_token.clone(),
+                    mm.channel_id.clone(),
+                    mm.allowed_users.clone(),
+                    mm.thread_replies.unwrap_or(true),
+                    mm.mention_only.unwrap_or(false),
+                )
+                .with_transcription(config.transcription.clone()),
+            ))
+        }
+        "signal" => {
+            let sg = config
+                .channels_config
+                .signal
+                .as_ref()
+                .context("Signal channel is not configured")?;
+            Ok(Arc::new(SignalChannel::new(
+                sg.http_url.clone(),
+                sg.account.clone(),
+                sg.group_id.clone(),
+                sg.allowed_from.clone(),
+                sg.ignore_attachments,
+                sg.ignore_stories,
+            )))
+        }
+        "qq" => {
+            let qq = config
+                .channels_config
+                .qq
+                .as_ref()
+                .context("QQ channel is not configured")?;
+            Ok(Arc::new(
+                QQChannel::new(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    qq.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ))
+        }
+        #[cfg(feature = "channel-matrix")]
+        "matrix" => {
+            let mx = config
+                .channels_config
+                .matrix
+                .as_ref()
+                .context("Matrix channel is not configured")?;
+            let room_id = mx.room_id.clone();
+            Ok(Arc::new(
+                MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
+                    mx.homeserver.clone(),
+                    mx.access_token.clone(),
+                    room_id,
+                    mx.allowed_users.clone(),
+                    mx.user_id.clone(),
+                    mx.device_id.clone(),
+                    config.config_path.parent().map(|path| path.to_path_buf()),
+                ),
+            ))
+        }
+        #[cfg(feature = "whatsapp-web")]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            let wa = config
+                .channels_config
+                .whatsapp
+                .as_ref()
+                .context("WhatsApp channel is not configured")?;
+            if !wa.is_web_config() {
+                anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
+            }
+            Ok(Arc::new(
+                WhatsAppWebChannel::new(
+                    wa.session_path.clone().unwrap_or_default(),
+                    wa.pair_phone.clone(),
+                    wa.pair_code.clone(),
+                    wa.allowed_numbers.clone(),
+                    wa.mode.clone(),
+                    wa.dm_policy.clone(),
+                    wa.group_policy.clone(),
+                    wa.self_chat_mode,
+                )
+                .with_transcription(config.transcription.clone()),
+            ))
+        }
+        other => anyhow::bail!(
+            "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, qq"
+        ),
     }
 }
 
