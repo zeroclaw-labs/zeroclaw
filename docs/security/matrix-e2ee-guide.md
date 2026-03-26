@@ -245,16 +245,24 @@ When configuring the Matrix channel, the wizard prompts:
 E2EE recovery key (or Enter to skip): EsTj 3yST y93F SLpB jJsz ...
 ```
 
-Paste the recovery key. It will be stored in `config.toml` as `channels_config.matrix.recovery_key`.
+Paste the recovery key (input is masked). It will be encrypted and stored in `config.toml` as `channels_config.matrix.recovery_key`.
 
-Option B — edit `config.toml` directly:
+Option B — via the secret CLI (recommended for existing installs):
+
+```bash
+zeroclaw secret set channels.matrix.recovery-key
+```
+
+Input is masked. The value is encrypted at rest immediately.
+
+Option C — edit `config.toml` directly:
 
 ```toml
 [channels_config.matrix]
 recovery_key = "EsTj 3yST y93F SLpB jJsz ..."
 ```
 
-If `secrets.encrypt = true` (the default), the value will be encrypted on next config save.
+If `secrets.encrypt = true` (the default), the value will be encrypted on next config save. Note: until a save is triggered, the value remains in plaintext. Using Option A or B is preferred.
 
 #### Step 3: Restart ZeroClaw
 
