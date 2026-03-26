@@ -17,6 +17,52 @@ pub mod creator;
 pub mod improver;
 pub mod testing;
 
+// ── Public API types for REST API ───────────────────────────────
+
+/// Skill summary information for API responses
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub author: Option<String>,
+    pub tools: Vec<SkillToolInfo>,
+    pub prompts_count: usize,
+    pub location: Option<String>,
+    pub always: bool,
+}
+
+/// Tool information within a skill for API responses
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillToolInfo {
+    pub name: String,
+    pub description: String,
+    pub kind: String,
+}
+
+impl From<&Skill> for SkillInfo {
+    fn from(skill: &Skill) -> Self {
+        SkillInfo {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            version: skill.version.clone(),
+            author: skill.author.clone(),
+            tools: skill
+                .tools
+                .iter()
+                .map(|t| SkillToolInfo {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                    kind: t.kind.clone(),
+                })
+                .collect(),
+            prompts_count: skill.prompts.len(),
+            location: skill.location.as_ref().map(|p| p.display().to_string()),
+            always: skill.always,
+        }
+    }
+}
+
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
@@ -45,6 +91,8 @@ pub struct Skill {
     pub prompts: Vec<String>,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    #[serde(default)]
+    pub always: bool,
 }
 
 /// A tool defined by a skill (shell command, HTTP call, etc.)
@@ -545,6 +593,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tools: manifest.tools,
         prompts: manifest.prompts,
         location: Some(path.to_path_buf()),
+        always: false,
     })
 }
 
@@ -571,6 +620,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         location: Some(path.to_path_buf()),
+        always: false,
     })
 }
 
@@ -610,6 +660,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tools: Vec::new(),
         prompts: vec![parsed.body],
         location: Some(path.to_path_buf()),
+        always: false,
     }))
 }
 
@@ -1526,6 +1577,93 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             Ok(())
         }
     }
+}
+
+// ── Public API functions for REST API ──────────────────────────
+
+/// List all installed skills — for API and CLI shared use
+pub fn list_skills(config: &crate::config::Config) -> Result<Vec<SkillInfo>> {
+    let skills = load_skills_with_config(&config.workspace_dir, config);
+    Ok(skills.iter().map(SkillInfo::from).collect())
+}
+
+/// Install a skill from source (Git URL or local path)
+pub async fn install_skill_from_source(
+    source: &str,
+    config: &crate::config::Config,
+) -> Result<(String, audit::SkillAuditReport)> {
+    let skills_path = skills_dir(&config.workspace_dir);
+    std::fs::create_dir_all(&skills_path)?;
+
+    let (installed_dir, _files_scanned) = if is_clawhub_source(source) {
+        install_clawhub_skill_source(source, &skills_path, config.skills.allow_scripts)
+            .with_context(|| format!("failed to install skill from ClawHub: {source}"))?
+    } else if is_git_source(source) {
+        install_git_skill_source(source, &skills_path, config.skills.allow_scripts)
+            .with_context(|| format!("failed to install git skill source: {source}"))?
+    } else {
+        install_local_skill_source(source, &skills_path, config.skills.allow_scripts)
+            .with_context(|| format!("failed to install local skill source: {source}"))?
+    };
+
+    let skill_name = installed_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let report = audit::audit_skill_directory_with_options(
+        &installed_dir,
+        audit::SkillAuditOptions {
+            allow_scripts: config.skills.allow_scripts,
+        },
+    )?;
+
+    Ok((skill_name, report))
+}
+
+/// Remove a skill by name
+pub fn remove_skill(name: &str, config: &crate::config::Config) -> Result<bool> {
+    // Reject path traversal attempts
+    if name.contains("..") || name.contains('/') || name.contains('\\') {
+        anyhow::bail!("Invalid skill name: {name}");
+    }
+
+    let skill_path = skills_dir(&config.workspace_dir).join(name);
+
+    // Verify the resolved path is actually inside the skills directory
+    let canonical_skills = skills_dir(&config.workspace_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| skills_dir(&config.workspace_dir));
+    if let Ok(canonical_skill) = skill_path.canonicalize() {
+        if !canonical_skill.starts_with(&canonical_skills) {
+            anyhow::bail!("Skill path escapes skills directory: {name}");
+        }
+    }
+
+    if !skill_path.exists() {
+        return Ok(false);
+    }
+
+    std::fs::remove_dir_all(&skill_path)?;
+    Ok(true)
+}
+
+/// Audit a skill by name
+pub fn audit_skill_by_name(
+    name: &str,
+    config: &crate::config::Config,
+) -> Result<audit::SkillAuditReport> {
+    let skill_path = skills_dir(&config.workspace_dir).join(name);
+    if !skill_path.exists() {
+        anyhow::bail!("Skill '{}' not found", name);
+    }
+    audit::audit_skill_directory_with_options(
+        &skill_path,
+        audit::SkillAuditOptions {
+            allow_scripts: config.skills.allow_scripts,
+        },
+    )
 }
 
 #[cfg(test)]

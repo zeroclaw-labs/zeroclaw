@@ -141,3 +141,42 @@ export interface WsMessage {
   message?: string;
   code?: string;
 }
+
+// ── Skills API types ──────────────────────────────────────────
+
+export interface SkillToolInfo {
+  name: string;
+  description: string;
+  kind: string;
+}
+
+export interface SkillInfo {
+  name: string;
+  description: string;
+  version: string;
+  author: string | null;
+  tools: SkillToolInfo[];
+  prompts_count: number;
+  location: string | null;
+  always: boolean;
+}
+
+export interface SkillsListResponse {
+  skills: SkillInfo[];
+  open_skills_enabled: boolean;
+  total: number;
+}
+
+export interface SkillAuditResult {
+  name?: string;
+  files_scanned: number;
+  findings: string[];
+  is_clean: boolean;
+  summary?: string;
+}
+
+export interface SkillInstallResponse {
+  status: string;
+  name: string;
+  audit: SkillAuditResult;
+}

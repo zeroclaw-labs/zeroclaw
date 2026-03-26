@@ -12,6 +12,7 @@ import {
   Activity,
   Stethoscope,
   Monitor,
+  Sparkles,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
 
@@ -27,6 +28,7 @@ const navItems = [
   { to: '/logs', icon: Activity, labelKey: 'nav.logs' },
   { to: '/doctor', icon: Stethoscope, labelKey: 'nav.doctor' },
   { to: '/canvas', icon: Monitor, labelKey: 'nav.canvas' },
+  { to: '/skills', icon: Sparkles, labelKey: 'nav.skills' },
 ];
 
 interface SidebarProps {

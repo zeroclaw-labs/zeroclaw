@@ -1380,6 +1380,164 @@ pub async fn handle_api_session_rename(
     }
 }
 
+// ── Skills API handlers ────────────────────────────────────────
+
+/// GET /api/skills — list all installed skills
+pub async fn handle_api_skills_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock();
+    match crate::skills::list_skills(&config) {
+        Ok(skills_list) => {
+            let open_skills_enabled = config.skills.open_skills_enabled;
+
+            Json(serde_json::json!({
+                "skills": skills_list,
+                "open_skills_enabled": open_skills_enabled,
+                "total": skills_list.len()
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/skills/install — install a new skill
+pub async fn handle_api_skills_install(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let source = match body.get("source").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing 'source' field"})),
+            )
+                .into_response();
+        }
+    };
+
+    let config = state.config.lock().clone();
+    match crate::skills::install_skill_from_source(&source, &config).await {
+        Ok((name, report)) => {
+            if report.is_clean() {
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "name": name,
+                    "audit": {
+                        "files_scanned": report.files_scanned,
+                        "findings": report.findings,
+                        "is_clean": true
+                    }
+                }))
+                .into_response()
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "Audit failed",
+                        "audit": {
+                            "files_scanned": report.files_scanned,
+                            "findings": report.findings,
+                            "is_clean": false
+                        }
+                    })),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// DELETE /api/skills/:name — remove a skill
+pub async fn handle_api_skills_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock();
+    match crate::skills::remove_skill(&name, &config) {
+        Ok(true) => Json(serde_json::json!({
+            "status": "ok", "deleted": true
+        }))
+        .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": "Skill not found", "deleted": false
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/skills/audit — audit a skill
+pub async fn handle_api_skills_audit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock();
+
+    if let Some(name) = body.get("name").and_then(|v| v.as_str()) {
+        match crate::skills::audit_skill_by_name(name, &config) {
+            Ok(report) => Json(serde_json::json!({
+                "name": name,
+                "files_scanned": report.files_scanned,
+                "findings": report.findings,
+                "is_clean": report.is_clean(),
+                "summary": report.summary()
+            }))
+            .into_response(),
+            Err(e) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "missing 'name' field"})),
+        )
+            .into_response()
+    }
+}
 // ── Claude Code hook endpoint ────────────────────────────────────
 
 /// POST /hooks/claude-code — receives HTTP hook events from Claude Code

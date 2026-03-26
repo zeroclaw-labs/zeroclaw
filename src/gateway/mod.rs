@@ -926,6 +926,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/memory/{key}", delete(api::handle_api_memory_delete))
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
+        // ── Skills API ──
+        .route("/api/skills", get(api::handle_api_skills_list))
+        .route("/api/skills/install", post(api::handle_api_skills_install))
+        .route("/api/skills/audit", post(api::handle_api_skills_audit))
+        .route("/api/skills/{name}", delete(api::handle_api_skills_remove))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))

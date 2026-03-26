@@ -326,3 +326,41 @@ export function getCliTools(): Promise<CliTool[]> {
     unwrapField(data, 'cli_tools'),
   );
 }
+
+// ---------------------------------------------------------------------------
+// Skills
+// ---------------------------------------------------------------------------
+
+export type {
+  SkillInfo,
+  SkillToolInfo,
+  SkillsListResponse,
+  SkillAuditResult,
+  SkillInstallResponse,
+} from '../types/api';
+
+export async function getSkills(): Promise<import('../types/api').SkillsListResponse> {
+  return apiFetch<import('../types/api').SkillsListResponse>('/api/skills');
+}
+
+export async function installSkill(source: string): Promise<import('../types/api').SkillInstallResponse> {
+  return apiFetch<import('../types/api').SkillInstallResponse>('/api/skills/install', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source }),
+  });
+}
+
+export async function removeSkill(name: string): Promise<{ deleted: boolean }> {
+  return apiFetch<{ deleted: boolean }>(`/api/skills/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+  });
+}
+
+export async function auditSkill(name: string): Promise<import('../types/api').SkillAuditResult> {
+  return apiFetch<import('../types/api').SkillAuditResult>('/api/skills/audit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  });
+}
