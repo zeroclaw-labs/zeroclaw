@@ -373,16 +373,14 @@ pub struct AppState {
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
 pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
-    // ── Security: refuse public bind without tunnel or explicit opt-in ──
+    // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
-        anyhow::bail!(
-            "🛑 Refusing to bind to {host} — gateway would be exposed to the internet.\n\
-             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
-             [gateway] allow_public_bind = true in config.toml (NOT recommended).\n\n\
-             Docker: if you need to reach the gateway from a Docker container, set\n\
-             [gateway] host = \"0.0.0.0\" and allow_public_bind = true in config.toml,\n\
-             then connect from the container via ws://host.docker.internal:{port}."
+        tracing::warn!(
+            "⚠️  Binding to {host} — gateway will be exposed to all network interfaces.\n\
+             Suggestion: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
+             [gateway] allow_public_bind = true in config.toml to silence this warning.\n\n\
+             Docker/VM: if you are running inside a container or VM, this is expected."
         );
     }
     let config_state = Arc::new(Mutex::new(config.clone()));

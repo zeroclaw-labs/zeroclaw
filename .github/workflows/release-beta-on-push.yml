@@ -251,6 +251,8 @@ jobs:
       - name: Check binary size
         shell: bash
         run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
+        env:
+          BINARY_SIZE_HARD_LIMIT: "52428800"  # 50MB — release builds include all optional features
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
