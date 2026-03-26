@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -77,6 +78,97 @@ impl Clone for ActionTracker {
     }
 }
 
+/// Per-sender sliding-window rate limiter.
+///
+/// Each unique sender key (Telegram thread ID, Discord channel, etc.) gets
+/// its own independent [`ActionTracker`] bucket. When no sender is in scope
+/// (cron jobs, CLI), the [`GLOBAL_KEY`] bucket is used.
+///
+/// Note: sender buckets accumulate for the daemon lifetime with no eviction.
+/// This is acceptable for bounded sets of chat IDs; in high-cardinality deployments,
+/// consider periodic cleanup.
+#[derive(Debug)]
+pub struct PerSenderTracker {
+    buckets: parking_lot::Mutex<HashMap<String, ActionTracker>>,
+}
+
+impl PerSenderTracker {
+    /// Bucket key used when no per-sender context is available (cron, CLI).
+    pub const GLOBAL_KEY: &'static str = "__global__";
+
+    /// Create an empty tracker with no sender buckets.
+    pub fn new() -> Self {
+        Self {
+            buckets: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve the current sender key from the task-local, falling back to GLOBAL_KEY.
+    fn current_key() -> String {
+        crate::agent::loop_::TOOL_LOOP_THREAD_ID
+            .try_with(|v| v.clone())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Self::GLOBAL_KEY.to_string())
+    }
+
+    /// Record one action for the current sender. Returns `true` if allowed
+    /// (count after recording <= max), `false` if budget exhausted.
+    pub fn record_for_current(&self, max: u32) -> bool {
+        let key = Self::current_key();
+        self.record_within(&key, max)
+    }
+
+    /// Record one action for `key`. Allows the action when count == max (≤ max);
+    /// blocks and returns false when count > max.
+    pub fn record_within(&self, key: &str, max: u32) -> bool {
+        let mut buckets = self.buckets.lock();
+        let tracker = buckets
+            .entry(key.to_string())
+            .or_insert_with(ActionTracker::new);
+        let count = tracker.record();
+        count <= max as usize
+    }
+
+    /// Check if the current sender is at or over the limit (without recording).
+    pub fn is_limited_for_current(&self, max: u32) -> bool {
+        let key = Self::current_key();
+        self.is_exhausted(&key, max)
+    }
+
+    /// Check if `key` is at or over `max` (without recording).
+    /// Does NOT insert a bucket for unseen keys.
+    /// A max of 0 is always exhausted (zero budget means no actions allowed).
+    /// Returns true when count has reached or exceeded max. Note: acquires write lock
+    /// because ActionTracker::count prunes stale entries internally. Also note: returns
+    /// true one count earlier than record_within would block.
+    pub fn is_exhausted(&self, key: &str, max: u32) -> bool {
+        if max == 0 {
+            return true;
+        }
+        let mut buckets = self.buckets.lock();
+        match buckets.get_mut(key) {
+            Some(tracker) => tracker.count() >= max as usize,
+            None => false,
+        }
+    }
+}
+
+impl Clone for PerSenderTracker {
+    fn clone(&self) -> Self {
+        let buckets = self.buckets.lock();
+        Self {
+            buckets: parking_lot::Mutex::new(buckets.clone()),
+        }
+    }
+}
+
+impl Default for PerSenderTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Security policy enforced on all tool executions
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
@@ -91,7 +183,7 @@ pub struct SecurityPolicy {
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
-    pub tracker: ActionTracker,
+    pub tracker: PerSenderTracker,
 }
 
 /// Default allowed commands for Unix platforms.
@@ -223,7 +315,7 @@ impl Default for SecurityPolicy {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
-            tracker: ActionTracker::new(),
+            tracker: PerSenderTracker::new(),
         }
     }
 }
@@ -1314,16 +1406,16 @@ impl SecurityPolicy {
         }
     }
 
-    /// Record an action and check if the rate limit has been exceeded.
-    /// Returns `true` if the action is allowed, `false` if rate-limited.
+    /// Record an action for the current sender and check if rate-limited.
+    /// Returns `true` if allowed, `false` if budget exhausted.
     pub fn record_action(&self) -> bool {
-        let count = self.tracker.record();
-        count <= self.max_actions_per_hour as usize
+        self.tracker.record_for_current(self.max_actions_per_hour)
     }
 
-    /// Check if the rate limit would be exceeded without recording.
+    /// Check if the current sender would be rate-limited without recording.
     pub fn is_rate_limited(&self) -> bool {
-        self.tracker.count() >= self.max_actions_per_hour as usize
+        self.tracker
+            .is_limited_for_current(self.max_actions_per_hour)
     }
 
     /// Resolve a user-provided path for tool use.
@@ -1393,7 +1485,7 @@ impl SecurityPolicy {
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
-            tracker: ActionTracker::new(),
+            tracker: PerSenderTracker::new(),
         }
     }
 
@@ -1477,7 +1569,7 @@ impl SecurityPolicy {
         // Rate limit
         let _ = writeln!(
             out,
-            "**Rate limit**: max {} actions per hour.",
+            "**Rate limit**: max {} actions per hour per chat (each conversation has its own independent budget).",
             self.max_actions_per_hour
         );
 
@@ -2592,7 +2684,6 @@ mod tests {
         };
         let workspace = PathBuf::from("/tmp/test");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
-        assert_eq!(policy.tracker.count(), 0);
         assert!(!policy.is_rate_limited());
     }
 
@@ -3123,5 +3214,34 @@ mod tests {
         let result = p.validate_command_execution("rm -rf /tmp/test", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    #[test]
+    fn per_sender_tracker_isolates_counts() {
+        let t = PerSenderTracker::new();
+        // sender A hits limit=2 on 3rd call
+        assert!(t.record_within("chat_a", 2)); // count=1 ≤ 2 → ok
+        assert!(t.record_within("chat_a", 2)); // count=2 ≤ 2 → ok
+        assert!(!t.record_within("chat_a", 2)); // count=3 > 2 → blocked
+                                                // sender B is unaffected — its bucket is empty
+        assert!(t.record_within("chat_b", 2)); // count=1 ≤ 2 → ok
+        assert!(t.record_within("chat_b", 2)); // count=2 ≤ 2 → ok
+        assert!(!t.record_within("chat_b", 2)); // count=3 > 2 → blocked
+    }
+
+    #[test]
+    fn per_sender_tracker_global_key_fallback() {
+        let t = PerSenderTracker::new();
+        assert!(!t.is_exhausted(PerSenderTracker::GLOBAL_KEY, 1));
+        t.record_within(PerSenderTracker::GLOBAL_KEY, u32::MAX);
+        // after 1 action, count=1 ≥ 1 → exhausted at max=1
+        assert!(t.is_exhausted(PerSenderTracker::GLOBAL_KEY, 1));
+    }
+
+    #[test]
+    fn per_sender_tracker_is_exhausted_reads_without_spurious_insert() {
+        let t = PerSenderTracker::new();
+        // Key "ghost" has never been recorded — should not be exhausted at max=1
+        assert!(!t.is_exhausted("ghost", 1));
     }
 }

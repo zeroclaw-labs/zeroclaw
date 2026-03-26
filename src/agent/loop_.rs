@@ -51,6 +51,22 @@ tokio::task_local! {
     pub(crate) static TOOL_LOOP_COST_TRACKING_CONTEXT: Option<ToolLoopCostTrackingContext>;
 }
 
+tokio::task_local! {
+    /// Stable thread/conversation identifier from the incoming channel message.
+    /// Used by [`PerSenderTracker`] to isolate rate-limit buckets per chat.
+    /// Set from the channel's thread ID, topic ID, or message ID.
+    pub static TOOL_LOOP_THREAD_ID: Option<String>;
+}
+
+/// Run a future with the thread ID set in task-local storage.
+/// Rate-limiting reads this to assign per-sender buckets.
+pub async fn scope_thread_id<F>(thread_id: Option<String>, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TOOL_LOOP_THREAD_ID.scope(thread_id, future).await
+}
+
 /// 3-tier model pricing lookup:
 /// 1. Direct model name
 /// 2. Qualified `provider/model`
