@@ -110,28 +110,18 @@ impl Observer for ChannelNotifyObserver {
                 Some(args) if !args.is_empty() => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
                         if let Some(cmd) = v.get("command").and_then(|c| c.as_str()) {
-                            format!(": `{}`", if cmd.len() > 200 { &cmd[..200] } else { cmd })
+                            format!(": `{}`", truncate_with_ellipsis(cmd, 200))
                         } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
-                            format!(": {}", if q.len() > 200 { &q[..200] } else { q })
+                            format!(": {}", truncate_with_ellipsis(q, 200))
                         } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
                             format!(": {p}")
                         } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
                             format!(": {u}")
                         } else {
-                            let s = args.to_string();
-                            if s.len() > 120 {
-                                format!(": {}…", &s[..120])
-                            } else {
-                                format!(": {s}")
-                            }
+                            format!(": {}", truncate_with_ellipsis(args, 120))
                         }
                     } else {
-                        let s = args.to_string();
-                        if s.len() > 120 {
-                            format!(": {}…", &s[..120])
-                        } else {
-                            format!(": {s}")
-                        }
+                        format!(": {}", truncate_with_ellipsis(args, 120))
                     }
                 }
                 _ => String::new(),

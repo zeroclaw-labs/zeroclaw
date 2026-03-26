@@ -4,16 +4,24 @@ resolver = "2"
 
 [package]
 name = "zeroclaw"
-version = "0.1.9"
+version = "0.1.10"
 edition = "2021"
-authors = ["theonlyhennygod"]
+authors = ["guangjunma"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
-repository = "https://github.com/zeroclaw-labs/zeroclaw"
+repository = "https://github.com/bighorse/zeroclaw"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]
 rust-version = "1.87"
+
+[package.metadata.binstall]
+pkg-url = "https://github.com/bighorse/zeroclaw/releases/download/v{version}/zeroclaw-{target}.{archive-format}"
+pkg-fmt = "tgz"
+bin-dir = "zeroclaw{binary-ext}"
+
+[package.metadata.binstall.overrides."x86_64-pc-windows-msvc"]
+pkg-fmt = "zip"
 
 [dependencies]
 # CLI - minimal and fast

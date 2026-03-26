@@ -459,9 +459,33 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
 }
 
 fn extract_description(content: &str) -> String {
+    // Try to extract description from YAML frontmatter first.
+    // SKILL.md files often start with:
+    //   ---
+    //   name: skill-name
+    //   description: What this skill does
+    //   ---
+    if content.starts_with("---") {
+        let after_first = &content[3..];
+        if let Some(end) = after_first.find("\n---") {
+            let frontmatter = &after_first[..end];
+            for line in frontmatter.lines() {
+                let trimmed = line.trim();
+                if let Some(rest) = trimmed.strip_prefix("description:") {
+                    let desc = rest.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !desc.is_empty() {
+                        return desc.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: first non-heading, non-empty, non-frontmatter line.
     content
         .lines()
-        .find(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .skip_while(|line| line.starts_with("---") || line.trim().is_empty())
+        .find(|line| !line.starts_with('#') && !line.starts_with("---") && !line.trim().is_empty())
         .unwrap_or("No description")
         .trim()
         .to_string()

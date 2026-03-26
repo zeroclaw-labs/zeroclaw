@@ -783,6 +783,26 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
                     }
                     continue;
                 }
+            } else {
+                // Attempt to auto-fix EOF errors by appending closing braces which 
+                // frequently happens when agent truncates outer JSON response blocks.
+                let mut fixed_value = None;
+                for suffix in [
+                    "}", "}}", "}}}", 
+                    "]", "]}", "]}}", 
+                    "\"]}", "\"} }",
+                ] {
+                    let patched = format!("{}{}", slice.trim_end(), suffix);
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&patched) {
+                        fixed_value = Some(v);
+                        break;
+                    }
+                }
+
+                if let Some(v) = fixed_value {
+                    values.push(v);
+                    break;
+                }
             }
         }
         idx += 1;
@@ -1980,8 +2000,8 @@ async fn execute_one_tool(
 ) -> Result<ToolExecutionOutcome> {
     let args_summary = {
         let raw = call_arguments.to_string();
-        if raw.len() > 300 {
-            format!("{}…", &raw[..300])
+        if raw.chars().count() > 300 {
+            format!("{}…", raw.chars().take(300).collect::<String>())
         } else {
             raw
         }

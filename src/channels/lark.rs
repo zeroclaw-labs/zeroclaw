@@ -588,9 +588,29 @@ impl LarkChannel {
                     .and_then(|v| v.parse::<i32>().ok())
             })
             .unwrap_or(0);
-        tracing::info!("Lark: connecting to {wss_url}");
-
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&wss_url).await?;
+        let mut connect_url = wss_url.clone();
+        let mut redirects = 0;
+        let ws_stream = loop {
+            tracing::info!("Lark: connecting to {connect_url}");
+            match tokio_tungstenite::connect_async(&connect_url).await {
+                Ok((stream, _)) => break stream,
+                Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                    let status = resp.status();
+                    if status.is_redirection() && redirects < 5 {
+                        if let Some(loc) = resp.headers().get("location") {
+                            if let Ok(loc_str) = loc.to_str() {
+                                tracing::info!("Lark: WS redirecting ({status}) to {loc_str}");
+                                connect_url = loc_str.to_string();
+                                redirects += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    anyhow::bail!("WS connect HTTP error: {status}");
+                }
+                Err(e) => anyhow::bail!("WS connect error: {e}"),
+            }
+        };
         let (mut write, mut read) = ws_stream.split();
         tracing::info!("Lark: WS connected (service_id={service_id})");
 
@@ -1136,26 +1156,42 @@ impl Channel for LarkChannel {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let content = serde_json::json!({
-            "zh_cn": {
-                "title": "",
-                "content": [
-                    [
-                        {
-                            "tag": "md",
-                            "text": message.content
-                        }
-                    ]
-                ]
+        let mut card_map = serde_json::Map::new();
+        card_map.insert("schema".to_string(), serde_json::json!("2.0"));
+        
+        card_map.insert("config".to_string(), serde_json::json!({
+            "wide_screen_mode": true
+        }));
+
+        card_map.insert("body".to_string(), serde_json::json!({
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": message.content
+                }
+            ]
+        }));
+
+        if let Some(subject) = &message.subject {
+            if !subject.is_empty() {
+                card_map.insert("header".to_string(), serde_json::json!({
+                    "template": "blue",
+                    "title": {
+                        "tag": "plain_text",
+                        "content": subject
+                    }
+                }));
             }
-        }).to_string();
+        }
+
+        let content = serde_json::Value::Object(card_map).to_string();
         let body = serde_json::json!({
             "receive_id": message.recipient,
-            "msg_type": "post",
+            "msg_type": "interactive",
             "content": content,
         });
 
-        let (status, response) = self.send_text_once(&url, &token, &body).await?;
+        let (mut status, mut response) = self.send_text_once(&url, &token, &body).await?;
 
         if should_refresh_lark_tenant_token(status, &response) {
             // Token expired/invalid, invalidate and retry once.
@@ -1164,17 +1200,46 @@ impl Channel for LarkChannel {
             let (retry_status, retry_response) =
                 self.send_text_once(&url, &new_token, &body).await?;
 
-            if should_refresh_lark_tenant_token(retry_status, &retry_response) {
+            status = retry_status;
+            response = retry_response;
+
+            if should_refresh_lark_tenant_token(status, &response) {
                 anyhow::bail!(
-                    "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
+                    "Lark send failed after token refresh: status={status}, body={response}"
                 );
             }
+        }
 
-            ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
+        // Feishu schema 2.0 interactive cards strictly limit markdown
+        // tables to a maximum of 5. If the agent generates >5 tables
+        // (code 230099 or 11310), we fall back to `post` msg_type which
+        // renders markdown (including tables) without this restriction.
+        let code = extract_lark_response_code(&response).unwrap_or(0);
+        if code == 230099 || code == 11310 || response.to_string().contains("table number over limit") {
+            tracing::warn!("Lark: interactive card table limit exceeded (code {}), falling back to 'post' message type", code);
+
+            // Re-fetch token in case we refreshed earlier; fall back to original if unavailable.
+            let best_token = self.get_tenant_access_token().await.unwrap_or(token);
+
+            let fallback_content = serde_json::json!({
+                "zh_cn": {
+                    "title": message.subject.as_deref().unwrap_or(""),
+                    "content": [[{ "tag": "md", "text": message.content }]]
+                }
+            }).to_string();
+
+            let fallback_body = serde_json::json!({
+                "receive_id": message.recipient,
+                "msg_type": "post",
+                "content": fallback_content,
+            });
+
+            let (fb_status, fb_response) = self.send_text_once(&url, &best_token, &fallback_body).await?;
+            ensure_lark_send_success(fb_status, &fb_response, "post fallback")?;
             return Ok(());
         }
 
-        ensure_lark_send_success(status, &response, "without token refresh")?;
+        ensure_lark_send_success(status, &response, "interactive format")?;
         Ok(())
     }
 

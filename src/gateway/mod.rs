@@ -665,6 +665,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
+        .route("/download/{filename}", get(handle_workspace_download))
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
@@ -741,6 +742,39 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
         "runtime": crate::health::snapshot_json(),
     });
     Json(body)
+}
+
+/// GET /download/{filename} — download a generated report from workspace
+async fn handle_workspace_download(
+    State(state): State<AppState>,
+    axum::extract::Path(filename): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let workspace_dir = {
+        let guard = state.config.lock();
+        guard.workspace_dir.clone()
+    };
+    
+    // Basic path traversal prevention
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return (StatusCode::BAD_REQUEST, "Invalid filename").into_response();
+    }
+    
+    let path = workspace_dir.join(&filename);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let encoded_name = urlencoding::encode(&filename);
+            let disposition = format!("attachment; filename*=UTF-8''{}", encoded_name);
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                    (header::CONTENT_DISPOSITION, disposition)
+                ],
+                bytes
+            ).into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "File not found").into_response(),
+    }
 }
 
 /// Prometheus content type for text exposition format.

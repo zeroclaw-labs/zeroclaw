@@ -71,6 +71,42 @@ fn is_non_retryable(err: &anyhow::Error) -> bool {
             || msg_lower.contains("invalid"))
 }
 
+/// Check if an error is a provider-level credential failure — meaning the
+/// provider will fail for *every* model, not just the current one.  Used to
+/// skip a dead provider when iterating the model fallback chain so we don't
+/// waste attempts on (e.g.) an Anthropic-custom endpoint for a MiniMax model.
+///
+/// Distinct from `is_non_retryable`: model-not-found (400/404 with "model"
+/// keyword) is model-level and should NOT mark the provider as dead.
+fn is_provider_credential_failure(err: &anyhow::Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
+        if let Some(status) = reqwest_err.status() {
+            if status.as_u16() == 401 {
+                return true;
+            }
+        }
+    }
+    let msg = err.to_string().to_lowercase();
+    // 401 embedded in a provider's stringified error message
+    if msg.contains("401") && msg.contains("unauthorized") {
+        return true;
+    }
+    let credential_hints = [
+        "invalid api key",
+        "incorrect api key",
+        "missing api key",
+        "api key not set",
+        "key not set",
+        "authentication failed",
+        "auth failed",
+        "unauthorized",
+        "permission denied",
+        "access denied",
+        "invalid token",
+    ];
+    credential_hints.iter().any(|hint| msg.contains(hint))
+}
+
 fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     let hints = [
@@ -311,6 +347,9 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        // Providers that failed with a credential error are dead for all models.
+        let mut dead_providers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // Outer: model fallback chain. Middle: provider priority. Inner: retries.
         // Each iteration: attempt one (provider, model) call. On success, return
@@ -318,6 +357,14 @@ impl Provider for ReliableProvider {
         // retryable error, sleep with exponential backoff and retry.
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if dead_providers.contains(provider_name.as_str()) {
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping provider with prior credential failure"
+                    );
+                    continue;
+                }
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -370,12 +417,22 @@ impl Provider for ReliableProvider {
                             }
 
                             if non_retryable {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
+                                if is_provider_credential_failure(&e) {
+                                    dead_providers.insert(provider_name.clone());
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        error = %error_detail,
+                                        "Provider credential failure; skipping for all remaining fallback models"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        error = %error_detail,
+                                        "Non-retryable error, moving on"
+                                    );
+                                }
 
                                 if is_context_window_exceeded(&e) {
                                     anyhow::bail!(
@@ -435,9 +492,19 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut dead_providers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if dead_providers.contains(provider_name.as_str()) {
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping provider with prior credential failure"
+                    );
+                    continue;
+                }
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -488,12 +555,22 @@ impl Provider for ReliableProvider {
                             }
 
                             if non_retryable {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
+                                if is_provider_credential_failure(&e) {
+                                    dead_providers.insert(provider_name.clone());
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        error = %error_detail,
+                                        "Provider credential failure; skipping for all remaining fallback models"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        error = %error_detail,
+                                        "Non-retryable error, moving on"
+                                    );
+                                }
 
                                 if is_context_window_exceeded(&e) {
                                     anyhow::bail!(
@@ -559,9 +636,19 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut dead_providers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if dead_providers.contains(provider_name.as_str()) {
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping provider with prior credential failure"
+                    );
+                    continue;
+                }
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -612,12 +699,22 @@ impl Provider for ReliableProvider {
                             }
 
                             if non_retryable {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
+                                if is_provider_credential_failure(&e) {
+                                    dead_providers.insert(provider_name.clone());
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        error = %error_detail,
+                                        "Provider credential failure; skipping for all remaining fallback models"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        error = %error_detail,
+                                        "Non-retryable error, moving on"
+                                    );
+                                }
 
                                 if is_context_window_exceeded(&e) {
                                     anyhow::bail!(
@@ -669,9 +766,19 @@ impl Provider for ReliableProvider {
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
+        let mut dead_providers: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
+                if dead_providers.contains(provider_name.as_str()) {
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping provider with prior credential failure"
+                    );
+                    continue;
+                }
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -723,12 +830,22 @@ impl Provider for ReliableProvider {
                             }
 
                             if non_retryable {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
+                                if is_provider_credential_failure(&e) {
+                                    dead_providers.insert(provider_name.clone());
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        error = %error_detail,
+                                        "Provider credential failure; skipping for all remaining fallback models"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        provider = provider_name,
+                                        model = *current_model,
+                                        error = %error_detail,
+                                        "Non-retryable error, moving on"
+                                    );
+                                }
 
                                 if is_context_window_exceeded(&e) {
                                     anyhow::bail!(

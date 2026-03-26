@@ -122,6 +122,10 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+      - name: Clear mold rustflag (not available on CI runners)
+        if: runner.os == 'macOS'
+        run: echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=" >> "$GITHUB_ENV"
+
       - name: Build release
         shell: bash
         run: |
@@ -177,6 +181,27 @@ jobs:
             artifacts/**/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  homebrew:
+    name: Update Homebrew Tap
+    needs: [validate, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: stable
+
+      - name: Install cargo-dist
+        run: cargo install cargo-dist --locked --version 0.28.0
+
+      - name: Push Homebrew formula
+        run: cargo dist host --steps=announce
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GITHUB_REF: refs/tags/${{ needs.validate.outputs.tag }}
 
   docker:
     name: Push Docker Image

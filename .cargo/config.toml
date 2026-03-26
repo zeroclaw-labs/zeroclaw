@@ -10,3 +10,15 @@ linker = "armv7a-linux-androideabi21-clang"
 
 [target.aarch64-linux-android]
 linker = "aarch64-linux-android21-clang"
+
+# Local dev: mold for faster incremental builds (requires `brew install mold`)
+# CI overrides this via CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=""
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=/usr/local/bin/mold"]
+
+[profile.dev]
+incremental = true
+
+[build]
+jobs = 10 
