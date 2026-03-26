@@ -122,10 +122,6 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
 
-      - name: Clear mold rustflag (not available on CI runners)
-        if: runner.os == 'macOS'
-        run: echo "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS=" >> "$GITHUB_ENV"
-
       - name: Build release
         shell: bash
         run: |
