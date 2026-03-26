@@ -6122,6 +6122,11 @@ pub struct ChannelsConfig {
     /// Auto-archive stale sessions older than this many hours. `0` disables. Default: `0`.
     #[serde(default)]
     pub session_ttl_hours: u32,
+    /// Inbound message debounce window in milliseconds. When a sender fires
+    /// multiple messages within this window, they are accumulated and dispatched
+    /// as a single concatenated message. `0` disables debouncing. Default: `0`.
+    #[serde(default)]
+    pub debounce_ms: u64,
 }
 
 impl ChannelsConfig {
@@ -6289,6 +6294,7 @@ impl Default for ChannelsConfig {
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
+            debounce_ms: 0,
         }
     }
 }
@@ -11341,6 +11347,7 @@ auto_save = true
                 session_persistence: true,
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
+                debounce_ms: 0,
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -12364,6 +12371,7 @@ allowed_users = ["@ops:matrix.org"]
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
+            debounce_ms: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -12730,6 +12738,7 @@ channel_ids = ["C123", "D456"]
             session_persistence: true,
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
+            debounce_ms: 0,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

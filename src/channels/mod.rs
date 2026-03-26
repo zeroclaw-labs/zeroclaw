@@ -18,6 +18,7 @@ pub mod acp_server;
 pub mod bluesky;
 pub mod clawdtalk;
 pub mod cli;
+pub mod debounce;
 pub mod dingtalk;
 pub mod discord;
 pub mod discord_history;
@@ -393,6 +394,7 @@ struct ChannelRuntimeContext {
     activated_tools: Option<std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     cost_tracking: Option<ChannelCostTrackingState>,
     pacing: crate::config::PacingConfig,
+    debouncer: Arc<debounce::MessageDebouncer>,
 }
 
 #[derive(Clone)]
@@ -3242,6 +3244,67 @@ async fn process_channel_message(
     }
 }
 
+/// Shared worker body extracted so both the normal path and the debounce path
+/// can reuse the same in-flight tracking / cancellation / process logic.
+async fn dispatch_worker(
+    ctx: Arc<ChannelRuntimeContext>,
+    msg: traits::ChannelMessage,
+    in_flight: Arc<tokio::sync::Mutex<HashMap<String, InFlightSenderTaskState>>>,
+    task_sequence: Arc<AtomicU64>,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) {
+    let _permit = permit;
+    let interrupt_enabled = ctx
+        .interrupt_on_new_message
+        .enabled_for_channel(msg.channel.as_str());
+    let sender_scope_key = interruption_scope_key(&msg);
+    let cancellation_token = CancellationToken::new();
+    let completion = Arc::new(InFlightTaskCompletion::new());
+    let task_id = task_sequence.fetch_add(1, Ordering::Relaxed) as u64;
+
+    let register_in_flight = msg.channel != "cli";
+
+    if register_in_flight {
+        let previous = {
+            let mut active = in_flight.lock().await;
+            active.insert(
+                sender_scope_key.clone(),
+                InFlightSenderTaskState {
+                    task_id,
+                    cancellation: cancellation_token.clone(),
+                    completion: Arc::clone(&completion),
+                },
+            )
+        };
+
+        if interrupt_enabled {
+            if let Some(previous) = previous {
+                tracing::info!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "Interrupting previous in-flight request for sender"
+                );
+                previous.cancellation.cancel();
+                previous.completion.wait().await;
+            }
+        }
+    }
+
+    process_channel_message(ctx, msg, cancellation_token).await;
+
+    if register_in_flight {
+        let mut active = in_flight.lock().await;
+        if active
+            .get(&sender_scope_key)
+            .is_some_and(|state| state.task_id == task_id)
+        {
+            active.remove(&sender_scope_key);
+        }
+    }
+
+    completion.mark_done();
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
@@ -3299,6 +3362,61 @@ async fn run_message_dispatch_loop(
             continue;
         }
 
+        // ── Debounce: accumulate rapid messages per sender ──────────
+        // CLI messages bypass debouncing so the interactive loop stays responsive.
+        let msg = if msg.channel != "cli" && ctx.debouncer.enabled() {
+            let debounce_key = conversation_history_key(&msg);
+            match ctx.debouncer.debounce(&debounce_key, &msg.content).await {
+                debounce::DebounceResult::Pending(rx) => {
+                    // Spawn a lightweight task that waits for the debounce window
+                    // to expire, then feeds the combined message through the normal
+                    // worker path below.
+                    let debounce_ctx = Arc::clone(&ctx);
+                    let debounce_in_flight = Arc::clone(&in_flight_by_sender);
+                    let debounce_semaphore = Arc::clone(&semaphore);
+                    let debounce_task_seq = Arc::clone(&task_sequence);
+                    let mut debounce_msg = msg;
+                    workers.spawn(async move {
+                        let combined = match rx.await {
+                            Ok(combined) => combined,
+                            Err(_) => {
+                                // Receiver dropped — a newer message superseded this one.
+                                return;
+                            }
+                        };
+                        debounce_msg.content = combined;
+                        tracing::info!(
+                            channel = %debounce_msg.channel,
+                            sender = %debounce_msg.sender,
+                            "Debounced message ready — dispatching combined message"
+                        );
+
+                        let permit = match debounce_semaphore.acquire_owned().await {
+                            Ok(permit) => permit,
+                            Err(_) => return,
+                        };
+
+                        dispatch_worker(
+                            debounce_ctx,
+                            debounce_msg,
+                            debounce_in_flight,
+                            debounce_task_seq,
+                            permit,
+                        )
+                        .await;
+                    });
+                    continue;
+                }
+                debounce::DebounceResult::Passthrough(content) => {
+                    let mut m = msg;
+                    m.content = content;
+                    m
+                }
+            }
+        } else {
+            msg
+        };
+
         let permit = match Arc::clone(&semaphore).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => break,
@@ -3308,59 +3426,7 @@ async fn run_message_dispatch_loop(
         let in_flight = Arc::clone(&in_flight_by_sender);
         let task_sequence = Arc::clone(&task_sequence);
         workers.spawn(async move {
-            let _permit = permit;
-            let interrupt_enabled = worker_ctx
-                .interrupt_on_new_message
-                .enabled_for_channel(msg.channel.as_str());
-            let sender_scope_key = interruption_scope_key(&msg);
-            let cancellation_token = CancellationToken::new();
-            let completion = Arc::new(InFlightTaskCompletion::new());
-            let task_id = task_sequence.fetch_add(1, Ordering::Relaxed) as u64;
-
-            // Register all non-CLI tasks in the in-flight store so /stop can reach them.
-            // This is a deliberate broadening from the previous behaviour where only
-            // interrupt_enabled (Telegram/Slack) channels registered tasks.
-            let register_in_flight = msg.channel != "cli";
-
-            if register_in_flight {
-                let previous = {
-                    let mut active = in_flight.lock().await;
-                    active.insert(
-                        sender_scope_key.clone(),
-                        InFlightSenderTaskState {
-                            task_id,
-                            cancellation: cancellation_token.clone(),
-                            completion: Arc::clone(&completion),
-                        },
-                    )
-                };
-
-                if interrupt_enabled {
-                    if let Some(previous) = previous {
-                        tracing::info!(
-                            channel = %msg.channel,
-                            sender = %msg.sender,
-                            "Interrupting previous in-flight request for sender"
-                        );
-                        previous.cancellation.cancel();
-                        previous.completion.wait().await;
-                    }
-                }
-            }
-
-            process_channel_message(worker_ctx, msg, cancellation_token).await;
-
-            if register_in_flight {
-                let mut active = in_flight.lock().await;
-                if active
-                    .get(&sender_scope_key)
-                    .is_some_and(|state| state.task_id == task_id)
-                {
-                    active.remove(&sender_scope_key);
-                }
-            }
-
-            completion.mark_done();
+            dispatch_worker(worker_ctx, msg, in_flight, task_sequence, permit).await;
         });
 
         while let Some(result) = workers.try_join_next() {
@@ -5245,6 +5311,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
             prices: Arc::new(config.cost.prices.clone()),
         }),
         pacing: config.pacing.clone(),
+        debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::from_millis(
+            config.channels_config.debounce_ms,
+        ))),
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -5652,6 +5721,7 @@ mod tests {
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -5771,6 +5841,7 @@ mod tests {
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -5846,6 +5917,7 @@ mod tests {
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -5940,6 +6012,7 @@ mod tests {
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         };
 
         assert!(rollback_orphan_user_turn(
@@ -6484,6 +6557,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -6569,6 +6643,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -6668,6 +6743,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -6752,6 +6828,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -6846,6 +6923,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -6961,6 +7039,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -7057,6 +7136,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -7168,6 +7248,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -7267,6 +7348,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 loop_detection_enabled: false,
                 ..crate::config::PacingConfig::default()
             },
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -7356,6 +7438,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 loop_detection_enabled: false,
                 ..crate::config::PacingConfig::default()
             },
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -7560,6 +7643,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -7667,6 +7751,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7789,6 +7874,7 @@ BTC is currently around $65,000 based on latest tool output."#
             cost_tracking: None,
             query_classification: crate::config::QueryClassificationConfig::default(),
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7908,6 +7994,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8009,6 +8096,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -8093,6 +8181,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -8874,6 +8963,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -9010,6 +9100,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -9187,6 +9278,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -9299,6 +9391,7 @@ BTC is currently around $65,000 based on latest tool output."#
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -9875,6 +9968,7 @@ This is an example JSON object for profile settings."#;
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -9966,6 +10060,7 @@ This is an example JSON object for profile settings."#;
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -10133,6 +10228,7 @@ This is an example JSON object for profile settings."#;
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -10248,6 +10344,7 @@ This is an example JSON object for profile settings."#;
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -10355,6 +10452,7 @@ This is an example JSON object for profile settings."#;
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -10482,6 +10580,7 @@ This is an example JSON object for profile settings."#;
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
@@ -10750,6 +10849,7 @@ This is an example JSON object for profile settings."#;
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
