@@ -139,6 +139,56 @@ const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+/// Find the largest byte index `<= i` that is a valid char boundary.
+/// MSRV-compatible replacement for `str::floor_char_boundary` (stable in 1.91).
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut pos = i;
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Find the smallest byte index `>= i` that is a valid char boundary.
+/// MSRV-compatible replacement for `str::ceil_char_boundary` (stable in 1.91).
+fn ceil_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut pos = i;
+    while pos < s.len() && !s.is_char_boundary(pos) {
+        pos += 1;
+    }
+    pos
+}
+
+/// Truncate a tool result to `max_chars`, keeping head (2/3) + tail (1/3)
+/// with a marker in the middle. Returns input unchanged if within limit or
+/// `max_chars == 0` (disabled).
+pub(crate) fn truncate_tool_result(output: &str, max_chars: usize) -> String {
+    if max_chars == 0 || output.len() <= max_chars {
+        return output.to_string();
+    }
+    let head_len = max_chars * 2 / 3;
+    let tail_len = max_chars.saturating_sub(head_len);
+    let head_end = floor_char_boundary(output, head_len);
+    let tail_start = ceil_char_boundary(output, output.len().saturating_sub(tail_len));
+    // Guard against overlap when max_chars is very small
+    if head_end >= tail_start {
+        return output[..floor_char_boundary(output, max_chars)].to_string();
+    }
+    let truncated_chars = tail_start - head_end;
+    format!(
+        "{}\n\n[... {} characters truncated ...]\n\n{}",
+        &output[..head_end],
+        truncated_chars,
+        &output[tail_start..]
+    )
+}
+
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
@@ -2502,6 +2552,7 @@ pub(crate) async fn agent_turn(
         activated_tools,
         model_switch_callback,
         &crate::config::PacingConfig::default(),
+        0, // max_tool_result_chars: 0 = disabled (legacy callers)
     )
     .await
 }
@@ -2812,6 +2863,7 @@ pub(crate) async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &crate::config::PacingConfig,
+    max_tool_result_chars: usize,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -3682,11 +3734,12 @@ pub(crate) async fn run_tool_call_loop(
                     }
                 }
             }
-            individual_results.push((tool_call_id, outcome.output.clone()));
+            let result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            individual_results.push((tool_call_id, result_output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, outcome.output
+                tool_name, result_output
             );
         }
 
@@ -4341,6 +4394,7 @@ pub async fn run(
                 activated_handle.as_ref(),
                 Some(model_switch_callback.clone()),
                 &config.pacing,
+                config.agent.max_tool_result_chars,
             )
             .await
             {
@@ -4642,6 +4696,7 @@ pub async fn run(
                     activated_handle.as_ref(),
                     Some(model_switch_callback.clone()),
                     &config.pacing,
+                    config.agent.max_tool_result_chars,
                 )
                 .await
                 {
@@ -5106,10 +5161,93 @@ pub async fn process_message(
 mod tests {
     use super::{
         apply_compaction_summary, build_compaction_transcript, load_interactive_session_history,
-        save_interactive_session_history, InteractiveSessionState,
+        save_interactive_session_history, truncate_tool_result, InteractiveSessionState,
     };
     use crate::providers::ChatMessage;
     use tempfile::tempdir;
+
+    // ── truncate_tool_result tests ────────────────────────────────
+
+    #[test]
+    fn truncate_tool_result_short_passthrough() {
+        let output = "short output";
+        assert_eq!(truncate_tool_result(output, 100), output);
+    }
+
+    #[test]
+    fn truncate_tool_result_exact_boundary() {
+        let output = "a".repeat(100);
+        assert_eq!(truncate_tool_result(&output, 100), output);
+    }
+
+    #[test]
+    fn truncate_tool_result_zero_disables() {
+        let output = "a".repeat(200_000);
+        assert_eq!(truncate_tool_result(&output, 0), output);
+    }
+
+    #[test]
+    fn truncate_tool_result_truncates_with_marker() {
+        let output = "a".repeat(200);
+        let result = truncate_tool_result(&output, 100);
+        assert!(result.contains("[... "));
+        assert!(result.contains("characters truncated ...]\n\n"));
+        // Head should be ~2/3 of 100 = 66, tail ~1/3 = 34
+        assert!(result.starts_with("aaa"));
+        assert!(result.ends_with("aaa"));
+        // Result should be shorter than original
+        assert!(result.len() < output.len());
+    }
+
+    #[test]
+    fn truncate_tool_result_preserves_head_tail_ratio() {
+        let output: String = (0u32..1000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let result = truncate_tool_result(&output, 300);
+        // Head = 2/3 of 300 = 200 chars, tail = 100 chars
+        // Find the marker
+        let marker_start = result.find("[... ").unwrap();
+        let marker_end = result.find("characters truncated ...]\n\n").unwrap()
+            + "characters truncated ...]\n\n".len();
+        let head = &result[..marker_start - 2]; // subtract \n\n
+        let tail = &result[marker_end..];
+        assert!(
+            head.len() >= 190 && head.len() <= 210,
+            "head len={}",
+            head.len()
+        );
+        assert!(
+            tail.len() >= 90 && tail.len() <= 110,
+            "tail len={}",
+            tail.len()
+        );
+    }
+
+    #[test]
+    fn truncate_tool_result_utf8_boundary_safety() {
+        // Create string with multi-byte chars: each emoji is 4 bytes
+        let output = "🦀".repeat(100); // 400 bytes
+                                       // This should not panic even with a limit that falls mid-char
+        let result = truncate_tool_result(&output, 50);
+        assert!(result.contains("[... "));
+        // Verify the result is valid UTF-8 (would panic otherwise)
+        let _ = result.len();
+    }
+
+    #[test]
+    fn truncate_tool_result_very_small_max() {
+        let output = "abcdefghijklmnopqrstuvwxyz";
+        // With max=5, head=3 tail=2 — result includes marker overhead
+        // but should not panic and should contain truncation marker
+        let result = truncate_tool_result(output, 5);
+        assert!(result.contains("[... "));
+        // Head (3 chars) + tail (2 chars) from original should be preserved
+        assert!(result.starts_with("abc"));
+        assert!(result.ends_with("yz"));
+    }
+
+    // ── existing tests ────────────────────────────────────────────
 
     #[test]
     fn interactive_session_state_round_trips_history() {
@@ -5857,6 +5995,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5909,6 +6048,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -5954,6 +6094,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5999,6 +6140,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -6051,6 +6193,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -6103,6 +6246,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -6156,6 +6300,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -6207,6 +6352,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -6258,6 +6404,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -6392,6 +6539,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("parallel execution should complete");
@@ -6463,6 +6611,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6526,6 +6675,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6584,6 +6734,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6654,6 +6805,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6715,6 +6867,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6796,6 +6949,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("loop should complete");
@@ -6854,6 +7008,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6936,6 +7091,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -7002,6 +7158,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("streaming provider should complete");
@@ -7070,6 +7227,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -7142,6 +7300,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -7223,6 +7382,7 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("routed streaming provider should complete");
@@ -9260,6 +9420,7 @@ Let me check the result."#;
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("tool loop should complete");
@@ -9414,6 +9575,7 @@ Let me check the result."#;
                     None,
                     None,
                     &crate::config::PacingConfig::default(),
+                    0,
                 ),
             )
             .await
@@ -9493,6 +9655,7 @@ Let me check the result."#;
                     None,
                     None,
                     &crate::config::PacingConfig::default(),
+                    0,
                 ),
             )
             .await
@@ -9548,6 +9711,7 @@ Let me check the result."#;
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
         )
         .await
         .expect("should succeed without cost scope");

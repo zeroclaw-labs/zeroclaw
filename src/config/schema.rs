@@ -1363,6 +1363,16 @@ pub struct AgentConfig {
     /// Context compression configuration for automatic conversation compaction.
     #[serde(default)]
     pub context_compression: crate::agent::context_compressor::ContextCompressionConfig,
+
+    /// Maximum characters for a single tool result before truncation.
+    /// Head (2/3) and tail (1/3) are preserved with a truncation marker in the
+    /// middle. Set to `0` to disable truncation. Default: `50000`.
+    #[serde(default = "default_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
+}
+
+fn default_max_tool_result_chars() -> usize {
+    50_000
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1404,6 +1414,7 @@ impl Default for AgentConfig {
             auto_classify: None,
             context_compression:
                 crate::agent::context_compressor::ContextCompressionConfig::default(),
+            max_tool_result_chars: default_max_tool_result_chars(),
         }
     }
 }
