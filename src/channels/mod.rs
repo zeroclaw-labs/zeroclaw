@@ -4216,7 +4216,9 @@ fn collect_configured_channels(
                                 wa.verify_token.clone().unwrap_or_default(),
                                 wa.allowed_numbers.clone(),
                             )
-                            .with_proxy_url(wa.proxy_url.clone()),
+                            .with_proxy_url(wa.proxy_url.clone())
+                            .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                            .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                         ),
                     });
                 } else {
@@ -4241,7 +4243,9 @@ fn collect_configured_channels(
                                 wa.self_chat_mode,
                             )
                             .with_transcription(config.transcription.clone())
-                            .with_tts(config.tts.clone()),
+                            .with_tts(config.tts.clone())
+                            .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
+                            .with_group_mention_patterns(wa.group_mention_patterns.clone()),
                         ),
                     });
                 } else {
