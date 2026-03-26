@@ -190,6 +190,11 @@ pub enum StreamEvent {
     TextDelta(StreamChunk),
     /// Structured tool call emitted during streaming.
     ToolCall(ToolCall),
+    /// A tool call that was already executed by the provider (e.g. Claude Code proxy).
+    /// Emitted for observability only — not re-executed by the agent's dispatcher.
+    PreExecutedToolCall { name: String, args: String },
+    /// The result of a pre-executed tool call.
+    PreExecutedToolResult { name: String, output: String },
     /// Stream has completed.
     Final,
 }

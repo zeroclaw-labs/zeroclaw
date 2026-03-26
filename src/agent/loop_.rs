@@ -2395,6 +2395,11 @@ async fn consume_provider_streaming_response(
                     outcome.forwarded_live_deltas = false;
                 }
             }
+            StreamEvent::PreExecutedToolCall { .. } | StreamEvent::PreExecutedToolResult { .. } => {
+                // Pre-executed tool events are for observability only.
+                // They are forwarded to the gateway via turn_streamed but
+                // do not affect the agent's tool dispatch loop.
+            }
             StreamEvent::TextDelta(chunk) => {
                 if chunk.delta.is_empty() {
                     continue;
