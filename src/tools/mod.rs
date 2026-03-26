@@ -84,6 +84,7 @@ pub mod proxy_config;
 pub mod pushover;
 pub mod reaction;
 pub mod read_skill;
+pub mod report_template_tool;
 pub mod report_templates;
 pub mod schedule;
 pub mod schema;
@@ -177,6 +178,7 @@ pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use reaction::ReactionTool;
 pub use read_skill::ReadSkillTool;
+pub use report_template_tool::ReportTemplateTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
 pub use schema::{CleaningStrategy, SchemaCleanr};
@@ -628,6 +630,8 @@ pub fn all_tools_with_runtime(
             root_config.project_intel.default_language.clone(),
             root_config.project_intel.risk_sensitivity.clone(),
         )));
+        // Report template tool — direct access to template engine
+        tool_arcs.push(Arc::new(ReportTemplateTool::new()));
     }
 
     // MCSS Security Operations
