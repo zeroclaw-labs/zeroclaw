@@ -285,7 +285,7 @@ impl AcpServer {
         info!("Created session {session_id} (workspace: {workspace_dir})");
 
         Ok(serde_json::json!({
-            "session_id": session_id,
+            "sessionId": session_id,
             "workspace_dir": workspace_dir,
         }))
     }
