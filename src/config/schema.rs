@@ -6632,6 +6632,10 @@ pub struct MatrixConfig {
     /// Delay (ms) between sending each paragraph in MultiMessage mode.
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
+    /// Optional Matrix recovery key for automatic E2EE key backup restore.
+    /// When set, ZeroClaw recovers room keys and cross-signing secrets on startup.
+    #[serde(default)]
+    pub recovery_key: Option<String>,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -9000,6 +9004,11 @@ impl Config {
                     &mut mx.access_token,
                     "config.channels_config.matrix.access_token",
                 )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut mx.recovery_key,
+                    "config.channels_config.matrix.recovery_key",
+                )?;
             }
             if let Some(ref mut wa) = config.channels_config.whatsapp {
                 decrypt_optional_secret(
@@ -10466,6 +10475,11 @@ impl Config {
                 &store,
                 &mut mx.access_token,
                 "config.channels_config.matrix.access_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut mx.recovery_key,
+                "config.channels_config.matrix.recovery_key",
             )?;
         }
         if let Some(ref mut wa) = config_to_save.channels_config.whatsapp {
@@ -12227,6 +12241,7 @@ default_temperature = 0.7
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            recovery_key: None,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12252,6 +12267,7 @@ default_temperature = 0.7
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            recovery_key: None,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12349,6 +12365,7 @@ allowed_users = ["@ops:matrix.org"]
                 stream_mode: StreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                recovery_key: None,
             }),
             signal: None,
             whatsapp: None,
