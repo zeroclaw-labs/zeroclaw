@@ -6016,7 +6016,7 @@ mod tests {
                 .any(|msg| msg.content.contains("trigger format error"))
             {
                 anyhow::bail!(
-                    "All providers/models failed. Attempts:\nprovider=custom:https://api.scnet.cn/api/llm/v1 model=MiniMax-M2.5 attempt 1/3: non_retryable; error=Custom API error (400 Bad Request): {{\"error\":{{\"message\":\"Format Error\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"400\"}},\"request_id\":\"test-request-id\"}}"
+                    "All providers/models failed. Attempts:\nprovider=custom:https://example.invalid/v1 model=test-model attempt 1/3: non_retryable; error=Custom API error (400 Bad Request): {{\"error\":{{\"message\":\"Format Error\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"400\"}},\"request_id\":\"test-request-id\"}}"
                 );
             }
 
@@ -10131,6 +10131,8 @@ This is an example JSON object for profile settings."#;
             activated_tools: None,
             cost_tracking: None,
             pacing: crate::config::PacingConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
         });
 
         process_channel_message(
@@ -10144,6 +10146,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 1,
                 thread_ts: None,
                 interruption_scope_id: None,
+                attachments: vec![],
             },
             CancellationToken::new(),
         )
@@ -10160,6 +10163,7 @@ This is an example JSON object for profile settings."#;
                 timestamp: 2,
                 thread_ts: None,
                 interruption_scope_id: None,
+                attachments: vec![],
             },
             CancellationToken::new(),
         )
