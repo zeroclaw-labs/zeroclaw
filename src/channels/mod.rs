@@ -2004,6 +2004,71 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AssistantChannelOutcome {
+    Reply(String),
+    NoReply { reason: Option<String> },
+}
+
+impl AssistantChannelOutcome {
+    fn history_marker(&self) -> String {
+        match self {
+            Self::Reply(text) => text.clone(),
+            Self::NoReply {
+                reason: Some(reason),
+            } if !reason.trim().is_empty() => {
+                format!("[No reply sent: {}]", reason.trim())
+            }
+            Self::NoReply { .. } => "[No reply sent]".to_string(),
+        }
+    }
+}
+
+async fn classify_channel_reply_intent(
+    provider: &dyn Provider,
+    system_prompt: &str,
+    history: &[ChatMessage],
+    model: &str,
+    temperature: f64,
+) -> anyhow::Result<AssistantChannelOutcome> {
+    let mut convo = String::from(
+        "Decide whether the assistant should send any visible reply to the latest inbound \
+         channel message.\n\nReturn exactly one of:\n- `REPLY`\n- `NO_REPLY: <short reason>`\n\n\
+         Rules:\n- Follow the workspace and channel instructions in the system prompt.\n- If the \
+         latest message is not clearly addressed to the assistant, prefer `NO_REPLY`.\n- In DMs \
+         or direct conversations, prefer `REPLY` unless the instructions explicitly say \
+         otherwise.\n- Do not answer the user. Only classify.\n\nConversation:\n",
+    );
+
+    for msg in history.iter().filter(|m| m.role != "system") {
+        let role = match msg.role.as_str() {
+            "assistant" => "assistant",
+            _ => "user",
+        };
+        let _ = writeln!(convo, "[{role}] {}", msg.content);
+    }
+
+    let response = provider
+        .chat_with_system(Some(system_prompt), &convo, model, temperature)
+        .await?;
+    let trimmed = response.trim();
+    if trimmed.eq_ignore_ascii_case("REPLY") {
+        return Ok(AssistantChannelOutcome::Reply(String::new()));
+    }
+
+    if let Some(reason) = trimmed.strip_prefix("NO_REPLY:") {
+        let reason = reason.trim();
+        return Ok(AssistantChannelOutcome::NoReply {
+            reason: (!reason.is_empty()).then(|| reason.to_string()),
+        });
+    }
+    if trimmed.eq_ignore_ascii_case("NO_REPLY") {
+        return Ok(AssistantChannelOutcome::NoReply { reason: None });
+    }
+
+    Ok(AssistantChannelOutcome::Reply(String::new()))
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -2702,6 +2767,48 @@ async fn process_channel_message(
             }
             _ => {}
         }
+    }
+
+    let reply_intent = classify_channel_reply_intent(
+        active_provider.as_ref(),
+        history[0].content.as_str(),
+        &history,
+        route.model.as_str(),
+        runtime_defaults.temperature,
+    )
+    .await
+    .unwrap_or(AssistantChannelOutcome::Reply(String::new()));
+
+    if let AssistantChannelOutcome::NoReply { reason } = reply_intent {
+        let history_response = AssistantChannelOutcome::NoReply {
+            reason: reason.clone(),
+        }
+        .history_marker();
+        append_sender_turn(
+            ctx.as_ref(),
+            &history_key,
+            ChatMessage::assistant(&history_response),
+        );
+        runtime_trace::record_event(
+            "channel_message_no_reply",
+            Some(msg.channel.as_str()),
+            Some(route.provider.as_str()),
+            Some(route.model.as_str()),
+            None,
+            Some(true),
+            reason.as_deref(),
+            serde_json::json!({
+                "sender": msg.sender,
+                "elapsed_ms": started_at.elapsed().as_millis(),
+                "phase": "precheck",
+            }),
+        );
+        println!(
+            "  🤖 No reply ({}ms): {}",
+            started_at.elapsed().as_millis(),
+            reason.as_deref().unwrap_or("no reason provided")
+        );
+        return;
     }
 
     let use_draft_streaming = target_channel
@@ -6284,6 +6391,13 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct DraftRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        stop_typing_calls: AtomicUsize,
+        cancelled_drafts: tokio::sync::Mutex<Vec<(String, String)>>,
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
@@ -6340,6 +6454,49 @@ mod tests {
         }
 
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for DraftRecordingChannel {
+        fn name(&self) -> &str {
+            "slack"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("draft-1".to_string()))
+        }
+
+        async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
+            self.cancelled_drafts
+                .lock()
+                .await
+                .push((recipient.to_string(), message_id.to_string()));
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -7920,8 +8077,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let elapsed = started.elapsed();
 
         assert!(
-            elapsed < Duration::from_millis(430),
-            "expected parallel dispatch (<430ms), got {:?}",
+            elapsed < Duration::from_millis(700),
+            "expected parallel dispatch with precheck (<700ms), got {:?}",
             elapsed
         );
 
@@ -8376,6 +8533,89 @@ BTC is currently around $65,000 based on latest tool output."#
         let stops = channel_impl.stop_typing_calls.load(Ordering::SeqCst);
         assert_eq!(starts, 1, "start_typing should be called once");
         assert_eq!(stops, 1, "stop_typing should be called once");
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_no_reply_precheck_skips_typing_indicator() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(NoReplyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "typing-fast-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-typing".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let starts = channel_impl.start_typing_calls.load(Ordering::SeqCst);
+        assert_eq!(starts, 0, "no-reply precheck should not show typing");
     }
 
     #[tokio::test]
@@ -11420,5 +11660,221 @@ This is an example JSON object for profile settings."#;
     fn default_keep_tool_context_turns_is_two() {
         let config = crate::config::schema::AgentConfig::default();
         assert_eq!(config.keep_tool_context_turns, 2);
+    }
+
+    struct NoReplyProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for NoReplyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("NO_REPLY: not addressed to agent".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_no_reply_skips_outbound_send() {
+        let channel_impl = Arc::new(SlackRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(NoReplyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
+        tx.send(traits::ChannelMessage {
+            id: "1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "C123".to_string(),
+            content: "side conversation".to_string(),
+            channel: "slack".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        run_message_dispatch_loop(rx, runtime_ctx.clone(), 1).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent_messages.is_empty(),
+            "no outbound message should be sent, got: {sent_messages:?}"
+        );
+        drop(sent_messages);
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let history = histories
+            .values()
+            .next()
+            .expect("conversation history should be recorded");
+        let last = history
+            .last()
+            .expect("history should contain assistant marker");
+        assert_eq!(last.role, "assistant");
+        assert_eq!(last.content, "[No reply sent: not addressed to agent]");
+    }
+
+    #[tokio::test]
+    async fn message_dispatch_no_reply_precheck_skips_draft_activity() {
+        let channel_impl = Arc::new(DraftRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(NoReplyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
+        tx.send(traits::ChannelMessage {
+            id: "1".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "C123".to_string(),
+            content: "side conversation".to_string(),
+            channel: "slack".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        run_message_dispatch_loop(rx, runtime_ctx, 1).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert!(sent_messages.is_empty());
+        drop(sent_messages);
+
+        let cancelled = channel_impl.cancelled_drafts.lock().await;
+        assert_eq!(
+            cancelled.len(),
+            0,
+            "no draft should be cancelled when no-reply returns before draft creation"
+        );
+        drop(cancelled);
+
+        assert_eq!(
+            channel_impl.stop_typing_calls.load(Ordering::SeqCst),
+            0,
+            "no typing/status cleanup should be needed when precheck returns before visible activity"
+        );
     }
 }

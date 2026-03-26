@@ -3516,6 +3516,7 @@ impl Channel for SlackChannel {
         let real_ts = self.resolve_draft_ts(message_id).await;
         // Clean up lazy mapping
         self.lazy_draft_ts.lock().await.remove(message_id);
+        self.set_assistant_status(recipient, "").await;
 
         let Some(real_ts) = real_ts else {
             // Draft was never materialized — just send as a fresh message
@@ -3577,6 +3578,7 @@ impl Channel for SlackChannel {
             .remove(recipient);
         let real_ts = self.resolve_draft_ts(message_id).await;
         self.lazy_draft_ts.lock().await.remove(message_id);
+        self.set_assistant_status(recipient, "").await;
         if let Some(ts) = real_ts {
             self.delete_message(recipient, &ts).await
         } else {
@@ -3998,7 +4000,7 @@ impl Channel for SlackChannel {
     async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
         // When using draft streaming, the final response is delivered via
         // chat.update (not chat.postMessage), so the Assistants API status
-        // does not auto-clear. Explicitly clear it.
+        // does not auto-clear. Explicitly clear it here as well.
         if self.stream_drafts {
             self.set_assistant_status(recipient, "").await;
         }
