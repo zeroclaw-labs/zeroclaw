@@ -18,7 +18,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          token: ${{ secrets.PAT_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 检查上游是否有更新
         id: check
@@ -64,6 +64,15 @@ jobs:
             git merge --abort
             exit 1
           }
+
+          # 撤销上游 workflow 文件的变更（GITHUB_TOKEN 无权推送 workflow 修改）
+          # 只保留我们自己的两个 action 文件
+          git checkout HEAD~1 -- .github/workflows/
+          git checkout HEAD -- .github/workflows/sync-upstream.yml
+          git checkout HEAD -- .github/workflows/build-browser-release.yml
+          if ! git diff --cached --quiet; then
+            git commit --amend --no-edit
+          fi
           git push origin master
 
       - name: 触发编译
