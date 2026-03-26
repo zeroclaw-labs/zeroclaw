@@ -11511,7 +11511,10 @@ auto_approve = ["my_custom_tool", "another_tool"]
             "web_fetch",
         ] {
             assert!(
-                parsed.autonomy.auto_approve.contains(&default_tool.to_string()),
+                parsed
+                    .autonomy
+                    .auto_approve
+                    .contains(&String::from(*default_tool)),
                 "default tool '{default_tool}' must be present in auto_approve even when user provides custom list"
             );
         }
