@@ -1143,6 +1143,16 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            if let Ok(exe) = std::env::current_exe() {
+                let exe_str = exe.to_string_lossy();
+                if exe_str.contains(".cargo/bin") || exe_str.contains("/home/") {
+                    tracing::warn!(
+                        "Daemon running from user home directory: {}. \
+                         Consider installing to /usr/local/bin for system-wide service.",
+                        exe_str
+                    );
+                }
+            }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {

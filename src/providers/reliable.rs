@@ -1152,7 +1152,7 @@ impl Provider for ReliableProvider {
 
             // Try the first model in the chain for streaming
             let current_model = match self.model_chain(model).first() {
-                Some(m) => m.to_string(),
+                Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
 
@@ -1219,7 +1219,7 @@ impl Provider for ReliableProvider {
             let provider_clone = provider_name.clone();
 
             let current_model = match self.model_chain(model).first() {
-                Some(m) => m.to_string(),
+                Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
 

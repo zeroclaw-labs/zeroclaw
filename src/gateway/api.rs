@@ -1056,6 +1056,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(email) = masked.channels_config.email.as_mut() {
         mask_required_secret(&mut email.password);
     }
+    mask_optional_secret(&mut masked.transcription.api_key);
     masked
 }
 
@@ -1243,6 +1244,10 @@ fn restore_masked_sensitive_fields(
     ) {
         restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
+    restore_optional_secret(
+        &mut incoming.transcription.api_key,
+        &current.transcription.api_key,
+    );
 }
 
 fn hydrate_config_for_save(
@@ -1294,6 +1299,40 @@ pub async fn handle_api_sessions_list(
         .collect();
 
     Json(serde_json::json!({ "sessions": gw_sessions })).into_response()
+}
+
+/// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
+pub async fn handle_api_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "session_id": id,
+            "messages": [],
+            "session_persistence": false,
+        }))
+        .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    let msgs = backend.load(&session_key);
+    let messages: Vec<serde_json::Value> = msgs
+        .into_iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+
+    Json(serde_json::json!({
+        "session_id": id,
+        "messages": messages,
+        "session_persistence": true,
+    }))
+    .into_response()
 }
 
 /// DELETE /api/sessions/{id} — delete a gateway session
@@ -1503,6 +1542,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(crate::gateway::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,

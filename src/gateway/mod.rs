@@ -13,6 +13,7 @@ pub mod api_pairing;
 pub mod api_plugins;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
+pub mod auth_rate_limit;
 pub mod canvas;
 pub mod nodes;
 pub mod sse;
@@ -330,6 +331,7 @@ pub struct AppState {
     pub pairing: Arc<PairingGuard>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
+    pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
@@ -625,6 +627,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
+                nc.bot_name.clone().unwrap_or_default(),
                 nc.allowed_users.clone(),
             ))
         });
@@ -824,6 +827,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
+        auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
@@ -927,6 +931,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route(
+            "/api/sessions/{id}/messages",
+            get(api::handle_api_session_messages),
+        )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
@@ -1184,6 +1192,16 @@ async fn handle_pair(
         return (StatusCode::TOO_MANY_REQUESTS, Json(err));
     }
 
+    // ── Auth rate limiting (brute-force protection) ──
+    if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
+        tracing::warn!("🔐 Pairing auth rate limit exceeded for {rate_key}");
+        let err = serde_json::json!({
+            "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
+            "retry_after": e.retry_after_secs,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
     let code = headers
         .get("X-Pairing-Code")
         .and_then(|v| v.to_str().ok())
@@ -1214,6 +1232,7 @@ async fn handle_pair(
             (StatusCode::OK, Json(body))
         }
         Ok(None) => {
+            state.auth_limiter.record_attempt(&rate_key);
             tracing::warn!("🔐 Pairing attempt with invalid code");
             let err = serde_json::json!({"error": "Invalid pairing code"});
             (StatusCode::FORBIDDEN, Json(err))
@@ -1313,14 +1332,23 @@ async fn handle_webhook(
         return (StatusCode::TOO_MANY_REQUESTS, Json(err));
     }
 
-    // ── Bearer token auth (pairing) ──
+    // ── Bearer token auth (pairing) with auth rate limiting ──
     if state.pairing.require_pairing() {
+        if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
+            tracing::warn!("Webhook: auth rate limit exceeded for {rate_key}");
+            let err = serde_json::json!({
+                "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
+                "retry_after": e.retry_after_secs,
+            });
+            return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        }
         let auth = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let token = auth.strip_prefix("Bearer ").unwrap_or("");
         if !state.pairing.is_authenticated(token) {
+            state.auth_limiter.record_attempt(&rate_key);
             tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
@@ -2282,6 +2310,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -2346,6 +2375,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -2736,6 +2766,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -2810,6 +2841,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -2896,6 +2928,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -2954,6 +2987,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3017,6 +3051,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3085,6 +3120,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -3129,6 +3165,7 @@ mod tests {
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            String::new(),
             vec!["*".into()],
         ));
 
@@ -3149,6 +3186,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
