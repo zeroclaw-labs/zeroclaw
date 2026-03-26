@@ -110,11 +110,7 @@ impl AuthRateLimiter {
 
         let now = Instant::now();
         let mut inner = self.inner.lock();
-        inner
-            .attempts
-            .entry(key.to_owned())
-            .or_default()
-            .push(now);
+        inner.attempts.entry(key.to_owned()).or_default().push(now);
     }
 
     /// Check whether `key` is currently locked out, without recording anything.
