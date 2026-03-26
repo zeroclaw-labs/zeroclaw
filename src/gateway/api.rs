@@ -1296,6 +1296,40 @@ pub async fn handle_api_sessions_list(
     Json(serde_json::json!({ "sessions": gw_sessions })).into_response()
 }
 
+/// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
+pub async fn handle_api_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "session_id": id,
+            "messages": [],
+            "session_persistence": false,
+        }))
+        .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    let msgs = backend.load(&session_key);
+    let messages: Vec<serde_json::Value> = msgs
+        .into_iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+
+    Json(serde_json::json!({
+        "session_id": id,
+        "messages": messages,
+        "session_persistence": true,
+    }))
+    .into_response()
+}
+
 /// DELETE /api/sessions/{id} — delete a gateway session
 pub async fn handle_api_session_delete(
     State(state): State<AppState>,

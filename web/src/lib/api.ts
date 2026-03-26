@@ -11,6 +11,7 @@ import type {
   HealthSnapshot,
   Session,
   ChannelDetail,
+  SessionMessagesResponse,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
@@ -305,6 +306,13 @@ export function getSessions(): Promise<Session[]> {
 
 export function getSession(id: string): Promise<Session> {
   return apiFetch<Session>(`/api/sessions/${encodeURIComponent(id)}`);
+}
+
+/** Load persisted gateway WebSocket chat transcript for the dashboard Agent Chat. */
+export function getSessionMessages(id: string): Promise<SessionMessagesResponse> {
+  return apiFetch<SessionMessagesResponse>(
+    `/api/sessions/${encodeURIComponent(id)}/messages`,
+  );
 }
 
 // ---------------------------------------------------------------------------
