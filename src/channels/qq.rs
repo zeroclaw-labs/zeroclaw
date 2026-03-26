@@ -413,6 +413,7 @@ impl QQChannel {
                     if attempt < AUTH_RETRY_MAX_ATTEMPTS {
                         // Add jitter: 75%-125% of base backoff
                         let jitter_factor = 0.75 + (rand::random::<f64>() * 0.5);
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                         let sleep_ms = (backoff_ms as f64 * jitter_factor) as u64;
                         tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
                         backoff_ms = (backoff_ms * 2).min(AUTH_RETRY_MAX_BACKOFF_MS);
@@ -1873,15 +1874,17 @@ allowed_users = ["user1"]
 
     #[test]
     fn test_auth_retry_constants_are_sensible() {
-        assert!(AUTH_RETRY_MAX_ATTEMPTS >= 2, "should retry at least once");
-        assert!(
-            AUTH_RETRY_INITIAL_BACKOFF_MS > 0,
-            "initial backoff must be positive"
-        );
-        assert!(
-            AUTH_RETRY_MAX_BACKOFF_MS >= AUTH_RETRY_INITIAL_BACKOFF_MS,
-            "max backoff must be >= initial"
-        );
+        const {
+            assert!(AUTH_RETRY_MAX_ATTEMPTS >= 2, "should retry at least once");
+            assert!(
+                AUTH_RETRY_INITIAL_BACKOFF_MS > 0,
+                "initial backoff must be positive"
+            );
+            assert!(
+                AUTH_RETRY_MAX_BACKOFF_MS >= AUTH_RETRY_INITIAL_BACKOFF_MS,
+                "max backoff must be >= initial"
+            );
+        }
     }
 
     #[test]
@@ -1956,15 +1959,18 @@ allowed_users = ["user1"]
         // First tick: counter is 0, send heartbeat
         assert!(missed < max_missed);
         missed += 1;
+        assert_eq!(missed, 1, "counter should be 1 after first heartbeat");
 
         // ACK received: reset
         missed = 0;
+        assert_eq!(missed, 0, "counter should reset on ACK");
 
         // 3 consecutive misses without ACK
-        for i in 0..max_missed {
-            if missed > 0 && missed >= max_missed {
-                panic!("should not reach zombie state at miss count {i}");
-            }
+        for _ in 0..max_missed {
+            assert!(
+                missed < max_missed,
+                "should not reach zombie state before {max_missed} misses"
+            );
             missed += 1;
         }
         assert!(
