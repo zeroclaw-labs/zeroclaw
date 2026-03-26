@@ -6437,6 +6437,11 @@ pub struct DiscordConfig {
     /// Only used when `stream_mode = "multi_message"`.
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
+    /// Stall-watchdog timeout in seconds.  When the WebSocket transport
+    /// receives no events for this duration the connection is considered
+    /// stalled and the listener restarts.  0 = disabled (default).
+    #[serde(default)]
+    pub stall_timeout_secs: u64,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -12213,6 +12218,7 @@ default_temperature = 0.7
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
+            stall_timeout_secs: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -12233,6 +12239,7 @@ default_temperature = 0.7
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
+            stall_timeout_secs: 0,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
