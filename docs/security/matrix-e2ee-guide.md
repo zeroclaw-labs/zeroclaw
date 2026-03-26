@@ -103,6 +103,10 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 - Check that returned `user_id` matches the bot account.
 - If `device_id` is missing, set `channels_config.matrix.device_id` manually.
+- To update the access token without re-running onboard:
+  ```bash
+  zeroclaw secret set channels.matrix.access-token
+  ```
 
 ### D. E2EE-specific checks
 
