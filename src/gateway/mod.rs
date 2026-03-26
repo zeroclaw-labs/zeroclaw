@@ -1121,17 +1121,32 @@ fn prometheus_disabled_hint() -> String {
     String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
 }
 
+#[cfg(feature = "observability-prometheus")]
+fn prometheus_observer_from_state(
+    observer: &dyn crate::observability::Observer,
+) -> Option<&crate::observability::PrometheusObserver> {
+    observer
+        .as_any()
+        .downcast_ref::<crate::observability::PrometheusObserver>()
+        .or_else(|| {
+            observer
+                .as_any()
+                .downcast_ref::<sse::BroadcastObserver>()
+                .and_then(|broadcast| {
+                    broadcast
+                        .inner()
+                        .as_any()
+                        .downcast_ref::<crate::observability::PrometheusObserver>()
+                })
+        })
+}
+
 /// GET /metrics — Prometheus text exposition format
 async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let body = {
         #[cfg(feature = "observability-prometheus")]
         {
-            if let Some(prom) = state
-                .observer
-                .as_ref()
-                .as_any()
-                .downcast_ref::<crate::observability::PrometheusObserver>()
-            {
+            if let Some(prom) = prometheus_observer_from_state(state.observer.as_ref()) {
                 prom.encode()
             } else {
                 prometheus_disabled_hint()
@@ -2282,13 +2297,17 @@ mod tests {
     #[cfg(feature = "observability-prometheus")]
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
-        let prom = Arc::new(crate::observability::PrometheusObserver::new());
+        let event_tx = tokio::sync::broadcast::channel(16).0;
+        let wrapped = sse::BroadcastObserver::new(
+            Box::new(crate::observability::PrometheusObserver::new()),
+            event_tx.clone(),
+        );
         crate::observability::Observer::record_event(
-            prom.as_ref(),
+            &wrapped,
             &crate::observability::ObserverEvent::HeartbeatTick,
         );
 
-        let observer: Arc<dyn crate::observability::Observer> = prom;
+        let observer: Arc<dyn crate::observability::Observer> = Arc::new(wrapped);
         let state = AppState {
             config: Arc::new(Mutex::new(Config::default())),
             provider: Arc::new(MockProvider::default()),
@@ -2312,7 +2331,7 @@ mod tests {
             observer,
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
-            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_tx,
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
