@@ -283,6 +283,10 @@ ci-all = [
     "plugins-wasm",
 ]
 
+[profile.dev]
+incremental = true
+opt-level = 1
+
 [profile.release]
 opt-level = "z"      # Optimize for size
 lto = "fat"          # Maximum cross-crate optimization for smaller binaries
