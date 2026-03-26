@@ -4031,7 +4031,178 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms),
             ))
         }
-        other => anyhow::bail!("Unknown channel '{other}'. Supported: telegram, discord, slack"),
+        "qq" => {
+            let qq = config
+                .channels_config
+                .qq
+                .as_ref()
+                .context("QQ channel is not configured")?;
+            Ok(Arc::new(
+                QQChannel::new(
+                    qq.app_id.clone(),
+                    qq.app_secret.clone(),
+                    qq.allowed_users.clone(),
+                )
+                .with_workspace_dir(config.workspace_dir.clone())
+                .with_proxy_url(qq.proxy_url.clone()),
+            ))
+        }
+        "mattermost" => {
+            let mm = config
+                .channels_config
+                .mattermost
+                .as_ref()
+                .context("Mattermost channel is not configured")?;
+            Ok(Arc::new(
+                MattermostChannel::new(
+                    mm.url.clone(),
+                    mm.bot_token.clone(),
+                    mm.channel_id.clone(),
+                    mm.allowed_users.clone(),
+                    mm.thread_replies.unwrap_or(true),
+                    mm.mention_only.unwrap_or(false),
+                )
+                .with_proxy_url(mm.proxy_url.clone())
+                .with_transcription(config.transcription.clone()),
+            ))
+        }
+        "signal" => {
+            let sig = config
+                .channels_config
+                .signal
+                .as_ref()
+                .context("Signal channel is not configured")?;
+            Ok(Arc::new(
+                SignalChannel::new(
+                    sig.http_url.clone(),
+                    sig.account.clone(),
+                    sig.group_id.clone(),
+                    sig.allowed_from.clone(),
+                    sig.ignore_attachments,
+                    sig.ignore_stories,
+                )
+                .with_proxy_url(sig.proxy_url.clone()),
+            ))
+        }
+        "email" => {
+            let email_cfg = config
+                .channels_config
+                .email
+                .as_ref()
+                .context("Email channel is not configured")?;
+            Ok(Arc::new(EmailChannel::new(email_cfg.clone())))
+        }
+        "irc" => {
+            let irc_cfg = config
+                .channels_config
+                .irc
+                .as_ref()
+                .context("IRC channel is not configured")?;
+            Ok(Arc::new(IrcChannel::new(irc::IrcChannelConfig {
+                server: irc_cfg.server.clone(),
+                port: irc_cfg.port,
+                nickname: irc_cfg.nickname.clone(),
+                username: irc_cfg.username.clone(),
+                channels: irc_cfg.channels.clone(),
+                allowed_users: irc_cfg.allowed_users.clone(),
+                server_password: irc_cfg.server_password.clone(),
+                nickserv_password: irc_cfg.nickserv_password.clone(),
+                sasl_password: irc_cfg.sasl_password.clone(),
+                verify_tls: irc_cfg.verify_tls.unwrap_or(true),
+            })))
+        }
+        "matrix" => {
+            #[cfg(feature = "channel-matrix")]
+            {
+                let mx = config
+                    .channels_config
+                    .matrix
+                    .as_ref()
+                    .context("Matrix channel is not configured")?;
+                Ok(Arc::new(
+                    MatrixChannel::new_full(
+                        mx.homeserver.clone(),
+                        mx.access_token.clone(),
+                        mx.room_id.clone(),
+                        mx.allowed_users.clone(),
+                        mx.allowed_rooms.clone(),
+                        mx.user_id.clone(),
+                        mx.device_id.clone(),
+                        config.config_path.parent().map(|path| path.to_path_buf()),
+                    )
+                    .with_streaming(
+                        mx.stream_mode,
+                        mx.draft_update_interval_ms,
+                        mx.multi_message_delay_ms,
+                    )
+                    .with_transcription(config.transcription.clone()),
+                ))
+            }
+            #[cfg(not(feature = "channel-matrix"))]
+            {
+                anyhow::bail!(
+                    "Matrix channel requires the `channel-matrix` feature at compile time"
+                );
+            }
+        }
+        "lark" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lk = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .context("Lark channel is not configured")?;
+                Ok(Arc::new(
+                    LarkChannel::from_lark_config(lk)
+                        .with_transcription(config.transcription.clone()),
+                ))
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!(
+                    "Lark channel requires the `channel-lark` feature at compile time"
+                );
+            }
+        }
+        "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let fs = config
+                    .channels_config
+                    .feishu
+                    .as_ref()
+                    .context("Feishu channel is not configured")?;
+                Ok(Arc::new(
+                    LarkChannel::from_feishu_config(fs)
+                        .with_transcription(config.transcription.clone()),
+                ))
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!(
+                    "Feishu channel requires the `channel-lark` feature at compile time"
+                );
+            }
+        }
+        "dingtalk" => {
+            let dt = config
+                .channels_config
+                .dingtalk
+                .as_ref()
+                .context("DingTalk channel is not configured")?;
+            Ok(Arc::new(
+                DingTalkChannel::new(
+                    dt.client_id.clone(),
+                    dt.client_secret.clone(),
+                    dt.allowed_users.clone(),
+                )
+                .with_proxy_url(dt.proxy_url.clone()),
+            ))
+        }
+        other => anyhow::bail!(
+            "Unknown channel '{other}'. Supported: telegram, discord, slack, qq, mattermost, signal, email, irc, matrix, lark, feishu, dingtalk"
+        ),
     }
 }
 
