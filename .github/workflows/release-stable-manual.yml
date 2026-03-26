@@ -128,7 +128,7 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --target ${{ matrix.target }}
+          cargo build --release --locked --features channel-lark --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -217,16 +217,12 @@ jobs:
             version "${VERSION}"
             license "MIT OR Apache-2.0"
 
-            # Pre-built binary is available for Apple Silicon only.
-            # Intel Mac (x86_64) is not supported — use: cargo install zeroclaw
+            # Pre-built binary for Apple Silicon (aarch64-apple-darwin).
+            # Works with both /opt/homebrew (native ARM) and /usr/local Homebrew under Rosetta.
             url "https://github.com/bighorse/zeroclaw/releases/download/${TAG}/zeroclaw-aarch64-apple-darwin.tar.gz"
             sha256 "${SHA256}"
 
             def install
-              if Hardware::CPU.intel?
-                odie "zeroclaw pre-built binaries require Apple Silicon (M1/M2/M3/M4).\\n" \
-                     "Intel Mac is not supported. Build from source: cargo install zeroclaw"
-              end
               bin.install "zeroclaw"
             end
 
