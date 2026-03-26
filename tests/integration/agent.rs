@@ -260,7 +260,7 @@ async fn e2e_multi_turn_history_fidelity() {
 async fn e2e_memory_enrichment_injects_context() {
     let (provider, recorded) = RecordingProvider::new(vec![text_response("enriched response")]);
 
-    let memory_context = "[Memory context]\n- user_name: test_user\n\n";
+    let memory_context = "[Memory context]\n- user_name: test_user\n[/Memory context]\n\n";
     let loader = StaticMemoryLoader::new(memory_context);
 
     let mut agent = build_recording_agent(Box::new(provider), vec![], Some(Box::new(loader)));
@@ -306,7 +306,7 @@ async fn e2e_multi_turn_with_memory_enrichment() {
     let (provider, recorded) =
         RecordingProvider::new(vec![text_response("answer 1"), text_response("answer 2")]);
 
-    let memory_context = "[Memory context]\n- project: zeroclaw\n\n";
+    let memory_context = "[Memory context]\n- project: zeroclaw\n[/Memory context]\n\n";
     let loader = StaticMemoryLoader::new(memory_context);
 
     let mut agent = build_recording_agent(Box::new(provider), vec![], Some(Box::new(loader)));

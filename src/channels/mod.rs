@@ -1787,7 +1787,7 @@ async fn build_memory_context(
         }
 
         if included > 0 {
-            context.push('\n');
+            context.push_str("[/Memory context]\n\n");
         }
     }
 
