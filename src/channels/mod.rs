@@ -634,6 +634,7 @@ fn build_channel_system_prompt(
     base_prompt: &str,
     channel_name: &str,
     reply_target: &str,
+    thread_ts: Option<&str>,
 ) -> String {
     let mut prompt = base_prompt.to_string();
 
@@ -665,12 +666,16 @@ fn build_channel_system_prompt(
     }
 
     if !reply_target.is_empty() {
+        let thread_part = thread_ts
+            .map(|ts| format!(", thread_ts={ts}"))
+            .unwrap_or_default();
         let context = format!(
             "\n\nChannel context: You are currently responding on channel={channel_name}, \
-             reply_target={reply_target}. When scheduling delayed messages or reminders \
+             reply_target={reply_target}{thread_part}. When scheduling delayed messages or reminders \
              via cron_add for this conversation, use delivery={{\"mode\":\"announce\",\
              \"channel\":\"{channel_name}\",\"to\":\"{reply_target}\"}} so the message \
-             reaches the user."
+             reaches the user. When uploading files to Slack, always include thread_ts={reply_target}{thread_part} \
+             to keep uploads in the current thread."
         );
         prompt.push_str(&context);
     }
@@ -2578,8 +2583,12 @@ async fn process_channel_message(
     } else {
         refreshed_new_session_system_prompt(ctx.as_ref())
     };
-    let mut system_prompt =
-        build_channel_system_prompt(&base_system_prompt, &msg.channel, &msg.reply_target);
+    let mut system_prompt = build_channel_system_prompt(
+        &base_system_prompt,
+        &msg.channel,
+        &msg.reply_target,
+        msg.thread_ts.as_deref(),
+    );
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
     }
@@ -2643,9 +2652,11 @@ async fn process_channel_message(
                 while let Some(event) = rx.recv().await {
                     match event {
                         DraftEvent::Clear => {
+                            tracing::debug!("Draft stream: clear");
                             accumulated.clear();
                         }
                         DraftEvent::Progress(text) => {
+                            tracing::debug!(text = %text.trim(), "Draft stream: progress");
                             if let Err(e) = channel
                                 .update_draft_progress(&reply_target, &draft_id, &text)
                                 .await
@@ -2654,6 +2665,11 @@ async fn process_channel_message(
                             }
                         }
                         DraftEvent::Content(text) => {
+                            tracing::debug!(
+                                chunk_len = text.len(),
+                                total_len = accumulated.len() + text.len(),
+                                "Draft stream: content chunk"
+                            );
                             accumulated.push_str(&text);
                             if let Err(e) = channel
                                 .update_draft(&reply_target, &draft_id, &accumulated)
@@ -2664,6 +2680,7 @@ async fn process_channel_message(
                         }
                     }
                 }
+                tracing::debug!(total_len = accumulated.len(), "Draft stream: complete");
             }))
         } else {
             None
@@ -3064,6 +3081,11 @@ async fn process_channel_message(
                 "  🤖 Reply ({}ms): {}",
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&delivered_response, 80)
+            );
+            tracing::debug!(
+                response = %truncate_with_ellipsis(&delivered_response, 2000),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                "Full LLM response"
             );
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
