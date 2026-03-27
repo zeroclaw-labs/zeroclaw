@@ -24,7 +24,8 @@ pub mod ws;
 
 use crate::channels::{
     session_backend::SessionBackend, session_sqlite::SqliteSessionBackend, Channel,
-    GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
+    GmailPushChannel, LineChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
+    WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;
@@ -93,6 +94,10 @@ fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
 
 fn wati_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("wati_{}_{}", msg.sender, msg.id)
+}
+
+fn line_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("line_{}_{}", msg.sender, msg.id)
 }
 
 fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
@@ -337,6 +342,10 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// LINE Messaging API channel
+    pub line: Option<Arc<LineChannel>>,
+    /// LINE Channel Secret for `X-Line-Signature` verification
+    pub line_channel_secret: Option<Arc<str>>,
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
@@ -582,6 +591,34 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         })
         .map(Arc::from);
 
+    // LINE channel (if configured)
+    let line_channel: Option<Arc<LineChannel>> = config.channels_config.line.as_ref().map(|ln| {
+        let mut ch = LineChannel::new(ln.channel_access_token.clone(), ln.allowed_users.clone())
+            .with_reply_mode(ln.reply_mode);
+        if let Some(ws_dir) = config.workspace_dir.parent() {
+            ch = ch.with_workspace_dir(ws_dir.join("workspace"));
+        }
+        Arc::new(ch)
+    });
+
+    // LINE Channel Secret for webhook signature verification
+    // Priority: environment variable > config file
+    let line_channel_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINE_CHANNEL_SECRET")
+        .ok()
+        .and_then(|s| {
+            let s = s.trim().to_owned();
+            (!s.is_empty()).then_some(s)
+        })
+        .or_else(|| {
+            config
+                .channels_config
+                .line
+                .as_ref()
+                .map(|ln| ln.channel_secret.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+        .map(Arc::from);
+
     // Linq channel (if configured)
     let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
         Arc::new(LinqChannel::new(
@@ -768,6 +805,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if linq_channel.is_some() {
         println!("  POST {pfx}/linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    if line_channel.is_some() {
+        println!("  POST {pfx}/line      — LINE message webhook");
+    }
     if wati_channel.is_some() {
         println!("  GET  {pfx}/wati      — WATI webhook verification");
         println!("  POST {pfx}/wati      — WATI message webhook");
@@ -834,6 +874,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        line: line_channel,
+        line_channel_secret,
         linq: linq_channel,
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
@@ -897,6 +939,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/line", post(handle_line_webhook))
         .route("/linq", post(handle_linq_webhook))
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
@@ -1692,6 +1735,120 @@ async fn handle_whatsapp_message(
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
+/// POST /line — incoming message webhook from LINE Messaging API
+async fn handle_line_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref line) = state.line else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "LINE not configured"})),
+        );
+    };
+
+    let body_str = String::from_utf8_lossy(&body);
+
+    // ── Security: Verify X-Line-Signature ────────────────────────────────────
+    if let Some(ref channel_secret) = state.line_channel_secret {
+        let signature = headers
+            .get("X-Line-Signature")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        if !crate::channels::line::verify_line_signature(channel_secret, &body_str, signature) {
+            tracing::warn!(
+                "LINE webhook signature verification failed ({})",
+                if signature.is_empty() {
+                    "missing"
+                } else {
+                    "invalid"
+                }
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Invalid signature"})),
+            );
+        }
+    }
+
+    // ── Parse JSON body ───────────────────────────────────────────────────────
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // ── Parse and dispatch messages ───────────────────────────────────────────
+    let messages = line.parse_webhook_payload(&payload).await;
+
+    if messages.is_empty() {
+        // Acknowledge without processing (e.g. follow/join events)
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    for msg in &messages {
+        tracing::info!(
+            "LINE message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+        let session_id = sender_session_id("line", msg);
+
+        // Auto-save to memory
+        if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
+            let key = line_memory_key(msg);
+            let _ = state
+                .mem
+                .store(
+                    &key,
+                    &msg.content,
+                    MemoryCategory::Conversation,
+                    Some(&session_id),
+                )
+                .await;
+        }
+
+        // Call the LLM
+        match Box::pin(run_gateway_chat_with_tools(
+            &state,
+            &msg.content,
+            Some(&session_id),
+        ))
+        .await
+        {
+            Ok(response) => {
+                if let Err(e) = line
+                    .send_with_reply_token(
+                        &SendMessage::new(response, &msg.reply_target),
+                        msg.thread_ts.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::error!("Failed to send LINE reply: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!("LLM error for LINE message: {e:#}");
+                let _ = line
+                    .send_with_reply_token(
+                        &SendMessage::new(
+                            "Sorry, I couldn't process your message right now.",
+                            &msg.reply_target,
+                        ),
+                        msg.thread_ts.as_deref(),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    // LINE expects HTTP 200 OK
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
 /// POST /linq — incoming message webhook (iMessage/RCS/SMS via Linq)
 async fn handle_linq_webhook(
     State(state): State<AppState>,
@@ -2320,6 +2477,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2388,6 +2547,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2782,6 +2943,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2860,6 +3023,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2950,6 +3115,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3012,6 +3179,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3079,6 +3248,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3151,6 +3322,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3220,6 +3393,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),

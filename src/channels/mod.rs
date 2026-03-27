@@ -28,6 +28,7 @@ pub mod imessage;
 pub mod irc;
 #[cfg(feature = "channel-lark")]
 pub mod lark;
+pub mod line;
 pub mod link_enricher;
 pub mod linq;
 #[cfg(feature = "channel-matrix")]
@@ -75,6 +76,7 @@ pub use imessage::IMessageChannel;
 pub use irc::IrcChannel;
 #[cfg(feature = "channel-lark")]
 pub use lark::LarkChannel;
+pub use line::LineChannel;
 pub use linq::LinqChannel;
 #[cfg(feature = "channel-matrix")]
 pub use matrix::MatrixChannel;

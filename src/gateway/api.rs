@@ -1626,6 +1626,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,

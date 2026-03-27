@@ -6067,6 +6067,8 @@ pub struct ChannelsConfig {
     pub signal: Option<SignalConfig>,
     /// WhatsApp channel configuration (Cloud API or Web mode).
     pub whatsapp: Option<WhatsAppConfig>,
+    /// LINE Messaging API channel configuration.
+    pub line: Option<LineConfig>,
     /// Linq Partner API channel configuration.
     pub linq: Option<LinqConfig>,
     /// WATI WhatsApp Business API channel configuration.
@@ -6178,6 +6180,10 @@ impl ChannelsConfig {
                 self.whatsapp.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.line.as_ref())),
+                self.line.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.linq.as_ref())),
                 self.linq.is_some(),
             ),
@@ -6278,6 +6284,7 @@ impl Default for ChannelsConfig {
             matrix: None,
             signal: None,
             whatsapp: None,
+            line: None,
             linq: None,
             wati: None,
             nextcloud_talk: None,
@@ -6801,6 +6808,52 @@ impl ChannelConfig for WhatsAppConfig {
     }
     fn desc() -> &'static str {
         "Business Cloud API"
+    }
+}
+
+/// Outbound message delivery mode for the LINE channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LineReplyMode {
+    /// Use Reply API when a `replyToken` is available (free, no quota cost),
+    /// fall back to Push API when no token is present (e.g. proactive messages).
+    /// **This is the recommended default** — it conserves Push quota on free plans.
+    #[default]
+    ReplyFirst,
+    /// Always use Push API regardless of whether a `replyToken` is available.
+    /// Compatible with all message types but consumes Push quota every time.
+    PushOnly,
+    /// Always use Reply API. Fails for proactive/scheduled messages that have
+    /// no `replyToken`. Suitable when Push API is not available on the plan.
+    ReplyOnly,
+}
+
+/// LINE Messaging API channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LineConfig {
+    /// LINE Channel Secret — used to verify `X-Line-Signature` webhook headers.
+    /// Can also be set via `ZEROCLAW_LINE_CHANNEL_SECRET` env var.
+    pub channel_secret: String,
+    /// LINE Channel Access Token — used for outbound push messages and content download.
+    pub channel_access_token: String,
+    /// Allowed LINE user IDs that the bot will respond to.
+    /// Use `["*"]` to allow all users (not recommended for public bots).
+    pub allowed_users: Vec<String>,
+    /// Outbound delivery mode: `reply_first` (default), `push_only`, or `reply_only`.
+    ///
+    /// - `reply_first` — Reply API when `replyToken` available, Push API as fallback.
+    /// - `push_only`   — Always Push API (current legacy behavior).
+    /// - `reply_only`  — Always Reply API; fails without a `replyToken`.
+    #[serde(default)]
+    pub reply_mode: LineReplyMode,
+}
+
+impl ChannelConfig for LineConfig {
+    fn name() -> &'static str {
+        "LINE"
+    }
+    fn desc() -> &'static str {
+        "LINE Messaging API bot"
     }
 }
 
@@ -11350,6 +11403,7 @@ auto_save = true
                 matrix: None,
                 signal: None,
                 whatsapp: None,
+                line: None,
                 linq: None,
                 wati: None,
                 nextcloud_talk: None,
@@ -12380,6 +12434,7 @@ allowed_users = ["@ops:matrix.org"]
             }),
             signal: None,
             whatsapp: None,
+            line: None,
             linq: None,
             wati: None,
             nextcloud_talk: None,
@@ -12747,6 +12802,7 @@ channel_ids = ["C123", "D456"]
                 group_mention_patterns: vec![],
                 proxy_url: None,
             }),
+            line: None,
             linq: None,
             wati: None,
             nextcloud_talk: None,
