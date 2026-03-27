@@ -678,23 +678,55 @@ fn build_channel_system_prompt(
     prompt
 }
 
+fn has_tool_call(text: &str) -> bool {
+    text.contains("<tool_call") || text.contains("\"tool_calls\"") || text.contains("\"tool_use\"")
+}
+
+fn has_tool_result(text: &str) -> bool {
+    text.contains("<tool_result") || text.contains("\"tool_result\"")
+}
+
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
+    let mut last_was_tool_call = false;
 
     for turn in turns {
         match (expecting_user, turn.role.as_str()) {
             (true, "user") => {
+                let mut turn = turn;
+                // Orphaned tool results at the start of history are invalid
+                // for most providers (especially Anthropic).
+                if (normalized.is_empty() || !last_was_tool_call) && has_tool_result(&turn.content) {
+                    turn.content = strip_tool_result_content(&turn.content);
+                }
+
+                if turn.content.trim().is_empty() && normalized.is_empty() {
+                    // Skip leading empty messages that resulted from stripping.
+                    continue;
+                }
+
                 normalized.push(turn);
                 expecting_user = false;
+                last_was_tool_call = false;
+            }
+            (true, "tool") => {
+                // Role "tool" turns (native tool results) satisfy the user/tool turn requirement.
+                if !normalized.is_empty() {
+                    normalized.push(turn);
+                    expecting_user = false;
+                    last_was_tool_call = false;
+                }
             }
             (false, "assistant") => {
+                let is_tool_call = has_tool_call(&turn.content);
                 normalized.push(turn);
                 expecting_user = true;
+                last_was_tool_call = is_tool_call;
             }
-            // Interrupted channel turns can produce consecutive user messages
-            // (no assistant persisted yet). Merge instead of dropping.
-            (false, "user") | (true, "assistant") => {
+            // Interrupted channel turns can produce consecutive messages of the same role.
+            // Merge instead of dropping to keep context.
+            (false, "user") | (true, "assistant") | (false, "tool") => {
                 if let Some(last_turn) = normalized.last_mut() {
                     if !turn.content.is_empty() {
                         if !last_turn.content.is_empty() {
@@ -712,14 +744,18 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
 }
 
 /// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
-/// header, if present) from a conversation-history entry so that stale tool
-/// output is never presented to the LLM without the corresponding `<tool_call>`.
+/// header, if present) from a conversation-history entry.
 fn strip_tool_result_content(text: &str) -> String {
     static TOOL_RESULT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?s)<tool_result[^>]*>.*?</tool_result>").unwrap()
     });
+    // Support native JSON tool results as well.
+    static NATIVE_TOOL_RESULT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#"(?s)\{"tool_call_id":\s*"[^"]*",\s*"content":\s*".*?"\}"#).unwrap()
+    });
 
     let cleaned = TOOL_RESULT_RE.replace_all(text, "");
+    let cleaned = NATIVE_TOOL_RESULT_RE.replace_all(&cleaned, "");
     let cleaned = cleaned.trim();
 
     // If the only remaining content is the header, drop it entirely.
@@ -2472,15 +2508,6 @@ async fn process_channel_message(
             .unwrap_or_default()
     };
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
-
-    // Strip stale tool_result blocks from cached turns so the LLM never
-    // sees a `<tool_result>` without a preceding `<tool_call>`, which
-    // causes hallucinated output on subsequent heartbeat ticks or sessions.
-    for turn in &mut prior_turns {
-        if turn.content.contains("<tool_result") {
-            turn.content = strip_tool_result_content(&turn.content);
-        }
-    }
 
     // Strip [Used tools: ...] prefixes from cached assistant turns so the
     // LLM never sees (and reproduces) this internal summary format (#4400).
@@ -5551,6 +5578,45 @@ mod tests {
             "telegram_user_msg_201",
             "plain text without tool results"
         ));
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_strips_leading_tool_result_instead_of_dropping_history() {
+        let turns = vec![
+            ChatMessage::assistant("<tool_call id='1' name='test' arguments='{}' />"),
+            ChatMessage::user("<tool_result id='1' status='success'>result</tool_result>"),
+            ChatMessage::assistant("final answer"),
+            ChatMessage::user("next user question"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        
+        // Assistant(1) is dropped because history must start with user.
+        // User(2) becomes the first message, but since its call was dropped, it's stripped.
+        // Stripped User(2) is empty, so it's skipped.
+        // Assistant(3) is now the first message (expecting_user=true), so it's merged into nothing/dropped.
+        // User(4) is the first valid user message.
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[0].content, "next user question");
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_preserves_paired_tool_use() {
+        let turns = vec![
+            ChatMessage::user("initial question"),
+            ChatMessage::assistant("<tool_call id='1' name='test' arguments='{}' />"),
+            ChatMessage::user("<tool_result id='1' status='success'>result</tool_result>"),
+            ChatMessage::assistant("final answer"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(normalized[1].role, "assistant");
+        assert!(normalized[1].content.contains("<tool_call"));
+        assert_eq!(normalized[2].role, "user");
+        assert!(normalized[2].content.contains("<tool_result"));
     }
 
     #[test]
