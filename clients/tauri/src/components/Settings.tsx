@@ -24,7 +24,7 @@ interface ModelOption {
 const MODEL_OPTIONS: Record<string, ModelOption[]> = {
   claude: [
     { id: "claude-opus-4-6", label: "Claude Opus 4.6", tier: "Premium" },
-    { id: "claude-sonnet-4-20250514", label: "Claude Sonnet 4.6", tier: "Standard" },
+    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", tier: "Standard" },
     { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5", tier: "Fast" },
   ],
   openai: [
@@ -64,11 +64,16 @@ function setStoredApiKey(provider: string, key: string): void {
 }
 
 function getStoredProvider(): string {
-  return localStorage.getItem(STORAGE_KEY_LLM_PROVIDER) || "gemini";
+  const stored = localStorage.getItem(STORAGE_KEY_LLM_PROVIDER);
+  if (stored) return stored;
+  // Auto-select provider priority: Anthropic > OpenAI > Gemini (free fallback)
+  if (localStorage.getItem(`${API_KEY_STORAGE_PREFIX}anthropic`)) return "claude";
+  if (localStorage.getItem(`${API_KEY_STORAGE_PREFIX}openai`)) return "openai";
+  return "gemini";
 }
 
 function getStoredModel(): string {
-  return localStorage.getItem(STORAGE_KEY_LLM_MODEL) || "gemini-2.5-flash";
+  return localStorage.getItem(STORAGE_KEY_LLM_MODEL) || "gemini-3.1-pro-preview";
 }
 
 export function Settings({ locale, isConnected, onLocaleChange, onBack, onLogout }: SettingsProps) {

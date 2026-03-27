@@ -35,18 +35,18 @@ const MODEL_GROUPS: ModelGroup[] = [
     provider: "openai",
     keyName: "openai",
     models: [
-      { id: "gpt-4.1", label: "GPT-4.1", tier: "Premium" },
-      { id: "gpt-4.1-mini", label: "GPT-4.1 Mini", tier: "Standard" },
-      { id: "gpt-4.1-nano", label: "GPT-4.1 Nano", tier: "Fast" },
+      { id: "gpt-5.4", label: "GPT-5.4", tier: "Premium" },
+      { id: "gpt-4.1", label: "GPT-4.1", tier: "Standard" },
+      { id: "gpt-4.1-mini", label: "GPT-4.1 Mini", tier: "Fast" },
     ],
   },
   {
     provider: "gemini",
     keyName: "gemini",
     models: [
-      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", tier: "Premium" },
+      { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro", tier: "Premium" },
       { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash", tier: "Standard" },
-      { id: "gemini-3.1-flash-lite-preview", label: "Gemini 3.1 Flash Lite", tier: "Fast" },
+      { id: "gemini-2.5-flash-lite", label: "Gemini 2.5 Flash-Lite", tier: "Fast" },
     ],
   },
 ];

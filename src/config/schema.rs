@@ -63,8 +63,8 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
     };
 
     match canonical_provider.as_str() {
-        "anthropic" => "claude-sonnet-4-5-20250929",
-        "openai" => "gpt-5.2",
+        "anthropic" => "claude-opus-4-6",
+        "openai" => "gpt-5.4",
         "openai-codex" => "gpt-5-codex",
         "venice" => "zai-org-glm-5",
         "groq" => "llama-3.3-70b-versatile",
@@ -87,7 +87,7 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "ollama" => "llama3.2",
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF",
         "sglang" | "vllm" | "osaurus" | "copilot" => "default",
-        "gemini" => "gemini-3.1-flash-lite-preview",
+        "gemini" => "gemini-3.1-pro-preview",
         "kimi-code" => "kimi-for-coding",
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0",
         "nvidia" => "meta/llama-3.3-70b-instruct",

@@ -791,8 +791,19 @@ export class MoAClient {
     }
 
     // Include user's selected provider/model preference
-    const provider = localStorage.getItem("zeroclaw_llm_provider") || "gemini";
-    const model = localStorage.getItem("zeroclaw_llm_model") || "gemini-2.5-flash";
+    // Priority: user's explicit choice > Anthropic (if key exists) > OpenAI > Gemini
+    let provider = localStorage.getItem("zeroclaw_llm_provider") || "";
+    if (!provider) {
+      if (localStorage.getItem("zeroclaw_api_key_anthropic")) provider = "claude";
+      else if (localStorage.getItem("zeroclaw_api_key_openai")) provider = "openai";
+      else provider = "gemini";
+    }
+    const providerDefaults: Record<string, string> = {
+      claude: "claude-opus-4-6",
+      openai: "gpt-5.4",
+      gemini: "gemini-3.1-pro-preview",
+    };
+    const model = localStorage.getItem("zeroclaw_llm_model") || providerDefaults[provider] || "gemini-3.1-pro-preview";
 
     const keyStorageName = MoAClient.PROVIDER_KEY_MAP[provider] || provider;
     const apiKey = localStorage.getItem(`zeroclaw_api_key_${keyStorageName}`) || "";
@@ -835,6 +846,7 @@ export class MoAClient {
     if (hasSelectedProviderKey) {
       // ════════════════════════════════════════════════════════════
       // MODE 1 — LOCAL: User has their own API key → local only
+      // API key NEVER leaves the device. No relay fallback.
       // ════════════════════════════════════════════════════════════
       const res = await this.tryChatRequest(this.serverUrl, body);
 
@@ -842,13 +854,11 @@ export class MoAClient {
         return this.parseChatResponse(res);
       }
 
-      // Local gateway unreachable — do NOT fall back to relay
+      // Local gateway unreachable — do NOT send API key to relay
       this.gatewayAlive = false;
       throw new Error(
-        "로컬에 저장하신 LLM 모델의 API key가 유효한 key인지 확인해 주세요.\n" +
-          "만약 key를 수정해도 다시 접속에 실패하면 API key를 제거하시고 " +
-          "'서버 경유'로 변경해 주세요.\n" +
-          "(서버 경유 시 운영자의 API key를 빌려서 사용하실 수 있습니다)",
+        "로컬 게이트웨이에 연결할 수 없습니다.\n" +
+          "MoA 앱을 재시작하거나, 설정에서 로컬 게이트웨이 상태를 확인해 주세요.",
       );
     }
 
