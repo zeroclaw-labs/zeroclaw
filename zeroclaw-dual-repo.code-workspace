@@ -1,0 +1,22 @@
+{
+  "folders": [
+    {
+      "name": "01 - zeroclaw-wsl-primary",
+      "path": "."
+    },
+    {
+      "name": "99 - zeroclaw-win-archive",
+      "path": "/home/lasve046/pilot/zeroclaw-win-archive"
+    }
+  ],
+  "settings": {
+    "search.exclude": {
+      "**/target": true,
+      "**/web/node_modules": true
+    },
+    "files.watcherExclude": {
+      "**/target/**": true,
+      "**/web/node_modules/**": true
+    }
+  }
+}

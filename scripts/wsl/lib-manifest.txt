@@ -1,0 +1,9 @@
+# mode|source|target
+#
+# Keep this list focused on the external assets your WSL workflows actually use.
+# Do not mirror everything by default.
+
+symlink|/mnt/l/libs/wp|/home/lasve046/libs/wp
+symlink|/mnt/s/libs/bin/qf-site-navigator-rs|/home/lasve046/libs/bin/qf-site-navigator-rs
+symlink|/mnt/s/pkg/INFRA/qf_port_authority|/home/lasve046/libs/infra/qf_port_authority
+symlink|/mnt/l/docs/pkg/app/qf_bricks_buddy/kb|/home/lasve046/libs/docs/qf_bricks_buddy-kb
