@@ -531,8 +531,10 @@ impl Provider for AnthropicProvider {
             Self::apply_cache_to_last_message(&mut messages);
         }
 
+        let clean_model = super::strip_provider_prefix(model);
+
         let native_request = NativeChatRequest {
-            model: model.to_string(),
+            model: clean_model.to_string(),
             max_tokens: 4096,
             system: system_prompt,
             messages,

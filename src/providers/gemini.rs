@@ -756,10 +756,11 @@ impl GeminiProvider {
     }
 
     fn format_model_name(model: &str) -> String {
-        if model.starts_with("models/") {
-            model.to_string()
+        let clean = super::strip_provider_prefix(model);
+        if clean.starts_with("models/") {
+            clean.to_string()
         } else {
-            format!("models/{model}")
+            format!("models/{clean}")
         }
     }
 

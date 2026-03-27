@@ -742,6 +742,23 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
+/// Strip provider-name prefix from model identifiers.
+///
+/// The client may send model names like "anthropic/claude-sonnet-4-6" or
+/// "openai/gpt-4o". Provider APIs expect the bare model name without the
+/// routing prefix (e.g. "claude-sonnet-4-6", "gpt-4o").
+pub fn strip_provider_prefix(model: &str) -> &str {
+    // Common prefixes: "anthropic/", "openai/", "gemini/", "google/", etc.
+    if let Some(pos) = model.find('/') {
+        let prefix = &model[..pos];
+        // Only strip if the prefix looks like a provider name (no dots, short)
+        if prefix.len() <= 20 && !prefix.contains('.') {
+            return &model[pos + 1..];
+        }
+    }
+    model
+}
+
 /// Scrub known secret-like token prefixes from provider error strings.
 ///
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,

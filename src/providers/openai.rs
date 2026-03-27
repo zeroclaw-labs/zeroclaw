@@ -337,8 +337,9 @@ impl Provider for OpenAiProvider {
             content: message.to_string(),
         });
 
+        let clean_model = super::strip_provider_prefix(model);
         let request = ChatRequest {
-            model: model.to_string(),
+            model: clean_model.to_string(),
             messages,
             temperature,
             max_tokens: self.max_tokens_override,
