@@ -35,7 +35,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
-use dialoguer::{Input, Password};
+use dialoguer::Password;
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -75,6 +75,7 @@ mod agent;
 mod approval;
 mod auth;
 mod channels;
+mod cli_input;
 mod commands;
 mod rag {
     pub use zeroclaw::rag::*;
@@ -106,16 +107,19 @@ mod security;
 mod service;
 mod skillforge;
 mod skills;
+mod sop;
 mod tools;
+mod trust;
 mod tunnel;
 mod util;
+mod verifiable_intent;
 
 use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
     ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
-    MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands,
+    MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands, SopCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -187,6 +191,10 @@ enum Commands {
         /// Memory backend (sqlite, lucid, markdown, none) - used in quick mode, default: sqlite
         #[arg(long)]
         memory: Option<String>,
+
+        /// Skip interactive prompts and use quick setup with defaults
+        #[arg(long)]
+        quick: bool,
     },
 
     /// Start the AI agent loop
@@ -241,6 +249,29 @@ Examples:
     Gateway {
         #[command(subcommand)]
         gateway_command: Option<zeroclaw::GatewayCommands>,
+    },
+
+    /// Start ACP (Agent Control Protocol) server over stdio
+    #[command(long_about = "\
+Start the ACP server (JSON-RPC 2.0 over stdio).
+
+Launches a JSON-RPC 2.0 server on stdin/stdout for IDE and tool \
+integration. Supports session management and streaming agent \
+responses as notifications.
+
+Methods: initialize, session/new, session/prompt, session/stop.
+
+Examples:
+  zeroclaw acp                        # start ACP server
+  zeroclaw acp --max-sessions 5       # limit concurrent sessions")]
+    Acp {
+        /// Maximum concurrent sessions (default: 10)
+        #[arg(long)]
+        max_sessions: Option<usize>,
+
+        /// Session inactivity timeout in seconds (default: 3600)
+        #[arg(long)]
+        session_timeout: Option<u64>,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -532,6 +563,25 @@ Examples:
         shell: CompletionShell,
     },
 
+    /// Launch or install the companion desktop app
+    #[command(long_about = "\
+Launch the ZeroClaw companion desktop app.
+
+The companion app is a lightweight menu bar / system tray application \
+that connects to the same gateway as the CLI. It provides quick access \
+to the dashboard, status monitoring, and device pairing.
+
+Use --install to download the pre-built companion app for your platform.
+
+Examples:
+  zeroclaw desktop              # launch the companion app
+  zeroclaw desktop --install    # download and install it")]
+    Desktop {
+        /// Download and install the companion app
+        #[arg(long)]
+        install: bool,
+    },
+
     /// Manage WASM plugins
     #[cfg(feature = "plugins-wasm")]
     Plugin {
@@ -602,6 +652,10 @@ enum AuthCommands {
         /// Use OAuth device-code flow
         #[arg(long)]
         device_code: bool,
+        /// Import an existing auth.json file instead of starting a new login flow.
+        /// Currently supports only `openai-codex`; Codex defaults to `~/.codex/auth.json`.
+        #[arg(long, value_name = "PATH", conflicts_with = "device_code")]
+        import: Option<PathBuf>,
     },
     /// Complete OAuth by pasting redirect URL or auth code
     PasteRedirect {
@@ -804,7 +858,9 @@ async fn main() -> Result<()> {
 
     // Onboard auto-detects the environment: if stdin/stdout are a TTY and no
     // provider flags were given, it runs the full interactive wizard; otherwise
-    // it runs the quick (scriptable) setup.  This means `curl … | bash` and
+    // it runs the quick (scriptable) setup.  Use --quick to force quick setup,
+    // or set ZEROCLAW_INTERACTIVE=1 to force interactive mode when TTY
+    // detection fails.  This means `curl … | bash` and
     // `zeroclaw onboard --api-key …` both take the fast path, while a bare
     // `zeroclaw onboard` in a terminal launches the wizard.
     if let Commands::Onboard {
@@ -815,6 +871,7 @@ async fn main() -> Result<()> {
         provider,
         model,
         memory,
+        quick,
     } = &cli.command
     {
         let force = *force;
@@ -824,6 +881,7 @@ async fn main() -> Result<()> {
         let provider = provider.clone();
         let model = model.clone();
         let memory = memory.clone();
+        let quick = *quick;
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
@@ -835,6 +893,9 @@ async fn main() -> Result<()> {
         }
         if channels_only && force {
             bail!("--channels-only does not accept --force");
+        }
+        if quick && channels_only {
+            bail!("--quick and --channels-only cannot be used together");
         }
 
         // Handle --reinit: backup and reset configuration
@@ -883,10 +944,20 @@ async fn main() -> Result<()> {
         let has_provider_flags =
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let env_interactive = std::env::var("ZEROCLAW_INTERACTIVE").as_deref() == Ok("1");
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
-        } else if is_tty && !has_provider_flags {
+        } else if quick || has_provider_flags {
+            Box::pin(onboard::run_quick_setup(
+                api_key.as_deref(),
+                provider.as_deref(),
+                model.as_deref(),
+                memory.as_deref(),
+                force,
+            ))
+            .await
+        } else if is_tty || env_interactive {
             Box::pin(onboard::run_wizard(force)).await
         } else {
             Box::pin(onboard::run_quick_setup(
@@ -958,6 +1029,21 @@ async fn main() -> Result<()> {
             ))
             .await
             .map(|_| ())
+        }
+
+        Commands::Acp {
+            max_sessions,
+            session_timeout,
+        } => {
+            let mut acp_config = channels::acp_server::AcpServerConfig::default();
+            if let Some(max) = max_sessions {
+                acp_config.max_sessions = max;
+            }
+            if let Some(timeout) = session_timeout {
+                acp_config.session_timeout_secs = timeout;
+            }
+            let server = channels::acp_server::AcpServer::new(config, acp_config);
+            server.run().await
         }
 
         Commands::Gateway { gateway_command } => {
@@ -1057,6 +1143,16 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            if let Ok(exe) = std::env::current_exe() {
+                let exe_str = exe.to_string_lossy();
+                if exe_str.contains(".cargo/bin") || exe_str.contains("/home/") {
+                    tracing::warn!(
+                        "Daemon running from user home directory: {}. \
+                         Consider installing to /usr/local/bin for system-wide service.",
+                        exe_str
+                    );
+                }
+            }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -1112,6 +1208,11 @@ async fn main() -> Result<()> {
             );
             println!("🛡️  Autonomy:      {:?}", config.autonomy.level);
             println!("⚙️  Runtime:       {}", config.runtime.kind);
+            if service::is_running() {
+                println!("🟢 Service:       running");
+            } else {
+                println!("🔴 Service:       stopped");
+            }
             let effective_memory_backend = memory::effective_memory_backend_name(
                 &config.memory.backend,
                 Some(&config.storage.provider.config),
@@ -1150,9 +1251,37 @@ async fn main() -> Result<()> {
                 config.autonomy.max_actions_per_hour
             );
             println!(
-                "  Max cost/day:      ${:.2}",
-                f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
+                "  Cost tracking:     {}",
+                if config.cost.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
+            println!("  Max cost/day:      ${:.2}", config.cost.daily_limit_usd);
+            println!("  Max cost/month:    ${:.2}", config.cost.monthly_limit_usd);
+            if config.cost.enabled {
+                match cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+                    Ok(tracker) => match tracker.get_summary() {
+                        Ok(summary) => {
+                            println!(
+                                "  Spent today:       ${:.4} / ${:.2}",
+                                summary.daily_cost_usd, config.cost.daily_limit_usd
+                            );
+                            println!(
+                                "  Spent this month:  ${:.4} / ${:.2}",
+                                summary.monthly_cost_usd, config.cost.monthly_limit_usd
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("  ⚠ Could not load cost usage: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("  ⚠ Could not init cost tracker: {e}");
+                    }
+                }
+            }
             println!("  OTP enabled:       {}", config.security.otp.enabled);
             println!("  E-stop enabled:    {}", config.security.estop.enabled);
             println!();
@@ -1310,6 +1439,122 @@ async fn main() -> Result<()> {
                 &config,
             ))
             .await
+        }
+
+        Commands::Desktop {
+            install: do_install,
+        } => {
+            let download_url = "https://www.zeroclawlabs.ai/download";
+
+            if do_install {
+                println!("Download the ZeroClaw companion app:");
+                println!();
+                #[cfg(target_os = "macos")]
+                {
+                    println!("  macOS:  {download_url}");
+                    println!();
+                    println!("Or install via Homebrew (coming soon):");
+                    println!("  brew install --cask zeroclaw");
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    println!("  Linux:  {download_url}");
+                    println!();
+                    println!("  Download the .deb or .AppImage for your architecture.");
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                {
+                    println!("  {download_url}");
+                }
+                println!();
+
+                // On macOS, open the download page in the browser
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = std::process::Command::new("open").arg(download_url).spawn();
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    let _ = std::process::Command::new("xdg-open")
+                        .arg(download_url)
+                        .spawn();
+                }
+                return Ok(());
+            }
+
+            // Locate the companion app
+            let desktop_bin = {
+                let mut found = None;
+
+                // 1. macOS: check /Applications/ZeroClaw.app
+                #[cfg(target_os = "macos")]
+                {
+                    let app_paths = [
+                        PathBuf::from("/Applications/ZeroClaw.app/Contents/MacOS/ZeroClaw"),
+                        PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                            .join("Applications/ZeroClaw.app/Contents/MacOS/ZeroClaw"),
+                    ];
+                    for app in &app_paths {
+                        if app.is_file() {
+                            found = Some(app.clone());
+                            break;
+                        }
+                    }
+                }
+
+                // 2. Same directory as the current executable
+                if found.is_none() {
+                    if let Ok(exe) = std::env::current_exe() {
+                        let sibling = exe.with_file_name("zeroclaw-desktop");
+                        if sibling.is_file() {
+                            found = Some(sibling);
+                        }
+                    }
+                }
+
+                // 3. ~/.cargo/bin/zeroclaw-desktop or ~/.local/bin/zeroclaw-desktop
+                if found.is_none() {
+                    if let Some(home) = std::env::var_os("HOME") {
+                        let home = PathBuf::from(home);
+                        for dir in &[".cargo/bin", ".local/bin"] {
+                            let candidate = home.join(dir).join("zeroclaw-desktop");
+                            if candidate.is_file() {
+                                found = Some(candidate);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 4. Fallback to PATH lookup
+                if found.is_none() {
+                    if let Ok(path) = which::which("zeroclaw-desktop") {
+                        found = Some(path);
+                    }
+                }
+
+                found
+            };
+
+            match desktop_bin {
+                Some(bin) => {
+                    println!("Launching ZeroClaw companion app...");
+                    let _child = std::process::Command::new(&bin)
+                        .spawn()
+                        .with_context(|| format!("Failed to launch {}", bin.display()))?;
+                    Ok(())
+                }
+                None => {
+                    println!("ZeroClaw companion app is not installed.");
+                    println!();
+                    println!("  Download it at: {download_url}");
+                    println!("  Or run: zeroclaw desktop --install");
+                    println!();
+                    println!("The companion app is a lightweight menu bar app that");
+                    println!("connects to the same gateway as the CLI.");
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Update {
@@ -1804,7 +2049,9 @@ fn read_auth_input(prompt: &str) -> Result<String> {
 }
 
 fn read_plain_input(prompt: &str) -> Result<String> {
-    let input: String = Input::new().with_prompt(prompt).interact_text()?;
+    let input: String = cli_input::Input::new()
+        .with_prompt(prompt)
+        .interact_text()?;
     Ok(input.trim().to_string())
 }
 
@@ -1817,6 +2064,54 @@ fn extract_openai_account_id_for_profile(access_token: &str) -> Option<String> {
         );
     }
     account_id
+}
+
+async fn import_openai_codex_auth_profile(
+    auth_service: &auth::AuthService,
+    profile: &str,
+    import_path: &std::path::Path,
+) -> Result<()> {
+    #[derive(Deserialize)]
+    struct CodexAuthTokens {
+        access_token: String,
+        #[serde(default)]
+        refresh_token: Option<String>,
+        #[serde(default)]
+        id_token: Option<String>,
+        #[serde(default)]
+        account_id: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct CodexAuthFile {
+        tokens: CodexAuthTokens,
+    }
+
+    let raw = std::fs::read_to_string(import_path)
+        .with_context(|| format!("Failed to read import file {}", import_path.display()))?;
+    let imported: CodexAuthFile = serde_json::from_str(&raw)
+        .with_context(|| format!("Failed to parse import file {}", import_path.display()))?;
+    let expires_at = auth::openai_oauth::extract_expiry_from_jwt(&imported.tokens.access_token);
+
+    let token_set = auth::profiles::TokenSet {
+        access_token: imported.tokens.access_token,
+        refresh_token: imported.tokens.refresh_token,
+        id_token: imported.tokens.id_token,
+        expires_at,
+        token_type: Some("Bearer".to_string()),
+        scope: None,
+    };
+
+    let account_id = imported
+        .tokens
+        .account_id
+        .or_else(|| extract_openai_account_id_for_profile(&token_set.access_token));
+
+    auth_service
+        .store_openai_tokens(profile, token_set, account_id, true)
+        .await?;
+
+    Ok(())
 }
 
 fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
@@ -1847,8 +2142,12 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             provider,
             profile,
             device_code,
+            import,
         } => {
             let provider = auth::normalize_provider(&provider)?;
+            if import.is_some() && provider != "openai-codex" {
+                bail!("`auth login --import` currently supports only --provider openai-codex");
+            }
             let client = reqwest::Client::new();
 
             match provider.as_str() {
@@ -1939,6 +2238,14 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
                     Ok(())
                 }
                 "openai-codex" => {
+                    if let Some(import_path) = import.as_deref() {
+                        import_openai_codex_auth_profile(&auth_service, &profile, import_path)
+                            .await?;
+                        println!("Imported auth profile from {}", import_path.display());
+                        println!("Active profile for openai-codex: {profile}");
+                        return Ok(());
+                    }
+
                     // OpenAI Codex OAuth flow
                     if device_code {
                         match auth::openai_oauth::start_device_code_flow(&client).await {
@@ -2400,6 +2707,28 @@ mod tests {
     fn onboard_cli_rejects_removed_interactive_flag() {
         // --interactive was removed; onboard auto-detects TTY instead.
         assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    }
+
+    #[test]
+    fn onboard_cli_parses_quick_flag() {
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick"])
+            .expect("onboard --quick should parse");
+
+        match cli.command {
+            Commands::Onboard { quick, .. } => assert!(quick),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn onboard_cli_quick_and_channels_only_conflict() {
+        // --quick and --channels-only should both parse at the CLI level
+        // (the conflict is checked at runtime), but we verify both flags parse.
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--quick", "--channels-only"]);
+        assert!(
+            cli.is_ok(),
+            "--quick --channels-only should parse at CLI level"
+        );
     }
 
     #[test]

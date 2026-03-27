@@ -1,4 +1,5 @@
 use super::traits::{Tool, ToolResult};
+use crate::config::GoogleWorkspaceAllowedOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -10,23 +11,7 @@ const DEFAULT_GWS_TIMEOUT_SECS: u64 = 30;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
-/// Allowed Google Workspace services that gws can target.
-const DEFAULT_ALLOWED_SERVICES: &[&str] = &[
-    "drive",
-    "sheets",
-    "gmail",
-    "calendar",
-    "docs",
-    "slides",
-    "tasks",
-    "people",
-    "chat",
-    "classroom",
-    "forms",
-    "keep",
-    "meet",
-    "events",
-];
+use crate::config::DEFAULT_GWS_SERVICES;
 
 /// Google Workspace CLI (`gws`) integration tool.
 ///
@@ -36,6 +21,7 @@ const DEFAULT_ALLOWED_SERVICES: &[&str] = &[
 pub struct GoogleWorkspaceTool {
     security: Arc<SecurityPolicy>,
     allowed_services: Vec<String>,
+    allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
     credentials_path: Option<String>,
     default_account: Option<String>,
     rate_limit_per_minute: u32,
@@ -50,6 +36,7 @@ impl GoogleWorkspaceTool {
     pub fn new(
         security: Arc<SecurityPolicy>,
         allowed_services: Vec<String>,
+        allowed_operations: Vec<GoogleWorkspaceAllowedOperation>,
         credentials_path: Option<String>,
         default_account: Option<String>,
         rate_limit_per_minute: u32,
@@ -57,22 +44,85 @@ impl GoogleWorkspaceTool {
         audit_log: bool,
     ) -> Self {
         let services = if allowed_services.is_empty() {
-            DEFAULT_ALLOWED_SERVICES
+            DEFAULT_GWS_SERVICES
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect()
         } else {
             allowed_services
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .collect()
         };
+        // Normalize stored operation fields at construction time so runtime
+        // comparisons can use plain equality without repeated .trim() calls.
+        let operations = allowed_operations
+            .into_iter()
+            .map(|op| GoogleWorkspaceAllowedOperation {
+                service: op.service.trim().to_string(),
+                resource: op.resource.trim().to_string(),
+                sub_resource: op.sub_resource.as_deref().map(|s| s.trim().to_string()),
+                methods: op.methods.iter().map(|m| m.trim().to_string()).collect(),
+            })
+            .collect();
         Self {
             security,
             allowed_services: services,
+            allowed_operations: operations,
             credentials_path,
             default_account,
             rate_limit_per_minute,
             timeout_secs,
             audit_log,
         }
+    }
+
+    /// Build the positional `gws` arguments: `[service, resource, (sub_resource,)? method]`.
+    fn positional_cmd_args(
+        service: &str,
+        resource: &str,
+        sub_resource: Option<&str>,
+        method: &str,
+    ) -> Vec<String> {
+        let mut args = vec![service.to_string(), resource.to_string()];
+        if let Some(sub) = sub_resource {
+            args.push(sub.to_string());
+        }
+        args.push(method.to_string());
+        args
+    }
+
+    /// Build the `--page-all` and `--page-limit` flags from validated pagination inputs.
+    /// `page_limit` alone (without `page_all`) caps page count; both together fetch all pages
+    /// up to the limit.
+    fn build_pagination_args(page_all: bool, page_limit: Option<u64>) -> Vec<String> {
+        let mut args = Vec::new();
+        if page_all {
+            args.push("--page-all".into());
+        }
+        if page_all || page_limit.is_some() {
+            args.push("--page-limit".into());
+            args.push(page_limit.unwrap_or(10).to_string());
+        }
+        args
+    }
+
+    fn is_operation_allowed(
+        &self,
+        service: &str,
+        resource: &str,
+        sub_resource: Option<&str>,
+        method: &str,
+    ) -> bool {
+        if self.allowed_operations.is_empty() {
+            return true;
+        }
+        self.allowed_operations.iter().any(|operation| {
+            operation.service == service
+                && operation.resource == resource
+                && operation.sub_resource.as_deref() == sub_resource
+                && operation.methods.iter().any(|allowed| allowed == method)
+        })
     }
 }
 
@@ -93,7 +143,7 @@ impl Tool for GoogleWorkspaceTool {
             "properties": {
                 "service": {
                     "type": "string",
-                    "description": "Google Workspace service (e.g. drive, gmail, calendar, sheets, docs, slides, tasks, people, chat, forms, keep, meet)"
+                    "description": "Google Workspace service (e.g. drive, gmail, calendar, sheets, docs, slides, tasks, people, chat, classroom, forms, keep, meet, events)"
                 },
                 "resource": {
                     "type": "string",
@@ -148,6 +198,37 @@ impl Tool for GoogleWorkspaceTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'method' parameter"))?;
 
+        // Extract and validate sub_resource early so the allowlist check can account for it.
+        let sub_resource: Option<&str> = if let Some(sub_resource_value) = args.get("sub_resource")
+        {
+            let s = match sub_resource_value.as_str() {
+                Some(s) => s,
+                None => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("'sub_resource' must be a string".into()),
+                    })
+                }
+            };
+            if !s
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+            {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(
+                        "Invalid characters in 'sub_resource': only lowercase alphanumeric, underscore, and hyphen are allowed"
+                            .into(),
+                    ),
+                });
+            }
+            Some(s)
+        } else {
+            None
+        };
+
         // Security checks
         if self.security.is_rate_limited() {
             return Ok(ToolResult {
@@ -170,6 +251,20 @@ impl Tool for GoogleWorkspaceTool {
             });
         }
 
+        if !self.is_operation_allowed(service, resource, sub_resource, method) {
+            let op_path = match sub_resource {
+                Some(sub) => format!("{service}/{resource}/{sub}/{method}"),
+                None => format!("{service}/{resource}/{method}"),
+            };
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Operation '{op_path}' is not in the allowed operations list"
+                )),
+            });
+        }
+
         // Validate inputs contain no shell metacharacters
         for (label, value) in [
             ("service", service),
@@ -178,49 +273,20 @@ impl Tool for GoogleWorkspaceTool {
         ] {
             if !value
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
             {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Invalid characters in '{label}': only alphanumeric, underscore, and hyphen are allowed"
+                        "Invalid characters in '{label}': only lowercase alphanumeric, underscore, and hyphen are allowed"
                     )),
                 });
             }
         }
 
         // Build the gws command — validate all optional fields before consuming budget
-        let mut cmd_args: Vec<String> = vec![service.to_string(), resource.to_string()];
-
-        if let Some(sub_resource_value) = args.get("sub_resource") {
-            let sub_resource = match sub_resource_value.as_str() {
-                Some(s) => s,
-                None => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some("'sub_resource' must be a string".into()),
-                    })
-                }
-            };
-            if !sub_resource
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(
-                        "Invalid characters in 'sub_resource': only alphanumeric, underscore, and hyphen are allowed"
-                            .into(),
-                    ),
-                });
-            }
-            cmd_args.push(sub_resource.to_string());
-        }
-
-        cmd_args.push(method.to_string());
+        let mut cmd_args = Self::positional_cmd_args(service, resource, sub_resource, method);
 
         if let Some(params) = args.get("params") {
             if !params.is_object() {
@@ -287,10 +353,6 @@ impl Tool for GoogleWorkspaceTool {
             },
             None => false,
         };
-        if page_all {
-            cmd_args.push("--page-all".into());
-        }
-
         let page_limit = match args.get("page_limit") {
             Some(v) => match v.as_u64() {
                 Some(n) => Some(n),
@@ -304,10 +366,7 @@ impl Tool for GoogleWorkspaceTool {
             },
             None => None,
         };
-        if page_all || page_limit.is_some() {
-            cmd_args.push("--page-limit".into());
-            cmd_args.push(page_limit.unwrap_or(10).to_string());
-        }
+        cmd_args.extend(Self::build_pagination_args(page_all, page_limit));
 
         // Charge action budget only after all validation passes
         if !self.security.record_action() {
@@ -343,26 +402,7 @@ impl Tool for GoogleWorkspaceTool {
                 tool = "google_workspace",
                 service = service,
                 resource = resource,
-                method = method,
-                "gws audit: executing API call"
-            );
-        }
-
-        // Apply credential path if configured
-        if let Some(ref creds) = self.credentials_path {
-            cmd.env("GOOGLE_APPLICATION_CREDENTIALS", creds);
-        }
-
-        // Apply default account if configured
-        if let Some(ref account) = self.default_account {
-            cmd.args(["--account", account]);
-        }
-
-        if self.audit_log {
-            tracing::info!(
-                tool = "google_workspace",
-                service = service,
-                resource = resource,
+                sub_resource = sub_resource.unwrap_or(""),
                 method = method,
                 "gws audit: executing API call"
             );
@@ -437,19 +477,22 @@ mod tests {
 
     #[test]
     fn tool_name() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         assert_eq!(tool.name(), "google_workspace");
     }
 
     #[test]
     fn tool_description_non_empty() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         assert!(!tool.description().is_empty());
     }
 
     #[test]
     fn tool_schema_has_required_fields() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["service"].is_object());
         assert!(schema["properties"]["resource"].is_object());
@@ -464,7 +507,8 @@ mod tests {
 
     #[test]
     fn default_allowed_services_populated() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         assert!(!tool.allowed_services.is_empty());
         assert!(tool.allowed_services.contains(&"drive".to_string()));
         assert!(tool.allowed_services.contains(&"gmail".to_string()));
@@ -476,6 +520,7 @@ mod tests {
         let tool = GoogleWorkspaceTool::new(
             test_security(),
             vec!["drive".into(), "sheets".into()],
+            vec![],
             None,
             None,
             60,
@@ -493,6 +538,7 @@ mod tests {
         let tool = GoogleWorkspaceTool::new(
             test_security(),
             vec!["drive".into()],
+            vec![],
             None,
             None,
             60,
@@ -520,6 +566,7 @@ mod tests {
         let tool = GoogleWorkspaceTool::new(
             test_security(),
             vec!["drive; rm -rf /".into()],
+            vec![],
             None,
             None,
             60,
@@ -544,7 +591,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_shell_injection_in_resource() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -563,7 +611,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_invalid_format() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -583,7 +632,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_params() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -603,7 +653,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_body() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -623,7 +674,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_all() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -643,7 +695,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_page_limit() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -663,7 +716,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_wrong_type_sub_resource() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -683,7 +737,8 @@ mod tests {
 
     #[tokio::test]
     async fn missing_required_param_returns_error() {
-        let tool = GoogleWorkspaceTool::new(test_security(), vec![], None, None, 60, 30, false);
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
         let result = tool.execute(json!({"service": "drive"})).await;
         assert!(result.is_err());
     }
@@ -696,7 +751,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = GoogleWorkspaceTool::new(security, vec![], None, None, 60, 30, false);
+        let tool = GoogleWorkspaceTool::new(security, vec![], vec![], None, None, 60, 30, false);
         let result = tool
             .execute(json!({
                 "service": "drive",
@@ -712,5 +767,269 @@ mod tests {
     #[test]
     fn gws_timeout_is_reasonable() {
         assert_eq!(DEFAULT_GWS_TIMEOUT_SECS, 30);
+    }
+
+    #[test]
+    fn operation_allowlist_defaults_to_allow_all() {
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        // Empty allowlist: everything passes regardless of sub_resource
+        assert!(tool.is_operation_allowed("gmail", "users", Some("messages"), "send"));
+        assert!(tool.is_operation_allowed("drive", "files", None, "list"));
+    }
+
+    #[test]
+    fn operation_allowlist_matches_gmail_sub_resource_shape() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["gmail".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into(), "update".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        // Exact match: allowed
+        assert!(tool.is_operation_allowed("gmail", "users", Some("drafts"), "create"));
+        assert!(tool.is_operation_allowed("gmail", "users", Some("drafts"), "update"));
+        // Send not in methods: denied
+        assert!(!tool.is_operation_allowed("gmail", "users", Some("drafts"), "send"));
+        // Different sub_resource: denied
+        assert!(!tool.is_operation_allowed("gmail", "users", Some("messages"), "list"));
+        // No sub_resource when entry requires one: denied
+        assert!(!tool.is_operation_allowed("gmail", "users", None, "create"));
+    }
+
+    #[test]
+    fn operation_allowlist_matches_drive_3_segment_shape() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["drive".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "drive".into(),
+                resource: "files".into(),
+                sub_resource: None,
+                methods: vec!["list".into(), "get".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        assert!(tool.is_operation_allowed("drive", "files", None, "list"));
+        assert!(tool.is_operation_allowed("drive", "files", None, "get"));
+        // Delete not in methods: denied
+        assert!(!tool.is_operation_allowed("drive", "files", None, "delete"));
+        // Entry has no sub_resource; call with sub_resource must not match
+        assert!(!tool.is_operation_allowed("drive", "files", Some("permissions"), "list"));
+    }
+
+    #[tokio::test]
+    async fn rejects_disallowed_operation() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["gmail".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        // send is not in the allowed methods list
+        let result = tool
+            .execute(json!({
+                "service": "gmail",
+                "resource": "users",
+                "sub_resource": "drafts",
+                "method": "send"
+            }))
+            .await
+            .expect("disallowed operation should return a result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("allowed operations list"));
+    }
+
+    #[tokio::test]
+    async fn rejects_operation_with_unlisted_sub_resource() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["gmail".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        // messages is not in the allowlist (only drafts is)
+        let result = tool
+            .execute(json!({
+                "service": "gmail",
+                "resource": "users",
+                "sub_resource": "messages",
+                "method": "send"
+            }))
+            .await
+            .expect("unlisted sub_resource should return a result");
+
+        assert!(!result.success);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("allowed operations list"));
+    }
+
+    // ── cmd_args ordering ────────────────────────────────────
+
+    #[test]
+    fn cmd_args_3_segment_shape_drive() {
+        // Drive uses gws <service> <resource> <method> — no sub_resource.
+        let args = GoogleWorkspaceTool::positional_cmd_args("drive", "files", None, "list");
+        assert_eq!(args, vec!["drive", "files", "list"]);
+    }
+
+    #[test]
+    fn cmd_args_4_segment_shape_gmail() {
+        // Gmail uses gws <service> <resource> <sub_resource> <method>.
+        let args =
+            GoogleWorkspaceTool::positional_cmd_args("gmail", "users", Some("messages"), "list");
+        assert_eq!(args, vec!["gmail", "users", "messages", "list"]);
+    }
+
+    #[test]
+    fn cmd_args_sub_resource_precedes_method() {
+        // sub_resource must come before method in the positional args.
+        let args =
+            GoogleWorkspaceTool::positional_cmd_args("gmail", "users", Some("drafts"), "create");
+        let sub_idx = args.iter().position(|a| a == "drafts").unwrap();
+        let method_idx = args.iter().position(|a| a == "create").unwrap();
+        assert!(sub_idx < method_idx, "sub_resource must precede method");
+    }
+
+    // ── denial error message ─────────────────────────────────
+
+    #[tokio::test]
+    async fn denial_error_includes_sub_resource_when_present() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["gmail".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("drafts".into()),
+                methods: vec!["create".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        let result = tool
+            .execute(json!({
+                "service": "gmail",
+                "resource": "users",
+                "sub_resource": "messages",
+                "method": "send"
+            }))
+            .await
+            .expect("denied operation should return a result");
+
+        let error = result.error.as_deref().unwrap_or("");
+        // Error must include sub_resource so the operator can distinguish
+        // gmail/users/messages/send from gmail/users/drafts/send.
+        assert!(
+            error.contains("gmail/users/messages/send"),
+            "expected full 4-segment path in error, got: {error}"
+        );
+    }
+
+    // ── whitespace normalization ─────────────────────────────
+
+    #[test]
+    fn allowed_operations_config_values_trimmed_at_construction() {
+        let tool = GoogleWorkspaceTool::new(
+            test_security(),
+            vec!["gmail".into()],
+            vec![GoogleWorkspaceAllowedOperation {
+                service: " gmail ".into(), // leading/trailing whitespace
+                resource: " users ".into(),
+                sub_resource: Some(" drafts ".into()),
+                methods: vec![" create ".into()],
+            }],
+            None,
+            None,
+            60,
+            30,
+            false,
+        );
+
+        // After construction, stored values are trimmed and plain equality works.
+        assert!(tool.is_operation_allowed("gmail", "users", Some("drafts"), "create"));
+        assert!(!tool.is_operation_allowed("gmail", "users", Some(" drafts "), "create"));
+    }
+
+    // ── page_limit / page_all flag building ─────────────────
+
+    #[test]
+    fn pagination_page_limit_alone_appends_limit_without_page_all() {
+        // page_limit without page_all caps page count without requesting all pages.
+        let flags = GoogleWorkspaceTool::build_pagination_args(false, Some(5));
+        assert!(flags.contains(&"--page-limit".to_string()));
+        assert!(!flags.contains(&"--page-all".to_string()));
+        let limit_idx = flags.iter().position(|f| f == "--page-limit").unwrap();
+        assert_eq!(flags[limit_idx + 1], "5");
+    }
+
+    #[test]
+    fn pagination_page_all_without_limit_uses_default() {
+        let flags = GoogleWorkspaceTool::build_pagination_args(true, None);
+        assert!(flags.contains(&"--page-all".to_string()));
+        assert!(flags.contains(&"--page-limit".to_string()));
+        let limit_idx = flags.iter().position(|f| f == "--page-limit").unwrap();
+        assert_eq!(flags[limit_idx + 1], "10"); // default cap
+    }
+
+    #[test]
+    fn pagination_page_all_with_limit_appends_both() {
+        let flags = GoogleWorkspaceTool::build_pagination_args(true, Some(20));
+        assert!(flags.contains(&"--page-all".to_string()));
+        let limit_idx = flags.iter().position(|f| f == "--page-limit").unwrap();
+        assert_eq!(flags[limit_idx + 1], "20");
+    }
+
+    #[test]
+    fn pagination_neither_appends_nothing() {
+        let flags = GoogleWorkspaceTool::build_pagination_args(false, None);
+        assert!(flags.is_empty());
     }
 }

@@ -1,13 +1,17 @@
 #[cfg(feature = "channel-matrix")]
 use crate::channels::MatrixChannel;
+#[cfg(feature = "whatsapp-web")]
+use crate::channels::WhatsAppWebChannel;
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SignalChannel, SlackChannel,
-    TelegramChannel,
+    Channel, DiscordChannel, MattermostChannel, QQChannel, SendMessage, SignalChannel,
+    SlackChannel, TelegramChannel,
 };
+use crate::config::schema::{CronJobDecl, CronScheduleDecl};
 use crate::config::Config;
 use crate::cron::{
-    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
-    update_job, CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget,
+    all_overdue_jobs, due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job,
+    reschedule_after_run, sync_declarative_jobs, update_job, CronJob, CronJobPatch, DeliveryConfig,
+    JobType, Schedule, SessionTarget,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
@@ -33,6 +37,56 @@ pub async fn run(config: Config) -> Result<()> {
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
+    // ── Declarative job sync: reconcile config-defined jobs with the DB.
+    let mut jobs_with_builtin = config.cron.jobs.clone();
+    if let Some(ref schedule_cron) = config.backup.schedule_cron {
+        let backup_job = CronJobDecl {
+            id: "__builtin_backup".to_string(),
+            name: Some("Scheduled backup".to_string()),
+            job_type: "shell".to_string(),
+            schedule: CronScheduleDecl::Cron {
+                expr: schedule_cron.clone(),
+                tz: config.backup.schedule_timezone.clone(),
+            },
+            command: Some("backup create".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            session_target: None,
+            delivery: None,
+        };
+        tracing::debug!(
+            schedule = %schedule_cron,
+            "Synthesizing builtin backup cron job from config.backup.schedule_cron"
+        );
+        jobs_with_builtin.push(backup_job);
+    }
+
+    match sync_declarative_jobs(&config, &jobs_with_builtin) {
+        Ok(()) => {
+            if !jobs_with_builtin.is_empty() {
+                tracing::info!(
+                    count = jobs_with_builtin.len(),
+                    "Synced declarative cron jobs from config"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("Failed to sync declarative cron jobs: {e}"),
+    }
+
+    // ── Startup catch-up: run ALL overdue jobs before entering the
+    //    normal polling loop. The regular loop is capped by `max_tasks`,
+    //    which could leave some overdue jobs waiting across many cycles
+    //    if the machine was off for a while. The catch-up phase fetches
+    //    without the `max_tasks` limit so every missed job fires once.
+    //    Controlled by `[cron] catch_up_on_startup` (default: true).
+    if config.cron.catch_up_on_startup {
+        catch_up_overdue_jobs(&config, &security).await;
+    } else {
+        tracing::info!("Scheduler startup: catch-up disabled by config");
+    }
+
     loop {
         interval.tick().await;
         // Keep scheduler liveness fresh even when there are no due jobs.
@@ -49,6 +103,35 @@ pub async fn run(config: Config) -> Result<()> {
 
         process_due_jobs(&config, &security, jobs, SCHEDULER_COMPONENT).await;
     }
+}
+
+/// Fetch **all** overdue jobs (ignoring `max_tasks`) and execute them.
+///
+/// Called once at scheduler startup so that jobs missed during downtime
+/// (e.g. late boot, daemon restart) are caught up immediately.
+async fn catch_up_overdue_jobs(config: &Config, security: &Arc<SecurityPolicy>) {
+    let now = Utc::now();
+    let jobs = match all_overdue_jobs(config, now) {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            tracing::warn!("Startup catch-up query failed: {e}");
+            return;
+        }
+    };
+
+    if jobs.is_empty() {
+        tracing::info!("Scheduler startup: no overdue jobs to catch up");
+        return;
+    }
+
+    tracing::info!(
+        count = jobs.len(),
+        "Scheduler startup: catching up overdue jobs"
+    );
+
+    process_due_jobs(config, security, jobs, SCHEDULER_COMPONENT).await;
+
+    tracing::info!("Scheduler startup: catch-up complete");
 }
 
 pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
@@ -176,7 +259,28 @@ async fn run_agent_job(
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+
+    // Recall relevant memories so cron jobs have context awareness.
+    let memory_context = match crate::memory::create_memory(
+        &config.memory,
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    ) {
+        Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
+            Ok(entries) if !entries.is_empty() => {
+                let ctx: String = entries
+                    .iter()
+                    .map(|e| format!("- {}: {}", e.key, e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("[Memory context]\n{ctx}\n\n")
+            }
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    };
+
+    let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
     let run_result = match job.session_target {
@@ -333,12 +437,47 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     deliver_announcement(config, channel, target, output).await
 }
 
+/// Output that has been scanned for credential leaks and redacted if necessary.
+/// All channel dispatch must use this type — constructing it requires going through
+/// `scan_and_redact_output`, which enforces leak detection on every outbound path.
+pub(crate) struct RedactedOutput(String);
+
+impl RedactedOutput {
+    /// Access the safe-to-send content.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Scan cron job output for credential leaks and return redacted output if leaks are detected.
+/// Logs a warning with channel, target, and detected patterns when credentials are found.
+fn scan_and_redact_output(channel: &str, target: &str, output: &str) -> RedactedOutput {
+    let leak_detector = crate::security::LeakDetector::new();
+    let leak_check = leak_detector.scan(output);
+
+    match leak_check {
+        crate::security::LeakResult::Detected { patterns, redacted } => {
+            tracing::warn!(
+                channel = %channel,
+                target = %target,
+                patterns = ?patterns,
+                "Credential leak detected in cron job output; redacting before delivery"
+            );
+            RedactedOutput(redacted)
+        }
+        crate::security::LeakResult::Clean => RedactedOutput(output.to_string()),
+    }
+}
+
 pub(crate) async fn deliver_announcement(
     config: &Config,
     channel: &str,
     target: &str,
     output: &str,
 ) -> Result<()> {
+    // Scan for credential leaks before delivering cron job output to channel.
+    let safe_output = scan_and_redact_output(channel, target, output);
+
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
             let tg = config
@@ -351,7 +490,9 @@ pub(crate) async fn deliver_announcement(
                 tg.allowed_users.clone(),
                 tg.mention_only,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "discord" => {
             let dc = config
@@ -366,7 +507,9 @@ pub(crate) async fn deliver_announcement(
                 dc.listen_to_bots,
                 dc.mention_only,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "slack" => {
             let sl = config
@@ -382,7 +525,9 @@ pub(crate) async fn deliver_announcement(
                 sl.allowed_users.clone(),
             )
             .with_workspace_dir(config.workspace_dir.clone());
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "mattermost" => {
             let mm = config
@@ -398,7 +543,9 @@ pub(crate) async fn deliver_announcement(
                 mm.thread_replies.unwrap_or(true),
                 mm.mention_only.unwrap_or(false),
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "signal" => {
             let sg = config
@@ -414,7 +561,9 @@ pub(crate) async fn deliver_announcement(
                 sg.ignore_attachments,
                 sg.ignore_stories,
             );
-            channel.send(&SendMessage::new(output, target)).await?;
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         "matrix" => {
             #[cfg(feature = "channel-matrix")]
@@ -434,12 +583,61 @@ pub(crate) async fn deliver_announcement(
                     mx.device_id.clone(),
                     config.config_path.parent().map(|path| path.to_path_buf()),
                 );
-                channel.send(&SendMessage::new(output, target)).await?;
+                channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
             }
             #[cfg(not(feature = "channel-matrix"))]
             {
                 anyhow::bail!("matrix delivery channel requires `channel-matrix` feature");
             }
+        }
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            #[cfg(feature = "whatsapp-web")]
+            {
+                let wa = config
+                    .channels_config
+                    .whatsapp
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("whatsapp channel not configured"))?;
+                if !wa.is_web_config() {
+                    anyhow::bail!(
+                        "whatsapp cron delivery requires Web mode (session_path must be set)"
+                    );
+                }
+                let channel = WhatsAppWebChannel::new(
+                    wa.session_path.clone().unwrap_or_default(),
+                    wa.pair_phone.clone(),
+                    wa.pair_code.clone(),
+                    wa.allowed_numbers.clone(),
+                    wa.mode.clone(),
+                    wa.dm_policy.clone(),
+                    wa.group_policy.clone(),
+                    wa.self_chat_mode,
+                );
+                channel
+                    .send(&SendMessage::new(safe_output.as_str(), target))
+                    .await?;
+            }
+            #[cfg(not(feature = "whatsapp-web"))]
+            {
+                anyhow::bail!("whatsapp delivery channel requires `whatsapp-web` feature");
+            }
+        }
+        "qq" => {
+            let qq = config
+                .channels_config
+                .qq
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("qq channel not configured"))?;
+            let channel = QQChannel::new(
+                qq.app_id.clone(),
+                qq.app_secret.clone(),
+                qq.allowed_users.clone(),
+            );
+            channel
+                .send(&SendMessage::new(safe_output.as_str(), target))
+                .await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -506,18 +704,12 @@ async fn run_job_command_with_timeout(
         );
     }
 
-    let child = match Command::new("sh")
-        .arg("-lc")
-        .arg(&job.command)
-        .current_dir(&config.workspace_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => return (false, format!("spawn error: {e}")),
+    let child = match build_cron_shell_command(&job.command, &config.workspace_dir) {
+        Ok(mut cmd) => match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => return (false, format!("spawn error: {e}")),
+        },
+        Err(e) => return (false, format!("shell setup error: {e}")),
     };
 
     match time::timeout(timeout, child.wait_with_output()).await {
@@ -538,6 +730,35 @@ async fn run_job_command_with_timeout(
             format!("job timed out after {}s", timeout.as_secs_f64()),
         ),
     }
+}
+
+/// Build a shell `Command` for cron job execution.
+///
+/// Uses `sh -c <command>` (non-login shell). On Windows, ZeroClaw users
+/// typically have Git Bash installed which provides `sh` in PATH, and
+/// cron commands are written with Unix shell syntax. The previous `-lc`
+/// (login shell) flag was dropped: login shells load the full user
+/// profile on every invocation which is slow and may cause side effects.
+///
+/// The command is configured with:
+/// - `current_dir` set to the workspace
+/// - `stdin` piped to `/dev/null` (no interactive input)
+/// - `stdout` and `stderr` piped for capture
+/// - `kill_on_drop(true)` for safe timeout handling
+fn build_cron_shell_command(
+    command: &str,
+    workspace_dir: &std::path::Path,
+) -> anyhow::Result<Command> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(workspace_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    Ok(cmd)
 }
 
 #[cfg(test)]
@@ -579,6 +800,7 @@ mod tests {
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
             allowed_tools: None,
+            source: "imperative".into(),
             created_at: Utc::now(),
             next_run: Utc::now(),
             last_run: None,
@@ -900,6 +1122,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -925,6 +1148,7 @@ mod tests {
             None,
             None,
             true,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -991,6 +1215,7 @@ mod tests {
                 best_effort: false,
             }),
             false,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -1029,6 +1254,7 @@ mod tests {
                 best_effort: true,
             }),
             false,
+            None,
         )
         .unwrap();
         let started = Utc::now();
@@ -1060,6 +1286,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .unwrap();
         assert!(!job.delete_after_run);
@@ -1151,5 +1378,73 @@ mod tests {
         assert!(err
             .to_string()
             .contains("matrix delivery channel requires `channel-matrix` feature"));
+    }
+
+    #[test]
+    fn build_cron_shell_command_uses_sh_non_login() {
+        let workspace = std::env::temp_dir();
+        let cmd = build_cron_shell_command("echo cron-test", &workspace).unwrap();
+        let debug = format!("{cmd:?}");
+        assert!(debug.contains("echo cron-test"));
+        assert!(debug.contains("\"sh\""), "should use sh: {debug}");
+        // Must NOT use login shell (-l) — login shells load full profile
+        // and are slow/unpredictable for cron jobs.
+        assert!(
+            !debug.contains("\"-lc\""),
+            "must not use login shell: {debug}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_cron_shell_command_executes_successfully() {
+        let workspace = std::env::temp_dir();
+        let mut cmd = build_cron_shell_command("echo cron-ok", &workspace).unwrap();
+        let output = cmd.output().await.unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("cron-ok"));
+    }
+
+    #[tokio::test]
+    async fn catch_up_queries_all_overdue_jobs_ignoring_max_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.scheduler.max_tasks = 1; // limit normal polling to 1
+
+        // Create 3 jobs with "every minute" schedule
+        for i in 0..3 {
+            let _ = cron::add_job(&config, "* * * * *", &format!("echo catchup-{i}")).unwrap();
+        }
+
+        // Verify normal due_jobs is limited to max_tasks=1
+        let far_future = Utc::now() + ChronoDuration::days(1);
+        let due = cron::due_jobs(&config, far_future).unwrap();
+        assert_eq!(due.len(), 1, "due_jobs must respect max_tasks");
+
+        // all_overdue_jobs ignores the limit
+        let overdue = cron::all_overdue_jobs(&config, far_future).unwrap();
+        assert_eq!(overdue.len(), 3, "all_overdue_jobs must return all");
+    }
+
+    #[test]
+    fn scan_and_redact_output_redacts_credentials() {
+        let leaked_output = "Deployment key: sk_test_FAKE1234567890abcdefgh"; // gitleaks:allow
+
+        let redacted = scan_and_redact_output("telegram", "123456", leaked_output);
+
+        assert!(
+            !redacted.as_str().contains("sk_test_FAKE1234567890abcdefgh"), // gitleaks:allow
+            "credentials must be redacted"
+        );
+        assert!(redacted.as_str().contains("[REDACTED"));
+    }
+
+    #[test]
+    fn scan_and_redact_output_preserves_clean_output() {
+        let clean_output = "Deployment completed successfully at 2024-03-15 10:00:00";
+
+        let redacted = scan_and_redact_output("telegram", "123456", clean_output);
+
+        assert_eq!(redacted.as_str(), clean_output);
     }
 }

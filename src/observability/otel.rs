@@ -210,7 +210,9 @@ impl Observer for OtelObserver {
             }
             ObserverEvent::LlmRequest { .. }
             | ObserverEvent::ToolCallStart { .. }
-            | ObserverEvent::TurnComplete => {}
+            | ObserverEvent::TurnComplete
+            | ObserverEvent::CacheHit { .. }
+            | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::LlmResponse {
                 provider,
                 model,
@@ -428,6 +430,12 @@ impl Observer for OtelObserver {
                 self.hand_duration
                     .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
             }
+            ObserverEvent::DeploymentStarted { .. }
+            | ObserverEvent::DeploymentCompleted { .. }
+            | ObserverEvent::DeploymentFailed { .. }
+            | ObserverEvent::RecoveryCompleted { .. } => {
+                // DORA deployment events: OTel pass-through not yet implemented.
+            }
         }
     }
 
@@ -467,6 +475,9 @@ impl Observer for OtelObserver {
                         KeyValue::new("success", success_str),
                     ],
                 );
+            }
+            ObserverMetric::DeploymentLeadTime(_) | ObserverMetric::RecoveryTime(_) => {
+                // DORA metrics: OTel pass-through not yet implemented.
             }
         }
     }

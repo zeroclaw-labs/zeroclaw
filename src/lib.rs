@@ -42,10 +42,11 @@ pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
 pub mod channels;
+pub(crate) mod cli_input;
 pub mod commands;
 pub mod config;
 pub(crate) mod cost;
-pub(crate) mod cron;
+pub mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
 pub mod gateway;
@@ -66,13 +67,17 @@ pub(crate) mod onboard;
 pub mod peripherals;
 pub mod providers;
 pub mod rag;
+pub mod routines;
 pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
+pub mod sop;
 pub mod tools;
+pub(crate) mod trust;
 pub(crate) mod tunnel;
 pub(crate) mod util;
+pub mod verifiable_intent;
 
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins;
@@ -160,6 +165,15 @@ pub enum ServiceCommands {
     Status,
     /// Uninstall daemon service unit
     Uninstall,
+    /// Tail daemon service logs
+    Logs {
+        /// Number of lines to show (default: 50)
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 /// Channel management subcommands
@@ -256,6 +270,14 @@ pub enum SkillCommands {
         /// Skill name to remove
         name: String,
     },
+    /// Run TEST.sh validation for a skill (or all skills)
+    Test {
+        /// Skill name to test; omit for all skills
+        name: Option<String>,
+        /// Show verbose output
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 /// Migration subcommands
@@ -299,6 +321,9 @@ Examples:
         /// Treat the argument as an agent prompt instead of a shell command
         #[arg(long)]
         agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -317,6 +342,9 @@ Examples:
         /// Treat the argument as an agent prompt instead of a shell command
         #[arg(long)]
         agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -335,6 +363,9 @@ Examples:
         /// Treat the argument as an agent prompt instead of a shell command
         #[arg(long)]
         agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -355,6 +386,9 @@ Examples:
         /// Treat the argument as an agent prompt instead of a shell command
         #[arg(long)]
         agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
         /// Command (shell) or prompt (agent) to run
         command: String,
     },
@@ -388,6 +422,9 @@ Examples:
         /// New job name
         #[arg(long)]
         name: Option<String>,
+        /// Replace the agent job allowlist with the specified tool names (repeatable)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
     },
     /// Pause a scheduled task
     Pause {
@@ -543,4 +580,21 @@ Examples:
     },
     /// Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)
     FlashNucleo,
+}
+
+/// SOP management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SopCommands {
+    /// List loaded SOPs
+    List,
+    /// Validate SOP definitions
+    Validate {
+        /// SOP name to validate (all if omitted)
+        name: Option<String>,
+    },
+    /// Show details of an SOP
+    Show {
+        /// Name of the SOP to show
+        name: String,
+    },
 }

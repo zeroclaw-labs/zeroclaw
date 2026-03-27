@@ -119,7 +119,8 @@ impl OllamaProvider {
         }
 
         trimmed
-            .strip_suffix("/api")
+            .strip_suffix("/api/chat")
+            .or_else(|| trimmed.strip_suffix("/api"))
             .unwrap_or(trimmed)
             .trim_end_matches('/')
             .to_string()
@@ -630,7 +631,7 @@ impl OllamaProvider {
 impl Provider for OllamaProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            native_tool_calling: true,
+            native_tool_calling: false,
             vision: true,
             prompt_caching: false,
         }
@@ -824,10 +825,13 @@ impl Provider for OllamaProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        // Ollama's /api/chat supports native function-calling for capable models
-        // (qwen2.5, llama3.1, mistral-nemo, etc.). chat_with_tools() sends tool
-        // definitions in the request and returns structured ToolCall objects.
-        true
+        // Default to prompt-guided tool calling (XML instructions in system prompt)
+        // because many Ollama-served models do not support Ollama's native
+        // /api/chat tool-calling parameter. Models that lack support silently
+        // ignore the tools array and emit tool-call JSON as plain text, which the
+        // agent loop cannot parse without the XML protocol instructions.
+        // See: https://github.com/zeroclaw-labs/zeroclaw/issues/3999
+        false
     }
 
     async fn chat(
@@ -899,6 +903,12 @@ mod tests {
     fn custom_url_strips_api_suffix() {
         let p = OllamaProvider::new(Some("https://ollama.com/api/"), None);
         assert_eq!(p.base_url, "https://ollama.com");
+    }
+
+    #[test]
+    fn custom_url_strips_api_chat_suffix() {
+        let p = OllamaProvider::new(Some("http://172.30.30.50:11434/api/chat"), None);
+        assert_eq!(p.base_url, "http://172.30.30.50:11434");
     }
 
     #[test]
@@ -1214,10 +1224,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_include_native_tools_and_vision() {
+    fn capabilities_disable_native_tools_and_enable_vision() {
         let provider = OllamaProvider::new(None, None);
         let caps = <OllamaProvider as Provider>::capabilities(&provider);
-        assert!(caps.native_tool_calling);
+        assert!(
+            !caps.native_tool_calling,
+            "Ollama should default to prompt-guided tool calling"
+        );
         assert!(caps.vision);
     }
 

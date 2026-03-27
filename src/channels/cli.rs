@@ -48,6 +48,8 @@ impl Channel for CliChannel {
                     .unwrap_or_default()
                     .as_secs(),
                 thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
             };
 
             if tx.send(msg).await.is_err() {
@@ -76,6 +78,7 @@ mod tests {
                 recipient: "user".into(),
                 subject: None,
                 thread_ts: None,
+                cancellation_token: None,
             })
             .await;
         assert!(result.is_ok());
@@ -90,6 +93,7 @@ mod tests {
                 recipient: String::new(),
                 subject: None,
                 thread_ts: None,
+                cancellation_token: None,
             })
             .await;
         assert!(result.is_ok());
@@ -111,6 +115,8 @@ mod tests {
             channel: "cli".into(),
             timestamp: 1_234_567_890,
             thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
         };
         assert_eq!(msg.id, "test-id");
         assert_eq!(msg.sender, "user");
@@ -130,6 +136,8 @@ mod tests {
             channel: "ch".into(),
             timestamp: 0,
             thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
         };
         let cloned = msg.clone();
         assert_eq!(cloned.id, msg.id);
