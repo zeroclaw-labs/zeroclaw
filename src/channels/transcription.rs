@@ -229,7 +229,22 @@ impl OpenAiWhisperProvider {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(ToOwned::to_owned)
-            .context("Missing OpenAI STT API key: set [transcription.openai].api_key")?;
+            .or_else(|| {
+                std::env::var("TRANSCRIPTION_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .or_else(|| {
+                std::env::var("OPENAI_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+            })
+            .context(
+                "Missing OpenAI STT API key: set [transcription.openai].api_key, \
+                 TRANSCRIPTION_API_KEY, or OPENAI_API_KEY",
+            )?;
 
         Ok(Self {
             api_key,
@@ -883,6 +898,42 @@ pub async fn transcribe_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
+    use tokio::sync::Mutex;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn rejects_oversized_audio() {
@@ -900,10 +951,10 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_missing_api_key() {
-        // Ensure all candidate keys are absent for this test.
-        std::env::remove_var("GROQ_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("TRANSCRIPTION_API_KEY");
+        let _lock = env_lock().lock().await;
+        let _groq = EnvVarGuard::unset("GROQ_API_KEY");
+        let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
+        let _transcription = EnvVarGuard::unset("TRANSCRIPTION_API_KEY");
 
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
@@ -919,7 +970,8 @@ mod tests {
 
     #[tokio::test]
     async fn uses_config_api_key_without_groq_env() {
-        std::env::remove_var("GROQ_API_KEY");
+        let _lock = env_lock().lock().await;
+        let _groq = EnvVarGuard::unset("GROQ_API_KEY");
 
         let data = vec![0u8; 100];
         let mut config = TranscriptionConfig::default();
@@ -937,6 +989,10 @@ mod tests {
 
     #[tokio::test]
     async fn openai_default_provider_uses_openai_config() {
+        let _lock = env_lock().lock().await;
+        let _transcription = EnvVarGuard::unset("TRANSCRIPTION_API_KEY");
+        let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
+
         let data = vec![0u8; 100];
         let mut config = TranscriptionConfig::default();
         config.default_provider = "openai".to_string();
@@ -949,9 +1005,39 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("[transcription.openai].api_key"),
+            err.to_string().contains("TRANSCRIPTION_API_KEY"),
             "expected openai-specific missing-key error, got: {err}"
         );
+    }
+
+    #[test]
+    fn openai_provider_uses_transcription_api_key_env_fallback() {
+        let _lock = env_lock().blocking_lock();
+        let _openai = EnvVarGuard::unset("OPENAI_API_KEY");
+        let _transcription = EnvVarGuard::set("TRANSCRIPTION_API_KEY", "stt-env-key");
+
+        let provider = OpenAiWhisperProvider::from_config(&crate::config::OpenAiSttConfig {
+            api_key: None,
+            model: "whisper-1".to_string(),
+        })
+        .expect("provider should use TRANSCRIPTION_API_KEY fallback");
+
+        assert_eq!(provider.api_key, "stt-env-key");
+    }
+
+    #[test]
+    fn openai_provider_uses_openai_api_key_env_fallback() {
+        let _lock = env_lock().blocking_lock();
+        let _transcription = EnvVarGuard::unset("TRANSCRIPTION_API_KEY");
+        let _openai = EnvVarGuard::set("OPENAI_API_KEY", "openai-env-key");
+
+        let provider = OpenAiWhisperProvider::from_config(&crate::config::OpenAiSttConfig {
+            api_key: None,
+            model: "whisper-1".to_string(),
+        })
+        .expect("provider should use OPENAI_API_KEY fallback");
+
+        assert_eq!(provider.api_key, "openai-env-key");
     }
 
     #[test]

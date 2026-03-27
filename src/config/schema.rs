@@ -1231,6 +1231,7 @@ pub struct ToolFilterGroup {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OpenAiSttConfig {
     /// OpenAI API key for Whisper transcription.
+    /// Falls back to `TRANSCRIPTION_API_KEY`, then `OPENAI_API_KEY`.
     #[serde(default)]
     pub api_key: Option<String>,
     /// Whisper model name (default: "whisper-1").
