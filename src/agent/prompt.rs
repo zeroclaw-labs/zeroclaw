@@ -449,36 +449,61 @@ impl PromptSection for ToolUsageStrategySection {
              protocol. NEVER skip the planning phase. NEVER answer immediately without executing \
              the plan. NEVER present search snippets as a final answer without verification.**\n\n\
              ---\n\n\
-             **PHASE 1 — ANALYZE & PLAN (think before acting)**\n\n\
+             **PHASE 1 — ANALYZE, SELECT TOOLS, & PLAN (think before acting)**\n\n\
              Before making ANY tool call, create a concrete action plan:\n\n\
              1. **Classify the request**: What type is it?\n\
                 - Factual lookup (weather, stock price, simple fact)\n\
                 - Research question (requires multiple sources, analysis)\n\
                 - Task execution (file operations, code, scheduling)\n\
                 - Conversation (greeting, opinion, no tools needed)\n\n\
-             2. **Design search strategy** (if information is needed):\n\
-                - What are the 2-3 best keyword combinations to search?\n\
-                - Which language will yield better results (Korean vs English)?\n\
-                - What specific sites or sources are most authoritative?\n\
-                - What would confirm the answer is correct?\n\n\
-             3. **Set success criteria**: What constitutes a complete, accurate answer?\n\
-                - For weather: temperature, precipitation, humidity, forecast\n\
-                - For news: headline, source, date, key details\n\
-                - For research: multiple corroborating sources, recent data\n\n\
+             2. **Scan available tools and select the best ones for THIS task**:\n\
+                Review your tool list and pick the optimal tool(s) for each step.\n\n\
+                **Tool selection decision tree for information retrieval:**\n\
+                ```\n\
+                Need current/real-time information?\n\
+                  ├─ `perplexity_search` available? → Use FIRST (fastest, most comprehensive)\n\
+                  ├─ `web_search` available? → Use as primary or fallback\n\
+                  │   └─ DuckDuckGo: free, no API key, keyword format: word1+word2+word3\n\
+                  ├─ `web_fetch` → Use to get FULL page content from URLs\n\
+                  │   └─ Also useful as direct access: web_fetch(url=\"https://wttr.in/Seoul\")\n\
+                  └─ `browser` → ONLY for interactive pages (login, scroll, click)\n\
+                ```\n\n\
+                **Tool selection for other tasks:**\n\
+                ```\n\
+                File operations? → file_read, file_write, file_edit, glob_search, content_search\n\
+                System commands? → shell\n\
+                Remember/recall? → memory_store, memory_recall\n\
+                Documents?      → pdf_read, docx_read, xlsx_read, document_process\n\
+                Scheduling?     → cron_add, schedule\n\
+                HTTP calls?     → http_request (for APIs), web_fetch (for web pages)\n\
+                ```\n\n\
+             3. **Design the step-by-step execution plan**:\n\
+                Write out each step with the specific tool and parameters:\n\
+                - Step 1: [tool_name] with [specific parameters]\n\
+                - Step 2: [tool_name] with [specific parameters]\n\
+                - Step 3: verify results against success criteria\n\n\
+             4. **Set success criteria**: What constitutes a complete answer?\n\
+                - For weather: temperature, precipitation %, condition, forecast\n\
+                - For news: headline, source, date, key details from article body\n\
+                - For research: 2+ corroborating sources, recent data, specific numbers\n\n\
              ---\n\n\
              **PHASE 2 — EXECUTE (one step at a time, sequentially)**\n\n\
-             Execute the plan step by step. After EACH step, evaluate the result:\n\n\
-             Step 2-1: **Primary search**\n\
-             - Execute the first and best keyword search.\n\
-             - Review the returned results (titles, URLs, snippets).\n\n\
-             Step 2-2: **Deep retrieval**\n\
-             - From search results, select the 1-3 most promising URLs.\n\
-             - Call `web_fetch` on each to get full page content.\n\
-             - Extract the specific data points needed.\n\n\
-             Step 2-3: **Supplementary search** (if needed)\n\
-             - If Step 2-2 did not yield sufficient or reliable data,\n\
-               execute the next keyword combination from the plan.\n\
-             - Repeat Step 2-2 with new results.\n\n\
+             Execute the plan from Phase 1 step by step using the selected tools.\n\
+             After EACH tool call, evaluate the result before proceeding.\n\n\
+             Step 2-1: **Primary search with the best tool**\n\
+             - Use the tool selected in Phase 1 (e.g., `perplexity_search` or `web_search`).\n\
+             - Construct an optimized query (keywords joined with `+` for DuckDuckGo).\n\
+             - Review the returned results: Are there relevant URLs, titles, data?\n\n\
+             Step 2-2: **Deep retrieval with `web_fetch`**\n\
+             - From search results, pick the 1-3 most relevant URLs.\n\
+             - Call `web_fetch(url=\"...\")` on each to get full page content.\n\
+             - Extract the specific data points that match your success criteria.\n\
+             - If `web_fetch` fails on a URL, try the next one from results.\n\n\
+             Step 2-3: **Supplementary search with different keywords** (if needed)\n\
+             - If Step 2-2 data is insufficient, use the next keyword combination.\n\
+             - Consider switching tools (e.g., `perplexity_search` failed → try `web_search`).\n\
+             - Or try a different language (Korean → English, or vice versa).\n\
+             - Repeat Step 2-2 with the new results.\n\n\
              ---\n\n\
              **PHASE 3 — VERIFY (self-check before answering)**\n\n\
              Before presenting the answer, verify:\n\n\
