@@ -51,6 +51,8 @@ pub struct SlackChannel {
     /// `send_draft` returns a placeholder without posting; the real message
     /// is created on the first `update_draft` call.
     lazy_draft_ts: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Emoji reaction name (without colons) that cancels an in-flight request.
+    cancel_reaction: Option<String>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -72,6 +74,24 @@ const SLACK_ATTACHMENT_FILENAME_MAX_CHARS: usize = 128;
 const SLACK_USER_CACHE_MAX_ENTRIES: usize = 1000;
 const SLACK_ATTACHMENT_SAVE_SUBDIR: &str = "slack_files";
 const SLACK_ATTACHMENT_MAX_FILES_PER_MESSAGE: usize = 8;
+const SLACK_PERMALINK_MAX_LINKS_PER_MESSAGE: usize = 3;
+const SLACK_PERMALINK_THREAD_MAX_REPLIES: usize = 20;
+const SLACK_PERMALINK_TEXT_MAX_CHARS: usize = 8_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlackPermalinkRef {
+    url: String,
+    channel_id: String,
+    message_ts: String,
+    thread_ts_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlackPermalinkLookup {
+    Message(serde_json::Value),
+    AccessDenied(String),
+    NotFound,
+}
 
 /// Extract the Slack message timestamp from a ZeroClaw message ID.
 ///
@@ -161,6 +181,7 @@ impl SlackChannel {
             draft_update_interval_ms: SLACK_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(HashMap::new()),
             lazy_draft_ts: tokio::sync::Mutex::new(HashMap::new()),
+            cancel_reaction: None,
         }
     }
 
@@ -226,6 +247,12 @@ impl SlackChannel {
         if interval_ms > 0 {
             self.draft_update_interval_ms = interval_ms;
         }
+        self
+    }
+
+    /// Set the emoji reaction name that cancels an in-flight request.
+    pub fn with_cancel_reaction(mut self, reaction: Option<String>) -> Self {
+        self.cancel_reaction = reaction;
         self
     }
 
@@ -797,7 +824,365 @@ impl SlackChannel {
             .unwrap_or_default();
         let normalized_text = Self::normalize_incoming_text(text, require_mention, bot_user_id)?;
         let attachment_blocks = self.render_file_attachments(message).await;
-        Self::compose_incoming_content(normalized_text, attachment_blocks)
+        let permalink_blocks = self.resolve_permalink_blocks(&normalized_text).await;
+        let mut blocks = attachment_blocks;
+        blocks.extend(permalink_blocks);
+        Self::compose_incoming_content(normalized_text, blocks)
+    }
+
+    async fn resolve_permalink_blocks(&self, text: &str) -> Vec<String> {
+        let permalinks = Self::extract_slack_permalinks(text);
+        if permalinks.is_empty() {
+            return Vec::new();
+        }
+        let tasks = permalinks
+            .into_iter()
+            .map(|permalink| async move { self.resolve_slack_permalink(&permalink).await });
+
+        futures_util::stream::iter(tasks)
+            .buffer_unordered(SLACK_ATTACHMENT_RENDER_CONCURRENCY)
+            .filter_map(|block| async move { block })
+            .collect()
+            .await
+    }
+
+    fn extract_slack_permalinks(text: &str) -> Vec<SlackPermalinkRef> {
+        let mut permalinks = Vec::new();
+        let mut seen = HashSet::new();
+
+        for token in text.split_whitespace() {
+            if permalinks.len() >= SLACK_PERMALINK_MAX_LINKS_PER_MESSAGE {
+                break;
+            }
+
+            let Some(url) = Self::extract_url_token(token) else {
+                continue;
+            };
+            let Some(permalink) = Self::parse_slack_permalink(&url) else {
+                continue;
+            };
+            if seen.insert((permalink.channel_id.clone(), permalink.message_ts.clone())) {
+                permalinks.push(permalink);
+            }
+        }
+
+        permalinks
+    }
+
+    fn extract_url_token(token: &str) -> Option<String> {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let candidate = if trimmed.starts_with('<') && trimmed.ends_with('>') {
+            trimmed
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .split('|')
+                .next()
+                .unwrap_or_default()
+                .trim()
+        } else {
+            trimmed.trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | ',' | ';'
+                )
+            })
+        };
+
+        if candidate.starts_with("https://") || candidate.starts_with("http://") {
+            Some(candidate.to_string())
+        } else {
+            None
+        }
+    }
+
+    fn parse_slack_permalink(raw_url: &str) -> Option<SlackPermalinkRef> {
+        let url = reqwest::Url::parse(raw_url).ok()?;
+        let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+        if host != "slack.com" && !host.ends_with(".slack.com") {
+            return None;
+        }
+
+        let mut segments = url.path_segments()?;
+        let first = segments.next()?;
+        let second = segments.next()?;
+        let third = segments.next()?;
+        if first != "archives" || segments.next().is_some() {
+            return None;
+        }
+
+        let channel_id = second.trim();
+        if channel_id.is_empty() {
+            return None;
+        }
+
+        let message_ts = Self::parse_slack_permalink_ts(third)?;
+        let thread_ts_hint = url
+            .query_pairs()
+            .find(|(key, _)| key == "thread_ts")
+            .map(|(_, value)| value.trim().to_string())
+            .filter(|value| Self::is_valid_slack_ts(value));
+
+        Some(SlackPermalinkRef {
+            url: raw_url.to_string(),
+            channel_id: channel_id.to_string(),
+            message_ts,
+            thread_ts_hint,
+        })
+    }
+
+    fn parse_slack_permalink_ts(segment: &str) -> Option<String> {
+        let digits = segment.strip_prefix('p')?.trim();
+        if digits.len() <= 6 || !digits.chars().all(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+
+        let (secs, micros) = digits.split_at(digits.len() - 6);
+        Some(format!("{secs}.{micros}"))
+    }
+
+    fn is_valid_slack_ts(ts: &str) -> bool {
+        let Some((secs, micros)) = ts.split_once('.') else {
+            return false;
+        };
+        !secs.is_empty()
+            && micros.len() == 6
+            && secs.chars().all(|ch| ch.is_ascii_digit())
+            && micros.chars().all(|ch| ch.is_ascii_digit())
+    }
+
+    async fn resolve_slack_permalink(&self, permalink: &SlackPermalinkRef) -> Option<String> {
+        let message_lookup = self
+            .fetch_permalink_message(&permalink.channel_id, &permalink.message_ts)
+            .await;
+        let message = match message_lookup {
+            SlackPermalinkLookup::Message(message) => message,
+            SlackPermalinkLookup::AccessDenied(reason) => {
+                return Some(Self::format_permalink_access_denied(permalink, &reason));
+            }
+            SlackPermalinkLookup::NotFound => {
+                let thread_ts = permalink.thread_ts_hint.as_deref()?;
+                let replies = self
+                    .fetch_thread_messages_with_retry(&permalink.channel_id, thread_ts)
+                    .await?;
+                let target = replies.into_iter().find(|reply| {
+                    reply.get("ts").and_then(|value| value.as_str())
+                        == Some(permalink.message_ts.as_str())
+                });
+                let target = target?;
+                return self
+                    .format_permalink_context(permalink, target, Some(thread_ts))
+                    .await;
+            }
+        };
+
+        let thread_ts = message
+            .get("thread_ts")
+            .and_then(|value| value.as_str())
+            .filter(|thread_ts| Self::is_valid_slack_ts(thread_ts))
+            .map(str::to_string);
+
+        let formatted = self
+            .format_permalink_context(permalink, message, thread_ts.as_deref())
+            .await;
+        formatted
+    }
+
+    async fn fetch_permalink_message(
+        &self,
+        channel_id: &str,
+        message_ts: &str,
+    ) -> SlackPermalinkLookup {
+        let resp = match self
+            .http_client()
+            .get("https://slack.com/api/conversations.history")
+            .bearer_auth(&self.bot_token)
+            .query(&[
+                ("channel", channel_id),
+                ("oldest", message_ts),
+                ("latest", message_ts),
+                ("inclusive", "true"),
+                ("limit", "1"),
+            ])
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                tracing::warn!(
+                    "Slack permalink resolver: conversations.history request failed for channel={} ts={}: {}",
+                    channel_id, message_ts, err
+                );
+                return SlackPermalinkLookup::NotFound;
+            }
+        };
+
+        let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+        if !status.is_success() {
+            let sanitized = crate::providers::sanitize_api_error(&body);
+            tracing::warn!(
+                "Slack permalink resolver: conversations.history failed for channel={} ts={} ({}): {}",
+                channel_id, message_ts, status, sanitized
+            );
+            return SlackPermalinkLookup::NotFound;
+        }
+
+        let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        if payload.get("ok") == Some(&serde_json::Value::Bool(false)) {
+            let err = payload
+                .get("error")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            return match err {
+                "not_in_channel" => SlackPermalinkLookup::AccessDenied(
+                    "The Slack bot is not in that channel. Invite the app to the channel and try again."
+                        .to_string(),
+                ),
+                "missing_scope" => SlackPermalinkLookup::AccessDenied(
+                    "The Slack app is missing the scope needed to read that channel."
+                        .to_string(),
+                ),
+                _ => {
+                    tracing::warn!(
+                        "Slack permalink resolver: conversations.history returned error for channel={} ts={}: {}",
+                        channel_id, message_ts, err
+                    );
+                    SlackPermalinkLookup::NotFound
+                }
+            };
+        }
+
+        let messages = payload
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .cloned()
+            .unwrap_or_default();
+        messages
+            .first()
+            .cloned()
+            .map(SlackPermalinkLookup::Message)
+            .unwrap_or(SlackPermalinkLookup::NotFound)
+    }
+
+    fn format_permalink_access_denied(permalink: &SlackPermalinkRef, reason: &str) -> String {
+        format!(
+            "[Slack Link Access]\nURL: {}\nStatus: {}",
+            permalink.url, reason
+        )
+    }
+
+    async fn fetch_thread_messages_with_retry(
+        &self,
+        channel_id: &str,
+        thread_ts: &str,
+    ) -> Option<Vec<serde_json::Value>> {
+        let payload = self
+            .fetch_thread_replies_with_retry(channel_id, thread_ts, "0")
+            .await?;
+        let messages = payload
+            .get("messages")
+            .and_then(|messages| messages.as_array())
+            .cloned()
+            .unwrap_or_default();
+        Some(messages)
+    }
+
+    async fn format_permalink_context(
+        &self,
+        permalink: &SlackPermalinkRef,
+        message: serde_json::Value,
+        thread_ts: Option<&str>,
+    ) -> Option<String> {
+        let mut lines = vec![
+            "[Slack Link Context]".to_string(),
+            format!("URL: {}", permalink.url),
+        ];
+
+        if let Some(thread_ts) = thread_ts {
+            let replies = self
+                .fetch_thread_messages_with_retry(&permalink.channel_id, thread_ts)
+                .await
+                .unwrap_or_else(|| vec![message.clone()]);
+            let rendered = self
+                .render_permalink_thread_messages(&replies, &permalink.message_ts)
+                .await;
+            if rendered.is_empty() {
+                return None;
+            }
+            lines.push("Thread:".to_string());
+            lines.extend(rendered);
+        } else {
+            let rendered = self.render_permalink_message_line(&message, true).await?;
+            lines.push("Message:".to_string());
+            lines.push(rendered);
+        }
+
+        Self::truncate_text(&lines.join("\n"), SLACK_PERMALINK_TEXT_MAX_CHARS)
+    }
+
+    async fn render_permalink_thread_messages(
+        &self,
+        messages: &[serde_json::Value],
+        target_ts: &str,
+    ) -> Vec<String> {
+        let mut rendered = Vec::new();
+        let total = messages.len();
+        let start = total.saturating_sub(SLACK_PERMALINK_THREAD_MAX_REPLIES);
+
+        if start > 0 {
+            rendered.push(format!("… {} earlier thread messages omitted …", start));
+        }
+
+        for message in &messages[start..] {
+            if let Some(line) = self
+                .render_permalink_message_line(
+                    message,
+                    message.get("ts").and_then(|value| value.as_str()) == Some(target_ts),
+                )
+                .await
+            {
+                rendered.push(line);
+            }
+        }
+
+        rendered
+    }
+
+    async fn render_permalink_message_line(
+        &self,
+        message: &serde_json::Value,
+        highlight: bool,
+    ) -> Option<String> {
+        let user_id = message
+            .get("user")
+            .or_else(|| message.get("bot_id"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let sender = if user_id.is_empty() {
+            "unknown".to_string()
+        } else {
+            self.resolve_sender_identity(user_id).await
+        };
+
+        let text = message
+            .get("text")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("[no text]");
+        let attachment_blocks = self.render_file_attachments(message).await;
+        let content = Self::compose_incoming_content(text.to_string(), attachment_blocks)
+            .unwrap_or_else(|| text.to_string())
+            .replace('\n', " ");
+        let prefix = if highlight { ">" } else { "-" };
+        Some(format!("{prefix} {sender}: {content}"))
     }
 
     async fn render_file_attachments(&self, message: &serde_json::Value) -> Vec<String> {
@@ -2314,6 +2699,63 @@ impl SlackChannel {
                     continue;
                 }
 
+                // Handle reaction-based cancellation.
+                if event_type == "reaction_added" {
+                    if let Some(ref cancel_emoji) = self.cancel_reaction {
+                        let reaction = event
+                            .get("reaction")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if reaction == cancel_emoji.as_str() {
+                            let user = event
+                                .get("user")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            if !user.is_empty() && self.is_user_allowed(user) {
+                                let item = event.get("item");
+                                let item_channel = item
+                                    .and_then(|i| i.get("channel"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let item_ts = item
+                                    .and_then(|i| i.get("ts"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                if !item_channel.is_empty() && !item_ts.is_empty() {
+                                    // Build a synthetic /stop message scoped to the
+                                    // thread of the reacted message so the dispatch
+                                    // loop cancels the correct in-flight task.
+                                    let thread_ts = Some(item_ts.to_string());
+                                    let scope_id = Some(item_ts.to_string());
+                                    let sender = self.resolve_sender_identity(user).await;
+                                    let cancel_msg = ChannelMessage {
+                                        id: format!("slack_{item_channel}_{item_ts}_cancel"),
+                                        sender,
+                                        reply_target: item_channel.to_string(),
+                                        content: "/stop".to_string(),
+                                        channel: "slack".to_string(),
+                                        timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        thread_ts,
+                                        interruption_scope_id: scope_id,
+                                        attachments: vec![],
+                                    };
+                                    tracing::info!(
+                                        "Slack: :{cancel_emoji}: reaction from {user} \
+                                         on {item_channel}/{item_ts} — sending /stop"
+                                    );
+                                    if tx.send(cancel_msg).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if event_type != "message" {
                     continue;
                 }
@@ -3064,19 +3506,29 @@ impl Channel for SlackChannel {
             .expect("last_draft_edit lock")
             .remove(recipient);
 
+        // Extract thread_ts from the lazy draft ID ("lazy:{channel}:{thread_ts}")
+        // so fallback sends preserve thread context.
+        let draft_thread_ts = message_id
+            .strip_prefix(LAZY_DRAFT_PREFIX)
+            .and_then(|rest| rest.find(':').map(|pos| &rest[pos + 1..]))
+            .filter(|ts| !ts.is_empty())
+            .map(String::from);
+
         let real_ts = self.resolve_draft_ts(message_id).await;
         // Clean up lazy mapping
         self.lazy_draft_ts.lock().await.remove(message_id);
 
         let Some(real_ts) = real_ts else {
             // Draft was never materialized — just send as a fresh message
-            return self.send(&SendMessage::new(text, recipient)).await;
+            let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
+            return self.send(&msg).await;
         };
 
         // If text exceeds Slack limit, delete draft and send as regular message
         if text.len() > SLACK_MESSAGE_MAX_CHARS {
             let _ = self.delete_message(recipient, &real_ts).await;
-            return self.send(&SendMessage::new(text, recipient)).await;
+            let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
+            return self.send(&msg).await;
         }
 
         // Edit the draft with the final formatted content
@@ -3115,7 +3567,8 @@ impl Channel for SlackChannel {
         tracing::debug!("Slack chat.update (finalize) failed: {err}; falling back to delete+send");
 
         let _ = self.delete_message(recipient, &real_ts).await;
-        self.send(&SendMessage::new(text, recipient)).await
+        let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
+        self.send(&msg).await
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
@@ -3822,6 +4275,60 @@ mod tests {
             composed.as_deref(),
             Some("[IMAGE:data:image/png;base64,aaaa]")
         );
+    }
+
+    #[test]
+    fn parse_slack_permalink_accepts_standard_archives_link() {
+        let parsed = SlackChannel::parse_slack_permalink(
+            "https://acme.slack.com/archives/C12345678/p1712345678901234",
+        )
+        .expect("permalink");
+
+        assert_eq!(parsed.channel_id, "C12345678");
+        assert_eq!(parsed.message_ts, "1712345678.901234");
+        assert_eq!(parsed.thread_ts_hint, None);
+    }
+
+    #[test]
+    fn parse_slack_permalink_reads_thread_hint_when_present() {
+        let parsed = SlackChannel::parse_slack_permalink(
+            "https://acme.slack.com/archives/C12345678/p1712345678901234?thread_ts=1712345600.000100&cid=C12345678",
+        )
+        .expect("permalink");
+
+        assert_eq!(parsed.thread_ts_hint.as_deref(), Some("1712345600.000100"));
+    }
+
+    #[test]
+    fn parse_slack_permalink_rejects_non_message_links() {
+        assert!(SlackChannel::parse_slack_permalink("https://example.com/path").is_none());
+        assert!(
+            SlackChannel::parse_slack_permalink("https://acme.slack.com/client/T1/C1").is_none()
+        );
+        assert!(SlackChannel::parse_slack_permalink(
+            "https://acme.slack.com/archives/C1/not-a-message"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn extract_slack_permalinks_handles_slack_angle_bracket_format() {
+        let permalinks = SlackChannel::extract_slack_permalinks(
+            "Please inspect <https://acme.slack.com/archives/C123/p1712345678901234|message> now",
+        );
+
+        assert_eq!(permalinks.len(), 1);
+        assert_eq!(permalinks[0].channel_id, "C123");
+        assert_eq!(permalinks[0].message_ts, "1712345678.901234");
+    }
+
+    #[test]
+    fn extract_slack_permalinks_deduplicates_message_targets() {
+        let permalinks = SlackChannel::extract_slack_permalinks(
+            "https://acme.slack.com/archives/C123/p1712345678901234 again <https://acme.slack.com/archives/C123/p1712345678901234|same>",
+        );
+
+        assert_eq!(permalinks.len(), 1);
     }
 
     #[test]

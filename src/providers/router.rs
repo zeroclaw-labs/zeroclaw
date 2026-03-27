@@ -376,7 +376,7 @@ mod tests {
             .zip(mocks.iter())
             .map(|((name, _), mock)| {
                 (
-                    name.to_string(),
+                    (*name).to_string(),
                     Box::new(Arc::clone(mock)) as Box<dyn Provider>,
                 )
             })
@@ -386,10 +386,10 @@ mod tests {
             .iter()
             .map(|(hint, provider_name, model)| {
                 (
-                    hint.to_string(),
+                    (*hint).to_string(),
                     Route {
-                        provider_name: provider_name.to_string(),
-                        model: model.to_string(),
+                        provider_name: (*provider_name).to_string(),
+                        model: (*model).to_string(),
                     },
                 )
             })
