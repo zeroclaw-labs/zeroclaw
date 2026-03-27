@@ -203,6 +203,7 @@ pdf-extract = { version = "0.10", optional = true }
 
 # WASM plugin runtime (extism)
 extism = { version = "1.20", optional = true }
+wasmtime = { version = "41", optional = true }
 
 # Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
 cpal = { version = "0.15", optional = true }
@@ -261,6 +262,8 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 voice-wake = ["dep:cpal"]
 # WASM plugin system (extism-based)
 plugins-wasm = ["dep:extism"]
+# Minimal in-process WASM runtime for sandboxed tools
+runtime-wasm = ["dep:wasmtime"]
 # WebAuthn / FIDO2 hardware key authentication
 webauthn = []
 # Meta-feature for CI: all features except those requiring system C libraries
@@ -319,6 +322,7 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
 rcgen = "0.13"
+wat = "1"
 
 [[test]]
 name = "component"

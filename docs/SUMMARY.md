@@ -2,7 +2,7 @@
 
 This file is the canonical table of contents for the documentation system.
 
-Last refreshed: **February 18, 2026**.
+Last refreshed: **March 27, 2026**.
 
 ## Language Entry
 
@@ -107,6 +107,7 @@ Last refreshed: **February 18, 2026**.
 - [agnostic-security.md](security/agnostic-security.md)
 - [frictionless-security.md](security/frictionless-security.md)
 - [sandboxing.md](security/sandboxing.md)
+- [wasm-runtime.md](security/wasm-runtime.md)
 - [resource-limits.md](ops/resource-limits.md)
 - [audit-logging.md](security/audit-logging.md)
 - [security-roadmap.md](security/security-roadmap.md)

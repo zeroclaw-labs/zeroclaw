@@ -1992,7 +1992,6 @@ struct StreamedChatOutcome {
     forwarded_live_deltas: bool,
 }
 
-
 async fn consume_provider_streaming_response(
     provider: &dyn Provider,
     messages: &[ChatMessage],
@@ -3049,7 +3048,8 @@ pub(crate) async fn run_tool_call_loop(
 
             let signature = {
                 let canonical_args = canonicalize_json_for_tool_signature(&tool_args);
-                let args_json = serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
+                let args_json =
+                    serde_json::to_string(&canonical_args).unwrap_or_else(|_| "{}".to_string());
                 (tool_name.trim().to_ascii_lowercase(), args_json)
             };
             let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
@@ -3113,7 +3113,9 @@ pub(crate) async fn run_tool_call_loop(
                 let hint = {
                     let raw = match tool_name.as_str() {
                         "shell" => tool_args.get("command").and_then(|v| v.as_str()),
-                        "file_read" | "file_write" => tool_args.get("path").and_then(|v| v.as_str()),
+                        "file_read" | "file_write" => {
+                            tool_args.get("path").and_then(|v| v.as_str())
+                        }
                         _ => tool_args
                             .get("action")
                             .and_then(|v| v.as_str())

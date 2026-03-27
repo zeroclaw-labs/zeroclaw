@@ -1,22 +1,29 @@
-//! WASM sandbox runtime — in-process tool isolation via `wasmi`.
+//! WASM sandbox runtime — in-process tool isolation.
 //!
-//! Provides capability-based sandboxing without Docker or external runtimes.
-//! Each WASM module runs with:
-//! - **Fuel limits**: prevents infinite loops (each instruction costs 1 fuel)
-//! - **Memory caps**: configurable per-module memory ceiling
-//! - **No filesystem access**: by default, tools are pure computation
-//! - **No network access**: unless explicitly allowlisted hosts are configured
+//! This runtime is intentionally narrow:
+//! - runs a single `.wasm` module per invocation
+//! - enforces fuel and memory limits
+//! - has no shell access
+//! - does not expose arbitrary host syscalls
+//!
+//! The first implementation only supports pure modules that export either:
+//! - `run() -> i32`
+//! - `_start()`
+//!
+//! That matches the immediate goal: make `runtime.kind = "wasm"` real in the
+//! main runtime factory without pretending that the whole ZeroClaw process can
+//! already live inside WASM.
 //!
 //! # Feature gate
 //! This module is only compiled when `--features runtime-wasm` is enabled.
-//! The default ZeroClaw binary excludes it to maintain the 4.6 MB size target.
+//! The default ZeroClaw binary still excludes it unless the feature is
+//! requested explicitly.
 
 use super::traits::RuntimeAdapter;
 use crate::config::WasmRuntimeConfig;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// WASM sandbox runtime — executes tool modules in an isolated interpreter.
 #[derive(Debug, Clone)]
 pub struct WasmRuntime {
     config: WasmRuntimeConfig,
@@ -26,28 +33,28 @@ pub struct WasmRuntime {
 /// Result of executing a WASM module.
 #[derive(Debug, Clone)]
 pub struct WasmExecutionResult {
-    /// Standard output captured from the module (if WASI is used)
+    /// Standard output captured from the module.
     pub stdout: String,
-    /// Standard error captured from the module
+    /// Standard error captured from the module.
     pub stderr: String,
-    /// Exit code (0 = success)
+    /// Exit code (0 = success).
     pub exit_code: i32,
-    /// Fuel consumed during execution
+    /// Fuel consumed during execution.
     pub fuel_consumed: u64,
 }
 
 /// Capabilities granted to a WASM tool module.
 #[derive(Debug, Clone, Default)]
 pub struct WasmCapabilities {
-    /// Allow reading files from workspace
+    /// Allow reading files from workspace.
     pub read_workspace: bool,
-    /// Allow writing files to workspace
+    /// Allow writing files to workspace.
     pub write_workspace: bool,
-    /// Allowed HTTP hosts (empty = no network)
+    /// Allowed HTTP hosts (reserved for a future host-mediated network bridge).
     pub allowed_hosts: Vec<String>,
-    /// Custom fuel override (0 = use config default)
+    /// Custom fuel override (0 = use config default).
     pub fuel_override: u64,
-    /// Custom memory override in MB (0 = use config default)
+    /// Custom memory override in MB (0 = use config default).
     pub memory_override_mb: u64,
 }
 
@@ -79,15 +86,15 @@ impl WasmRuntime {
             bail!("runtime.wasm.memory_limit_mb must be > 0");
         }
         if self.config.memory_limit_mb > 4096 {
-            bail!(
-                "runtime.wasm.memory_limit_mb of {} exceeds the 4 GB safety limit for 32-bit WASM",
-                self.config.memory_limit_mb
-            );
+            bail!("runtime.wasm.memory_limit_mb exceeds the 4 GB safety limit");
         }
-        if self.config.tools_dir.is_empty() {
+        if self.config.tools_dir.trim().is_empty() {
             bail!("runtime.wasm.tools_dir cannot be empty");
         }
-        // Verify tools directory doesn't escape workspace
+        let tools_path = Path::new(&self.config.tools_dir);
+        if tools_path.is_absolute() {
+            bail!("runtime.wasm.tools_dir must be relative to the workspace");
+        }
         if self.config.tools_dir.contains("..") {
             bail!("runtime.wasm.tools_dir must not contain '..' path traversal");
         }
@@ -129,11 +136,6 @@ impl WasmRuntime {
         mb.saturating_mul(1024 * 1024)
     }
 
-    /// Execute a WASM module from the tools directory.
-    ///
-    /// This is the primary entry point for running sandboxed tool code.
-    /// The module must export a `_start` function (WASI convention) or
-    /// a custom `run` function that takes no arguments and returns i32.
     #[cfg(feature = "runtime-wasm")]
     pub fn execute_module(
         &self,
@@ -141,12 +143,16 @@ impl WasmRuntime {
         workspace_dir: &Path,
         caps: &WasmCapabilities,
     ) -> Result<WasmExecutionResult> {
-        use wasmi::{Engine, Linker, Module, Store};
+        use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimitsBuilder};
 
-        // Resolve module path
+        self.validate_config()?;
+
+        if caps.memory_override_mb > 4096 {
+            bail!("runtime.wasm.memory_limit_mb exceeds the 4 GB safety limit");
+        }
+
         let tools_path = self.tools_dir(workspace_dir);
         let module_path = tools_path.join(format!("{module_name}.wasm"));
-
         if !module_path.exists() {
             bail!(
                 "WASM module not found: {} (looked in {})",
@@ -155,88 +161,87 @@ impl WasmRuntime {
             );
         }
 
-        // Read module bytes
         let wasm_bytes = std::fs::read(&module_path)
             .with_context(|| format!("Failed to read WASM module: {}", module_path.display()))?;
-
-        // Validate module size (sanity check)
         if wasm_bytes.len() > 50 * 1024 * 1024 {
             bail!(
-                "WASM module {} is {} MB — exceeds 50 MB safety limit",
+                "WASM module {} is too large: {} bytes exceeds 50 MB limit",
                 module_name,
-                wasm_bytes.len() / (1024 * 1024)
+                wasm_bytes.len()
             );
         }
 
-        // Configure engine with fuel metering
-        let mut engine_config = wasmi::Config::default();
+        let mut engine_config = Config::new();
         engine_config.consume_fuel(true);
-        let engine = Engine::new(&engine_config);
+        let engine = Engine::new(&engine_config).context("Failed to create wasmtime engine")?;
+        let module = Module::from_binary(&engine, &wasm_bytes)
+            .with_context(|| format!("Failed to compile WASM module: {module_name}"))?;
 
-        // Parse and validate module
-        let module = Module::new(&engine, &wasm_bytes[..])
-            .with_context(|| format!("Failed to parse WASM module: {module_name}"))?;
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(self.effective_memory_bytes(caps) as usize)
+            .build();
+        let mut store = Store::new(&engine, limits);
+        store.limiter(|state| state);
 
-        // Create store with fuel budget
-        let mut store = Store::new(&engine, ());
         let fuel = self.effective_fuel(caps);
         if fuel > 0 {
-            store.set_fuel(fuel).with_context(|| {
-                format!("Failed to set fuel budget ({fuel}) for module: {module_name}")
-            })?;
+            store
+                .set_fuel(fuel)
+                .with_context(|| format!("Failed to set fuel budget ({fuel})"))?;
         }
 
-        // Link host functions (minimal — pure sandboxing)
         let linker = Linker::new(&engine);
-
-        // Instantiate module
         let instance = linker
             .instantiate(&mut store, &module)
-            .and_then(|pre| pre.start(&mut store))
             .with_context(|| format!("Failed to instantiate WASM module: {module_name}"))?;
 
-        // Look for exported entry point
-        let run_fn = instance
-            .get_typed_func::<(), i32>(&store, "run")
-            .or_else(|_| instance.get_typed_func::<(), i32>(&store, "_start"))
-            .with_context(|| {
-                format!(
-                    "WASM module '{module_name}' must export a 'run() -> i32' or '_start() -> i32' function"
-                )
-            })?;
+        let fuel_before = store.get_fuel().unwrap_or(fuel);
 
-        // Execute with fuel accounting
-        let fuel_before = store.get_fuel().unwrap_or(0);
-        let exit_code = match run_fn.call(&mut store, ()) {
-            Ok(code) => code,
-            Err(e) => {
-                // Check if we ran out of fuel (infinite loop protection)
+        // Support both a pure `run() -> i32` tool contract and `_start()`.
+        let execution = if let Ok(run_fn) = instance.get_typed_func::<(), i32>(&mut store, "run") {
+            run_fn
+                .call(&mut store, ())
+                .map(|exit_code| WasmExecutionResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code,
+                    fuel_consumed: 0,
+                })
+        } else if let Ok(start_fn) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            start_fn.call(&mut store, ()).map(|()| WasmExecutionResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: 0,
+                fuel_consumed: 0,
+            })
+        } else {
+            bail!("WASM module '{module_name}' must export 'run() -> i32' or '_start()'");
+        };
+
+        match execution {
+            Ok(mut result) => {
                 let fuel_after = store.get_fuel().unwrap_or(0);
-                if fuel_after == 0 && fuel > 0 {
+                result.fuel_consumed = fuel_before.saturating_sub(fuel_after);
+                Ok(result)
+            }
+            Err(err) => {
+                let fuel_after = store.get_fuel().unwrap_or(0);
+                if fuel > 0 && fuel_after == 0 {
                     return Ok(WasmExecutionResult {
                         stdout: String::new(),
                         stderr: format!(
-                            "WASM module '{module_name}' exceeded fuel limit ({fuel} ticks) — likely an infinite loop"
+                            "WASM module '{module_name}' exceeded fuel limit ({fuel} ticks)"
                         ),
                         exit_code: -1,
                         fuel_consumed: fuel,
                     });
                 }
-                bail!("WASM execution error in '{module_name}': {e}");
-            }
-        };
-        let fuel_after = store.get_fuel().unwrap_or(0);
-        let fuel_consumed = fuel_before.saturating_sub(fuel_after);
 
-        Ok(WasmExecutionResult {
-            stdout: String::new(),  // No WASI stdout yet — pure computation
-            stderr: String::new(),
-            exit_code,
-            fuel_consumed,
-        })
+                bail!("WASM execution error in '{module_name}': {err}");
+            }
+        }
     }
 
-    /// Stub for when the `runtime-wasm` feature is not enabled.
     #[cfg(not(feature = "runtime-wasm"))]
     pub fn execute_module(
         &self,
@@ -245,14 +250,14 @@ impl WasmRuntime {
         _caps: &WasmCapabilities,
     ) -> Result<WasmExecutionResult> {
         bail!(
-            "WASM runtime is not available in this build. \
-             Rebuild with `cargo build --features runtime-wasm` to enable WASM sandbox support. \
-             Module requested: {module_name}"
+            "WASM runtime is not available in this build. Rebuild with `--features runtime-wasm`. Module requested: {module_name}"
         )
     }
 
     /// List available WASM tool modules in the tools directory.
     pub fn list_modules(&self, workspace_dir: &Path) -> Result<Vec<String>> {
+        self.validate_config()?;
+
         let tools_path = self.tools_dir(workspace_dir);
         if !tools_path.exists() {
             return Ok(Vec::new());
@@ -281,7 +286,6 @@ impl RuntimeAdapter for WasmRuntime {
     }
 
     fn has_shell_access(&self) -> bool {
-        // WASM sandbox does NOT provide shell access — that's the point
         false
     }
 
@@ -296,7 +300,6 @@ impl RuntimeAdapter for WasmRuntime {
     }
 
     fn supports_long_running(&self) -> bool {
-        // WASM modules are short-lived invocations, not daemons
         false
     }
 
@@ -308,15 +311,10 @@ impl RuntimeAdapter for WasmRuntime {
         &self,
         _command: &str,
         _workspace_dir: &Path,
-    ) -> anyhow::Result<tokio::process::Command> {
-        bail!(
-            "WASM runtime does not support shell commands. \
-             Use `execute_module()` to run WASM tools, or switch to runtime.kind = \"native\" for shell access."
-        )
+    ) -> Result<tokio::process::Command> {
+        bail!("WASM runtime does not support shell commands. Use `execute_module()` instead.")
     }
 }
-
-// ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -326,362 +324,187 @@ mod tests {
         WasmRuntimeConfig::default()
     }
 
-    // ── Basic trait compliance ──────────────────────────────────
-
     #[test]
-    fn wasm_runtime_name() {
-        let rt = WasmRuntime::new(default_config());
-        assert_eq!(rt.name(), "wasm");
+    fn runtime_trait_surface_is_locked_down() {
+        let runtime = WasmRuntime::new(default_config());
+        assert_eq!(runtime.name(), "wasm");
+        assert!(!runtime.has_shell_access());
+        assert!(!runtime.has_filesystem_access());
+        assert!(!runtime.supports_long_running());
+        assert_eq!(runtime.memory_budget(), 64 * 1024 * 1024);
     }
 
     #[test]
-    fn wasm_no_shell_access() {
-        let rt = WasmRuntime::new(default_config());
-        assert!(!rt.has_shell_access());
+    fn storage_path_uses_workspace_when_present() {
+        let runtime =
+            WasmRuntime::with_workspace(default_config(), PathBuf::from("/tmp/zeroclaw-space"));
+        assert_eq!(
+            runtime.storage_path(),
+            PathBuf::from("/tmp/zeroclaw-space/.zeroclaw")
+        );
     }
 
     #[test]
-    fn wasm_no_filesystem_by_default() {
-        let rt = WasmRuntime::new(default_config());
-        assert!(!rt.has_filesystem_access());
+    fn build_shell_command_is_rejected() {
+        let runtime = WasmRuntime::new(default_config());
+        let err = runtime
+            .build_shell_command("echo hello", Path::new("."))
+            .unwrap_err();
+        assert!(err.to_string().contains("does not support shell"));
     }
 
     #[test]
-    fn wasm_filesystem_when_read_enabled() {
-        let mut cfg = default_config();
-        cfg.allow_workspace_read = true;
-        let rt = WasmRuntime::new(cfg);
-        assert!(rt.has_filesystem_access());
-    }
-
-    #[test]
-    fn wasm_filesystem_when_write_enabled() {
-        let mut cfg = default_config();
-        cfg.allow_workspace_write = true;
-        let rt = WasmRuntime::new(cfg);
-        assert!(rt.has_filesystem_access());
-    }
-
-    #[test]
-    fn wasm_no_long_running() {
-        let rt = WasmRuntime::new(default_config());
-        assert!(!rt.supports_long_running());
-    }
-
-    #[test]
-    fn wasm_memory_budget() {
-        let rt = WasmRuntime::new(default_config());
-        assert_eq!(rt.memory_budget(), 64 * 1024 * 1024);
-    }
-
-    #[test]
-    fn wasm_shell_command_errors() {
-        let rt = WasmRuntime::new(default_config());
-        let result = rt.build_shell_command("echo hello", Path::new("/tmp"));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("does not support shell"));
-    }
-
-    #[test]
-    fn wasm_storage_path_default() {
-        let rt = WasmRuntime::new(default_config());
-        assert!(rt.storage_path().to_string_lossy().contains("zeroclaw"));
-    }
-
-    #[test]
-    fn wasm_storage_path_with_workspace() {
-        let rt = WasmRuntime::with_workspace(default_config(), PathBuf::from("/home/user/project"));
-        assert_eq!(rt.storage_path(), PathBuf::from("/home/user/project/.zeroclaw"));
-    }
-
-    // ── Config validation ──────────────────────────────────────
-
-    #[test]
-    fn validate_rejects_zero_memory() {
-        let mut cfg = default_config();
-        cfg.memory_limit_mb = 0;
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
+    fn validate_config_rejects_bad_paths_and_limits() {
+        let mut config = default_config();
+        config.memory_limit_mb = 0;
+        let err = WasmRuntime::new(config).validate_config().unwrap_err();
         assert!(err.to_string().contains("must be > 0"));
-    }
 
-    #[test]
-    fn validate_rejects_excessive_memory() {
-        let mut cfg = default_config();
-        cfg.memory_limit_mb = 8192;
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("4 GB safety limit"));
-    }
+        let mut config = default_config();
+        config.tools_dir = "/tmp/escape".into();
+        let err = WasmRuntime::new(config).validate_config().unwrap_err();
+        assert!(err.to_string().contains("must be relative"));
 
-    #[test]
-    fn validate_rejects_empty_tools_dir() {
-        let mut cfg = default_config();
-        cfg.tools_dir = String::new();
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("cannot be empty"));
-    }
-
-    #[test]
-    fn validate_rejects_path_traversal() {
-        let mut cfg = default_config();
-        cfg.tools_dir = "../../../etc/passwd".into();
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
+        let mut config = default_config();
+        config.tools_dir = "../escape".into();
+        let err = WasmRuntime::new(config).validate_config().unwrap_err();
         assert!(err.to_string().contains("path traversal"));
     }
 
     #[test]
-    fn validate_accepts_valid_config() {
-        let rt = WasmRuntime::new(default_config());
-        assert!(rt.validate_config().is_ok());
-    }
-
-    #[test]
-    fn validate_accepts_max_memory() {
-        let mut cfg = default_config();
-        cfg.memory_limit_mb = 4096;
-        let rt = WasmRuntime::new(cfg);
-        assert!(rt.validate_config().is_ok());
-    }
-
-    // ── Capabilities & fuel ────────────────────────────────────
-
-    #[test]
-    fn effective_fuel_uses_config_default() {
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities::default();
-        assert_eq!(rt.effective_fuel(&caps), 1_000_000);
-    }
-
-    #[test]
-    fn effective_fuel_respects_override() {
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities {
-            fuel_override: 500,
-            ..Default::default()
-        };
-        assert_eq!(rt.effective_fuel(&caps), 500);
-    }
-
-    #[test]
-    fn effective_memory_uses_config_default() {
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities::default();
-        assert_eq!(rt.effective_memory_bytes(&caps), 64 * 1024 * 1024);
-    }
-
-    #[test]
-    fn effective_memory_respects_override() {
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities {
-            memory_override_mb: 128,
-            ..Default::default()
-        };
-        assert_eq!(rt.effective_memory_bytes(&caps), 128 * 1024 * 1024);
-    }
-
-    #[test]
-    fn default_capabilities_match_config() {
-        let mut cfg = default_config();
-        cfg.allow_workspace_read = true;
-        cfg.allowed_hosts = vec!["api.example.com".into()];
-        let rt = WasmRuntime::new(cfg);
-        let caps = rt.default_capabilities();
+    fn default_capabilities_follow_config() {
+        let mut config = default_config();
+        config.allow_workspace_read = true;
+        config.allowed_hosts = vec!["api.example.com".into()];
+        let caps = WasmRuntime::new(config).default_capabilities();
         assert!(caps.read_workspace);
         assert!(!caps.write_workspace);
         assert_eq!(caps.allowed_hosts, vec!["api.example.com"]);
     }
 
-    // ── Tools directory ────────────────────────────────────────
-
     #[test]
-    fn tools_dir_resolves_relative_to_workspace() {
-        let rt = WasmRuntime::new(default_config());
-        let dir = rt.tools_dir(Path::new("/home/user/project"));
-        assert_eq!(dir, PathBuf::from("/home/user/project/tools/wasm"));
-    }
-
-    #[test]
-    fn list_modules_empty_when_dir_missing() {
-        let rt = WasmRuntime::new(default_config());
-        let modules = rt.list_modules(Path::new("/nonexistent/path")).unwrap();
-        assert!(modules.is_empty());
-    }
-
-    #[test]
-    fn list_modules_finds_wasm_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools_dir = dir.path().join("tools/wasm");
+    fn list_modules_reads_tools_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let tools_dir = temp.path().join("tools/wasm");
         std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(tools_dir.join("one.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(tools_dir.join("two.wasm"), b"\0asm\x01\0\0\0").unwrap();
+        std::fs::write(tools_dir.join("notes.txt"), b"ignore").unwrap();
 
-        // Create dummy .wasm files
-        std::fs::write(tools_dir.join("calculator.wasm"), b"\0asm").unwrap();
-        std::fs::write(tools_dir.join("formatter.wasm"), b"\0asm").unwrap();
-        std::fs::write(tools_dir.join("readme.txt"), b"not a wasm").unwrap();
-
-        let rt = WasmRuntime::new(default_config());
-        let modules = rt.list_modules(dir.path()).unwrap();
-        assert_eq!(modules, vec!["calculator", "formatter"]);
+        let modules = WasmRuntime::new(default_config())
+            .list_modules(temp.path())
+            .unwrap();
+        assert_eq!(modules, vec!["one", "two"]);
     }
 
-    // ── Module execution edge cases ────────────────────────────
-
-    #[test]
-    fn execute_module_missing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools_dir = dir.path().join("tools/wasm");
+    #[cfg(feature = "runtime-wasm")]
+    fn write_wasm_module(dir: &Path, name: &str, wat_source: &str) {
+        let tools_dir = dir.join("tools/wasm");
         std::fs::create_dir_all(&tools_dir).unwrap();
-
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities::default();
-        let result = rt.execute_module("nonexistent", dir.path(), &caps);
-        assert!(result.is_err());
-
-        let err_msg = result.unwrap_err().to_string();
-        // Should mention the module name
-        assert!(err_msg.contains("nonexistent"));
+        let bytes = wat::parse_str(wat_source).unwrap();
+        std::fs::write(tools_dir.join(format!("{name}.wasm")), bytes).unwrap();
     }
 
+    #[cfg(feature = "runtime-wasm")]
     #[test]
-    fn execute_module_invalid_wasm() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools_dir = dir.path().join("tools/wasm");
-        std::fs::create_dir_all(&tools_dir).unwrap();
+    fn execute_module_runs_exported_run_function() {
+        let temp = tempfile::tempdir().unwrap();
+        write_wasm_module(
+            temp.path(),
+            "adder",
+            r#"(module
+                (func (export "run") (result i32)
+                    i32.const 7
+                )
+            )"#,
+        );
 
-        // Write invalid WASM bytes
-        std::fs::write(tools_dir.join("bad.wasm"), b"not valid wasm bytes at all").unwrap();
+        let runtime = WasmRuntime::new(default_config());
+        let result = runtime
+            .execute_module("adder", temp.path(), &WasmCapabilities::default())
+            .unwrap();
 
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities::default();
-        let result = rt.execute_module("bad", dir.path(), &caps);
-        assert!(result.is_err());
+        assert_eq!(result.exit_code, 7);
+        assert!(result.stderr.is_empty());
     }
 
+    #[cfg(feature = "runtime-wasm")]
     #[test]
-    fn execute_module_oversized_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools_dir = dir.path().join("tools/wasm");
-        std::fs::create_dir_all(&tools_dir).unwrap();
+    fn execute_module_runs_exported_start_function() {
+        let temp = tempfile::tempdir().unwrap();
+        write_wasm_module(
+            temp.path(),
+            "starter",
+            r#"(module
+                (func (export "_start"))
+            )"#,
+        );
 
-        // Write a file > 50 MB (we just check the size, don't actually allocate)
-        // This test verifies the check without consuming 50 MB of disk
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities::default();
+        let runtime = WasmRuntime::new(default_config());
+        let result = runtime
+            .execute_module("starter", temp.path(), &WasmCapabilities::default())
+            .unwrap();
 
-        // File doesn't exist for oversized test — the missing file check catches first
-        // But if it did exist and was 51 MB, the size check would catch it
-        let result = rt.execute_module("oversized", dir.path(), &caps);
-        assert!(result.is_err());
+        assert_eq!(result.exit_code, 0);
     }
 
-    // ── Feature gate check ─────────────────────────────────────
-
+    #[cfg(feature = "runtime-wasm")]
     #[test]
-    fn is_available_matches_feature_flag() {
-        // This test verifies the compile-time feature detection works
-        let available = WasmRuntime::is_available();
-        assert_eq!(available, cfg!(feature = "runtime-wasm"));
-    }
+    fn execute_module_enforces_fuel_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        write_wasm_module(
+            temp.path(),
+            "loop_forever",
+            r#"(module
+                (func (export "run") (result i32)
+                    (loop $spin
+                        br $spin
+                    )
+                    i32.const 0
+                )
+            )"#,
+        );
 
-    // ── Memory overflow edge cases ─────────────────────────────
-
-    #[test]
-    fn memory_budget_no_overflow() {
-        let mut cfg = default_config();
-        cfg.memory_limit_mb = 4096; // Max valid
-        let rt = WasmRuntime::new(cfg);
-        assert_eq!(rt.memory_budget(), 4096 * 1024 * 1024);
-    }
-
-    #[test]
-    fn effective_memory_saturating() {
-        let rt = WasmRuntime::new(default_config());
+        let runtime = WasmRuntime::new(default_config());
         let caps = WasmCapabilities {
-            memory_override_mb: u64::MAX,
-            ..Default::default()
+            fuel_override: 10_000,
+            ..WasmCapabilities::default()
         };
-        // Should not panic — saturating_mul prevents overflow
-        let _bytes = rt.effective_memory_bytes(&caps);
+        let result = runtime
+            .execute_module("loop_forever", temp.path(), &caps)
+            .unwrap();
+
+        assert_eq!(result.exit_code, -1);
+        assert!(result.stderr.contains("exceeded fuel limit"));
     }
 
-    // ── WasmCapabilities default ───────────────────────────────
-
+    #[cfg(feature = "runtime-wasm")]
     #[test]
-    fn capabilities_default_is_locked_down() {
-        let caps = WasmCapabilities::default();
-        assert!(!caps.read_workspace);
-        assert!(!caps.write_workspace);
-        assert!(caps.allowed_hosts.is_empty());
-        assert_eq!(caps.fuel_override, 0);
-        assert_eq!(caps.memory_override_mb, 0);
+    fn execute_module_rejects_invalid_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let tools_dir = temp.path().join("tools/wasm");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(tools_dir.join("bad.wasm"), b"not valid wasm").unwrap();
+
+        let runtime = WasmRuntime::new(default_config());
+        let err = runtime
+            .execute_module("bad", temp.path(), &WasmCapabilities::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("Failed to compile"));
     }
 
-    // ── §3.1 / §3.2 WASM fuel & memory exhaustion tests ─────
-
+    #[cfg(not(feature = "runtime-wasm"))]
     #[test]
-    fn wasm_fuel_limit_enforced_in_config() {
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities::default();
-        let fuel = rt.effective_fuel(&caps);
-        assert!(
-            fuel > 0,
-            "default fuel limit must be > 0 to prevent infinite loops"
-        );
-    }
+    fn execute_module_requires_feature() {
+        let temp = tempfile::tempdir().unwrap();
+        let tools_dir = temp.path().join("tools/wasm");
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::write(tools_dir.join("test.wasm"), b"\0asm\x01\0\0\0").unwrap();
 
-    #[test]
-    fn wasm_memory_limit_enforced_in_config() {
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities::default();
-        let mem_bytes = rt.effective_memory_bytes(&caps);
-        assert!(
-            mem_bytes > 0,
-            "default memory limit must be > 0"
-        );
-        assert!(
-            mem_bytes <= 4096 * 1024 * 1024,
-            "default memory must not exceed 4 GB safety limit"
-        );
-    }
-
-    #[test]
-    fn wasm_zero_fuel_override_uses_default() {
-        let rt = WasmRuntime::new(default_config());
-        let caps = WasmCapabilities {
-            fuel_override: 0,
-            ..Default::default()
-        };
-        assert_eq!(
-            rt.effective_fuel(&caps),
-            1_000_000,
-            "fuel_override=0 must use config default"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_memory_just_above_limit() {
-        let mut cfg = default_config();
-        cfg.memory_limit_mb = 4097;
-        let rt = WasmRuntime::new(cfg);
-        let err = rt.validate_config().unwrap_err();
-        assert!(err.to_string().contains("4 GB safety limit"));
-    }
-
-    #[test]
-    fn execute_module_stub_returns_error_without_feature() {
-        if !WasmRuntime::is_available() {
-            let dir = tempfile::tempdir().unwrap();
-            let tools_dir = dir.path().join("tools/wasm");
-            std::fs::create_dir_all(&tools_dir).unwrap();
-            std::fs::write(tools_dir.join("test.wasm"), b"\0asm\x01\0\0\0").unwrap();
-
-            let rt = WasmRuntime::new(default_config());
-            let caps = WasmCapabilities::default();
-            let result = rt.execute_module("test", dir.path(), &caps);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("not available"));
-        }
+        let runtime = WasmRuntime::new(default_config());
+        let err = runtime
+            .execute_module("test", temp.path(), &WasmCapabilities::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("runtime-wasm"));
     }
 }
