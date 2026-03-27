@@ -95,7 +95,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
 
 ### 3.1 CRITICAL (must fix before any deployment)
 
-**F1: Memory zeroization**
+#### F1: Memory zeroization
 - Problem: TOTP secret stays in heap after use. Rust's Drop does not zero memory.
 - Fix: Wrap secret_base32 in `Zeroizing<String>`. Implement `ZeroizeOnDrop` on `TotpSecret`.
   Use `secrecy::SecretString` for the base32 field.
@@ -103,7 +103,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
   The totp-rs reference crate implements Zeroize on its TOTP struct as precedent.
 - Status: WILL FIX in code.
 
-**F2: Recovery codes missing**
+#### F2: Recovery codes missing
 - Problem: No recovery path if authenticator device is lost.
 - Fix: Generate 10 codes at setup. Format: 8 alphanumeric chars (a-z0-9, no ambiguous chars like 0/O, 1/l).
   CSPRNG-generated. Stored encrypted alongside TOTP secret. Each code is consumed on use.
@@ -111,7 +111,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
 - Industry precedent: GitHub (10 codes, 8 chars), Google (10 codes, 8 digits), GitLab (10 codes).
 - Status: WILL FIX in code.
 
-**F3: Audit log missing**
+#### F3: Audit log missing
 - Problem: No record of TOTP verifications, gate decisions, or admin actions. GDPR Art. 32 requires demonstrable technical safeguards.
 - Fix: SQLite table `totp_audit` with hash chain for tamper evidence.
   Append-only: application role has INSERT + SELECT only, no UPDATE/DELETE.
@@ -119,13 +119,13 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
   Retention: configurable, default 365 days. For legal domains: match profession's retention rules.
 - Status: WILL FIX in code.
 
-**F4: Phishing / real-time proxy (architectural limitation)**
+#### F4: Phishing / real-time proxy (architectural limitation)
 - Problem: TOTP is not phishing-resistant. Evilginx-style AiTM attacks can relay codes in real time.
 - Mitigation (v1): Document the limitation clearly. Recommend E2E-encrypted channels (Matrix) for TOTP prompts instead of Telegram Bot API (not E2E). Add `channel_security` field to config so users can mark channels as E2E or not, and the engine can warn if TOTP prompts go over a non-E2E channel.
 - Mitigation (future): FIDO2/WebAuthn as `SecurityLevel::Fido2Required`.
 - Status: DOCUMENTED in code + config.
 
-**F15: TOCTOU — Time-of-Check vs Time-of-Use**
+#### F15: TOCTOU — Time-of-Check vs Time-of-Use
 - Problem: Gate says "allowed" at time T. Between T and actual execution, the command could be
   modified (e.g. by prompt injection during wait time). Gate checked `sudo apt update`,
   agent executes `sudo rm -rf /`.
@@ -135,7 +135,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
   HMAC key: derived via HKDF with info="totp-gate-signing" from the master .secret_key.
 - Status: WILL FIX in code.
 
-**F16: Agent creates new tools/skills that bypass gating**
+#### F16: Agent creates new tools/skills that bypass gating
 - Problem: ZeroClaw's skill system allows the agent to autonomously create skills. A malicious
   or prompt-injected agent could create a skill that internally calls `db.delete` but is not
   covered by any gating pattern. The wrapper skill name does not match any rule.
@@ -146,7 +146,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
 - Status: WILL FIX in code (skill-creation gating) + ARCHITECTURAL (recursive gate evaluation
   depends on ZeroClaw's skill dispatch implementation).
 
-**F17: Config downgrade attack**
+#### F17: Config downgrade attack
 - Problem: Someone with config file access sets `enabled = false` or changes all levels to `none`.
   Entire gating system silently disabled.
 - Fix: Config reload detects security downgrades by comparing new config to current running config.
@@ -162,30 +162,30 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
 
 ### 3.2 HIGH (fix before first customer deployment)
 
-**F5: Secret in Debug output**
+#### F5: Secret in Debug output
 - Problem: `#[derive(Debug)]` on `TotpSecret` leaks `secret_base32` in logs/crash dumps.
 - Fix: Manual `impl fmt::Debug` that prints `secret_base32: [REDACTED]`.
 - Status: WILL FIX in code.
 
-**F6: Rate limiting is per-account only**
+#### F6: Rate limiting is per-account only
 - Problem: Attacker can try 3 codes per account * N accounts without global throttle.
 - Fix: Add `global_rate_limit_per_minute` config field. Sliding window counter (AtomicU32 + timestamp).
 - Status: WILL FIX in code.
 
-**F7: No clock drift compensation**
+#### F7: No clock drift compensation
 - Problem: RFC 6238 section 6 recommends tracking drift. Skew=1 handles +-30s, but
   systematic drift causes permanent failures.
 - Fix: Track offset on each successful verify. If same offset N times consecutively (default 3),
   persist as `clock_drift_steps: i64` and apply to future verifications.
 - Status: WILL FIX in code.
 
-**F8: Lockout not persistent**
+#### F8: Lockout not persistent
 - Problem: Process restart resets the lockout counter.
 - Fix: Persist `failed_attempts` and `lockout_until_timestamp` in the encrypted store.
   AtomicU32 as hot cache, synced to disk on each failure.
 - Status: WILL FIX in code.
 
-**F13: Prompt injection — indirect execution via shell**
+#### F13: Prompt injection — indirect execution via shell
 - Problem: Agent is prompted to bypass gating by using shell commands instead of named tools.
   Example: instead of `akte.loeschen(id)`, agent writes a Python script that deletes the DB row directly.
 - Fix: Shell execution itself is gated at `totp_required` level. Any shell tool call goes through
@@ -193,7 +193,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
   highest-risk tool and should always require TOTP.
 - Status: WILL FIX in config defaults (shell pattern = totp_required).
 
-**F14: Prompt injection — poisoned document triggers tool call**
+#### F14: Prompt injection — poisoned document triggers tool call
 - Problem: A document the agent processes contains hidden instructions ("delete case file 42").
   Agent parses it as an instruction and calls `akte.loeschen`.
 - Fix: The tool call goes through the gate. `akte.loeschen` matches the pattern, TOTP is required.
@@ -202,7 +202,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
   that prompt injection cannot control.
 - Status: COVERED by existing gate design. No additional code needed.
 
-**F18: Intentional lockout (DoS against another user)**
+#### F18: Intentional lockout (DoS against another user)
 - Problem: Attacker knows a user's ID. Submits 3 wrong TOTP codes. User is locked out for 5 minutes.
   Repeatable indefinitely = permanent denial of service.
 - Fix: Bind lockout to session, not to user_id. Failed attempts from session A do not lock out
@@ -210,7 +210,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
   (the attacker would need to be logged in as the target user, which requires knowing the password).
 - Status: WILL FIX in code.
 
-**F19: No notifications on critical events**
+#### F19: No notifications on critical events
 - Problem: Everything is logged but nobody is actively notified. Break-glass at 3 AM, repeated
   TOTP failures, config downgrade attempts — admin/maintainer finds out days later.
 - Fix: Notification hook in the audit module. Events with `severity: critical` trigger an alert
@@ -219,7 +219,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
   repeated_verify_fail (threshold configurable).
 - Status: WILL FIX in code.
 
-**F20: Approval queue manipulation**
+#### F20: Approval queue manipulation
 - Problem: Agent queues a proposal at night: "delete 12 orphaned rows." Prompt injection modifies
   the proposal in the queue before the user sees it. User approves the manipulated proposal.
 - Fix: Each approval queue entry gets an HMAC over the original command + timestamp + proposer.
@@ -227,7 +227,7 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
   and approval, verification fails and the approval is rejected. Same HMAC approach as F15.
 - Status: WILL FIX in code.
 
-**F21: E-Stop must be TOTP-exempt**
+#### F21: E-Stop must be TOTP-exempt
 - Problem: ZeroClaw has an E-Stop (emergency shutdown). If the agent is doing something wrong
   autonomously, the kill switch must work immediately. An E-Stop that requires a 6-digit code
   is not an E-Stop.
@@ -239,28 +239,28 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
 
 ### 3.3 MEDIUM (track as issues, implement before v2)
 
-**F9: Pattern matching is substring-based**
+#### F9: Pattern matching is substring-based
 - Problem: Bypassable via Unicode tricks, shell aliases, indirect execution.
 - Fix (v2): Add optional `pattern_regex` field. Apply NFKC Unicode normalization before matching.
 - Status: KNOWN, v2 roadmap.
 
-**F10: No secret rotation mechanism**
+#### F10: No secret rotation mechanism
 - Problem: Once set up, TOTP secret is never rotated.
 - Fix (v2): `zeroclaw auth totp rotate` command.
 - Status: KNOWN, v2 roadmap.
 
-**F11: QR code visible in terminal**
+#### F11: QR code visible in terminal
 - Problem: Shoulder-surfing, screen recording, terminal scrollback can capture the secret.
 - Fix: Print warning before showing QR. After verification succeeds, issue terminal clear.
 - Status: WILL FIX in code (warning + clear).
 
-**F12: Encryption key not derived**
+#### F12: Encryption key not derived
 - Problem: Using .secret_key directly means TOTP store and auth-profiles share the same key.
 - Fix: HKDF-SHA256(secret_key, salt="zeroclaw-totp-v1", info="totp-store-encryption").
   Different info strings for different purposes.
 - Status: WILL FIX in code.
 
-**F22: Audit log storage / rotation**
+#### F22: Audit log storage / rotation
 - Problem: SQLite audit log grows unbounded. On constrained devices (Raspberry Pi, 16GB SD),
   this becomes a problem after months.
 - Fix: Configurable `audit_retention_days` (default: 365). Entries older than the threshold are
@@ -268,13 +268,13 @@ allows us to use `#[derive(Zeroize, ZeroizeOnDrop)]` on our structs.
   remains verifiable for the retained portion.
 - Status: WILL FIX in code.
 
-**F23: Concurrent cron jobs on same data**
+#### F23: Concurrent cron jobs on same data
 - Problem: Two autonomous jobs run simultaneously, both writing to the same database.
 - Fix: SQLite WAL mode (concurrent reads + serial writes). Already the default in ZeroClaw's
   rusqlite usage. For the TOTP store specifically: file lock (flock) serializes access.
 - Status: COVERED by existing SQLite WAL + file lock design.
 
-**F24: Server migration / TOTP export**
+#### F24: Server migration / TOTP export
 - Problem: User changes server. Encrypted TOTP store must be migrated. Without export, all users
   must re-enroll.
 - Fix: `zeroclaw totp export --encrypted` exports the store in a portable format that can be
@@ -646,14 +646,14 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
 
 ### 9.1 Unit tests (in each module)
 
-**core.rs (7 tests)**
+#### core.rs (7 tests)
 - RFC 6238 test vectors (T=59, T=1111111109, T=1234567890)
 - Verify with skew accepts adjacent window
 - Verify rejects wrong code
 - Replay protection rejects reused step
 - Generate and verify roundtrip
 
-**encrypted.rs (6 tests)**
+#### encrypted.rs (6 tests)
 - Roundtrip encrypt/decrypt
 - Wrong key fails decryption
 - Empty store returns defaults
@@ -661,7 +661,7 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
 - Remove secret works
 - Atomic write survives simulated crash (write temp, verify rename)
 
-**gating.rs (12 tests)**
+#### gating.rs (12 tests)
 - Safe commands pass (ls, cat, cargo build)
 - Dangerous commands require TOTP (sudo, rm -rf)
 - Destructive commands require TOTP+confirm (rm -rf /, mkfs)
@@ -675,53 +675,53 @@ CREATE TABLE IF NOT EXISTS pending_approvals (
 - SignedDecision HMAC verification passes for unchanged command (F15)
 - SignedDecision HMAC verification fails for modified command (F15)
 
-**config.rs (5 tests)**
+#### config.rs (5 tests)
 - TOML roundtrip serialization
 - Partial config uses defaults
 - User can override rules completely
 - Invalid level string produces clear error
 - SecurityLevel serde snake_case
 
-**validate.rs (4 tests)**
+#### validate.rs (4 tests)
 - Valid config passes
 - Typo in level produces human-readable error
 - Missing required field produces clear message
 - Security downgrade detected (F17)
 
-**users.rs (4 tests)**
+#### users.rs (4 tests)
 - Role inheritance resolves correctly
 - Blocked operations deny before TOTP check
 - Unknown role produces error
 - Identity field correctly parsed (type:identifier)
 
-**recovery.rs (5 tests)**
+#### recovery.rs (5 tests)
 - Generated codes are correct length and charset
 - Code works exactly once
 - Used code rejected on second attempt
 - All 10 codes are unique
 - Recovery attempt counted toward lockout
 
-**audit.rs (4 tests)**
+#### audit.rs (4 tests)
 - Hash chain integrity verifiable
 - Tampered entry detected
 - Export produces valid JSONL
 - Notification triggered on critical event
 
-**autonomy.rs (5 tests)**
+#### autonomy.rs (5 tests)
 - Autonomous operation allowed in Cron context
 - Never-autonomous operation blocked in Cron context
 - Unknown operation defaults to queue_for_approval
 - Human context bypasses autonomy check (uses normal rules)
 - Extra ops from config merged correctly
 
-**approval_queue.rs (5 tests)**
+#### approval_queue.rs (5 tests)
 - Proposal created with valid HMAC
 - Approval with valid TOTP succeeds and HMAC verifies
 - Modified proposal fails HMAC verification (F20)
 - Expired proposal auto-transitions to expired status
 - Rejected proposal archived with audit entry
 
-**emergency.rs (3 tests)**
+#### emergency.rs (3 tests)
 - E-Stop executes without TOTP (F21)
 - Break-glass requires maintainer key
 - Break-glass with wrong key rejected
