@@ -37,9 +37,28 @@ check_cmd() {
   fi
 }
 
+check_docker() {
+  # Detect broken Docker Desktop symlink (common after Docker Desktop WSL integration)
+  if [[ -L "/usr/bin/docker" ]] && [[ ! -e "/usr/bin/docker" ]]; then
+    warn "docker: broken symlink at /usr/bin/docker (Docker Desktop integration not active)"
+    warn "  Fix: scripts/wsl/bootstrap-docker.sh"
+    failures=$((failures + 1))
+  elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    ok "docker available and daemon running"
+  elif command -v docker >/dev/null 2>&1; then
+    warn "docker binary present but daemon not reachable (service down?)"
+    warn "  Fix: sudo systemctl start docker  OR  scripts/wsl/bootstrap-docker.sh"
+    failures=$((failures + 1))
+  else
+    warn "docker not installed"
+    warn "  Fix: scripts/wsl/bootstrap-docker.sh"
+    failures=$((failures + 1))
+  fi
+}
+
 check_cmd git
 check_cmd rsync
-check_cmd docker
+check_docker
 
 check_path_exists "$PRIMARY_REPO/.git" "primary repo"
 check_path_exists "$ARCHIVE_REPO/.git" "archive repo"

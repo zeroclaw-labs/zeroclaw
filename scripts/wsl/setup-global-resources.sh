@@ -3,6 +3,7 @@ set -euo pipefail
 
 DRY_RUN=false
 NO_BASHRC=false
+WITH_DOCKER=false
 PRIMARY_REPO="${ZEROCLAW_PRIMARY_REPO:-/home/lasve046/projects/zeroclaw-wsl}"
 ARCHIVE_REPO="${ZEROCLAW_WIN_ARCHIVE_REPO:-/home/lasve046/pilot/zeroclaw-win-archive}"
 CONFIG_DIR="${ZEROCLAW_WSL_CONFIG_DIR:-$HOME/.config/zeroclaw-wsl}"
@@ -21,6 +22,7 @@ Usage:
 Options:
   --dry-run            Print planned actions without writing
   --no-bashrc          Do not update ~/.bashrc
+  --with-docker        Run bootstrap-docker.sh after setup
   --primary <path>     Override WSL primary repo path
   --archive <path>     Override legacy archive repo path
   -h, --help           Show this help
@@ -115,6 +117,10 @@ while [[ $# -gt 0 ]]; do
       NO_BASHRC=true
       shift
       ;;
+    --with-docker)
+      WITH_DOCKER=true
+      shift
+      ;;
     --primary)
       PRIMARY_REPO="$2"
       shift 2
@@ -156,3 +162,10 @@ else
   log "- bashrc source block: skipped (--no-bashrc)"
 fi
 log "Next: run 'source $ENV_FILE' in current shell or open a new terminal."
+
+if [[ "$WITH_DOCKER" == true ]]; then
+  log "Running Docker bootstrap..."
+  bash "$PRIMARY_REPO/scripts/wsl/bootstrap-docker.sh" ${DRY_RUN:+--dry-run}
+else
+  log "Tip: run 'scripts/wsl/bootstrap-docker.sh' to install Docker CE natively."
+fi
