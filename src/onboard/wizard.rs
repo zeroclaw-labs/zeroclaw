@@ -4190,7 +4190,7 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     draft_update_interval_ms: existing_sl
                         .map(|s| s.draft_update_interval_ms)
                         .unwrap_or(1200),
-                    cancel_reaction: existing_sl.and_then(|s| s.cancel_reaction.clone()),
+                    cancel_reaction: existing_sl.and_then(|s: &SlackConfig| s.cancel_reaction.clone()),
                 });
             }
             ChannelMenuChoice::IMessage => {

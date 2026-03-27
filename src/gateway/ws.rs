@@ -413,7 +413,12 @@ async fn process_chat_message(
     // instead — `turn_streamed` writes to the channel and we drain it
     // from the other branch.
     let content_owned = content.to_string();
-    let turn_fut = async { agent.turn_streamed(&content_owned, event_tx).await };
+    let provider_label_for_agent = provider_label.clone();
+    let turn_fut = async {
+        agent
+            .turn_streamed(&content_owned, event_tx, &provider_label_for_agent)
+            .await
+    };
 
     // Drive both futures concurrently: the agent turn produces events
     // and we relay them over WebSocket.
@@ -431,6 +436,27 @@ async fn process_chat_message(
                 }
                 TurnEvent::ToolResult { name, output } => {
                     serde_json::json!({ "type": "tool_result", "name": name, "output": output })
+                }
+                TurnEvent::Trace {
+                    event_type,
+                    turn_id,
+                    provider,
+                    model,
+                    success,
+                    payload,
+                } => {
+                    // Record trace event to runtime_trace, but do not forward to WebSocket client
+                    crate::observability::runtime_trace::record_event(
+                        &event_type,
+                        Some("websocket"),
+                        Some(&provider),
+                        Some(&model),
+                        Some(&turn_id),
+                        success,
+                        None,
+                        payload,
+                    );
+                    continue; // Skip WebSocket send
                 }
             };
             let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
