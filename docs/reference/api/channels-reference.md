@@ -420,7 +420,6 @@ base_url = "https://cloud.example.com"
 app_token = "nextcloud-talk-app-token"
 webhook_secret = "optional-webhook-secret"  # optional but recommended
 allowed_users = ["*"]
-# bot_name = "zeroclaw"  # display name of the bot; filters own messages to prevent feedback loops
 ```
 
 Notes:

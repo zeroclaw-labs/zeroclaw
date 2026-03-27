@@ -1,4 +1,6 @@
-use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
+use crate::channels::traits::{
+    Channel, ChannelMessage, HistoryFilter, HistoryMessage, SendMessage,
+};
 use async_trait::async_trait;
 use matrix_sdk::{
     authentication::matrix::MatrixSession,
@@ -44,7 +46,6 @@ pub struct MatrixChannel {
     reaction_events: Arc<RwLock<HashMap<String, String>>>,
     voice_mode: Arc<AtomicBool>,
     otk_conflict_detected: Arc<AtomicBool>,
-    recovery_key: Option<String>,
     transcription: Option<crate::config::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     stream_mode: crate::config::StreamMode,
@@ -126,6 +127,89 @@ struct RoomAliasResponse {
     room_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct MessagesResponse {
+    #[serde(default)]
+    chunk: Vec<MessagesEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagesEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default)]
+    sender: Option<String>,
+    #[serde(default)]
+    origin_server_ts: Option<u64>,
+    #[serde(default)]
+    content: MessagesEventContent,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct MessagesEventContent {
+    #[serde(default)]
+    msgtype: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+}
+
+/// Parse a Matrix `/messages` response into `HistoryMessage` values, applying filters.
+fn parse_matrix_messages(
+    response: &MessagesResponse,
+    filter: &HistoryFilter,
+    room_id: &str,
+) -> Vec<HistoryMessage> {
+    let mut results = Vec::new();
+
+    for event in &response.chunk {
+        if event.event_type != "m.room.message" {
+            continue;
+        }
+
+        let Some(ref event_id) = event.event_id else {
+            continue;
+        };
+        let Some(ref sender) = event.sender else {
+            continue;
+        };
+        let body = match event.content.body.as_deref() {
+            Some(b) if !b.trim().is_empty() => b.to_string(),
+            _ => continue,
+        };
+        let timestamp_ms = event.origin_server_ts.unwrap_or(0);
+        let timestamp = timestamp_ms / 1000;
+
+        if let Some(since) = filter.since {
+            if timestamp < since {
+                continue;
+            }
+        }
+        if let Some(until) = filter.until {
+            if timestamp > until {
+                continue;
+            }
+        }
+        if let Some(ref filter_sender) = filter.sender {
+            if !sender.eq_ignore_ascii_case(filter_sender) {
+                continue;
+            }
+        }
+
+        results.push(HistoryMessage {
+            id: event_id.clone(),
+            sender: sender.clone(),
+            content: body,
+            timestamp,
+            channel: room_id.to_string(),
+            thread_ts: None,
+        });
+    }
+
+    results
+}
+
 impl MatrixChannel {
     fn is_otk_conflict_message(message: &str) -> bool {
         let lower = message.to_ascii_lowercase();
@@ -157,7 +241,6 @@ impl MatrixChannel {
             None,
             None,
             None,
-            None,
         )
     }
 
@@ -177,7 +260,6 @@ impl MatrixChannel {
             vec![],
             owner_hint,
             device_id_hint,
-            None,
             None,
         )
     }
@@ -200,7 +282,6 @@ impl MatrixChannel {
             owner_hint,
             device_id_hint,
             zeroclaw_dir,
-            None,
         )
     }
 
@@ -213,7 +294,6 @@ impl MatrixChannel {
         owner_hint: Option<String>,
         device_id_hint: Option<String>,
         zeroclaw_dir: Option<PathBuf>,
-        recovery_key: Option<String>,
     ) -> Self {
         let homeserver = homeserver.trim_end_matches('/').to_string();
         let access_token = access_token.trim().to_string();
@@ -244,7 +324,6 @@ impl MatrixChannel {
             reaction_events: Arc::new(RwLock::new(HashMap::new())),
             voice_mode: Arc::new(AtomicBool::new(false)),
             otk_conflict_detected: Arc::new(AtomicBool::new(false)),
-            recovery_key,
             transcription: None,
             transcription_manager: None,
             stream_mode: crate::config::StreamMode::Off,
@@ -609,25 +688,6 @@ impl MatrixChannel {
                 client.restore_session(session).await?;
                 tracing::debug!("Matrix session restored for device");
 
-                // Attempt E2EE key recovery if a recovery key is configured
-                if let Some(ref key) = self.recovery_key {
-                    match client.encryption().recovery().recover(key).await {
-                        Ok(()) => {
-                            tracing::info!(
-                                "Matrix E2EE recovery successful — room keys and cross-signing secrets restored from server backup."
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                "Matrix E2EE recovery failed: {error}. \
-                                 The recovery key may be incorrect, or server-side key backup may not be configured. \
-                                 The bot will still work in unencrypted rooms. \
-                                 See docs/security/matrix-e2ee-guide.md section 4I."
-                            );
-                        }
-                    }
-                }
-
                 Ok::<MatrixSdkClient, anyhow::Error>(client)
             })
             .await?;
@@ -776,18 +836,11 @@ impl MatrixChannel {
             tracing::info!("Matrix room-key backup is enabled for this device.");
         } else {
             let _ = client.encryption().backups().disable().await;
-            if self.recovery_key.is_some() {
-                tracing::info!(
-                    "Matrix room-key backup is not active on this device, but a recovery key is configured. \
-                     Room keys will be restored from server backup on startup."
-                );
-            } else {
-                tracing::warn!(
-                    "Matrix room-key backup is not enabled for this device. \
-                     To automatically restore room keys after a device reset, set recovery_key in your Matrix config. \
-                     See docs/security/matrix-e2ee-guide.md section 4I."
-                );
-            }
+            tracing::warn!(
+                "Matrix room-key backup is not enabled for this device. \
+                 Key backup warnings may appear until recovery is configured. \
+                 See docs/security/matrix-e2ee-guide.md section 4D."
+            );
         }
     }
 }
@@ -949,19 +1002,11 @@ impl Channel for MatrixChannel {
 
         let _ = client.sync_once(SyncSettings::new()).await;
 
-        if self.allowed_rooms.is_empty() {
-            tracing::info!(
-                "Matrix channel listening on room {} (configured as {})...",
-                target_room_id,
-                self.room_id
-            );
-        } else {
-            tracing::info!(
-                "Matrix channel listening on {} allowed room(s) (primary: {})...",
-                self.allowed_rooms.len(),
-                self.room_id
-            );
-        }
+        tracing::info!(
+            "Matrix channel listening on room {} (configured as {})...",
+            target_room_id,
+            self.room_id
+        );
 
         let recent_event_cache = Arc::new(Mutex::new((
             std::collections::VecDeque::new(),
@@ -992,19 +1037,15 @@ impl Channel for MatrixChannel {
             let transcription_mgr = transcription_mgr_for_handler.clone();
 
             async move {
-                // Room filtering: use allowed_rooms if set, otherwise fall back to single room_id
-                if allowed_rooms.is_empty() {
-                    if !MatrixChannel::room_matches_target(
-                        target_room.as_str(),
-                        room.room_id().as_str(),
-                    ) {
-                        tracing::debug!(
-                            "Matrix: ignoring message from room {} (not the configured room_id)",
-                            room.room_id()
-                        );
-                        return;
-                    }
-                } else if !MatrixChannel::is_room_allowed_static(&allowed_rooms, room.room_id().as_ref()) {
+                if !MatrixChannel::room_matches_target(
+                    target_room.as_str(),
+                    room.room_id().as_str(),
+                ) {
+                    return;
+                }
+
+                // Room allowlist: skip messages from rooms not in the configured list
+                if !MatrixChannel::is_room_allowed_static(&allowed_rooms, room.room_id().as_ref()) {
                     tracing::debug!(
                         "Matrix: ignoring message from room {} (not in allowed_rooms)",
                         room.room_id()
@@ -1012,20 +1053,12 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
-                tracing::debug!(
-                    "Matrix: received message in room {} from {}",
-                    room.room_id(),
-                    event.sender
-                );
-
                 if event.sender == my_user_id {
-                    tracing::debug!("Matrix: ignoring own message");
                     return;
                 }
 
                 let sender = event.sender.to_string();
                 if !MatrixChannel::is_sender_allowed(&allowed_users, &sender) {
-                    tracing::debug!("Matrix: ignoring message from non-allowed user {sender}");
                     return;
                 }
 
@@ -1760,6 +1793,35 @@ impl Channel for MatrixChannel {
             }
         }
     }
+
+    async fn messages(&self, filter: &HistoryFilter) -> anyhow::Result<Vec<HistoryMessage>> {
+        let room_id = match filter.channel_id {
+            Some(ref id) => id.clone(),
+            None => self.target_room_id().await?,
+        };
+
+        let encoded_room = Self::encode_path_segment(&room_id);
+        let limit = filter.limit.unwrap_or(50);
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/messages?dir=b&limit={}",
+            self.homeserver, encoded_room, limit
+        );
+
+        let resp = self
+            .http_client
+            .get(&url)
+            .header("Authorization", self.auth_header_value())
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Matrix messages fetch failed for '{}': {}", room_id, err);
+        }
+
+        let messages_resp: MessagesResponse = resp.json().await?;
+        Ok(parse_matrix_messages(&messages_resp, filter, &room_id))
+    }
 }
 
 #[cfg(test)]
@@ -2231,7 +2293,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         );
         assert!(ch.is_room_allowed("!allowed:matrix.org"));
         assert!(!ch.is_room_allowed("!forbidden:matrix.org"));
@@ -2248,7 +2309,6 @@ mod tests {
                 "#ops:matrix.org".to_string(),
                 "!direct:matrix.org".to_string(),
             ],
-            None,
             None,
             None,
             None,
@@ -2269,7 +2329,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         );
         assert!(ch.is_room_allowed("!room:matrix.org"));
         assert!(ch.is_room_allowed("!ROOM:MATRIX.ORG"));
@@ -2283,7 +2342,6 @@ mod tests {
             "!r:m".to_string(),
             vec![],
             vec!["  !room:matrix.org  ".to_string(), "   ".to_string()],
-            None,
             None,
             None,
             None,
@@ -2313,5 +2371,157 @@ mod tests {
         let sanitized = MatrixChannel::sanitize_error_for_log(&"auth failed: sk-proj-abc123xyz");
         assert!(!sanitized.contains("sk-proj-abc123xyz"));
         assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    // --- Message history tests ---
+
+    fn make_messages_response(chunk_json: &str) -> MessagesResponse {
+        let json = format!(r#"{{"chunk":{}}}"#, chunk_json);
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn messages_url_construction() {
+        let ch = make_channel();
+        let encoded_room = MatrixChannel::encode_path_segment("!room:matrix.org");
+        let limit = 50usize;
+        let url = format!(
+            "{}/_matrix/client/v3/rooms/{}/messages?dir=b&limit={}",
+            ch.homeserver, encoded_room, limit
+        );
+        assert_eq!(
+            url,
+            "https://matrix.org/_matrix/client/v3/rooms/%21room%3Amatrix.org/messages?dir=b&limit=50"
+        );
+    }
+
+    #[test]
+    fn parse_response_extracts_history_messages() {
+        let resp = make_messages_response(
+            r#"[
+                {
+                    "type": "m.room.message",
+                    "event_id": "$abc123",
+                    "sender": "@alice:matrix.org",
+                    "origin_server_ts": 1700000000000,
+                    "content": { "msgtype": "m.text", "body": "Hello world" }
+                }
+            ]"#,
+        );
+        let filter = HistoryFilter::default();
+        let msgs = parse_matrix_messages(&resp, &filter, "!room:matrix.org");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "$abc123");
+        assert_eq!(msgs[0].sender, "@alice:matrix.org");
+        assert_eq!(msgs[0].content, "Hello world");
+        assert_eq!(msgs[0].timestamp, 1700000000);
+        assert_eq!(msgs[0].channel, "!room:matrix.org");
+    }
+
+    #[test]
+    fn parse_response_filters_by_sender() {
+        let resp = make_messages_response(
+            r#"[
+                {
+                    "type": "m.room.message",
+                    "event_id": "$1",
+                    "sender": "@alice:m",
+                    "origin_server_ts": 1000000,
+                    "content": { "msgtype": "m.text", "body": "from alice" }
+                },
+                {
+                    "type": "m.room.message",
+                    "event_id": "$2",
+                    "sender": "@bob:m",
+                    "origin_server_ts": 2000000,
+                    "content": { "msgtype": "m.text", "body": "from bob" }
+                }
+            ]"#,
+        );
+        let filter = HistoryFilter {
+            sender: Some("@alice:m".to_string()),
+            ..Default::default()
+        };
+        let msgs = parse_matrix_messages(&resp, &filter, "!r:m");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].sender, "@alice:m");
+    }
+
+    #[test]
+    fn parse_response_filters_by_since_until() {
+        let resp = make_messages_response(
+            r#"[
+                {
+                    "type": "m.room.message",
+                    "event_id": "$early",
+                    "sender": "@u:m",
+                    "origin_server_ts": 100000,
+                    "content": { "msgtype": "m.text", "body": "early" }
+                },
+                {
+                    "type": "m.room.message",
+                    "event_id": "$mid",
+                    "sender": "@u:m",
+                    "origin_server_ts": 200000,
+                    "content": { "msgtype": "m.text", "body": "mid" }
+                },
+                {
+                    "type": "m.room.message",
+                    "event_id": "$late",
+                    "sender": "@u:m",
+                    "origin_server_ts": 300000,
+                    "content": { "msgtype": "m.text", "body": "late" }
+                }
+            ]"#,
+        );
+        let filter = HistoryFilter {
+            since: Some(150),
+            until: Some(250),
+            ..Default::default()
+        };
+        let msgs = parse_matrix_messages(&resp, &filter, "!r:m");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "$mid");
+    }
+
+    #[test]
+    fn parse_response_limit_defaults_to_50() {
+        let filter = HistoryFilter::default();
+        let limit = filter.limit.unwrap_or(50);
+        assert_eq!(limit, 50);
+    }
+
+    #[test]
+    fn parse_response_empty_chunk_returns_empty() {
+        let resp = make_messages_response("[]");
+        let filter = HistoryFilter::default();
+        let msgs = parse_matrix_messages(&resp, &filter, "!r:m");
+        assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn parse_response_skips_non_message_events() {
+        let resp = make_messages_response(
+            r#"[
+                {
+                    "type": "m.room.member",
+                    "event_id": "$member",
+                    "sender": "@u:m",
+                    "origin_server_ts": 100000,
+                    "content": {}
+                },
+                {
+                    "type": "m.room.message",
+                    "event_id": "$msg",
+                    "sender": "@u:m",
+                    "origin_server_ts": 200000,
+                    "content": { "msgtype": "m.text", "body": "hello" }
+                }
+            ]"#,
+        );
+        let filter = HistoryFilter::default();
+        let msgs = parse_matrix_messages(&resp, &filter, "!r:m");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, "$msg");
     }
 }

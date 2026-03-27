@@ -78,7 +78,6 @@ const QWEN_OAUTH_DEFAULT_CLIENT_ID: &str = "f0304373b74a44d2b584a3fb70ca9e56";
 const QWEN_OAUTH_CREDENTIAL_FILE: &str = ".qwen/oauth_creds.json";
 const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
-const QIANFAN_BASE_URL: &str = "https://qianfan.baidubce.com/v2";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
@@ -177,14 +176,6 @@ pub(crate) fn is_zai_alias(name: &str) -> bool {
 
 pub(crate) fn is_qianfan_alias(name: &str) -> bool {
     matches!(name, "qianfan" | "baidu")
-}
-
-fn qianfan_base_url(api_url: Option<&str>) -> String {
-    api_url
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| QIANFAN_BASE_URL.to_string())
 }
 
 pub(crate) fn is_doubao_alias(name: &str) -> bool {
@@ -1315,12 +1306,9 @@ fn create_provider_with_url_and_options(
                 true,
             )))
         }
-        name if is_qianfan_alias(name) => {
-            let base_url = qianfan_base_url(api_url);
-            Ok(compat(OpenAiCompatibleProvider::new(
-                "Qianfan", &base_url, key, AuthStyle::Bearer,
-            )))
-        }
+        name if is_qianfan_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
+            "Qianfan", "https://aip.baidubce.com", key, AuthStyle::Bearer,
+        ))),
         name if is_doubao_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
             "Doubao",
             "https://ark.cn-beijing.volces.com/api/v3",

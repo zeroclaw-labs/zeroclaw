@@ -960,35 +960,22 @@ fn sse_bytes_to_chunks(
         }
 
         let mut bytes_stream = response.bytes_stream();
-        // Accumulate partial UTF-8 sequences that may be split across
-        // HTTP/1.1 chunked transfer boundaries (e.g. 3-byte CJK chars).
-        let mut utf8_buf: Vec<u8> = Vec::new();
 
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    utf8_buf.extend_from_slice(&bytes);
-                    let text = match std::str::from_utf8(&utf8_buf) {
-                        Ok(s) => {
-                            let owned = s.to_string();
-                            utf8_buf.clear();
-                            owned
-                        }
+                    let text = match String::from_utf8(bytes.to_vec()) {
+                        Ok(t) => t,
                         Err(e) => {
-                            let valid_up_to = e.valid_up_to();
-                            if valid_up_to == 0 && utf8_buf.len() < 4 {
-                                // Could still be an incomplete multi-byte char; wait for more data
-                                continue;
-                            }
-                            let valid =
-                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
-                            utf8_buf.drain(..valid_up_to);
-                            valid
+                            let _ = tx
+                                .send(Err(StreamError::InvalidSse(format!(
+                                    "Invalid UTF-8: {}",
+                                    e
+                                ))))
+                                .await;
+                            break;
                         }
                     };
-                    if text.is_empty() {
-                        continue;
-                    }
 
                     buffer.push_str(&text);
 
@@ -1052,32 +1039,21 @@ fn sse_bytes_to_events(
         }
 
         let mut bytes_stream = response.bytes_stream();
-        // Accumulate partial UTF-8 sequences split across chunk boundaries.
-        let mut utf8_buf: Vec<u8> = Vec::new();
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    utf8_buf.extend_from_slice(&bytes);
-                    let text = match std::str::from_utf8(&utf8_buf) {
-                        Ok(s) => {
-                            let owned = s.to_string();
-                            utf8_buf.clear();
-                            owned
-                        }
+                    let text = match String::from_utf8(bytes.to_vec()) {
+                        Ok(t) => t,
                         Err(e) => {
-                            let valid_up_to = e.valid_up_to();
-                            if valid_up_to == 0 && utf8_buf.len() < 4 {
-                                continue;
-                            }
-                            let valid =
-                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
-                            utf8_buf.drain(..valid_up_to);
-                            valid
+                            let _ = tx
+                                .send(Err(StreamError::InvalidSse(format!(
+                                    "Invalid UTF-8: {}",
+                                    e
+                                ))))
+                                .await;
+                            return;
                         }
                     };
-                    if text.is_empty() {
-                        continue;
-                    }
 
                     buffer.push_str(&text);
 

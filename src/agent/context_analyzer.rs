@@ -32,7 +32,7 @@ pub fn analyze_turn_context(
     if let Some(last_assistant) = history.iter().rev().find(|m| m.role == "assistant") {
         for word in last_assistant.content.split_whitespace() {
             for tool_name in tools_for_keyword(word) {
-                tools.insert(String::from(*tool_name));
+                tools.insert(tool_name.to_string());
             }
         }
     }

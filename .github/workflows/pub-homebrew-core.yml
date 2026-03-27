@@ -205,12 +205,6 @@ jobs:
           fork_owner="${BOT_FORK_REPO%%/*}"
           bot_email="${BOT_EMAIL:-${fork_owner}@users.noreply.github.com}"
 
-          # Pre-flight: verify token has push access to the fork
-          if ! gh api "repos/${BOT_FORK_REPO}" --jq '.permissions.push' 2>/dev/null | grep -q true; then
-            echo "::error::Token lacks push access to ${BOT_FORK_REPO}. Ensure HOMEBREW_CORE_BOT_TOKEN (or HOMEBREW_UPSTREAM_PR_TOKEN) is a PAT with 'Contents: write' scope for ${BOT_FORK_REPO}."
-            exit 1
-          fi
-
           git -C "$repo_dir" config user.name "$fork_owner"
           git -C "$repo_dir" config user.email "$bot_email"
           git -C "$repo_dir" add "$FORMULA_PATH"

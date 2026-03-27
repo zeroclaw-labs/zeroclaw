@@ -896,7 +896,6 @@ mod tests {
             stream_mode: crate::config::StreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
-            recovery_key: None,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();

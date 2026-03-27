@@ -702,7 +702,6 @@ Native Nextcloud Talk bot integration (webhook receive + OCS send API).
 | `app_token` | Yes | Bot app token used for OCS bearer auth |
 | `webhook_secret` | Optional | Enables webhook signature verification |
 | `allowed_users` | Recommended | Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all) |
-| `bot_name` | Optional | Display name of the bot in Nextcloud Talk (e.g. `"zeroclaw"`). Used to filter out the bot's own messages and prevent feedback loops. |
 
 Notes:
 

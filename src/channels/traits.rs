@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 /// A message received from or sent to a channel
@@ -35,7 +36,6 @@ pub struct SendMessage {
     /// Optional cancellation token for interruptible delivery (e.g. multi-message mode).
     pub cancellation_token: Option<CancellationToken>,
 }
-
 impl SendMessage {
     /// Create a new message with content and recipient
     pub fn new(content: impl Into<String>, recipient: impl Into<String>) -> Self {
@@ -74,6 +74,25 @@ impl SendMessage {
         self.cancellation_token = Some(token);
         self
     }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryMessage {
+    pub id: String,
+    pub sender: String,
+    pub content: String,
+    pub timestamp: u64,
+    pub channel: String,
+    pub thread_ts: Option<String>,
+}
+
+/// Filter for message history queries
+#[derive(Debug, Clone, Default)]
+pub struct HistoryFilter {
+    pub channel_id: Option<String>,
+    pub since: Option<u64>,
+    pub until: Option<u64>,
+    pub limit: Option<usize>,
+    pub sender: Option<String>,
 }
 
 /// Core channel trait — implement for any messaging platform
@@ -211,6 +230,12 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Retrieve historical messages from this channel.
+    /// Default implementation returns an empty list (channel does not support history).
+    async fn messages(&self, _filter: &HistoryFilter) -> anyhow::Result<Vec<HistoryMessage>> {
+        Ok(vec![])
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +353,61 @@ mod tests {
         assert_eq!(received.sender, "tester");
         assert_eq!(received.content, "hello");
         assert_eq!(received.channel, "dummy");
+    }
+
+    #[test]
+    fn history_message_construction_and_field_access() {
+        let msg = HistoryMessage {
+            id: "$evt:matrix.org".to_string(),
+            sender: "@alice:matrix.org".to_string(),
+            content: "hello world".to_string(),
+            timestamp: 1_700_000_000,
+            channel: "matrix".to_string(),
+            thread_ts: Some("$thread:matrix.org".to_string()),
+        };
+        assert_eq!(msg.id, "$evt:matrix.org");
+        assert_eq!(msg.sender, "@alice:matrix.org");
+        assert_eq!(msg.content, "hello world");
+        assert_eq!(msg.timestamp, 1_700_000_000);
+        assert_eq!(msg.channel, "matrix");
+        assert_eq!(msg.thread_ts.as_deref(), Some("$thread:matrix.org"));
+    }
+
+    #[test]
+    fn history_filter_default_has_all_none() {
+        let filter = HistoryFilter::default();
+        assert!(filter.channel_id.is_none());
+        assert!(filter.since.is_none());
+        assert!(filter.until.is_none());
+        assert!(filter.limit.is_none());
+        assert!(filter.sender.is_none());
+    }
+
+    #[test]
+    fn history_message_serializes_to_json() {
+        let msg = HistoryMessage {
+            id: "$evt:m".to_string(),
+            sender: "@u:m".to_string(),
+            content: "test".to_string(),
+            timestamp: 123,
+            channel: "matrix".to_string(),
+            thread_ts: None,
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["id"], "$evt:m");
+        assert_eq!(json["sender"], "@u:m");
+        assert_eq!(json["content"], "test");
+        assert_eq!(json["timestamp"], 123);
+        assert_eq!(json["channel"], "matrix");
+        assert!(json["thread_ts"].is_null());
+    }
+
+    #[tokio::test]
+    async fn default_messages_returns_empty() {
+        let channel = DummyChannel;
+        let filter = HistoryFilter::default();
+        let messages = channel.messages(&filter).await.unwrap();
+        assert!(messages.is_empty());
     }
 
     #[tokio::test]

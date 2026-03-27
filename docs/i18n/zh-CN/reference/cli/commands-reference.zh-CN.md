@@ -2,7 +2,7 @@
 
 本参考文档派生自当前 CLI 界面（`zeroclaw --help`）。
 
-最后验证时间：**2026年3月26日**。
+最后验证时间：**2026年2月21日**。
 
 ## 顶级命令
 
@@ -11,7 +11,6 @@
 | `onboard` | 快速或交互式初始化工作区/配置 |
 | `agent` | 运行交互式聊天或单消息模式 |
 | `gateway` | 启动 webhook 和 WhatsApp HTTP 网关 |
-| `acp` | 启动 ACP（Agent Control Protocol）stdio 服务器 |
 | `daemon` | 启动受监管的运行时（网关 + 渠道 + 可选心跳/调度器） |
 | `service` | 管理用户级操作系统服务生命周期 |
 | `doctor` | 运行诊断和新鲜度检查 |
@@ -60,20 +59,6 @@
 提示：
 
 - 在交互式聊天中，你可以用自然语言要求更改路由（例如“对话使用 kimi，编码使用 gpt-5.3-codex”）；助手可以通过工具 `model_routing_config` 持久化这些设置。
-
-### `acp`
-
-- `zeroclaw acp`
-- `zeroclaw acp --max-sessions <N>`
-- `zeroclaw acp --session-timeout <SECONDS>`
-
-启动 ACP（Agent Control Protocol）服务器，用于 IDE 和工具集成。
-
-- 使用标准输入/输出的 JSON-RPC 2.0
-- 支持方法：`initialize`、`session/new`、`session/prompt`、`session/stop`
-- 实时流式传输代理推理、工具调用和内容通知
-- 默认最大会话数：10
-- 默认会话超时：3600 秒（1 小时）
 
 ### `gateway` / `daemon`
 

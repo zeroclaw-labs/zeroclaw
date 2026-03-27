@@ -4,16 +4,6 @@ rustflags = ["-C", "link-arg=-static"]
 [target.aarch64-unknown-linux-musl]
 rustflags = ["-C", "link-arg=-static", "-C", "link-arg=-Wl,-z,stack-size=8388608"]
 
-# Windows targets
-[target.x86_64-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/STACK:8388608"]
-
-[target.i686-pc-windows-msvc]
-rustflags = ["-C", "link-arg=/STACK:8388608"]
-
-[target.x86_64-pc-windows-gnu]
-rustflags = ["-C", "link-arg=-Wl,--stack,8388608"]
-
 # Android targets (NDK toolchain)
 [target.armv7-linux-androideabi]
 linker = "armv7a-linux-androideabi21-clang"

@@ -221,15 +221,15 @@ impl AcpServer {
 
     fn handle_initialize(&self, _params: &Value) -> RpcResult {
         Ok(serde_json::json!({
-            "protocolVersion": "1.0",
-            "serverInfo": {
+            "protocol_version": "1.0",
+            "server_info": {
                 "name": "zeroclaw-acp",
                 "version": env!("CARGO_PKG_VERSION"),
             },
             "capabilities": {
                 "streaming": true,
-                "maxSessions": self.acp_config.max_sessions,
-                "sessionTimeoutSecs": self.acp_config.session_timeout_secs,
+                "max_sessions": self.acp_config.max_sessions,
+                "session_timeout_secs": self.acp_config.session_timeout_secs,
             },
             "methods": [
                 "initialize",
@@ -255,9 +255,7 @@ impl AcpServer {
         }
 
         let workspace_dir = params
-            .get("cwd")
-            .or_else(|| params.get("workspaceDir"))
-            .or_else(|| params.get("workspace_dir"))
+            .get("workspace_dir")
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| self.config.workspace_dir.to_str().unwrap_or("."))
             .to_string();
@@ -287,19 +285,18 @@ impl AcpServer {
         info!("Created session {session_id} (workspace: {workspace_dir})");
 
         Ok(serde_json::json!({
-            "sessionId": session_id,
-            "workspaceDir": workspace_dir,
+            "session_id": session_id,
+            "workspace_dir": workspace_dir,
         }))
     }
 
     async fn handle_session_prompt(&self, params: &Value, _request_id: &Value) -> RpcResult {
         let session_id = params
-            .get("sessionId")
-            .or_else(|| params.get("session_id"))
+            .get("session_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
-                message: "Missing required parameter: sessionId".to_string(),
+                message: "Missing required parameter: session_id".to_string(),
                 data: None,
             })?
             .to_string();
@@ -345,7 +342,7 @@ impl AcpServer {
                     jsonrpc: "2.0",
                     method: "session/event",
                     params: serde_json::json!({
-                        "sessionId": session_id,
+                        "session_id": session_id,
                         "type": "chunk",
                         "content": delta,
                     }),
@@ -354,7 +351,7 @@ impl AcpServer {
                     jsonrpc: "2.0",
                     method: "session/event",
                     params: serde_json::json!({
-                        "sessionId": session_id,
+                        "session_id": session_id,
                         "type": "tool_call",
                         "name": name,
                         "args": args,
@@ -364,7 +361,7 @@ impl AcpServer {
                     jsonrpc: "2.0",
                     method: "session/event",
                     params: serde_json::json!({
-                        "sessionId": session_id,
+                        "session_id": session_id,
                         "type": "tool_result",
                         "name": name,
                         "output": output,
@@ -374,7 +371,7 @@ impl AcpServer {
                     jsonrpc: "2.0",
                     method: "session/event",
                     params: serde_json::json!({
-                        "sessionId": session_id,
+                        "session_id": session_id,
                         "type": "thinking",
                         "content": delta,
                     }),
@@ -404,19 +401,18 @@ impl AcpServer {
         }
 
         Ok(serde_json::json!({
-            "sessionId": session_id,
+            "session_id": session_id,
             "content": result,
         }))
     }
 
     async fn handle_session_stop(&self, params: &Value) -> RpcResult {
         let session_id = params
-            .get("sessionId")
-            .or_else(|| params.get("session_id"))
+            .get("session_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| RpcError {
                 code: INVALID_PARAMS,
-                message: "Missing required parameter: sessionId".to_string(),
+                message: "Missing required parameter: session_id".to_string(),
                 data: None,
             })?;
 
@@ -424,7 +420,7 @@ impl AcpServer {
         if sessions.remove(session_id).is_some() {
             info!("Stopped session {session_id}");
             Ok(serde_json::json!({
-                "sessionId": session_id,
+                "session_id": session_id,
                 "stopped": true,
             }))
         } else {

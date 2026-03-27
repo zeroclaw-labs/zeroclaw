@@ -23,10 +23,10 @@ export interface WebSocketClientOptions {
 const DEFAULT_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 30000;
 
-export const SESSION_STORAGE_KEY = 'zeroclaw_session_id';
+const SESSION_STORAGE_KEY = 'zeroclaw_session_id';
 
 /** Return a stable session ID, persisted in sessionStorage across reconnects. */
-export function getOrCreateSessionId(): string {
+function getOrCreateSessionId(): string {
   let id = sessionStorage.getItem(SESSION_STORAGE_KEY);
   if (!id) {
     id = generateUUID();
