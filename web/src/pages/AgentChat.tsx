@@ -3,10 +3,18 @@ import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
-import { WebSocketClient } from '@/lib/ws';
+import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
+import { getSessionMessages } from '@/lib/api';
+import {
+  loadChatHistory,
+  mapServerMessagesToPersisted,
+  persistedToUiMessages,
+  saveChatHistory,
+  uiMessagesToPersisted,
+} from '@/lib/chatHistoryStorage';
 
 interface ChatMessage {
   id: string;
@@ -20,8 +28,10 @@ interface ChatMessage {
 const DRAFT_KEY = 'agent-chat';
 
 export default function AgentChat() {
+  const sessionIdRef = useRef(getOrCreateSessionId());
   const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [historyReady, setHistoryReady] = useState(false);
   const [input, setInput] = useState(draft);
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -42,6 +52,50 @@ export default function AgentChat() {
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
+
+  // Hydrate chat from server (preferred) or localStorage fallback
+  useEffect(() => {
+    const sid = sessionIdRef.current;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await getSessionMessages(sid);
+        if (cancelled) return;
+        if (res.session_persistence && res.messages.length > 0) {
+          setMessages((prev) =>
+            prev.length > 0 ? prev : persistedToUiMessages(mapServerMessagesToPersisted(res.messages)),
+          );
+        } else if (!res.session_persistence) {
+          setMessages((prev) => {
+            if (prev.length > 0) return prev;
+            const ls = loadChatHistory(sid);
+            return ls.length ? persistedToUiMessages(ls) : prev;
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setMessages((prev) => {
+            if (prev.length > 0) return prev;
+            const ls = loadChatHistory(sid);
+            return ls.length ? persistedToUiMessages(ls) : prev;
+          });
+        }
+      } finally {
+        if (!cancelled) setHistoryReady(true);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
+  useEffect(() => {
+    if (!historyReady) return;
+    saveChatHistory(sessionIdRef.current, uiMessagesToPersisted(messages));
+  }, [messages, historyReady]);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -64,6 +118,10 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'session_start':
+        case 'connected':
+          break;
+
         case 'thinking':
           setTyping(true);
           pendingThinkingRef.current += msg.content ?? '';

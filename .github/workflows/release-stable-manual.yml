@@ -356,6 +356,32 @@ jobs:
           name: desktop-macos
           path: artifacts/desktop-macos
 
+      - name: Verify required release assets
+        shell: bash
+        run: |
+          required_assets=(
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
+            "zeroclaw-aarch64-unknown-linux-gnu.tar.gz"
+            "zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz"
+            "zeroclaw-arm-unknown-linux-gnueabihf.tar.gz"
+            "zeroclaw-aarch64-apple-darwin.tar.gz"
+            "zeroclaw-aarch64-linux-android.tar.gz"
+            "zeroclaw-x86_64-pc-windows-msvc.zip"
+            "ZeroClaw.dmg"
+          )
+          missing=0
+          for asset in "${required_assets[@]}"; do
+            if ! find artifacts -type f -name "$asset" -print -quit | grep -q .; then
+              echo "::error::Missing required release asset: ${asset}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Collected files:"
+            find artifacts -type f | sort
+            exit 1
+          fi
+
       - name: Generate checksums
         run: |
           cd artifacts
@@ -566,6 +592,16 @@ jobs:
     with:
       release_tag: ${{ needs.validate.outputs.tag }}
       dry_run: false
+    secrets: inherit
+
+  # ── Post-publish: sync marketplace templates (Coolify, Dokploy, EasyPanel) ──
+  marketplace:
+    name: Sync Marketplace Templates
+    needs: [validate, docker]
+    if: ${{ !cancelled() && needs.docker.result == 'success' }}
+    uses: ./.github/workflows/sync-marketplace-templates.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
     secrets: inherit
 
   # ── Post-publish: announce after release + website are live ───────────

@@ -139,6 +139,96 @@ const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+/// Find the largest byte index `<= i` that is a valid char boundary.
+/// MSRV-compatible replacement for `str::floor_char_boundary` (stable in 1.91).
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut pos = i;
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
+}
+
+/// Find the smallest byte index `>= i` that is a valid char boundary.
+/// MSRV-compatible replacement for `str::ceil_char_boundary` (stable in 1.91).
+fn ceil_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut pos = i;
+    while pos < s.len() && !s.is_char_boundary(pos) {
+        pos += 1;
+    }
+    pos
+}
+
+/// Truncate a tool result to `max_chars`, keeping head (2/3) + tail (1/3)
+/// with a marker in the middle. Returns input unchanged if within limit or
+/// `max_chars == 0` (disabled).
+pub(crate) fn truncate_tool_result(output: &str, max_chars: usize) -> String {
+    if max_chars == 0 || output.len() <= max_chars {
+        return output.to_string();
+    }
+    let head_len = max_chars * 2 / 3;
+    let tail_len = max_chars.saturating_sub(head_len);
+    let head_end = floor_char_boundary(output, head_len);
+    let tail_start = ceil_char_boundary(output, output.len().saturating_sub(tail_len));
+    // Guard against overlap when max_chars is very small
+    if head_end >= tail_start {
+        return output[..floor_char_boundary(output, max_chars)].to_string();
+    }
+    let truncated_chars = tail_start - head_end;
+    format!(
+        "{}\n\n[... {} characters truncated ...]\n\n{}",
+        &output[..head_end],
+        truncated_chars,
+        &output[tail_start..]
+    )
+}
+
+/// Aggressively trim old tool result messages in history to recover from
+/// context overflow. Keeps the last `protect_last_n` messages untouched.
+/// Returns total characters saved.
+fn fast_trim_tool_results(
+    history: &mut [crate::providers::ChatMessage],
+    protect_last_n: usize,
+) -> usize {
+    let trim_to = 2000;
+    let mut saved = 0;
+    let cutoff = history.len().saturating_sub(protect_last_n);
+    for msg in &mut history[..cutoff] {
+        if msg.role == "tool" && msg.content.len() > trim_to {
+            let original_len = msg.content.len();
+            msg.content = truncate_tool_result(&msg.content, trim_to);
+            saved += original_len - msg.content.len();
+        }
+    }
+    saved
+}
+
+/// Emergency: drop oldest non-system, non-recent messages from history.
+/// Returns number of messages dropped.
+fn emergency_history_trim(
+    history: &mut Vec<crate::providers::ChatMessage>,
+    keep_recent: usize,
+) -> usize {
+    let mut dropped = 0;
+    let target_drop = history.len() / 3;
+    let mut i = 0;
+    while dropped < target_drop && i < history.len().saturating_sub(keep_recent) {
+        if history[i].role == "system" {
+            i += 1;
+        } else {
+            history.remove(i);
+            dropped += 1;
+        }
+    }
+    dropped
+}
+
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
@@ -2502,6 +2592,9 @@ pub(crate) async fn agent_turn(
         activated_tools,
         model_switch_callback,
         &crate::config::PacingConfig::default(),
+        0,    // max_tool_result_chars: 0 = disabled (legacy callers)
+        0,    // context_token_budget: 0 = disabled (legacy callers)
+        None, // shared_budget: no shared budget for legacy callers
     )
     .await
 }
@@ -2812,6 +2905,9 @@ pub(crate) async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &crate::config::PacingConfig,
+    max_tool_result_chars: usize,
+    context_token_budget: usize,
+    shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2845,6 +2941,53 @@ pub(crate) async fn run_tool_call_loop(
             .is_some_and(CancellationToken::is_cancelled)
         {
             return Err(ToolLoopCancelled.into());
+        }
+
+        // Shared iteration budget: parent + subagents share a global counter
+        if let Some(ref budget) = shared_budget {
+            let remaining = budget.load(std::sync::atomic::Ordering::Relaxed);
+            if remaining == 0 {
+                tracing::warn!("Shared iteration budget exhausted at iteration {iteration}");
+                break;
+            }
+            budget.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        // Preemptive context management: trim history before it overflows
+        if context_token_budget > 0 {
+            let estimated = estimate_history_tokens(history);
+            if estimated > context_token_budget {
+                tracing::info!(
+                    estimated,
+                    budget = context_token_budget,
+                    iteration = iteration + 1,
+                    "Preemptive context trim: estimated tokens exceed budget"
+                );
+                let chars_saved = fast_trim_tool_results(history, 4);
+                if chars_saved > 0 {
+                    tracing::info!(chars_saved, "Preemptive fast-trim applied");
+                }
+                // If still over budget, use the history pruner for deeper cleanup
+                let recheck = estimate_history_tokens(history);
+                if recheck > context_token_budget {
+                    let stats = crate::agent::history_pruner::prune_history(
+                        history,
+                        &crate::agent::history_pruner::HistoryPrunerConfig {
+                            enabled: true,
+                            max_tokens: context_token_budget,
+                            keep_recent: 4,
+                            collapse_tool_results: true,
+                        },
+                    );
+                    if stats.dropped_messages > 0 || stats.collapsed_pairs > 0 {
+                        tracing::info!(
+                            collapsed = stats.collapsed_pairs,
+                            dropped = stats.dropped_messages,
+                            "Preemptive history prune applied"
+                        );
+                    }
+                }
+            }
         }
 
         // Check if model switch was requested via model_switch tool
@@ -3252,6 +3395,35 @@ pub(crate) async fn run_tool_call_loop(
                         "duration_ms": llm_started_at.elapsed().as_millis(),
                     }),
                 );
+
+                // Context overflow recovery: trim history and retry
+                if crate::providers::reliable::is_context_window_exceeded(&e) {
+                    tracing::warn!(
+                        iteration = iteration + 1,
+                        "Context window exceeded, attempting in-loop recovery"
+                    );
+
+                    // Step 1: fast-trim old tool results (cheap)
+                    let chars_saved = fast_trim_tool_results(history, 4);
+                    if chars_saved > 0 {
+                        tracing::info!(
+                            chars_saved,
+                            "Context recovery: trimmed old tool results, retrying"
+                        );
+                        continue;
+                    }
+
+                    // Step 2: emergency drop oldest non-system messages
+                    let dropped = emergency_history_trim(history, 4);
+                    if dropped > 0 {
+                        tracing::info!(dropped, "Context recovery: dropped old messages, retrying");
+                        continue;
+                    }
+
+                    // Nothing left to trim — truly unrecoverable
+                    tracing::error!("Context overflow unrecoverable: no trimmable messages");
+                }
+
                 return Err(e);
             }
         };
@@ -3682,11 +3854,12 @@ pub(crate) async fn run_tool_call_loop(
                     }
                 }
             }
-            individual_results.push((tool_call_id, outcome.output.clone()));
+            let result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            individual_results.push((tool_call_id, result_output.clone()));
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                tool_name, outcome.output
+                tool_name, result_output
             );
         }
 
@@ -3784,7 +3957,36 @@ pub(crate) async fn run_tool_call_loop(
             "max_iterations": max_iterations,
         }),
     );
-    anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+
+    // Graceful shutdown: ask the LLM for a final summary without tools
+    tracing::warn!(
+        max_iterations,
+        "Max iterations reached, requesting final summary"
+    );
+    history.push(ChatMessage::user(
+        "You have reached the maximum number of tool iterations. \
+         Please provide your best answer based on the work completed so far. \
+         Summarize what you accomplished and what remains to be done."
+            .to_string(),
+    ));
+
+    let summary_request = crate::providers::ChatRequest {
+        messages: history,
+        tools: None, // No tools — force a text response
+    };
+    match provider.chat(summary_request, model, temperature).await {
+        Ok(resp) => {
+            let text = resp.text.unwrap_or_default();
+            if text.is_empty() {
+                anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+            }
+            Ok(text)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Final summary LLM call failed, bailing");
+            anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+        }
+    }
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -4341,6 +4543,9 @@ pub async fn run(
                 activated_handle.as_ref(),
                 Some(model_switch_callback.clone()),
                 &config.pacing,
+                config.agent.max_tool_result_chars,
+                config.agent.max_context_tokens,
+                None, // shared_budget
             )
             .await
             {
@@ -4642,6 +4847,9 @@ pub async fn run(
                     activated_handle.as_ref(),
                     Some(model_switch_callback.clone()),
                     &config.pacing,
+                    config.agent.max_tool_result_chars,
+                    config.agent.max_context_tokens,
+                    None, // shared_budget
                 )
                 .await
                 {
@@ -4682,6 +4890,45 @@ pub async fn run(
 
                             continue;
                         }
+                        // Context overflow recovery: compress and retry
+                        if crate::providers::reliable::is_context_window_exceeded(&e) {
+                            tracing::warn!(
+                                "Context overflow in interactive loop, attempting recovery"
+                            );
+                            let mut compressor =
+                                crate::agent::context_compressor::ContextCompressor::new(
+                                    config.agent.context_compression.clone(),
+                                    config.agent.max_context_tokens,
+                                )
+                                .with_memory(mem.clone());
+                            let error_msg = format!("{e}");
+                            match compressor
+                                .compress_on_error(
+                                    &mut history,
+                                    provider.as_ref(),
+                                    &model_name,
+                                    &error_msg,
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    tracing::info!(
+                                        "Context recovered via compression, retrying turn"
+                                    );
+                                    continue;
+                                }
+                                Ok(false) => {
+                                    tracing::warn!("Compression ran but couldn't reduce enough");
+                                }
+                                Err(compress_err) => {
+                                    tracing::warn!(
+                                        error = %compress_err,
+                                        "Compression failed during recovery"
+                                    );
+                                }
+                            }
+                        }
+
                         eprintln!("\nError: {e}\n");
                         break String::new();
                     }
@@ -4711,18 +4958,27 @@ pub async fn run(
                 let compressor = crate::agent::context_compressor::ContextCompressor::new(
                     config.agent.context_compression.clone(),
                     config.agent.max_context_tokens,
-                );
-                if let Ok(result) = compressor
+                )
+                .with_memory(mem.clone());
+                match compressor
                     .compress_if_needed(&mut history, provider.as_ref(), &model_name)
                     .await
                 {
-                    if result.compressed {
+                    Ok(result) if result.compressed => {
                         tracing::info!(
                             passes = result.passes_used,
                             before = result.tokens_before,
                             after = result.tokens_after,
                             "Context compression complete"
                         );
+                    }
+                    Ok(_) => {} // No compression needed
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Context compression failed, falling back to history trim"
+                        );
+                        trim_history(&mut history, config.agent.max_history_messages / 2);
                     }
                 }
             }
@@ -5105,11 +5361,257 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_compaction_summary, build_compaction_transcript, load_interactive_session_history,
-        save_interactive_session_history, InteractiveSessionState,
+        apply_compaction_summary, build_compaction_transcript, emergency_history_trim,
+        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
+        save_interactive_session_history, truncate_tool_result, InteractiveSessionState,
     };
     use crate::providers::ChatMessage;
     use tempfile::tempdir;
+
+    // ── truncate_tool_result tests ────────────────────────────────
+
+    #[test]
+    fn truncate_tool_result_short_passthrough() {
+        let output = "short output";
+        assert_eq!(truncate_tool_result(output, 100), output);
+    }
+
+    #[test]
+    fn truncate_tool_result_exact_boundary() {
+        let output = "a".repeat(100);
+        assert_eq!(truncate_tool_result(&output, 100), output);
+    }
+
+    #[test]
+    fn truncate_tool_result_zero_disables() {
+        let output = "a".repeat(200_000);
+        assert_eq!(truncate_tool_result(&output, 0), output);
+    }
+
+    #[test]
+    fn truncate_tool_result_truncates_with_marker() {
+        let output = "a".repeat(200);
+        let result = truncate_tool_result(&output, 100);
+        assert!(result.contains("[... "));
+        assert!(result.contains("characters truncated ...]\n\n"));
+        // Head should be ~2/3 of 100 = 66, tail ~1/3 = 34
+        assert!(result.starts_with("aaa"));
+        assert!(result.ends_with("aaa"));
+        // Result should be shorter than original
+        assert!(result.len() < output.len());
+    }
+
+    #[test]
+    fn truncate_tool_result_preserves_head_tail_ratio() {
+        let output: String = (0u32..1000)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let result = truncate_tool_result(&output, 300);
+        // Head = 2/3 of 300 = 200 chars, tail = 100 chars
+        // Find the marker
+        let marker_start = result.find("[... ").unwrap();
+        let marker_end = result.find("characters truncated ...]\n\n").unwrap()
+            + "characters truncated ...]\n\n".len();
+        let head = &result[..marker_start - 2]; // subtract \n\n
+        let tail = &result[marker_end..];
+        assert!(
+            head.len() >= 190 && head.len() <= 210,
+            "head len={}",
+            head.len()
+        );
+        assert!(
+            tail.len() >= 90 && tail.len() <= 110,
+            "tail len={}",
+            tail.len()
+        );
+    }
+
+    #[test]
+    fn truncate_tool_result_utf8_boundary_safety() {
+        // Create string with multi-byte chars: each emoji is 4 bytes
+        let output = "🦀".repeat(100); // 400 bytes
+                                       // This should not panic even with a limit that falls mid-char
+        let result = truncate_tool_result(&output, 50);
+        assert!(result.contains("[... "));
+        // Verify the result is valid UTF-8 (would panic otherwise)
+        let _ = result.len();
+    }
+
+    #[test]
+    fn truncate_tool_result_very_small_max() {
+        let output = "abcdefghijklmnopqrstuvwxyz";
+        // With max=5, head=3 tail=2 — result includes marker overhead
+        // but should not panic and should contain truncation marker
+        let result = truncate_tool_result(output, 5);
+        assert!(result.contains("[... "));
+        // Head (3 chars) + tail (2 chars) from original should be preserved
+        assert!(result.starts_with("abc"));
+        assert!(result.ends_with("yz"));
+    }
+
+    // ── fast_trim_tool_results tests ────────────────────────────
+
+    #[test]
+    fn fast_trim_protects_recent_messages() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::tool("a".repeat(5000)),
+            ChatMessage::tool("b".repeat(5000)),
+            ChatMessage::user("recent user msg"),
+            ChatMessage::tool("c".repeat(5000)), // recent, should be protected
+        ];
+        // protect_last_n = 2 → last 2 messages protected
+        let saved = fast_trim_tool_results(&mut history, 2);
+        assert!(saved > 0);
+        // First two tool messages should be trimmed
+        assert!(history[1].content.len() <= 2100);
+        assert!(history[2].content.len() <= 2100);
+        // Last tool message (protected) should be unchanged
+        assert_eq!(history[4].content.len(), 5000);
+    }
+
+    #[test]
+    fn fast_trim_skips_non_tool_messages() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("a".repeat(5000)),
+            ChatMessage::assistant("b".repeat(5000)),
+        ];
+        let saved = fast_trim_tool_results(&mut history, 0);
+        assert_eq!(saved, 0);
+        assert_eq!(history[1].content.len(), 5000);
+        assert_eq!(history[2].content.len(), 5000);
+    }
+
+    #[test]
+    fn fast_trim_small_tool_results_unchanged() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::tool("short result"),
+        ];
+        let saved = fast_trim_tool_results(&mut history, 0);
+        assert_eq!(saved, 0);
+        assert_eq!(history[1].content, "short result");
+    }
+
+    // ── emergency_history_trim tests ──────────────────────────────
+
+    #[test]
+    fn emergency_trim_preserves_system() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("msg1"),
+            ChatMessage::assistant("resp1"),
+            ChatMessage::user("msg2"),
+            ChatMessage::assistant("resp2"),
+            ChatMessage::user("msg3"),
+        ];
+        let dropped = emergency_history_trim(&mut history, 2);
+        assert!(dropped > 0);
+        // System message should always be preserved
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[0].content, "sys");
+        // Last 2 messages should be preserved
+        let len = history.len();
+        assert_eq!(history[len - 1].content, "msg3");
+    }
+
+    #[test]
+    fn emergency_trim_preserves_recent() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old1"),
+            ChatMessage::user("old2"),
+            ChatMessage::user("recent1"),
+            ChatMessage::user("recent2"),
+        ];
+        let dropped = emergency_history_trim(&mut history, 2);
+        assert!(dropped > 0);
+        // Last 2 should be preserved
+        let len = history.len();
+        assert_eq!(history[len - 1].content, "recent2");
+        assert_eq!(history[len - 2].content, "recent1");
+    }
+
+    #[test]
+    fn emergency_trim_nothing_to_drop() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("only user msg"),
+        ];
+        // protect_last = 1, system is protected → only 1 droppable
+        // target_drop = 2/3 = 0 → nothing dropped
+        let dropped = emergency_history_trim(&mut history, 1);
+        assert_eq!(dropped, 0);
+    }
+
+    // ── estimate_history_tokens tests ─────────────────────────────
+
+    #[test]
+    fn estimate_tokens_empty_history() {
+        let history: Vec<ChatMessage> = vec![];
+        assert_eq!(estimate_history_tokens(&history), 0);
+    }
+
+    #[test]
+    fn estimate_tokens_single_message() {
+        // 40 chars → 40.div_ceil(4) + 4 = 10 + 4 = 14 tokens
+        let msg = "a".repeat(40);
+        let history = vec![ChatMessage::user(&msg)];
+        let est = estimate_history_tokens(&history);
+        assert_eq!(est, 14);
+    }
+
+    #[test]
+    fn estimate_tokens_multiple_messages() {
+        let history = vec![
+            ChatMessage::system("system prompt here"), // 18 chars → 18/4=4 +4=8 (div_ceil: 5+4=9)
+            ChatMessage::user("hello"),                // 5 chars → 5/4=1 +4=5 (div_ceil: 2+4=6)
+            ChatMessage::assistant("world"),           // 5 chars → 5/4=1 +4=5 (div_ceil: 2+4=6)
+        ];
+        let est = estimate_history_tokens(&history);
+        // Each message: content_len.div_ceil(4) + 4
+        // 18.div_ceil(4)=5, 5.div_ceil(4)=2, 5.div_ceil(4)=2 → 5+4 + 2+4 + 2+4 = 21
+        assert_eq!(est, 21);
+    }
+
+    #[test]
+    fn estimate_tokens_large_tool_result() {
+        let big = "x".repeat(40_000);
+        let history = vec![ChatMessage::tool(&big)];
+        let est = estimate_history_tokens(&history);
+        // 40000.div_ceil(4) + 4 = 10000 + 4 = 10004
+        assert_eq!(est, 10_004);
+    }
+
+    // ── shared_budget tests ───────────────────────────────────────
+
+    #[test]
+    fn shared_budget_decrement_logic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let budget = Arc::new(AtomicUsize::new(3));
+
+        // Simulate 3 iterations decrementing
+        for i in 0..3 {
+            let remaining = budget.load(Ordering::Relaxed);
+            assert!(remaining > 0, "Budget should be >0 at iteration {i}");
+            budget.fetch_sub(1, Ordering::Relaxed);
+        }
+
+        // Budget should now be 0
+        assert_eq!(budget.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn shared_budget_none_has_no_effect() {
+        // When shared_budget is None, the check is simply skipped
+        let budget: Option<Arc<std::sync::atomic::AtomicUsize>> = None;
+        assert!(budget.is_none());
+    }
+
+    // ── existing tests ────────────────────────────────────────────
 
     #[test]
     fn interactive_session_state_round_trips_history() {
@@ -5857,6 +6359,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5909,6 +6414,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -5954,6 +6462,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5999,6 +6510,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -6051,6 +6565,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -6103,6 +6620,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -6156,6 +6676,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -6207,6 +6730,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -6258,6 +6784,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -6392,6 +6921,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -6463,6 +6995,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6526,6 +7061,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6584,6 +7122,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6654,6 +7195,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6715,6 +7259,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6796,6 +7343,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -6854,6 +7404,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6936,6 +7489,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -7002,6 +7558,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("streaming provider should complete");
@@ -7070,6 +7629,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -7142,6 +7704,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -7223,6 +7788,9 @@ mod tests {
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("routed streaming provider should complete");
@@ -9260,6 +9828,9 @@ Let me check the result."#;
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("tool loop should complete");
@@ -9414,6 +9985,9 @@ Let me check the result."#;
                     None,
                     None,
                     &crate::config::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
                 ),
             )
             .await
@@ -9493,6 +10067,9 @@ Let me check the result."#;
                     None,
                     None,
                     &crate::config::PacingConfig::default(),
+                    0,
+                    0,
+                    None,
                 ),
             )
             .await
@@ -9548,6 +10125,9 @@ Let me check the result."#;
             None,
             None,
             &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
         )
         .await
         .expect("should succeed without cost scope");
