@@ -39,6 +39,8 @@ jobs:
     container: amazonlinux:2023
     timeout-minutes: 40
     steps:
+      - name: Install prerequisites
+        run: dnf install -y tar git
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
