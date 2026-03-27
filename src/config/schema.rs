@@ -1369,10 +1369,21 @@ pub struct AgentConfig {
     /// middle. Set to `0` to disable truncation. Default: `50000`.
     #[serde(default = "default_max_tool_result_chars")]
     pub max_tool_result_chars: usize,
+
+    /// Number of most recent conversation turns whose full tool-call/result
+    /// messages are preserved in channel conversation history. Older turns
+    /// keep only the final assistant text. Set to `0` to disable (previous
+    /// behavior). Default: `2`.
+    #[serde(default = "default_keep_tool_context_turns")]
+    pub keep_tool_context_turns: usize,
 }
 
 fn default_max_tool_result_chars() -> usize {
     50_000
+}
+
+fn default_keep_tool_context_turns() -> usize {
+    2
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1415,6 +1426,7 @@ impl Default for AgentConfig {
             context_compression:
                 crate::agent::context_compressor::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
+            keep_tool_context_turns: default_keep_tool_context_turns(),
         }
     }
 }
