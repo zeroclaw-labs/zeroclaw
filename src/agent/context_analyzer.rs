@@ -121,12 +121,16 @@ mod tests {
             make_message("assistant", "I will store that in memory"),
         ];
         let signals = analyze_turn_context(&history, "ok", 1, &[]);
-        assert!(signals
-            .suggested_tools
-            .contains(&"memory_store".to_string()));
-        assert!(signals
-            .suggested_tools
-            .contains(&"memory_recall".to_string()));
+        assert!(
+            signals
+                .suggested_tools
+                .contains(&"memory_store".to_string())
+        );
+        assert!(
+            signals
+                .suggested_tools
+                .contains(&"memory_recall".to_string())
+        );
     }
 
     #[test]
@@ -141,9 +145,11 @@ mod tests {
         let signals = analyze_turn_context(&history, "go", 1, &[]);
         assert!(signals.suggested_tools.contains(&"file_read".to_string()));
         assert!(signals.suggested_tools.contains(&"shell".to_string()));
-        assert!(signals
-            .suggested_tools
-            .contains(&"content_search".to_string()));
+        assert!(
+            signals
+                .suggested_tools
+                .contains(&"content_search".to_string())
+        );
     }
 
     #[test]

@@ -1017,11 +1017,7 @@ fn check_api_key_prefix(provider_name: &str, key: &str) -> Option<&'static str> 
         _ => return None, // Unknown format provider — skip
     };
 
-    if matches {
-        None
-    } else {
-        Some(expected)
-    }
+    if matches { None } else { Some(expected) }
 }
 
 fn parse_custom_provider_url(
@@ -1156,10 +1152,10 @@ fn create_provider_with_url_and_options(
             )?))
         }
         // ── Primary providers (custom implementations) ───────
-        "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(
-            key,
-            options.provider_timeout_secs,
-        ).with_max_tokens(options.provider_max_tokens))),
+        "openrouter" => Ok(Box::new(
+            openrouter::OpenRouterProvider::new(key, options.provider_timeout_secs)
+                .with_max_tokens(options.provider_max_tokens),
+        )),
         "anthropic" => {
             let mut p = anthropic::AnthropicProvider::new(key);
             if let Some(mt) = options.provider_max_tokens {
@@ -1176,29 +1172,23 @@ fn create_provider_with_url_and_options(
         }
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
         "ollama" => {
+            let env_url = std::env::var("ZEROCLAW_PROVIDER_URL").ok();
 
-                let env_url = std::env::var("ZEROCLAW_PROVIDER_URL").ok();
+            let api_url = env_url.as_deref().or(api_url);
 
-                let api_url = env_url
-                    .as_deref()
-                    .or(api_url);
-
-                Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
-                    api_url,
-                    key,
-                    options.reasoning_enabled,
-                )))
-        },
+            Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
+                api_url,
+                key,
+                options.reasoning_enabled,
+            )))
+        }
         "gemini" | "google" | "google-gemini" => {
-            let state_dir = options
-                .zeroclaw_dir
-                .clone()
-                .unwrap_or_else(|| {
-                    directories::UserDirs::new().map_or_else(
-                        || PathBuf::from(".zeroclaw"),
-                        |dirs| dirs.home_dir().join(".zeroclaw"),
-                    )
-                });
+            let state_dir = options.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
             let auth_service = AuthService::new(&state_dir, options.secrets_encrypt);
             Ok(Box::new(gemini::GeminiProvider::new_with_auth(
                 key,
@@ -1211,7 +1201,10 @@ fn create_provider_with_url_and_options(
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(compat(
             OpenAiCompatibleProvider::new(
-                "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
+                "Venice",
+                "https://api.venice.ai",
+                key,
+                AuthStyle::Bearer,
             )
             .without_native_tools(),
         )),
@@ -1233,23 +1226,32 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(compat(
-            OpenAiCompatibleProvider::new_with_user_agent(
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => {
+            Ok(compat(OpenAiCompatibleProvider::new_with_user_agent(
                 "Kimi Code",
                 "https://api.kimi.com/coding/v1",
                 key,
                 AuthStyle::Bearer,
                 "KimiCLI/0.77",
-            ),
-        )),
+            )))
+        }
         "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Synthetic", "https://api.synthetic.new/openai/v1", key, AuthStyle::Bearer,
+            "Synthetic",
+            "https://api.synthetic.new/openai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "opencode" | "opencode-zen" => Ok(compat(OpenAiCompatibleProvider::new(
-            "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
+            "OpenCode Zen",
+            "https://opencode.ai/zen/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "opencode-go" => Ok(compat(OpenAiCompatibleProvider::new(
-            "OpenCode Go", "https://opencode.ai/zen/go/v1", key, AuthStyle::Bearer,
+            "OpenCode Go",
+            "https://opencode.ai/zen/go/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
             "Z.AI",
@@ -1271,13 +1273,13 @@ fn create_provider_with_url_and_options(
                 minimax_base_url(name).expect("checked in guard"),
                 key,
                 AuthStyle::Bearer,
-            )
+            ),
         )),
         "azure_openai" | "azure-openai" | "azure" => {
             let resource = std::env::var("AZURE_OPENAI_RESOURCE")
                 .unwrap_or_else(|_| "my-resource".to_string());
-            let deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT")
-                .unwrap_or_else(|_| "gpt-4o".to_string());
+            let deployment =
+                std::env::var("AZURE_OPENAI_DEPLOYMENT").unwrap_or_else(|_| "gpt-4o".to_string());
             let api_version = std::env::var("AZURE_OPENAI_API_VERSION").ok();
             Ok(Box::new(azure_openai::AzureOpenAiProvider::new(
                 key,
@@ -1302,23 +1304,31 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
-                .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
+                .or_else(|| {
+                    qwen_oauth_context
+                        .as_ref()
+                        .and_then(|context| context.base_url.clone())
+                })
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
 
             Ok(compat(
                 OpenAiCompatibleProvider::new_with_user_agent_and_vision(
-                "Qwen Code",
-                &base_url,
-                key,
-                AuthStyle::Bearer,
-                "QwenCode/1.0",
-                true,
-            )))
+                    "Qwen Code",
+                    &base_url,
+                    key,
+                    AuthStyle::Bearer,
+                    "QwenCode/1.0",
+                    true,
+                ),
+            ))
         }
         name if is_qianfan_alias(name) => {
             let base_url = qianfan_base_url(api_url);
             Ok(compat(OpenAiCompatibleProvider::new(
-                "Qianfan", &base_url, key, AuthStyle::Bearer,
+                "Qianfan",
+                &base_url,
+                key,
+                AuthStyle::Bearer,
             )))
         }
         name if is_doubao_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
@@ -1335,43 +1345,72 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
                 "openclaw",
                 true,
-            )
+            ),
         )),
-        name if qwen_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_with_vision(
-            "Qwen",
-            qwen_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-            true,
-        ))),
+        name if qwen_base_url(name).is_some() => {
+            Ok(compat(OpenAiCompatibleProvider::new_with_vision(
+                "Qwen",
+                qwen_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::Bearer,
+                true,
+            )))
+        }
 
         // ── Extended ecosystem (community favorites) ─────────
         "groq" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Groq", "https://api.groq.com/openai/v1", key, AuthStyle::Bearer,
+            "Groq",
+            "https://api.groq.com/openai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "mistral" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Mistral", "https://api.mistral.ai/v1", key, AuthStyle::Bearer,
+            "Mistral",
+            "https://api.mistral.ai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "xai" | "grok" => Ok(compat(OpenAiCompatibleProvider::new(
-            "xAI", "https://api.x.ai", key, AuthStyle::Bearer,
+            "xAI",
+            "https://api.x.ai",
+            key,
+            AuthStyle::Bearer,
         ))),
         "deepseek" => Ok(compat(OpenAiCompatibleProvider::new(
-            "DeepSeek", "https://api.deepseek.com", key, AuthStyle::Bearer,
+            "DeepSeek",
+            "https://api.deepseek.com",
+            key,
+            AuthStyle::Bearer,
         ))),
         "together" | "together-ai" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Together AI", "https://api.together.xyz", key, AuthStyle::Bearer,
+            "Together AI",
+            "https://api.together.xyz",
+            key,
+            AuthStyle::Bearer,
         ))),
         "fireworks" | "fireworks-ai" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Fireworks AI", "https://api.fireworks.ai/inference/v1", key, AuthStyle::Bearer,
+            "Fireworks AI",
+            "https://api.fireworks.ai/inference/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "novita" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Novita AI", "https://api.novita.ai/openai", key, AuthStyle::Bearer,
+            "Novita AI",
+            "https://api.novita.ai/openai",
+            key,
+            AuthStyle::Bearer,
         ))),
         "perplexity" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Perplexity", "https://api.perplexity.ai", key, AuthStyle::Bearer,
+            "Perplexity",
+            "https://api.perplexity.ai",
+            key,
+            AuthStyle::Bearer,
         ))),
         "cohere" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Cohere", "https://api.cohere.com/compatibility", key, AuthStyle::Bearer,
+            "Cohere",
+            "https://api.cohere.com/compatibility",
+            key,
+            AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
         "claude-code" => Ok(Box::new(claude_code::ClaudeCodeProvider::new())),
@@ -1446,18 +1485,21 @@ fn create_provider_with_url_and_options(
                 AuthStyle::Bearer,
             )))
         }
-        "nvidia" | "nvidia-nim" | "build.nvidia.com" => Ok(compat(
-            OpenAiCompatibleProvider::new_no_responses_fallback(
+        "nvidia" | "nvidia-nim" | "build.nvidia.com" => {
+            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "NVIDIA NIM",
                 "https://integrate.api.nvidia.com/v1",
                 key,
                 AuthStyle::Bearer,
-            ),
-        )),
+            )))
+        }
 
         // ── AI inference routers ─────────────────────────────
         "astrai" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Astrai", "https://as-trai.com/v1", key, AuthStyle::Bearer,
+            "Astrai",
+            "https://as-trai.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "siliconflow" | "silicon-flow" => Ok(compat(OpenAiCompatibleProvider::new(
             "SiliconFlow",
@@ -1486,42 +1528,78 @@ fn create_provider_with_url_and_options(
 
         // ── Fast inference providers ──────────────────────────
         "cerebras" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Cerebras", "https://api.cerebras.ai/v1", key, AuthStyle::Bearer,
+            "Cerebras",
+            "https://api.cerebras.ai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "sambanova" => Ok(compat(OpenAiCompatibleProvider::new(
-            "SambaNova", "https://api.sambanova.ai/v1", key, AuthStyle::Bearer,
+            "SambaNova",
+            "https://api.sambanova.ai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "hyperbolic" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Hyperbolic", "https://api.hyperbolic.xyz/v1", key, AuthStyle::Bearer,
+            "Hyperbolic",
+            "https://api.hyperbolic.xyz/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
 
         // ── Model hosting platforms ──────────────────────────
         "deepinfra" | "deep-infra" => Ok(compat(OpenAiCompatibleProvider::new(
-            "DeepInfra", "https://api.deepinfra.com/v1/openai", key, AuthStyle::Bearer,
+            "DeepInfra",
+            "https://api.deepinfra.com/v1/openai",
+            key,
+            AuthStyle::Bearer,
         ))),
         "huggingface" | "hf" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Hugging Face", "https://router.huggingface.co/v1", key, AuthStyle::Bearer,
+            "Hugging Face",
+            "https://router.huggingface.co/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "ai21" | "ai21-labs" => Ok(compat(OpenAiCompatibleProvider::new(
-            "AI21 Labs", "https://api.ai21.com/studio/v1", key, AuthStyle::Bearer,
+            "AI21 Labs",
+            "https://api.ai21.com/studio/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "reka" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Reka", "https://api.reka.ai/v1", key, AuthStyle::Bearer,
+            "Reka",
+            "https://api.reka.ai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "baseten" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Baseten", "https://inference.baseten.co/v1", key, AuthStyle::Bearer,
+            "Baseten",
+            "https://inference.baseten.co/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "nscale" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Nscale", "https://inference.api.nscale.com/v1", key, AuthStyle::Bearer,
+            "Nscale",
+            "https://inference.api.nscale.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "anyscale" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Anyscale", "https://api.endpoints.anyscale.com/v1", key, AuthStyle::Bearer,
+            "Anyscale",
+            "https://api.endpoints.anyscale.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "nebius" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Nebius AI Studio", "https://api.studio.nebius.ai/v1", key, AuthStyle::Bearer,
+            "Nebius AI Studio",
+            "https://api.studio.nebius.ai/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "friendli" | "friendliai" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Friendli AI", "https://api.friendli.ai/serverless/v1", key, AuthStyle::Bearer,
+            "Friendli AI",
+            "https://api.friendli.ai/serverless/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "lepton" | "lepton-ai" => {
             let base_url = api_url
@@ -1538,22 +1616,40 @@ fn create_provider_with_url_and_options(
 
         // ── Chinese AI providers ─────────────────────────────
         "stepfun" | "step" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Stepfun", "https://api.stepfun.com/v1", key, AuthStyle::Bearer,
+            "Stepfun",
+            "https://api.stepfun.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "baichuan" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Baichuan", "https://api.baichuan-ai.com/v1", key, AuthStyle::Bearer,
+            "Baichuan",
+            "https://api.baichuan-ai.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "yi" | "01ai" | "lingyiwanwu" => Ok(compat(OpenAiCompatibleProvider::new(
-            "01.AI (Yi)", "https://api.lingyiwanwu.com/v1", key, AuthStyle::Bearer,
+            "01.AI (Yi)",
+            "https://api.lingyiwanwu.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "hunyuan" | "tencent" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Tencent Hunyuan", "https://api.hunyuan.cloud.tencent.com/v1", key, AuthStyle::Bearer,
+            "Tencent Hunyuan",
+            "https://api.hunyuan.cloud.tencent.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "avian" => Ok(compat(OpenAiCompatibleProvider::new(
-            "Avian", "https://api.avian.io/v1", key, AuthStyle::Bearer,
+            "Avian",
+            "https://api.avian.io/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
         "deepmyst" | "deep-myst" => Ok(compat(OpenAiCompatibleProvider::new(
-            "DeepMyst", "https://api.deepmyst.com/v1", key, AuthStyle::Bearer,
+            "DeepMyst",
+            "https://api.deepmyst.com/v1",
+            key,
+            AuthStyle::Bearer,
         ))),
 
         // ── Cloud AI endpoints ───────────────────────────────
@@ -2248,8 +2344,10 @@ mod tests {
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
             match value {
-                Some(next) => std::env::set_var(key, next),
-                None => std::env::remove_var(key),
+                // SAFETY: test-only, single-threaded test runner.
+                Some(next) => unsafe { std::env::set_var(key, next) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(key) },
             }
 
             Self { key, original }
@@ -2259,9 +2357,11 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             if let Some(original) = self.original.as_deref() {
-                std::env::set_var(self.key, original);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, original) };
             } else {
-                std::env::remove_var(self.key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }
@@ -3619,7 +3719,8 @@ mod tests {
 
     #[test]
     fn env_provider_url_overrides_api_url() {
-        std::env::set_var("ZEROCLAW_PROVIDER_URL", "http://env-ollama:11434");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_PROVIDER_URL", "http://env-ollama:11434") };
 
         let options = ProviderRuntimeOptions::default();
 
@@ -3632,6 +3733,7 @@ mod tests {
 
         assert!(provider.is_ok());
 
-        std::env::remove_var("ZEROCLAW_PROVIDER_URL");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_PROVIDER_URL") };
     }
 }

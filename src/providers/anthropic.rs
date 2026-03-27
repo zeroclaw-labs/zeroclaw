@@ -610,6 +610,24 @@ impl AnthropicProvider {
                 .unwrap_or_default();
 
             match event_type {
+                "message_start" => {
+                    let model = event
+                        .get("message")
+                        .and_then(|m| m.get("model"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown");
+                    let input_tokens = event
+                        .get("message")
+                        .and_then(|m| m.get("usage"))
+                        .and_then(|u| u.get("input_tokens"))
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    tracing::debug!(
+                        model = %model,
+                        input_tokens = input_tokens,
+                        "Anthropic stream: message_start"
+                    );
+                }
                 "content_block_start" => {
                     if let Some(block) = event.get("content_block") {
                         let block_type = block
@@ -685,7 +703,32 @@ impl AnthropicProvider {
                             .await;
                     }
                 }
+                "message_delta" => {
+                    let stop_reason = event
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("none");
+                    let output_tokens = event
+                        .get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    if stop_reason == "max_tokens" {
+                        tracing::warn!(
+                            output_tokens = output_tokens,
+                            "Anthropic response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
+                        );
+                    } else {
+                        tracing::debug!(
+                            stop_reason = %stop_reason,
+                            output_tokens = output_tokens,
+                            "Anthropic stream: message_delta"
+                        );
+                    }
+                }
                 "message_stop" => {
+                    tracing::debug!("Anthropic stream: message_stop");
                     let _ = tx.send(Ok(StreamEvent::Final)).await;
                     return;
                 }
@@ -728,6 +771,7 @@ impl Provider for AnthropicProvider {
             system
         };
 
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic API request");
         let request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: self.max_tokens,
@@ -805,6 +849,7 @@ impl Provider for AnthropicProvider {
         } else {
             system_prompt
         };
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic streaming API request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
             max_tokens: self.max_tokens,
@@ -958,9 +1003,10 @@ impl Provider for AnthropicProvider {
             system_prompt
         };
 
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic stream_chat request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: 4096,
+            max_tokens: self.max_tokens,
             system: system_prompt,
             messages,
             temperature,
@@ -1028,7 +1074,7 @@ impl Provider for AnthropicProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
+    use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
 
     #[test]
     fn creates_with_key() {
@@ -1678,7 +1724,7 @@ mod tests {
     /// ALL conversation turns and native tool definitions.
     #[tokio::test]
     async fn chat_with_tools_sends_full_history_and_native_tools() {
-        use axum::{routing::post, Json, Router};
+        use axum::{Json, Router, routing::post};
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
 
@@ -1723,7 +1769,9 @@ mod tests {
         let messages = vec![
             ChatMessage::system("You are a helpful assistant."),
             ChatMessage::user("gen a 2 sum in golang"),
-            ChatMessage::assistant("```go\nfunc twoSum(nums []int, target int) []int {\n    m := make(map[int]int)\n    for i, n := range nums {\n        if j, ok := m[target-n]; ok {\n            return []int{j, i}\n        }\n        m[n] = i\n    }\n    return nil\n}\n```"),
+            ChatMessage::assistant(
+                "```go\nfunc twoSum(nums []int, target int) []int {\n    m := make(map[int]int)\n    for i, n := range nums {\n        if j, ok := m[target-n]; ok {\n            return []int{j, i}\n        }\n        m[n] = i\n    }\n    return nil\n}\n```",
+            ),
             ChatMessage::user("what's meaning of make here?"),
         ];
 

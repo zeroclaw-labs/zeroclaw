@@ -51,6 +51,8 @@ pub struct SlackChannel {
     /// `send_draft` returns a placeholder without posting; the real message
     /// is created on the first `update_draft` call.
     lazy_draft_ts: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Emoji reaction name (without colons) that cancels an in-flight request.
+    cancel_reaction: Option<String>,
 }
 
 const SLACK_HISTORY_MAX_RETRIES: u32 = 3;
@@ -179,6 +181,7 @@ impl SlackChannel {
             draft_update_interval_ms: SLACK_DRAFT_UPDATE_INTERVAL_MS,
             last_draft_edit: Mutex::new(HashMap::new()),
             lazy_draft_ts: tokio::sync::Mutex::new(HashMap::new()),
+            cancel_reaction: None,
         }
     }
 
@@ -244,6 +247,12 @@ impl SlackChannel {
         if interval_ms > 0 {
             self.draft_update_interval_ms = interval_ms;
         }
+        self
+    }
+
+    /// Set the emoji reaction name that cancels an in-flight request.
+    pub fn with_cancel_reaction(mut self, reaction: Option<String>) -> Self {
+        self.cancel_reaction = reaction;
         self
     }
 
@@ -976,10 +985,8 @@ impl SlackChannel {
             .filter(|thread_ts| Self::is_valid_slack_ts(thread_ts))
             .map(str::to_string);
 
-        let formatted = self
-            .format_permalink_context(permalink, message, thread_ts.as_deref())
-            .await;
-        formatted
+        self.format_permalink_context(permalink, message, thread_ts.as_deref())
+            .await
     }
 
     async fn fetch_permalink_message(
@@ -1005,7 +1012,9 @@ impl SlackChannel {
             Err(err) => {
                 tracing::warn!(
                     "Slack permalink resolver: conversations.history request failed for channel={} ts={}: {}",
-                    channel_id, message_ts, err
+                    channel_id,
+                    message_ts,
+                    err
                 );
                 return SlackPermalinkLookup::NotFound;
             }
@@ -1020,7 +1029,10 @@ impl SlackChannel {
             let sanitized = crate::providers::sanitize_api_error(&body);
             tracing::warn!(
                 "Slack permalink resolver: conversations.history failed for channel={} ts={} ({}): {}",
-                channel_id, message_ts, status, sanitized
+                channel_id,
+                message_ts,
+                status,
+                sanitized
             );
             return SlackPermalinkLookup::NotFound;
         }
@@ -1731,11 +1743,7 @@ impl SlackChannel {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        if mime.is_empty() {
-            None
-        } else {
-            Some(mime)
-        }
+        if mime.is_empty() { None } else { Some(mime) }
     }
 
     fn is_supported_image_mime(mime: &str) -> bool {
@@ -2690,6 +2698,63 @@ impl SlackChannel {
                     continue;
                 }
 
+                // Handle reaction-based cancellation.
+                if event_type == "reaction_added" {
+                    if let Some(ref cancel_emoji) = self.cancel_reaction {
+                        let reaction = event
+                            .get("reaction")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default();
+                        if reaction == cancel_emoji.as_str() {
+                            let user = event
+                                .get("user")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or_default();
+                            if !user.is_empty() && self.is_user_allowed(user) {
+                                let item = event.get("item");
+                                let item_channel = item
+                                    .and_then(|i| i.get("channel"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let item_ts = item
+                                    .and_then(|i| i.get("ts"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                if !item_channel.is_empty() && !item_ts.is_empty() {
+                                    // Build a synthetic /stop message scoped to the
+                                    // thread of the reacted message so the dispatch
+                                    // loop cancels the correct in-flight task.
+                                    let thread_ts = Some(item_ts.to_string());
+                                    let scope_id = Some(item_ts.to_string());
+                                    let sender = self.resolve_sender_identity(user).await;
+                                    let cancel_msg = ChannelMessage {
+                                        id: format!("slack_{item_channel}_{item_ts}_cancel"),
+                                        sender,
+                                        reply_target: item_channel.to_string(),
+                                        content: "/stop".to_string(),
+                                        channel: "slack".to_string(),
+                                        timestamp: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_secs(),
+                                        thread_ts,
+                                        interruption_scope_id: scope_id,
+                                        attachments: vec![],
+                                    };
+                                    tracing::info!(
+                                        "Slack: :{cancel_emoji}: reaction from {user} \
+                                         on {item_channel}/{item_ts} — sending /stop"
+                                    );
+                                    if tx.send(cancel_msg).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
                 if event_type != "message" {
                     continue;
                 }
@@ -3440,19 +3505,29 @@ impl Channel for SlackChannel {
             .expect("last_draft_edit lock")
             .remove(recipient);
 
+        // Extract thread_ts from the lazy draft ID ("lazy:{channel}:{thread_ts}")
+        // so fallback sends preserve thread context.
+        let draft_thread_ts = message_id
+            .strip_prefix(LAZY_DRAFT_PREFIX)
+            .and_then(|rest| rest.find(':').map(|pos| &rest[pos + 1..]))
+            .filter(|ts| !ts.is_empty())
+            .map(String::from);
+
         let real_ts = self.resolve_draft_ts(message_id).await;
         // Clean up lazy mapping
         self.lazy_draft_ts.lock().await.remove(message_id);
 
         let Some(real_ts) = real_ts else {
             // Draft was never materialized — just send as a fresh message
-            return self.send(&SendMessage::new(text, recipient)).await;
+            let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
+            return self.send(&msg).await;
         };
 
         // If text exceeds Slack limit, delete draft and send as regular message
         if text.len() > SLACK_MESSAGE_MAX_CHARS {
             let _ = self.delete_message(recipient, &real_ts).await;
-            return self.send(&SendMessage::new(text, recipient)).await;
+            let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
+            return self.send(&msg).await;
         }
 
         // Edit the draft with the final formatted content
@@ -3491,7 +3566,8 @@ impl Channel for SlackChannel {
         tracing::debug!("Slack chat.update (finalize) failed: {err}; falling back to delete+send");
 
         let _ = self.delete_message(recipient, &real_ts).await;
-        self.send(&SendMessage::new(text, recipient)).await
+        let msg = SendMessage::new(text, recipient).in_thread(draft_thread_ts);
+        self.send(&msg).await
     }
 
     async fn cancel_draft(&self, recipient: &str, message_id: &str) -> anyhow::Result<()> {
@@ -4228,10 +4304,10 @@ mod tests {
         assert!(
             SlackChannel::parse_slack_permalink("https://acme.slack.com/client/T1/C1").is_none()
         );
-        assert!(SlackChannel::parse_slack_permalink(
-            "https://acme.slack.com/archives/C1/not-a-message"
-        )
-        .is_none());
+        assert!(
+            SlackChannel::parse_slack_permalink("https://acme.slack.com/archives/C1/not-a-message")
+                .is_none()
+        );
     }
 
     #[test]

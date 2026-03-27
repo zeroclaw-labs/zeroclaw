@@ -931,9 +931,11 @@ mod tests {
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should fail on local endpoint");
-        assert!(error
-            .to_string()
-            .contains("requested cloud routing, but Ollama endpoint is local"));
+        assert!(
+            error
+                .to_string()
+                .contains("requested cloud routing, but Ollama endpoint is local")
+        );
     }
 
     #[test]
@@ -942,9 +944,11 @@ mod tests {
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should require API key");
-        assert!(error
-            .to_string()
-            .contains("requested cloud routing, but no API key is configured"));
+        assert!(
+            error
+                .to_string()
+                .contains("requested cloud routing, but no API key is configured")
+        );
     }
 
     #[test]
@@ -1323,11 +1327,13 @@ mod tests {
     fn effective_content_returns_none_when_both_empty() {
         assert!(OllamaProvider::effective_content("", None).is_none());
         assert!(OllamaProvider::effective_content("", Some("")).is_none());
-        assert!(OllamaProvider::effective_content(
-            "<think>only thinking</think>",
-            Some("<think>also only thinking</think>")
-        )
-        .is_none());
+        assert!(
+            OllamaProvider::effective_content(
+                "<think>only thinking</think>",
+                Some("<think>also only thinking</think>")
+            )
+            .is_none()
+        );
     }
 
     #[test]

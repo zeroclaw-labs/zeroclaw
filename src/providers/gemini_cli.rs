@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// Environment variable for overriding the path to the `gemini` binary.
 pub const GEMINI_CLI_PATH_ENV: &str = "GEMINI_CLI_PATH";
@@ -247,12 +247,15 @@ mod tests {
     fn new_uses_env_override() {
         let _guard = env_lock();
         let orig = std::env::var(GEMINI_CLI_PATH_ENV).ok();
-        std::env::set_var(GEMINI_CLI_PATH_ENV, "/usr/local/bin/gemini");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, "/usr/local/bin/gemini") };
         let provider = GeminiCliProvider::new();
         assert_eq!(provider.binary_path, PathBuf::from("/usr/local/bin/gemini"));
         match orig {
-            Some(v) => std::env::set_var(GEMINI_CLI_PATH_ENV, v),
-            None => std::env::remove_var(GEMINI_CLI_PATH_ENV),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var(GEMINI_CLI_PATH_ENV) },
         }
     }
 
@@ -260,11 +263,13 @@ mod tests {
     fn new_defaults_to_gemini() {
         let _guard = env_lock();
         let orig = std::env::var(GEMINI_CLI_PATH_ENV).ok();
-        std::env::remove_var(GEMINI_CLI_PATH_ENV);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var(GEMINI_CLI_PATH_ENV) };
         let provider = GeminiCliProvider::new();
         assert_eq!(provider.binary_path, PathBuf::from("gemini"));
         if let Some(v) = orig {
-            std::env::set_var(GEMINI_CLI_PATH_ENV, v);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, v) };
         }
     }
 
@@ -272,12 +277,15 @@ mod tests {
     fn new_ignores_blank_env_override() {
         let _guard = env_lock();
         let orig = std::env::var(GEMINI_CLI_PATH_ENV).ok();
-        std::env::set_var(GEMINI_CLI_PATH_ENV, "   ");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, "   ") };
         let provider = GeminiCliProvider::new();
         assert_eq!(provider.binary_path, PathBuf::from("gemini"));
         match orig {
-            Some(v) => std::env::set_var(GEMINI_CLI_PATH_ENV, v),
-            None => std::env::remove_var(GEMINI_CLI_PATH_ENV),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var(GEMINI_CLI_PATH_ENV, v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var(GEMINI_CLI_PATH_ENV) },
         }
     }
 
@@ -305,9 +313,10 @@ mod tests {
     #[test]
     fn validate_temperature_rejects_custom_value() {
         let err = GeminiCliProvider::validate_temperature(0.2).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("temperature unsupported by Gemini CLI"));
+        assert!(
+            err.to_string()
+                .contains("temperature unsupported by Gemini CLI")
+        );
     }
 
     #[tokio::test]
