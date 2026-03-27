@@ -193,10 +193,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_missing_env_allows_fallback() {
-        // Missing env var should allow fallback
+    fn auto_missing_env_denies_fallback() {
+        // Missing env var should deny fallback (fail-closed by default)
         std::env::remove_var("ZEROCLAW_ALLOW_NO_SANDBOX");
-        assert!(allow_noop_fallback());
+        assert!(!allow_noop_fallback());
     }
 
     #[test]
