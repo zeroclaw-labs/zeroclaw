@@ -41,7 +41,7 @@ impl FirejailSandbox {
         Command::new("firejail")
             .arg("--help")
             .output()
-            .map(|o| String::from_utf8_lossy(&o).contains("--seccomp"))
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("--seccomp"))
             .unwrap_or(false)
     }
 
@@ -50,7 +50,7 @@ impl FirejailSandbox {
         Command::new("firejail")
             .arg("--help")
             .output()
-            .map(|o| String::from_utf8_lossy(&o).contains("--caps.drop"))
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("--caps.drop"))
             .unwrap_or(false)
     }
 
@@ -59,7 +59,7 @@ impl FirejailSandbox {
         Command::new("firejail")
             .arg("--help")
             .output()
-            .map(|o| String::from_utf8_lossy(&o).contains("--noroot"))
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("--noroot"))
             .unwrap_or(false)
     }
 }
