@@ -1143,6 +1143,9 @@ impl DelegateTool {
                 None,
                 None,
                 &crate::config::PacingConfig::default(),
+                0,    // max_tool_result_chars: inherit from parent config in future
+                0,    // context_token_budget: 0 = disabled for subagents
+                None, // shared_budget: TODO thread from parent in future
             ),
         )
         .await;

@@ -1419,6 +1419,86 @@ pub async fn handle_api_session_rename(
     }
 }
 
+/// GET /api/sessions/running — list sessions currently in "running" state
+pub async fn handle_api_sessions_running(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "sessions": [],
+            "message": "Session persistence is disabled"
+        }))
+        .into_response();
+    };
+
+    let running = backend.list_running_sessions();
+    let sessions: Vec<serde_json::Value> = running
+        .into_iter()
+        .filter_map(|meta| {
+            let session_id = meta.key.strip_prefix("gw_")?;
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "created_at": meta.created_at.to_rfc3339(),
+                "last_activity": meta.last_activity.to_rfc3339(),
+                "message_count": meta.message_count,
+            }))
+        })
+        .collect();
+
+    Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// GET /api/sessions/{id}/state — get session state
+pub async fn handle_api_session_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    match backend.get_session_state(&session_key) {
+        Ok(Some(ss)) => {
+            let mut resp = serde_json::json!({
+                "session_id": id,
+                "state": ss.state,
+            });
+            if let Some(turn_id) = ss.turn_id {
+                resp["turn_id"] = serde_json::Value::String(turn_id);
+            }
+            if let Some(started) = ss.turn_started_at {
+                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
+            }
+            Json(resp).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 // ── Claude Code hook endpoint ────────────────────────────────────
 
 /// POST /hooks/claude-code — receives HTTP hook events from Claude Code
@@ -1559,6 +1639,9 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            session_queue: Arc::new(crate::gateway::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
             device_registry: None,
             pending_pairings: None,
             path_prefix: String::new(),

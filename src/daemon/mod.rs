@@ -370,13 +370,42 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             None
         };
 
+        // Create memory once per tick for recall + consolidation.
+        let heartbeat_memory: Option<Box<dyn crate::memory::Memory>> =
+            crate::memory::create_memory(
+                &config.memory,
+                &config.workspace_dir,
+                config.api_key.as_deref(),
+            )
+            .ok();
+
         let mut tick_had_error = false;
         for task in &tasks_to_run {
             let task_start = std::time::Instant::now();
             let task_prompt = format!("[Heartbeat Task | {}] {}", task.priority, task.text);
-            let prompt = match &session_context {
-                Some(ctx) => format!("{ctx}\n\n{task_prompt}"),
-                None => task_prompt,
+
+            // Recall relevant memories so heartbeat tasks have context awareness.
+            let memory_context = if let Some(ref mem) = heartbeat_memory {
+                match mem.recall(&task.text, 5, None, None, None).await {
+                    Ok(entries) if !entries.is_empty() => {
+                        let ctx: String = entries
+                            .iter()
+                            .map(|e| format!("- {}: {}", e.key, e.content))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        Some(format!("[Memory context]\n{ctx}\n"))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let prompt = match (&session_context, &memory_context) {
+                (Some(sc), Some(mc)) => format!("{mc}\n{sc}\n\n{task_prompt}"),
+                (Some(sc), None) => format!("{sc}\n\n{task_prompt}"),
+                (None, Some(mc)) => format!("{mc}\n\n{task_prompt}"),
+                (None, None) => task_prompt,
             };
             let temp = config.default_temperature;
             match Box::pin(crate::agent::run(
@@ -408,6 +437,31 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         duration_ms,
                         config.heartbeat.max_run_history,
                     );
+                    // Consolidate heartbeat output to memory for cross-session awareness.
+                    if config.memory.auto_save && output.chars().count() >= 50 {
+                        if let Some(ref mem) = heartbeat_memory {
+                            let key = format!("heartbeat_{}", uuid::Uuid::new_v4());
+                            let summary = if output.len() > 500 {
+                                // Find a valid UTF-8 char boundary at or before 500.
+                                let mut end = 500;
+                                while end > 0 && !output.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                &output[..end]
+                            } else {
+                                &output
+                            };
+                            let _ = mem
+                                .store(
+                                    &key,
+                                    &format!("Heartbeat task '{}': {}", task.text, summary),
+                                    crate::memory::MemoryCategory::Daily,
+                                    None,
+                                )
+                                .await;
+                        }
+                    }
+
                     let announcement = if output.trim().is_empty() {
                         format!("💓 heartbeat task completed: {}", task.text)
                     } else {

@@ -347,6 +347,20 @@ async fn handle_socket(
             continue;
         }
 
+        // Acquire session lock to serialize concurrent turns
+        let _session_guard = match state.session_queue.acquire(&session_key).await {
+            Ok(guard) => guard,
+            Err(e) => {
+                let err = serde_json::json!({
+                    "type": "error",
+                    "message": e.to_string(),
+                    "code": "SESSION_BUSY"
+                });
+                let _ = sender.send(Message::Text(err.to_string().into())).await;
+                continue;
+            }
+        };
+
         // Persist user message
         if let Some(ref backend) = state.session_backend {
             let user_msg = crate::providers::ChatMessage::user(&content);
@@ -383,6 +397,12 @@ async fn process_chat_message(
         "provider": provider_label,
         "model": state.model,
     }));
+
+    // Set session state to running
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    if let Some(ref backend) = state.session_backend {
+        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
+    }
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -427,6 +447,29 @@ async fn process_chat_message(
                 let _ = backend.append(session_key, &assistant_msg);
             }
 
+            // Fire-and-forget memory consolidation so facts from WS sessions
+            // are extracted to long-term memory (Daily + Core categories).
+            if state.auto_save {
+                let mem = state.mem.clone();
+                let provider = state.provider.clone();
+                let model = state.model.clone();
+                let user_msg = content.to_string();
+                let assistant_resp = response.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::memory::consolidation::consolidate_turn(
+                        provider.as_ref(),
+                        &model,
+                        mem.as_ref(),
+                        &user_msg,
+                        &assistant_resp,
+                    )
+                    .await
+                    {
+                        tracing::debug!("WS memory consolidation skipped: {e}");
+                    }
+                });
+            }
+
             // Send chunk_reset so the client clears any accumulated draft
             // before the authoritative done message.
             let reset = serde_json::json!({ "type": "chunk_reset" });
@@ -438,6 +481,11 @@ async fn process_chat_message(
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
+            // Set session state to idle
+            if let Some(ref backend) = state.session_backend {
+                let _ = backend.set_session_state(session_key, "idle", None);
+            }
+
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
@@ -446,6 +494,11 @@ async fn process_chat_message(
             }));
         }
         Err(e) => {
+            // Set session state to error
+            if let Some(ref backend) = state.session_backend {
+                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
+            }
+
             tracing::error!(error = %e, "Agent turn failed");
             let sanitized = crate::providers::sanitize_api_error(&e.to_string());
             let error_code = if sanitized.to_lowercase().contains("api key")

@@ -1363,6 +1363,16 @@ pub struct AgentConfig {
     /// Context compression configuration for automatic conversation compaction.
     #[serde(default)]
     pub context_compression: crate::agent::context_compressor::ContextCompressionConfig,
+
+    /// Maximum characters for a single tool result before truncation.
+    /// Head (2/3) and tail (1/3) are preserved with a truncation marker in the
+    /// middle. Set to `0` to disable truncation. Default: `50000`.
+    #[serde(default = "default_max_tool_result_chars")]
+    pub max_tool_result_chars: usize,
+}
+
+fn default_max_tool_result_chars() -> usize {
+    50_000
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1404,6 +1414,7 @@ impl Default for AgentConfig {
             auto_classify: None,
             context_compression:
                 crate::agent::context_compressor::ContextCompressionConfig::default(),
+            max_tool_result_chars: default_max_tool_result_chars(),
         }
     }
 }
@@ -5721,7 +5732,7 @@ pub struct HeartbeatConfig {
 }
 
 fn default_heartbeat_interval() -> u32 {
-    5
+    30
 }
 
 fn default_two_phase() -> bool {
@@ -6494,6 +6505,11 @@ pub struct SlackConfig {
     /// Minimum interval (ms) between draft message edits to avoid Slack rate limits.
     #[serde(default = "default_slack_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Emoji reaction name (without colons) that cancels an in-flight request.
+    /// For example, `"x"` means reacting with `:x:` cancels the task.
+    /// Leave unset to disable reaction-based cancellation.
+    #[serde(default)]
+    pub cancel_reaction: Option<String>,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
@@ -11088,7 +11104,7 @@ mod tests {
     async fn heartbeat_config_default() {
         let h = HeartbeatConfig::default();
         assert!(!h.enabled);
-        assert_eq!(h.interval_minutes, 5);
+        assert_eq!(h.interval_minutes, 30);
         assert!(h.message.is_none());
         assert!(h.target.is_none());
         assert!(h.to.is_none());
