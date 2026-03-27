@@ -1,0 +1,65 @@
+name: Build Linux aarch64
+
+on:
+  push:
+    branches: [master, "feat/**", "fix/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  web:
+    name: Build Web Dashboard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+          retention-days: 1
+
+  build:
+    name: Build zeroclaw (aarch64 / AL2023)
+    needs: [web]
+    runs-on: ubuntu-24.04-arm
+    container: amazonlinux:2023
+    timeout-minutes: 40
+    steps:
+      - name: Install prerequisites
+        run: dnf install -y tar git
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+      - name: Install build dependencies
+        run: |
+          dnf install -y gcc
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binary
+        run: |
+          cargo build --release --locked \
+            --features channel-matrix,channel-lark
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zeroclaw-linux-aarch64
+          path: target/release/zeroclaw
+          retention-days: 7

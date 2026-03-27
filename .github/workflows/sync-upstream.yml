@@ -1,0 +1,77 @@
+name: Sync with upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # daily at 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Rebase onto upstream/master
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/zeroclaw-labs/zeroclaw.git
+
+      - name: Fetch upstream
+        run: git fetch upstream master
+
+      - name: Check for new upstream commits
+        id: check
+        run: |
+          BEHIND=$(git rev-list HEAD..upstream/master --count)
+          echo "behind=$BEHIND" >> $GITHUB_OUTPUT
+          echo "Upstream is $BEHIND commits ahead"
+
+      - name: Create sync branch and rebase
+        if: steps.check.outputs.behind != '0'
+        run: |
+          BRANCH="sync/upstream-$(date +%Y%m%d)"
+          git checkout -b "$BRANCH"
+          git rebase upstream/master || {
+            echo "::error::Rebase conflict — manual resolution required"
+            git rebase --abort
+            exit 1
+          }
+          git push origin "$BRANCH" --force-with-lease
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+
+      - name: Open pull request
+        if: steps.check.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BEHIND=${{ steps.check.outputs.behind }}
+          gh pr create \
+            --title "chore: sync $BEHIND upstream commit(s) $(date +%Y-%m-%d)" \
+            --body "$(cat <<'EOF'
+          Automated daily sync from [zeroclaw-labs/zeroclaw](https://github.com/zeroclaw-labs/zeroclaw).
+
+          **Before merging:**
+          - Check that \`src/channels/discord.rs\` patch still applies cleanly
+          - Review any breaking changes in Cargo.toml / config schema
+          - The build workflow will run automatically on merge
+
+          EOF
+          )" \
+            --head "$BRANCH" \
+            --base master
+
+      - name: No changes
+        if: steps.check.outputs.behind == '0'
+        run: echo "Already up to date with upstream."
