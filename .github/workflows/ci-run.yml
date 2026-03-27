@@ -49,6 +49,11 @@ jobs:
         with:
           toolchain: 1.92.0
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          # Benchmark compilation produces a very large target dir. Restoring the
+          # cache is useful, but saving it back has been flaky enough to fail the
+          # job after a successful build.
+          save-if: "false"
 
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
