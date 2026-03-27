@@ -3067,22 +3067,64 @@ async fn process_channel_message(
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
+                        match channel
                             .send(
                                 &SendMessage::new(&delivered_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
-                            .await;
+                            .await
+                        {
+                            Ok(()) => {
+                                if let Some(hooks) = &ctx.hooks {
+                                    hooks
+                                        .fire_message_sent(
+                                            &msg.channel,
+                                            &msg.reply_target,
+                                            &delivered_response,
+                                        )
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  ❌ Failed fallback send on {}: {e}", channel.name());
+                            }
+                        }
+                    } else {
+                        // ── Hook: fire_message_sent after successful finalize_draft ──
+                        if let Some(hooks) = &ctx.hooks {
+                            hooks
+                                .fire_message_sent(
+                                    &msg.channel,
+                                    &msg.reply_target,
+                                    &delivered_response,
+                                )
+                                .await;
+                        }
                     }
-                } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(&delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone())
-                            .with_cancellation(cancellation_token.clone()),
-                    )
-                    .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                } else {
+                    match channel
+                        .send(
+                            &SendMessage::new(&delivered_response, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            // ── Hook: fire_message_sent (void) ─────────
+                            if let Some(hooks) = &ctx.hooks {
+                                hooks
+                                    .fire_message_sent(
+                                        &msg.channel,
+                                        &msg.reply_target,
+                                        &delivered_response,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                        }
+                    }
                 }
             }
         }
@@ -10241,6 +10283,7 @@ This is an example JSON object for profile settings."#;
             pacing: crate::config::PacingConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(
