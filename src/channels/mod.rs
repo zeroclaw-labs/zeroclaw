@@ -113,7 +113,7 @@ use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::traits::{ObserverEvent, ObserverMetric};
-use crate::observability::{self, runtime_trace, Observer};
+use crate::observability::{self, Observer, runtime_trace};
 use crate::providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
@@ -684,7 +684,11 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
 
     for turn in turns {
         match (expecting_user, turn.role.as_str()) {
-            (true, "user") => {
+            // Pass through tool-role messages preserved by
+            // keep_tool_context_turns (#4827).  After a tool result the
+            // next expected message is an assistant response, same as
+            // after a user message.
+            (_, "tool") | (true, "user") => {
                 normalized.push(turn);
                 expecting_user = false;
             }
@@ -1211,6 +1215,90 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     }
 }
 
+/// Extract tool-call (assistant with tool_call content) and tool-result
+/// messages from the current turn in the LLM history, excluding the final
+/// assistant text response.  "Current turn" = everything after the last
+/// user-role message.
+fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    // Find the index of the last user message — tool messages for the
+    // current turn come after it.
+    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+
+    let tail = &history[last_user_idx + 1..];
+    if tail.is_empty() {
+        return Vec::new();
+    }
+
+    // Everything except the very last assistant message (which is the
+    // final text response that gets stored separately).
+    let end = if tail.last().is_some_and(|m| m.role == "assistant") {
+        tail.len() - 1
+    } else {
+        tail.len()
+    };
+
+    tail[..end]
+        .iter()
+        .filter(|m| m.role == "assistant" || m.role == "tool")
+        .cloned()
+        .collect()
+}
+
+/// Remove tool-role and intermediate assistant tool-call messages from
+/// conversation turns older than the most recent `keep_turns` user→assistant
+/// exchanges.  This prevents unbounded history growth while preserving
+/// tool context for the N most recent turns.
+fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_turns: usize) {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return;
+    };
+
+    // Walk backwards to find the boundary: count user messages to
+    // identify which turns are "recent" (protected from stripping).
+    let mut user_count = 0;
+    let mut protect_from = turns.len();
+    for (i, turn) in turns.iter().enumerate().rev() {
+        if turn.role == "user" {
+            user_count += 1;
+            if user_count > keep_turns {
+                // Everything before this index is old enough to strip.
+                protect_from = i + 1; // protect from next message onward
+                break;
+            }
+        }
+    }
+
+    // Remove tool and intermediate assistant messages before the boundary.
+    // An "intermediate assistant" is one whose content looks like a tool
+    // call (contains `<tool_call>` or starts with `{\"tool_call`).
+    let mut i = 0;
+    while i < protect_from && i < turns.len() {
+        let dominated = turns[i].role == "tool"
+            || (turns[i].role == "assistant" && is_tool_call_content(&turns[i].content));
+        if dominated {
+            turns.remove(i);
+            // Adjust boundary since we removed an element.
+            protect_from = protect_from.saturating_sub(1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Heuristic: does this assistant message content represent a tool call
+/// rather than a final text response?
+fn is_tool_call_content(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed.contains("<tool_call>")
+        || trimmed.starts_with("{\"tool_call\"")
+        || trimmed.starts_with("{\"name\"")
+}
+
 fn rollback_orphan_user_turn(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
@@ -1687,15 +1775,15 @@ async fn handle_runtime_command_if_needed(
                             }
 
                             format!(
-                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                            current.model
-                        )
+                                "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                                current.model
+                            )
                         }
                         Err(err) => {
                             let safe_err = providers::sanitize_api_error(&err.to_string());
                             format!(
-                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
-                        )
+                                "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                            )
                         }
                     }
                 }
@@ -2253,7 +2341,7 @@ fn spawn_scoped_typing_task(
 ) -> tokio::task::JoinHandle<()> {
     let stop_signal = cancellation_token;
     let refresh_interval = Duration::from_secs(CHANNEL_TYPING_REFRESH_INTERVAL_SECS);
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut interval = tokio::time::interval(refresh_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2271,9 +2359,7 @@ fn spawn_scoped_typing_task(
         if let Err(e) = channel.stop_typing(&recipient).await {
             tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
         }
-    });
-
-    handle
+    })
 }
 
 async fn process_channel_message(
@@ -2585,6 +2671,39 @@ async fn process_channel_message(
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+
+    // ── Proactive context compression ────────────────────────────
+    // Use the existing ContextCompressor to summarize older history
+    // before the LLM call, preventing context-window-exceeded errors
+    // and preserving key decisions through LLM-driven summarization.
+    {
+        let cc_config = ctx.prompt_config.agent.context_compression.clone();
+        let compressor = crate::agent::context_compressor::ContextCompressor::new(
+            cc_config,
+            ctx.context_token_budget,
+        )
+        .with_memory(Arc::clone(&ctx.memory));
+        match compressor
+            .compress_if_needed(&mut history, active_provider.as_ref(), route.model.as_str())
+            .await
+        {
+            Ok(result) if result.compressed => {
+                tracing::info!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    tokens_before = result.tokens_before,
+                    tokens_after = result.tokens_after,
+                    passes = result.passes_used,
+                    "Proactive context compression applied before LLM call"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Context compression failed, proceeding without: {e}");
+            }
+            _ => {}
+        }
+    }
+
     let use_draft_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -3022,21 +3141,32 @@ async fn process_channel_message(
                 }),
             );
 
-            // Previously we prepended a `[Used tools: …]` summary to the
-            // history entry so the LLM retained awareness of prior tool usage.
-            // This caused the model to learn and reproduce the bracket format
-            // in its own output, which leaked to end-users as raw log lines
-            // instead of meaningful responses (#4400).  The LLM already
-            // receives tool context through the tool-call/result messages in
-            // the conversation history built by `run_tool_call_loop`, so the
-            // extra summary prefix is unnecessary.
-            let history_response = delivered_response.clone();
+            // Persist intermediate tool-call/result messages from this turn
+            // so the model retains concrete "I used tools" examples in
+            // context, preventing drift toward tool-less responses (#4827).
+            let keep_tool_turns = ctx.prompt_config.agent.keep_tool_context_turns;
+            if keep_tool_turns > 0 {
+                // Find tool messages for the current turn: everything after
+                // the last user message up to (but not including) the final
+                // assistant response that matches our delivered text.
+                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
+                for tool_msg in tool_messages {
+                    append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
+                }
+            }
 
+            let history_response = delivered_response.clone();
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            // Strip tool-call messages from turns older than
+            // keep_tool_context_turns to prevent unbounded growth.
+            if keep_tool_turns > 0 {
+                strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
+            }
 
             // Fire-and-forget LLM-driven memory consolidation.
             if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
@@ -4460,7 +4590,9 @@ fn collect_configured_channels(
                         ),
                     });
                 } else {
-                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
+                    tracing::warn!(
+                        "WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)"
+                    );
                 }
             }
             "web" => {
@@ -4491,13 +4623,19 @@ fn collect_configured_channels(
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
-                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
-                    eprintln!("  ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in.");
+                    tracing::warn!(
+                        "WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web"
+                    );
+                    eprintln!(
+                        "  ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in."
+                    );
                     eprintln!("    Rebuild with: cargo build --features whatsapp-web");
                 }
             }
             _ => {
-                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
+                tracing::warn!(
+                    "WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set"
+                );
             }
         }
     }
@@ -5404,8 +5542,8 @@ mod tests {
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn make_workspace() -> TempDir {
@@ -7904,12 +8042,16 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 2);
         let second_call = &calls[1];
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("forwarded content") }));
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("summarize this") }));
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("forwarded content") })
+        );
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("summarize this") })
+        );
         assert!(
             !second_call.iter().any(|(role, _)| role == "assistant"),
             "cancelled turn should not persist an assistant response"
@@ -8029,12 +8171,16 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 2);
         let second_call = &calls[1];
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("first question") }));
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("second question") }));
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("first question") })
+        );
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("second question") })
+        );
         assert!(
             !second_call.iter().any(|(role, _)| role == "assistant"),
             "cancelled turn should not persist an assistant response"
@@ -8515,8 +8661,11 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<description>Review code for bugs</description>"));
         assert!(prompt.contains("SKILL.md</location>"));
         assert!(prompt.contains("<instructions>"));
-        assert!(prompt
-            .contains("<instruction>Always run cargo test before final response.</instruction>"));
+        assert!(
+            prompt.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review.lint</name>"));
@@ -8560,8 +8709,11 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<location>skills/code-review/SKILL.md</location>"));
         assert!(prompt.contains("loaded on demand"));
         assert!(!prompt.contains("<instructions>"));
-        assert!(!prompt
-            .contains("<instruction>Always run cargo test before final response.</instruction>"));
+        assert!(
+            !prompt.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
         // Compact mode should still include tools so the LLM knows about them.
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
         assert!(prompt.contains("<callable_tools"));
@@ -9331,9 +9483,11 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(sent_messages
-            .iter()
-            .any(|message| { message.contains("Conversation history cleared. Starting fresh.") }));
+        assert!(
+            sent_messages.iter().any(|message| {
+                message.contains("Conversation history cleared. Starting fresh.")
+            })
+        );
     }
 
     #[tokio::test]
@@ -9835,12 +9989,16 @@ This is an example JSON object for profile settings."#;
 
         let channels = collect_configured_channels(&config, "test");
 
-        assert!(channels
-            .iter()
-            .any(|entry| entry.display_name == "Mattermost"));
-        assert!(channels
-            .iter()
-            .any(|entry| entry.channel.name() == "mattermost"));
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.display_name == "Mattermost")
+        );
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.channel.name() == "mattermost")
+        );
     }
 
     struct AlwaysFailChannel {
@@ -9912,10 +10070,12 @@ This is an example JSON object for profile settings."#;
         let component = &snapshot["components"]["channel:test-supervised-fail"];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
-        assert!(component["last_error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("listen boom"));
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("listen boom")
+        );
         assert!(calls.load(Ordering::SeqCst) >= 1);
     }
 
@@ -9939,19 +10099,19 @@ This is an example JSON object for profile settings."#;
         );
 
         tokio::time::sleep(Duration::from_millis(35)).await;
-        let first_last_ok = crate::health::snapshot_json()["components"][&component_name]
-            ["last_ok"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let first_last_ok =
+            crate::health::snapshot_json()["components"][&component_name]["last_ok"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
         assert!(!first_last_ok.is_empty());
 
         tokio::time::sleep(Duration::from_millis(70)).await;
-        let second_last_ok = crate::health::snapshot_json()["components"][&component_name]
-            ["last_ok"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let second_last_ok =
+            crate::health::snapshot_json()["components"][&component_name]["last_ok"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
         let first = chrono::DateTime::parse_from_rfc3339(&first_last_ok)
             .expect("last_ok should be valid RFC3339");
         let second = chrono::DateTime::parse_from_rfc3339(&second_last_ok)
@@ -11180,5 +11340,85 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(clean_text, &tools);
 
         assert_eq!(result, clean_text);
+    }
+
+    // ── Tests for #4827: tool context preservation ──────────────
+
+    #[test]
+    fn extract_current_turn_tool_messages_returns_intermediate_messages() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("older msg"),
+            ChatMessage::assistant("older reply"),
+            ChatMessage::user("block the iPad"),
+            ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+            ChatMessage::tool("ok"),
+            ChatMessage::assistant("Done, iPad is blocked."),
+        ];
+
+        let tool_msgs = extract_current_turn_tool_messages(&history);
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(tool_msgs[0].role, "assistant");
+        assert!(tool_msgs[0].content.contains("tool_call"));
+        assert_eq!(tool_msgs[1].role, "tool");
+    }
+
+    #[test]
+    fn extract_current_turn_tool_messages_empty_when_no_tools() {
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("Hi there!"),
+        ];
+
+        let tool_msgs = extract_current_turn_tool_messages(&history);
+        assert!(tool_msgs.is_empty());
+    }
+
+    #[test]
+    fn extract_current_turn_tool_messages_multiple_tool_rounds() {
+        let history = vec![
+            ChatMessage::user("do two things"),
+            ChatMessage::assistant("{\"tool_call\": \"read_skill\"}"),
+            ChatMessage::tool("skill content"),
+            ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+            ChatMessage::tool("shell output"),
+            ChatMessage::assistant("All done."),
+        ];
+
+        let tool_msgs = extract_current_turn_tool_messages(&history);
+        assert_eq!(tool_msgs.len(), 4);
+    }
+
+    #[test]
+    fn is_tool_call_content_detects_tool_calls() {
+        assert!(is_tool_call_content("{\"tool_call\": \"shell\"}"));
+        assert!(is_tool_call_content("<tool_call>shell</tool_call>"));
+        assert!(is_tool_call_content(
+            "{\"name\": \"read_file\", \"args\": {}}"
+        ));
+        assert!(!is_tool_call_content("The iPad has been blocked."));
+        assert!(!is_tool_call_content(""));
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_passes_through_tool_messages() {
+        let turns = vec![
+            ChatMessage::user("block the iPad"),
+            ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+            ChatMessage::tool("ok"),
+            ChatMessage::assistant("iPad blocked."),
+            ChatMessage::user("next question"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        // user, assistant(tool_call), tool, assistant(final), user
+        assert_eq!(normalized.len(), 5);
+        assert_eq!(normalized[2].role, "tool");
+    }
+
+    #[test]
+    fn default_keep_tool_context_turns_is_two() {
+        let config = crate::config::schema::AgentConfig::default();
+        assert_eq!(config.keep_tool_context_turns, 2);
     }
 }

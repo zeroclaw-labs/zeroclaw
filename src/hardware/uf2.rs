@@ -11,7 +11,7 @@
 //! Both firmware files are compiled into the binary with `include_bytes!` so
 //! users never need to download them separately.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 // ── Embedded firmware ─────────────────────────────────────────────────────────

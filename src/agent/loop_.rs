@@ -2,9 +2,9 @@ use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::cost::types::BudgetCheck;
 use crate::i18n::ToolDescriptions;
-use crate::memory::{self, decay, Memory, MemoryCategory};
+use crate::memory::{self, Memory, MemoryCategory, decay};
 use crate::multimodal;
-use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
+use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::providers::traits::StreamEvent;
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
@@ -27,8 +27,8 @@ use uuid::Uuid;
 
 // Cost tracking moved to `super::cost`.
 pub(crate) use super::cost::{
-    check_tool_loop_budget, record_tool_loop_cost_usage, ToolLoopCostTrackingContext,
-    TOOL_LOOP_COST_TRACKING_CONTEXT,
+    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, check_tool_loop_budget,
+    record_tool_loop_cost_usage,
 };
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -379,8 +379,8 @@ fn build_hardware_context(
 
 // Tool execution moved to `super::tool_execution`.
 pub(crate) use super::tool_execution::{
-    execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
-    ToolExecutionOutcome,
+    ToolExecutionOutcome, execute_tools_parallel, execute_tools_sequential,
+    should_execute_tools_in_parallel,
 };
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -620,11 +620,7 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
         });
     }
 
-    if calls.is_empty() {
-        None
-    } else {
-        Some(calls)
-    }
+    if calls.is_empty() { None } else { Some(calls) }
 }
 
 /// Parse MiniMax-style XML tool calls with attributed invoke/parameter tags.
@@ -2501,7 +2497,9 @@ pub(crate) async fn run_tool_call_loop(
         {
             return Err(anyhow::anyhow!(
                 "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
-                current_usd, limit_usd, period
+                current_usd,
+                limit_usd,
+                period
             ));
         }
 
@@ -4074,7 +4072,9 @@ pub async fn run(
                     println!("  /help             Show this help message");
                     println!("  /clear /new       Clear conversation history");
                     println!("  /quit /exit       Exit interactive mode");
-                    println!("  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n");
+                    println!(
+                        "  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n"
+                    );
                     continue;
                 }
                 "/clear" | "/new" => {
@@ -4784,7 +4784,7 @@ mod tests {
         emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
         load_interactive_session_history, save_interactive_session_history, truncate_tool_result,
     };
-    use crate::agent::history::{InteractiveSessionState, DEFAULT_MAX_HISTORY_MESSAGES};
+    use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
     use crate::providers::ChatMessage;
     use tempfile::tempdir;
@@ -4851,7 +4851,7 @@ mod tests {
     fn truncate_tool_result_utf8_boundary_safety() {
         // Create string with multi-byte chars: each emoji is 4 bytes
         let output = "🦀".repeat(100); // 400 bytes
-                                       // This should not panic even with a limit that falls mid-char
+        // This should not panic even with a limit that falls mid-char
         let result = truncate_tool_result(&output, 50);
         assert!(result.contains("[... "));
         // Verify the result is valid UTF-8 (would panic otherwise)
@@ -5009,8 +5009,8 @@ mod tests {
 
     #[test]
     fn shared_budget_decrement_logic() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let budget = Arc::new(AtomicUsize::new(3));
 
@@ -5073,7 +5073,7 @@ mod tests {
 
     use super::*;
     use async_trait::async_trait;
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -5150,9 +5150,9 @@ mod tests {
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
+    use crate::providers::ChatResponse;
     use crate::providers::router::{Route, RouterProvider};
     use crate::providers::traits::{ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions};
-    use crate::providers::ChatResponse;
     use tempfile::TempDir;
 
     struct NonVisionProvider {
@@ -5842,9 +5842,10 @@ mod tests {
         .await
         .expect_err("oversized payload must fail");
 
-        assert!(err
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
+        assert!(
+            err.to_string()
+                .contains("multimodal image size limit exceeded")
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -7976,7 +7977,7 @@ Tail"#;
         assert_eq!(history[0].content, "system prompt");
         // Trimmed to limit
         assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
-                                                                     // Most recent messages preserved
+        // Most recent messages preserved
         let last = &history[history.len() - 1];
         assert_eq!(
             last.content,
@@ -8447,10 +8448,12 @@ Final answer."#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
         assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(calls[0].1["command"]
-            .as_str()
-            .unwrap()
-            .contains("example.com"));
+        assert!(
+            calls[0].1["command"]
+                .as_str()
+                .unwrap()
+                .contains("example.com")
+        );
     }
 
     #[test]
@@ -9312,7 +9315,7 @@ Let me check the result."#;
     #[tokio::test]
     async fn cost_tracking_records_usage_when_scoped() {
         use super::{
-            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
         };
         use crate::config::schema::ModelPricing;
         use crate::cost::CostTracker;
@@ -9395,7 +9398,7 @@ Let me check the result."#;
     #[tokio::test]
     async fn cost_tracking_enforces_budget() {
         use super::{
-            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
         };
         use crate::config::schema::ModelPricing;
         use crate::cost::CostTracker;

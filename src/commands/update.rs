@@ -1,6 +1,6 @@
 //! `zeroclaw update` — self-update pipeline with rollback.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -526,8 +526,8 @@ mod tests {
 
     #[test]
     fn extract_tar_gz_finds_binary() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // Build a tar.gz in memory containing a fake "zeroclaw" binary.
@@ -562,8 +562,8 @@ mod tests {
 
     #[test]
     fn extract_tar_gz_errors_on_missing_binary() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // Build a tar.gz with a file that is NOT named "zeroclaw".

@@ -1837,7 +1837,7 @@ impl LarkChannel {
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
-        use axum::{extract::State, routing::post, Json, Router};
+        use axum::{Json, Router, extract::State, routing::post};
 
         #[derive(Clone)]
         struct AppState {
@@ -3174,10 +3174,11 @@ mod tests {
                 }
             }
         });
-        assert!(ch
-            .parse_event_payload(&wrong_mention_payload)
-            .await
-            .is_empty());
+        assert!(
+            ch.parse_event_payload(&wrong_mention_payload)
+                .await
+                .is_empty()
+        );
 
         let bot_mention_payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
