@@ -505,7 +505,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: website
-      url: https://zeroclaw.com
+      url: https://www.zeroclawlabs.ai
     steps:
       - name: Trigger website redeploy
         env:
