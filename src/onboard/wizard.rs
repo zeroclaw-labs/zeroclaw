@@ -4078,6 +4078,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     proxy_url: None,
                     stream_drafts: false,
                     draft_update_interval_ms: 1200,
+                    cancel_reaction: None,
                 });
             }
             ChannelMenuChoice::IMessage => {
