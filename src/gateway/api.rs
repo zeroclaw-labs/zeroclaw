@@ -1459,44 +1459,52 @@ pub async fn handle_api_session_state(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let Some(ref backend) = state.session_backend else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session persistence is disabled"})),
-        )
-            .into_response();
-    };
-
-    let session_key = format!("gw_{id}");
-    match backend.get_session_state(&session_key) {
-        Ok(Some(ss)) => {
-            let mut resp = serde_json::json!({
-                "session_id": id,
-                "state": ss.state,
-            });
-            if let Some(turn_id) = ss.turn_id {
-                resp["turn_id"] = serde_json::Value::String(turn_id);
-            }
-            if let Some(started) = ss.turn_started_at {
-                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
-            }
-            Json(resp).into_response()
+    #[allow(clippy::unused_async)]
+    async fn inner(
+        state: &AppState,
+        headers: &HeaderMap,
+        id: &str,
+    ) -> impl IntoResponse {
+        if let Err(e) = require_auth(state, headers) {
+            return e.into_response();
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
-        )
-            .into_response(),
+
+        let Some(ref backend) = state.session_backend else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session persistence is disabled"})),
+            )
+                .into_response();
+        };
+
+        let session_key = format!("gw_{id}");
+        match backend.get_session_state(&session_key) {
+            Ok(Some(ss)) => {
+                let mut resp = serde_json::json!({
+                    "session_id": id,
+                    "state": ss.state,
+                });
+                if let Some(turn_id) = ss.turn_id {
+                    resp["turn_id"] = serde_json::Value::String(turn_id);
+                }
+                if let Some(started) = ss.turn_started_at {
+                    resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
+                }
+                Json(resp).into_response()
+            }
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session not found"})),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
+            )
+                .into_response(),
+        }
     }
+    inner(&state, &headers, &id).await
 }
 
 // ── Claude Code hook endpoint ────────────────────────────────────
