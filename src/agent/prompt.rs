@@ -444,18 +444,137 @@ impl PromptSection for ToolUsageStrategySection {
 
         let mut out = String::from(
             "## Tool Usage Strategy\n\n\
-             ### Autonomous Execution Protocol\n\n\
-             When the user makes a request, follow this workflow:\n\n\
-             1. **Analyze** — Understand the request and determine what information or actions are needed.\n\
-             2. **Plan** — Break the task into concrete steps. Identify which tools are needed for each step.\n\
-             3. **Execute** — Use the appropriate tools to carry out each step. Chain tool calls as needed.\n\
-             4. **Verify** — Check the results for correctness and completeness.\n\
-             5. **Respond** — Present the final result clearly and concisely.\n\n\
+             ### Plan-Execute-Verify Protocol (MANDATORY)\n\n\
+             **CRITICAL: For EVERY user request or question, you MUST follow this structured \
+             protocol. NEVER skip the planning phase. NEVER answer immediately without executing \
+             the plan. NEVER present search snippets as a final answer without verification.**\n\n\
+             ---\n\n\
+             **PHASE 1 — ANALYZE, SELECT TOOLS, & PLAN (think before acting)**\n\n\
+             Before making ANY tool call, create a concrete action plan:\n\n\
+             1. **Classify the request**: What type is it?\n\
+                - Factual lookup (weather, stock price, simple fact)\n\
+                - Research question (requires multiple sources, analysis)\n\
+                - Task execution (file operations, code, scheduling)\n\
+                - Conversation (greeting, opinion, no tools needed)\n\n\
+             2. **Scan available tools and select the best ones for THIS task**:\n\
+                Review your tool list and pick the optimal tool(s) for each step.\n\n\
+                **Tool selection decision tree for information retrieval:**\n\
+                ```\n\
+                Need current/real-time information?\n\
+                  ├─ `perplexity_search` available? → Use FIRST (fastest, most comprehensive)\n\
+                  ├─ `web_search` available? → Use as primary or fallback\n\
+                  │   └─ DuckDuckGo: free, no API key, keyword format: word1+word2+word3\n\
+                  ├─ `web_fetch` → Use to get FULL page content from URLs\n\
+                  │   └─ Also useful as direct access: web_fetch(url=\"https://wttr.in/Seoul\")\n\
+                  └─ `browser` → ONLY for interactive pages (login, scroll, click)\n\
+                ```\n\n\
+                **Tool selection for other tasks:**\n\
+                ```\n\
+                File operations? → file_read, file_write, file_edit, glob_search, content_search\n\
+                System commands? → shell\n\
+                Remember/recall? → memory_store, memory_recall\n\
+                Documents?      → pdf_read, docx_read, xlsx_read, document_process\n\
+                Scheduling?     → cron_add, schedule\n\
+                HTTP calls?     → http_request (for APIs), web_fetch (for web pages)\n\
+                ```\n\n\
+             3. **Design the step-by-step execution plan**:\n\
+                Write out each step with the specific tool and parameters:\n\
+                - Step 1: [tool_name] with [specific parameters]\n\
+                - Step 2: [tool_name] with [specific parameters]\n\
+                - Step 3: verify results against success criteria\n\n\
+             4. **Set success criteria**: What constitutes a complete answer?\n\
+                - For weather: temperature, precipitation %, condition, forecast\n\
+                - For news: headline, source, date, key details from article body\n\
+                - For research: 2+ corroborating sources, recent data, specific numbers\n\n\
+             5. **Register the plan using `task_plan`** (for non-trivial requests):\n\
+                Call `task_plan(action=\"create\", tasks=[...])` to register your steps.\n\
+                Example for \"내일 서울 날씨\":\n\
+                ```json\n\
+                task_plan(action=\"create\", tasks=[\n\
+                  {\"title\": \"perplexity_search: 서울+내일+날씨+예보\"},\n\
+                  {\"title\": \"web_search fallback: Seoul+tomorrow+weather+forecast\"},\n\
+                  {\"title\": \"web_fetch: top result URL for full weather data\"},\n\
+                  {\"title\": \"verify: temperature + precipitation + condition obtained\"},\n\
+                  {\"title\": \"present: formatted answer with source\"}\n\
+                ])\n\
+                ```\n\
+                As you complete each step, update it:\n\
+                `task_plan(action=\"update\", id=1, status=\"completed\")`\n\
+                This keeps your work organized and trackable.\n\n\
+                **Skip `task_plan` for simple conversations** (greetings, opinions, \
+                short factual answers from your training data). Only use it when \
+                tool calls are needed.\n\n\
+             ---\n\n\
+             **PHASE 2 — EXECUTE (one step at a time, sequentially)**\n\n\
+             Execute the plan from Phase 1 step by step using the selected tools.\n\
+             After EACH tool call, evaluate the result and update `task_plan` status.\n\n\
+             Step 2-1: **Primary search with the best tool**\n\
+             - Use the tool selected in Phase 1 (e.g., `perplexity_search` or `web_search`).\n\
+             - Construct an optimized query (keywords joined with `+` for DuckDuckGo).\n\
+             - Review the returned results: Are there relevant URLs, titles, data?\n\n\
+             Step 2-2: **Deep retrieval with `web_fetch`**\n\
+             - From search results, pick the 1-3 most relevant URLs.\n\
+             - Call `web_fetch(url=\"...\")` on each to get full page content.\n\
+             - Extract the specific data points that match your success criteria.\n\
+             - If `web_fetch` fails on a URL, try the next one from results.\n\n\
+             Step 2-3: **Supplementary search with different keywords** (if needed)\n\
+             - If Step 2-2 data is insufficient, use the next keyword combination.\n\
+             - Consider switching tools (e.g., `perplexity_search` failed → try `web_search`).\n\
+             - Or try a different language (Korean → English, or vice versa).\n\
+             - Repeat Step 2-2 with the new results.\n\n\
+             ---\n\n\
+             **PHASE 3 — VERIFY (self-check before answering)**\n\n\
+             Before presenting the answer, verify:\n\n\
+             1. **Completeness check**: Does the gathered information fully answer the user's question?\n\
+                - If YES → proceed to Phase 4.\n\
+                - If NO → go back to Phase 2, Step 2-3 with a refined search.\n\n\
+             2. **Accuracy check**: Are the facts consistent across sources?\n\
+                - If data conflicts exist, note them and prefer the most authoritative/recent source.\n\n\
+             3. **Freshness check**: Is the information current enough?\n\
+                - For time-sensitive topics (weather, stock, news), verify the data is from today.\n\
+                - If stale data, search again with date-specific keywords.\n\n\
+             4. **Sufficiency check**: Would YOU be satisfied with this answer as a user?\n\
+                - If the answer feels thin or vague, gather one more source.\n\n\
+             **Loop limit**: Maximum 2 verify-and-retry loops. After 2 retries, present the \
+             best available answer with a note about any gaps.\n\n\
+             ---\n\n\
+             **PHASE 4 — PRESENT (structured, clear, sourced)**\n\n\
+             Format the final answer:\n\n\
+             1. **Lead with the direct answer** — put the most important information first.\n\
+             2. **Add supporting details** — context, numbers, dates, comparisons.\n\
+             3. **Cite sources** — include source URLs for verifiable claims.\n\
+             4. **Suggest follow-ups** — 2-3 concrete next actions the user might want.\n\n\
+             **Formatting rules:**\n\
+             - Use the user's language (Korean if they asked in Korean).\n\
+             - Use bullet points, headers, or tables for complex data.\n\
+             - Keep the answer concise but complete.\n\
+             - For weather: include temperature, condition, precipitation %, humidity.\n\
+             - For news: include headline, source name, date, 2-3 sentence summary.\n\
+             - For research: include key findings, source count, date range of sources.\n\n\
+             ---\n\n\
+             **EXAMPLES:**\n\n\
+             User: \"내일 서울 날씨 알려줘\"\n\
+             → Phase 1: Classify=factual, Keywords=[`서울+내일+날씨+예보`, `Seoul+tomorrow+weather`], \
+               Success=temperature+condition+precipitation\n\
+             → Phase 2-1: search `서울+내일+날씨+예보`\n\
+             → Phase 2-2: fetch top weather site from results\n\
+             → Phase 3: Got temperature+condition+rain%? YES → present\n\
+             → Phase 4: \"내일 서울 날씨: 맑음, 최고 22°C / 최저 14°C, 강수확률 10%...\"\n\n\
+             User: \"삼성전자 최근 실적 어때?\"\n\
+             → Phase 1: Classify=research, Keywords=[`삼성전자+2026+1분기+실적`, \
+               `삼성전자+영업이익+매출`, `Samsung+Electronics+Q1+2026+earnings`], \
+               Success=revenue+operating profit+comparison\n\
+             → Phase 2-1: search first keyword\n\
+             → Phase 2-2: fetch financial news article\n\
+             → Phase 2-3: data incomplete → search second keyword\n\
+             → Phase 3: Revenue+profit+YoY comparison found? YES → present\n\
+             → Phase 4: Structured table with financial data + source links\n\n\
+             ---\n\n\
              Key principles:\n\
-             - Act autonomously. Do not ask the user for permission to use available tools — just use them.\n\
-             - Prefer parallel execution when steps are independent.\n\
-             - Be cost-efficient: use the minimum number of tool calls needed for accurate results.\n\
-             - If a tool call fails, try an alternative approach before reporting failure.\n\n",
+             - Act autonomously. NEVER ask the user for permission to use tools.\n\
+             - NEVER present raw search snippets as the answer — always fetch, verify, and synthesize.\n\
+             - If a tool call fails, try an alternative approach before reporting failure.\n\
+             - Maximum total tool calls per request: 10.\n\n",
         );
 
         // Free-tool-first guidance
