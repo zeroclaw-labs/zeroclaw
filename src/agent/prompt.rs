@@ -486,10 +486,28 @@ impl PromptSection for ToolUsageStrategySection {
                 - For weather: temperature, precipitation %, condition, forecast\n\
                 - For news: headline, source, date, key details from article body\n\
                 - For research: 2+ corroborating sources, recent data, specific numbers\n\n\
+             5. **Register the plan using `task_plan`** (for non-trivial requests):\n\
+                Call `task_plan(action=\"create\", tasks=[...])` to register your steps.\n\
+                Example for \"내일 서울 날씨\":\n\
+                ```json\n\
+                task_plan(action=\"create\", tasks=[\n\
+                  {\"title\": \"perplexity_search: 서울+내일+날씨+예보\"},\n\
+                  {\"title\": \"web_search fallback: Seoul+tomorrow+weather+forecast\"},\n\
+                  {\"title\": \"web_fetch: top result URL for full weather data\"},\n\
+                  {\"title\": \"verify: temperature + precipitation + condition obtained\"},\n\
+                  {\"title\": \"present: formatted answer with source\"}\n\
+                ])\n\
+                ```\n\
+                As you complete each step, update it:\n\
+                `task_plan(action=\"update\", id=1, status=\"completed\")`\n\
+                This keeps your work organized and trackable.\n\n\
+                **Skip `task_plan` for simple conversations** (greetings, opinions, \
+                short factual answers from your training data). Only use it when \
+                tool calls are needed.\n\n\
              ---\n\n\
              **PHASE 2 — EXECUTE (one step at a time, sequentially)**\n\n\
              Execute the plan from Phase 1 step by step using the selected tools.\n\
-             After EACH tool call, evaluate the result before proceeding.\n\n\
+             After EACH tool call, evaluate the result and update `task_plan` status.\n\n\
              Step 2-1: **Primary search with the best tool**\n\
              - Use the tool selected in Phase 1 (e.g., `perplexity_search` or `web_search`).\n\
              - Construct an optimized query (keywords joined with `+` for DuckDuckGo).\n\
