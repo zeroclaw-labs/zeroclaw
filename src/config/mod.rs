@@ -36,6 +36,10 @@ pub use schema::{
     set_runtime_proxy_config, ws_connect_with_proxy,
 };
 
+// Re-export security types used in config
+#[allow(unused_imports)]
+pub use crate::security::{GuardAction, GuardResult, PromptGuard};
+
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
     (T::name(), channel.is_some())
 }
