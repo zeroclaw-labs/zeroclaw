@@ -78,3 +78,9 @@ Use override only for intentional rollback/replay:
 ```bash
 scripts/wsl/sync-from-win-archive.sh --allow-older-source --dry-run
 ```
+
+## Global Machine Resources
+
+Set up shared shell and environment resources once per machine:
+
+- [wsl-global-resources.md](wsl-global-resources.md)
