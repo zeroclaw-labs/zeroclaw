@@ -834,10 +834,8 @@ export class MoAClient {
 
     if (hasSelectedProviderKey) {
       // ════════════════════════════════════════════════════════════
-      // MODE 1 — LOCAL: User has their own API key
-      // Try local gateway first → if unreachable, fall back to relay
-      // WITH user's own API key (no credits charged — relay uses
-      // the user's key directly, not the operator's key).
+      // MODE 1 — LOCAL: User has their own API key → local only
+      // API key NEVER leaves the device. No relay fallback.
       // ════════════════════════════════════════════════════════════
       const res = await this.tryChatRequest(this.serverUrl, body);
 
@@ -845,19 +843,11 @@ export class MoAClient {
         return this.parseChatResponse(res);
       }
 
-      // Local gateway unreachable — try relay with user's own API key
+      // Local gateway unreachable — do NOT send API key to relay
       this.gatewayAlive = false;
-      const relayRes = await this.tryChatRequest(this.relayUrl, body);
-      if (relayRes !== null) {
-        return this.parseChatResponse(relayRes);
-      }
-
-      // Both failed
       throw new Error(
-        "로컬에 저장하신 LLM 모델의 API key가 유효한 key인지 확인해 주세요.\n" +
-          "만약 key를 수정해도 다시 접속에 실패하면 API key를 제거하시고 " +
-          "'서버 경유'로 변경해 주세요.\n" +
-          "(서버 경유 시 운영자의 API key를 빌려서 사용하실 수 있습니다)",
+        "로컬 게이트웨이에 연결할 수 없습니다.\n" +
+          "MoA 앱을 재시작하거나, 설정에서 로컬 게이트웨이 상태를 확인해 주세요.",
       );
     }
 
