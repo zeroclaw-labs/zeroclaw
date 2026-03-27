@@ -50,9 +50,9 @@ struct LineWebhook {
 struct LineEvent {
     #[serde(rename = "type")]
     event_type: String,
-    /// present on message events
+    /// present on message events (renamed from replyToken in JSON)
     #[serde(rename = "replyToken")]
-    reply_token: Option<String>,
+    token: Option<String>,
     source: LineSource,
     message: Option<LineMsg>,
     /// milliseconds since epoch
@@ -335,7 +335,7 @@ impl LineChannel {
             // Store the replyToken in thread_ts so the gateway handler can pass it
             // to send_with_reply_token() without changing the ChannelMessage schema.
             // LINE reply tokens are one-time-use and expire after 1 minute.
-            let reply_token = event.reply_token.filter(|t| !t.is_empty());
+            let reply_token = event.token.filter(|t| !t.is_empty());
 
             out.push(ChannelMessage {
                 id,
