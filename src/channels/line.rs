@@ -447,7 +447,7 @@ impl LineChannel {
     ///
     /// | Mode | Behaviour |
     /// |------|-----------|
-    /// | `reply_first` | Reply API when token present, Push fallback |
+    /// | `reply_first` | Reply API when token present; fallback to Push on error (e.g. expired token) |
     /// | `push_only`   | Always Push API |
     /// | `reply_only`  | Reply API; error if token absent |
     pub async fn send_with_reply_token(
@@ -459,7 +459,16 @@ impl LineChannel {
             LineReplyMode::ReplyFirst => {
                 if let Some(token) = reply_token.filter(|t| !t.is_empty()) {
                     tracing::debug!("LINE: sending via Reply API");
-                    self.send_via_reply(token, &message.content).await
+                    match self.send_via_reply(token, &message.content).await {
+                        Ok(()) => Ok(()),
+                        Err(e) => {
+                            tracing::warn!(
+                                "LINE: Reply API failed ({e:#}), falling back to Push API"
+                            );
+                            self.send_via_push(&message.recipient, &message.content)
+                                .await
+                        }
+                    }
                 } else {
                     tracing::debug!("LINE: no reply token — falling back to Push API");
                     self.send_via_push(&message.recipient, &message.content)

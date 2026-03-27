@@ -1791,60 +1791,68 @@ async fn handle_line_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
-    for msg in &messages {
+    for msg in messages {
         tracing::info!(
             "LINE message from {}: {}",
             msg.sender,
             truncate_with_ellipsis(&msg.content, 50)
         );
-        let session_id = sender_session_id("line", msg);
+        let session_id = sender_session_id("line", &msg);
 
-        // Auto-save to memory
-        if state.auto_save && !memory::should_skip_autosave_content(&msg.content) {
-            let key = line_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        // Call the LLM
-        match Box::pin(run_gateway_chat_with_tools(
-            &state,
-            &msg.content,
-            Some(&session_id),
-        ))
-        .await
-        {
-            Ok(response) => {
-                if let Err(e) = line
-                    .send_with_reply_token(
-                        &SendMessage::new(response, &msg.reply_target),
-                        msg.thread_ts.as_deref(),
-                    )
-                    .await
-                {
-                    tracing::error!("Failed to send LINE reply: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::error!("LLM error for LINE message: {e:#}");
-                let _ = line
-                    .send_with_reply_token(
-                        &SendMessage::new(
-                            "Sorry, I couldn't process your message right now.",
-                            &msg.reply_target,
-                        ),
-                        msg.thread_ts.as_deref(),
+        // Spawn everything (including memory save) so the webhook returns 200
+        // immediately — minimises reply-token expiry risk.
+        let state_clone = state.clone();
+        let line_clone = Arc::clone(line);
+        let content = msg.content.clone();
+        let reply_target = msg.reply_target.clone();
+        let reply_token = msg.thread_ts.clone();
+        tokio::spawn(async move {
+            // Auto-save to memory (non-blocking relative to HTTP response)
+            if state_clone.auto_save && !memory::should_skip_autosave_content(&content) {
+                let key = line_memory_key(&msg);
+                let _ = state_clone
+                    .mem
+                    .store(
+                        &key,
+                        &content,
+                        MemoryCategory::Conversation,
+                        Some(&session_id),
                     )
                     .await;
             }
-        }
+
+            match Box::pin(run_gateway_chat_with_tools(
+                &state_clone,
+                &content,
+                Some(&session_id),
+            ))
+            .await
+            {
+                Ok(response) => {
+                    if let Err(e) = line_clone
+                        .send_with_reply_token(
+                            &SendMessage::new(response, &reply_target),
+                            reply_token.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::error!("Failed to send LINE reply: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for LINE message: {e:#}");
+                    let _ = line_clone
+                        .send_with_reply_token(
+                            &SendMessage::new(
+                                "Sorry, I couldn't process your message right now.",
+                                &reply_target,
+                            ),
+                            reply_token.as_deref(),
+                        )
+                        .await;
+                }
+            }
+        });
     }
 
     // LINE expects HTTP 200 OK
