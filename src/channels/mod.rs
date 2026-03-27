@@ -10323,6 +10323,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
