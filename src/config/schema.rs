@@ -6505,6 +6505,11 @@ pub struct SlackConfig {
     /// Minimum interval (ms) between draft message edits to avoid Slack rate limits.
     #[serde(default = "default_slack_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+    /// Emoji reaction name (without colons) that cancels an in-flight request.
+    /// For example, `"x"` means reacting with `:x:` cancels the task.
+    /// Leave unset to disable reaction-based cancellation.
+    #[serde(default)]
+    pub cancel_reaction: Option<String>,
 }
 
 fn default_slack_draft_update_interval_ms() -> u64 {
