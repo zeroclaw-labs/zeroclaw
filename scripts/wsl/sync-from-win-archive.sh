@@ -75,15 +75,31 @@ if [[ "$SOURCE_REPO" == "$DEST_REPO" ]]; then
   die "Source and destination are the same path"
 fi
 
-source_head="$(git -C "$SOURCE_REPO" rev-parse HEAD)"
-dest_head="$(git -C "$DEST_REPO" rev-parse HEAD)"
-
 if [[ "$ALLOW_OLDER_SOURCE" == false ]]; then
+  tmp_ref="refs/tmp/win-archive-sync-head"
+  cleanup_ref() {
+    git -C "$DEST_REPO" update-ref -d "$tmp_ref" >/dev/null 2>&1 || true
+  }
+  trap cleanup_ref EXIT
+
+  git -C "$DEST_REPO" fetch -q "$SOURCE_REPO" HEAD:"$tmp_ref"
+  source_head="$(git -C "$DEST_REPO" rev-parse "$tmp_ref")"
+  dest_head="$(git -C "$DEST_REPO" rev-parse HEAD)"
+
   if git -C "$DEST_REPO" merge-base --is-ancestor "$source_head" "$dest_head"; then
     printf 'Source HEAD: %s\n' "$source_head"
     printf 'Dest HEAD:   %s\n' "$dest_head"
     die "Refusing sync: source is older or equal to destination. Use --allow-older-source to override."
+  elif git -C "$DEST_REPO" merge-base --is-ancestor "$dest_head" "$source_head"; then
+    :
+  else
+    printf 'Source HEAD: %s\n' "$source_head"
+    printf 'Dest HEAD:   %s\n' "$dest_head"
+    die "Refusing sync: source and destination have diverged. Use --allow-older-source to override."
   fi
+
+  cleanup_ref
+  trap - EXIT
 fi
 
 RSYNC_ARGS=(

@@ -12,7 +12,7 @@ echo "Step 2: sync from archive (dry-run with safety guard)"
 if scripts/wsl/sync-from-win-archive.sh --dry-run; then
   echo "Sync check: source has newer content worth syncing."
 else
-  echo "Sync check: skipped by guard (archive source is older than WSL primary)."
+  echo "Sync check: skipped by guard (archive source is not safely fast-forwardable)."
   echo "This is expected once WSL becomes the active primary."
 fi
 
