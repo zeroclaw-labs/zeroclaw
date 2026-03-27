@@ -555,12 +555,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .as_ref()
         .filter(|wa| wa.is_cloud_config())
         .map(|wa| {
-            Arc::new(WhatsAppChannel::new(
+            let channel = WhatsAppChannel::new(
                 wa.access_token.clone().unwrap_or_default(),
                 wa.phone_number_id.clone().unwrap_or_default(),
                 wa.verify_token.clone().unwrap_or_default(),
                 wa.allowed_numbers.clone(),
-            ))
+            )
+            .with_transcription(config.transcription.clone());
+            Arc::new(channel)
         });
 
     // WhatsApp app secret for webhook signature verification
@@ -1632,7 +1634,7 @@ async fn handle_whatsapp_message(
     };
 
     // Parse messages from the webhook payload
-    let messages = wa.parse_webhook_payload(&payload);
+    let messages = wa.parse_webhook_payload(&payload).await;
 
     if messages.is_empty() {
         // Acknowledge the webhook even if no messages (could be status updates)
