@@ -533,3 +533,43 @@ When working in fast iterative mode:
 - Prefer deterministic behavior over clever shortcuts.
 - Do not “ship and hope” on security-sensitive paths.
 - If uncertain, leave a concrete TODO with verification context, not a hidden guess.
+
+## 13) gstack — AI-Powered Development Methodology
+
+Use gstack skills for structured development workflow: Think → Plan → Build → Review → Test → Ship → Reflect.
+
+### Available Skills
+
+Use `/browse` from gstack for all web browsing. Never use `mcp_claude-in-chrome_*` tools.
+
+**Planning:**
+- `/office-hours` — Product reframing through 6 challenge questions; generates design doc
+- `/plan-ceo-review` — CEO-level scope review (expand/reduce/hold)
+- `/plan-eng-review` — Architecture lock with ASCII diagrams, test matrices, failure modes
+- `/plan-design-review` — Design dimension scoring (0-10), AI slop detection
+- `/autoplan` — Runs CEO → design → eng review automatically in one command
+
+**Implementation & Review:**
+- `/review` — Staff engineer code review; auto-fixes obvious issues; flags gaps
+- `/investigate` — Systematic root-cause debugging; stops after 3 failed fixes
+- `/design-review` — Design audit with atomic commits and screenshots
+
+**Testing & QA:**
+- `/qa` — Real Chromium browser testing; finds bugs; fixes with atomic commits; generates regression tests
+- `/browse` — Real browser control with Playwright (~100ms per command)
+- `/cso` — OWASP Top 10 + STRIDE threat modeling security audit
+- `/benchmark` — Performance baseline and before/after comparison
+
+**Release:**
+- `/ship` — Sync main, run tests, audit coverage, push, open PR
+- `/land-and-deploy` — Merge PR, wait CI, deploy, verify production health
+- `/retro` — Weekly retrospective with shipping streaks and test trends
+
+### Workflow Rules
+
+1. Every feature starts with `/office-hours` or `/autoplan` — never code without a plan.
+2. Every PR goes through `/review` before `/ship`.
+3. Every user-facing change gets `/qa` with real browser verification.
+4. Security-sensitive changes require `/cso` audit.
+5. Split commits into logical, bisectable changes.
+6. Stage files explicitly (`git add file1 file2`) — never `git add .`.
