@@ -7601,13 +7601,16 @@ mod tests {
         channels.signal = None;
         channels.mattermost = Some(crate::config::schema::MattermostConfig {
             url: "https://mattermost.example.com".into(),
-            bot_token: "token".into(),
+            bot_token: Some("token".into()),
             channel_id: Some("channel".into()),
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
             interrupt_on_new_message: false,
             proxy_url: None,
+            listen_mode: None,
+            bot_id: None,
+            bot_password: None,
         });
         assert!(has_launchable_channels(&channels));
 

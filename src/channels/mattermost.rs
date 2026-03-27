@@ -1,8 +1,12 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use anyhow::{bail, Result};
 use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 
@@ -10,7 +14,8 @@ const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 /// Mattermost is API-compatible with many Slack patterns but uses a dedicated v4 structure.
 pub struct MattermostChannel {
     base_url: String, // e.g., https://mm.example.com
-    bot_token: String,
+    /// Static bot token from config. `None` when using credential-based auth.
+    bot_token: Option<String>,
     channel_id: Option<String>,
     allowed_users: Vec<String>,
     /// When true (default), replies thread on the original post's root_id.
@@ -24,12 +29,39 @@ pub struct MattermostChannel {
     proxy_url: Option<String>,
     transcription: Option<crate::config::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    /// Listening mode: "polling" (default) or "websocket".
+    listen_mode: ListenMode,
+    /// Bot ID for login-based authentication.
+    bot_id: Option<String>,
+    /// Bot password for login-based authentication.
+    bot_password: Option<String>,
+    /// Runtime session token obtained via `login_for_token()`. Used when
+    /// `bot_token` is `None`.
+    session_token: Arc<RwLock<Option<String>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ListenMode {
+    #[default]
+    Polling,
+    WebSocket,
+}
+
+impl ListenMode {
+    fn from_config(s: Option<&str>) -> Self {
+        match s {
+            Some(s) if s.eq_ignore_ascii_case("websocket") || s.eq_ignore_ascii_case("ws") => {
+                Self::WebSocket
+            }
+            _ => Self::Polling,
+        }
+    }
 }
 
 impl MattermostChannel {
     pub fn new(
         base_url: String,
-        bot_token: String,
+        bot_token: Option<String>,
         channel_id: Option<String>,
         allowed_users: Vec<String>,
         thread_replies: bool,
@@ -48,6 +80,10 @@ impl MattermostChannel {
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            listen_mode: ListenMode::Polling,
+            bot_id: None,
+            bot_password: None,
+            session_token: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -75,6 +111,342 @@ impl MattermostChannel {
         self
     }
 
+    pub fn with_listen_mode(mut self, mode: Option<&str>) -> Self {
+        self.listen_mode = ListenMode::from_config(mode);
+        self
+    }
+
+    pub fn with_credentials(mut self, bot_id: Option<String>, bot_password: Option<String>) -> Self {
+        self.bot_id = bot_id;
+        self.bot_password = bot_password;
+        self
+    }
+
+    /// Resolve the bearer token for REST API calls.
+    ///
+    /// Returns the static `bot_token` when configured. Otherwise, returns
+    /// (and caches) a session token obtained via `login_for_token()`.
+    async fn effective_token(&self) -> Result<String> {
+        // Fast path: static bot token.
+        if let Some(ref token) = self.bot_token {
+            return Ok(token.clone());
+        }
+
+        // Check cached session token.
+        {
+            let cached = self.session_token.read().await;
+            if let Some(ref t) = *cached {
+                return Ok(t.clone());
+            }
+        }
+
+        // Login and cache.
+        let token = self.login_for_token().await?;
+        {
+            let mut cached = self.session_token.write().await;
+            *cached = Some(token.clone());
+        }
+        Ok(token)
+    }
+
+    /// Authenticate via `POST /api/v4/users/login` and return the session token
+    /// from the `Token` response header.
+    async fn login_for_token(&self) -> Result<String> {
+        let login_id = self
+            .bot_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("bot_id required for credential-based auth"))?;
+        let password = self
+            .bot_password
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("bot_password required for credential-based auth"))?;
+
+        let resp = self
+            .http_client()
+            .post(format!("{}/api/v4/users/login", self.base_url))
+            .json(&serde_json::json!({
+                "login_id": login_id,
+                "password": password,
+            }))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            bail!("Mattermost login failed: {body}");
+        }
+
+        let token = resp
+            .headers()
+            .get("Token")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| anyhow::anyhow!("Mattermost login response missing Token header"))?
+            .to_string();
+
+        Ok(token)
+    }
+
+    /// WebSocket-based listener — connects to the Mattermost WebSocket API for
+    /// real-time event streaming. Automatically reconnects with exponential backoff.
+    async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        // WebSocket mode receives events from all channels the bot can see.
+        // When channel_id is set, only events for that channel are processed.
+        let filter_channel_id = self.channel_id.clone();
+
+        let (bot_user_id, bot_username) = self.get_bot_identity().await;
+
+        tracing::info!(
+            "Mattermost channel listening (websocket){}...",
+            filter_channel_id
+                .as_deref()
+                .map_or(String::new(), |id| format!(" on {id}"))
+        );
+
+        let mut reconnect_attempt: u32 = 0;
+        const PING_INTERVAL: Duration = Duration::from_secs(30);
+        const PONG_TIMEOUT: Duration = Duration::from_secs(15);
+
+        loop {
+            // 1. Login to get session token
+            let token = match self.login_for_token().await {
+                Ok(token) => {
+                    tracing::info!("Mattermost: login successful");
+                    token
+                }
+                Err(e) => {
+                    let wait = compute_mm_backoff(reconnect_attempt);
+                    tracing::warn!(
+                        "Mattermost: login failed: {e}; retrying in {:.1}s (attempt #{})",
+                        wait.as_secs_f64(),
+                        reconnect_attempt + 1,
+                    );
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+
+            // 2. Build WebSocket URL
+            let ws_url = build_mm_ws_url(&self.base_url);
+
+            // 3. Connect via proxy-aware helper
+            let (ws_stream, _) = match crate::config::ws_connect_with_proxy(
+                &ws_url,
+                "channel.mattermost",
+                self.proxy_url.as_deref(),
+            )
+            .await
+            {
+                Ok(conn) => {
+                    reconnect_attempt = 0;
+                    conn
+                }
+                Err(e) => {
+                    let wait = compute_mm_backoff(reconnect_attempt);
+                    tracing::warn!(
+                        "Mattermost WS: connect failed: {e}; retrying in {:.1}s (attempt #{})",
+                        wait.as_secs_f64(),
+                        reconnect_attempt + 1,
+                    );
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    tokio::time::sleep(wait).await;
+                    continue;
+                }
+            };
+            tracing::info!("Mattermost WS: connected to {ws_url}");
+
+            let (mut write, mut read) = ws_stream.split();
+
+            // 4. Send authentication challenge immediately (matches official Go/JS drivers)
+            let auth_msg = serde_json::json!({
+                "seq": 1,
+                "action": "authentication_challenge",
+                "data": { "token": token }
+            });
+            if let Err(e) = write
+                .send(WsMessage::Text(auth_msg.to_string().into()))
+                .await
+            {
+                tracing::warn!("Mattermost WS: auth send failed: {e}");
+                continue;
+            }
+
+            // 4a. Wait for auth OK response (up to 5 messages)
+            let mut authenticated = false;
+            for _ in 0..5 {
+                match tokio::time::timeout(Duration::from_secs(10), read.next()).await {
+                    Ok(Some(Ok(WsMessage::Text(text)))) => {
+                        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(text.as_ref()) {
+                            // Accept "OK" status response or any event (hello, etc.)
+                            if msg.get("status").and_then(|s| s.as_str()) == Some("OK")
+                                || msg.get("event").is_some()
+                            {
+                                authenticated = true;
+                                break;
+                            }
+                            if msg.get("error").is_some() {
+                                tracing::warn!("Mattermost WS: auth error: {msg}");
+                                break;
+                            }
+                        }
+                    }
+                    Ok(Some(Ok(_))) => continue,
+                    _ => break,
+                }
+            }
+            if !authenticated {
+                tracing::warn!("Mattermost WS: authentication failed, reconnecting...");
+                continue;
+            }
+            tracing::info!("Mattermost WS: authenticated");
+
+            // 5. Event loop with ping keep-alive and pong timeout
+            let mut ping_timer = tokio::time::interval(PING_INTERVAL);
+            ping_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut pong_deadline: Option<tokio::time::Instant> = None;
+
+            loop {
+                let pong_timeout = async {
+                    match pong_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                };
+
+                tokio::select! {
+                    _ = ping_timer.tick() => {
+                        if let Err(e) = write.send(WsMessage::Ping(vec![].into())).await {
+                            tracing::warn!("Mattermost WS: ping send failed: {e}");
+                            break;
+                        }
+                        // Expect pong within 15 seconds
+                        pong_deadline = Some(tokio::time::Instant::now() + PONG_TIMEOUT);
+                    }
+                    () = pong_timeout => {
+                        tracing::warn!("Mattermost WS: pong timeout, connection dead");
+                        break;
+                    }
+                    frame = read.next() => {
+                        // Any incoming message resets pong deadline
+                        pong_deadline = None;
+
+                        match frame {
+                            Some(Ok(WsMessage::Text(text))) => {
+                                if let Some(msg) = self.handle_ws_event(
+                                    text.as_ref(),
+                                    &bot_user_id,
+                                    &bot_username,
+                                    filter_channel_id.as_deref(),
+                                ).await {
+                                    if tx.send(msg).await.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                            Some(Ok(WsMessage::Ping(payload))) => {
+                                if let Err(e) = write.send(WsMessage::Pong(payload)).await {
+                                    tracing::warn!("Mattermost WS: pong failed: {e}");
+                                    break;
+                                }
+                            }
+                            Some(Ok(WsMessage::Close(_))) => {
+                                tracing::warn!("Mattermost WS: server closed connection");
+                                break;
+                            }
+                            Some(Ok(_)) => continue,
+                            Some(Err(e)) => {
+                                tracing::warn!("Mattermost WS: read error: {e}");
+                                break;
+                            }
+                            None => {
+                                tracing::warn!("Mattermost WS: stream ended");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Reconnect with backoff
+            let wait = compute_mm_backoff(reconnect_attempt);
+            tracing::warn!(
+                "Mattermost WS: reconnecting in {:.1}s (attempt #{})...",
+                wait.as_secs_f64(),
+                reconnect_attempt + 1,
+            );
+            reconnect_attempt = reconnect_attempt.saturating_add(1);
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// Parse a Mattermost WebSocket event and produce a `ChannelMessage` if it
+    /// represents a new post in the monitored channel.
+    async fn handle_ws_event(
+        &self,
+        raw: &str,
+        bot_user_id: &str,
+        bot_username: &str,
+        filter_channel_id: Option<&str>,
+    ) -> Option<ChannelMessage> {
+        let event: serde_json::Value = serde_json::from_str(raw).ok()?;
+
+        // Only process "posted" events.
+        let event_type = event.get("event").and_then(|e| e.as_str())?;
+        if event_type != "posted" {
+            return None;
+        }
+
+        // Mattermost encodes the post as a JSON string inside data.post.
+        let post_str = event
+            .get("data")
+            .and_then(|d| d.get("post"))
+            .and_then(|p| p.as_str())?;
+        let post: serde_json::Value = serde_json::from_str(post_str).ok()?;
+
+        // Filter by channel_id when configured; otherwise accept all channels.
+        let post_channel = post
+            .get("channel_id")
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if let Some(filter) = filter_channel_id {
+            if post_channel != filter {
+                return None;
+            }
+        }
+
+        // Use the post's own channel_id for reply routing.
+        let effective_channel_id = if post_channel.is_empty() {
+            filter_channel_id.unwrap_or("")
+        } else {
+            post_channel
+        };
+
+        // Handle audio transcription for voice-only messages.
+        let effective_text = if post
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+            && post_has_audio_attachment(&post)
+        {
+            self.try_transcribe_audio_attachment(&post).await
+        } else {
+            None
+        };
+
+        // Reuse existing parse logic. Pass 0 for last_create_at so the
+        // timestamp filter always passes — WS events are inherently real-time.
+        self.parse_mattermost_post(
+            &post,
+            bot_user_id,
+            bot_username,
+            0,
+            effective_channel_id,
+            effective_text.as_deref(),
+        )
+    }
+
     fn http_client(&self) -> reqwest::Client {
         crate::config::build_channel_proxy_client("channel.mattermost", self.proxy_url.as_deref())
     }
@@ -88,10 +460,11 @@ impl MattermostChannel {
     /// Get the bot's own user ID and username so we can ignore our own messages
     /// and detect @-mentions by username.
     async fn get_bot_identity(&self) -> (String, String) {
+        let token = self.effective_token().await.unwrap_or_default();
         let resp: Option<serde_json::Value> = async {
             self.http_client()
                 .get(format!("{}/api/v4/users/me", self.base_url))
-                .bearer_auth(&self.bot_token)
+                .bearer_auth(&token)
                 .send()
                 .await
                 .ok()?
@@ -145,10 +518,11 @@ impl MattermostChannel {
             .and_then(|n| n.as_str())
             .unwrap_or("audio");
 
+        let token = self.effective_token().await.unwrap_or_default();
         let response = match self
             .http_client()
             .get(format!("{}/api/v4/files/{}", self.base_url, file_id))
-            .bearer_auth(&self.bot_token)
+            .bearer_auth(&token)
             .send()
             .await
         {
@@ -229,10 +603,11 @@ impl Channel for MattermostChannel {
             );
         }
 
+        let token = self.effective_token().await?;
         let resp = self
             .http_client()
             .post(format!("{}/api/v4/posts", self.base_url))
-            .bearer_auth(&self.bot_token)
+            .bearer_auth(&token)
             .json(&body_map)
             .send()
             .await?;
@@ -250,96 +625,35 @@ impl Channel for MattermostChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_id = self
-            .channel_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Mattermost channel_id required for listening"))?;
-
-        let (bot_user_id, bot_username) = self.get_bot_identity().await;
-        #[allow(clippy::cast_possible_truncation)]
-        let mut last_create_at = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()) as i64;
-
-        tracing::info!("Mattermost channel listening on {}...", channel_id);
-
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-            let resp = match self
-                .http_client()
-                .get(format!(
-                    "{}/api/v4/channels/{}/posts",
-                    self.base_url, channel_id
-                ))
-                .bearer_auth(&self.bot_token)
-                .query(&[("since", last_create_at.to_string())])
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Mattermost poll error: {e}");
-                    continue;
+        // Validate that we have at least one auth method.
+        if self.bot_token.is_none()
+            && (self.bot_id.is_none() || self.bot_password.is_none())
+        {
+            bail!(
+                "Mattermost requires either bot_token or both bot_id and bot_password"
+            );
+        }
+        match self.listen_mode {
+            ListenMode::WebSocket => {
+                if self.bot_id.is_none() || self.bot_password.is_none() {
+                    bail!(
+                        "Mattermost WebSocket mode requires both bot_id and bot_password"
+                    );
                 }
-            };
-
-            let data: serde_json::Value = match resp.json().await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("Mattermost parse error: {e}");
-                    continue;
-                }
-            };
-
-            if let Some(posts) = data.get("posts").and_then(|p| p.as_object()) {
-                // Process in chronological order
-                let mut post_list: Vec<_> = posts.values().collect();
-                post_list.sort_by_key(|p| p.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0));
-
-                let last_create_at_before_this_batch = last_create_at;
-                for post in post_list {
-                    let create_at = post
-                        .get("create_at")
-                        .and_then(|c| c.as_i64())
-                        .unwrap_or(last_create_at);
-                    last_create_at = last_create_at.max(create_at);
-
-                    let effective_text = if post
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .is_empty()
-                        && post_has_audio_attachment(post)
-                    {
-                        self.try_transcribe_audio_attachment(post).await
-                    } else {
-                        None
-                    };
-
-                    if let Some(channel_msg) = self.parse_mattermost_post(
-                        post,
-                        &bot_user_id,
-                        &bot_username,
-                        last_create_at_before_this_batch,
-                        &channel_id,
-                        effective_text.as_deref(),
-                    ) {
-                        if tx.send(channel_msg).await.is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
+                self.listen_ws(tx).await
             }
+            ListenMode::Polling => self.listen_polling(tx).await,
         }
     }
 
     async fn health_check(&self) -> bool {
+        let token = match self.effective_token().await {
+            Ok(t) => t,
+            Err(_) => return false,
+        };
         self.http_client()
             .get(format!("{}/api/v4/users/me", self.base_url))
-            .bearer_auth(&self.bot_token)
+            .bearer_auth(&token)
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -351,7 +665,7 @@ impl Channel for MattermostChannel {
         self.stop_typing(recipient).await?;
 
         let client = self.http_client();
-        let token = self.bot_token.clone();
+        let token = self.effective_token().await.unwrap_or_default();
         let base_url = self.base_url.clone();
 
         // recipient is "channel_id" or "channel_id:root_id"
@@ -403,6 +717,103 @@ impl Channel for MattermostChannel {
 }
 
 impl MattermostChannel {
+    /// Polling-based listener — polls the REST API every 3 seconds.
+    async fn listen_polling(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+        let channel_id = self
+            .channel_id
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Mattermost channel_id required for listening"))?;
+
+        let (bot_user_id, bot_username) = self.get_bot_identity().await;
+        #[allow(clippy::cast_possible_truncation)]
+        let mut last_create_at = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()) as i64;
+
+        tracing::info!("Mattermost channel listening (polling) on {}...", channel_id);
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            let token = match self.effective_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!("Mattermost: token resolve error: {e}");
+                    continue;
+                }
+            };
+
+            let resp = match self
+                .http_client()
+                .get(format!(
+                    "{}/api/v4/channels/{}/posts",
+                    self.base_url, channel_id
+                ))
+                .bearer_auth(&token)
+                .query(&[("since", last_create_at.to_string())])
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Mattermost poll error: {e}");
+                    continue;
+                }
+            };
+
+            let data: serde_json::Value = match resp.json().await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!("Mattermost parse error: {e}");
+                    continue;
+                }
+            };
+
+            if let Some(posts) = data.get("posts").and_then(|p| p.as_object()) {
+                // Process in chronological order
+                let mut post_list: Vec<_> = posts.values().collect();
+                post_list
+                    .sort_by_key(|p| p.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0));
+
+                let last_create_at_before_this_batch = last_create_at;
+                for post in post_list {
+                    let create_at = post
+                        .get("create_at")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(last_create_at);
+                    last_create_at = last_create_at.max(create_at);
+
+                    let effective_text = if post
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .is_empty()
+                        && post_has_audio_attachment(post)
+                    {
+                        self.try_transcribe_audio_attachment(post).await
+                    } else {
+                        None
+                    };
+
+                    if let Some(channel_msg) = self.parse_mattermost_post(
+                        post,
+                        &bot_user_id,
+                        &bot_username,
+                        last_create_at_before_this_batch,
+                        &channel_id,
+                        effective_text.as_deref(),
+                    ) {
+                        if tx.send(channel_msg).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn parse_mattermost_post(
         &self,
         post: &serde_json::Value,
@@ -612,6 +1023,30 @@ fn normalize_mattermost_content(
     Some(cleaned)
 }
 
+/// Convert an HTTP(S) base URL to the corresponding WebSocket URL for
+/// Mattermost's event stream endpoint.
+fn build_mm_ws_url(base_url: &str) -> String {
+    let ws_scheme = if base_url.starts_with("https") {
+        "wss"
+    } else {
+        "ws"
+    };
+    let host = base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    format!("{ws_scheme}://{host}/api/v4/websocket")
+}
+
+/// Compute exponential backoff with jitter for reconnection attempts.
+fn compute_mm_backoff(attempt: u32) -> Duration {
+    const BASE_SECS: u64 = 1;
+    const MAX_SECS: u64 = 120;
+    let multiplier = 1_u64.checked_shl(attempt).unwrap_or(u64::MAX);
+    let backoff = BASE_SECS.saturating_mul(multiplier).min(MAX_SECS);
+    let jitter_ms = rand::random::<u64>() % 1001;
+    Duration::from_secs(backoff) + Duration::from_millis(jitter_ms)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,7 +1056,7 @@ mod tests {
     fn make_channel(allowed: Vec<String>, thread_replies: bool) -> MattermostChannel {
         MattermostChannel::new(
             "url".into(),
-            "token".into(),
+            Some("token".into()),
             None,
             allowed,
             thread_replies,
@@ -633,7 +1068,7 @@ mod tests {
     fn make_mention_only_channel() -> MattermostChannel {
         MattermostChannel::new(
             "url".into(),
-            "token".into(),
+            Some("token".into()),
             None,
             vec!["*".into()],
             true,
@@ -645,7 +1080,7 @@ mod tests {
     fn mattermost_url_trimming() {
         let ch = MattermostChannel::new(
             "https://mm.example.com/".into(),
-            "token".into(),
+            Some("token".into()),
             None,
             vec![],
             false,
@@ -1426,7 +1861,7 @@ mod tests {
             let whisper_url = format!("{}/v1/audio/transcriptions", mock_server.uri());
             let ch = MattermostChannel::new(
                 mock_server.uri(),
-                "test_token".to_string(),
+                Some("test_token".to_string()),
                 None,
                 vec!["*".into()],
                 false,
@@ -1476,7 +1911,7 @@ mod tests {
 
             let ch = MattermostChannel::new(
                 mock_server.uri(),
-                "test_token".to_string(),
+                Some("test_token".to_string()),
                 None,
                 vec!["*".into()],
                 false,
