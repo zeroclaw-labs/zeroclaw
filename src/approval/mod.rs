@@ -8,8 +8,10 @@ use crate::security::AutonomyLevel;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
+use std::time::Duration;
 
 // ── Types ────────────────────────────────────────────────────────
 
@@ -42,6 +44,18 @@ pub struct ApprovalLogEntry {
     pub channel: String,
 }
 
+/// A pending approval request awaiting channel response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingApproval {
+    pub request_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+    pub sender: String,
+    pub channel: String,
+    pub created_at: String,
+    pub timeout_at: String,
+}
+
 // ── ApprovalManager ──────────────────────────────────────────────
 
 /// Manages the approval workflow for tool calls.
@@ -67,9 +81,18 @@ pub struct ApprovalManager {
     /// auto-denied instead. Used for channel-driven (non-CLI) runs.
     non_interactive: bool,
     /// Session-scoped allowlist built from "Always" responses.
-    session_allowlist: Mutex<HashSet<String>>,
+    session_allowlist: Arc<Mutex<HashSet<String>>>,
     /// Audit trail of approval decisions.
-    audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    audit_log: Arc<Mutex<Vec<ApprovalLogEntry>>>,
+    /// Pending approval requests awaiting channel response.
+    pending_requests: Arc<Mutex<HashMap<String, PendingApproval>>>,
+    /// Resolved decisions from channel responses.
+    resolved_decisions: Arc<Mutex<HashMap<String, ApprovalResponse>>>,
+    /// Notifiers for async wait on approval resolution.
+    notifiers: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalResponse>>>>,
+    /// When `true`, tools requiring approval prompt via channel.
+    /// When `false`, auto-deny (existing behavior).
+    channel_interactive: bool,
 }
 
 impl ApprovalManager {
@@ -80,8 +103,12 @@ impl ApprovalManager {
             always_ask: config.always_ask.iter().cloned().collect(),
             autonomy_level: config.level,
             non_interactive: false,
-            session_allowlist: Mutex::new(HashSet::new()),
-            audit_log: Mutex::new(Vec::new()),
+            session_allowlist: Arc::new(Mutex::new(HashSet::new())),
+            audit_log: Arc::new(Mutex::new(Vec::new())),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            resolved_decisions: Arc::new(Mutex::new(HashMap::new())),
+            notifiers: Arc::new(Mutex::new(HashMap::new())),
+            channel_interactive: false,
         }
     }
 
@@ -96,8 +123,31 @@ impl ApprovalManager {
             always_ask: config.always_ask.iter().cloned().collect(),
             autonomy_level: config.level,
             non_interactive: true,
-            session_allowlist: Mutex::new(HashSet::new()),
-            audit_log: Mutex::new(Vec::new()),
+            session_allowlist: Arc::new(Mutex::new(HashSet::new())),
+            audit_log: Arc::new(Mutex::new(Vec::new())),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            resolved_decisions: Arc::new(Mutex::new(HashMap::new())),
+            notifiers: Arc::new(Mutex::new(HashMap::new())),
+            channel_interactive: false,
+        }
+    }
+
+    /// Create a channel-interactive approval manager.
+    ///
+    /// When enabled, tools requiring approval will send a prompt via the
+    /// messaging channel and await user response instead of auto-denying.
+    pub fn for_channel_interactive(config: &AutonomyConfig) -> Self {
+        Self {
+            auto_approve: config.auto_approve.iter().cloned().collect(),
+            always_ask: config.always_ask.iter().cloned().collect(),
+            autonomy_level: config.level,
+            non_interactive: false,
+            session_allowlist: Arc::new(Mutex::new(HashSet::new())),
+            audit_log: Arc::new(Mutex::new(Vec::new())),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            resolved_decisions: Arc::new(Mutex::new(HashMap::new())),
+            notifiers: Arc::new(Mutex::new(HashMap::new())),
+            channel_interactive: true,
         }
     }
 
@@ -105,6 +155,11 @@ impl ApprovalManager {
     /// (i.e. for channel-driven runs where no operator can approve).
     pub fn is_non_interactive(&self) -> bool {
         self.non_interactive
+    }
+
+    /// Returns `true` when this manager operates in channel-interactive mode.
+    pub fn is_channel_interactive(&self) -> bool {
+        self.channel_interactive
     }
 
     /// Check whether a tool call requires interactive approval.
@@ -193,6 +248,159 @@ impl ApprovalManager {
     /// auto-deny in the tool-call loop before reaching this point.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
         prompt_cli_interactive(request)
+    }
+
+    /// Create a pending approval request and return its unique ID.
+    pub fn create_pending_request(
+        &self,
+        tool_name: String,
+        arguments: serde_json::Value,
+        sender: String,
+        channel: String,
+        timeout: Duration,
+    ) -> String {
+        use uuid::Uuid;
+
+        let request_id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let timeout_time = now + chrono::Duration::from_std(timeout).unwrap();
+
+        let pending = PendingApproval {
+            request_id: request_id.clone(),
+            tool_name,
+            arguments,
+            sender,
+            channel,
+            created_at: now.to_rfc3339(),
+            timeout_at: timeout_time.to_rfc3339(),
+        };
+
+        let mut requests = self.pending_requests.lock();
+        requests.insert(request_id.clone(), pending);
+
+        request_id
+    }
+
+    /// Resolve a pending approval request with a decision.
+    ///
+    /// Validates that the sender matches the original request sender.
+    pub fn resolve_pending_request(
+        &self,
+        request_id: &str,
+        sender: &str,
+        decision: ApprovalResponse,
+    ) -> anyhow::Result<()> {
+        let mut requests = self.pending_requests.lock();
+
+        let pending = requests
+            .get(request_id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown approval request ID: {}", request_id))?;
+
+        if pending.sender != sender {
+            anyhow::bail!(
+                "Sender mismatch: expected '{}', got '{}'",
+                pending.sender,
+                sender
+            );
+        }
+
+        let tool_name = pending.tool_name.clone();
+        requests.remove(request_id);
+        drop(requests);
+
+        // If "Always", add to session allowlist.
+        if decision == ApprovalResponse::Always {
+            let mut allowlist = self.session_allowlist.lock();
+            allowlist.insert(tool_name);
+        }
+
+        // Store resolved decision.
+        let mut resolved = self.resolved_decisions.lock();
+        resolved.insert(request_id.to_string(), decision);
+
+        // Notify waiter if present.
+        let mut notifiers = self.notifiers.lock();
+        if let Some(tx) = notifiers.remove(request_id) {
+            let _ = tx.send(decision);
+        }
+
+        Ok(())
+    }
+
+    /// Wait for an approval decision, with timeout.
+    pub async fn wait_for_approval(&self, request_id: &str, timeout: Duration) -> ApprovalResponse {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        {
+            let mut notifiers = self.notifiers.lock();
+            notifiers.insert(request_id.to_string(), tx);
+        }
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(decision)) => decision,
+            _ => {
+                // Timeout or channel closed - cleanup and return No.
+                self.cleanup_request(request_id);
+                ApprovalResponse::No
+            }
+        }
+    }
+
+    /// Clean up a single pending request (e.g., on timeout).
+    fn cleanup_request(&self, request_id: &str) {
+        let mut requests = self.pending_requests.lock();
+        requests.remove(request_id);
+        drop(requests);
+
+        let mut resolved = self.resolved_decisions.lock();
+        resolved.remove(request_id);
+        drop(resolved);
+
+        let mut notifiers = self.notifiers.lock();
+        notifiers.remove(request_id);
+    }
+
+    /// Remove expired pending requests and notify waiters with No.
+    pub fn cleanup_expired(&self) {
+        let now = Utc::now();
+        let mut requests = self.pending_requests.lock();
+        let mut notifiers = self.notifiers.lock();
+
+        let expired: Vec<String> = requests
+            .iter()
+            .filter_map(|(id, req)| {
+                if let Ok(timeout_time) = chrono::DateTime::parse_from_rfc3339(&req.timeout_at) {
+                    if timeout_time.with_timezone(&Utc) < now {
+                        return Some(id.clone());
+                    }
+                }
+                None
+            })
+            .collect();
+
+        for id in expired {
+            requests.remove(&id);
+            if let Some(tx) = notifiers.remove(&id) {
+                let _ = tx.send(ApprovalResponse::No);
+            }
+        }
+    }
+}
+
+impl Clone for ApprovalManager {
+    fn clone(&self) -> Self {
+        Self {
+            auto_approve: self.auto_approve.clone(),
+            always_ask: self.always_ask.clone(),
+            autonomy_level: self.autonomy_level,
+            non_interactive: self.non_interactive,
+            session_allowlist: Arc::clone(&self.session_allowlist),
+            audit_log: Arc::clone(&self.audit_log),
+            pending_requests: Arc::clone(&self.pending_requests),
+            resolved_decisions: Arc::clone(&self.resolved_decisions),
+            notifiers: Arc::clone(&self.notifiers),
+            channel_interactive: self.channel_interactive,
+        }
     }
 }
 
@@ -607,5 +815,464 @@ mod tests {
             mgr.needs_approval("weather"),
             "always_ask must override auto_approve"
         );
+    }
+
+    // ── PendingApproval ──────────────────────────────────────────
+
+    #[test]
+    fn pending_approval_serde_roundtrip() {
+        let pending = PendingApproval {
+            request_id: "test-123".into(),
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+            sender: "alice".into(),
+            channel: "telegram".into(),
+            created_at: "2024-01-01T00:00:00Z".into(),
+            timeout_at: "2024-01-01T00:01:00Z".into(),
+        };
+
+        let json = serde_json::to_string(&pending).unwrap();
+        let parsed: PendingApproval = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.request_id, "test-123");
+        assert_eq!(parsed.tool_name, "shell");
+        assert_eq!(parsed.sender, "alice");
+        assert_eq!(parsed.channel, "telegram");
+        assert_eq!(parsed.created_at, "2024-01-01T00:00:00Z");
+        assert_eq!(parsed.timeout_at, "2024-01-01T00:01:00Z");
+    }
+
+    // ── Channel-interactive mode ─────────────────────────────────
+
+    #[test]
+    fn approval_manager_for_channel_interactive_initializes_empty() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        assert_eq!(mgr.pending_requests.lock().len(), 0);
+        assert_eq!(mgr.resolved_decisions.lock().len(), 0);
+        assert_eq!(mgr.notifiers.lock().len(), 0);
+    }
+
+    #[test]
+    fn approval_manager_for_channel_interactive_sets_flag() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        assert!(mgr.is_channel_interactive());
+        assert!(!mgr.is_non_interactive());
+    }
+
+    #[test]
+    fn approval_manager_is_channel_interactive_returns_flag() {
+        let interactive = ApprovalManager::for_channel_interactive(&supervised_config());
+        let non_interactive = ApprovalManager::for_non_interactive(&supervised_config());
+        let cli = ApprovalManager::from_config(&supervised_config());
+
+        assert!(interactive.is_channel_interactive());
+        assert!(!non_interactive.is_channel_interactive());
+        assert!(!cli.is_channel_interactive());
+    }
+
+    #[test]
+    fn approval_manager_create_pending_request_generates_id() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id1 = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+        let id2 = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "pwd"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        assert_ne!(id1, id2);
+        assert!(!id1.is_empty());
+        assert!(!id2.is_empty());
+    }
+
+    #[test]
+    fn approval_manager_create_pending_request_stores() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let requests = mgr.pending_requests.lock();
+        assert_eq!(requests.len(), 1);
+        let pending = requests.get(&id).unwrap();
+        assert_eq!(pending.tool_name, "shell");
+        assert_eq!(pending.sender, "alice");
+        assert_eq!(pending.channel, "telegram");
+    }
+
+    #[test]
+    fn approval_manager_create_pending_request_sets_timeout() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let requests = mgr.pending_requests.lock();
+        let pending = requests.get(&id).unwrap();
+
+        let created = chrono::DateTime::parse_from_rfc3339(&pending.created_at).unwrap();
+        let timeout = chrono::DateTime::parse_from_rfc3339(&pending.timeout_at).unwrap();
+
+        let diff = (timeout - created).num_seconds();
+        assert_eq!(diff, 60);
+    }
+
+    #[test]
+    fn approval_manager_resolve_pending_request_moves_to_resolved() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        mgr.resolve_pending_request(&id, "alice", ApprovalResponse::Yes)
+            .unwrap();
+
+        assert_eq!(mgr.pending_requests.lock().len(), 0);
+        assert_eq!(mgr.resolved_decisions.lock().len(), 1);
+        assert_eq!(
+            *mgr.resolved_decisions.lock().get(&id).unwrap(),
+            ApprovalResponse::Yes
+        );
+    }
+
+    #[test]
+    fn approval_manager_resolve_pending_request_unknown_id_is_noop() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let result = mgr.resolve_pending_request("unknown", "alice", ApprovalResponse::Yes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn approval_manager_resolve_pending_request_enforces_sender_match() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let result = mgr.resolve_pending_request(&id, "bob", ApprovalResponse::Yes);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Sender mismatch"));
+
+        // Request should still be pending.
+        assert_eq!(mgr.pending_requests.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_manager_wait_for_approval_returns_decision() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let mgr_clone = mgr.clone();
+        let id_clone = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            mgr_clone
+                .resolve_pending_request(&id_clone, "alice", ApprovalResponse::Yes)
+                .unwrap();
+        });
+
+        let decision = mgr
+            .wait_for_approval(&id, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(decision, ApprovalResponse::Yes);
+    }
+
+    #[tokio::test]
+    async fn approval_manager_wait_for_approval_timeout_returns_no() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let decision = mgr
+            .wait_for_approval(&id, std::time::Duration::from_millis(100))
+            .await;
+        assert_eq!(decision, ApprovalResponse::No);
+    }
+
+    #[test]
+    fn approval_manager_cleanup_expired_removes_old() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+
+        // Create request with very short timeout (already expired).
+        let _id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_millis(1),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        mgr.cleanup_expired();
+
+        assert_eq!(mgr.pending_requests.lock().len(), 0);
+    }
+
+    #[test]
+    fn approval_manager_cleanup_expired_preserves_active() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+
+        let _id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        mgr.cleanup_expired();
+
+        assert_eq!(mgr.pending_requests.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_manager_cleanup_expired_notifies_timed_out() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_millis(1),
+        );
+
+        let mgr_clone = mgr.clone();
+        let id_clone = id.clone();
+        let handle = tokio::spawn(async move {
+            mgr_clone
+                .wait_for_approval(&id_clone, std::time::Duration::from_secs(5))
+                .await
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        mgr.cleanup_expired();
+
+        let decision = handle.await.unwrap();
+        assert_eq!(decision, ApprovalResponse::No);
+    }
+
+    #[test]
+    fn approval_manager_needs_approval_skips_when_channel_interactive_false() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        assert!(!mgr.is_channel_interactive());
+        // Should follow existing logic - unknown tools need approval in supervised mode.
+        assert!(mgr.needs_approval("file_write"));
+    }
+
+    #[test]
+    fn approval_manager_needs_approval_requires_when_channel_interactive_true() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        assert!(mgr.is_channel_interactive());
+        // Should still require approval - channel_interactive doesn't bypass approval.
+        assert!(mgr.needs_approval("file_write"));
+    }
+
+    // ── Integration tests ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn approval_manager_channel_flow_end_to_end_allow() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let mgr_clone = mgr.clone();
+        let id_clone = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            mgr_clone
+                .resolve_pending_request(&id_clone, "alice", ApprovalResponse::Yes)
+                .unwrap();
+        });
+
+        let decision = mgr
+            .wait_for_approval(&id, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(decision, ApprovalResponse::Yes);
+    }
+
+    #[tokio::test]
+    async fn approval_manager_channel_flow_end_to_end_deny() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "rm -rf"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let mgr_clone = mgr.clone();
+        let id_clone = id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            mgr_clone
+                .resolve_pending_request(&id_clone, "alice", ApprovalResponse::No)
+                .unwrap();
+        });
+
+        let decision = mgr
+            .wait_for_approval(&id, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(decision, ApprovalResponse::No);
+    }
+
+    #[tokio::test]
+    async fn approval_manager_channel_flow_end_to_end_always() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "file_write".into(),
+            serde_json::json!({"path": "test.txt"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let id_clone = id.clone();
+        tokio::spawn({
+            let mgr = mgr.clone();
+            async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                mgr.resolve_pending_request(&id_clone, "alice", ApprovalResponse::Always)
+                    .unwrap();
+            }
+        });
+
+        let decision = mgr
+            .wait_for_approval(&id, std::time::Duration::from_secs(5))
+            .await;
+        assert_eq!(decision, ApprovalResponse::Always);
+
+        // Verify tool was added to session allowlist.
+        // Give a small delay to ensure the resolve completed.
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        let allowlist = mgr.session_allowlist();
+        assert!(allowlist.contains("file_write"));
+    }
+
+    #[tokio::test]
+    async fn approval_manager_channel_flow_concurrent_requests() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+
+        let id1 = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let id2 = mgr.create_pending_request(
+            "file_write".into(),
+            serde_json::json!({"path": "test.txt"}),
+            "bob".into(),
+            "discord".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let mgr1 = mgr.clone();
+        let id1_clone = id1.clone();
+        let handle1 = tokio::spawn(async move {
+            mgr1.wait_for_approval(&id1_clone, std::time::Duration::from_secs(5))
+                .await
+        });
+
+        let mgr2 = mgr.clone();
+        let id2_clone = id2.clone();
+        let handle2 = tokio::spawn(async move {
+            mgr2.wait_for_approval(&id2_clone, std::time::Duration::from_secs(5))
+                .await
+        });
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        mgr.resolve_pending_request(&id1, "alice", ApprovalResponse::Yes)
+            .unwrap();
+        mgr.resolve_pending_request(&id2, "bob", ApprovalResponse::No)
+            .unwrap();
+
+        let decision1 = handle1.await.unwrap();
+        let decision2 = handle2.await.unwrap();
+
+        assert_eq!(decision1, ApprovalResponse::Yes);
+        assert_eq!(decision2, ApprovalResponse::No);
+    }
+
+    #[tokio::test]
+    async fn approval_manager_channel_flow_timeout_before_resolve() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_secs(60),
+        );
+
+        let decision = mgr
+            .wait_for_approval(&id, std::time::Duration::from_millis(100))
+            .await;
+        assert_eq!(decision, ApprovalResponse::No);
+
+        // Subsequent resolve should fail since request is cleaned up.
+        let result = mgr.resolve_pending_request(&id, "alice", ApprovalResponse::Yes);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn approval_manager_channel_flow_cleanup_after_timeout() {
+        let mgr = ApprovalManager::for_channel_interactive(&supervised_config());
+        let id = mgr.create_pending_request(
+            "shell".into(),
+            serde_json::json!({"command": "ls"}),
+            "alice".into(),
+            "telegram".into(),
+            std::time::Duration::from_millis(1),
+        );
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        mgr.cleanup_expired();
+
+        let result = mgr.resolve_pending_request(&id, "alice", ApprovalResponse::Yes);
+        assert!(result.is_err());
     }
 }

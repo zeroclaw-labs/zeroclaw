@@ -5201,11 +5201,11 @@ impl Default for WebhookAuditConfig {
 
 // ── Autonomy / Security ──────────────────────────────────────────
 
+#[allow(clippy::struct_excessive_bools)]
 /// Autonomy and security policy configuration (`[autonomy]` section).
 ///
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
 /// risk approval gates, and per-policy budgets.
-#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct AutonomyConfig {
@@ -5258,6 +5258,13 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Enable channel-based approval prompts.
+    /// When `true`, tools requiring approval will send a prompt via the
+    /// messaging channel and await user response.
+    /// When `false`, tools requiring approval are auto-denied in non-CLI mode.
+    #[serde(default)]
+    pub channel_interactive: bool,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -5353,6 +5360,7 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            channel_interactive: false,
         }
     }
 }
@@ -11300,6 +11308,7 @@ auto_save = true
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                channel_interactive: false,
             },
             trust: crate::trust::TrustConfig::default(),
             backup: BackupConfig::default(),
@@ -15742,5 +15751,24 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let config = CostConfig::default();
         assert_eq!(config.enforcement.mode, "warn");
         assert_eq!(config.enforcement.reserve_percent, 10);
+    }
+
+    // ── AutonomyConfig channel_interactive ───────────────────────
+
+    #[tokio::test]
+    async fn autonomy_config_channel_interactive_default_false() {
+        let config = AutonomyConfig::default();
+        assert!(!config.channel_interactive);
+    }
+
+    #[tokio::test]
+    async fn autonomy_config_channel_interactive_serde_roundtrip() {
+        let mut config = AutonomyConfig::default();
+        config.channel_interactive = true;
+
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: AutonomyConfig = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed.channel_interactive);
     }
 }
