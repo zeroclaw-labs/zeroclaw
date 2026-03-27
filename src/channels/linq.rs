@@ -13,9 +13,65 @@ pub struct LinqChannel {
     from_phone: String,
     allowed_senders: Vec<String>,
     client: reqwest::Client,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
 }
 
 const LINQ_API_BASE: &str = "https://api.linqapp.com/api/partner/v3";
+
+/// Maximum audio download size (25MB)
+const MAX_LINQ_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Returns true if the URL host resolves to a private, loopback, or link-local address.
+fn is_private_url(url: &str) -> bool {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return true, // unparseable URLs are blocked
+    };
+
+    let host = match parsed.host_str() {
+        Some(h) => h.to_ascii_lowercase(),
+        None => return true, // no host → block
+    };
+
+    // Block localhost variants
+    if host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1" {
+        return true;
+    }
+
+    // Block private IP ranges
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.octets()[0] == 169 && v4.octets()[1] == 254 // link-local
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback(),
+        };
+    }
+
+    // Block internal hostnames
+    if host.ends_with(".local") || host.ends_with(".internal") || host == "metadata.google.internal"
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Map MIME subtype or URL extension to a supported audio filename extension.
+fn extension_for_audio(format: &str) -> Option<&'static str> {
+    match format.to_ascii_lowercase().as_str() {
+        "flac" => Some("flac"),
+        "mp3" | "mpeg" | "mpga" => Some("mp3"),
+        "mp4" | "m4a" => Some("mp4"),
+        "ogg" | "oga" | "opus" => Some("ogg"),
+        "wav" => Some("wav"),
+        "webm" => Some("webm"),
+        _ => None,
+    }
+}
 
 impl LinqChannel {
     pub fn new(api_token: String, from_phone: String, allowed_senders: Vec<String>) -> Self {
@@ -24,7 +80,25 @@ impl LinqChannel {
             from_phone,
             allowed_senders,
             client: reqwest::Client::new(),
+            transcription_manager: None,
         }
+    }
+
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, audio transcription disabled: {e}"
+                );
+            }
+        }
+        self
     }
 
     /// Check if a sender phone number is allowed (E.164 format: +1234567890)
@@ -37,7 +111,7 @@ impl LinqChannel {
         &self.from_phone
     }
 
-    fn media_part_to_image_marker(part: &serde_json::Value) -> Option<String> {
+    fn media_part_to_content_marker(part: &serde_json::Value) -> Option<String> {
         let source = part
             .get("url")
             .or_else(|| part.get("value"))
@@ -51,6 +125,10 @@ impl LinqChannel {
             .map(str::trim)
             .unwrap_or_default()
             .to_ascii_lowercase();
+
+        if mime_type.starts_with("audio/") {
+            return Some(format!("[AUDIO:{source}]"));
+        }
 
         if !mime_type.starts_with("image/") {
             return None;
@@ -211,7 +289,7 @@ impl LinqChannel {
                         .and_then(|v| v.as_str())
                         .map(ToString::to_string),
                     "media" | "image" => {
-                        if let Some(marker) = Self::media_part_to_image_marker(part) {
+                        if let Some(marker) = Self::media_part_to_content_marker(part) {
                             Some(marker)
                         } else {
                             tracing::debug!("Linq: skipping unsupported {part_type} part");
@@ -272,6 +350,99 @@ impl LinqChannel {
         });
 
         messages
+    }
+
+    /// Download and transcribe an audio file from a URL.
+    ///
+    /// Returns the transcript text on success, or `None` if transcription is not configured,
+    /// the download fails, or the audio format cannot be determined.
+    pub async fn try_transcribe_audio_part(&self, url: &str) -> Option<String> {
+        let manager = self.transcription_manager.as_ref()?;
+
+        #[cfg(not(test))]
+        if is_private_url(url) {
+            tracing::warn!("blocked audio fetch to private/internal URL: {url}");
+            return None;
+        }
+
+        // Download the audio file
+        let response = match self.client.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("failed to download audio from {url}: {e}");
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            tracing::warn!(
+                "audio download failed with status {}: {url}",
+                response.status()
+            );
+            return None;
+        }
+
+        if let Some(content_length) = response.content_length() {
+            if content_length > MAX_LINQ_AUDIO_BYTES {
+                tracing::warn!(
+                    "audio download skipped for {url}: content-length {content_length} exceeds {} bytes",
+                    MAX_LINQ_AUDIO_BYTES
+                );
+                return None;
+            }
+        }
+
+        // Derive extension from Content-Type header
+        let extension = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|ct| ct.to_str().ok())
+            .and_then(|ct| {
+                let subtype = ct.split('/').nth(1)?.split(';').next()?.trim();
+                extension_for_audio(subtype)
+            })
+            .or_else(|| {
+                // Fallback: derive extension from URL path (strip query and fragment)
+                url.split('/')
+                    .next_back()?
+                    .split('?')
+                    .next()?
+                    .split('#')
+                    .next()?
+                    .rsplit_once('.')
+                    .and_then(|(_, ext)| extension_for_audio(ext))
+            });
+
+        let Some(ext) = extension else {
+            tracing::warn!("could not determine audio format for {url}");
+            return None;
+        };
+
+        let audio_bytes = match response.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("failed to read audio bytes from {url}: {e}");
+                return None;
+            }
+        };
+
+        if audio_bytes.len() as u64 > MAX_LINQ_AUDIO_BYTES {
+            tracing::warn!(
+                "audio download too large after fetch for {url}: {} bytes exceeds {} bytes",
+                audio_bytes.len(),
+                MAX_LINQ_AUDIO_BYTES
+            );
+            return None;
+        }
+
+        let file_name = format!("audio.{ext}");
+        match manager.transcribe(&audio_bytes, &file_name).await {
+            Ok(transcript) => Some(transcript),
+            Err(e) => {
+                tracing::warn!("transcription failed for {url}: {e}");
+                None
+            }
+        }
     }
 }
 
@@ -687,15 +858,18 @@ mod tests {
                     "id": "msg-abc",
                     "parts": [{
                         "type": "media",
-                        "url": "https://example.com/sound.mp3",
-                        "mime_type": "audio/mpeg"
+                        "url": "https://example.com/video.mp4",
+                        "mime_type": "video/mp4"
                     }]
                 }
             }
         });
 
         let msgs = ch.parse_webhook_payload(&payload);
-        assert!(msgs.is_empty(), "Non-image media should still be skipped");
+        assert!(
+            msgs.is_empty(),
+            "Non-image, non-audio media should still be skipped"
+        );
     }
 
     #[test]
@@ -1122,5 +1296,446 @@ mod tests {
         let msgs = ch.parse_webhook_payload(&payload);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].sender, "+1234567890");
+    }
+
+    // ---- Transcription tests ----
+
+    #[test]
+    fn linq_manager_none_when_transcription_not_configured() {
+        let ch = make_channel();
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn linq_manager_some_when_valid_config() {
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "local_whisper".into(),
+            local_whisper: Some(crate::config::LocalWhisperConfig {
+                url: "http://localhost:8001/v1/transcribe".into(),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 120,
+            }),
+            ..Default::default()
+        };
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            vec!["+1234567890".into()],
+        )
+        .with_transcription(config);
+        assert!(ch.transcription_manager.is_some());
+    }
+
+    #[test]
+    fn linq_manager_none_and_warn_on_init_failure() {
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "groq".into(),
+            api_key: Some(String::new()),
+            ..Default::default()
+        };
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            vec!["+1234567890".into()],
+        )
+        .with_transcription(config);
+        assert!(ch.transcription_manager.is_none());
+    }
+
+    #[test]
+    fn linq_parse_audio_media_part_emits_placeholder() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat_id": "chat-789",
+                "from": "+1234567890",
+                "is_from_me": false,
+                "message": {
+                    "id": "msg-abc",
+                    "parts": [{
+                        "type": "media",
+                        "url": "https://example.com/voice.mp3",
+                        "mime_type": "audio/mpeg"
+                    }]
+                }
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[AUDIO:https://example.com/voice.mp3]");
+    }
+
+    #[test]
+    fn linq_parse_audio_part_new_format() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "api_version": "v3",
+            "webhook_version": "2026-02-03",
+            "event_type": "message.received",
+            "data": {
+                "id": "msg-abc",
+                "direction": "inbound",
+                "sender_handle": {
+                    "handle": "+1234567890",
+                    "is_me": false
+                },
+                "chat": { "id": "chat-789" },
+                "parts": [{
+                    "type": "media",
+                    "url": "https://example.com/voice.ogg",
+                    "mime_type": "audio/ogg"
+                }]
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[AUDIO:https://example.com/voice.ogg]");
+    }
+
+    #[test]
+    fn linq_parse_image_part_unchanged() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat_id": "chat-789",
+                "from": "+1234567890",
+                "is_from_me": false,
+                "message": {
+                    "id": "msg-abc",
+                    "parts": [{
+                        "type": "media",
+                        "url": "https://example.com/photo.jpg",
+                        "mime_type": "image/jpeg"
+                    }]
+                }
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[IMAGE:https://example.com/photo.jpg]");
+    }
+
+    #[test]
+    fn linq_parse_non_image_non_audio_media_still_skipped() {
+        let ch = LinqChannel::new("tok".into(), "+15551234567".into(), vec!["*".into()]);
+        let payload = serde_json::json!({
+            "event_type": "message.received",
+            "data": {
+                "chat_id": "chat-789",
+                "from": "+1234567890",
+                "is_from_me": false,
+                "message": {
+                    "id": "msg-abc",
+                    "parts": [{
+                        "type": "media",
+                        "url": "https://example.com/video.mp4",
+                        "mime_type": "video/mp4"
+                    }]
+                }
+            }
+        });
+
+        let msgs = ch.parse_webhook_payload(&payload);
+        assert!(msgs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn linq_try_transcribe_audio_part_returns_none_when_manager_absent() {
+        let ch = make_channel();
+        let result = ch
+            .try_transcribe_audio_part("https://example.com/voice.mp3")
+            .await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn linq_try_transcribe_audio_part_downloads_and_transcribes() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let mock_media = MockServer::start().await;
+        let mock_transcription = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.mp3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![0u8; 100])
+                    .insert_header("Content-Type", "audio/mpeg"),
+            )
+            .mount(&mock_media)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "test transcript"
+            })))
+            .mount(&mock_transcription)
+            .await;
+
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "groq".into(),
+            api_url: format!("{}/v1/audio/transcriptions", mock_transcription.uri()),
+            model: "whisper-large-v3".into(),
+            api_key: Some("test-key".into()),
+            language: None,
+            initial_prompt: None,
+            max_duration_secs: 300,
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
+            local_whisper: None,
+            transcribe_non_ptt_audio: false,
+        };
+
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            vec!["+1234567890".into()],
+        )
+        .with_transcription(config);
+
+        let url = format!("{}/voice.mp3", mock_media.uri());
+        let result = ch.try_transcribe_audio_part(&url).await;
+
+        assert_eq!(result, Some("test transcript".to_string()));
+    }
+
+    #[tokio::test]
+    async fn linq_try_transcribe_audio_part_returns_none_on_download_error() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::TranscriptionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            vec!["+1234567890".into()],
+        )
+        .with_transcription(config);
+
+        let url = format!("{}/voice.mp3", mock_server.uri());
+        let result = ch.try_transcribe_audio_part(&url).await;
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn linq_try_transcribe_audio_part_derives_extension_from_url_when_no_content_type() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let mock_media = MockServer::start().await;
+        let mock_transcription = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.ogg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![0u8; 100])
+                    .insert_header("Content-Type", "application/octet-stream"),
+            )
+            .mount(&mock_media)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "url extension transcript"
+            })))
+            .mount(&mock_transcription)
+            .await;
+
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "groq".into(),
+            api_url: format!("{}/v1/audio/transcriptions", mock_transcription.uri()),
+            model: "whisper-large-v3".into(),
+            api_key: Some("test-key".into()),
+            language: None,
+            initial_prompt: None,
+            max_duration_secs: 300,
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
+            local_whisper: None,
+            transcribe_non_ptt_audio: false,
+        };
+
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            vec!["+1234567890".into()],
+        )
+        .with_transcription(config);
+
+        let url = format!("{}/voice.ogg", mock_media.uri());
+        let result = ch.try_transcribe_audio_part(&url).await;
+
+        assert_eq!(result, Some("url extension transcript".to_string()));
+    }
+
+    #[tokio::test]
+    async fn linq_try_transcribe_audio_part_returns_none_when_extension_cannot_be_derived() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![0u8; 100])
+                    .insert_header("Content-Type", "application/octet-stream"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = crate::config::TranscriptionConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            vec!["+1234567890".into()],
+        )
+        .with_transcription(config);
+
+        let url = format!("{}/unknownfile", mock_server.uri());
+        let result = ch.try_transcribe_audio_part(&url).await;
+
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn linq_audio_routes_through_local_whisper() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let mock_media = MockServer::start().await;
+        let mock_whisper = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/voice.mp3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(vec![0u8; 100])
+                    .insert_header("Content-Type", "audio/mpeg"),
+            )
+            .mount(&mock_media)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/transcribe"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "local whisper transcript"
+            })))
+            .mount(&mock_whisper)
+            .await;
+
+        let config = crate::config::TranscriptionConfig {
+            enabled: true,
+            default_provider: "local_whisper".into(),
+            api_url: String::new(),
+            model: String::new(),
+            api_key: None,
+            language: None,
+            initial_prompt: None,
+            max_duration_secs: 300,
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
+            local_whisper: Some(crate::config::LocalWhisperConfig {
+                url: format!("{}/transcribe", mock_whisper.uri()),
+                bearer_token: Some("test-token".to_string()),
+                max_audio_bytes: 25 * 1024 * 1024,
+                timeout_secs: 120,
+            }),
+            transcribe_non_ptt_audio: false,
+        };
+
+        let ch = LinqChannel::new(
+            "test-token".into(),
+            "+15551234567".into(),
+            vec!["+1234567890".into()],
+        )
+        .with_transcription(config);
+
+        let url = format!("{}/voice.mp3", mock_media.uri());
+        let result = ch.try_transcribe_audio_part(&url).await;
+
+        assert_eq!(result, Some("local whisper transcript".to_string()));
+    }
+
+    #[test]
+    fn is_private_url_blocks_localhost() {
+        assert!(is_private_url("http://localhost:8080/audio.mp3"));
+        assert!(is_private_url("http://127.0.0.1:9000/voice.ogg"));
+        assert!(is_private_url("http://[::1]:3000/file.wav"));
+    }
+
+    #[test]
+    fn is_private_url_blocks_private_ranges() {
+        assert!(is_private_url("http://10.0.0.1/audio.mp3"));
+        assert!(is_private_url("http://192.168.1.1/audio.mp3"));
+        assert!(is_private_url("http://172.16.0.1/audio.mp3"));
+        assert!(is_private_url("http://172.31.255.1/audio.mp3"));
+        assert!(is_private_url("http://169.254.1.1/audio.mp3"));
+    }
+
+    #[test]
+    fn is_private_url_blocks_internal_hostnames() {
+        assert!(is_private_url("http://host.local/audio.mp3"));
+        assert!(is_private_url("http://svc.internal/audio.mp3"));
+        assert!(is_private_url("http://metadata.google.internal/audio.mp3"));
+    }
+
+    #[test]
+    fn is_private_url_allows_public_urls() {
+        assert!(!is_private_url("https://cdn.example.com/audio.mp3"));
+        assert!(!is_private_url("https://api.linq.ai/media/voice.ogg"));
+    }
+
+    #[test]
+    fn is_private_url_blocks_subdomain_bypass() {
+        // A hostname like 169.254.169.254.evil.com must NOT bypass the guard
+        assert!(!is_private_url("http://169.254.169.254.evil.com/audio.mp3"));
+        // But the actual link-local IP must be blocked
+        assert!(is_private_url("http://169.254.169.254/audio.mp3"));
+    }
+
+    #[test]
+    fn is_private_url_blocks_unparseable() {
+        assert!(is_private_url("not-a-url"));
     }
 }

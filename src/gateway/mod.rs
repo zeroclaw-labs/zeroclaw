@@ -79,6 +79,10 @@ pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 
+/// Regex pattern for detecting audio placeholders in Linq messages
+static LINQ_AUDIO_PATTERN: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"\[AUDIO:([^\]]+)\]").unwrap());
+
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
 }
@@ -584,11 +588,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // Linq channel (if configured)
     let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
-        Arc::new(LinqChannel::new(
-            lq.api_token.clone(),
-            lq.from_phone.clone(),
-            lq.allowed_senders.clone(),
-        ))
+        Arc::new(
+            LinqChannel::new(
+                lq.api_token.clone(),
+                lq.from_phone.clone(),
+                lq.allowed_senders.clone(),
+            )
+            .with_transcription(config.transcription.clone()),
+        )
     });
 
     // Linq signing secret for webhook signature verification
@@ -1751,10 +1758,38 @@ async fn handle_linq_webhook(
     };
 
     // Parse messages from the webhook payload
-    let messages = linq.parse_webhook_payload(&payload);
+    let mut messages = linq.parse_webhook_payload(&payload);
 
     if messages.is_empty() {
         // Acknowledge the webhook even if no messages (could be status/delivery events)
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    // Post-process audio placeholders: replace [AUDIO:<url>] with transcripts
+    for msg in &mut messages {
+        if msg.content.contains("[AUDIO:") {
+            let mut processed_content = msg.content.clone();
+
+            for cap in LINQ_AUDIO_PATTERN.captures_iter(&msg.content) {
+                if let Some(url_match) = cap.get(1) {
+                    let url = url_match.as_str();
+                    if let Some(transcript) = linq.try_transcribe_audio_part(url).await {
+                        processed_content =
+                            processed_content.replace(&format!("[AUDIO:{url}]"), &transcript);
+                    } else {
+                        processed_content =
+                            processed_content.replace(&format!("[AUDIO:{url}]"), "");
+                    }
+                }
+            }
+            msg.content = processed_content.trim().to_string();
+        }
+    }
+
+    // Filter out messages that became empty after audio placeholder removal
+    messages.retain(|msg| !msg.content.is_empty());
+
+    if messages.is_empty() {
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 

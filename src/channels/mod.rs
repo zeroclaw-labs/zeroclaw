@@ -4643,11 +4643,14 @@ fn collect_configured_channels(
     if let Some(ref lq) = config.channels_config.linq {
         channels.push(ConfiguredChannel {
             display_name: "Linq",
-            channel: Arc::new(LinqChannel::new(
-                lq.api_token.clone(),
-                lq.from_phone.clone(),
-                lq.allowed_senders.clone(),
-            )),
+            channel: Arc::new(
+                LinqChannel::new(
+                    lq.api_token.clone(),
+                    lq.from_phone.clone(),
+                    lq.allowed_senders.clone(),
+                )
+                .with_transcription(config.transcription.clone()),
+            ),
         });
     }
 
