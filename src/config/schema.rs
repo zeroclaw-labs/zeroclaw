@@ -818,7 +818,7 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google".
+    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google", "local_whisper".
     #[serde(default = "default_transcription_provider")]
     pub default_provider: String,
     /// API key used for transcription requests (Groq provider).
@@ -840,6 +840,15 @@ pub struct TranscriptionConfig {
     /// Whisper API request.
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    /// Global audio size cap in bytes, applied before dispatching to any provider.
+    ///
+    /// When unset, no global cap is applied by `TranscriptionManager`; each provider
+    /// enforces its own limit independently (25 MB for cloud providers via
+    /// `validate_audio()`, `local_whisper.max_audio_bytes` for the local provider).
+    /// Set this to enforce a uniform upper limit regardless of which provider handles
+    /// the request.
+    #[serde(default)]
+    pub max_audio_bytes: Option<u64>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
@@ -874,6 +883,7 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: default_transcription_max_duration_secs(),
             openai: None,
             deepgram: None,
@@ -9925,6 +9935,11 @@ impl Config {
                     anyhow::bail!(
                         "transcription.default_provider must be one of: groq, openai, deepgram, assemblyai, google, local_whisper (got '{other}')"
                     );
+                }
+            }
+            if let Some(cap) = self.transcription.max_audio_bytes {
+                if cap == 0 {
+                    anyhow::bail!("transcription.max_audio_bytes must be greater than zero");
                 }
             }
         }
