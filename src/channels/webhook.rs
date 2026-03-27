@@ -237,6 +237,8 @@ impl Channel for WebhookChannel {
                 channel: "webhook".to_string(),
                 timestamp,
                 thread_ts: payload.thread_id,
+                interruption_scope_id: None,
+                attachments: vec![],
             };
 
             if state.tx.send(msg).await.is_err() {

@@ -12,6 +12,8 @@ use chrono::{DateTime, Utc};
 pub struct SessionMetadata {
     /// Session key (e.g. `telegram_user123`).
     pub key: String,
+    /// Optional human-readable name (e.g. `eyrie-commander-briefing`).
+    pub name: Option<String>,
     /// When the session was first created.
     pub created_at: DateTime<Utc>,
     /// When the last message was appended.
@@ -54,6 +56,7 @@ pub trait SessionBackend: Send + Sync {
                 let messages = self.load(&key);
                 SessionMetadata {
                     key,
+                    name: None,
                     created_at: Utc::now(),
                     last_activity: Utc::now(),
                     message_count: messages.len(),
@@ -81,6 +84,53 @@ pub trait SessionBackend: Send + Sync {
     fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
         Ok(false)
     }
+
+    /// Set or update the human-readable name for a session.
+    fn set_session_name(&self, _session_key: &str, _name: &str) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the human-readable name for a session (if set).
+    fn get_session_name(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Set the session state (e.g. "idle", "running", "error").
+    /// `turn_id` identifies the current turn (set when running, cleared on idle).
+    fn set_session_state(
+        &self,
+        _session_key: &str,
+        _state: &str,
+        _turn_id: Option<&str>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the current session state. Returns `None` if the backend doesn't track state.
+    fn get_session_state(&self, _session_key: &str) -> std::io::Result<Option<SessionState>> {
+        Ok(None)
+    }
+
+    /// List sessions currently in "running" state.
+    fn list_running_sessions(&self) -> Vec<SessionMetadata> {
+        Vec::new()
+    }
+
+    /// List sessions stuck in "running" state longer than `threshold_secs`.
+    fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
+        Vec::new()
+    }
+}
+
+/// Session state information.
+#[derive(Debug, Clone)]
+pub struct SessionState {
+    /// Current state: "idle", "running", or "error".
+    pub state: String,
+    /// Turn ID of the active or last turn.
+    pub turn_id: Option<String>,
+    /// When the current state was entered.
+    pub turn_started_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -91,6 +141,7 @@ mod tests {
     fn session_metadata_is_constructible() {
         let meta = SessionMetadata {
             key: "test".into(),
+            name: None,
             created_at: Utc::now(),
             last_activity: Utc::now(),
             message_count: 5,

@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::select;
+use wa_rs_proto::whatsapp::device_props::PlatformType;
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
@@ -58,6 +59,14 @@ pub struct WhatsAppWebChannel {
     pair_code: Option<String>,
     /// Allowed phone numbers (E.164 format) or "*" for all
     allowed_numbers: Vec<String>,
+    /// Usage mode (business vs personal policy filtering)
+    mode: crate::config::WhatsAppWebMode,
+    /// DM policy when mode = personal
+    dm_policy: crate::config::WhatsAppChatPolicy,
+    /// Group policy when mode = personal
+    group_policy: crate::config::WhatsAppChatPolicy,
+    /// Whether to always respond in self-chat when mode = personal
+    self_chat_mode: bool,
     /// Bot handle for shutdown
     bot_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Client handle for sending messages and typing indicators
@@ -66,6 +75,7 @@ pub struct WhatsAppWebChannel {
     tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ChannelMessage>>>>,
     /// Voice transcription (STT) config
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     /// Text-to-speech config for voice replies
     tts_config: Option<crate::config::TtsConfig>,
     /// Chats awaiting a voice reply — maps chat JID to the latest substantive
@@ -75,6 +85,12 @@ pub struct WhatsAppWebChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Chats whose last incoming message was a voice note.
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Compiled mention patterns for DM mention gating.
+    dm_mention_patterns: Arc<Vec<regex::Regex>>,
+    /// Compiled mention patterns for group-chat mention gating.
+    /// When non-empty, only group messages matching at least one pattern are
+    /// processed; matched fragments are stripped from the forwarded content.
+    group_mention_patterns: Arc<Vec<regex::Regex>>,
 }
 
 impl WhatsAppWebChannel {
@@ -86,33 +102,59 @@ impl WhatsAppWebChannel {
     /// * `pair_phone` - Optional phone number for pair code linking (format: "15551234567")
     /// * `pair_code` - Optional custom pair code (leave empty for auto-generated)
     /// * `allowed_numbers` - Phone numbers allowed to interact (E.164 format) or "*" for all
+    /// * `mode` - Usage mode (business or personal)
+    /// * `dm_policy` - DM policy when mode = personal
+    /// * `group_policy` - Group policy when mode = personal
+    /// * `self_chat_mode` - Whether to always respond in self-chat when mode = personal
     #[cfg(feature = "whatsapp-web")]
     pub fn new(
         session_path: String,
         pair_phone: Option<String>,
         pair_code: Option<String>,
         allowed_numbers: Vec<String>,
+        mode: crate::config::WhatsAppWebMode,
+        dm_policy: crate::config::WhatsAppChatPolicy,
+        group_policy: crate::config::WhatsAppChatPolicy,
+        self_chat_mode: bool,
     ) -> Self {
         Self {
             session_path,
             pair_phone,
             pair_code,
             allowed_numbers,
+            mode,
+            dm_policy,
+            group_policy,
+            self_chat_mode,
             bot_handle: Arc::new(Mutex::new(None)),
             client: Arc::new(Mutex::new(None)),
             tx: Arc::new(Mutex::new(None)),
             transcription: None,
+            transcription_manager: None,
             tts_config: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            dm_mention_patterns: Arc::new(Vec::new()),
+            group_mention_patterns: Arc::new(Vec::new()),
         }
     }
 
     /// Configure voice transcription (STT) for incoming voice notes.
     #[cfg(feature = "whatsapp-web")]
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
         }
         self
     }
@@ -123,6 +165,28 @@ impl WhatsAppWebChannel {
         if config.enabled {
             self.tts_config = Some(config);
         }
+        self
+    }
+
+    /// Set mention patterns for DM mention gating.
+    /// Each pattern string is compiled as a case-insensitive regex.
+    /// Invalid patterns are logged and skipped.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_dm_mention_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.dm_mention_patterns = Arc::new(
+            super::whatsapp::WhatsAppChannel::compile_mention_patterns(&patterns),
+        );
+        self
+    }
+
+    /// Set mention patterns for group-chat mention gating.
+    /// Each pattern string is compiled as a case-insensitive regex.
+    /// Invalid patterns are logged and skipped.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_group_mention_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.group_mention_patterns = Arc::new(
+            super::whatsapp::WhatsAppChannel::compile_mention_patterns(&patterns),
+        );
         self
     }
 
@@ -318,8 +382,10 @@ impl WhatsAppWebChannel {
         client: &wa_rs::Client,
         audio: &wa_rs_proto::whatsapp::message::AudioMessage,
         transcription_config: Option<&crate::config::TranscriptionConfig>,
+        transcription_manager: Option<&super::transcription::TranscriptionManager>,
     ) -> Option<String> {
         let config = transcription_config?;
+        let manager = transcription_manager?;
 
         // Enforce duration limit
         if let Some(seconds) = audio.seconds {
@@ -358,7 +424,7 @@ impl WhatsAppWebChannel {
             file_name
         );
 
-        match super::transcription::transcribe_audio(audio_data, file_name, config).await {
+        match manager.transcribe(&audio_data, file_name).await {
             Ok(text) if text.trim().is_empty() => {
                 tracing::info!("WhatsApp Web: voice transcription returned empty text, skipping");
                 None
@@ -624,14 +690,24 @@ impl Channel for WhatsAppWebChannel {
             let retry_count_clone = retry_count.clone();
             let session_revoked_clone = session_revoked.clone();
             let transcription_config = self.transcription.clone();
-
-            let transcription_config = self.transcription.clone();
+            let transcription_mgr = self.transcription_manager.clone();
             let voice_chats = self.voice_chats.clone();
+            let wa_mode = self.mode.clone();
+            let wa_dm_policy = self.dm_policy.clone();
+            let wa_group_policy = self.group_policy.clone();
+            let wa_self_chat_mode = self.self_chat_mode;
+            let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
+            let wa_group_mention_patterns = self.group_mention_patterns.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
+                .with_device_props(
+                    Some("ZeroClaw".to_string()),
+                    None,
+                    Some(PlatformType::Desktop),
+                )
                 .on_event(move |event, client| {
                     let tx_inner = tx_clone.clone();
                     let allowed_numbers = allowed_numbers.clone();
@@ -639,7 +715,13 @@ impl Channel for WhatsAppWebChannel {
                     let retry_count = retry_count_clone.clone();
                     let session_revoked = session_revoked_clone.clone();
                     let transcription_config = transcription_config.clone();
+                    let transcription_mgr = transcription_mgr.clone();
                     let voice_chats = voice_chats.clone();
+                    let wa_mode = wa_mode.clone();
+                    let wa_dm_policy = wa_dm_policy.clone();
+                    let wa_group_policy = wa_group_policy.clone();
+                    let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
+                    let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     async move {
                         match event {
                             Event::Message(msg, info) => {
@@ -659,30 +741,97 @@ impl Channel for WhatsAppWebChannel {
                                     mapped_phone.as_deref(),
                                 );
 
-                                let normalized = match sender_candidates
+                                let normalized = sender_candidates
                                     .iter()
                                     .find(|candidate| {
                                         Self::is_number_allowed_for_list(&allowed_numbers, candidate)
                                     })
-                                    .cloned()
-                                {
-                                    Some(n) => n,
-                                    None => {
-                                        tracing::warn!(
-                                            "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
-                                            sender_candidates.len()
-                                        );
-                                        return;
-                                    }
-                                };
+                                    .cloned();
 
-                                // Attempt voice note transcription (ptt = push-to-talk = voice note)
+                                let is_group = info.source.is_group;
+
+                                // ── Personal-mode chat-type policy filtering ──
+                                if wa_mode == crate::config::WhatsAppWebMode::Personal {
+                                    // Self-chat: the chat JID user part matches
+                                    // the sender's user part (message to "Notes
+                                    // to Self").
+                                    let sender_user = sender_jid.user();
+                                    let chat_user = chat
+                                        .split_once('@')
+                                        .map(|(u, _)| u)
+                                        .unwrap_or(&chat);
+                                    let is_self_chat = !is_group && sender_user == chat_user && info.source.is_from_me;
+
+                                    if is_self_chat {
+                                        if !wa_self_chat_mode {
+                                            tracing::debug!(
+                                                "WhatsApp Web: ignoring self-chat message (self_chat_mode=false)"
+                                            );
+                                            return;
+                                        }
+                                        // self_chat_mode=true: always process, skip further policy checks
+                                    } else if is_group {
+                                        match wa_group_policy {
+                                            crate::config::WhatsAppChatPolicy::Ignore => {
+                                                tracing::debug!(
+                                                    "WhatsApp Web: ignoring group message (group_policy=ignore)"
+                                                );
+                                                return;
+                                            }
+                                            crate::config::WhatsAppChatPolicy::All => {
+                                                // allow unconditionally
+                                            }
+                                            crate::config::WhatsAppChatPolicy::Allowlist => {
+                                                if normalized.is_none() {
+                                                    tracing::warn!(
+                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
+                                                        sender_candidates.len()
+                                                    );
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // DM (non-self)
+                                        match wa_dm_policy {
+                                            crate::config::WhatsAppChatPolicy::Ignore => {
+                                                tracing::debug!(
+                                                    "WhatsApp Web: ignoring DM (dm_policy=ignore)"
+                                                );
+                                                return;
+                                            }
+                                            crate::config::WhatsAppChatPolicy::All => {
+                                                // allow unconditionally
+                                            }
+                                            crate::config::WhatsAppChatPolicy::Allowlist => {
+                                                if normalized.is_none() {
+                                                    tracing::warn!(
+                                                        "WhatsApp Web: message from unrecognized sender not in allowed list (candidates_count={})",
+                                                        sender_candidates.len()
+                                                    );
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                let normalized = normalized.unwrap_or_else(|| sender.clone());
+
+                                // Attempt voice note transcription (ptt = push-to-talk = voice note).
+                                // When `transcribe_non_ptt_audio` is enabled in the transcription
+                                // config, also transcribe forwarded / regular audio messages.
                                 let voice_text = if let Some(ref audio) = msg.audio_message {
-                                    if audio.ptt == Some(true) {
+                                    let is_ptt = audio.ptt == Some(true);
+                                    let non_ptt_enabled = transcription_config
+                                        .as_ref()
+                                        .is_some_and(|c| c.transcribe_non_ptt_audio);
+                                    if is_ptt || non_ptt_enabled {
                                         Self::try_transcribe_voice_note(
                                             &client,
                                             audio,
                                             transcription_config.as_ref(),
+                                            transcription_mgr.as_deref(),
                                         )
                                         .await
                                     } else {
@@ -731,6 +880,28 @@ impl Channel for WhatsAppWebChannel {
                                     return;
                                 }
 
+                                // ── Mention-pattern gating ──
+                                // Apply dm_mention_patterns for DMs and
+                                // group_mention_patterns for group chats.
+                                // When the applicable pattern set is non-empty,
+                                // messages without a match are dropped and
+                                // matched fragments are stripped.
+                                let content =
+                                    match super::whatsapp::WhatsAppChannel::apply_mention_gating(
+                                        &wa_dm_mention_patterns,
+                                        &wa_group_mention_patterns,
+                                        &content,
+                                        is_group,
+                                    ) {
+                                        Some(c) => c,
+                                        None => {
+                                            tracing::debug!(
+                                                "WhatsApp Web: message from {normalized} did not match mention patterns, dropping"
+                                            );
+                                            return;
+                                        }
+                                    };
+
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
@@ -741,6 +912,8 @@ impl Channel for WhatsAppWebChannel {
                                         content,
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
+                                        interruption_scope_id: None,
+                    attachments: vec![],
                                     })
                                     .await
                                 {
@@ -978,6 +1151,10 @@ impl WhatsAppWebChannel {
         _pair_phone: Option<String>,
         _pair_code: Option<String>,
         _allowed_numbers: Vec<String>,
+        _mode: crate::config::WhatsAppWebMode,
+        _dm_policy: crate::config::WhatsAppChatPolicy,
+        _group_policy: crate::config::WhatsAppChatPolicy,
+        _self_chat_mode: bool,
     ) -> Self {
         Self { _private: () }
     }
@@ -1044,6 +1221,10 @@ mod tests {
             None,
             None,
             vec!["+1234567890".into()],
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
         )
     }
 
@@ -1065,7 +1246,16 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_allowed_wildcard() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec!["*".into()]);
+        let ch = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            None,
+            None,
+            vec!["*".into()],
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
+        );
         assert!(ch.is_number_allowed("+1234567890"));
         assert!(ch.is_number_allowed("+9999999999"));
     }
@@ -1073,7 +1263,16 @@ mod tests {
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn whatsapp_web_number_denied_empty() {
-        let ch = WhatsAppWebChannel::new("/tmp/test.db".into(), None, None, vec![]);
+        let ch = WhatsAppWebChannel::new(
+            "/tmp/test.db".into(),
+            None,
+            None,
+            vec![],
+            crate::config::WhatsAppWebMode::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            crate::config::WhatsAppChatPolicy::default(),
+            false,
+        );
         // Empty allowlist means "deny all" (matches channel-wide allowlist policy).
         assert!(!ch.is_number_allowed("+1234567890"));
     }
@@ -1235,9 +1434,11 @@ mod tests {
     fn with_transcription_sets_config_when_enabled() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
 
         let ch = make_channel().with_transcription(tc);
         assert!(ch.transcription.is_some());
+        assert!(ch.transcription_manager.is_some());
     }
 
     #[test]
@@ -1246,6 +1447,7 @@ mod tests {
         let tc = crate::config::TranscriptionConfig::default(); // enabled = false
         let ch = make_channel().with_transcription(tc);
         assert!(ch.transcription.is_none());
+        assert!(ch.transcription_manager.is_none());
     }
 
     #[test]

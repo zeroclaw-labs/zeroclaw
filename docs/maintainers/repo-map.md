@@ -116,7 +116,7 @@ Tool categories:
 |---|---|---|
 | `memory/` | `traits.rs`, `backend.rs`, `mod.rs`, + 8 backend files | **Persistent knowledge.** `Memory` trait: `store()`, `recall()`, `get()`, `list()`, `forget()`, `count()`. Categories: Core, Daily, Conversation, Custom. |
 
-Backends: `sqlite`, `markdown`, `lucid` (hybrid SQLite + embeddings), `qdrant` (vector DB), `postgres`, `none`
+Backends: `sqlite`, `markdown`, `lucid` (hybrid SQLite + embeddings), `qdrant` (vector DB), `none`
 
 Supporting: `embeddings.rs` (embedding generation), `vector.rs` (vector ops), `chunker.rs` (text splitting), `hygiene.rs` (cleanup), `snapshot.rs` (backup), `response_cache.rs` (caching), `cli.rs` (CLI commands)
 

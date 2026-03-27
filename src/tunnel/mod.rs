@@ -3,6 +3,7 @@ mod custom;
 mod ngrok;
 mod none;
 mod openvpn;
+mod pinggy;
 mod tailscale;
 
 pub use cloudflare::CloudflareTunnel;
@@ -11,6 +12,7 @@ pub use ngrok::NgrokTunnel;
 #[allow(unused_imports)]
 pub use none::NoneTunnel;
 pub use openvpn::OpenVpnTunnel;
+pub use pinggy::PinggyTunnel;
 pub use tailscale::TailscaleTunnel;
 
 use crate::config::schema::{TailscaleTunnelConfig, TunnelConfig};
@@ -132,7 +134,18 @@ pub fn create_tunnel(config: &TunnelConfig) -> Result<Option<Box<dyn Tunnel>>> {
             ))))
         }
 
-        other => bail!("Unknown tunnel provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, openvpn, custom"),
+        "pinggy" => {
+            let pg = config
+                .pinggy
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("tunnel.provider = \"pinggy\" but [tunnel.pinggy] section is missing"))?;
+            Ok(Some(Box::new(PinggyTunnel::new(
+                pg.token.clone(),
+                pg.region.clone(),
+            ))))
+        }
+
+        other => bail!("Unknown tunnel provider: \"{other}\". Valid: none, cloudflare, tailscale, ngrok, openvpn, pinggy, custom"),
     }
 }
 
@@ -143,7 +156,7 @@ mod tests {
     use super::*;
     use crate::config::schema::{
         CloudflareTunnelConfig, CustomTunnelConfig, NgrokTunnelConfig, OpenVpnTunnelConfig,
-        TunnelConfig,
+        PinggyTunnelConfig, TunnelConfig,
     };
     use tokio::process::Command;
 
@@ -265,6 +278,30 @@ mod tests {
         let t = create_tunnel(&cfg).unwrap();
         assert!(t.is_some());
         assert_eq!(t.unwrap().name(), "custom");
+    }
+
+    #[test]
+    fn factory_pinggy_missing_config_errors() {
+        let cfg = TunnelConfig {
+            provider: "pinggy".into(),
+            ..TunnelConfig::default()
+        };
+        assert_tunnel_err(&cfg, "[tunnel.pinggy]");
+    }
+
+    #[test]
+    fn factory_pinggy_with_config_ok() {
+        let cfg = TunnelConfig {
+            provider: "pinggy".into(),
+            pinggy: Some(PinggyTunnelConfig {
+                token: Some("tok".into()),
+                region: None,
+            }),
+            ..TunnelConfig::default()
+        };
+        let t = create_tunnel(&cfg).unwrap();
+        assert!(t.is_some());
+        assert_eq!(t.unwrap().name(), "pinggy");
     }
 
     #[test]
@@ -427,6 +464,25 @@ mod tests {
     #[tokio::test]
     async fn custom_health_false_before_start_without_health_url() {
         let tunnel = CustomTunnel::new("echo hi".into(), None, Some("https://".into()));
+        assert!(!tunnel.health_check().await);
+    }
+
+    #[test]
+    fn pinggy_tunnel_name() {
+        let t = PinggyTunnel::new(Some("tok".into()), None);
+        assert_eq!(t.name(), "pinggy");
+        assert!(t.public_url().is_none());
+    }
+
+    #[test]
+    fn pinggy_without_token() {
+        let t = PinggyTunnel::new(None, None);
+        assert_eq!(t.name(), "pinggy");
+    }
+
+    #[tokio::test]
+    async fn pinggy_health_false_before_start() {
+        let tunnel = PinggyTunnel::new(None, None);
         assert!(!tunnel.health_check().await);
     }
 }

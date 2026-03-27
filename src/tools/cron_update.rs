@@ -89,6 +89,11 @@ impl Tool for CronUpdateTool {
                             "type": "string",
                             "description": "Model override for agent jobs, e.g. 'x-ai/grok-4-1-fast'"
                         },
+                        "allowed_tools": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional replacement allowlist of tool names for agent jobs"
+                        },
                         "session_target": {
                             "type": "string",
                             "enum": ["isolated", "main"],
@@ -403,6 +408,7 @@ mod tests {
             "command",
             "prompt",
             "model",
+            "allowed_tools",
             "session_target",
             "delete_after_run",
             "schedule",
@@ -500,5 +506,78 @@ mod tests {
             .unwrap_or_default()
             .contains("Rate limit exceeded"));
         assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn empty_allowed_tools_patch_stored_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &cfg,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "check status",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec!["file_read".into()]),
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "allowed_tools": [] }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
+            None,
+            "empty allowed_tools patch should clear to None"
+        );
+    }
+
+    #[tokio::test]
+    async fn updates_agent_allowed_tools() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &cfg,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "check status",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "allowed_tools": ["file_read", "web_search"] }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
+            Some(vec!["file_read".into(), "web_search".into()])
+        );
     }
 }

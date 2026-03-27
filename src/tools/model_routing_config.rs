@@ -707,6 +707,7 @@ impl ModelRoutingConfigTool {
                 max_iterations: DEFAULT_AGENT_MAX_ITERATIONS,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
+                skills_directory: None,
             });
 
         next_agent.provider = provider;

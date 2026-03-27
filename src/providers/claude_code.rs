@@ -90,17 +90,31 @@ impl ClaudeCodeProvider {
             .any(|v| (temperature - v).abs() < TEMP_EPSILON)
     }
 
-    fn validate_temperature(temperature: f64) -> anyhow::Result<()> {
+    fn validate_temperature(temperature: f64) -> anyhow::Result<f64> {
         if !temperature.is_finite() {
             anyhow::bail!("Claude Code provider received non-finite temperature value");
         }
-        if !Self::supports_temperature(temperature) {
-            anyhow::bail!(
-                "temperature unsupported by Claude Code CLI: {temperature}. \
-                 Supported values: 0.7 or 1.0"
-            );
+        if Self::supports_temperature(temperature) {
+            return Ok(temperature);
         }
-        Ok(())
+        // Clamp to the nearest supported value — the CLI ignores temperature
+        // anyway, so a hard error just blocks callers like memory consolidation
+        // that legitimately request low temperatures.
+        let clamped = *CLAUDE_CODE_SUPPORTED_TEMPERATURES
+            .iter()
+            .min_by(|a, b| {
+                (temperature - **a)
+                    .abs()
+                    .partial_cmp(&(temperature - **b).abs())
+                    .unwrap()
+            })
+            .unwrap();
+        tracing::debug!(
+            requested = temperature,
+            clamped = clamped,
+            "Clamped unsupported temperature to nearest Claude Code CLI value"
+        );
+        Ok(clamped)
     }
 
     fn redact_stderr(stderr: &[u8]) -> String {
@@ -279,6 +293,7 @@ impl Provider for ClaudeCodeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -286,6 +301,19 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock poisoned")
+    }
+
+    /// Serialize tests that spawn the echo-provider script.
+    ///
+    /// On Linux, writing a shell script and exec'ing it from parallel threads
+    /// can trigger `ETXTBSY` ("Text file busy") even with unique file paths,
+    /// because the kernel briefly holds `deny_write_access` on the interpreter
+    /// page cache. Serializing these tests eliminates the race.
+    ///
+    /// Uses `tokio::sync::Mutex` so the guard can be held across `.await`.
+    fn script_mutex() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 
     #[test]
@@ -352,11 +380,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_temperature_rejects_custom_value() {
-        let err = ClaudeCodeProvider::validate_temperature(0.2).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("temperature unsupported by Claude Code CLI"));
+    fn validate_temperature_clamps_custom_value() {
+        let clamped = ClaudeCodeProvider::validate_temperature(0.2).unwrap();
+        assert!((clamped - 0.7).abs() < 1e-9, "0.2 should clamp to 0.7");
+
+        let clamped = ClaudeCodeProvider::validate_temperature(0.9).unwrap();
+        assert!((clamped - 1.0).abs() < 1e-9, "0.9 should clamp to 1.0");
+    }
+
+    #[test]
+    fn validate_temperature_rejects_non_finite() {
+        assert!(ClaudeCodeProvider::validate_temperature(f64::NAN).is_err());
+        assert!(ClaudeCodeProvider::validate_temperature(f64::INFINITY).is_err());
     }
 
     #[tokio::test]
@@ -376,35 +411,40 @@ mod tests {
     /// Helper: create a provider that uses a shell script echoing stdin back.
     /// The script ignores CLI flags (`--print`, `--model`, `-`) and just cats stdin.
     ///
-    /// Uses `OnceLock` to write the script file exactly once, avoiding
-    /// "Text file busy" (ETXTBSY) races when parallel tests try to
-    /// overwrite a script that another test is currently executing.
+    /// Each invocation places the script in its own unique directory and writes
+    /// the file atomically via `std::fs::write` to avoid `ETXTBSY` ("Text file
+    /// busy") races that occur when parallel test threads create and exec
+    /// scripts concurrently on the same filesystem.
     fn echo_provider() -> ClaudeCodeProvider {
-        use std::sync::OnceLock;
+        static SCRIPT_ID: AtomicUsize = AtomicUsize::new(0);
+        let script_id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_claude_code_{}_{}",
+            std::process::id(),
+            script_id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
 
-        static SCRIPT_PATH: OnceLock<PathBuf> = OnceLock::new();
-        let script = SCRIPT_PATH.get_or_init(|| {
-            use std::io::Write;
-            let dir = std::env::temp_dir().join("zeroclaw_test_claude_code");
-            std::fs::create_dir_all(&dir).unwrap();
-            let path = dir.join(format!("fake_claude_{}.sh", std::process::id()));
-            let mut f = std::fs::File::create(&path).unwrap();
-            writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
-            drop(f);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            path
-        });
-        ClaudeCodeProvider {
-            binary_path: script.clone(),
+        let path = dir.join("fake_claude.sh");
+        std::fs::write(&path, "#!/bin/sh\ncat /dev/stdin\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        ClaudeCodeProvider { binary_path: path }
+    }
+
+    #[test]
+    fn echo_provider_uses_unique_script_paths() {
+        let first = echo_provider();
+        let second = echo_provider();
+        assert_ne!(first.binary_path, second.binary_path);
     }
 
     #[tokio::test]
     async fn chat_with_history_single_user_message() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
@@ -416,6 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_single_user_with_system() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![
             ChatMessage::system("You are helpful."),
@@ -430,6 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_multi_turn_includes_all_messages() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![
             ChatMessage::system("Be concise."),
@@ -450,6 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_multi_turn_without_system() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![
             ChatMessage::user("hi"),
@@ -467,10 +510,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_with_history_rejects_bad_temperature() {
+    async fn chat_with_history_clamps_bad_temperature() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![ChatMessage::user("test")];
         let result = provider.chat_with_history(&messages, "default", 0.5).await;
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "unsupported temperature should be clamped, not rejected"
+        );
     }
 }

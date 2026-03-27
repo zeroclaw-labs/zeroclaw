@@ -1,22 +1,31 @@
+pub mod audit;
 pub mod backend;
 pub mod chunker;
 pub mod cli;
+pub mod conflict;
 pub mod consolidation;
+pub mod decay;
 pub mod embeddings;
 pub mod hygiene;
+pub mod importance;
 pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
 pub mod none;
-#[cfg(feature = "memory-postgres")]
-pub mod postgres;
+pub mod policy;
 pub mod qdrant;
 pub mod response_cache;
+pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
 pub mod traits;
 pub mod vector;
 
+#[cfg(test)]
+mod battle_tests;
+
+#[allow(unused_imports)]
+pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
     classify_memory_backend, default_memory_backend_key, memory_backend_profile,
@@ -25,30 +34,30 @@ pub use backend::{
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
 pub use none::NoneMemory;
-#[cfg(feature = "memory-postgres")]
-pub use postgres::PostgresMemory;
+#[allow(unused_imports)]
+pub use policy::PolicyEnforcer;
 pub use qdrant::QdrantMemory;
 pub use response_cache::ResponseCache;
+#[allow(unused_imports)]
+pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
-pub use traits::{MemoryCategory, MemoryEntry};
+pub use traits::{ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use anyhow::Context;
 use std::path::Path;
 use std::sync::Arc;
 
-fn create_memory_with_builders<F, G>(
+fn create_memory_with_builders<F>(
     backend_name: &str,
     workspace_dir: &Path,
     mut sqlite_builder: F,
-    mut postgres_builder: G,
     unknown_context: &str,
 ) -> anyhow::Result<Box<dyn Memory>>
 where
     F: FnMut() -> anyhow::Result<SqliteMemory>,
-    G: FnMut() -> anyhow::Result<Box<dyn Memory>>,
 {
     match classify_memory_backend(backend_name) {
         MemoryBackendKind::Sqlite => Ok(Box::new(sqlite_builder()?)),
@@ -56,7 +65,6 @@ where
             let local = sqlite_builder()?;
             Ok(Box::new(LucidMemory::new(workspace_dir, local)))
         }
-        MemoryBackendKind::Postgres => postgres_builder(),
         MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => {
             Ok(Box::new(MarkdownMemory::new(workspace_dir)))
         }
@@ -101,6 +109,7 @@ pub fn should_skip_autosave_content(content: &str) -> bool {
 
     let lowered = normalized.to_ascii_lowercase();
     lowered.starts_with("[cron:")
+        || lowered.starts_with("[heartbeat task")
         || lowered.starts_with("[distilled_")
         || lowered.contains("distilled_index_sig:")
 }
@@ -298,41 +307,9 @@ pub fn create_memory_with_storage_and_routes(
             config.keyword_weight as f32,
             config.embedding_cache_size,
             config.sqlite_open_timeout_secs,
+            config.search_mode.clone(),
         )?;
         Ok(mem)
-    }
-
-    #[cfg(feature = "memory-postgres")]
-    fn build_postgres_memory(
-        storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<Box<dyn Memory>> {
-        let storage_provider = storage_provider
-            .context("memory backend 'postgres' requires [storage.provider.config] settings")?;
-        let db_url = storage_provider
-            .db_url
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .context(
-                "memory backend 'postgres' requires [storage.provider.config].db_url (or dbURL)",
-            )?;
-
-        let memory = PostgresMemory::new(
-            db_url,
-            &storage_provider.schema,
-            &storage_provider.table,
-            storage_provider.connect_timeout_secs,
-        )?;
-        Ok(Box::new(memory))
-    }
-
-    #[cfg(not(feature = "memory-postgres"))]
-    fn build_postgres_memory(
-        _storage_provider: Option<&StorageProviderConfig>,
-    ) -> anyhow::Result<Box<dyn Memory>> {
-        anyhow::bail!(
-            "memory backend 'postgres' requested but this build was compiled without `memory-postgres`; rebuild with `--features memory-postgres`"
-        );
     }
 
     if matches!(backend_kind, MemoryBackendKind::Qdrant) {
@@ -380,7 +357,6 @@ pub fn create_memory_with_storage_and_routes(
         &backend_name,
         workspace_dir,
         || build_sqlite_memory(config, workspace_dir, &resolved_embedding),
-        || build_postgres_memory(storage_provider),
         "",
     )
 }
@@ -395,20 +371,10 @@ pub fn create_memory_for_migration(
         );
     }
 
-    if matches!(
-        classify_memory_backend(backend),
-        MemoryBackendKind::Postgres
-    ) {
-        anyhow::bail!(
-            "memory migration for backend 'postgres' is unsupported; migrate with sqlite or markdown first"
-        );
-    }
-
     create_memory_with_builders(
         backend,
         workspace_dir,
         || SqliteMemory::new(workspace_dir),
-        || anyhow::bail!("postgres backend is not available in migration context"),
         " during migration",
     )
 }
@@ -470,6 +436,12 @@ mod tests {
         assert!(should_skip_autosave_content("[cron:auto] patrol check"));
         assert!(should_skip_autosave_content(
             "[DISTILLED_MEMORY_CHUNK 1/2] DISTILLED_INDEX_SIG:abc123"
+        ));
+        assert!(should_skip_autosave_content(
+            "[Heartbeat Task | decision] Should I run tasks?"
+        ));
+        assert!(should_skip_autosave_content(
+            "[Heartbeat Task | high] Execute scheduled patrol"
         ));
         assert!(!should_skip_autosave_content(
             "User prefers concise answers."
@@ -539,38 +511,14 @@ mod tests {
     #[test]
     fn effective_backend_name_prefers_storage_override() {
         let storage = StorageProviderConfig {
-            provider: "postgres".into(),
+            provider: "qdrant".into(),
             ..StorageProviderConfig::default()
         };
 
         assert_eq!(
             effective_memory_backend_name("sqlite", Some(&storage)),
-            "postgres"
+            "qdrant"
         );
-    }
-
-    #[test]
-    fn factory_postgres_without_db_url_is_rejected() {
-        let tmp = TempDir::new().unwrap();
-        let cfg = MemoryConfig {
-            backend: "postgres".into(),
-            ..MemoryConfig::default()
-        };
-
-        let storage = StorageProviderConfig {
-            provider: "postgres".into(),
-            db_url: None,
-            ..StorageProviderConfig::default()
-        };
-
-        let error = create_memory_with_storage(&cfg, Some(&storage), tmp.path(), None)
-            .err()
-            .expect("postgres without db_url should be rejected");
-        if cfg!(feature = "memory-postgres") {
-            assert!(error.to_string().contains("db_url"));
-        } else {
-            assert!(error.to_string().contains("memory-postgres"));
-        }
     }
 
     #[test]

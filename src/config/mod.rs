@@ -4,29 +4,36 @@ pub mod workspace;
 
 #[allow(unused_imports)]
 pub use schema::{
-    apply_runtime_proxy_to_builder, build_runtime_proxy_client,
+    apply_channel_proxy_to_builder, apply_runtime_proxy_to_builder, build_channel_proxy_client,
+    build_channel_proxy_client_with_timeouts, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
-    AgentConfig, AssemblyAiSttConfig, AuditConfig, AutonomyConfig, BackupConfig,
-    BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
-    ClassificationRule, CloudOpsConfig, ComposioConfig, Config, ConversationalAiConfig, CostConfig,
-    CronConfig, DataRetentionConfig, DeepgramSttConfig, DelegateAgentConfig, DiscordConfig,
-    DockerRuntimeConfig, EdgeTtsConfig, ElevenLabsTtsConfig, EmbeddingRouteConfig, EstopConfig,
-    FeishuConfig, GatewayConfig, GoogleSttConfig, GoogleTtsConfig, GoogleWorkspaceConfig,
+    ws_connect_with_proxy, AgentConfig, AssemblyAiSttConfig, AuditConfig, AutonomyConfig,
+    BackupConfig, BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
+    ClassificationRule, ClaudeCodeConfig, ClaudeCodeRunnerConfig, CloudOpsConfig, CodexCliConfig,
+    ComposioConfig, Config, ConversationalAiConfig, CostConfig, CronConfig, CronJobDecl,
+    CronScheduleDecl, DataRetentionConfig, DeepgramSttConfig, DelegateAgentConfig,
+    DelegateToolConfig, DiscordConfig, DockerRuntimeConfig, EdgeTtsConfig, ElevenLabsTtsConfig,
+    EmbeddingRouteConfig, EstopConfig, FeishuConfig, GatewayConfig, GeminiCliConfig,
+    GoogleSttConfig, GoogleTtsConfig, GoogleWorkspaceAllowedOperation, GoogleWorkspaceConfig,
     HardwareConfig, HardwareTransport, HeartbeatConfig, HooksConfig, HttpRequestConfig,
-    IMessageConfig, IdentityConfig, ImageProviderDalleConfig, ImageProviderFluxConfig,
-    ImageProviderImagenConfig, ImageProviderStabilityConfig, KnowledgeConfig, LarkConfig,
-    LinkedInConfig, LinkedInContentConfig, LinkedInImageConfig, MatrixConfig, McpConfig,
-    McpServerConfig, McpTransport, MemoryConfig, Microsoft365Config, ModelRouteConfig,
-    MultimodalConfig, NextcloudTalkConfig, NodeTransportConfig, NodesConfig, NotionConfig,
-    ObservabilityConfig, OpenAiSttConfig, OpenAiTtsConfig, OpenVpnTunnelConfig, OtpConfig,
-    OtpMethod, PeripheralBoardConfig, PeripheralsConfig, PluginsConfig, ProjectIntelConfig,
+    IMessageConfig, IdentityConfig, ImageGenConfig, ImageProviderDalleConfig,
+    ImageProviderFluxConfig, ImageProviderImagenConfig, ImageProviderStabilityConfig, JiraConfig,
+    KnowledgeConfig, LarkConfig, LinkEnricherConfig, LinkedInConfig, LinkedInContentConfig,
+    LinkedInImageConfig, LocalWhisperConfig, MatrixConfig, McpConfig, McpServerConfig,
+    McpTransport, MediaPipelineConfig, MemoryConfig, MemoryPolicyConfig, Microsoft365Config,
+    ModelRouteConfig, MultimodalConfig, NextcloudTalkConfig, NodeTransportConfig, NodesConfig,
+    NotionConfig, ObservabilityConfig, OpenAiSttConfig, OpenAiTtsConfig, OpenCodeCliConfig,
+    OpenVpnTunnelConfig, OtpConfig, OtpMethod, PacingConfig, PeripheralBoardConfig,
+    PeripheralsConfig, PipelineConfig, PiperTtsConfig, PluginsConfig, ProjectIntelConfig,
     ProxyConfig, ProxyScope, QdrantConfig, QueryClassificationConfig, ReliabilityConfig,
     ResourceLimitsConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig,
-    SecretsConfig, SecurityConfig, SecurityOpsConfig, SkillCreationConfig, SkillsConfig,
-    SkillsPromptInjectionMode, SlackConfig, StorageConfig, StorageProviderConfig,
-    StorageProviderSection, StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig,
-    ToolFilterGroup, ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig,
-    WebFetchConfig, WebSearchConfig, WebhookConfig, WorkspaceConfig,
+    SearchMode, SecretsConfig, SecurityConfig, SecurityOpsConfig, ShellToolConfig,
+    SkillCreationConfig, SkillImprovementConfig, SkillsConfig, SkillsPromptInjectionMode,
+    SlackConfig, SopConfig, StorageConfig, StorageProviderConfig, StorageProviderSection,
+    StreamMode, SwarmConfig, SwarmStrategy, TelegramConfig, TextBrowserConfig, ToolFilterGroup,
+    ToolFilterGroupMode, TranscriptionConfig, TtsConfig, TunnelConfig, VerifiableIntentConfig,
+    WebFetchConfig, WebSearchConfig, WebhookConfig, WhatsAppChatPolicy, WhatsAppWebMode,
+    WorkspaceConfig, DEFAULT_GWS_SERVICES,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
@@ -56,6 +63,7 @@ mod tests {
             interrupt_on_new_message: false,
             mention_only: false,
             ack_reactions: None,
+            proxy_url: None,
         };
 
         let discord = DiscordConfig {
@@ -63,7 +71,12 @@ mod tests {
             guild_id: Some("123".into()),
             allowed_users: vec![],
             listen_to_bots: false,
+            interrupt_on_new_message: false,
             mention_only: false,
+            proxy_url: None,
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            multi_message_delay_ms: 800,
         };
 
         let lark = LarkConfig {
@@ -76,6 +89,7 @@ mod tests {
             use_feishu: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         };
         let feishu = FeishuConfig {
             app_id: "app-id".into(),
@@ -85,6 +99,7 @@ mod tests {
             allowed_users: vec![],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         };
 
         let nextcloud_talk = NextcloudTalkConfig {
@@ -92,6 +107,8 @@ mod tests {
             app_token: "app-token".into(),
             webhook_secret: None,
             allowed_users: vec!["*".into()],
+            proxy_url: None,
+            bot_name: None,
         };
 
         assert_eq!(telegram.allowed_users.len(), 1);

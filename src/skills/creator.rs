@@ -106,8 +106,14 @@ impl SkillCreator {
         // Trim leading/trailing hyphens, then truncate.
         let trimmed = collapsed.trim_matches('-');
         if trimmed.len() > 64 {
-            // Truncate at a hyphen boundary if possible.
-            let truncated = &trimmed[..64];
+            // Find the nearest valid character boundary at or before 64 bytes.
+            let safe_index = trimmed
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= 64)
+                .last()
+                .unwrap_or(0);
+            let truncated = &trimmed[..safe_index];
             truncated.trim_end_matches('-').to_string()
         } else {
             trimmed.to_string()

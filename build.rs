@@ -11,6 +11,7 @@ fn main() {
     println!("cargo:rerun-if-changed=web/src");
     println!("cargo:rerun-if-changed=web/public");
     println!("cargo:rerun-if-changed=web/index.html");
+    println!("cargo:rerun-if-changed=docs/assets/zeroclaw-trans.png");
     println!("cargo:rerun-if-changed=web/package.json");
     println!("cargo:rerun-if-changed=web/package-lock.json");
     println!("cargo:rerun-if-changed=web/tsconfig.json");
@@ -83,6 +84,7 @@ fn main() {
     }
 
     ensure_dist_dir(dist_dir);
+    ensure_dashboard_assets(dist_dir);
 }
 
 fn web_build_required(web_dir: &Path, dist_dir: &Path) -> bool {
@@ -133,6 +135,24 @@ fn latest_modified(path: &Path) -> Option<SystemTime> {
 fn ensure_dist_dir(dist_dir: &Path) {
     if !dist_dir.exists() {
         std::fs::create_dir_all(dist_dir).expect("failed to create web/dist/");
+    }
+}
+
+fn ensure_dashboard_assets(dist_dir: &Path) {
+    // The Rust gateway serves `web/dist/` via rust-embed under `/_app/*`.
+    // Some builds may end up with missing/blank logo assets, so we ensure the
+    // expected image is always present in `web/dist/` at compile time.
+    let src = Path::new("docs/assets/zeroclaw-trans.png");
+    if !src.exists() {
+        eprintln!(
+            "cargo:warning=docs/assets/zeroclaw-trans.png not found; skipping dashboard asset copy"
+        );
+        return;
+    }
+
+    let dst = dist_dir.join("zeroclaw-trans.png");
+    if let Err(e) = fs::copy(src, &dst) {
+        eprintln!("cargo:warning=Failed to copy zeroclaw-trans.png into web/dist/: {e}");
     }
 }
 

@@ -76,7 +76,7 @@ Operational note for container users:
 
 | Key | Default | Purpose |
 |---|---|---|
-| `compact_context` | `false` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
+| `compact_context` | `true` | When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models |
 | `max_tool_iterations` | `10` | Maximum tool-call loop turns per user message across CLI, gateway, and channels |
 | `max_history_messages` | `50` | Maximum conversation history messages retained per session |
 | `parallel_tools` | `false` | Enable parallel tool execution within a single iteration |
@@ -120,6 +120,34 @@ tools = ["mcp_vikunja_*"]
 mode = "dynamic"
 tools = ["mcp_browser_*"]
 keywords = ["browse", "navigate", "open url", "screenshot"]
+```
+
+## `[pacing]`
+
+Pacing controls for slow/local LLM workloads (Ollama, llama.cpp, vLLM). All keys are optional; when absent, existing behavior is preserved.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `step_timeout_secs` | _none_ | Per-step timeout: maximum seconds for a single LLM inference turn. Catches a truly hung model without terminating the overall task loop |
+| `loop_detection_min_elapsed_secs` | _none_ | Minimum elapsed seconds before loop detection activates. Tasks completing under this threshold get aggressive loop protection; longer-running tasks receive a grace period |
+| `loop_ignore_tools` | `[]` | Tool names excluded from identical-output loop detection. Useful for browser workflows where `browser_screenshot` structurally resembles a loop |
+| `message_timeout_scale_max` | `4` | Override for the hardcoded timeout scaling cap. The channel message timeout budget is `message_timeout_secs * min(max_tool_iterations, message_timeout_scale_max)` |
+
+Notes:
+
+- These settings are intended for local/slow LLM deployments. Cloud-provider users typically do not need them.
+- `step_timeout_secs` operates independently of the total channel message timeout budget. A step timeout abort does not consume the overall budget; the loop simply stops.
+- `loop_detection_min_elapsed_secs` delays loop-detection counting, not the task itself. Loop protection remains fully active for short tasks (the default).
+- `loop_ignore_tools` only suppresses tool-output-based loop detection for the listed tools. Other safety features (max iterations, overall timeout) remain active.
+- `message_timeout_scale_max` must be >= 1. Setting it higher than `max_tool_iterations` has no additional effect (the formula uses `min()`).
+- Example configuration for a slow local Ollama deployment:
+
+```toml
+[pacing]
+step_timeout_secs = 120
+loop_detection_min_elapsed_secs = 60
+loop_ignore_tools = ["browser_screenshot", "browser_navigate"]
+message_timeout_scale_max = 8
 ```
 
 ## `[security.otp]`
@@ -185,12 +213,15 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `max_iterations` | `10` | Max tool-call iterations for agentic mode |
 | `timeout_secs` | `120` | Timeout in seconds for non-agentic provider calls (1–3600) |
 | `agentic_timeout_secs` | `300` | Timeout in seconds for agentic sub-agent loops (1–3600) |
+| `skills_directory` | unset | Optional skills directory path (workspace-relative) for scoped skill loading |
 
 Notes:
 
 - `agentic = false` preserves existing single prompt→response delegate behavior.
 - `agentic = true` requires at least one matching entry in `allowed_tools`.
 - The `delegate` tool is excluded from sub-agent allowlists to prevent re-entrant delegation loops.
+- Sub-agents receive an enriched system prompt containing: tools section (allowed tools with parameters), skills section (from scoped or default directory), workspace path, current date/time, safety constraints, and shell policy when `shell` is in the effective tool list.
+- When `skills_directory` is unset or empty, the sub-agent loads skills from the default workspace `skills/` directory. When set, skills are loaded exclusively from that directory (relative to workspace root), enabling per-agent scoped skill sets.
 
 ```toml
 [agents.researcher]
@@ -208,6 +239,14 @@ provider = "ollama"
 model = "qwen2.5-coder:32b"
 temperature = 0.2
 timeout_secs = 60
+
+[agents.code_reviewer]
+provider = "anthropic"
+model = "claude-opus-4-5"
+system_prompt = "You are an expert code reviewer focused on security and performance."
+agentic = true
+allowed_tools = ["file_read", "shell"]
+skills_directory = "skills/code-review"
 ```
 
 ## `[runtime]`
@@ -349,6 +388,63 @@ Notes:
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
 - Local/private targets are still blocked even when `"*"` is configured.
 
+## `[google_workspace]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable the `google_workspace` tool |
+| `credentials_path` | unset | Path to Google service account or OAuth credentials JSON |
+| `default_account` | unset | Default Google account passed as `--account` to `gws` |
+| `allowed_services` | (built-in list) | Services the agent may access: `drive`, `gmail`, `calendar`, `sheets`, `docs`, `slides`, `tasks`, `people`, `chat`, `classroom`, `forms`, `keep`, `meet`, `events` |
+| `rate_limit_per_minute` | `60` | Maximum `gws` calls per minute |
+| `timeout_secs` | `30` | Per-call execution timeout before kill |
+| `audit_log` | `false` | Emit an `INFO` log line for every `gws` call |
+
+### `[[google_workspace.allowed_operations]]`
+
+When this array is non-empty, only exact matches pass. An entry matches a call when
+`service`, `resource`, `sub_resource`, and `method` all agree. When the array is
+empty (the default), all combinations within `allowed_services` are available.
+
+| Key | Required | Purpose |
+|---|---|---|
+| `service` | yes | Service identifier (must match an entry in `allowed_services`) |
+| `resource` | yes | Top-level resource name (`users` for Gmail, `files` for Drive, `events` for Calendar) |
+| `sub_resource` | no | Sub-resource for 4-segment gws commands. Gmail operations use `gws gmail users <sub_resource> <method>`, so Gmail entries need `sub_resource` to match at runtime. Drive, Calendar, and most other services use 3-segment commands and omit it. |
+| `methods` | yes | One or more method names allowed on that resource/sub_resource |
+
+Gmail uses `gws gmail users <sub_resource> <method>` for all operations. A Gmail
+entry without `sub_resource` will never match at runtime. Drive and Calendar use
+3-segment commands and omit `sub_resource`.
+
+```toml
+[google_workspace]
+enabled = true
+default_account = "owner@company.com"
+allowed_services = ["gmail"]
+audit_log = true
+
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "users"
+sub_resource = "messages"
+methods = ["list", "get"]
+
+[[google_workspace.allowed_operations]]
+service = "gmail"
+resource = "users"
+sub_resource = "drafts"
+methods = ["list", "get", "create", "update"]
+```
+
+Notes:
+
+- Requires `gws` to be installed and authenticated (`gws auth login`). Install: `npm install -g @googleworkspace/cli`.
+- `credentials_path` sets `GOOGLE_APPLICATION_CREDENTIALS` before each call.
+- `allowed_services` defaults to the built-in list if omitted or empty.
+- Validation rejects duplicate `(service, resource)` pairs and duplicate methods within a single entry.
+- See `docs/superpowers/specs/2026-03-19-google-workspace-operation-allowlist.md` for the full policy model and verified workflow examples.
+
 ## `[gateway]`
 
 | Key | Default | Purpose |
@@ -357,6 +453,12 @@ Notes:
 | `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+| `path_prefix` | _(none)_ | URL path prefix for reverse-proxy deployments (e.g. `"/zeroclaw"`) |
+
+When deploying behind a reverse proxy that maps ZeroClaw to a sub-path,
+set `path_prefix` to that sub-path (e.g. `"/zeroclaw"`). All gateway
+routes will be served under this prefix. The value must start with `/`
+and must not end with `/`.
 
 ## `[autonomy]`
 
@@ -505,7 +607,7 @@ Top-level channel options are configured under `channels_config`.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
+| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x, overridable via `[pacing].message_timeout_scale_max`) |
 
 Examples:
 
@@ -520,7 +622,7 @@ Examples:
 Notes:
 
 - Default `300s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
-- Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, 4)` and a minimum of `1`.
+- Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, cap)` and a minimum of `1`. The default cap is `4`; override with `[pacing].message_timeout_scale_max`.
 - This scaling avoids false timeouts when the first LLM turn is slow/retried but later tool-loop turns still need to complete.
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
 - Values below `30` are clamped to `30` to avoid immediate timeout churn.
@@ -600,6 +702,7 @@ Native Nextcloud Talk bot integration (webhook receive + OCS send API).
 | `app_token` | Yes | Bot app token used for OCS bearer auth |
 | `webhook_secret` | Optional | Enables webhook signature verification |
 | `allowed_users` | Recommended | Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all) |
+| `bot_name` | Optional | Display name of the bot in Nextcloud Talk (e.g. `"zeroclaw"`). Used to filter out the bot's own messages and prevent feedback loops. |
 
 Notes:
 
