@@ -53,6 +53,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.93.0
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: |
           cargo build --release --locked \
