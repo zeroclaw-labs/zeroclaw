@@ -192,12 +192,17 @@ impl SecretStore {
             {
                 // On Windows, use icacls to restrict permissions to current user only
                 // Use whoami command to get full user identity (COMPUTER\User or DOMAIN\User)
-                // which is required by icacls for correct parsing
+                // which is required by icacls for correct parsing.
+                // Note: whoami returns backslashes, but icacls requires forward slashes.
                 let username = std::process::Command::new("whoami")
                     .output()
                     .ok()
                     .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .map(|o| {
+                        let name = String::from_utf8_lossy(&o.stdout);
+                        // icacls requires forward slashes (e.g., "COMPUTER/User")
+                        name.trim().replace('\\', "/")
+                    })
                     .unwrap_or_else(|| std::env::var("USERNAME").unwrap_or_default());
                 let Some(grant_arg) = build_windows_icacls_grant_arg(&username) else {
                     tracing::warn!(
