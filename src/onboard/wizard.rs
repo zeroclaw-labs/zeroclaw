@@ -3856,8 +3856,12 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     bot_token: token,
                     allowed_users,
                     stream_mode: existing_tg.map(|t| t.stream_mode).unwrap_or_default(),
-                    draft_update_interval_ms: existing_tg.map(|t| t.draft_update_interval_ms).unwrap_or(1000),
-                    interrupt_on_new_message: existing_tg.map(|t| t.interrupt_on_new_message).unwrap_or(false),
+                    draft_update_interval_ms: existing_tg
+                        .map(|t| t.draft_update_interval_ms)
+                        .unwrap_or(1000),
+                    interrupt_on_new_message: existing_tg
+                        .map(|t| t.interrupt_on_new_message)
+                        .unwrap_or(false),
                     mention_only: existing_tg.map(|t| t.mention_only).unwrap_or(false),
                     ack_reactions: existing_tg.and_then(|t| t.ack_reactions),
                     proxy_url: existing_tg.and_then(|t| t.proxy_url.clone()),
@@ -3986,12 +3990,20 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     guild_id: if guild.is_empty() { None } else { Some(guild) },
                     allowed_users,
                     listen_to_bots: existing_dc.map(|d| d.listen_to_bots).unwrap_or(false),
-                    interrupt_on_new_message: existing_dc.map(|d| d.interrupt_on_new_message).unwrap_or(false),
+                    interrupt_on_new_message: existing_dc
+                        .map(|d| d.interrupt_on_new_message)
+                        .unwrap_or(false),
                     mention_only: existing_dc.map(|d| d.mention_only).unwrap_or(false),
                     proxy_url: existing_dc.and_then(|d| d.proxy_url.clone()),
-                    stream_mode: existing_dc.map(|d| d.stream_mode).unwrap_or(StreamMode::MultiMessage),
-                    draft_update_interval_ms: existing_dc.map(|d| d.draft_update_interval_ms).unwrap_or(1000),
-                    multi_message_delay_ms: existing_dc.map(|d| d.multi_message_delay_ms).unwrap_or(800),
+                    stream_mode: existing_dc
+                        .map(|d| d.stream_mode)
+                        .unwrap_or(StreamMode::MultiMessage),
+                    draft_update_interval_ms: existing_dc
+                        .map(|d| d.draft_update_interval_ms)
+                        .unwrap_or(1000),
+                    multi_message_delay_ms: existing_dc
+                        .map(|d| d.multi_message_delay_ms)
+                        .unwrap_or(800),
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -4149,15 +4161,23 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     } else {
                         Some(channel)
                     },
-                    channel_ids: existing_sl.map(|s| s.channel_ids.clone()).unwrap_or_default(),
+                    channel_ids: existing_sl
+                        .map(|s| s.channel_ids.clone())
+                        .unwrap_or_default(),
                     allowed_users,
-                    interrupt_on_new_message: existing_sl.map(|s| s.interrupt_on_new_message).unwrap_or(false),
+                    interrupt_on_new_message: existing_sl
+                        .map(|s| s.interrupt_on_new_message)
+                        .unwrap_or(false),
                     thread_replies: existing_sl.and_then(|s| s.thread_replies),
                     mention_only: existing_sl.map(|s| s.mention_only).unwrap_or(false),
-                    use_markdown_blocks: existing_sl.map(|s| s.use_markdown_blocks).unwrap_or(false),
+                    use_markdown_blocks: existing_sl
+                        .map(|s| s.use_markdown_blocks)
+                        .unwrap_or(false),
                     proxy_url: existing_sl.and_then(|s| s.proxy_url.clone()),
                     stream_drafts: existing_sl.map(|s| s.stream_drafts).unwrap_or(false),
-                    draft_update_interval_ms: existing_sl.map(|s| s.draft_update_interval_ms).unwrap_or(1200),
+                    draft_update_interval_ms: existing_sl
+                        .map(|s| s.draft_update_interval_ms)
+                        .unwrap_or(1200),
                     cancel_reaction: existing_sl.and_then(|s| s.cancel_reaction.clone()),
                 });
             }
@@ -4335,7 +4355,10 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     users_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
 
-                let has_existing_recovery = config.matrix.as_ref().is_some_and(|m| m.recovery_key.is_some());
+                let has_existing_recovery = config
+                    .matrix
+                    .as_ref()
+                    .is_some_and(|m| m.recovery_key.is_some());
                 let recovery_prompt = if has_existing_recovery {
                     "  E2EE recovery key (Enter to keep existing — see docs/security/matrix-e2ee-guide.md section 4G)"
                 } else {
@@ -4361,11 +4384,21 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     room_id,
                     allowed_users,
                     // Preserve non-prompted fields from existing config (#4655)
-                    allowed_rooms: existing_mx.map(|m| m.allowed_rooms.clone()).unwrap_or_default(),
-                    interrupt_on_new_message: existing_mx.map(|m| m.interrupt_on_new_message).unwrap_or(false),
-                    stream_mode: existing_mx.map(|m| m.stream_mode).unwrap_or(StreamMode::Partial),
-                    draft_update_interval_ms: existing_mx.map(|m| m.draft_update_interval_ms).unwrap_or(1500),
-                    multi_message_delay_ms: existing_mx.map(|m| m.multi_message_delay_ms).unwrap_or(800),
+                    allowed_rooms: existing_mx
+                        .map(|m| m.allowed_rooms.clone())
+                        .unwrap_or_default(),
+                    interrupt_on_new_message: existing_mx
+                        .map(|m| m.interrupt_on_new_message)
+                        .unwrap_or(false),
+                    stream_mode: existing_mx
+                        .map(|m| m.stream_mode)
+                        .unwrap_or(StreamMode::Partial),
+                    draft_update_interval_ms: existing_mx
+                        .map(|m| m.draft_update_interval_ms)
+                        .unwrap_or(1500),
+                    multi_message_delay_ms: existing_mx
+                        .map(|m| m.multi_message_delay_ms)
+                        .unwrap_or(800),
                     recovery_key,
                 });
             }
@@ -4562,10 +4595,16 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         allowed_numbers,
                         mode: existing_wa.map(|w| w.mode.clone()).unwrap_or_default(),
                         dm_policy: existing_wa.map(|w| w.dm_policy.clone()).unwrap_or_default(),
-                        group_policy: existing_wa.map(|w| w.group_policy.clone()).unwrap_or_default(),
+                        group_policy: existing_wa
+                            .map(|w| w.group_policy.clone())
+                            .unwrap_or_default(),
                         self_chat_mode: existing_wa.map(|w| w.self_chat_mode).unwrap_or(false),
-                        dm_mention_patterns: existing_wa.map(|w| w.dm_mention_patterns.clone()).unwrap_or_default(),
-                        group_mention_patterns: existing_wa.map(|w| w.group_mention_patterns.clone()).unwrap_or_default(),
+                        dm_mention_patterns: existing_wa
+                            .map(|w| w.dm_mention_patterns.clone())
+                            .unwrap_or_default(),
+                        group_mention_patterns: existing_wa
+                            .map(|w| w.group_mention_patterns.clone())
+                            .unwrap_or_default(),
                         proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
                     });
 
@@ -4671,10 +4710,16 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     allowed_numbers,
                     mode: existing_wa.map(|w| w.mode.clone()).unwrap_or_default(),
                     dm_policy: existing_wa.map(|w| w.dm_policy.clone()).unwrap_or_default(),
-                    group_policy: existing_wa.map(|w| w.group_policy.clone()).unwrap_or_default(),
+                    group_policy: existing_wa
+                        .map(|w| w.group_policy.clone())
+                        .unwrap_or_default(),
                     self_chat_mode: existing_wa.map(|w| w.self_chat_mode).unwrap_or(false),
-                    dm_mention_patterns: existing_wa.map(|w| w.dm_mention_patterns.clone()).unwrap_or_default(),
-                    group_mention_patterns: existing_wa.map(|w| w.group_mention_patterns.clone()).unwrap_or_default(),
+                    dm_mention_patterns: existing_wa
+                        .map(|w| w.dm_mention_patterns.clone())
+                        .unwrap_or_default(),
+                    group_mention_patterns: existing_wa
+                        .map(|w| w.group_mention_patterns.clone())
+                        .unwrap_or_default(),
                     proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
                 });
             }
@@ -7813,10 +7858,7 @@ mod tests {
         assert_eq!(config.discord.as_ref().unwrap().bot_token, "keep-me");
 
         // Matrix should reflect the update
-        assert_eq!(
-            config.matrix.as_ref().unwrap().access_token,
-            "new-token"
-        );
+        assert_eq!(config.matrix.as_ref().unwrap().access_token, "new-token");
     }
 
     #[test]
@@ -7853,9 +7895,7 @@ mod tests {
         let preserved_draft_ms = existing_mx
             .map(|m| m.draft_update_interval_ms)
             .unwrap_or(1500);
-        let preserved_multi_ms = existing_mx
-            .map(|m| m.multi_message_delay_ms)
-            .unwrap_or(800);
+        let preserved_multi_ms = existing_mx.map(|m| m.multi_message_delay_ms).unwrap_or(800);
 
         assert_eq!(preserved_rooms, vec!["!keep:m.org".to_string()]);
         assert!(preserved_interrupt);
