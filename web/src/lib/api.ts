@@ -307,6 +307,15 @@ export function getSession(id: string): Promise<Session> {
   return apiFetch<Session>(`/api/sessions/${encodeURIComponent(id)}`);
 }
 
+export interface HistoryMessage {
+  role: 'user' | 'assistant' | 'system';
+  content: string;
+}
+
+export function getSessionHistory(id: string): Promise<{ session_id: string; history: HistoryMessage[] }> {
+  return apiFetch<{ session_id: string; history: HistoryMessage[] }>(`/api/sessions/${encodeURIComponent(id)}/history`);
+}
+
 // ---------------------------------------------------------------------------
 // Channels (detailed)
 // ---------------------------------------------------------------------------
