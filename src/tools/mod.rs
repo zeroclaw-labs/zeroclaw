@@ -750,10 +750,30 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    // Session-to-session messaging tools (always available when sessions dir exists)
+    // Session-to-session messaging tools (always available when sessions dir exists).
+    // Build a composite backend that merges channel sessions (JSONL file store)
+    // with gateway sessions (SQLite) so the agent can see all sessions regardless
+    // of which persistence layer stores them.
     if let Ok(session_store) = crate::channels::session_store::SessionStore::new(workspace_dir) {
-        let backend: Arc<dyn crate::channels::session_backend::SessionBackend> =
+        let file_backend: Arc<dyn crate::channels::session_backend::SessionBackend> =
             Arc::new(session_store);
+
+        let backend: Arc<dyn crate::channels::session_backend::SessionBackend> =
+            if let Ok(sqlite_backend) =
+                crate::channels::session_sqlite::SqliteSessionBackend::new(workspace_dir)
+            {
+                let sqlite_arc: Arc<dyn crate::channels::session_backend::SessionBackend> =
+                    Arc::new(sqlite_backend);
+                Arc::new(
+                    crate::channels::session_backend::CompositeSessionBackend::new(
+                        file_backend,
+                        sqlite_arc,
+                    ),
+                )
+            } else {
+                file_backend
+            };
+
         tool_arcs.push(Arc::new(SessionsListTool::new(backend.clone())));
         tool_arcs.push(Arc::new(SessionsHistoryTool::new(
             backend.clone(),
