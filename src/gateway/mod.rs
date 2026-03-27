@@ -23,9 +23,9 @@ pub mod tls;
 pub mod ws;
 
 use crate::channels::{
-    session_backend::SessionBackend, session_sqlite::SqliteSessionBackend, Channel,
-    GmailPushChannel, LineChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
-    WhatsAppChannel,
+    Channel, GmailPushChannel, LineChannel, LinqChannel, NextcloudTalkChannel, SendMessage,
+    WatiChannel, WhatsAppChannel, session_backend::SessionBackend,
+    session_sqlite::SqliteSessionBackend,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;

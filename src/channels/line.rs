@@ -1,7 +1,7 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use anyhow::Result;
 use async_trait::async_trait;
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::path::Path;
@@ -752,9 +752,11 @@ mod tests {
         let msg = crate::channels::traits::SendMessage::new("hello", "U999");
         let result = ch.send_with_reply_token(&msg, None).await;
         assert!(result.is_err(), "reply_only without token must return Err");
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("reply_only mode but no replyToken"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("reply_only mode but no replyToken")
+        );
     }
 }
