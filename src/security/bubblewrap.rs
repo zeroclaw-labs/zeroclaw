@@ -36,7 +36,7 @@ impl BubblewrapSandbox {
         Command::new("bwrap")
             .arg("--help")
             .output()
-            .map(|o| String::from_utf8_lossy(&o).contains("--seccomp"))
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("--seccomp"))
             .unwrap_or(false)
     }
 }
