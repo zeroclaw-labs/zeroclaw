@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::{policy::ToolOperation, SecurityPolicy};
+use crate::security::{SecurityPolicy, policy::ToolOperation};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;

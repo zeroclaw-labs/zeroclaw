@@ -142,7 +142,10 @@ impl InteractiveSessionState {
     }
 }
 
-pub(crate) fn load_interactive_session_history(path: &Path, system_prompt: &str) -> Result<Vec<ChatMessage>> {
+pub(crate) fn load_interactive_session_history(
+    path: &Path,
+    system_prompt: &str,
+) -> Result<Vec<ChatMessage>> {
     if !path.exists() {
         return Ok(vec![ChatMessage::system(system_prompt)]);
     }

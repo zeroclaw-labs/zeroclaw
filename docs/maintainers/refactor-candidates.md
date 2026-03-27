@@ -98,10 +98,6 @@ The project claims size optimization as a goal (`opt-level = "z"`, `lto = "fat"`
 
 Two instances in `src/service/mod.rs` for `libc::getuid()` — no `// SAFETY:` comment. Could use the `nix` crate's safe wrapper instead.
 
-### Low: Python code quality
-
-The `python/` subtree has minimal type hints, no docstrings on key functions, and no parametrized tests. Inconsistent with the Rust side's rigor.
-
 ### Low: Minimal `rustfmt.toml`
 
 Only sets `edition = "2021"`. For a project this size, configuring `max_width`, `imports_granularity`, `group_imports` would enforce consistency as contributor count grows.

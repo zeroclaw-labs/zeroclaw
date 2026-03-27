@@ -985,10 +985,8 @@ impl SlackChannel {
             .filter(|thread_ts| Self::is_valid_slack_ts(thread_ts))
             .map(str::to_string);
 
-        let formatted = self
-            .format_permalink_context(permalink, message, thread_ts.as_deref())
-            .await;
-        formatted
+        self.format_permalink_context(permalink, message, thread_ts.as_deref())
+            .await
     }
 
     async fn fetch_permalink_message(
@@ -1014,7 +1012,9 @@ impl SlackChannel {
             Err(err) => {
                 tracing::warn!(
                     "Slack permalink resolver: conversations.history request failed for channel={} ts={}: {}",
-                    channel_id, message_ts, err
+                    channel_id,
+                    message_ts,
+                    err
                 );
                 return SlackPermalinkLookup::NotFound;
             }
@@ -1029,7 +1029,10 @@ impl SlackChannel {
             let sanitized = crate::providers::sanitize_api_error(&body);
             tracing::warn!(
                 "Slack permalink resolver: conversations.history failed for channel={} ts={} ({}): {}",
-                channel_id, message_ts, status, sanitized
+                channel_id,
+                message_ts,
+                status,
+                sanitized
             );
             return SlackPermalinkLookup::NotFound;
         }
@@ -1740,11 +1743,7 @@ impl SlackChannel {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        if mime.is_empty() {
-            None
-        } else {
-            Some(mime)
-        }
+        if mime.is_empty() { None } else { Some(mime) }
     }
 
     fn is_supported_image_mime(mime: &str) -> bool {
@@ -4305,10 +4304,10 @@ mod tests {
         assert!(
             SlackChannel::parse_slack_permalink("https://acme.slack.com/client/T1/C1").is_none()
         );
-        assert!(SlackChannel::parse_slack_permalink(
-            "https://acme.slack.com/archives/C1/not-a-message"
-        )
-        .is_none());
+        assert!(
+            SlackChannel::parse_slack_permalink("https://acme.slack.com/archives/C1/not-a-message")
+                .is_none()
+        );
     }
 
     #[test]

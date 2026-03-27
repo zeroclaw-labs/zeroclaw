@@ -1199,8 +1199,10 @@ mod tests {
         fn set(key: &str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
             match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
+                // SAFETY: test-only, single-threaded test runner.
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(key) },
             }
             Self {
                 key: key.to_string(),
@@ -1212,8 +1214,10 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.original {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
+                // SAFETY: test-only, single-threaded test runner.
+                Some(v) => unsafe { std::env::set_var(&self.key, v) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(&self.key) },
             }
         }
     }

@@ -46,7 +46,6 @@ zeroclaw/
 ├── docs/contributing/extension-examples.md  # Extension examples (custom provider/channel/tool/memory)
 ├── firmware/             # Embedded firmware for Arduino, ESP32, Nucleo boards
 ├── web/                  # Web UI (Vite + TypeScript)
-├── python/               # Python SDK / tools bridge
 ├── dev/                  # Local dev tooling (Docker, CI scripts, sandbox)
 ├── scripts/              # CI scripts, release automation, bootstrap
 ├── docs/                 # Documentation system (multilingual, runtime refs)
@@ -200,7 +199,6 @@ Sandboxing: `bubblewrap.rs`, `firejail.rs`, `landlock.rs`, `docker.rs`, `detect.
 | `docs/contributing/extension-examples.md` | Extension examples for custom providers, channels, tools, and memory backends |
 | `firmware/` | Embedded firmware: `arduino/`, `esp32/`, `esp32-ui/`, `nucleo/`, `uno-q-bridge/` |
 | `web/` | Web UI frontend (Vite + TypeScript) |
-| `python/` | Python SDK / tools bridge with its own tests |
 | `dev/` | Local development: Docker Compose, CI script (`ci.sh`), config template, sandbox configs |
 | `scripts/` | CI helpers, release automation, bootstrap, contributor tier computation |
 | `docs/` | Documentation system: multilingual (en/zh-CN/ja/ru/fr/vi), runtime references, operations runbooks, security proposals |

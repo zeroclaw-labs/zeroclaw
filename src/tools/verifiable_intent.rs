@@ -5,14 +5,14 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use crate::tools::traits::{Tool, ToolResult};
 use crate::verifiable_intent::error::ViError;
 use crate::verifiable_intent::types::{Constraint, Fulfillment};
 use crate::verifiable_intent::verification::{
-    check_constraints, verify_sd_hash_binding, verify_timestamps, ConstraintCheckResult,
-    StrictnessMode,
+    ConstraintCheckResult, StrictnessMode, check_constraints, verify_sd_hash_binding,
+    verify_timestamps,
 };
 
 /// Tool for verifying Verifiable Intent credential chains and evaluating

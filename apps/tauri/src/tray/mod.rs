@@ -5,8 +5,8 @@ pub mod icon;
 pub mod menu;
 
 use tauri::{
-    tray::{TrayIcon, TrayIconBuilder, TrayIconEvent},
     App, Manager, Runtime,
+    tray::{TrayIcon, TrayIconBuilder, TrayIconEvent},
 };
 
 /// Set up the system tray icon and menu.
