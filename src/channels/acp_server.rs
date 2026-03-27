@@ -326,12 +326,20 @@ impl AcpServer {
 
         let sessions_ref = Arc::clone(&self.sessions);
         let sid = session_id.clone();
+        let provider_name = self
+            .config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
 
         // Run turn_streamed in a spawned task. The task takes ownership of
         // the whole Session and returns it alongside the result so we can
         // put the session back into the map afterwards.
         let turn_handle = tokio::spawn(async move {
-            let result = session.agent.turn_streamed(&prompt, event_tx).await;
+            let result = session
+                .agent
+                .turn_streamed(&prompt, event_tx, &provider_name)
+                .await;
             (session, result)
         });
 
@@ -376,6 +384,8 @@ impl AcpServer {
                         "content": delta,
                     }),
                 },
+                // Trace events are internal observability events, not forwarded to ACP clients
+                TurnEvent::Trace { .. } => continue,
             };
             self.write_notification(&notification).await;
         }
