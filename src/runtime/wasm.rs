@@ -1,4 +1,4 @@
-//! Minimal in-process WASM runtime.
+//! WASM sandbox runtime — in-process tool isolation.
 //!
 //! This runtime is intentionally narrow:
 //! - runs a single `.wasm` module per invocation
@@ -13,6 +13,11 @@
 //! That matches the immediate goal: make `runtime.kind = "wasm"` real in the
 //! main runtime factory without pretending that the whole ZeroClaw process can
 //! already live inside WASM.
+//!
+//! # Feature gate
+//! This module is only compiled when `--features runtime-wasm` is enabled.
+//! The default ZeroClaw binary still excludes it unless the feature is
+//! requested explicitly.
 
 use super::traits::RuntimeAdapter;
 use crate::config::WasmRuntimeConfig;
@@ -25,24 +30,36 @@ pub struct WasmRuntime {
     workspace_dir: Option<PathBuf>,
 }
 
+/// Result of executing a WASM module.
 #[derive(Debug, Clone)]
 pub struct WasmExecutionResult {
+    /// Standard output captured from the module.
     pub stdout: String,
+    /// Standard error captured from the module.
     pub stderr: String,
+    /// Exit code (0 = success).
     pub exit_code: i32,
+    /// Fuel consumed during execution.
     pub fuel_consumed: u64,
 }
 
+/// Capabilities granted to a WASM tool module.
 #[derive(Debug, Clone, Default)]
 pub struct WasmCapabilities {
+    /// Allow reading files from workspace.
     pub read_workspace: bool,
+    /// Allow writing files to workspace.
     pub write_workspace: bool,
+    /// Allowed HTTP hosts (reserved for a future host-mediated network bridge).
     pub allowed_hosts: Vec<String>,
+    /// Custom fuel override (0 = use config default).
     pub fuel_override: u64,
+    /// Custom memory override in MB (0 = use config default).
     pub memory_override_mb: u64,
 }
 
 impl WasmRuntime {
+    /// Create a new WASM runtime with the given configuration.
     pub fn new(config: WasmRuntimeConfig) -> Self {
         Self {
             config,
@@ -50,6 +67,7 @@ impl WasmRuntime {
         }
     }
 
+    /// Create a WASM runtime bound to a specific workspace directory.
     pub fn with_workspace(config: WasmRuntimeConfig, workspace_dir: PathBuf) -> Self {
         Self {
             config,
@@ -57,10 +75,12 @@ impl WasmRuntime {
         }
     }
 
+    /// Check if the WASM runtime feature is available in this build.
     pub fn is_available() -> bool {
         cfg!(feature = "runtime-wasm")
     }
 
+    /// Validate the WASM config for common misconfigurations.
     pub fn validate_config(&self) -> Result<()> {
         if self.config.memory_limit_mb == 0 {
             bail!("runtime.wasm.memory_limit_mb must be > 0");
@@ -81,10 +101,12 @@ impl WasmRuntime {
         Ok(())
     }
 
+    /// Resolve the absolute path to the WASM tools directory.
     pub fn tools_dir(&self, workspace_dir: &Path) -> PathBuf {
         workspace_dir.join(&self.config.tools_dir)
     }
 
+    /// Build capabilities from config defaults.
     pub fn default_capabilities(&self) -> WasmCapabilities {
         WasmCapabilities {
             read_workspace: self.config.allow_workspace_read,
@@ -95,6 +117,7 @@ impl WasmRuntime {
         }
     }
 
+    /// Get the effective fuel limit for an invocation.
     pub fn effective_fuel(&self, caps: &WasmCapabilities) -> u64 {
         if caps.fuel_override > 0 {
             caps.fuel_override
@@ -103,6 +126,7 @@ impl WasmRuntime {
         }
     }
 
+    /// Get the effective memory limit in bytes.
     pub fn effective_memory_bytes(&self, caps: &WasmCapabilities) -> u64 {
         let mb = if caps.memory_override_mb > 0 {
             caps.memory_override_mb
@@ -173,6 +197,7 @@ impl WasmRuntime {
 
         let fuel_before = store.get_fuel().unwrap_or(fuel);
 
+        // Support both a pure `run() -> i32` tool contract and `_start()`.
         let execution = if let Ok(run_fn) = instance.get_typed_func::<(), i32>(&mut store, "run") {
             run_fn
                 .call(&mut store, ())
@@ -229,6 +254,7 @@ impl WasmRuntime {
         )
     }
 
+    /// List available WASM tool modules in the tools directory.
     pub fn list_modules(&self, workspace_dir: &Path) -> Result<Vec<String>> {
         self.validate_config()?;
 
