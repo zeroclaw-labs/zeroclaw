@@ -121,6 +121,19 @@ pub struct Config {
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
 
+    /// Provider-specific environment variables injected at daemon startup.
+    ///
+    /// Use this to store API keys for secondary providers without relying on
+    /// shell environment or wrapper scripts.
+    ///
+    /// ```toml
+    /// [provider_env]
+    /// MODELSTUDIO_API_KEY = "sk-sp-..."
+    /// DASHSCOPE_API_KEY = "sk-..."
+    /// ```
+    #[serde(default)]
+    pub provider_env: HashMap<String, String>,
+
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -8227,6 +8240,7 @@ impl Default for Config {
             provider_timeout_secs: default_provider_timeout_secs(),
             provider_max_tokens: None,
             extra_headers: HashMap::new(),
+            provider_env: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             trust: crate::trust::TrustConfig::default(),
@@ -8333,9 +8347,27 @@ fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
 /// Returns `true` if `path` lives under the OS temp directory.
 fn is_temp_directory(path: &Path) -> bool {
     let temp = std::env::temp_dir();
+
+    // Fast path: exact lexical prefix match.
+    // Handles the case where canonicalization fails but paths match directly.
+    if path.starts_with(&temp) {
+        return true;
+    }
+
     // Canonicalize when possible to handle symlinks (macOS /var → /private/var)
     let canon_temp = temp.canonicalize().unwrap_or_else(|_| temp.clone());
-    let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    // If the path doesn't exist yet, canonicalize() will fail (io::Error NotFound).
+    // In that case, we can try to canonicalize its parent directory to resolve symlinks.
+    let canon_path = path.canonicalize().unwrap_or_else(|_| {
+        if let Some(parent) = path.parent() {
+            if let Ok(canon_parent) = parent.canonicalize() {
+                return canon_parent.join(path.file_name().unwrap_or_default());
+            }
+        }
+        path.to_path_buf()
+    });
+
     canon_path.starts_with(&canon_temp)
 }
 
@@ -9224,6 +9256,16 @@ impl Config {
             }
 
             config.apply_env_overrides();
+
+            // Inject provider_env entries as process environment variables
+            // so that provider credential resolution picks them up automatically.
+            for (key, value) in &config.provider_env {
+                if std::env::var(key).is_err() {
+                    std::env::set_var(key, value);
+                    tracing::debug!(key = %key, "Injected provider_env into process environment");
+                }
+            }
+
             config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
@@ -10808,7 +10850,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         let dir = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
@@ -10898,6 +10940,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
+    #[cfg(unix)]
     use tempfile::TempDir;
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
@@ -11310,6 +11353,7 @@ auto_save = true
             provider_timeout_secs: 120,
             provider_max_tokens: None,
             extra_headers: HashMap::new(),
+            provider_env: HashMap::new(),
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -11917,6 +11961,7 @@ default_temperature = 0.7
             provider_timeout_secs: 120,
             provider_max_tokens: None,
             extra_headers: HashMap::new(),
+            provider_env: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             trust: crate::trust::TrustConfig::default(),

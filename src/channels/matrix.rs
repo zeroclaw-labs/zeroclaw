@@ -1171,10 +1171,22 @@ impl Channel for MatrixChannel {
                     tracing::warn!("Matrix failed to start typing notification: {error}");
                 }
 
+                // Always root a thread at the incoming message. Without this,
+                // the first exchange uses thread_ts=None (room-level session key)
+                // but Matrix implicitly creates a thread, so the follow-up arrives
+                // with a different thread_ts (the bot's response event ID), causing
+                // a session key mismatch and loss of context. See #4804.
                 let thread_ts = match &event.content.relates_to {
                     Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
-                    _ => None,
+                    _ => Some(event_id.clone()),
                 };
+
+                tracing::debug!(
+                    thread_ts = ?thread_ts,
+                    event_id = %event_id,
+                    "Matrix message thread context"
+                );
+
                 let msg = ChannelMessage {
                     id: event_id,
                     sender: sender.clone(),

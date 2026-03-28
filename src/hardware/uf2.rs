@@ -364,7 +364,10 @@ mod tests {
         // Either succeeds (real UF2) or fails with a clear placeholder message.
         match result {
             Ok(dir) => {
-                assert!(dir.exists(), "firmware dir should exist after ensure_firmware_dir");
+                assert!(
+                    dir.exists(),
+                    "firmware dir should exist after ensure_firmware_dir"
+                );
                 assert!(dir.ends_with("pico"), "firmware dir should end with 'pico'");
             }
             Err(e) => {
@@ -416,7 +419,10 @@ mod tests {
 
         let port = std::path::Path::new("/dev/ttyACM_fake_test");
         let result = deploy_main_py(port, firmware_dir).await;
-        assert!(result.is_err(), "deploy should fail when main.py is missing");
+        assert!(
+            result.is_err(),
+            "deploy should fail when main.py is missing"
+        );
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("main.py not found"),
