@@ -45,6 +45,7 @@ pub struct MatrixChannel {
     voice_mode: Arc<AtomicBool>,
     otk_conflict_detected: Arc<AtomicBool>,
     recovery_key: Option<String>,
+    mention_only: bool,
     transcription: Option<crate::config::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
     stream_mode: crate::config::StreamMode,
@@ -245,6 +246,7 @@ impl MatrixChannel {
             voice_mode: Arc::new(AtomicBool::new(false)),
             otk_conflict_detected: Arc::new(AtomicBool::new(false)),
             recovery_key,
+            mention_only: false,
             transcription: None,
             transcription_manager: None,
             stream_mode: crate::config::StreamMode::Off,
@@ -268,6 +270,27 @@ impl MatrixChannel {
         self.draft_update_interval_ms = draft_update_interval_ms;
         self.multi_message_delay_ms = multi_message_delay_ms;
         self
+    }
+
+    /// When true, only respond to messages that @-mention the bot in group rooms.
+    pub fn with_mention_only(mut self, mention_only: bool) -> Self {
+        self.mention_only = mention_only;
+        self
+    }
+
+    /// Check whether a message body contains a mention of the bot's user ID.
+    fn body_contains_mention(body: &str, bot_user_id: &str) -> bool {
+        body.contains(bot_user_id)
+    }
+
+    /// Strip the bot's user ID mention from the message body.
+    fn strip_mention(body: &str, bot_user_id: &str) -> String {
+        body.replace(bot_user_id, "").trim().to_string()
+    }
+
+    /// Determine if a room is a DM (≤2 joined members).
+    fn is_dm_room(joined_member_count: u64) -> bool {
+        joined_member_count <= 2
     }
 
     /// Configure voice transcription for audio messages.
@@ -978,6 +1001,7 @@ impl Channel for MatrixChannel {
         let access_token_for_handler = self.access_token.clone();
         let voice_mode_for_handler = Arc::clone(&self.voice_mode);
         let transcription_mgr_for_handler = self.transcription_manager.clone();
+        let mention_only_for_handler = self.mention_only;
 
         client.add_event_handler(move |event: OriginalSyncRoomMessageEvent, room: Room| {
             let tx = tx_handler.clone();
@@ -990,6 +1014,7 @@ impl Channel for MatrixChannel {
             let access_token = access_token_for_handler.clone();
             let voice_mode = Arc::clone(&voice_mode_for_handler);
             let transcription_mgr = transcription_mgr_for_handler.clone();
+            let mention_only = mention_only_for_handler;
 
             async move {
                 // Room filtering: use allowed_rooms if set, otherwise fall back to single room_id
@@ -1029,6 +1054,26 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
+                // Mention gate: in group rooms, require @-mention when mention_only is enabled.
+                // DMs (rooms with ≤2 joined members) bypass this gate.
+                if mention_only
+                    && !MatrixChannel::is_dm_room(room.joined_members_count())
+                {
+                    let bot_id_str = my_user_id.as_str();
+                    let body_text = match &event.content.msgtype {
+                        MessageType::Text(c) => c.body.as_str(),
+                        MessageType::Notice(c) => c.body.as_str(),
+                        _ => "",
+                    };
+                    if !MatrixChannel::body_contains_mention(body_text, bot_id_str) {
+                        tracing::debug!(
+                            "Matrix: ignoring message (mention_only enabled, no mention of {})",
+                            bot_id_str
+                        );
+                        return;
+                    }
+                }
+
                 // Helper: extract mxc:// download URL and filename for media types
                 let media_info = |source: &MediaSource, name: &str| -> Option<(String, String)> {
                     match source {
@@ -1063,6 +1108,18 @@ impl Channel for MatrixChannel {
                     }
                     _ => return,
                 };
+
+                // Strip bot mention from body when mention_only is active
+                let body = if mention_only {
+                    MatrixChannel::strip_mention(&body, my_user_id.as_str())
+                } else {
+                    body
+                };
+
+                if body.is_empty() {
+                    tracing::debug!("Matrix: ignoring empty message after mention stripping");
+                    return;
+                }
 
                 // Download media to workspace if present
                 let body = if let Some((url, filename)) = media_download {
@@ -1171,10 +1228,22 @@ impl Channel for MatrixChannel {
                     tracing::warn!("Matrix failed to start typing notification: {error}");
                 }
 
+                // Always root a thread at the incoming message. Without this,
+                // the first exchange uses thread_ts=None (room-level session key)
+                // but Matrix implicitly creates a thread, so the follow-up arrives
+                // with a different thread_ts (the bot's response event ID), causing
+                // a session key mismatch and loss of context. See #4804.
                 let thread_ts = match &event.content.relates_to {
                     Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
-                    _ => None,
+                    _ => Some(event_id.clone()),
                 };
+
+                tracing::debug!(
+                    thread_ts = ?thread_ts,
+                    event_id = %event_id,
+                    "Matrix message thread context"
+                );
+
                 let msg = ChannelMessage {
                     id: event_id,
                     sender: sender.clone(),
@@ -2316,5 +2385,81 @@ mod tests {
         let sanitized = MatrixChannel::sanitize_error_for_log(&"auth failed: sk-proj-abc123xyz");
         assert!(!sanitized.contains("sk-proj-abc123xyz"));
         assert!(sanitized.contains("[REDACTED]"));
+    }
+
+    // ── mention_only tests ──
+
+    #[test]
+    fn mention_detected_with_full_user_id() {
+        assert!(MatrixChannel::body_contains_mention(
+            "@bot:matrix.org hello there",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_detected_mid_message() {
+        assert!(MatrixChannel::body_contains_mention(
+            "hey @bot:matrix.org what do you think?",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_not_detected_when_absent() {
+        assert!(!MatrixChannel::body_contains_mention(
+            "hello there",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_not_detected_partial_match() {
+        assert!(!MatrixChannel::body_contains_mention(
+            "@bot:other.org hello",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn strip_mention_from_start() {
+        let result =
+            MatrixChannel::strip_mention("@bot:matrix.org what is rust?", "@bot:matrix.org");
+        assert_eq!(result, "what is rust?");
+    }
+
+    #[test]
+    fn strip_mention_from_middle() {
+        let result =
+            MatrixChannel::strip_mention("hey @bot:matrix.org explain this", "@bot:matrix.org");
+        assert_eq!(result, "hey  explain this");
+    }
+
+    #[test]
+    fn strip_mention_only_mention_yields_empty() {
+        let result = MatrixChannel::strip_mention("@bot:matrix.org", "@bot:matrix.org");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn strip_mention_no_mention_unchanged() {
+        let result = MatrixChannel::strip_mention("hello world", "@bot:matrix.org");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn is_dm_room_two_members() {
+        assert!(MatrixChannel::is_dm_room(2));
+    }
+
+    #[test]
+    fn is_dm_room_one_member() {
+        assert!(MatrixChannel::is_dm_room(1));
+    }
+
+    #[test]
+    fn is_dm_room_group() {
+        assert!(!MatrixChannel::is_dm_room(3));
+        assert!(!MatrixChannel::is_dm_room(50));
     }
 }

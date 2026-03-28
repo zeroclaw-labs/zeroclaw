@@ -16,6 +16,7 @@
 
 pub mod acp_server;
 pub mod bluesky;
+pub mod chunker;
 pub mod clawdtalk;
 pub mod cli;
 pub mod debounce;
@@ -188,8 +189,7 @@ impl Observer for ChannelNotifyObserver {
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
 /// Senders that requested `/new` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
-/// Maximum history messages to keep per sender.
-const MAX_CHANNEL_HISTORY: usize = 50;
+
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Messages shorter than this (e.g. "ok", "thanks") are not stored,
 /// reducing noise in memory recall.
@@ -327,6 +327,7 @@ struct InterruptOnNewMessageConfig {
     discord: bool,
     mattermost: bool,
     matrix: bool,
+    whatsapp: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -337,6 +338,7 @@ impl InterruptOnNewMessageConfig {
             "discord" => self.discord,
             "mattermost" => self.mattermost,
             "matrix" => self.matrix,
+            "whatsapp" => self.whatsapp,
             _ => false,
         }
     }
@@ -2830,28 +2832,12 @@ async fn process_channel_message(
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
-    let notify_channel = target_channel.clone();
-    let notify_reply_target = msg.reply_target.clone();
-    let notify_thread_root = followup_thread_id(&msg);
-    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls {
-        Some(tokio::spawn(async move {
-            while notify_rx.recv().await.is_some() {}
-        }))
-    } else {
-        Some(tokio::spawn(async move {
-            let thread_ts = notify_thread_root;
-            while let Some(text) = notify_rx.recv().await {
-                if let Some(ref ch) = notify_channel {
-                    let _ = ch
-                        .send(
-                            &SendMessage::new(&text, &notify_reply_target)
-                                .in_thread(thread_ts.clone()),
-                        )
-                        .await;
-                }
-            }
-        }))
-    };
+    // Tool call notifications are already displayed via the draft updater (progress
+    // messages through on_delta channel), so we only consume them here without
+    // sending separate channel messages to avoid duplicate/spammy output.
+    let notify_task = Some(tokio::spawn(async move {
+        while notify_rx.recv().await.is_some() {}
+    }));
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -3724,7 +3710,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     );
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
+    if !tools.is_empty() && !native_tools {
         prompt.push_str("## Tools\n\n");
         if compact_context {
             // Compact mode: tool names only, no descriptions/schemas
@@ -3805,6 +3791,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     });
     prompt.push('\n');
+    if let Some(autonomy_config) = autonomy_config {
+        append_autonomy_constraints_once(&mut prompt, autonomy_config, workspace_dir);
+    }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -3926,6 +3915,82 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     } else {
         prompt
     }
+}
+
+pub fn autonomy_constraints_prompt(
+    autonomy: &crate::config::AutonomyConfig,
+    workspace_dir: &std::path::Path,
+) -> String {
+    use std::fmt::Write;
+
+    let autonomy_level = match autonomy.level {
+        crate::security::AutonomyLevel::ReadOnly => "read-only",
+        crate::security::AutonomyLevel::Supervised => "supervised",
+        crate::security::AutonomyLevel::Full => "full",
+    };
+
+    let mut prompt = String::from("## Autonomy Constraints\n\n");
+    let _ = writeln!(prompt, "- Current autonomy level: `{autonomy_level}`.");
+
+    if autonomy.workspace_only {
+        let _ = writeln!(
+            prompt,
+            "- File access is confined to the workspace `{}` unless a path resolves inside `allowed_roots`.",
+            workspace_dir.display()
+        );
+    } else {
+        prompt.push_str(
+            "- File access may go outside the workspace, but forbidden paths still remain blocked.\n",
+        );
+    }
+
+    if autonomy.allowed_roots.is_empty() {
+        prompt.push_str("- No extra `allowed_roots` are configured.\n");
+    } else {
+        let _ = writeln!(
+            prompt,
+            "- Extra `allowed_roots`: {}.",
+            autonomy.allowed_roots.join(", ")
+        );
+    }
+
+    match autonomy.level {
+        crate::security::AutonomyLevel::ReadOnly => {
+            prompt.push_str(
+                "- Do not attempt write operations, mutations, or side-effecting commands.\n",
+            );
+        }
+        crate::security::AutonomyLevel::Supervised => {
+            prompt.push_str("- Risky actions may require approval; ask or wait for approval instead of pretending the action already happened.\n");
+        }
+        crate::security::AutonomyLevel::Full => {
+            prompt.push_str(
+                "- You may act autonomously, but still stay within command/path/rate limits.\n",
+            );
+        }
+    }
+
+    if !autonomy.non_cli_excluded_tools.is_empty() {
+        let _ = writeln!(
+            prompt,
+            "- The following tools are unavailable on non-CLI channels: {}.",
+            autonomy.non_cli_excluded_tools.join(", ")
+        );
+    }
+
+    prompt.push('\n');
+    prompt
+}
+
+pub fn append_autonomy_constraints_once(
+    prompt: &mut String,
+    autonomy: &crate::config::AutonomyConfig,
+    workspace_dir: &std::path::Path,
+) {
+    if prompt.contains("## Autonomy Constraints") {
+        return;
+    }
+    prompt.push_str(&autonomy_constraints_prompt(autonomy, workspace_dir));
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
@@ -4224,6 +4289,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_workspace_dir(config.workspace_dir.as_path().to_path_buf())
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -4429,6 +4495,7 @@ fn collect_configured_channels(
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_workspace_dir(config.workspace_dir.as_path().to_path_buf())
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -4534,6 +4601,7 @@ fn collect_configured_channels(
                     mx.draft_update_interval_ms,
                     mx.multi_message_delay_ms,
                 )
+                .with_mention_only(mx.mention_only)
                 .with_transcription(config.transcription.clone()),
             ),
         });
@@ -5397,6 +5465,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .matrix
         .as_ref()
         .is_some_and(|mx| mx.interrupt_on_new_message);
+    let interrupt_on_new_message_whatsapp = config
+        .channels_config
+        .whatsapp
+        .as_ref()
+        .is_some_and(|wa| wa.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -5428,6 +5501,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             discord: interrupt_on_new_message_discord,
             mattermost: interrupt_on_new_message_mattermost,
             matrix: interrupt_on_new_message_matrix,
+            whatsapp: interrupt_on_new_message_whatsapp,
         },
         multimodal: config.multimodal.clone(),
         media_pipeline: config.media_pipeline.clone(),
@@ -5867,6 +5941,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -5989,6 +6064,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -6067,6 +6143,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -6164,6 +6241,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -6748,6 +6826,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -6836,6 +6915,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -6938,6 +7018,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7025,6 +7106,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7122,6 +7204,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7240,6 +7323,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7339,6 +7423,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7453,6 +7538,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7552,6 +7638,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7644,6 +7731,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7862,6 +7950,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7972,6 +8061,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8101,6 +8191,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -8227,6 +8318,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8331,6 +8423,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8418,6 +8511,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8510,6 +8604,33 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("**shell**"));
         assert!(prompt.contains("Run commands"));
         assert!(prompt.contains("**memory_recall**"));
+    }
+
+    #[test]
+    fn prompt_skips_tools_summary_when_native_tools_enabled() {
+        let ws = make_workspace();
+        let tools = vec![
+            ("shell", "Run commands"),
+            ("memory_recall", "Search memory"),
+        ];
+        let prompt = build_system_prompt_with_mode(
+            ws.path(),
+            "gpt-4o",
+            &tools,
+            &[],
+            None,
+            None,
+            true,
+            crate::config::SkillsPromptInjectionMode::Full,
+            AutonomyLevel::default(),
+        );
+
+        assert!(
+            !prompt.contains("## Tools"),
+            "native tools mode should skip the duplicate tools summary"
+        );
+        assert!(prompt.contains("## Safety"));
+        assert!(prompt.contains("## Workspace"));
     }
 
     #[test]
@@ -8851,6 +8972,22 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("Never pretend you are waiting for a human approval"),
             "full autonomy should not simulate interactive approval flows"
         );
+        assert_eq!(
+            prompt.matches("## Autonomy Constraints").count(),
+            1,
+            "autonomy constraints should only be injected once"
+        );
+    }
+
+    #[test]
+    fn autonomy_constraints_prompt_describes_workspace_scope() {
+        let config = crate::config::AutonomyConfig::default();
+        let prompt = autonomy_constraints_prompt(&config, std::path::Path::new("/workspace"));
+
+        assert!(prompt.contains("## Autonomy Constraints"));
+        assert!(prompt.contains("supervised"));
+        assert!(prompt.contains("allowed_roots"));
+        assert!(prompt.contains("/workspace"));
     }
 
     #[test]
@@ -9208,6 +9345,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -9347,6 +9485,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -9529,6 +9668,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -9644,6 +9784,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10229,6 +10370,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10323,6 +10465,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10451,6 +10594,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -10473,6 +10617,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(debounce::MessageDebouncer::new(std::time::Duration::ZERO)),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(std::time::Duration::ZERO)),
         });
 
         process_channel_message(
@@ -10623,6 +10768,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10741,6 +10887,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10851,6 +10998,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10981,6 +11129,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -11121,6 +11270,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: true,
             matrix: false,
+            whatsapp: false,
         };
         assert!(cfg.enabled_for_channel("mattermost"));
     }
@@ -11133,6 +11283,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(!cfg.enabled_for_channel("mattermost"));
     }
@@ -11145,6 +11296,7 @@ This is an example JSON object for profile settings."#;
             discord: true,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(cfg.enabled_for_channel("discord"));
     }
@@ -11157,6 +11309,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
     }
@@ -11252,6 +11405,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),

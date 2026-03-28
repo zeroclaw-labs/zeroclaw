@@ -1172,7 +1172,8 @@ fn default_param_for_tool(tool: &str) -> &'static str {
         | "websearch" | "search" => "query",
         "memory_store" | "memorystore" | "store" | "memstore" => "content",
         // HTTP and browser tools default to "url"
-        "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser" => "url",
+        "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser"
+        | "web_fetch" | "webfetch" => "url",
         _ => "input",
     }
 }
@@ -1934,6 +1935,14 @@ fn resolve_display_text(
     }
 }
 
+fn ensure_trailing_newline(text: &str) -> String {
+    if text.ends_with('\n') {
+        text.to_string()
+    } else {
+        format!("{text}\n")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedToolCall {
     pub(crate) name: String,
@@ -2159,7 +2168,7 @@ fn maybe_inject_channel_delivery_defaults(
 
     if !matches!(
         channel_name,
-        "telegram" | "discord" | "slack" | "mattermost" | "matrix"
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "lark" | "feishu"
     ) {
         return;
     }
@@ -7343,6 +7352,22 @@ mod tests {
     }
 
     #[test]
+    fn ensure_trailing_newline_appends_missing_linebreak() {
+        assert_eq!(
+            ensure_trailing_newline("Let me check that."),
+            "Let me check that.\n"
+        );
+    }
+
+    #[test]
+    fn ensure_trailing_newline_preserves_existing_linebreak() {
+        assert_eq!(
+            ensure_trailing_newline("Let me check that.\n"),
+            "Let me check that.\n"
+        );
+    }
+
+    #[test]
     fn parse_tool_calls_extracts_single_call() {
         let response = r#"Let me check that.
 <tool_call>
@@ -8738,9 +8763,8 @@ Let me check the result."#;
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
-    /// the output must contain ZERO XML protocol artifacts. In the native path
-    /// `build_tool_instructions` is never called, so the system prompt alone
-    /// must be clean of XML tool-call protocol.
+    /// the output must contain ZERO XML protocol artifacts and must not inject
+    /// the duplicate non-native tools summary.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
         use crate::channels::build_system_prompt_with_mode;
@@ -8784,10 +8808,10 @@ Let me check the result."#;
             "Native prompt must not contain XML protocol header"
         );
 
-        // Positive: native prompt should still list tools and contain task instructions
+        // Positive: native prompt should still contain the native-task framing.
         assert!(
-            system_prompt.contains("shell"),
-            "Native prompt must list tool names"
+            !system_prompt.contains("## Tools"),
+            "Native prompt should skip the duplicate tools summary"
         );
         assert!(
             system_prompt.contains("## Your Task"),
@@ -8950,6 +8974,9 @@ Let me check the result."#;
         assert_eq!(default_param_for_tool("search"), "query");
         assert_eq!(default_param_for_tool("http_request"), "url");
         assert_eq!(default_param_for_tool("browser_open"), "url");
+        assert_eq!(default_param_for_tool("web_search_tool"), "query");
+        assert_eq!(default_param_for_tool("web_search"), "query");
+        assert_eq!(default_param_for_tool("web_fetch"), "url");
         assert_eq!(default_param_for_tool("unknown_tool"), "input");
     }
 

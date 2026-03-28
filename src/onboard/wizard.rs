@@ -143,6 +143,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         provider_timeout_secs: 120,
         provider_max_tokens: None,
         extra_headers: std::collections::HashMap::new(),
+        provider_env: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         trust: crate::trust::TrustConfig::default(),
@@ -590,6 +591,7 @@ async fn run_quick_setup_with_home(
         provider_timeout_secs: 120,
         provider_max_tokens: None,
         extra_headers: std::collections::HashMap::new(),
+        provider_env: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         trust: crate::trust::TrustConfig::default(),
@@ -4292,6 +4294,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1500,
                     multi_message_delay_ms: 800,
                     recovery_key,
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::Signal => {
@@ -4490,6 +4493,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         self_chat_mode: false,
                         dm_mention_patterns: vec![],
                         group_mention_patterns: vec![],
+                        interrupt_on_new_message: false,
                         proxy_url: None,
                     });
 
@@ -4598,6 +4602,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     self_chat_mode: false,
                     dm_mention_patterns: vec![],
                     group_mention_patterns: vec![],
+                    interrupt_on_new_message: false,
                     proxy_url: None,
                 });
             }

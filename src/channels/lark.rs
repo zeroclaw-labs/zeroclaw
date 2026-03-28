@@ -3670,6 +3670,18 @@ mod tests {
 
     #[tokio::test]
     async fn lark_audio_file_key_missing_returns_none() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let whisper_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "test"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
         let ch = make_channel();
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
