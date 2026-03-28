@@ -1,6 +1,8 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
-use crate::cron::{self, DeliveryConfig, JobType, Schedule, SessionTarget};
+use crate::cron::{
+    self, DeliveryConfig, JobType, Schedule, SessionTarget, deserialize_maybe_stringified,
+};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -56,7 +58,7 @@ impl Tool for CronAddTool {
     fn description(&self) -> &str {
         "Create a scheduled cron job (shell or agent) with cron/at/every schedules. \
          Use job_type='agent' with a prompt to run the AI agent on schedule. \
-         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix), set \
+         To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix, QQ), set \
          delivery={\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id_or_chat_id>\"}. \
          This is the preferred tool for sending scheduled/delayed messages to users via channels."
     }
@@ -128,6 +130,11 @@ impl Tool for CronAddTool {
                     "type": "string",
                     "description": "Optional model override for agent jobs, e.g. 'x-ai/grok-4-1-fast'"
                 },
+                "allowed_tools": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional allowlist of tool names for agent jobs. When omitted, all tools remain available."
+                },
                 "delivery": {
                     "type": "object",
                     "description": "Optional delivery config to send job output to a channel after each run. When provided, all three of mode, channel, and to are expected.",
@@ -139,7 +146,7 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix"],
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "lark", "feishu"],
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
@@ -176,7 +183,7 @@ impl Tool for CronAddTool {
         }
 
         let schedule = match args.get("schedule") {
-            Some(v) => match serde_json::from_value::<Schedule>(v.clone()) {
+            Some(v) => match deserialize_maybe_stringified::<Schedule>(v) {
                 Ok(schedule) => schedule,
                 Err(e) => {
                     return Ok(ToolResult {
@@ -228,6 +235,19 @@ impl Tool for CronAddTool {
             .get("approved")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
+        let delivery = match args.get("delivery") {
+            Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Invalid delivery config: {e}")),
+                    });
+                }
+            },
+            None => None,
+        };
 
         let result = match job_type {
             JobType::Shell => {
@@ -254,7 +274,14 @@ impl Tool for CronAddTool {
                     return Ok(blocked);
                 }
 
-                cron::add_shell_job_with_approval(&self.config, name, schedule, command, approved)
+                cron::add_shell_job_with_approval(
+                    &self.config,
+                    name,
+                    schedule,
+                    command,
+                    delivery,
+                    approved,
+                )
             }
             JobType::Agent => {
                 let prompt = match args.get("prompt").and_then(serde_json::Value::as_str) {
@@ -286,15 +313,20 @@ impl Tool for CronAddTool {
                     .get("model")
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_string);
-
-                let delivery = match args.get("delivery") {
-                    Some(v) => match serde_json::from_value::<DeliveryConfig>(v.clone()) {
-                        Ok(cfg) => Some(cfg),
+                let allowed_tools = match args.get("allowed_tools") {
+                    Some(v) => match serde_json::from_value::<Vec<String>>(v.clone()) {
+                        Ok(v) => {
+                            if v.is_empty() {
+                                None // Treat empty list same as unset
+                            } else {
+                                Some(v)
+                            }
+                        }
                         Err(e) => {
                             return Ok(ToolResult {
                                 success: false,
                                 output: String::new(),
-                                error: Some(format!("Invalid delivery config: {e}")),
+                                error: Some(format!("Invalid allowed_tools: {e}")),
                             });
                         }
                     },
@@ -314,6 +346,7 @@ impl Tool for CronAddTool {
                     model,
                     delivery,
                     delete_after_run,
+                    allowed_tools,
                 )
             }
         };
@@ -327,7 +360,8 @@ impl Tool for CronAddTool {
                     "job_type": job.job_type,
                     "schedule": job.schedule,
                     "next_run": job.next_run,
-                    "enabled": job.enabled
+                    "enabled": job.enabled,
+                    "allowed_tools": job.allowed_tools
                 }))?,
                 error: None,
             }),
@@ -382,6 +416,36 @@ mod tests {
 
         assert!(result.success, "{:?}", result.error);
         assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn shell_job_persists_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "shell",
+                "command": "echo ok",
+                "delivery": {
+                    "mode": "announce",
+                    "channel": "discord",
+                    "to": "1234567890",
+                    "best_effort": true
+                }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].delivery.mode, "announce");
+        assert_eq!(jobs[0].delivery.channel.as_deref(), Some("discord"));
+        assert_eq!(jobs[0].delivery.to.as_deref(), Some("1234567890"));
+        assert!(jobs[0].delivery.best_effort);
     }
 
     #[tokio::test]
@@ -464,10 +528,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
         assert!(cron::list_jobs(&cfg).unwrap().is_empty());
     }
 
@@ -494,10 +560,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
 
         let approved = tool
             .execute(json!({
@@ -509,6 +577,63 @@ mod tests {
             .await
             .unwrap();
         assert!(approved.success, "{:?}", approved.error);
+    }
+
+    #[tokio::test]
+    async fn accepts_schedule_passed_as_json_string() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        // Simulate the LLM double-serializing the schedule: the value arrives
+        // as a JSON string containing a JSON object, rather than an object.
+        let result = tool
+            .execute(json!({
+                "schedule": r#"{"kind":"cron","expr":"*/5 * * * *"}"#,
+                "job_type": "shell",
+                "command": "echo string-schedule"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.output.contains("next_run"));
+    }
+
+    #[tokio::test]
+    async fn accepts_stringified_interval_schedule() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": r#"{"kind":"every","every_ms":60000}"#,
+                "job_type": "shell",
+                "command": "echo interval"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+    }
+
+    #[tokio::test]
+    async fn accepts_stringified_schedule_with_timezone() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": r#"{"kind":"cron","expr":"*/30 9-15 * * 1-5","tz":"Asia/Shanghai"}"#,
+                "job_type": "shell",
+                "command": "echo tz-test"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
     }
 
     #[tokio::test]
@@ -527,10 +652,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("every_ms must be > 0"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("every_ms must be > 0")
+        );
     }
 
     #[tokio::test]
@@ -547,10 +674,64 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Missing 'prompt'"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Missing 'prompt'")
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_job_persists_allowed_tools() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "agent",
+                "prompt": "check status",
+                "allowed_tools": ["file_read", "web_search"]
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].allowed_tools,
+            Some(vec!["file_read".into(), "web_search".into()])
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_allowed_tools_stored_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                "job_type": "agent",
+                "prompt": "check status",
+                "allowed_tools": []
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].allowed_tools, None,
+            "empty allowed_tools should be stored as None"
+        );
     }
 
     #[tokio::test]
@@ -559,11 +740,11 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
-        let values = tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]
-            ["enum"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let values =
+            tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]["enum"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
 
         assert!(values.iter().any(|value| value == "matrix"));
     }

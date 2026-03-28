@@ -20,10 +20,10 @@ use crate::config::{RobotConfig, SafetyConfig};
 use crate::traits::ToolResult;
 use anyhow::Result;
 use portable_atomic::{AtomicU64, Ordering};
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 
 /// Safety events broadcast to all listeners
 #[derive(Debug, Clone)]

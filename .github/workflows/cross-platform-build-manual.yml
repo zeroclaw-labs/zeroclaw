@@ -44,6 +44,11 @@ jobs:
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
+          - os: ubuntu-latest
+            target: armv7-unknown-linux-gnueabihf
+            cross_compiler: gcc-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: windows-latest
@@ -52,7 +57,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.93.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         if: runner.os != 'Windows'
@@ -74,4 +79,4 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --features channel-matrix --target ${{ matrix.target }}
+          cargo build --release --locked --features channel-matrix,channel-lark --target ${{ matrix.target }}

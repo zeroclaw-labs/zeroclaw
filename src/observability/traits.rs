@@ -94,6 +94,25 @@ pub enum ObserverEvent {
         error: String,
         duration_ms: u64,
     },
+    /// A deployment has started.
+    DeploymentStarted {
+        /// Identifier for the deployment (e.g., commit SHA or release tag).
+        deploy_id: String,
+    },
+    /// A deployment has completed successfully.
+    DeploymentCompleted {
+        deploy_id: String,
+        /// Commit SHA that was deployed.
+        commit_sha: String,
+    },
+    /// A deployment has failed.
+    DeploymentFailed {
+        deploy_id: String,
+        /// Human-readable failure reason.
+        reason: String,
+    },
+    /// Recovery from a failed deployment has completed.
+    RecoveryCompleted { deploy_id: String },
 }
 
 /// Numeric metrics emitted by the agent runtime.
@@ -119,6 +138,10 @@ pub enum ObserverMetric {
     HandFindingsCount { hand_name: String, count: u64 },
     /// Records a hand run outcome for success-rate tracking.
     HandSuccessRate { hand_name: String, success: bool },
+    /// Time elapsed from commit to deployment (lead time for changes).
+    DeploymentLeadTime(Duration),
+    /// Time elapsed to recover from a failed deployment.
+    RecoveryTime(Duration),
 }
 
 /// Core observability trait for recording agent runtime telemetry.

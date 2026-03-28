@@ -160,11 +160,7 @@ impl CloudPatternsTool {
                     .iter()
                     .filter(|kw| lower.contains(kw.as_str()))
                     .count();
-                if score > 0 {
-                    Some((p, score))
-                } else {
-                    None
-                }
+                if score > 0 { Some((p, score)) } else { None }
             })
             .collect();
 
