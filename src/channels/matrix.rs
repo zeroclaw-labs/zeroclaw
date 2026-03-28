@@ -55,6 +55,10 @@ pub struct MatrixChannel {
     /// Tracks how much text has been sent in MultiMessage mode so we can
     /// detect new paragraphs from the accumulated text passed to `update_draft`.
     multi_message_sent_len: Arc<Mutex<HashMap<String, usize>>>,
+    /// Bytes consumed from empty paragraphs (leading `\n\n`) during MultiMessage
+    /// streaming.  Used to adjust `sent_so_far` in `finalize_draft` when the
+    /// finalize text has been sanitized (leading whitespace trimmed).
+    multi_message_empty_consumed: Arc<Mutex<HashMap<String, usize>>>,
     /// Thread context captured from `send_draft()` for MultiMessage paragraph delivery.
     multi_message_thread_ts: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
@@ -252,6 +256,7 @@ impl MatrixChannel {
             multi_message_delay_ms: 800,
             last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
             multi_message_sent_len: Arc::new(Mutex::new(HashMap::new())),
+            multi_message_empty_consumed: Arc::new(Mutex::new(HashMap::new())),
             multi_message_thread_ts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1551,6 +1556,7 @@ impl Channel for MatrixChannel {
                 // Capture thread context for paragraph delivery.
                 let room_id = Self::extract_room_id(&message.recipient, &self.room_id);
                 self.multi_message_sent_len.lock().await.clear();
+                self.multi_message_empty_consumed.lock().await.clear();
                 self.multi_message_thread_ts
                     .lock()
                     .await
@@ -1613,6 +1619,10 @@ impl Channel for MatrixChannel {
                 // DraftEvent::Clear reset the accumulator — reset our counter.
                 if text.len() < sent_so_far {
                     sent_map.insert(room_id.clone(), 0);
+                    self.multi_message_empty_consumed
+                        .lock()
+                        .await
+                        .insert(room_id.clone(), 0);
                     return Ok(());
                 }
                 if text.len() == sent_so_far {
@@ -1659,6 +1669,15 @@ impl Channel for MatrixChannel {
                                 ))
                                 .await;
                             }
+                        } else {
+                            // Empty paragraph (leading \n\n whitespace) — track
+                            // consumed bytes so finalize_draft can adjust its offset.
+                            *self
+                                .multi_message_empty_consumed
+                                .lock()
+                                .await
+                                .entry(room_id.clone())
+                                .or_insert(0) += scan_pos + 2;
                         }
                         // Advance past the \n\n and update tracking.
                         let consumed = scan_pos + 2;
@@ -1716,9 +1735,19 @@ impl Channel for MatrixChannel {
                 // Flush any remaining buffered text that didn't hit a \n\n boundary.
                 let mut sent_map = self.multi_message_sent_len.lock().await;
                 let sent_so_far = sent_map.get(&room_id).copied().unwrap_or(0);
+                // Adjust offset: empty paragraphs (leading \n\n) consume bytes in the
+                // raw accumulated text but are trimmed from the sanitized finalize text.
+                let empty_consumed = self
+                    .multi_message_empty_consumed
+                    .lock()
+                    .await
+                    .get(&room_id)
+                    .copied()
+                    .unwrap_or(0);
+                let adjusted_offset = sent_so_far.saturating_sub(empty_consumed);
 
-                if text.len() > sent_so_far {
-                    let remaining = multi_message_remaining_text(text, sent_so_far).to_string();
+                if text.len() > adjusted_offset {
+                    let remaining = text[adjusted_offset..].trim().to_string();
                     if !remaining.is_empty() {
                         let thread_ts = self
                             .multi_message_thread_ts
@@ -1735,6 +1764,7 @@ impl Channel for MatrixChannel {
                 }
 
                 sent_map.remove(&room_id);
+                self.multi_message_empty_consumed.lock().await.remove(&room_id);
                 self.multi_message_thread_ts.lock().await.remove(&room_id);
                 Ok(())
             }
@@ -1755,26 +1785,11 @@ impl Channel for MatrixChannel {
             StreamMode::MultiMessage => {
                 // Paragraphs already sent can't be unsent. Just clean up state.
                 self.multi_message_sent_len.lock().await.remove(&room_id);
+                self.multi_message_empty_consumed.lock().await.remove(&room_id);
                 self.multi_message_thread_ts.lock().await.remove(&room_id);
                 Ok(())
             }
         }
-    }
-}
-
-/// Compute the unsent tail for MultiMessage finalize.
-///
-/// `update_draft` sends all complete paragraphs (delimited by `\n\n`)
-/// via recursion, so the only remaining content is the tail after the
-/// last boundary.  Using `rsplit_once` avoids relying on a byte offset
-/// that may not align with the (sanitized) finalize text.
-fn multi_message_remaining_text<'a>(text: &'a str, sent_so_far: usize) -> &'a str {
-    if sent_so_far > 0 {
-        text.rsplit_once("\n\n")
-            .map_or(text, |(_, tail)| tail)
-            .trim()
-    } else {
-        text.trim()
     }
 }
 
@@ -2505,47 +2520,54 @@ mod tests {
     }
 
     #[test]
-    fn multi_message_remaining_leading_newlines_trimmed_by_sanitize() {
-        // accumulated was "\n\nHello world", sent_so_far=2 from empty paragraph.
-        // Sanitized text has leading \n\n stripped.
-        assert_eq!(
-            super::multi_message_remaining_text("Hello world", 2),
-            "Hello world"
-        );
+    fn multi_message_offset_adjustment_leading_newlines() {
+        // accumulated was "\n\nHello world": sent_so_far=2 (empty para consumed),
+        // empty_consumed=2.  Sanitized text has leading \n\n stripped.
+        let sent_so_far: usize = 2;
+        let empty_consumed: usize = 2;
+        let adjusted = sent_so_far.saturating_sub(empty_consumed);
+        let text = "Hello world";
+        assert_eq!(text[adjusted..].trim(), "Hello world");
     }
 
     #[test]
-    fn multi_message_remaining_after_sent_paragraph() {
-        // "Para 1\n\nPara 2" — Para 1 was sent, tail is Para 2.
-        assert_eq!(
-            super::multi_message_remaining_text("Para 1\n\nPara 2", 15),
-            "Para 2"
-        );
+    fn multi_message_offset_adjustment_after_sent_paragraph() {
+        // accumulated "\n\nPara 1\n\nPara 2": empty \n\n consumed (2 bytes),
+        // then "Para 1\n\n" sent (8 bytes).  sent_so_far=10, empty_consumed=2.
+        // Sanitized = "Para 1\n\nPara 2", adjusted=8, text[8..] = "Para 2".
+        let sent_so_far: usize = 10;
+        let empty_consumed: usize = 2;
+        let adjusted = sent_so_far.saturating_sub(empty_consumed);
+        let text = "Para 1\n\nPara 2";
+        assert_eq!(text[adjusted..].trim(), "Para 2");
     }
 
     #[test]
-    fn multi_message_remaining_nothing_sent() {
-        // No paragraphs sent, flush everything.
-        assert_eq!(
-            super::multi_message_remaining_text("Hello world", 0),
-            "Hello world"
-        );
+    fn multi_message_offset_adjustment_no_empty_paragraphs() {
+        // No leading \n\n: sent_so_far=7 ("Hello\n\n"), empty_consumed=0.
+        let sent_so_far: usize = 7;
+        let empty_consumed: usize = 0;
+        let adjusted = sent_so_far.saturating_sub(empty_consumed);
+        let text = "Hello\n\nWorld";
+        assert_eq!(text[adjusted..].trim(), "World");
     }
 
     #[test]
-    fn multi_message_remaining_all_paragraphs_sent() {
-        // All paragraphs sent (sent_so_far exceeds sanitized text length).
-        // Guard in finalize_draft prevents entering this path, but the
-        // helper still returns the tail safely.
-        assert_eq!(
-            super::multi_message_remaining_text("Para 1\n\nPara 2", 28),
-            "Para 2"
-        );
+    fn multi_message_offset_adjustment_with_appended_receipts() {
+        // accumulated "\n\nResponse\n\nMore": sent "Response", empty_consumed=2.
+        // Sanitized + receipts = "Response\n\nMore\n\n---\nTool receipts:\n  r1".
+        let sent_so_far: usize = 12; // 2 + 10 ("Response\n\n")
+        let empty_consumed: usize = 2;
+        let adjusted = sent_so_far.saturating_sub(empty_consumed);
+        let text = "Response\n\nMore\n\n---\nTool receipts:\n  r1";
+        assert_eq!(text[adjusted..].trim(), "More\n\n---\nTool receipts:\n  r1");
     }
 
     #[test]
-    fn multi_message_remaining_leading_whitespace_no_paragraphs() {
-        // accumulated was "  Hello", sent_so_far=0, sanitized trimmed.
-        assert_eq!(super::multi_message_remaining_text("Hello", 0), "Hello");
+    fn multi_message_offset_adjustment_nothing_sent() {
+        // sent_so_far=0, empty_consumed=0: flush everything.
+        let adjusted: usize = 0;
+        let text = "Hello world";
+        assert_eq!(text[adjusted..].trim(), "Hello world");
     }
 }
