@@ -7122,6 +7122,12 @@ pub struct SecurityConfig {
     /// WebAuthn / FIDO2 hardware key authentication configuration.
     #[serde(default)]
     pub webauthn: WebAuthnConfig,
+
+    /// Sensitivity threshold for the outbound credential leak detector (0.0–1.0).
+    /// Higher values detect more aggressively; `0.0` disables high-entropy token
+    /// scanning entirely.  Default when omitted: `0.7`.
+    #[serde(default)]
+    pub leak_detector_sensitivity: Option<f64>,
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).
