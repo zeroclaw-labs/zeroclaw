@@ -1188,6 +1188,11 @@ impl Provider for BedrockProvider {
 mod tests {
     use super::*;
     use crate::providers::traits::ChatMessage;
+    use std::sync::Mutex;
+
+    /// Mutex to serialize tests that mutate process-wide environment variables,
+    /// preventing race conditions during parallel `cargo test` execution.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     /// RAII guard that sets/unsets an env var and restores the original on drop.
     struct EnvGuard {
@@ -1199,8 +1204,10 @@ mod tests {
         fn set(key: &str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
             match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
+                // SAFETY: test-only, single-threaded test runner.
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(key) },
             }
             Self {
                 key: key.to_string(),
@@ -1212,8 +1219,10 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.original {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
+                // SAFETY: test-only, single-threaded test runner.
+                Some(v) => unsafe { std::env::set_var(&self.key, v) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(&self.key) },
             }
         }
     }
@@ -1400,6 +1409,7 @@ mod tests {
 
     #[test]
     fn bearer_token_from_env() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _guard = EnvGuard::set("BEDROCK_API_KEY", Some("env-bearer-token"));
         // Clear SigV4 vars to ensure Bearer is chosen.
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
@@ -1414,6 +1424,7 @@ mod tests {
 
     #[test]
     fn bearer_token_precedence() {
+        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         let _bearer_guard = EnvGuard::set("BEDROCK_API_KEY", Some("bearer-key"));
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));

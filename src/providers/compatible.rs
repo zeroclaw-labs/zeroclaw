@@ -9,10 +9,10 @@ use crate::providers::traits::{
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use reqwest::{
-    header::{HeaderMap, HeaderValue, USER_AGENT},
     Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +102,27 @@ impl OpenAiCompatibleProvider {
     ) -> Self {
         Self::new_with_options(
             name, base_url, credential, auth_style, false, false, None, false,
+        )
+    }
+
+    /// Same as `new_with_vision` but skips the /v1/responses fallback on 404.
+    /// Use for custom OpenAI-compatible providers that only support chat completions.
+    pub fn new_with_vision_no_responses_fallback(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        supports_vision: bool,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            false,
+            None,
+            false,
         )
     }
 
@@ -960,22 +981,35 @@ fn sse_bytes_to_chunks(
         }
 
         let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences that may be split across
+        // HTTP/1.1 chunked transfer boundaries (e.g. 3-byte CJK chars).
+        let mut utf8_buf: Vec<u8> = Vec::new();
 
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            break;
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                // Could still be an incomplete multi-byte char; wait for more data
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
                         }
                     };
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     buffer.push_str(&text);
 
@@ -1039,21 +1073,32 @@ fn sse_bytes_to_events(
         }
 
         let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences split across chunk boundaries.
+        let mut utf8_buf: Vec<u8> = Vec::new();
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            return;
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
                         }
                     };
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     buffer.push_str(&text);
 
@@ -2440,10 +2485,12 @@ mod tests {
             .chat_with_system(None, "hello", "llama-3.3-70b", 0.7)
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Venice API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Venice API key not set")
+        );
     }
 
     #[test]
@@ -2660,9 +2707,10 @@ mod tests {
             .await
             .expect_err("system-only fallback payload should fail");
 
-        assert!(err
-            .to_string()
-            .contains("requires at least one non-system message"));
+        assert!(
+            err.to_string()
+                .contains("requires at least one non-system message")
+        );
     }
 
     #[test]
@@ -3427,10 +3475,12 @@ mod tests {
 
         let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TestProvider API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TestProvider API key not set")
+        );
     }
 
     #[test]

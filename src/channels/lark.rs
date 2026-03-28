@@ -1837,7 +1837,7 @@ impl LarkChannel {
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
-        use axum::{extract::State, routing::post, Json, Router};
+        use axum::{Json, Router, extract::State, routing::post};
 
         #[derive(Clone)]
         struct AppState {
@@ -2278,7 +2278,14 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
                                 mentioned_open_ids.push(open_id.to_string());
                             }
                         }
-                        _ => {}
+                        _ => {
+                            // Some Feishu rich-text tags (for example `md`) still carry useful
+                            // human text in a `text` field. Keep that text instead of dropping
+                            // the whole message as empty.
+                            if let Some(t) = el.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
                     }
                 }
                 text.push('\n');
@@ -3167,10 +3174,11 @@ mod tests {
                 }
             }
         });
-        assert!(ch
-            .parse_event_payload(&wrong_mention_payload)
-            .await
-            .is_empty());
+        assert!(
+            ch.parse_event_payload(&wrong_mention_payload)
+                .await
+                .is_empty()
+        );
 
         let bot_mention_payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -3217,6 +3225,28 @@ mod tests {
         });
 
         assert_eq!(ch.parse_event_payload(&payload).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lark_parse_post_message_accepts_md_tag_text_content() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                "message": {
+                    "message_type": "post",
+                    "chat_type": "p2p",
+                    "chat_id": "oc_chat",
+                    "mentions": [],
+                    "content": "{\"zh_cn\":{\"title\":\"\",\"content\":[[{\"tag\":\"md\",\"text\":\"* 1\\n* 2\"}]]}}"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "* 1\n* 2");
     }
 
     #[tokio::test]

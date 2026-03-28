@@ -10,7 +10,7 @@ use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::ToSocketAddrs;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -1115,7 +1115,7 @@ mod native_backend {
     use fantoccini::actions::{InputSource, MouseActions, PointerAction};
     use fantoccini::key::Key;
     use fantoccini::{Client, ClientBuilder, Locator};
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
@@ -2290,9 +2290,10 @@ mod tests {
         let tool = BrowserTool::new(security, vec!["*".into()], None);
         assert!(tool.validate_url("https://[::1]/").is_err());
         assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
-        assert!(tool
-            .validate_url("https://[::ffff:10.0.0.1]:8080/")
-            .is_err());
+        assert!(
+            tool.validate_url("https://[::ffff:10.0.0.1]:8080/")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2447,15 +2448,18 @@ mod tests {
             },
         );
 
-        assert!(tool
-            .validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
-            .is_ok());
-        assert!(tool
-            .validate_coordinate("x", 101, tool.computer_use.max_coordinate_x)
-            .is_err());
-        assert!(tool
-            .validate_coordinate("y", -1, tool.computer_use.max_coordinate_y)
-            .is_err());
+        assert!(
+            tool.validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
+                .is_ok()
+        );
+        assert!(
+            tool.validate_coordinate("x", 101, tool.computer_use.max_coordinate_x)
+                .is_err()
+        );
+        assert!(
+            tool.validate_coordinate("y", -1, tool.computer_use.max_coordinate_y)
+                .is_err()
+        );
     }
 
     #[test]

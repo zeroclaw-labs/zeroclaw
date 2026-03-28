@@ -221,9 +221,11 @@ mod tests {
         // inside a character. This must not panic.
         let cjk_text = "二手书项目".repeat(50); // 250 chars = 750 bytes
         let result = parse_consolidation_response("invalid", &cjk_text);
-        assert!(result
-            .history_entry
-            .is_char_boundary(result.history_entry.len()));
+        assert!(
+            result
+                .history_entry
+                .is_char_boundary(result.history_entry.len())
+        );
         assert!(result.history_entry.ends_with('…'));
     }
 }

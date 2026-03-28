@@ -310,11 +310,13 @@ mod tests {
         assert!(params.temperature_adjustment < 0.0);
         assert!(params.max_tokens_adjustment < 0);
         assert!(params.system_prompt_prefix.is_some());
-        assert!(params
-            .system_prompt_prefix
-            .unwrap()
-            .to_lowercase()
-            .contains("concise"));
+        assert!(
+            params
+                .system_prompt_prefix
+                .unwrap()
+                .to_lowercase()
+                .contains("concise")
+        );
     }
 
     #[test]

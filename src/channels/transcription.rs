@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 
@@ -901,9 +901,12 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_api_key() {
         // Ensure all candidate keys are absent for this test.
-        std::env::remove_var("GROQ_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("TRANSCRIPTION_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("TRANSCRIPTION_API_KEY") };
 
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
@@ -919,7 +922,8 @@ mod tests {
 
     #[tokio::test]
     async fn uses_config_api_key_without_groq_env() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let data = vec![0u8; 100];
         let mut config = TranscriptionConfig::default();
@@ -1034,7 +1038,8 @@ mod tests {
 
     #[test]
     fn manager_creation_with_default_config() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let config = TranscriptionConfig::default();
         let manager = TranscriptionManager::new(&config).unwrap();
@@ -1045,7 +1050,8 @@ mod tests {
 
     #[test]
     fn manager_registers_groq_with_key() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let mut config = TranscriptionConfig::default();
         config.api_key = Some("test-groq-key".to_string());
@@ -1057,7 +1063,8 @@ mod tests {
 
     #[test]
     fn manager_registers_multiple_providers() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let mut config = TranscriptionConfig::default();
         config.api_key = Some("test-groq-key".to_string());
@@ -1079,7 +1086,8 @@ mod tests {
 
     #[tokio::test]
     async fn manager_rejects_unconfigured_provider() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let mut config = TranscriptionConfig::default();
         config.api_key = Some("test-groq-key".to_string());
@@ -1097,7 +1105,8 @@ mod tests {
 
     #[test]
     fn manager_default_provider_from_config() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let mut config = TranscriptionConfig::default();
         config.default_provider = "openai".to_string();

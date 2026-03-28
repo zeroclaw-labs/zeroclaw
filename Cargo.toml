@@ -4,8 +4,8 @@ resolver = "2"
 
 [package]
 name = "zeroclawlabs"
-version = "0.6.4"
-edition = "2021"
+version = "0.6.5"
+edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
@@ -282,6 +282,10 @@ ci-all = [
     "whatsapp-web",
     "plugins-wasm",
 ]
+
+[profile.dev]
+incremental = true
+opt-level = 1
 
 [profile.release]
 opt-level = "z"      # Optimize for size

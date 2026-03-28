@@ -66,7 +66,7 @@ coverage
 lcov.info
 
 # Application and script directories (not needed for Docker runtime)
-# Note: apps/tauri/Cargo.toml is required for workspace resolution in Docker build
+# Note: apps/tauri/Cargo.toml is required for workspace resolution in Docker build.
 apps/*
 !apps/tauri/
 apps/tauri/src/
@@ -75,5 +75,5 @@ apps/tauri/gen/
 apps/tauri/capabilities/
 apps/tauri/tauri.conf.json
 apps/tauri/build.rs
-python/
+!apps/tauri/Cargo.toml
 scripts/

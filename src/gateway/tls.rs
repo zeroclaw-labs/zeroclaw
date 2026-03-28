@@ -6,10 +6,10 @@
 
 use crate::config::schema::{GatewayClientAuthConfig, GatewayTlsConfig};
 use anyhow::{Context, Result};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;

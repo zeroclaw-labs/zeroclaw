@@ -106,14 +106,14 @@ impl SkillCreator {
         // Trim leading/trailing hyphens, then truncate.
         let trimmed = collapsed.trim_matches('-');
         if trimmed.len() > 64 {
-            // Find the nearest valid character boundary at or before 64 bytes.
-            let safe_index = trimmed
+            // Truncate at a hyphen boundary if possible.
+            let end = trimmed
                 .char_indices()
-                .map(|(i, _)| i)
+                .map(|(i, c)| i + c.len_utf8())
                 .take_while(|&i| i <= 64)
                 .last()
                 .unwrap_or(0);
-            let truncated = &trimmed[..safe_index];
+            let truncated = &trimmed[..end];
             truncated.trim_end_matches('-').to_string()
         } else {
             trimmed.to_string()
@@ -427,6 +427,14 @@ mod tests {
     fn slug_unicode() {
         let slug = SkillCreator::generate_slug("Deploy cafe app");
         assert_eq!(slug, "deploy-cafe-app");
+    }
+
+    #[test]
+    fn slug_cjk_no_panic() {
+        // CJK chars are multi-byte in UTF-8; a long string must not panic on truncation.
+        let cjk = "部署到生产环境".repeat(20);
+        let slug = SkillCreator::generate_slug(&cjk);
+        assert!(slug.len() <= 64);
     }
 
     // ── Slug validation ──────────────────────────────────────────
