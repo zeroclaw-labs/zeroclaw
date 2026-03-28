@@ -1764,7 +1764,10 @@ impl Channel for MatrixChannel {
                 }
 
                 sent_map.remove(&room_id);
-                self.multi_message_empty_consumed.lock().await.remove(&room_id);
+                self.multi_message_empty_consumed
+                    .lock()
+                    .await
+                    .remove(&room_id);
                 self.multi_message_thread_ts.lock().await.remove(&room_id);
                 Ok(())
             }
@@ -1785,7 +1788,10 @@ impl Channel for MatrixChannel {
             StreamMode::MultiMessage => {
                 // Paragraphs already sent can't be unsent. Just clean up state.
                 self.multi_message_sent_len.lock().await.remove(&room_id);
-                self.multi_message_empty_consumed.lock().await.remove(&room_id);
+                self.multi_message_empty_consumed
+                    .lock()
+                    .await
+                    .remove(&room_id);
                 self.multi_message_thread_ts.lock().await.remove(&room_id);
                 Ok(())
             }

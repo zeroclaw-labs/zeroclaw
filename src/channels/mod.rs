@@ -33,6 +33,7 @@ pub mod linq;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod media_markers;
 pub mod media_pipeline;
 pub mod mochat;
 pub mod mqtt;
