@@ -65,6 +65,17 @@ enum ChannelEvent {
         message_id: String,
         reason: Option<String>,
     },
+    CreateRoom {
+        name: Option<String>,
+        topic: Option<String>,
+        invites: Vec<String>,
+        visibility: Option<String>,
+        encryption: Option<bool>,
+    },
+    InviteUser {
+        room_id: String,
+        user_id: String,
+    },
 }
 
 /// Full-featured matrix test channel that tracks every trait method invocation.
@@ -131,6 +142,7 @@ impl Channel for MatrixTestChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -277,6 +289,38 @@ impl Channel for MatrixTestChannel {
                 message_id: message_id.to_string(),
                 reason,
             });
+        Ok(())
+    }
+
+    async fn create_room(
+        &self,
+        name: Option<&str>,
+        topic: Option<&str>,
+        invites: Vec<String>,
+        visibility: Option<&str>,
+        encryption: Option<bool>,
+    ) -> anyhow::Result<String> {
+        let room_id = format!(
+            "!test_room_{}:example.com",
+            self.events.lock().unwrap().len()
+        );
+
+        self.events.lock().unwrap().push(ChannelEvent::CreateRoom {
+            name: name.map(String::from),
+            topic: topic.map(String::from),
+            invites,
+            visibility: visibility.map(String::from),
+            encryption,
+        });
+
+        Ok(room_id)
+    }
+
+    async fn invite_user(&self, room_id: &str, user_id: &str) -> anyhow::Result<()> {
+        self.events.lock().unwrap().push(ChannelEvent::InviteUser {
+            room_id: room_id.to_string(),
+            user_id: user_id.to_string(),
+        });
         Ok(())
     }
 }
@@ -612,7 +656,68 @@ async fn redact_message_lifecycle() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 7. CHANNEL MESSAGE IDENTITY & FIELD SEMANTICS
+// 7. ROOM CREATION AND INVITE SUPPORT
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn create_room_lifecycle() {
+    let ch = MatrixTestChannel::new("matrix");
+
+    let room_id = ch
+        .create_room(
+            Some("Project Discussion"),
+            Some("Discuss project updates"),
+            vec![
+                "@alice:example.com".to_string(),
+                "@bob:example.com".to_string(),
+            ],
+            Some("private"),
+            Some(true),
+        )
+        .await
+        .unwrap();
+
+    assert!(!room_id.is_empty());
+
+    let events = ch.events();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        ChannelEvent::CreateRoom {
+            name,
+            topic,
+            invites,
+            visibility,
+            encryption
+        } if name == &Some("Project Discussion".to_string())
+            && topic == &Some("Discuss project updates".to_string())
+            && invites.len() == 2
+            && visibility == &Some("private".to_string())
+            && encryption == &Some(true)
+    ));
+}
+
+#[tokio::test]
+async fn invite_user_lifecycle() {
+    let ch = MatrixTestChannel::new("matrix");
+
+    ch.invite_user("!room:example.com", "@user:example.com")
+        .await
+        .unwrap();
+
+    let events = ch.events();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        &events[0],
+        ChannelEvent::InviteUser {
+            room_id,
+            user_id
+        } if room_id == "!room:example.com" && user_id == "@user:example.com"
+    ));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 8. CHANNEL MESSAGE IDENTITY & FIELD SEMANTICS
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -627,6 +732,7 @@ fn channel_message_thread_ts_preserved_on_clone() {
         thread_ts: Some("1700000000.000001".into()),
         interruption_scope_id: None,
         attachments: vec![],
+        observe_group: false,
     };
 
     let cloned = msg.clone();
@@ -645,6 +751,7 @@ fn channel_message_none_thread_ts_preserved() {
         thread_ts: None,
         interruption_scope_id: None,
         attachments: vec![],
+        observe_group: false,
     };
 
     assert!(msg.clone().thread_ts.is_none());
@@ -700,6 +807,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "discord" => ChannelMessage {
             id: "dc_1".into(),
@@ -711,6 +819,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "slack" => ChannelMessage {
             id: "sl_1".into(),
@@ -722,6 +831,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: Some("1700000000.000001".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "imessage" => ChannelMessage {
             id: "im_1".into(),
@@ -733,6 +843,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "irc" => ChannelMessage {
             id: "irc_1".into(),
@@ -744,6 +855,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "email" => ChannelMessage {
             id: "email_1".into(),
@@ -755,6 +867,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "signal" => ChannelMessage {
             id: "sig_1".into(),
@@ -766,6 +879,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "mattermost" => ChannelMessage {
             id: "mm_1".into(),
@@ -777,6 +891,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: Some("root_msg_id".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "whatsapp" => ChannelMessage {
             id: "wa_1".into(),
@@ -788,6 +903,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "nextcloud_talk" => ChannelMessage {
             id: "nc_1".into(),
@@ -799,6 +915,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "wecom" => ChannelMessage {
             id: "wc_1".into(),
@@ -810,6 +927,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "dingtalk" => ChannelMessage {
             id: "dt_1".into(),
@@ -821,6 +939,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "qq" => ChannelMessage {
             id: "qq_1".into(),
@@ -832,6 +951,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "linq" => ChannelMessage {
             id: "lq_1".into(),
@@ -843,6 +963,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "wati" => ChannelMessage {
             id: "wt_1".into(),
@@ -854,6 +975,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
@@ -865,6 +987,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         _ => panic!("Unknown platform: {platform}"),
     }
@@ -1168,6 +1291,7 @@ fn channel_message_zero_timestamp() {
         thread_ts: None,
         interruption_scope_id: None,
         attachments: vec![],
+        observe_group: false,
     };
     assert_eq!(msg.timestamp, 0);
 }
@@ -1184,6 +1308,7 @@ fn channel_message_max_timestamp() {
         thread_ts: None,
         interruption_scope_id: None,
         attachments: vec![],
+        observe_group: false,
     };
     assert_eq!(msg.timestamp, u64::MAX);
 }
@@ -1353,6 +1478,20 @@ async fn minimal_channel_all_defaults_succeed() {
             .is_ok()
     );
     assert!(ch.redact_message("c", "m", None).await.is_ok());
+    let room_id = ch
+        .create_room(
+            Some("Test"),
+            Some("Topic"),
+            vec!["@user:example.com".to_string()],
+            Some("private"),
+            Some(true),
+        )
+        .await
+        .unwrap();
+    assert!(ch
+        .invite_user(&room_id, "@another:example.com")
+        .await
+        .is_ok());
 }
 
 #[tokio::test]

@@ -140,6 +140,7 @@ pub async fn prepare_messages_for_provider(
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
+    let mut has_successful_images = false;
     for message in messages {
         if message.role != "user" {
             normalized_messages.push(message.clone());
@@ -153,13 +154,40 @@ pub async fn prepare_messages_for_provider(
         }
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
-        for reference in refs {
-            let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
-            normalized_refs.push(data_uri);
+        let mut skipped_refs = Vec::new();
+        for reference in &refs {
+            match normalize_image_reference(reference, config, max_bytes, &remote_client).await {
+                Ok(data_uri) => normalized_refs.push(data_uri),
+                Err(e) => {
+                    tracing::warn!(
+                        image = %reference,
+                        error = %e,
+                        "Multimodal: skipping unresolvable image, continuing without it"
+                    );
+                    skipped_refs.push(reference.as_str());
+                }
+            }
         }
 
-        let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
+        // If all images failed, fall back to text-only with a note
+        let effective_text = if normalized_refs.is_empty() && !skipped_refs.is_empty() {
+            format!(
+                "{cleaned_text}\n\n(Note: {} attached image(s) could not be loaded)",
+                skipped_refs.len()
+            )
+        } else if !skipped_refs.is_empty() {
+            format!(
+                "{cleaned_text}\n\n(Note: {} of {} image(s) could not be loaded)",
+                skipped_refs.len(),
+                refs.len()
+            )
+        } else {
+            cleaned_text.clone()
+        };
+        if !normalized_refs.is_empty() {
+            has_successful_images = true;
+        }
+        let content = compose_multimodal_message(&effective_text, &normalized_refs);
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
@@ -168,7 +196,7 @@ pub async fn prepare_messages_for_provider(
 
     Ok(PreparedMessages {
         messages: normalized_messages,
-        contains_images: true,
+        contains_images: has_successful_images,
     })
 }
 
@@ -520,24 +548,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_remote_url_when_disabled() {
+    async fn prepare_messages_skips_remote_url_when_disabled() {
         let messages = vec![ChatMessage::user(
             "Look [IMAGE:https://example.com/img.png]".to_string(),
         )];
 
-        let error = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+        let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
             .await
-            .expect_err("should reject remote image URL when fetch is disabled");
+            .expect("should succeed with skipped image note");
 
-        assert!(
-            error
-                .to_string()
-                .contains("multimodal remote image fetch is disabled")
-        );
+        // The image should be skipped and a note appended
+        assert!(result.messages[0]
+            .content
+            .contains("image(s) could not be loaded"));
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_oversized_local_image() {
+    async fn prepare_messages_skips_oversized_local_image() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("big.png");
 
@@ -555,15 +582,13 @@ mod tests {
             ..Default::default()
         };
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let result = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect_err("should reject oversized local image");
+            .expect("should succeed with skipped image note");
 
-        assert!(
-            error
-                .to_string()
-                .contains("multimodal image size limit exceeded")
-        );
+        assert!(result.messages[0]
+            .content
+            .contains("image(s) could not be loaded"));
     }
 
     #[test]

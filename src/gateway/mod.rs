@@ -23,8 +23,9 @@ pub mod tls;
 pub mod ws;
 
 use crate::channels::{
-    Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
-    WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
+    Channel, GmailPushChannel, LineChannel, LinqChannel, NextcloudTalkChannel, SendMessage,
+    WatiChannel, WhatsAppChannel, session_backend::SessionBackend,
+    session_sqlite::SqliteSessionBackend,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;
@@ -93,6 +94,10 @@ fn linq_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
 
 fn wati_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
     format!("wati_{}_{}", msg.sender, msg.id)
+}
+
+fn line_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("line_{}_{}", msg.sender, msg.id)
 }
 
 fn nextcloud_talk_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
@@ -337,6 +342,10 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// LINE Messaging API channel
+    pub line: Option<Arc<LineChannel>>,
+    /// LINE Channel Secret for `X-Line-Signature` verification
+    pub line_channel_secret: Option<Arc<str>>,
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
@@ -381,11 +390,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
-        tracing::warn!(
-            "⚠️  Binding to {host} — gateway will be exposed to all network interfaces.\n\
-             Suggestion: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
-             [gateway] allow_public_bind = true in config.toml to silence this warning.\n\n\
-             Docker/VM: if you are running inside a container or VM, this is expected."
+        anyhow::bail!(
+            "🛑 Refusing to bind to {host} — gateway would be exposed on all network interfaces.\n\
+             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
+             [gateway] allow_public_bind = true in config.toml.\n\n\
+             Docker / VM / container: if you need to reach the gateway from another\n\
+             container or host, set [gateway] host = \"0.0.0.0\" and allow_public_bind = true\n\
+             in config.toml, then connect via ws://host.docker.internal:{port}."
         );
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
@@ -582,6 +593,45 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         })
         .map(Arc::from);
 
+    // LINE channel (if configured)
+    let line_channel: Option<Arc<LineChannel>> = if let Some(ln) =
+        config.channels_config.line.as_ref()
+    {
+        let mut ch = LineChannel::new(ln.channel_access_token.clone(), ln.allowed_users.clone())
+            .with_reply_mode(ln.reply_mode)
+            .with_mention_only(ln.mention_only, ln.bot_display_name.clone());
+        if let Some(ws_dir) = config.workspace_dir.parent() {
+            ch = ch.with_workspace_dir(ws_dir.join("workspace"));
+        }
+        let ch = Arc::new(ch);
+        // Resolve bot display name (no-op if already set via config override).
+        // Only needed when mention_only is enabled, but cheap to call regardless.
+        if ln.mention_only {
+            ch.resolve_bot_display_name().await;
+        }
+        Some(ch)
+    } else {
+        None
+    };
+
+    // LINE Channel Secret for webhook signature verification
+    // Priority: environment variable > config file
+    let line_channel_secret: Option<Arc<str>> = std::env::var("ZEROCLAW_LINE_CHANNEL_SECRET")
+        .ok()
+        .and_then(|s| {
+            let s = s.trim().to_owned();
+            (!s.is_empty()).then_some(s)
+        })
+        .or_else(|| {
+            config
+                .channels_config
+                .line
+                .as_ref()
+                .map(|ln| ln.channel_secret.trim().to_owned())
+                .filter(|s| !s.is_empty())
+        })
+        .map(Arc::from);
+
     // Linq channel (if configured)
     let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
         Arc::new(LinqChannel::new(
@@ -768,6 +818,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     if linq_channel.is_some() {
         println!("  POST {pfx}/linq      — Linq message webhook (iMessage/RCS/SMS)");
     }
+    if line_channel.is_some() {
+        println!("  POST {pfx}/line      — LINE message webhook");
+    }
     if wati_channel.is_some() {
         println!("  GET  {pfx}/wati      — WATI webhook verification");
         println!("  POST {pfx}/wati      — WATI message webhook");
@@ -834,6 +887,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        line: line_channel,
+        line_channel_secret,
         linq: linq_channel,
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
@@ -897,6 +952,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
+        .route("/line", post(handle_line_webhook))
         .route("/linq", post(handle_linq_webhook))
         .route("/wati", get(handle_wati_verify))
         .route("/wati", post(handle_wati_webhook))
@@ -934,6 +990,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        .route("/api/channels", get(api::handle_api_channels))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
@@ -941,6 +998,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(api::handle_api_session_messages),
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}/history", get(api::handle_api_session_history))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
@@ -1282,13 +1340,18 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     // workspace-aware system context before model invocation.
     let system_prompt = {
         let config_guard = state.config.lock();
-        crate::channels::build_system_prompt(
+        crate::channels::build_system_prompt_with_mode_and_autonomy(
             &config_guard.workspace_dir,
             &state.model,
             &[], // tools - empty for simple chat
             &[], // skills
             Some(&config_guard.identity),
             None, // bootstrap_max_chars - use default
+            Some(&config_guard.autonomy),
+            false,
+            config_guard.skills.prompt_injection_mode,
+            false,
+            0,
         )
     };
 
@@ -1691,6 +1754,151 @@ async fn handle_whatsapp_message(
     }
 
     // Acknowledge the webhook
+    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+/// POST /line — incoming message webhook from LINE Messaging API
+async fn handle_line_webhook(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let Some(ref line) = state.line else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "LINE not configured"})),
+        );
+    };
+
+    // ── Security: Body size limit ─────────────────────────────────────────────
+    if body.len() > MAX_BODY_SIZE {
+        tracing::warn!("LINE webhook body too large: {} bytes", body.len());
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Payload too large"})),
+        );
+    }
+
+    // ── Security: Require valid UTF-8 before signature check ─────────────────
+    let body_str = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!("LINE webhook body is not valid UTF-8");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid UTF-8 body"})),
+            );
+        }
+    };
+
+    // ── Security: Verify X-Line-Signature (mandatory) ────────────────────────
+    let Some(ref channel_secret) = state.line_channel_secret else {
+        tracing::error!("LINE channel_secret not configured — rejecting webhook");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "LINE channel_secret not configured"})),
+        );
+    };
+    let signature = headers
+        .get("X-Line-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !crate::channels::line::verify_line_signature(channel_secret, body_str, signature) {
+        tracing::warn!(
+            "LINE webhook signature verification failed ({})",
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
+    }
+
+    // ── Parse JSON body ───────────────────────────────────────────────────────
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(body_str) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Invalid JSON payload"})),
+        );
+    };
+
+    // ── Parse and dispatch messages ───────────────────────────────────────────
+    let messages = line.parse_webhook_payload(&payload).await;
+
+    if messages.is_empty() {
+        // Acknowledge without processing (e.g. follow/join events)
+        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
+    }
+
+    for msg in messages {
+        tracing::info!(
+            "LINE message from {}: {}",
+            msg.sender,
+            truncate_with_ellipsis(&msg.content, 50)
+        );
+        let session_id = sender_session_id("line", &msg);
+
+        // Spawn everything (including memory save) so the webhook returns 200
+        // immediately — minimises reply-token expiry risk.
+        let state_clone = state.clone();
+        let line_clone = Arc::clone(line);
+        let content = msg.content.clone();
+        let reply_target = msg.reply_target.clone();
+        let reply_token = msg.thread_ts.clone();
+        tokio::spawn(async move {
+            // Auto-save to memory (non-blocking relative to HTTP response)
+            if state_clone.auto_save && !memory::should_skip_autosave_content(&content) {
+                let key = line_memory_key(&msg);
+                let _ = state_clone
+                    .mem
+                    .store(
+                        &key,
+                        &content,
+                        MemoryCategory::Conversation,
+                        Some(&session_id),
+                    )
+                    .await;
+            }
+
+            match Box::pin(run_gateway_chat_with_tools(
+                &state_clone,
+                &content,
+                Some(&session_id),
+            ))
+            .await
+            {
+                Ok(response) => {
+                    if let Err(e) = line_clone
+                        .send_with_reply_token(
+                            &SendMessage::new(response, &reply_target),
+                            reply_token.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::error!("Failed to send LINE reply: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("LLM error for LINE message: {e:#}");
+                    let _ = line_clone
+                        .send_with_reply_token(
+                            &SendMessage::new(
+                                "Sorry, I couldn't process your message right now.",
+                                &reply_target,
+                            ),
+                            reply_token.as_deref(),
+                        )
+                        .await;
+                }
+            }
+        });
+    }
+
+    // LINE expects HTTP 200 OK
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
 
@@ -2323,6 +2531,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2391,6 +2601,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2621,6 +2833,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -2699,6 +2912,84 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".into())
         }
+    }
+
+    #[derive(Default)]
+    struct CaptureSystemPromptProvider {
+        last_system_prompt: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for CaptureSystemPromptProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            *self.last_system_prompt.lock() = system_prompt.map(std::string::ToString::to_string);
+            Ok("ok".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_gateway_chat_simple_uses_runtime_autonomy_config() {
+        let provider_impl = Arc::new(CaptureSystemPromptProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut config = Config::default();
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        config.autonomy.workspace_only = false;
+        config.autonomy.allowed_roots = vec!["/var/data".into()];
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            gmail_push: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+        };
+
+        run_gateway_chat_simple(&state, "hello").await.unwrap();
+        let prompt = provider_impl
+            .last_system_prompt
+            .lock()
+            .clone()
+            .expect("system prompt should be present");
+
+        assert!(prompt.contains("## Autonomy Constraints"));
+        assert!(prompt.contains("Current autonomy level: `read-only`."));
+        assert!(prompt.contains("/var/data"));
+        assert!(
+            !prompt.contains("Current autonomy level: `supervised`."),
+            "prompt should not fall back to synthetic default autonomy config"
+        );
     }
 
     #[derive(Default)]
@@ -2785,6 +3076,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2863,6 +3156,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2953,6 +3248,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3015,6 +3312,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3082,6 +3381,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3154,6 +3455,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3223,6 +3526,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),

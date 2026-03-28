@@ -212,6 +212,7 @@ impl WatiChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         });
 
         messages
@@ -355,6 +356,7 @@ impl WatiChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         });
 
         messages
@@ -717,6 +719,7 @@ mod tests {
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -747,6 +750,7 @@ mod tests {
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -790,6 +794,7 @@ mod tests {
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -932,6 +937,7 @@ mod tests {
             model: "whisper-1".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -985,6 +991,7 @@ mod tests {
             model: "whisper-1".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,

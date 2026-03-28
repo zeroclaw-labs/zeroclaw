@@ -720,6 +720,7 @@ async fn parse_whisper_response(resp: reqwest::Response) -> Result<String> {
 pub struct TranscriptionManager {
     providers: HashMap<String, Box<dyn TranscriptionProvider>>,
     default_provider: String,
+    max_audio_bytes: Option<u64>,
 }
 
 impl TranscriptionManager {
@@ -783,14 +784,39 @@ impl TranscriptionManager {
             );
         }
 
+        if let Some(cap) = config.max_audio_bytes {
+            anyhow::ensure!(
+                cap > 0,
+                "transcription.max_audio_bytes must be greater than zero"
+            );
+        }
+
+        let max_audio_bytes = config.max_audio_bytes;
+
         Ok(Self {
             providers,
             default_provider,
+            max_audio_bytes,
         })
+    }
+
+    /// Check global audio size cap. Returns `Ok(())` if audio passes the cap, or error if rejected.
+    fn check_global_cap(&self, audio_data: &[u8]) -> Result<()> {
+        if let Some(cap) = self.max_audio_bytes {
+            if audio_data.len() as u64 > cap {
+                bail!(
+                    "Audio file too large ({} bytes, global max {})",
+                    audio_data.len(),
+                    cap
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Transcribe audio using the default provider.
     pub async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
+        self.check_global_cap(audio_data)?;
         self.transcribe_with_provider(audio_data, file_name, &self.default_provider)
             .await
     }
@@ -802,6 +828,7 @@ impl TranscriptionManager {
         file_name: &str,
         provider: &str,
     ) -> Result<String> {
+        self.check_global_cap(audio_data)?;
         let p = self.providers.get(provider).ok_or_else(|| {
             let available: Vec<&str> = self.providers.keys().map(|k| k.as_str()).collect();
             anyhow::anyhow!(
@@ -834,6 +861,13 @@ impl TranscriptionManager {
 ///
 /// The caller is responsible for enforcing duration limits *before* downloading
 /// the file; this function enforces the byte-size cap.
+///
+/// **Note:** The global `TranscriptionConfig.max_audio_bytes` cap is enforced by
+/// `TranscriptionManager::transcribe()`, not by this function. Callers using this
+/// shim directly will not have the global cap applied. This is a known design gap:
+/// channels currently call this shim until PR-02 wires them through TranscriptionManager.
+/// The global cap will take effect for live traffic once channels are migrated to use
+/// TranscriptionManager directly.
 pub async fn transcribe_audio(
     audio_data: Vec<u8>,
     file_name: &str,
@@ -1427,6 +1461,143 @@ mod tests {
         assert!(
             err.to_string().contains("Bad Gateway"),
             "expected plain-text body in error, got: {err}"
+        );
+    }
+
+    // ── global max_audio_bytes cap tests ─────────────────────────────
+
+    #[test]
+    fn manager_no_global_cap_by_default() {
+        unsafe {
+            std::env::remove_var("GROQ_API_KEY");
+        }
+        let config = TranscriptionConfig::default();
+        assert!(config.max_audio_bytes.is_none());
+        let manager = TranscriptionManager::new(&config).unwrap();
+        assert!(manager.max_audio_bytes.is_none());
+    }
+
+    #[test]
+    fn manager_stores_configured_global_cap() {
+        unsafe {
+            std::env::remove_var("GROQ_API_KEY");
+        }
+        let mut config = TranscriptionConfig::default();
+        config.max_audio_bytes = Some(10 * 1024 * 1024);
+        let manager = TranscriptionManager::new(&config).unwrap();
+        assert_eq!(manager.max_audio_bytes, Some(10 * 1024 * 1024));
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_audio_exceeding_global_cap() {
+        unsafe {
+            std::env::remove_var("GROQ_API_KEY");
+        }
+        let mut config = TranscriptionConfig::default();
+        config.max_audio_bytes = Some(1000);
+        let manager = TranscriptionManager::new(&config).unwrap();
+        let big = vec![0u8; 1001];
+        let err = manager.transcribe(&big, "voice.ogg").await.unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected global cap error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("global max"),
+            "expected global max in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_rejects_audio_exceeding_global_cap_named_provider() {
+        unsafe {
+            std::env::remove_var("GROQ_API_KEY");
+        }
+        let mut config = TranscriptionConfig::default();
+        config.max_audio_bytes = Some(1000);
+        let manager = TranscriptionManager::new(&config).unwrap();
+        let big = vec![0u8; 1001];
+        let err = manager
+            .transcribe_with_provider(&big, "voice.ogg", "groq")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("too large"),
+            "expected global cap error, got: {err}"
+        );
+        assert!(
+            err.to_string().contains("global max"),
+            "expected global max in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_accepts_audio_at_global_cap_boundary() {
+        unsafe {
+            std::env::remove_var("GROQ_API_KEY");
+        }
+        unsafe {
+            std::env::remove_var("TRANSCRIPTION_API_KEY");
+        }
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
+        let mut config = TranscriptionConfig::default();
+        config.max_audio_bytes = Some(1000);
+        let manager = TranscriptionManager::new(&config).unwrap();
+        // Exactly at cap — must NOT trigger the global cap rejection.
+        // Provider may fail for other reasons (not configured, missing key, etc.).
+        let at_cap = vec![0u8; 1000];
+        let result = manager.transcribe(&at_cap, "voice.ogg").await;
+        match result {
+            Ok(_) => {}
+            Err(ref err) => {
+                let msg = err.to_string();
+                assert!(
+                    !msg.contains("too large"),
+                    "global cap must not fire at boundary, got: {msg}"
+                );
+                assert!(
+                    msg.contains("not configured") || msg.contains("Missing"),
+                    "expected downstream provider error, got: {msg}"
+                );
+            }
+        }
+    }
+
+    // validate_audio() does not accept TranscriptionConfig, so the global
+    // max_audio_bytes cap cannot structurally affect it. This test documents
+    // that invariant explicitly.
+    #[test]
+    fn global_cap_does_not_affect_validate_audio() {
+        // validate_audio() must still enforce the 25 MB module constant.
+        let at_limit = vec![0u8; MAX_AUDIO_BYTES];
+        assert!(validate_audio(&at_limit, "test.ogg").is_ok());
+        let over_limit = vec![0u8; MAX_AUDIO_BYTES + 1];
+        let err = validate_audio(&over_limit, "test.ogg").unwrap_err();
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[test]
+    fn backward_compat_defaults_include_max_audio_bytes_none() {
+        let config = TranscriptionConfig::default();
+        assert!(
+            config.max_audio_bytes.is_none(),
+            "max_audio_bytes must default to None for backward compatibility"
+        );
+    }
+
+    #[test]
+    fn manager_rejects_zero_global_cap() {
+        unsafe {
+            std::env::remove_var("GROQ_API_KEY");
+        }
+        let mut config = TranscriptionConfig::default();
+        config.max_audio_bytes = Some(0);
+        let err = TranscriptionManager::new(&config).err().unwrap();
+        assert!(
+            err.to_string().contains("must be greater than zero"),
+            "expected zero-cap rejection, got: {err}"
         );
     }
 }
