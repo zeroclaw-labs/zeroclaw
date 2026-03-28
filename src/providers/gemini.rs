@@ -375,6 +375,13 @@ fn refresh_gemini_cli_token(
         .unwrap_or_else(|_| "<failed to read response body>".to_string());
 
     if !status.is_success() {
+        if status.as_u16() == 400 && body.contains("client_secret is missing") {
+            anyhow::bail!(
+                "Gemini CLI OAuth refresh failed: client_secret is not available. \
+                 Re-run `gemini auth` to obtain fresh credentials that include the \
+                 client_secret, or set the GEMINI_OAUTH_CLIENT_SECRET environment variable."
+            );
+        }
         anyhow::bail!("Gemini CLI OAuth refresh failed (HTTP {status}): {body}");
     }
 
@@ -673,6 +680,14 @@ impl GeminiProvider {
                 .as_deref()
                 .and_then(Self::normalize_non_empty)
         });
+
+        if client_secret.is_none() {
+            tracing::warn!(
+                path = %path.unwrap_or(&PathBuf::new()).display(),
+                "Gemini CLI credential file is missing client_secret — token refresh will fail when \
+                 the access token expires. Re-run `gemini auth` or set GEMINI_OAUTH_CLIENT_SECRET to fix."
+            );
+        }
 
         Some(OAuthTokenState {
             access_token,
