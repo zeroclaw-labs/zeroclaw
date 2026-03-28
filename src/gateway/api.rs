@@ -787,6 +787,41 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/channels — list all configured channels with status details
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let channels: Vec<serde_json::Value> = config
+        .channels_config
+        .channels()
+        .into_iter()
+        .map(|(channel, enabled)| {
+            let status = if enabled { "active" } else { "inactive" };
+            let health = if enabled { "healthy" } else { "down" };
+            serde_json::json!({
+                "name": channel.name(),
+                "type": channel.name(),
+                "enabled": enabled,
+                "status": status,
+                // TODO: track per-channel message counts
+                "message_count": 0,
+                // TODO: track per-channel last message timestamp
+                "last_message_at": null,
+                "health": health,
+            })
+        })
+        .collect();
+
+    Json(channels).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn is_masked_secret(value: &str) -> bool {
