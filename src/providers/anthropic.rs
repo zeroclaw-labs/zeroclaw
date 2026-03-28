@@ -3,7 +3,7 @@ use crate::providers::traits::{
     Provider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
-use crate::tools::ToolSpec;
+use crate::tools::{SchemaCleanr, ToolSpec};
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::stream::{self, StreamExt};
@@ -109,7 +109,7 @@ enum NativeContentOut {
 struct NativeToolSpec<'a> {
     name: &'a str,
     description: &'a str,
-    input_schema: &'a serde_json::Value,
+    input_schema: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_control: Option<CacheControl>,
 }
@@ -286,7 +286,7 @@ impl AnthropicProvider {
             .map(|tool| NativeToolSpec {
                 name: &tool.name,
                 description: &tool.description,
-                input_schema: &tool.parameters,
+                input_schema: SchemaCleanr::clean_for_anthropic(tool.parameters.clone()),
                 cache_control: None,
             })
             .collect();
@@ -1398,7 +1398,7 @@ mod tests {
         let tool = NativeToolSpec {
             name: "get_weather",
             description: "Get weather info",
-            input_schema: &schema,
+            input_schema: schema.clone(),
             cache_control: None,
         };
         let json = serde_json::to_string(&tool).unwrap();
@@ -1412,7 +1412,7 @@ mod tests {
         let tool = NativeToolSpec {
             name: "get_weather",
             description: "Get weather info",
-            input_schema: &schema,
+            input_schema: schema.clone(),
             cache_control: Some(CacheControl::ephemeral()),
         };
         let json = serde_json::to_string(&tool).unwrap();

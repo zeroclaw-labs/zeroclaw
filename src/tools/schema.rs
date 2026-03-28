@@ -105,8 +105,7 @@ impl CleaningStrategy {
     /// Get the list of unsupported keywords for this strategy.
     pub fn unsupported_keywords(self) -> &'static [&'static str] {
         match self {
-            Self::Gemini => GEMINI_UNSUPPORTED_KEYWORDS,
-            Self::Anthropic => &["$ref", "$defs", "definitions"], // Anthropic doesn't resolve refs
+            Self::Gemini | Self::Anthropic => GEMINI_UNSUPPORTED_KEYWORDS,
             Self::OpenAI => &[],                                  // OpenAI is most permissive
             Self::Conservative => &["$ref", "$defs", "definitions", "additionalProperties"],
         }
@@ -232,10 +231,18 @@ impl SchemaCleanr {
             }
         }
 
+        // Handle allOf (intersection semantics — different from anyOf/oneOf)
+        if obj.contains_key("allOf") {
+            if let Some(merged) = Self::try_merge_allof(&obj, defs, strategy, ref_stack) {
+                return merged;
+            }
+        }
+
         // Build cleaned object
         let mut cleaned = Map::new();
         let unsupported: HashSet<&str> = strategy.unsupported_keywords().iter().copied().collect();
-        let has_union = obj.contains_key("anyOf") || obj.contains_key("oneOf");
+        let has_union =
+            obj.contains_key("anyOf") || obj.contains_key("oneOf") || obj.contains_key("allOf");
 
         for (key, value) in obj {
             // Skip unsupported keywords
@@ -355,24 +362,32 @@ impl SchemaCleanr {
     }
 
     /// Try to simplify anyOf/oneOf to a simpler form.
+    ///
+    /// Collects variants from both `anyOf` and `oneOf` if both are present —
+    /// having both simultaneously is unusual but valid JSON Schema.
     fn try_simplify_union(
         obj: &Map<String, Value>,
         defs: &HashMap<String, Value>,
         strategy: CleaningStrategy,
         ref_stack: &mut HashSet<String>,
     ) -> Option<Value> {
-        let union_key = if obj.contains_key("anyOf") {
-            "anyOf"
-        } else if obj.contains_key("oneOf") {
-            "oneOf"
-        } else {
+        if !obj.contains_key("anyOf") && !obj.contains_key("oneOf") {
             return None;
-        };
+        }
 
-        let variants = obj.get(union_key)?.as_array()?;
+        // Collect from both keys — if both are present their variants are unioned
+        let mut raw_variants: Vec<Value> = Vec::new();
+        for key in &["anyOf", "oneOf"] {
+            if let Some(Value::Array(arr)) = obj.get(*key) {
+                raw_variants.extend(arr.iter().cloned());
+            }
+        }
+        if raw_variants.is_empty() {
+            return None;
+        }
 
         // Clean all variants first
-        let cleaned_variants: Vec<Value> = variants
+        let cleaned_variants: Vec<Value> = raw_variants
             .iter()
             .map(|v| Self::clean_with_defs(v.clone(), defs, strategy, ref_stack))
             .collect();
@@ -391,6 +406,23 @@ impl SchemaCleanr {
         // Try to flatten to enum if all variants are literals
         if let Some(enum_value) = Self::try_flatten_literal_union(&non_null) {
             return Some(Self::preserve_meta(obj, enum_value));
+        }
+
+        // Gemini doesn't support anyOf/oneOf at all — apply progressively
+        // more aggressive simplifications until something works.
+        if (strategy == CleaningStrategy::Gemini || strategy == CleaningStrategy::Anthropic)
+            && !non_null.is_empty()
+        {
+            // All-object union → merge all properties into one object
+            if let Some(merged) = Self::try_merge_discriminated_variants(&non_null, obj) {
+                return Some(merged);
+            }
+            // All same primitive type → collapse (union enums if present)
+            if let Some(typed) = Self::try_same_primitive_type_union(&non_null, obj) {
+                return Some(typed);
+            }
+            // Heterogeneous union → best-effort property union or richest variant
+            return Some(Self::gemini_union_fallback(&non_null, obj));
         }
 
         None
@@ -446,11 +478,21 @@ impl SchemaCleanr {
                 return None;
             };
 
-            // Check type consistency
-            let variant_type = obj.get("type")?.as_str()?;
+            // Check type consistency — infer from the literal value when not explicit
+            let variant_type = if let Some(t) = obj.get("type").and_then(|v| v.as_str()) {
+                t.to_string()
+            } else {
+                match &literal_value {
+                    Value::String(_) => "string".to_string(),
+                    Value::Bool(_) => "boolean".to_string(),
+                    Value::Number(n) if n.is_f64() => "number".to_string(),
+                    Value::Number(_) => "integer".to_string(),
+                    _ => return None,
+                }
+            };
             match &common_type {
-                None => common_type = Some(variant_type.to_string()),
-                Some(t) if t != variant_type => return None,
+                None => common_type = Some(variant_type),
+                Some(t) if *t != variant_type => return None,
                 _ => {}
             }
 
@@ -463,6 +505,494 @@ impl SchemaCleanr {
                 "enum": all_values
             })
         })
+    }
+
+    /// Merge an all-object union into a single discriminated-union object schema.
+    ///
+    /// Named `try_merge_discriminated_variants` rather than `try_merge_object_union`
+    /// because the function does more than merge: it detects discriminator fields,
+    /// reconstructs them as enum lists, and injects conditional descriptions.
+    ///
+    /// Algorithm:
+    /// 1. Detect discriminator fields — properties present in every variant
+    ///    where each variant supplies a `const` or single-value `enum`.  Their
+    ///    values are unioned into one `enum` list on the merged property.
+    /// 2. Merge all other properties (first definition wins on key collision).
+    /// 3. `required` becomes the intersection of all variants' required lists,
+    ///    plus any detected discriminator fields (they are always required).
+    ///
+    /// Example:
+    /// ```json
+    /// oneOf: [
+    ///   {type:"object", properties:{kind:{const:"ssn"},  num:{type:"string"}}, required:["kind","num"]},
+    ///   {type:"object", properties:{kind:{const:"pass"}, id:{type:"string"}},  required:["kind","id"]}
+    /// ]
+    /// ```
+    /// →
+    /// ```json
+    /// {type:"object",
+    ///  properties:{kind:{type:"string",enum:["ssn","pass"]}, num:{…}, id:{…}},
+    ///  required:["kind"]}
+    /// ```
+    fn try_merge_discriminated_variants(variants: &[Value], source: &Map<String, Value>) -> Option<Value> {
+        if variants.is_empty() {
+            return None;
+        }
+
+        // All variants must be type: "object"
+        for v in variants {
+            let obj = v.as_object()?;
+            match obj.get("type") {
+                Some(Value::String(t)) if t == "object" => {}
+                _ => return None,
+            }
+        }
+
+        // ── Discriminator detection ──────────────────────────────────────────
+        // A discriminator field is one that:
+        //   • appears in every variant's properties, AND
+        //   • carries a single constant value (const or 1-item enum) in every variant
+        //
+        // We collect the per-variant values so we can union them.
+
+        // Gather the property key sets for each variant
+        let prop_sets: Vec<HashSet<&str>> = variants
+            .iter()
+            .map(|v| {
+                v.get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|o| o.keys().map(String::as_str).collect())
+                    .unwrap_or_default()
+            })
+            .collect();
+
+        // Keys present in every variant
+        let common_keys: HashSet<&str> = prop_sets
+            .iter()
+            .skip(1)
+            .fold(prop_sets.first().cloned().unwrap_or_default(), |acc, s| {
+                acc.intersection(s).copied().collect()
+            });
+
+        // For each common key, check whether every variant pins it to a single value
+        let mut discriminators: HashMap<String, Vec<Value>> = HashMap::new();
+        'keys: for key in &common_keys {
+            let mut values: Vec<Value> = Vec::new();
+            for variant in variants {
+                let Some(props) = variant.get("properties").and_then(|p| p.as_object()) else {
+                    continue 'keys;
+                };
+                if let Some(prop) = props.get(*key) {
+                    let pin = if let Some(c) = prop.get("const") {
+                        Some(c.clone())
+                    } else if let Some(Value::Array(arr)) = prop.get("enum") {
+                        if arr.len() == 1 {
+                            Some(arr[0].clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                    match pin {
+                        Some(v) if !values.contains(&v) => values.push(v),
+                        Some(_) => {} // duplicate value across variants — still a discriminator
+                        None => continue 'keys, // not pinned → not a discriminator
+                    }
+                }
+            }
+            if !values.is_empty() {
+                discriminators.insert(key.to_string(), values);
+            }
+        }
+
+        // ── Required intersection ────────────────────────────────────────────
+        // Fields required by ALL variants stay required in the merged schema.
+        let required_intersection: HashSet<String> = {
+            let per_variant: Vec<HashSet<String>> = variants
+                .iter()
+                .map(|v| {
+                    v.get("required")
+                        .and_then(|r| r.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            per_variant
+                .iter()
+                .skip(1)
+                .fold(per_variant.first().cloned().unwrap_or_default(), |acc, s| {
+                    acc.intersection(s).cloned().collect()
+                })
+        };
+
+        // Discriminator fields are always required (model must specify which branch)
+        let mut required: HashSet<String> = required_intersection;
+        required.extend(discriminators.keys().cloned());
+
+        // ── Merge properties ─────────────────────────────────────────────────
+        let mut merged_props: Map<String, Value> = Map::new();
+
+        // Non-discriminator properties: first definition wins on collision
+        for variant in variants {
+            if let Some(Value::Object(props)) = variant.get("properties") {
+                for (k, v) in props {
+                    if !discriminators.contains_key(k) {
+                        merged_props.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+            }
+        }
+
+        // Discriminator properties: build from first variant's schema + unioned enum
+        for (key, values) in &discriminators {
+            // Use first variant's property as the base (preserves type, description, etc.)
+            let base = variants
+                .iter()
+                .find_map(|v| {
+                    v.get("properties")
+                        .and_then(|p| p.as_object())
+                        .and_then(|o| o.get(key))
+                        .and_then(|s| s.as_object())
+                        .cloned()
+                })
+                .unwrap_or_default();
+
+            let mut disc_schema = base;
+            disc_schema.remove("const"); // already absorbed into enum
+            disc_schema.insert("enum".to_string(), Value::Array(values.clone()));
+            // Ensure type is present; default to "string" (discriminators almost always are)
+            disc_schema.entry("type".to_string()).or_insert_with(|| json!("string"));
+            merged_props.insert(key.clone(), Value::Object(disc_schema));
+        }
+
+        // ── Conditional description injection ───────────────────────────────
+        // When exactly one discriminator field is present we can state clearly
+        // which branch each non-discriminator property belongs to.  This turns
+        // implicit structural knowledge ("number only exists in the ssn branch")
+        // into an explicit instruction the model can follow.
+        //
+        // Security: only string/number/bool discriminator values are injected —
+        // complex values (null, object, array) are skipped.  String values are
+        // quote-escaped and capped at 64 chars to prevent oversized descriptions.
+        // Discriminator values come from schema `const`/`enum` definitions
+        // (application-controlled), not from runtime user input.
+        if discriminators.len() == 1 {
+            let disc_key = discriminators.keys().next().unwrap().clone();
+
+            // Collect all property keys so we can detect variant-exclusive ones
+            // without borrowing merged_props mutably at the same time.
+            let prop_keys: Vec<String> = merged_props
+                .keys()
+                .filter(|k| *k != &disc_key)
+                .cloned()
+                .collect();
+
+            for prop_key in prop_keys {
+                // Discriminator values of the variants that contain this property
+                let matching_disc_vals: Vec<String> = variants
+                    .iter()
+                    .filter_map(|v| {
+                        let has_prop = v
+                            .get("properties")
+                            .and_then(|p| p.as_object())
+                            .map(|o| o.contains_key(&prop_key))
+                            .unwrap_or(false);
+                        if !has_prop {
+                            return None;
+                        }
+                        // Read the discriminator enum value for this variant
+                        let raw = v
+                            .get("properties")
+                            .and_then(|p| p.as_object())
+                            .and_then(|o| o.get(&disc_key))
+                            .and_then(|p| p.get("enum"))
+                            .and_then(|e| e.as_array())
+                            .and_then(|a| a.first())?;
+                        match raw {
+                            Value::String(s) => {
+                                let safe: String = s.chars().take(64).collect();
+                                Some(format!("\"{}\"", safe.replace('"', "\\\"")))
+                            }
+                            Value::Number(n) => Some(n.to_string()),
+                            Value::Bool(b) => Some(b.to_string()),
+                            _ => None, // null / object / array — skip
+                        }
+                    })
+                    .collect();
+
+                // Only inject when the property is exclusive to a subset of variants
+                if matching_disc_vals.len() < variants.len() && !matching_disc_vals.is_empty() {
+                    let condition =
+                        format!("Only when {} is {}.", disc_key, matching_disc_vals.join(" or "));
+
+                    if let Some(Value::Object(schema_obj)) =
+                        merged_props.get_mut(&prop_key)
+                    {
+                        let existing = schema_obj
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let new_desc = if existing.is_empty() {
+                            condition
+                        } else {
+                            format!("{} {}", condition, existing)
+                        };
+                        schema_obj
+                            .insert("description".to_string(), Value::String(new_desc));
+                    }
+                }
+            }
+        }
+
+        // ── Assemble result ──────────────────────────────────────────────────
+        let mut result = Map::new();
+        result.insert("type".to_string(), json!("object"));
+        if !merged_props.is_empty() {
+            result.insert("properties".to_string(), Value::Object(merged_props));
+        }
+        if !required.is_empty() {
+            let mut req_vec: Vec<String> = required.into_iter().collect();
+            req_vec.sort(); // deterministic ordering for tests
+            let req_vec: Vec<Value> = req_vec.into_iter().map(Value::String).collect();
+            result.insert("required".to_string(), Value::Array(req_vec));
+        }
+
+        Some(Self::preserve_meta(source, Value::Object(result)))
+    }
+
+    /// Collapse a union where every variant shares the same primitive type.
+    ///
+    /// When all variants agree on a primitive type:
+    /// - If every variant carries an `enum`, the values are unioned into one list.
+    /// - Otherwise the type is returned without enum restriction so no data is lost.
+    ///
+    /// Does not handle `object` or `array` — those go through
+    /// `try_merge_discriminated_variants` instead.
+    fn try_same_primitive_type_union(
+        variants: &[Value],
+        source: &Map<String, Value>,
+    ) -> Option<Value> {
+        if variants.is_empty() {
+            return None;
+        }
+
+        let mut common_type: Option<String> = None;
+
+        for variant in variants {
+            let obj = variant.as_object()?;
+            let t = obj.get("type")?.as_str()?;
+            // Object/array unions are handled by try_merge_discriminated_variants
+            if matches!(t, "object" | "array") {
+                return None;
+            }
+            match &common_type {
+                None => common_type = Some(t.to_string()),
+                Some(ct) if ct == t => {}
+                _ => return None,
+            }
+        }
+
+        let t = common_type?;
+
+        // If every variant carries an enum, union all values into one enum.
+        let all_have_enum = variants.iter().all(|v| {
+            v.as_object()
+                .map(|o| o.contains_key("enum"))
+                .unwrap_or(false)
+        });
+
+        let result = if all_have_enum {
+            let mut combined: Vec<Value> = Vec::new();
+            for variant in variants {
+                if let Some(Value::Array(vals)) = variant.get("enum") {
+                    for v in vals {
+                        if !combined.contains(v) {
+                            combined.push(v.clone());
+                        }
+                    }
+                }
+            }
+            json!({ "type": t, "enum": combined })
+        } else {
+            json!({ "type": t })
+        };
+
+        Some(Self::preserve_meta(source, result))
+    }
+
+    /// Merge an `allOf` schema into a single flat schema.
+    ///
+    /// `allOf` means every sub-schema must hold simultaneously (intersection),
+    /// so:
+    /// - **Properties** are the union of all variants' properties (all apply).
+    /// - **`required`** is the union of all variants' required lists (any field
+    ///   that any variant marks required is required in the merged schema).
+    ///
+    /// For non-Gemini strategies only trivial cases are flattened (single
+    /// effective variant after stripping empty schemas); providers that
+    /// understand `allOf` natively keep it for multi-variant cases.
+    fn try_merge_allof(
+        obj: &Map<String, Value>,
+        defs: &HashMap<String, Value>,
+        strategy: CleaningStrategy,
+        ref_stack: &mut HashSet<String>,
+    ) -> Option<Value> {
+        let raw = obj.get("allOf")?.as_array()?;
+
+        // Clean variants first (resolves $refs, strips unsupported keywords, etc.)
+        let cleaned: Vec<Value> = raw
+            .iter()
+            .map(|v| Self::clean_with_defs(v.clone(), defs, strategy, ref_stack))
+            .collect();
+
+        // Drop empty schemas {} — cleaning may have removed all meaningful content
+        let effective: Vec<Value> = cleaned
+            .into_iter()
+            .filter(|v| v.as_object().map_or(true, |o| !o.is_empty()))
+            .collect();
+
+        if effective.is_empty() {
+            return Some(Self::preserve_meta(obj, Value::Object(Map::new())));
+        }
+
+        // Single effective schema → unwrap directly (applies for all strategies)
+        if effective.len() == 1 {
+            return Some(Self::preserve_meta(
+                obj,
+                effective.into_iter().next().unwrap(),
+            ));
+        }
+
+        // Multi-variant: only Gemini must flatten (other providers support allOf)
+        if strategy != CleaningStrategy::Gemini && strategy != CleaningStrategy::Anthropic {
+            return None;
+        }
+
+        // All variants are objects → merge (union of properties + union of required)
+        let all_objects = effective.iter().all(|v| {
+            v.as_object()
+                .and_then(|o| o.get("type"))
+                .and_then(|t| t.as_str())
+                == Some("object")
+        });
+
+        if all_objects {
+            let mut merged_props: Map<String, Value> = Map::new();
+            let mut all_required: HashSet<String> = HashSet::new();
+
+            for variant in &effective {
+                if let Some(Value::Object(props)) = variant.get("properties") {
+                    for (k, v) in props {
+                        merged_props.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+                if let Some(Value::Array(req)) = variant.get("required") {
+                    for r in req {
+                        if let Some(s) = r.as_str() {
+                            all_required.insert(s.to_string());
+                        }
+                    }
+                }
+            }
+
+            let mut result = Map::new();
+            result.insert("type".to_string(), json!("object"));
+            if !merged_props.is_empty() {
+                result.insert("properties".to_string(), Value::Object(merged_props));
+            }
+            if !all_required.is_empty() {
+                let mut req_vec: Vec<String> = all_required.into_iter().collect();
+                req_vec.sort();
+                let req_vec: Vec<Value> = req_vec.into_iter().map(Value::String).collect();
+                result.insert("required".to_string(), Value::Array(req_vec));
+            }
+            return Some(Self::preserve_meta(obj, Value::Object(result)));
+        }
+
+        // Heterogeneous allOf — key-level merge, first definition wins on collision.
+        // Handles the common add-constraint pattern: allOf: [{type:"T"}, {enum:[...]}]
+        // and also preserves description/title/default from description-only variants.
+        let mut merged: Map<String, Value> = Map::new();
+        for variant in &effective {
+            if let Some(variant_obj) = variant.as_object() {
+                for (k, v) in variant_obj {
+                    merged.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            }
+        }
+        Some(Self::preserve_meta(obj, Value::Object(merged)))
+    }
+
+    /// Last-resort Gemini flattening for unions that couldn't be simplified.
+    ///
+    /// Strategy:
+    /// 1. Build a merged property map from every variant that has `properties`.
+    /// 2. Collect a common `type` if all variants agree on one.
+    /// 3. Fall back to the richest variant (most top-level keys) when the
+    ///    variants are too heterogeneous to merge cleanly.
+    fn gemini_union_fallback(variants: &[Value], source: &Map<String, Value>) -> Value {
+        // Collect merged properties from all object-bearing variants
+        let mut merged_props: Map<String, Value> = Map::new();
+        let mut common_type: Option<String> = None;
+        let mut type_conflict = false;
+
+        for variant in variants {
+            if let Some(obj) = variant.as_object() {
+                // Accumulate properties (first definition wins on collision)
+                if let Some(Value::Object(props)) = obj.get("properties") {
+                    for (k, v) in props {
+                        merged_props.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+
+                // Track whether all variants agree on a type
+                if let Some(Value::String(t)) = obj.get("type") {
+                    match &common_type {
+                        None => common_type = Some(t.clone()),
+                        Some(ct) if ct == t => {}
+                        _ => type_conflict = true,
+                    }
+                }
+            }
+        }
+
+        // If we accumulated properties, emit a merged object schema
+        if !merged_props.is_empty() {
+            let mut result = Map::new();
+            result.insert("type".to_string(), json!("object"));
+            result.insert("properties".to_string(), Value::Object(merged_props));
+            return Self::preserve_meta(source, Value::Object(result));
+        }
+
+        // No properties to merge — use common type if all variants agreed,
+        // otherwise fall back to the variant with the most top-level keys.
+        if !type_conflict {
+            if let Some(t) = common_type {
+                if t == "array" {
+                    let first_items = variants
+                        .iter()
+                        .find_map(|v| v.as_object().and_then(|o| o.get("items")).cloned());
+                    if let Some(items) = first_items {
+                        return Self::preserve_meta(source, json!({ "type": "array", "items": items }));
+                    }
+                }
+                return Self::preserve_meta(source, json!({ "type": t }));
+            }
+        }
+
+        let richest = variants
+            .iter()
+            .max_by_key(|v| v.as_object().map_or(0, |o| o.len()))
+            .cloned()
+            .unwrap_or(Value::Object(Map::new()));
+
+        Self::preserve_meta(source, richest)
     }
 
     /// Clean type array, removing null.
@@ -795,7 +1325,9 @@ mod tests {
     }
 
     #[test]
-    fn test_skip_type_when_non_simplifiable_union_exists() {
+    fn test_all_object_oneof_merged_for_gemini() {
+        // All-object oneOf is now merged into a single object schema for Gemini
+        // (Gemini doesn't support oneOf at all).
         let schema = json!({
             "type": "object",
             "oneOf": [
@@ -816,8 +1348,491 @@ mod tests {
 
         let cleaned = SchemaCleanr::clean_for_gemini(schema);
 
-        assert!(cleaned.get("type").is_none());
+        // Merged into one object with all properties; oneOf is gone
+        assert_eq!(cleaned["type"], "object");
+        assert!(cleaned.get("oneOf").is_none());
+        assert_eq!(cleaned["properties"]["a"]["type"], "string");
+        assert_eq!(cleaned["properties"]["b"]["type"], "number");
+    }
+
+    #[test]
+    fn test_all_object_oneof_kept_for_openai() {
+        // Non-Gemini strategies keep oneOf when it can't be simplified to enum/single.
+        let schema = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } }
+                },
+                {
+                    "type": "object",
+                    "properties": { "b": { "type": "number" } }
+                }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_openai(schema);
+
+        // OpenAI supports oneOf natively — keep it
         assert!(cleaned.get("oneOf").is_some());
+    }
+
+    #[test]
+    fn test_merge_object_union_no_discriminator() {
+        // No common const fields — properties merged, required is intersection (empty here)
+        let schema = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } },
+                    "required": ["a"]
+                },
+                {
+                    "type": "object",
+                    "properties": { "b": { "type": "integer" } },
+                    "required": ["b"]
+                }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "object");
+        assert!(cleaned.get("oneOf").is_none());
+        // required intersection is empty (a and b are not shared)
+        assert!(cleaned.get("required").is_none());
+        assert_eq!(cleaned["properties"]["a"]["type"], "string");
+        assert_eq!(cleaned["properties"]["b"]["type"], "integer");
+    }
+
+    #[test]
+    fn test_merge_object_union_discriminator_detected() {
+        // "kind" is pinned to a different const in each variant → becomes an enum
+        let schema = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "ssn" },
+                        "number": { "type": "string" }
+                    },
+                    "required": ["kind", "number"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "passport" },
+                        "country": { "type": "string" },
+                        "id": { "type": "string" }
+                    },
+                    "required": ["kind", "id"]
+                }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "object");
+        assert!(cleaned.get("oneOf").is_none());
+
+        // Discriminator: enum with both values, no const leak
+        let kind = &cleaned["properties"]["kind"];
+        assert_eq!(kind["type"], "string");
+        assert!(kind.get("const").is_none());
+        let enum_vals = kind["enum"].as_array().unwrap();
+        assert_eq!(enum_vals.len(), 2);
+        assert!(enum_vals.contains(&json!("ssn")));
+        assert!(enum_vals.contains(&json!("passport")));
+
+        // Other properties merged
+        assert_eq!(cleaned["properties"]["number"]["type"], "string");
+        assert_eq!(cleaned["properties"]["country"]["type"], "string");
+        assert_eq!(cleaned["properties"]["id"]["type"], "string");
+
+        // "kind" required (discriminator); "number" and "id" not (not in both variants' required)
+        let req = cleaned["required"].as_array().unwrap();
+        assert!(req.contains(&json!("kind")));
+        assert!(!req.contains(&json!("number")));
+        assert!(!req.contains(&json!("id")));
+    }
+
+    #[test]
+    fn test_discriminated_variants_conditional_description_injected() {
+        let schema = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "ssn" },
+                        "number": { "type": "string", "description": "The SSN value." }
+                    },
+                    "required": ["kind", "number"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "passport" },
+                        "country": { "type": "string" },
+                        "id": { "type": "string", "description": "Passport ID." }
+                    },
+                    "required": ["kind", "id"]
+                }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        // Discriminator: unchanged (already enum, no condition added to it)
+        let kind = &cleaned["properties"]["kind"];
+        assert!(kind.get("description").is_none() || !kind["description"].as_str().unwrap_or("").contains("Only when"));
+
+        // Branch-exclusive properties get conditional prefix
+        let number_desc = cleaned["properties"]["number"]["description"].as_str().unwrap();
+        assert!(number_desc.starts_with("Only when kind is \"ssn\"."));
+        assert!(number_desc.contains("The SSN value.")); // original preserved
+
+        let country_desc = cleaned["properties"]["country"]["description"].as_str().unwrap();
+        assert!(country_desc.starts_with("Only when kind is \"passport\"."));
+
+        let id_desc = cleaned["properties"]["id"]["description"].as_str().unwrap();
+        assert!(id_desc.starts_with("Only when kind is \"passport\"."));
+        assert!(id_desc.contains("Passport ID."));
+    }
+
+    #[test]
+    fn test_discriminated_variants_no_injection_when_shared_property() {
+        // user_id appears in both variants — no conditional description
+        let schema = json!({
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "a" },
+                        "user_id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "b" },
+                        "user_id": { "type": "string" }
+                    }
+                }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        // user_id is in both variants — should not get "Only when" description
+        let user_id = &cleaned["properties"]["user_id"];
+        assert!(
+            user_id.get("description").is_none()
+                || !user_id["description"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("Only when")
+        );
+    }
+
+    #[test]
+    fn test_merge_object_union_required_intersection_preserved() {
+        // Fields required by ALL variants stay required in merged schema
+        let schema = json!({
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": { "user_id": { "type": "string" }, "a": { "type": "string" } },
+                    "required": ["user_id", "a"]
+                },
+                {
+                    "type": "object",
+                    "properties": { "user_id": { "type": "string" }, "b": { "type": "integer" } },
+                    "required": ["user_id", "b"]
+                }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        let req = cleaned["required"].as_array().unwrap();
+        assert!(req.contains(&json!("user_id")));
+        assert!(!req.contains(&json!("a")));
+        assert!(!req.contains(&json!("b")));
+    }
+
+    #[test]
+    fn test_merge_object_union_preserves_meta() {
+        let schema = json!({
+            "description": "One of these shapes",
+            "anyOf": [
+                { "type": "object", "properties": { "x": { "type": "number" } } },
+                { "type": "object", "properties": { "y": { "type": "number" } } }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "object");
+        assert_eq!(cleaned["description"], "One of these shapes");
+        assert!(cleaned.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_same_primitive_type_union_no_enum() {
+        // Same type, no enum — collapse to the type
+        let schema = json!({
+            "anyOf": [
+                { "type": "string" },
+                { "type": "string", "description": "alternate" }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "string");
+        assert!(cleaned.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_same_primitive_type_union_merges_enums() {
+        // All variants carry an enum — values should be unioned
+        let schema = json!({
+            "anyOf": [
+                { "type": "string", "enum": ["a", "b"] },
+                { "type": "string", "enum": ["c", "d"] }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "string");
+        assert!(cleaned.get("anyOf").is_none());
+        let vals = cleaned["enum"].as_array().unwrap();
+        assert_eq!(vals.len(), 4);
+        assert!(vals.contains(&json!("a")));
+        assert!(vals.contains(&json!("d")));
+    }
+
+    #[test]
+    fn test_same_primitive_type_union_deduplicates_enums() {
+        let schema = json!({
+            "anyOf": [
+                { "type": "string", "enum": ["a", "b"] },
+                { "type": "string", "enum": ["b", "c"] }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        let vals = cleaned["enum"].as_array().unwrap();
+        assert_eq!(vals.len(), 3); // "b" deduplicated
+    }
+
+    #[test]
+    fn test_gemini_fallback_mixed_types_unions_properties() {
+        // Mixed types — fallback should union properties rather than pick one
+        let schema = json!({
+            "anyOf": [
+                { "type": "object", "properties": { "a": { "type": "string" } } },
+                { "type": "object", "properties": { "b": { "type": "integer" } } },
+                { "type": "integer" }  // makes it not all-object
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        // anyOf must be gone — Gemini doesn't support it
+        assert!(cleaned.get("anyOf").is_none());
+    }
+
+    #[test]
+    fn test_gemini_fallback_preserves_meta() {
+        let schema = json!({
+            "description": "Either format",
+            "anyOf": [
+                { "type": "string" },
+                { "type": "integer" }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert!(cleaned.get("anyOf").is_none());
+        assert_eq!(cleaned["description"], "Either format");
+    }
+
+    #[test]
+    fn test_non_gemini_keeps_unresolvable_union() {
+        // Non-Gemini strategies should keep anyOf when it can't be simplified.
+        let schema = json!({
+            "anyOf": [
+                { "type": "string" },
+                { "type": "integer" }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_openai(schema);
+
+        // OpenAI can handle anyOf natively — keep it
+        assert!(cleaned.get("anyOf").is_some());
+    }
+
+    // ── Fix 1: infer type from literal when absent ───────────────────────────
+
+    #[test]
+    fn test_flatten_literal_union_infers_type_from_const() {
+        // Variants have const but no explicit type field
+        let schema = json!({
+            "anyOf": [
+                { "const": "admin" },
+                { "const": "user" }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "string");
+        assert!(cleaned.get("anyOf").is_none());
+        let vals = cleaned["enum"].as_array().unwrap();
+        assert!(vals.contains(&json!("admin")));
+        assert!(vals.contains(&json!("user")));
+    }
+
+    #[test]
+    fn test_flatten_literal_union_infers_integer_type() {
+        let schema = json!({
+            "anyOf": [
+                { "const": 1 },
+                { "const": 2 },
+                { "const": 3 }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "integer");
+        let vals = cleaned["enum"].as_array().unwrap();
+        assert_eq!(vals.len(), 3);
+    }
+
+    // ── Fix 2: allOf handling ────────────────────────────────────────────────
+
+    #[test]
+    fn test_allof_single_effective_schema_unwrapped() {
+        // allOf with one real schema + one that becomes empty after cleaning
+        let schema = json!({
+            "allOf": [
+                { "type": "string" },
+                { "minLength": 1 }  // stripped by Gemini — becomes {}
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "string");
+        assert!(cleaned.get("allOf").is_none());
+    }
+
+    #[test]
+    fn test_allof_merges_objects_for_gemini() {
+        // allOf composition: base schema + extension
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"]
+                },
+                {
+                    "type": "object",
+                    "properties": { "name": { "type": "string" } },
+                    "required": ["name"]
+                }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "object");
+        assert!(cleaned.get("allOf").is_none());
+        assert_eq!(cleaned["properties"]["id"]["type"], "string");
+        assert_eq!(cleaned["properties"]["name"]["type"], "string");
+        // allOf required = UNION (both fields required in intersection schema)
+        let req = cleaned["required"].as_array().unwrap();
+        assert!(req.contains(&json!("id")));
+        assert!(req.contains(&json!("name")));
+    }
+
+    #[test]
+    fn test_allof_kept_for_openai() {
+        let schema = json!({
+            "allOf": [
+                { "type": "object", "properties": { "a": { "type": "string" } } },
+                { "type": "object", "properties": { "b": { "type": "integer" } } }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_openai(schema);
+
+        // OpenAI supports allOf natively
+        assert!(cleaned.get("allOf").is_some());
+    }
+
+    #[test]
+    fn test_allof_ref_resolution_then_merge() {
+        // Common pattern: allOf with a $ref + inline extension
+        let schema = json!({
+            "allOf": [
+                { "$ref": "#/$defs/Base" },
+                {
+                    "type": "object",
+                    "properties": { "extra": { "type": "boolean" } },
+                    "required": ["extra"]
+                }
+            ],
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } },
+                    "required": ["id"]
+                }
+            }
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        assert_eq!(cleaned["type"], "object");
+        assert!(cleaned.get("allOf").is_none());
+        assert!(cleaned.get("$defs").is_none());
+        assert_eq!(cleaned["properties"]["id"]["type"], "string");
+        assert_eq!(cleaned["properties"]["extra"]["type"], "boolean");
+        let req = cleaned["required"].as_array().unwrap();
+        assert!(req.contains(&json!("id")));
+        assert!(req.contains(&json!("extra")));
+    }
+
+    // ── Fix 3: both anyOf and oneOf present ──────────────────────────────────
+
+    #[test]
+    fn test_anyof_and_oneof_both_present_variants_unioned() {
+        let schema = json!({
+            "anyOf": [
+                { "type": "object", "properties": { "a": { "type": "string" } } }
+            ],
+            "oneOf": [
+                { "type": "object", "properties": { "b": { "type": "integer" } } }
+            ]
+        });
+
+        let cleaned = SchemaCleanr::clean_for_gemini(schema);
+
+        // Both variant sets merged — neither anyOf nor oneOf in output
+        assert!(cleaned.get("anyOf").is_none());
+        assert!(cleaned.get("oneOf").is_none());
+        assert_eq!(cleaned["type"], "object");
+        assert_eq!(cleaned["properties"]["a"]["type"], "string");
+        assert_eq!(cleaned["properties"]["b"]["type"], "integer");
     }
 
     #[test]
