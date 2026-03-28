@@ -133,6 +133,63 @@ pub struct SessionState {
     pub turn_started_at: Option<DateTime<Utc>>,
 }
 
+/// A read-only session backend that merges listings from two backends.
+///
+/// Channel sessions live in JSONL files; gateway sessions live in SQLite.
+/// This wrapper lets session tools see both. Primary wins on key conflicts;
+/// writes delegate to primary only.
+pub struct CompositeSessionBackend {
+    primary: std::sync::Arc<dyn SessionBackend>,
+    secondary: std::sync::Arc<dyn SessionBackend>,
+}
+
+impl CompositeSessionBackend {
+    pub fn new(
+        primary: std::sync::Arc<dyn SessionBackend>,
+        secondary: std::sync::Arc<dyn SessionBackend>,
+    ) -> Self {
+        Self { primary, secondary }
+    }
+}
+
+impl SessionBackend for CompositeSessionBackend {
+    fn load(&self, session_key: &str) -> Vec<ChatMessage> {
+        let msgs = self.primary.load(session_key);
+        if !msgs.is_empty() {
+            return msgs;
+        }
+        self.secondary.load(session_key)
+    }
+
+    fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
+        self.primary.append(session_key, message)
+    }
+
+    fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+        self.primary.remove_last(session_key)
+    }
+
+    fn list_sessions(&self) -> Vec<String> {
+        let mut keys: std::collections::HashSet<String> =
+            self.primary.list_sessions().into_iter().collect();
+        keys.extend(self.secondary.list_sessions());
+        keys.into_iter().collect()
+    }
+
+    fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
+        let primary_meta = self.primary.list_sessions_with_metadata();
+        let mut seen: std::collections::HashSet<String> =
+            primary_meta.iter().map(|m| m.key.clone()).collect();
+        let mut result = primary_meta;
+        for meta in self.secondary.list_sessions_with_metadata() {
+            if seen.insert(meta.key.clone()) {
+                result.push(meta);
+            }
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +212,130 @@ mod tests {
         let q = SessionQuery::default();
         assert!(q.keyword.is_none());
         assert!(q.limit.is_none());
+    }
+
+    // ── CompositeSessionBackend tests ─────────────────────────────
+
+    use crate::channels::session_sqlite::SqliteSessionBackend;
+    use crate::channels::session_store::SessionStore;
+
+    #[test]
+    fn composite_merges_sessions_from_both_dirs() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+
+        let store_a = SessionStore::new(dir_a.path()).unwrap();
+        store_a
+            .append("telegram__alice", &ChatMessage::user("hi"))
+            .unwrap();
+
+        let store_b = SessionStore::new(dir_b.path()).unwrap();
+        store_b
+            .append("gw_project-abc", &ChatMessage::user("hello"))
+            .unwrap();
+
+        let composite = CompositeSessionBackend::new(
+            std::sync::Arc::new(store_a),
+            std::sync::Arc::new(store_b),
+        );
+        let sessions = composite.list_sessions();
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn composite_primary_wins_on_load_conflict() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+
+        let store_a = SessionStore::new(dir_a.path()).unwrap();
+        store_a
+            .append("shared", &ChatMessage::user("primary"))
+            .unwrap();
+
+        let store_b = SessionStore::new(dir_b.path()).unwrap();
+        store_b
+            .append("shared", &ChatMessage::user("secondary"))
+            .unwrap();
+
+        let composite = CompositeSessionBackend::new(
+            std::sync::Arc::new(store_a),
+            std::sync::Arc::new(store_b),
+        );
+        let msgs = composite.load("shared");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "primary");
+
+        // Deduplicated in listing
+        assert_eq!(composite.list_sessions().len(), 1);
+    }
+
+    #[test]
+    fn composite_falls_through_to_secondary() {
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let dir_b = tempfile::TempDir::new().unwrap();
+
+        let store_a = SessionStore::new(dir_a.path()).unwrap();
+        let store_b = SessionStore::new(dir_b.path()).unwrap();
+        store_b
+            .append("gw_session", &ChatMessage::user("from gateway"))
+            .unwrap();
+
+        let composite = CompositeSessionBackend::new(
+            std::sync::Arc::new(store_a),
+            std::sync::Arc::new(store_b),
+        );
+        let msgs = composite.load("gw_session");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "from gateway");
+    }
+
+    #[test]
+    fn composite_jsonl_plus_sqlite_with_overlapping_keys() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // JSONL backend: channel session
+        let jsonl = SessionStore::new(dir.path()).unwrap();
+        jsonl
+            .append("telegram__alice", &ChatMessage::user("channel msg"))
+            .unwrap();
+        // Overlapping key in JSONL
+        jsonl
+            .append("shared_session", &ChatMessage::user("jsonl version"))
+            .unwrap();
+
+        // SQLite backend: gateway sessions
+        let sqlite = SqliteSessionBackend::new(dir.path()).unwrap();
+        sqlite
+            .append("gw_project-abc", &ChatMessage::user("gateway msg"))
+            .unwrap();
+        // Overlapping key in SQLite
+        sqlite
+            .append("shared_session", &ChatMessage::user("sqlite version"))
+            .unwrap();
+
+        let composite =
+            CompositeSessionBackend::new(std::sync::Arc::new(jsonl), std::sync::Arc::new(sqlite));
+
+        // Both unique sessions visible
+        let sessions = composite.list_sessions();
+        assert!(sessions.contains(&"telegram__alice".to_string()));
+        assert!(sessions.contains(&"gw_project-abc".to_string()));
+        assert!(sessions.contains(&"shared_session".to_string()));
+        assert_eq!(sessions.len(), 3);
+
+        // Primary (JSONL) wins on overlapping key
+        let msgs = composite.load("shared_session");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "jsonl version");
+
+        // Gateway-only session loads from secondary
+        let gw_msgs = composite.load("gw_project-abc");
+        assert_eq!(gw_msgs.len(), 1);
+        assert_eq!(gw_msgs[0].content, "gateway msg");
+
+        // Metadata listing also deduplicates
+        let meta = composite.list_sessions_with_metadata();
+        let keys: Vec<&str> = meta.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(keys.iter().filter(|k| **k == "shared_session").count(), 1);
     }
 }

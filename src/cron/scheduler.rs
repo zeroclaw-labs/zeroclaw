@@ -1,3 +1,5 @@
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
 #[cfg(feature = "channel-matrix")]
 use crate::channels::MatrixChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -14,7 +16,7 @@ use crate::cron::{
     sync_declarative_jobs, update_job,
 };
 use crate::security::SecurityPolicy;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
@@ -301,14 +303,7 @@ async fn run_agent_job(
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
-            } else {
-                response
-            },
-        ),
+        Ok(response) => (true, response),
         Err(e) => (false, format!("agent job failed: {e}")),
     }
 }
@@ -421,18 +416,33 @@ fn resolve_matrix_delivery_room(configured_room_id: &str, target: &str) -> Strin
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
-    if !delivery.mode.eq_ignore_ascii_case("announce") {
+
+    // Determine if delivery is requested:
+    // - Explicit "announce" mode (legacy format)
+    // - Channel set with no mode / empty mode (simplified format)
+    // - "none" mode → skip delivery
+    let has_channel = delivery.channel.as_deref().is_some_and(|c| !c.is_empty());
+    let mode = delivery.mode.trim().to_ascii_lowercase();
+    if mode == "none" || (!has_channel && mode != "announce") {
+        return Ok(());
+    }
+
+    // Skip delivery for empty, whitespace-only, or "NONE" output
+    let trimmed = output.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        tracing::debug!(
+            "Cron job '{}': skipping delivery (no actionable output)",
+            job.name.as_deref().unwrap_or(&job.id)
+        );
         return Ok(());
     }
 
     let channel = delivery
         .channel
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
-    let target = delivery
-        .to
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+        .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for delivery"))?;
+    // `to` is optional for live-channel delivery (channel knows its target)
+    let target = delivery.to.as_deref().unwrap_or("");
 
     deliver_announcement(config, channel, target, output).await
 }
@@ -478,6 +488,19 @@ pub(crate) async fn deliver_announcement(
     // Scan for credential leaks before delivering cron job output to channel.
     let safe_output = scan_and_redact_output(channel, target, output);
 
+    // Try the live channel registry first -- this reuses the daemon's
+    // connected channel instances, which is required for stateful
+    // channels like WhatsApp Web that need an active browser session.
+    if let Some(live_ch) = crate::channels::get_live_channel(channel) {
+        live_ch
+            .send(&SendMessage::new(safe_output.as_str(), target))
+            .await
+            .with_context(|| format!("live channel '{channel}' delivery failed"))?;
+        return Ok(());
+    }
+
+    // Fall back to constructing a new channel instance (works for
+    // stateless HTTP-based channels like Telegram, Discord, Slack).
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
             let tg = config
@@ -524,7 +547,8 @@ pub(crate) async fn deliver_announcement(
                 Vec::new(),
                 sl.allowed_users.clone(),
             )
-            .with_workspace_dir(config.workspace_dir.clone());
+            .with_workspace_dir(config.workspace_dir.clone())
+            .with_markdown_blocks(sl.use_markdown_blocks);
             channel
                 .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
@@ -638,6 +662,22 @@ pub(crate) async fn deliver_announcement(
             channel
                 .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
+        }
+        "lark" | "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lark = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = LarkChannel::from_config(lark);
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("lark delivery channel requires `channel-lark` feature");
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }

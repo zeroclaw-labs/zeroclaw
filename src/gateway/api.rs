@@ -1290,6 +1290,7 @@ pub async fn handle_api_sessions_list(
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
+                "name": meta.name
             });
             if let Some(name) = meta.name {
                 entry["name"] = serde_json::Value::String(name);
@@ -1419,6 +1420,8 @@ pub async fn handle_api_session_rename(
     }
 }
 
+/// GET /api/sessions/{id}/history — get message history for a gateway session
+pub async fn handle_api_session_history(
 /// GET /api/sessions/running — list sessions currently in "running" state
 pub async fn handle_api_sessions_running(
     State(state): State<AppState>,
@@ -1472,6 +1475,29 @@ pub async fn handle_api_session_state(
     };
 
     let session_key = format!("gw_{id}");
+
+    // Verify the session exists
+    let sessions = backend.list_sessions();
+    if !sessions.contains(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
+    let messages = backend.load(&session_key);
+    let history: Vec<serde_json::Value> = messages
+        .into_iter()
+        .map(|msg| {
+            serde_json::json!({
+                "role": msg.role,
+                "content": msg.content,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "session_id": id, "history": history })).into_response()
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({

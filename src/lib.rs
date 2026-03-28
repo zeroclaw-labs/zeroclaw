@@ -78,6 +78,7 @@ pub(crate) mod trust;
 pub(crate) mod tunnel;
 pub(crate) mod util;
 pub mod verifiable_intent;
+pub mod voice;
 
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins;

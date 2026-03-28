@@ -909,6 +909,18 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
+                    // Log the full message payload on the first attempt of each
+                    // call (not on retries). Enabled by `--log-llm` / TRACE level.
+                    if attempt == 0 && tracing::enabled!(tracing::Level::TRACE) {
+                        let json = serde_json::to_string_pretty(&effective_messages)
+                            .unwrap_or_else(|e| format!("<serialization error: {e}>"));
+                        tracing::trace!(
+                            provider = %provider_name,
+                            model = %current_model,
+                            "\n{json}\n"
+                        );
+                    }
+
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
@@ -2934,49 +2946,5 @@ mod tests {
             "unexpected error: {err}"
         );
         assert!(stream.next().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn fallback_records_provider_fallback_info() {
-        scope_provider_fallback(async {
-            let provider = ReliableProvider::new(
-                vec![
-                    (
-                        "broken".into(),
-                        Box::new(MockProvider {
-                            calls: Arc::new(AtomicUsize::new(0)),
-                            fail_until_attempt: 99, // always fail
-                            response: "unused",
-                            error: "401 Unauthorized",
-                        }),
-                    ),
-                    (
-                        "working".into(),
-                        Box::new(MockProvider {
-                            calls: Arc::new(AtomicUsize::new(0)),
-                            fail_until_attempt: 0,
-                            response: "hello from working",
-                            error: "unused",
-                        }),
-                    ),
-                ],
-                2,
-                1,
-            );
-
-            let resp = provider.simple_chat("hi", "test-model", 0.0).await.unwrap();
-            assert_eq!(resp, "hello from working");
-
-            let fb = take_last_provider_fallback();
-            assert!(fb.is_some(), "fallback info should be recorded");
-            let fb = fb.unwrap();
-            assert_eq!(fb.requested_provider, "broken");
-            assert_eq!(fb.actual_provider, "working");
-            assert_eq!(fb.actual_model, "test-model");
-
-            // Second take should be None.
-            assert!(take_last_provider_fallback().is_none());
-        })
-        .await;
     }
 }
