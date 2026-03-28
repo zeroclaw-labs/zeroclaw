@@ -9,7 +9,7 @@
 //!
 //! Ref: https://github.com/zeroclaw-labs/zeroclaw/issues/618 (item 7)
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 

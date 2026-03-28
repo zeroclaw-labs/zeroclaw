@@ -1,11 +1,11 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::{
-    runtime_proxy_config, set_runtime_proxy_config, Config, ProxyConfig, ProxyScope,
+    Config, ProxyConfig, ProxyScope, runtime_proxy_config, set_runtime_proxy_config,
 };
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs;
 use std::sync::Arc;
 
@@ -490,10 +490,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("proxy.scope='services'"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("proxy.scope='services'")
+        );
     }
 
     #[tokio::test]

@@ -109,6 +109,7 @@ Options:
   --api-key <key>            API key (skips interactive prompt)
   --provider <id>            Provider (default: openrouter)
   --model <id>               Model (optional)
+  --cargo-features <list>    Extra cargo features (comma/space separated)
   --skip-onboard             Skip provider/API key configuration
   --skip-build               Skip build step
   --skip-install             Skip cargo install step
@@ -138,6 +139,7 @@ Environment:
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   ZEROCLAW_MODEL             Used when --model is not provided
+  ZEROCLAW_CARGO_FEATURES    Extra cargo features for source builds (comma/space separated)
   ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
   ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
   ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS
@@ -147,6 +149,37 @@ USAGE
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+append_cargo_feature() {
+  local feature="${1:-}"
+  [[ -n "$feature" ]] || return 0
+  case ",${CARGO_FEATURES_CSV:-}," in
+    *,"$feature",*) return 0 ;;
+  esac
+  if [[ -n "${CARGO_FEATURES_CSV:-}" ]]; then
+    CARGO_FEATURES_CSV+=",${feature}"
+  else
+    CARGO_FEATURES_CSV="$feature"
+  fi
+}
+
+append_cargo_features_from_input() {
+  local raw="${1:-}" token
+  raw="${raw//,/ }"
+  for token in $raw; do
+    append_cargo_feature "$token"
+  done
+}
+
+refresh_cargo_feature_args() {
+  CARGO_FEATURE_ARGS=()
+  if [[ "${CARGO_NO_DEFAULT_FEATURES:-false}" == true ]]; then
+    CARGO_FEATURE_ARGS+=(--no-default-features)
+  fi
+  if [[ -n "${CARGO_FEATURES_CSV:-}" ]]; then
+    CARGO_FEATURE_ARGS+=(--features "$CARGO_FEATURES_CSV")
+  fi
 }
 
 get_total_memory_mb() {
@@ -646,10 +679,92 @@ MSG
   esac
 }
 
+# Get minimum Rust version from Cargo.toml rust-version field
+get_minimum_rust_version() {
+  local cargo_toml="${ROOT_DIR}/Cargo.toml"
+  if [[ -f "$cargo_toml" ]]; then
+    grep -E '^rust-version\s*=' "$cargo_toml" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?.*/\1/'
+  fi
+}
+
+# Compare two version strings (e.g., "1.87" vs "1.63")
+# Returns 0 if $1 >= $2, 1 otherwise
+version_ge() {
+  local v1="$1"
+  local v2="$2"
+  # Use sort -V for version comparison
+  if [[ "$(printf '%s\n%s' "$v2" "$v1" | sort -V | head -1)" == "$v2" ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# Check if installed Rust version meets minimum requirement
+check_rust_version() {
+  local min_version
+  min_version="$(get_minimum_rust_version)"
+  if [[ -z "$min_version" ]]; then
+    return 0  # No minimum version specified
+  fi
+
+  if ! have_cmd rustc; then
+    return 1  # Rust not installed
+  fi
+
+  local current_version
+  current_version="$(rustc --version | awk '{print $2}')"
+
+  if version_ge "$current_version" "$min_version"; then
+    return 0  # Version OK
+  else
+    return 1  # Version too old
+  fi
+}
+
 install_rust_toolchain() {
+  # Check if Rust is installed and meets minimum version
   if have_cmd cargo && have_cmd rustc; then
-    step_ok "Rust already installed: $(rustc --version)"
-    return
+    local min_version current_version
+    min_version="$(get_minimum_rust_version)"
+    current_version="$(rustc --version | awk '{print $2}')"
+
+    if [[ -n "$min_version" ]]; then
+      if version_ge "$current_version" "$min_version"; then
+        step_ok "Rust already installed: $(rustc --version)"
+        return
+      else
+        warn "Rust version $current_version is too old (minimum required: $min_version)"
+        # Check if rustup is available for upgrade
+        if have_cmd rustup; then
+          step_dot "Updating Rust to latest stable via rustup"
+          rustup update stable
+          # Re-source cargo env to ensure new version is in PATH
+          if [[ -f "$HOME/.cargo/env" ]]; then
+            # shellcheck disable=SC1090
+            source "$HOME/.cargo/env"
+          fi
+          # Verify the update worked
+          current_version="$(rustc --version | awk '{print $2}')"
+          if version_ge "$current_version" "$min_version"; then
+            step_ok "Rust updated to $current_version"
+            return
+          else
+            error "Failed to update Rust to required version $min_version"
+            error "Please manually update Rust: rustup update stable"
+            exit 1
+          fi
+        else
+          error "Rust $current_version is too old and rustup is not available"
+          error "Please install rustup or update your Rust installation manually"
+          error "Minimum required version: $min_version"
+          exit 1
+        fi
+      fi
+    else
+      step_ok "Rust already installed: $(rustc --version)"
+      return
+    fi
   fi
 
   if ! have_cmd curl; then
@@ -1129,6 +1244,10 @@ CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
 MODEL="${ZEROCLAW_MODEL:-}"
+CARGO_FEATURES_INPUT="${ZEROCLAW_CARGO_FEATURES:-}"
+CARGO_NO_DEFAULT_FEATURES=false
+CARGO_FEATURES_CSV=""
+CARGO_FEATURE_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1192,6 +1311,14 @@ while [[ $# -gt 0 ]]; do
       }
       shift 2
       ;;
+    --cargo-features)
+      CARGO_FEATURES_INPUT="${2:-}"
+      [[ -n "$CARGO_FEATURES_INPUT" ]] || {
+        error "--cargo-features requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
     --build-first)
       SKIP_BUILD=false
       shift
@@ -1216,6 +1343,9 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+append_cargo_features_from_input "$CARGO_FEATURES_INPUT"
+refresh_cargo_feature_args
 
 OS_NAME="$(uname -s)"
 DEVICE_CLASS="$(detect_device_class)"
@@ -1485,17 +1615,22 @@ if [[ "$SKIP_BUILD" == false ]]; then
 
   # Determine cargo feature flags — disable prometheus on 32-bit targets
   # (prometheus crate requires AtomicU64, unavailable on armv7l/armv6l)
-  CARGO_FEATURE_FLAGS=""
   _build_arch="$(uname -m)"
   case "$_build_arch" in
     armv7l|armv6l|armhf)
       step_dot "32-bit ARM detected ($_build_arch) — disabling prometheus (requires 64-bit atomics)"
-      CARGO_FEATURE_FLAGS="--no-default-features --features channel-nostr,skill-creation"
+      CARGO_NO_DEFAULT_FEATURES=true
+      append_cargo_feature "channel-nostr"
+      append_cargo_feature "skill-creation"
       ;;
   esac
+  refresh_cargo_feature_args
+  if [[ ${#CARGO_FEATURE_ARGS[@]} -gt 0 ]]; then
+    step_dot "Cargo feature flags: ${CARGO_FEATURE_ARGS[*]}"
+  fi
 
   step_dot "Building release binary"
-  cargo build --release --locked $CARGO_FEATURE_FLAGS
+  cargo build --release --locked "${CARGO_FEATURE_ARGS[@]}"
   step_ok "Release binary built"
 else
   step_dot "Skipping build"
@@ -1514,7 +1649,7 @@ if [[ "$SKIP_INSTALL" == false ]]; then
     fi
   fi
 
-  cargo install --path "$WORK_DIR" --force --locked $CARGO_FEATURE_FLAGS
+  cargo install --path "$WORK_DIR" --force --locked "${CARGO_FEATURE_ARGS[@]}"
   step_ok "ZeroClaw installed"
 
   # Sync binary to ~/.local/bin so PATH lookups find the fresh version

@@ -1,6 +1,6 @@
 //! Tray menu event handling.
 
-use tauri::{menu::MenuEvent, AppHandle, Manager, Runtime};
+use tauri::{AppHandle, Manager, Runtime, menu::MenuEvent};
 
 pub fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: MenuEvent) {
     match event.id().as_ref() {

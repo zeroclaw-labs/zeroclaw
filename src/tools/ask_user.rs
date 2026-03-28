@@ -8,8 +8,8 @@
 
 use super::traits::{Tool, ToolResult};
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
@@ -305,6 +305,7 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             };
             let _ = tx.send(msg).await;
             Ok(())

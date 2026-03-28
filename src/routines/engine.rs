@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use super::event_matcher::{matches_any, EventPattern, RoutineEvent};
+use super::event_matcher::{EventPattern, RoutineEvent, matches_any};
 
 /// What happens when a routine fires.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,9 +307,11 @@ mod tests {
 
         let results = engine.dispatch(&test_event("webhook", "/deploy"));
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|r| matches!(r, RoutineDispatchResult::Fired { .. })));
+        assert!(
+            results
+                .iter()
+                .all(|r| matches!(r, RoutineDispatchResult::Fired { .. }))
+        );
     }
 
     #[test]

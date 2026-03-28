@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
+use reqwest::multipart::{Form, Part};
+use std::path::Path;
+use tokio::fs;
+use super::media_markers::{parse_outgoing_media_markers, OutgoingMediaKind};
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -1027,6 +1031,7 @@ impl LarkChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                        observe_group: false,
                         interruption_scope_id: None,
                     attachments: vec![],
                     };
@@ -1556,6 +1561,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         }]
     }
 
@@ -1770,11 +1776,22 @@ impl LarkChannel {
             channel: self.channel_name().to_string(),
             timestamp,
             thread_ts: None,
+            observe_group: false,
             interruption_scope_id: None,
             attachments: vec![],
         });
 
         messages
+    }
+}
+
+/// Lark/Feishu file_type for non-image uploads.
+fn lark_file_type(kind: OutgoingMediaKind) -> &'static str {
+    match kind {
+        OutgoingMediaKind::Image => "image",
+        OutgoingMediaKind::Document => "stream",
+        OutgoingMediaKind::Video => "mp4",
+        OutgoingMediaKind::Audio | OutgoingMediaKind::Voice => "opus",
     }
 }
 
@@ -1785,34 +1802,302 @@ impl Channel for LarkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let token = self.get_tenant_access_token().await?;
+        let mut token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let chunks = split_markdown_chunks(&message.content, LARK_CARD_MARKDOWN_MAX_BYTES);
-        for chunk in &chunks {
-            let body = build_interactive_card_body(&message.recipient, chunk);
+        let (cleaned_text, parts) = parse_outgoing_media_markers(&message.content);
 
-            let (status, response) = self.send_text_once(&url, &token, &body).await?;
+        // Send text first (caption-like content) when present.
+        let mut sent_any = false;
+        if !cleaned_text.is_empty() {
+            let content = serde_json::json!({ "text": cleaned_text }).to_string();
+            let body = serde_json::json!({
+                "receive_id": message.recipient,
+                "msg_type": "text",
+                "content": content,
+            });
 
-            if should_refresh_lark_tenant_token(status, &response) {
-                // Token expired/invalid, invalidate and retry once.
-                self.invalidate_token().await;
-                let new_token = self.get_tenant_access_token().await?;
-                let (retry_status, retry_response) =
-                    self.send_text_once(&url, &new_token, &body).await?;
-
-                if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                    anyhow::bail!(
-                        "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
-                    );
+            let mut retried = false;
+            loop {
+                let (status, response) = self.send_text_once(&url, &token, &body).await?;
+                if should_refresh_lark_tenant_token(status, &response) && !retried {
+                    // Token expired/invalid, invalidate and retry once.
+                    self.invalidate_token().await;
+                    token = self.get_tenant_access_token().await?;
+                    retried = true;
+                    continue;
                 }
-
-                ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
-            } else {
-                ensure_lark_send_success(status, &response, "without token refresh")?;
+                ensure_lark_send_success(status, &response, "text message")?;
+                sent_any = true;
+                break;
             }
         }
 
+        // Upload & send local media parts (v1: local paths only).
+        for part in parts {
+            if part.target.starts_with("http://") || part.target.starts_with("https://") {
+                tracing::warn!("lark: unresolved remote media skipped (kind={:?})", part.kind);
+                continue;
+            }
+
+            let path = Path::new(&part.target);
+            if !path.exists() || !path.is_file() {
+                tracing::warn!("lark: unresolved local media skipped (kind={:?})", part.kind);
+                continue;
+            }
+
+            // Read once so retries do not re-read from disk.
+            let file_bytes = match fs::read(path).await {
+                Ok(b) => b,
+                Err(_) => {
+                    tracing::warn!("lark: media read failed (kind={:?})", part.kind);
+                    continue;
+                }
+            };
+
+            match part.kind {
+                OutgoingMediaKind::Image => {
+                    let upload_url = format!("{}/im/v1/images", self.api_base());
+
+                    let mut uploaded_image_key: Option<String> = None;
+                    let mut retried = false;
+                    loop {
+                        let file_name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image.bin");
+
+                        let form = Form::new()
+                            .text("image_type", "message")
+                            .part(
+                                "image",
+                                Part::bytes(file_bytes.clone()).file_name(file_name.to_string()),
+                            );
+
+                        let resp = self
+                            .http_client()
+                            .post(&upload_url)
+                            .header("Authorization", format!("Bearer {token}"))
+                            .multipart(form)
+                            .send()
+                            .await;
+
+                        let resp = match resp {
+                            Ok(r) => r,
+                            Err(_) => {
+                                tracing::warn!("lark: image upload request failed");
+                                break;
+                            }
+                        };
+
+                        let status = resp.status();
+                        let raw = resp.text().await.unwrap_or_default();
+                        let body_json = serde_json::from_str::<serde_json::Value>(&raw)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+
+                        if should_refresh_lark_tenant_token(status, &body_json) && !retried {
+                            self.invalidate_token().await;
+                            token = self.get_tenant_access_token().await?;
+                            retried = true;
+                            continue;
+                        }
+
+                        if status.is_success()
+                            && body_json
+                                .get("code")
+                                .and_then(|c| c.as_i64())
+                                .unwrap_or(0)
+                                == 0
+                        {
+                            let image_key = body_json
+                                .pointer("/image_key")
+                                .or_else(|| body_json.pointer("/data/image_key"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
+                            uploaded_image_key = image_key;
+                        }
+                        break;
+                    }
+
+                    let Some(image_key) = uploaded_image_key else {
+                        tracing::warn!("lark: image upload failed");
+                        continue;
+                    };
+
+                    // Send image message.
+                    let content = serde_json::json!({ "image_key": image_key }).to_string();
+                    let body = serde_json::json!({
+                        "receive_id": message.recipient,
+                        "msg_type": "image",
+                        "content": content,
+                    });
+
+                    let mut retried = false;
+                    loop {
+                        let (status, response) = match self.send_text_once(&url, &token, &body).await
+                        {
+                            Ok(v) => v,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "lark: image message send request failed (kind={:?})",
+                                    part.kind
+                                );
+                                break;
+                            }
+                        };
+                        if should_refresh_lark_tenant_token(status, &response) && !retried {
+                            self.invalidate_token().await;
+                            token = self.get_tenant_access_token().await?;
+                            retried = true;
+                            continue;
+                        }
+                        if let Err(_) =
+                            ensure_lark_send_success(status, &response, "image message")
+                        {
+                            tracing::warn!(
+                                "lark: image message send failed (kind={:?})",
+                                part.kind
+                            );
+                            break;
+                        }
+                        sent_any = true;
+                        break;
+                    }
+                }
+                _ => {
+                    let upload_url = format!("{}/im/v1/files", self.api_base());
+                    let file_type = lark_file_type(part.kind);
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("attachment.bin")
+                        .to_string();
+
+                    let mut uploaded_file_key: Option<String> = None;
+                    let mut retried = false;
+                    loop {
+                        let form = Form::new()
+                            .text("file_type", file_type)
+                            .text("file_name", filename.clone())
+                            .part(
+                                "file",
+                                Part::bytes(file_bytes.clone()).file_name(filename.clone()),
+                            );
+
+                        let resp = self
+                            .http_client()
+                            .post(&upload_url)
+                            .header("Authorization", format!("Bearer {token}"))
+                            .multipart(form)
+                            .send()
+                            .await;
+
+                        let resp = match resp {
+                            Ok(r) => r,
+                            Err(_) => {
+                                tracing::warn!("lark: file upload request failed (kind={:?})", part.kind);
+                                break;
+                            }
+                        };
+
+                        let status = resp.status();
+                        let raw = resp.text().await.unwrap_or_default();
+                        let body_json = serde_json::from_str::<serde_json::Value>(&raw)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+
+                        if should_refresh_lark_tenant_token(status, &body_json) && !retried {
+                            self.invalidate_token().await;
+                            token = self.get_tenant_access_token().await?;
+                            retried = true;
+                            continue;
+                        }
+
+                        if status.is_success()
+                            && body_json
+                                .get("code")
+                                .and_then(|c| c.as_i64())
+                                .unwrap_or(0)
+                                == 0
+                        {
+                            let file_key = body_json
+                                .pointer("/file_key")
+                                .or_else(|| body_json.pointer("/data/file_key"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
+                            uploaded_file_key = file_key;
+                        }
+                        break;
+                    }
+
+                    let Some(file_key) = uploaded_file_key else {
+                        tracing::warn!("lark: file upload failed (kind={:?})", part.kind);
+                        continue;
+                    };
+
+                    let content = serde_json::json!({ "file_key": file_key }).to_string();
+                    let body = serde_json::json!({
+                        "receive_id": message.recipient,
+                        "msg_type": "file",
+                        "content": content,
+                    });
+
+                    let mut retried = false;
+                    loop {
+                        let (status, response) = match self.send_text_once(&url, &token, &body).await
+                        {
+                            Ok(v) => v,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "lark: file message send request failed (kind={:?})",
+                                    part.kind
+                                );
+                                break;
+                            }
+                        };
+                        if should_refresh_lark_tenant_token(status, &response) && !retried {
+                            self.invalidate_token().await;
+                            token = self.get_tenant_access_token().await?;
+                            retried = true;
+                            continue;
+                        }
+                        if let Err(_) =
+                            ensure_lark_send_success(status, &response, "file message")
+                        {
+                            tracing::warn!(
+                                "lark: file message send failed (kind={:?})",
+                                part.kind
+                            );
+                            break;
+                        }
+                        sent_any = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // v1 compatibility: if everything was unresolved/failed and we didn't send
+        // any text, send a fixed placeholder to avoid empty deliveries.
+        if !sent_any {
+            let content = serde_json::json!({ "text": "[empty message]" }).to_string();
+            let body = serde_json::json!({
+                "receive_id": message.recipient,
+                "msg_type": "text",
+                "content": content,
+            });
+            let mut retried = false;
+            loop {
+                let (status, response) = self.send_text_once(&url, &token, &body).await?;
+                if should_refresh_lark_tenant_token(status, &response) && !retried {
+                    self.invalidate_token().await;
+                    token = self.get_tenant_access_token().await?;
+                    retried = true;
+                    continue;
+                }
+                ensure_lark_send_success(status, &response, "empty message")?;
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -1837,7 +2122,7 @@ impl LarkChannel {
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
-        use axum::{extract::State, routing::post, Json, Router};
+        use axum::{Json, Router, extract::State, routing::post};
 
         #[derive(Clone)]
         struct AppState {
@@ -2278,7 +2563,14 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
                                 mentioned_open_ids.push(open_id.to_string());
                             }
                         }
-                        _ => {}
+                        _ => {
+                            // Some Feishu rich-text tags (for example `md`) still carry useful
+                            // human text in a `text` field. Keep that text instead of dropping
+                            // the whole message as empty.
+                            if let Some(t) = el.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
                     }
                 }
                 text.push('\n');
@@ -3167,10 +3459,11 @@ mod tests {
                 }
             }
         });
-        assert!(ch
-            .parse_event_payload(&wrong_mention_payload)
-            .await
-            .is_empty());
+        assert!(
+            ch.parse_event_payload(&wrong_mention_payload)
+                .await
+                .is_empty()
+        );
 
         let bot_mention_payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -3217,6 +3510,28 @@ mod tests {
         });
 
         assert_eq!(ch.parse_event_payload(&payload).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lark_parse_post_message_accepts_md_tag_text_content() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                "message": {
+                    "message_type": "post",
+                    "chat_type": "p2p",
+                    "chat_id": "oc_chat",
+                    "mentions": [],
+                    "content": "{\"zh_cn\":{\"title\":\"\",\"content\":[[{\"tag\":\"md\",\"text\":\"* 1\\n* 2\"}]]}}"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "* 1\n* 2");
     }
 
     #[tokio::test]
@@ -3640,6 +3955,18 @@ mod tests {
 
     #[tokio::test]
     async fn lark_audio_file_key_missing_returns_none() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let whisper_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "test"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
         let ch = make_channel();
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;

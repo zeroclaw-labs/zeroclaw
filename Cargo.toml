@@ -4,8 +4,8 @@ resolver = "2"
 
 [package]
 name = "zeroclawlabs"
-version = "0.6.4"
-edition = "2021"
+version = "0.6.5"
+edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
@@ -75,6 +75,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
+# CIDR-range matching for SSRF validator
+ipnetwork = "0.20"
+
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
@@ -132,6 +135,9 @@ ring = "0.17"
 
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
+
+# LRU cache for bounded sender state
+lru = "0.16"
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -205,7 +211,7 @@ pdf-extract = { version = "0.10", optional = true }
 extism = { version = "1.20", optional = true }
 
 # Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.17", optional = true }
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
@@ -229,7 +235,7 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["observability-prometheus", "skill-creation"]
+default = ["observability-prometheus", "channel-nostr", "channel-lark", "skill-creation"]
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
@@ -282,6 +288,10 @@ ci-all = [
     "whatsapp-web",
     "plugins-wasm",
 ]
+
+[profile.dev]
+incremental = true
+opt-level = 1
 
 [profile.release]
 opt-level = "z"      # Optimize for size

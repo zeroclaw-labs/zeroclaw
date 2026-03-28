@@ -9,10 +9,10 @@ use crate::providers::traits::{
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use reqwest::{
-    header::{HeaderMap, HeaderValue, USER_AGENT},
     Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +102,27 @@ impl OpenAiCompatibleProvider {
     ) -> Self {
         Self::new_with_options(
             name, base_url, credential, auth_style, false, false, None, false,
+        )
+    }
+
+    /// Same as `new_with_vision` but skips the /v1/responses fallback on 404.
+    /// Use for custom OpenAI-compatible providers that only support chat completions.
+    pub fn new_with_vision_no_responses_fallback(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        supports_vision: bool,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            false,
+            None,
+            false,
         )
     }
 
@@ -406,11 +427,27 @@ impl OpenAiCompatibleProvider {
     }
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
-        let id = model.rsplit('/').next().unwrap_or(model);
-        let supports_reasoning_effort = id.starts_with("gpt-5") || id.contains("codex");
-        supports_reasoning_effort
-            .then(|| self.reasoning_effort.clone())
-            .flatten()
+        let id = model.rsplit('/').next().unwrap_or(model).to_lowercase();
+        // Only apply reasoning_effort to known OpenAI o1/o3/gpt-5 models
+        // and only if the provider seems to intend to support it.
+        let is_openai_reasoning_model = id.starts_with("o1-")
+            || id == "o1"
+            || id.starts_with("o3-")
+            || id == "o3"
+            || id.starts_with("gpt-5");
+
+        // Stricter check for 'codex' models: only if it looks like an official OpenAI model
+        // or if the provider name explicitly contains "openai" or "codex".
+        let is_likely_codex_supported = id.contains("codex")
+            && (id.starts_with("gpt-")
+                || self.name.to_lowercase().contains("openai")
+                || self.name.to_lowercase().contains("codex"));
+
+        if is_openai_reasoning_model || is_likely_codex_supported {
+            self.reasoning_effort.clone()
+        } else {
+            None
+        }
     }
 }
 
@@ -476,6 +513,9 @@ struct UsageInfo {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    /// OpenAI-style completion status (`stop`, `tool_calls`, …).
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 /// Remove `<think>...</think>` blocks from model output.
@@ -502,10 +542,51 @@ fn strip_think_tags(s: &str) -> String {
     result.trim().to_string()
 }
 
+/// OpenAI chat completions may return `message.content` as a string, null, or a JSON array of
+/// parts such as `[{"type":"text","text":"..."}]`. Many gateways preserve the array shape even
+/// for plain text, which would not deserialize into `String`.
+fn openai_assistant_content_plaintext(content: Option<&serde_json::Value>) -> Option<String> {
+    let value = content?;
+    match value {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        serde_json::Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                let Some(obj) = part.as_object() else {
+                    continue;
+                };
+                let text = obj
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(text);
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ResponseMessage {
     #[serde(default)]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     /// Reasoning/thinking models (e.g. Qwen3, GLM-4) may return their output
     /// in `reasoning_content` instead of `content`. Used as automatic fallback.
     #[serde(default)]
@@ -521,8 +602,8 @@ impl ResponseMessage {
     /// Strips `<think>...</think>` blocks that some models (e.g. MiniMax) embed
     /// inline in `content` instead of using a separate field.
     fn effective_content(&self) -> String {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
+        if let Some(raw) = openai_assistant_content_plaintext(self.content.as_ref()) {
+            let stripped = strip_think_tags(&raw);
             if !stripped.is_empty() {
                 return stripped;
             }
@@ -536,8 +617,8 @@ impl ResponseMessage {
     }
 
     fn effective_content_optional(&self) -> Option<String> {
-        if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
-            let stripped = strip_think_tags(content);
+        if let Some(raw) = openai_assistant_content_plaintext(self.content.as_ref()) {
+            let stripped = strip_think_tags(&raw);
             if !stripped.is_empty() {
                 return Some(stripped);
             }
@@ -960,22 +1041,35 @@ fn sse_bytes_to_chunks(
         }
 
         let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences that may be split across
+        // HTTP/1.1 chunked transfer boundaries (e.g. 3-byte CJK chars).
+        let mut utf8_buf: Vec<u8> = Vec::new();
 
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            break;
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                // Could still be an incomplete multi-byte char; wait for more data
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
                         }
                     };
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     buffer.push_str(&text);
 
@@ -1039,21 +1133,32 @@ fn sse_bytes_to_events(
         }
 
         let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences split across chunk boundaries.
+        let mut utf8_buf: Vec<u8> = Vec::new();
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            return;
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
                         }
                     };
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     buffer.push_str(&text);
 
@@ -1518,16 +1623,18 @@ impl OpenAiCompatibleProvider {
         let lower = error.to_lowercase();
         [
             "unknown parameter: tools",
+            "unknown parameter: tool_choice",
             "unsupported parameter: tools",
+            "invalid parameter: tools",
+            "unexpected parameter 'tools'",
+            "extra fields not allowed",
             "unrecognized field `tools`",
             "does not support tools",
             "function calling is not supported",
-            "tool_choice",
             "tool call validation failed",
-            "was not in request",
         ]
         .iter()
-        .any(|hint| lower.contains(hint))
+        .any(|pattern| lower.contains(pattern))
     }
 }
 
@@ -1610,22 +1717,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &fallback_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1723,22 +1815,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1876,31 +1953,9 @@ impl Provider for OpenAiCompatibleProvider {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let text = choice.message.effective_content_optional();
-        let reasoning_content = choice.message.reasoning_content;
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|tc| {
-                let function = tc.function?;
-                let name = function.name?;
-                let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
-                Some(ProviderToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    name,
-                    arguments,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok(ProviderChatResponse {
-            text,
-            tool_calls,
-            usage,
-            reasoning_content,
-        })
+        let mut result = Self::parse_native_response(choice.message);
+        result.usage = usage;
+        Ok(result)
     }
 
     async fn chat(
@@ -1948,28 +2003,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            usage: None,
-                            reasoning_content: None,
-                        })
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -2404,9 +2438,37 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::traits::ChatRequest;
+    use crate::tools::ToolSpec;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
+    }
+
+    async fn spawn_transport_error_server(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connection_count);
+
+        let handle = tokio::spawn(async move {
+            while let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+            {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        (format!("http://{addr}/v1"), connection_count, handle)
     }
 
     #[test]
@@ -2440,10 +2502,12 @@ mod tests {
             .chat_with_system(None, "hello", "llama-3.3-70b", 0.7)
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Venice API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Venice API key not set")
+        );
     }
 
     #[test]
@@ -2482,9 +2546,17 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(
-            resp.choices[0].message.content,
-            Some("Hello from Venice!".to_string())
+            openai_assistant_content_plaintext(resp.choices[0].message.content.as_ref()).as_deref(),
+            Some("Hello from Venice!")
         );
+    }
+
+    #[test]
+    fn response_deserializes_content_as_openai_text_parts_array() {
+        let json =
+            r#"{"choices":[{"message":{"content":[{"type":"text","text":"Hello array"}]}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices[0].message.effective_content(), "Hello array");
     }
 
     #[test]
@@ -2660,9 +2732,101 @@ mod tests {
             .await
             .expect_err("system-only fallback payload should fail");
 
-        assert!(err
-            .to_string()
-            .contains("requires at least one non-system message"));
+        assert!(
+            err.to_string()
+                .contains("requires at least one non-system message")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+
+        let err = provider
+            .chat_with_system(Some("policy"), "hello", "gpt-test", 0.0)
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+
+        let err = provider
+            .chat_with_history(
+                &[ChatMessage::system("policy"), ChatMessage::user("hello")],
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_chat_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+        let messages = [ChatMessage::user("hello")];
+        let tools = [ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell commands".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                }
+            }),
+        }];
+
+        let err = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
     }
 
     #[test]
@@ -3054,18 +3218,46 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_only_applies_to_gpt5_and_codex_models() {
+    fn reasoning_effort_only_applies_to_openai_and_selected_codex_models() {
         let provider = make_provider("test", "https://example.com", None)
             .with_reasoning_effort(Some("high".to_string()));
 
+        // OpenAI reasoning models
         assert_eq!(
-            provider.reasoning_effort_for_model("gpt-5.3-codex"),
+            provider.reasoning_effort_for_model("o1-preview"),
             Some("high".to_string())
         );
         assert_eq!(
-            provider.reasoning_effort_for_model("openai/gpt-5"),
+            provider.reasoning_effort_for_model("openai/o3-mini"),
             Some("high".to_string())
         );
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-5"),
+            Some("high".to_string())
+        );
+
+        // Codex models with gpt- prefix (likely OpenAI)
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-4-codex"),
+            Some("high".to_string())
+        );
+
+        // Non-OpenAI codex models with generic provider name should be REJECTED
+        assert_eq!(
+            provider.reasoning_effort_for_model("llama-3-codex"),
+            None,
+            "Generic codex model should not get reasoning_effort on unknown provider"
+        );
+
+        // But if provider name contains "openai", it should be ACCEPTED
+        let openai_provider = make_provider("openai-proxy", "https://example.com", None)
+            .with_reasoning_effort(Some("high".to_string()));
+        assert_eq!(
+            openai_provider.reasoning_effort_for_model("llama-3-codex"),
+            Some("high".to_string()),
+            "Codex model should get reasoning_effort if provider name contains 'openai'"
+        );
+
         assert_eq!(provider.reasoning_effort_for_model("llama-3.3-70b"), None);
     }
 
@@ -3396,7 +3588,10 @@ mod tests {
 
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.content.as_deref(), Some("I'll check both."));
+        assert_eq!(
+            openai_assistant_content_plaintext(msg.content.as_ref()).as_deref(),
+            Some("I'll check both.")
+        );
         let tool_calls = msg.tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 2);
         assert_eq!(
@@ -3427,10 +3622,12 @@ mod tests {
 
         let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TestProvider API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TestProvider API key not set")
+        );
     }
 
     #[test]
@@ -3438,7 +3635,10 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"Just text, no tools."}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.content.as_deref(), Some("Just text, no tools."));
+        assert_eq!(
+            openai_assistant_content_plaintext(msg.content.as_ref()).as_deref(),
+            Some("Just text, no tools.")
+        );
         assert!(msg.tool_calls.is_none());
     }
 
@@ -3690,7 +3890,7 @@ mod tests {
     #[test]
     fn parse_native_response_captures_reasoning_content() {
         let message = ResponseMessage {
-            content: Some("answer".to_string()),
+            content: Some(serde_json::json!("answer")),
             reasoning_content: Some("thinking step".to_string()),
             tool_calls: Some(vec![ToolCall {
                 id: Some("call_1".to_string()),
@@ -3714,7 +3914,7 @@ mod tests {
     #[test]
     fn parse_native_response_none_reasoning_content_for_normal_model() {
         let message = ResponseMessage {
-            content: Some("hello".to_string()),
+            content: Some(serde_json::json!("hello")),
             reasoning_content: None,
             tool_calls: None,
         };
