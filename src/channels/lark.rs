@@ -1837,7 +1837,7 @@ impl LarkChannel {
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
-        use axum::{extract::State, routing::post, Json, Router};
+        use axum::{Json, Router, extract::State, routing::post};
 
         #[derive(Clone)]
         struct AppState {
@@ -3174,10 +3174,11 @@ mod tests {
                 }
             }
         });
-        assert!(ch
-            .parse_event_payload(&wrong_mention_payload)
-            .await
-            .is_empty());
+        assert!(
+            ch.parse_event_payload(&wrong_mention_payload)
+                .await
+                .is_empty()
+        );
 
         let bot_mention_payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -3669,6 +3670,18 @@ mod tests {
 
     #[tokio::test]
     async fn lark_audio_file_key_missing_returns_none() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let whisper_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "test"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
         let ch = make_channel();
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;

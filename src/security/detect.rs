@@ -145,6 +145,13 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
         return Arc::new(sandbox);
     }
 
+    // Path-validation fallback: software-only deny/allow list enforcement
+    let pv = super::path_validation::PathValidationSandbox::new();
+    if pv.is_available() {
+        tracing::info!("Path-validation sandbox enabled (software-only fallback)");
+        return Arc::new(pv);
+    }
+
     // Fallback: application-layer security only
     tracing::info!("No sandbox backend available, using application-layer security");
     Arc::new(super::traits::NoopSandbox)

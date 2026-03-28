@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::audit::SopAuditLogger;
-use super::engine::{now_iso8601, SopEngine};
+use super::engine::{SopEngine, now_iso8601};
 use super::types::{SopEvent, SopRun, SopRunAction, SopTriggerSource};
 
 // ── Dispatch result ─────────────────────────────────────────────

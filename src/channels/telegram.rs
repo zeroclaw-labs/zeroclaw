@@ -1148,6 +1148,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
 
+        if let Some(forward_info) = Self::extract_forward_info(message) {
+            content = format!("{forward_info}\n\n{content}");
+        }
+
         // Prepend reply context if replying to another message
         if let Some(quote) = self.extract_reply_context(message) {
             content = format!("{quote}\n\n{content}");
@@ -1276,10 +1280,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             cache.insert(format!("{chat_id}:{message_id}"), text.clone());
         }
 
+        let mut content = format!("[Voice] {text}");
+
+        if let Some(forward_info) = Self::extract_forward_info(message) {
+            content = format!("{forward_info}\n\n{content}");
+        }
+
         let content = if let Some(quote) = self.extract_reply_context(message) {
-            format!("{quote}\n\n[Voice] {text}")
+            format!("{quote}\n\n{content}")
         } else {
-            format!("[Voice] {text}")
+            content
         };
 
         // Prepend forwarding attribution when the message was forwarded
@@ -1416,6 +1426,50 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
     }
 
+    /// Extract forward info from a Telegram `forward_origin`, if present.
+    fn extract_forward_info(message: &serde_json::Value) -> Option<String> {
+        let forward_origin = message.get("forward_origin")?;
+        let origin_type = forward_origin.get("type").and_then(|t| t.as_str())?;
+
+        let attribution = match origin_type {
+            "user" => {
+                let user = forward_origin.get("sender_user")?;
+                if let Some(username) = user.get("username").and_then(|u| u.as_str()) {
+                    format!("@{}", username)
+                } else if let Some(first_name) = user.get("first_name").and_then(|n| n.as_str()) {
+                    let mut name = first_name.to_string();
+                    if let Some(last_name) = user.get("last_name").and_then(|n| n.as_str()) {
+                        name.push(' ');
+                        name.push_str(last_name);
+                    }
+                    name
+                } else {
+                    "unknown user".to_string()
+                }
+            }
+            "hidden_user" => forward_origin
+                .get("sender_user_name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown hidden user")
+                .to_string(),
+            "chat" => forward_origin
+                .get("sender_chat")
+                .and_then(|c| c.get("title"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown chat")
+                .to_string(),
+            "channel" => forward_origin
+                .get("chat")
+                .and_then(|c| c.get("title"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown channel")
+                .to_string(),
+            _ => "unknown source".to_string(),
+        };
+
+        Some(format!("[Forwarded from {}]", attribution))
+    }
+
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let message = update.get("message")?;
 
@@ -1468,13 +1522,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        let content = if self.mention_only && is_group {
+        let mut content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             Self::normalize_incoming_content(text, bot_username)?
         } else {
             text.to_string()
         };
+
+        if let Some(forward_info) = Self::extract_forward_info(message) {
+            content = format!("{forward_info}\n\n{content}");
+        }
 
         let content = if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n{content}")
@@ -4256,6 +4314,85 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // extract_forward_info tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_forward_info_user() {
+        let msg = serde_json::json!({
+            "forward_origin": {
+                "type": "user",
+                "sender_user": { "id": 123, "username": "alice" }
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg),
+            Some("[Forwarded from @alice]".to_string())
+        );
+
+        let msg_first_last = serde_json::json!({
+            "forward_origin": {
+                "type": "user",
+                "sender_user": { "id": 123, "first_name": "Alice", "last_name": "Smith" }
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg_first_last),
+            Some("[Forwarded from Alice Smith]".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_forward_info_hidden_user() {
+        let msg = serde_json::json!({
+            "forward_origin": {
+                "type": "hidden_user",
+                "sender_user_name": "Anonymous Sender"
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg),
+            Some("[Forwarded from Anonymous Sender]".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_forward_info_chat() {
+        let msg = serde_json::json!({
+            "forward_origin": {
+                "type": "chat",
+                "sender_chat": { "id": 123, "title": "Secret Group" }
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg),
+            Some("[Forwarded from Secret Group]".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_forward_info_channel() {
+        let msg = serde_json::json!({
+            "forward_origin": {
+                "type": "channel",
+                "chat": { "id": 123, "title": "News Channel" }
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg),
+            Some("[Forwarded from News Channel]".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_forward_info_none() {
+        let msg = serde_json::json!({
+            "text": "regular message"
+        });
+        assert_eq!(TelegramChannel::extract_forward_info(&msg), None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // extract_reply_context tests
     // ─────────────────────────────────────────────────────────────────────
 
@@ -4324,6 +4461,80 @@ mod tests {
         });
         let ctx = ch.extract_reply_context(&msg).unwrap();
         assert_eq!(ctx, "> @bob:\n> [Voice] Hello from voice");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // parse_update_message tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_update_message_forwarded() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 10,
+                "text": "look at this news",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "forward_origin": {
+                    "type": "channel",
+                    "chat": { "id": 123, "title": "News Channel" }
+                }
+            }
+        });
+        let parsed = ch.parse_update_message(&update).unwrap();
+        assert!(
+            parsed.content.contains("[Forwarded from News Channel]"),
+            "content should contain forward info: {}",
+            parsed.content
+        );
+        assert!(
+            parsed.content.contains("look at this news"),
+            "content should contain original text"
+        );
+        assert!(
+            parsed.content.starts_with("[Forwarded"),
+            "forward info should be prepended"
+        );
+    }
+
+    #[test]
+    fn parse_update_message_forwarded_with_reply() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 10,
+                "text": "look at this news",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "reply_to_message": {
+                    "from": { "username": "bot" },
+                    "text": "What do you think?"
+                },
+                "forward_origin": {
+                    "type": "channel",
+                    "chat": { "id": 123, "title": "News Channel" }
+                }
+            }
+        });
+        let parsed = ch.parse_update_message(&update).unwrap();
+        // Quote should be at the very top, then forward info, then text
+        assert!(
+            parsed.content.starts_with("> @bot:"),
+            "content should start with quote block: {}",
+            parsed.content
+        );
+        assert!(
+            parsed.content.contains("[Forwarded from News Channel]"),
+            "content should contain forward info"
+        );
+        let quote_pos = parsed.content.find("> @bot:").unwrap();
+        let fwd_pos = parsed.content.find("[Forwarded").unwrap();
+        let text_pos = parsed.content.find("look at this").unwrap();
+        assert!(
+            quote_pos < fwd_pos && fwd_pos < text_pos,
+            "order must be quote -> forward -> text"
+        );
     }
 
     #[test]
@@ -4901,8 +5112,8 @@ mod tests {
     /// guard in `agent/loop_.rs` will reject photo messages.
     #[test]
     fn groq_provider_rejects_photo_with_vision_error() {
-        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
         use crate::providers::Provider;
+        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
 
         let groq = OpenAiCompatibleProvider::new(
             "Groq",

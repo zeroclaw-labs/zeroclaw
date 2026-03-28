@@ -16,6 +16,7 @@
 
 pub mod acp_server;
 pub mod bluesky;
+pub mod chunker;
 pub mod clawdtalk;
 pub mod cli;
 pub mod debounce;
@@ -113,7 +114,7 @@ use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
 use crate::observability::traits::{ObserverEvent, ObserverMetric};
-use crate::observability::{self, runtime_trace, Observer};
+use crate::observability::{self, Observer, runtime_trace};
 use crate::providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
@@ -122,7 +123,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use portable_atomic::{AtomicU64, Ordering};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -188,8 +189,7 @@ impl Observer for ChannelNotifyObserver {
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
 /// Senders that requested `/new` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
-/// Maximum history messages to keep per sender.
-const MAX_CHANNEL_HISTORY: usize = 50;
+
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Messages shorter than this (e.g. "ok", "thanks") are not stored,
 /// reducing noise in memory recall.
@@ -231,6 +231,66 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
+/// Process-wide shared per-chat route overrides. Persisted to `routes.json` in the workspace.
+static GLOBAL_ROUTE_OVERRIDES: std::sync::LazyLock<RouteSelectionMap> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// Path to the routes.json file; set once at startup when the workspace is known.
+static GLOBAL_ROUTES_FILE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Return a clone of the global route-overrides Arc.
+fn global_route_overrides() -> RouteSelectionMap {
+    Arc::clone(&GLOBAL_ROUTE_OVERRIDES)
+}
+
+/// Set the routes.json path and load any persisted overrides from disk.
+fn init_route_overrides(workspace_dir: &std::path::Path) {
+    let routes_file = workspace_dir.join("routes.json");
+    *GLOBAL_ROUTES_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(routes_file.clone());
+
+    if let Ok(text) = std::fs::read_to_string(&routes_file) {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, ChannelRouteSelection>>(&text) {
+            let mut overrides = GLOBAL_ROUTE_OVERRIDES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *overrides = map;
+            tracing::info!(
+                path = %routes_file.display(),
+                count = overrides.len(),
+                "Loaded per-chat route overrides from disk"
+            );
+        }
+    }
+}
+
+/// Persist current route overrides to routes.json (best-effort; logs on failure).
+fn save_route_overrides(overrides: &HashMap<String, ChannelRouteSelection>) {
+    let path_guard = GLOBAL_ROUTES_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ref path) = *path_guard else { return };
+    match serde_json::to_string_pretty(overrides) {
+        Ok(json) => {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(
+                        path = %parent.display(),
+                        error = %e,
+                        "Failed to create parent directory for route overrides"
+                    );
+                    return;
+                }
+            }
+            if let Err(e) = std::fs::write(path, json) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to save route overrides"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to serialize route overrides"),
+    }
+}
+
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
@@ -256,7 +316,7 @@ fn channel_message_timeout_budget_secs_with_cap(
     message_timeout_secs.saturating_mul(scale)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ChannelRouteSelection {
     provider: String,
     model: String,
@@ -327,6 +387,7 @@ struct InterruptOnNewMessageConfig {
     discord: bool,
     mattermost: bool,
     matrix: bool,
+    whatsapp: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -337,6 +398,7 @@ impl InterruptOnNewMessageConfig {
             "discord" => self.discord,
             "mattermost" => self.mattermost,
             "matrix" => self.matrix,
+            "whatsapp" => self.whatsapp,
             _ => false,
         }
     }
@@ -450,6 +512,20 @@ fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
         ),
         None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
     }
+}
+
+/// Generate the legacy session key as it would appear after lossy filename sanitization.
+/// Used to find sessions persisted before the percent-encoding fix (#4806).
+fn legacy_sanitized_key(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
@@ -684,7 +760,11 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
 
     for turn in turns {
         match (expecting_user, turn.role.as_str()) {
-            (true, "user") => {
+            // Pass through tool-role messages preserved by
+            // keep_tool_context_turns (#4827).  After a tool result the
+            // next expected message is an assistant response, same as
+            // after a user message.
+            (_, "tool") | (true, "user") => {
                 normalized.push(turn);
                 expecting_user = false;
             }
@@ -1024,6 +1104,16 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
 }
 
 fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> ChannelRouteSelection {
+    // Check global (persisted) overrides first, then fall back to ctx-local overrides.
+    let global = global_route_overrides();
+    if let Some(entry) = global
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+    {
+        return entry;
+    }
     ctx.route_overrides
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1034,14 +1124,35 @@ fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> Channel
 
 fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
     let default_route = default_route_selection(ctx);
-    let mut routes = ctx
-        .route_overrides
+
+    // Update ctx-local overrides.
+    {
+        let mut local = ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if next == default_route {
+            local.remove(sender_key);
+        } else {
+            local.insert(sender_key.to_string(), next.clone());
+        }
+    }
+
+    // Persist to global overrides + disk only when routes file is configured
+    // (i.e., init_route_overrides was called at startup). Skipped in tests.
+    let has_routes_file = GLOBAL_ROUTES_FILE
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if next == default_route {
-        routes.remove(sender_key);
-    } else {
-        routes.insert(sender_key.to_string(), next);
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    if has_routes_file {
+        let global = global_route_overrides();
+        let mut routes = global.lock().unwrap_or_else(|e| e.into_inner());
+        if next == default_route {
+            routes.remove(sender_key);
+        } else {
+            routes.insert(sender_key.to_string(), next);
+        }
+        save_route_overrides(&routes);
     }
 }
 
@@ -1209,6 +1320,90 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     while turns.len() > max_history {
         turns.remove(0);
     }
+}
+
+/// Extract tool-call (assistant with tool_call content) and tool-result
+/// messages from the current turn in the LLM history, excluding the final
+/// assistant text response.  "Current turn" = everything after the last
+/// user-role message.
+fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    // Find the index of the last user message — tool messages for the
+    // current turn come after it.
+    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+
+    let tail = &history[last_user_idx + 1..];
+    if tail.is_empty() {
+        return Vec::new();
+    }
+
+    // Everything except the very last assistant message (which is the
+    // final text response that gets stored separately).
+    let end = if tail.last().is_some_and(|m| m.role == "assistant") {
+        tail.len() - 1
+    } else {
+        tail.len()
+    };
+
+    tail[..end]
+        .iter()
+        .filter(|m| m.role == "assistant" || m.role == "tool")
+        .cloned()
+        .collect()
+}
+
+/// Remove tool-role and intermediate assistant tool-call messages from
+/// conversation turns older than the most recent `keep_turns` user→assistant
+/// exchanges.  This prevents unbounded history growth while preserving
+/// tool context for the N most recent turns.
+fn strip_old_tool_context(ctx: &ChannelRuntimeContext, sender_key: &str, keep_turns: usize) {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return;
+    };
+
+    // Walk backwards to find the boundary: count user messages to
+    // identify which turns are "recent" (protected from stripping).
+    let mut user_count = 0;
+    let mut protect_from = turns.len();
+    for (i, turn) in turns.iter().enumerate().rev() {
+        if turn.role == "user" {
+            user_count += 1;
+            if user_count > keep_turns {
+                // Everything before this index is old enough to strip.
+                protect_from = i + 1; // protect from next message onward
+                break;
+            }
+        }
+    }
+
+    // Remove tool and intermediate assistant messages before the boundary.
+    // An "intermediate assistant" is one whose content looks like a tool
+    // call (contains `<tool_call>` or starts with `{\"tool_call`).
+    let mut i = 0;
+    while i < protect_from && i < turns.len() {
+        let dominated = turns[i].role == "tool"
+            || (turns[i].role == "assistant" && is_tool_call_content(&turns[i].content));
+        if dominated {
+            turns.remove(i);
+            // Adjust boundary since we removed an element.
+            protect_from = protect_from.saturating_sub(1);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Heuristic: does this assistant message content represent a tool call
+/// rather than a final text response?
+fn is_tool_call_content(content: &str) -> bool {
+    let trimmed = content.trim();
+    trimmed.contains("<tool_call>")
+        || trimmed.starts_with("{\"tool_call\"")
+        || trimmed.starts_with("{\"name\"")
 }
 
 fn rollback_orphan_user_turn(
@@ -1687,15 +1882,15 @@ async fn handle_runtime_command_if_needed(
                             }
 
                             format!(
-                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                            current.model
-                        )
+                                "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                                current.model
+                            )
                         }
                         Err(err) => {
                             let safe_err = providers::sanitize_api_error(&err.to_string());
                             format!(
-                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
-                        )
+                                "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                            )
                         }
                     }
                 }
@@ -2253,7 +2448,7 @@ fn spawn_scoped_typing_task(
 ) -> tokio::task::JoinHandle<()> {
     let stop_signal = cancellation_token;
     let refresh_interval = Duration::from_secs(CHANNEL_TYPING_REFRESH_INTERVAL_SECS);
-    let handle = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut interval = tokio::time::interval(refresh_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -2271,9 +2466,7 @@ fn spawn_scoped_typing_task(
         if let Err(e) = channel.stop_typing(&recipient).await {
             tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
         }
-    });
-
-    handle
+    })
 }
 
 async fn process_channel_message(
@@ -2464,12 +2657,40 @@ async fn process_channel_message(
     let prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&msg.content)]
     } else {
-        ctx.conversation_histories
+        let mut histories = ctx
+            .conversation_histories
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&history_key)
-            .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut turns = histories.get(&history_key).cloned().unwrap_or_default();
+
+        // Fallback: check for sessions persisted under the legacy lossy-sanitized
+        // key (pre-#4806). If found, migrate to the correct key. See #4806.
+        if turns.is_empty() {
+            let legacy_key = legacy_sanitized_key(&history_key);
+            if legacy_key != history_key {
+                if let Some(legacy_turns) = histories.remove(&legacy_key) {
+                    if !legacy_turns.is_empty() {
+                        tracing::info!(
+                            old_key = %legacy_key,
+                            new_key = %history_key,
+                            "Migrated legacy session to percent-encoded key"
+                        );
+                        histories.insert(history_key.clone(), legacy_turns.clone());
+                        // Re-persist under new key and remove legacy file
+                        if let Some(ref store) = ctx.session_store {
+                            for turn in &legacy_turns {
+                                let _ = store.append(&history_key, turn);
+                            }
+                            let _ = store.delete_session(&legacy_key);
+                        }
+                        turns = legacy_turns;
+                    }
+                }
+            }
+        }
+
+        drop(histories);
+        turns
     };
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
@@ -2585,6 +2806,39 @@ async fn process_channel_message(
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+
+    // ── Proactive context compression ────────────────────────────
+    // Use the existing ContextCompressor to summarize older history
+    // before the LLM call, preventing context-window-exceeded errors
+    // and preserving key decisions through LLM-driven summarization.
+    {
+        let cc_config = ctx.prompt_config.agent.context_compression.clone();
+        let compressor = crate::agent::context_compressor::ContextCompressor::new(
+            cc_config,
+            ctx.context_token_budget,
+        )
+        .with_memory(Arc::clone(&ctx.memory));
+        match compressor
+            .compress_if_needed(&mut history, active_provider.as_ref(), route.model.as_str())
+            .await
+        {
+            Ok(result) if result.compressed => {
+                tracing::info!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    tokens_before = result.tokens_before,
+                    tokens_after = result.tokens_after,
+                    passes = result.passes_used,
+                    "Proactive context compression applied before LLM call"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Context compression failed, proceeding without: {e}");
+            }
+            _ => {}
+        }
+    }
+
     let use_draft_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -2711,35 +2965,23 @@ async fn process_channel_message(
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
-    let notify_channel = target_channel.clone();
-    let notify_reply_target = msg.reply_target.clone();
-    let notify_thread_root = followup_thread_id(&msg);
-    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls {
-        Some(tokio::spawn(async move {
-            while notify_rx.recv().await.is_some() {}
-        }))
-    } else {
-        Some(tokio::spawn(async move {
-            let thread_ts = notify_thread_root;
-            while let Some(text) = notify_rx.recv().await {
-                if let Some(ref ch) = notify_channel {
-                    let _ = ch
-                        .send(
-                            &SendMessage::new(&text, &notify_reply_target)
-                                .in_thread(thread_ts.clone()),
-                        )
-                        .await;
-                }
-            }
-        }))
-    };
+    // Tool call notifications are already displayed via the draft updater (progress
+    // messages through on_delta channel), so we only consume them here without
+    // sending separate channel messages to avoid duplicate/spammy output.
+    let notify_task = Some(tokio::spawn(async move {
+        while notify_rx.recv().await.is_some() {}
+    }));
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
         Cancelled,
     }
 
-    let model_switch_callback = get_model_switch_state();
+    // Per-request model switch slot: isolates model_switch tool results per user,
+    // preventing cross-user leakage from the global MODEL_SWITCH_REQUEST.
+    let model_switch_slot: crate::agent::loop_::ModelSwitchCallback = Arc::new(Mutex::new(None));
+    // Clear any stale global state before entering the loop.
+    clear_model_switch_request();
     let scale_cap = ctx
         .pacing
         .message_timeout_scale_max
@@ -2790,7 +3032,7 @@ async fn process_channel_message(
                         },
                         ctx.tool_call_dedup_exempt.as_ref(),
                         ctx.activated_tools.as_ref(),
-                        Some(model_switch_callback.clone()),
+                        Some(model_switch_slot.clone()),
                         &ctx.pacing,
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
@@ -2848,6 +3090,37 @@ async fn process_channel_message(
         (llm_result, fb)
     })
     .await;
+
+    // After the agent loop, check the per-request model_switch_slot first,
+    // then fall back to the global MODEL_SWITCH_REQUEST, and persist the
+    // route override for this sender.
+    let pending_switch = model_switch_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .or_else(|| {
+            get_model_switch_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        });
+    if let Some((sw_provider, sw_model)) = pending_switch {
+        tracing::info!(
+            provider = %sw_provider,
+            model = %sw_model,
+            sender = %history_key,
+            "Persisting model switch from agent loop"
+        );
+        set_route_selection(
+            ctx.as_ref(),
+            &history_key,
+            ChannelRouteSelection {
+                provider: sw_provider,
+                model: sw_model,
+                api_key: None,
+            },
+        );
+    }
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
     tracing::debug!("Post-loop: dropping delta_tx and awaiting draft updater");
@@ -3022,21 +3295,32 @@ async fn process_channel_message(
                 }),
             );
 
-            // Previously we prepended a `[Used tools: …]` summary to the
-            // history entry so the LLM retained awareness of prior tool usage.
-            // This caused the model to learn and reproduce the bracket format
-            // in its own output, which leaked to end-users as raw log lines
-            // instead of meaningful responses (#4400).  The LLM already
-            // receives tool context through the tool-call/result messages in
-            // the conversation history built by `run_tool_call_loop`, so the
-            // extra summary prefix is unnecessary.
-            let history_response = delivered_response.clone();
+            // Persist intermediate tool-call/result messages from this turn
+            // so the model retains concrete "I used tools" examples in
+            // context, preventing drift toward tool-less responses (#4827).
+            let keep_tool_turns = ctx.prompt_config.agent.keep_tool_context_turns;
+            if keep_tool_turns > 0 {
+                // Find tool messages for the current turn: everything after
+                // the last user message up to (but not including) the final
+                // assistant response that matches our delivered text.
+                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
+                for tool_msg in tool_messages {
+                    append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
+                }
+            }
 
+            let history_response = delivered_response.clone();
             append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
                 ChatMessage::assistant(&history_response),
             );
+
+            // Strip tool-call messages from turns older than
+            // keep_tool_context_turns to prevent unbounded growth.
+            if keep_tool_turns > 0 {
+                strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
+            }
 
             // Fire-and-forget LLM-driven memory consolidation.
             if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
@@ -3594,7 +3878,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     );
 
     // ── 1. Tooling ──────────────────────────────────────────────
-    if !tools.is_empty() {
+    if !tools.is_empty() && !native_tools {
         prompt.push_str("## Tools\n\n");
         if compact_context {
             // Compact mode: tool names only, no descriptions/schemas
@@ -3675,6 +3959,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     });
     prompt.push('\n');
+    if let Some(autonomy_config) = autonomy_config {
+        append_autonomy_constraints_once(&mut prompt, autonomy_config, workspace_dir);
+    }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -3796,6 +4083,82 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     } else {
         prompt
     }
+}
+
+pub fn autonomy_constraints_prompt(
+    autonomy: &crate::config::AutonomyConfig,
+    workspace_dir: &std::path::Path,
+) -> String {
+    use std::fmt::Write;
+
+    let autonomy_level = match autonomy.level {
+        crate::security::AutonomyLevel::ReadOnly => "read-only",
+        crate::security::AutonomyLevel::Supervised => "supervised",
+        crate::security::AutonomyLevel::Full => "full",
+    };
+
+    let mut prompt = String::from("## Autonomy Constraints\n\n");
+    let _ = writeln!(prompt, "- Current autonomy level: `{autonomy_level}`.");
+
+    if autonomy.workspace_only {
+        let _ = writeln!(
+            prompt,
+            "- File access is confined to the workspace `{}` unless a path resolves inside `allowed_roots`.",
+            workspace_dir.display()
+        );
+    } else {
+        prompt.push_str(
+            "- File access may go outside the workspace, but forbidden paths still remain blocked.\n",
+        );
+    }
+
+    if autonomy.allowed_roots.is_empty() {
+        prompt.push_str("- No extra `allowed_roots` are configured.\n");
+    } else {
+        let _ = writeln!(
+            prompt,
+            "- Extra `allowed_roots`: {}.",
+            autonomy.allowed_roots.join(", ")
+        );
+    }
+
+    match autonomy.level {
+        crate::security::AutonomyLevel::ReadOnly => {
+            prompt.push_str(
+                "- Do not attempt write operations, mutations, or side-effecting commands.\n",
+            );
+        }
+        crate::security::AutonomyLevel::Supervised => {
+            prompt.push_str("- Risky actions may require approval; ask or wait for approval instead of pretending the action already happened.\n");
+        }
+        crate::security::AutonomyLevel::Full => {
+            prompt.push_str(
+                "- You may act autonomously, but still stay within command/path/rate limits.\n",
+            );
+        }
+    }
+
+    if !autonomy.non_cli_excluded_tools.is_empty() {
+        let _ = writeln!(
+            prompt,
+            "- The following tools are unavailable on non-CLI channels: {}.",
+            autonomy.non_cli_excluded_tools.join(", ")
+        );
+    }
+
+    prompt.push('\n');
+    prompt
+}
+
+pub fn append_autonomy_constraints_once(
+    prompt: &mut String,
+    autonomy: &crate::config::AutonomyConfig,
+    workspace_dir: &std::path::Path,
+) {
+    if prompt.contains("## Autonomy Constraints") {
+        return;
+    }
+    prompt.push_str(&autonomy_constraints_prompt(autonomy, workspace_dir));
 }
 
 /// Inject a single workspace file into the prompt with truncation and missing-file markers.
@@ -4094,6 +4457,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_workspace_dir(config.workspace_dir.as_path().to_path_buf())
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -4119,7 +4483,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .with_workspace_dir(config.workspace_dir.clone())
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_transcription(config.transcription.clone())
-                .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms),
+                .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
+                .with_cancel_reaction(sl.cancel_reaction.clone()),
             ))
         }
         "mattermost" => {
@@ -4298,6 +4663,7 @@ fn collect_configured_channels(
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_workspace_dir(config.workspace_dir.as_path().to_path_buf())
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -4351,7 +4717,8 @@ fn collect_configured_channels(
                 .with_markdown_blocks(sl.use_markdown_blocks)
                 .with_proxy_url(sl.proxy_url.clone())
                 .with_transcription(config.transcription.clone())
-                .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms),
+                .with_streaming(sl.stream_drafts, sl.draft_update_interval_ms)
+                .with_cancel_reaction(sl.cancel_reaction.clone()),
             ),
         });
     }
@@ -4402,6 +4769,7 @@ fn collect_configured_channels(
                     mx.draft_update_interval_ms,
                     mx.multi_message_delay_ms,
                 )
+                .with_mention_only(mx.mention_only)
                 .with_transcription(config.transcription.clone()),
             ),
         });
@@ -4458,7 +4826,9 @@ fn collect_configured_channels(
                         ),
                     });
                 } else {
-                    tracing::warn!("WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)");
+                    tracing::warn!(
+                        "WhatsApp Cloud API configured but missing required fields (phone_number_id, access_token, verify_token)"
+                    );
                 }
             }
             "web" => {
@@ -4489,13 +4859,19 @@ fn collect_configured_channels(
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
-                    tracing::warn!("WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web");
-                    eprintln!("  ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in.");
+                    tracing::warn!(
+                        "WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web"
+                    );
+                    eprintln!(
+                        "  ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in."
+                    );
                     eprintln!("    Rebuild with: cargo build --features whatsapp-web");
                 }
             }
             _ => {
-                tracing::warn!("WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set");
+                tracing::warn!(
+                    "WhatsApp config invalid: neither phone_number_id (Cloud API) nor session_path (Web) is set"
+                );
             }
         }
     }
@@ -5257,6 +5633,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .matrix
         .as_ref()
         .is_some_and(|mx| mx.interrupt_on_new_message);
+    let interrupt_on_new_message_whatsapp = config
+        .channels_config
+        .whatsapp
+        .as_ref()
+        .is_some_and(|wa| wa.interrupt_on_new_message);
+
+    // Load persisted per-chat route overrides from routes.json in workspace.
+    init_route_overrides(&config.workspace_dir);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -5288,6 +5672,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             discord: interrupt_on_new_message_discord,
             mattermost: interrupt_on_new_message_mattermost,
             matrix: interrupt_on_new_message_matrix,
+            whatsapp: interrupt_on_new_message_whatsapp,
         },
         multimodal: config.multimodal.clone(),
         media_pipeline: config.media_pipeline.clone(),
@@ -5402,8 +5787,8 @@ mod tests {
     use crate::providers::{ChatMessage, Provider};
     use crate::tools::{Tool, ToolResult};
     use std::collections::{HashMap, HashSet};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn make_workspace() -> TempDir {
@@ -5684,6 +6069,24 @@ mod tests {
     }
 
     #[test]
+    fn legacy_sanitized_key_matches_old_encoding() {
+        let key = "matrix_@user:m.org||!room:m.org_$evt123:m.org_@user:m.org";
+        let legacy = legacy_sanitized_key(key);
+        assert_eq!(
+            legacy,
+            "matrix__user_m_org___room_m_org__evt123_m_org__user_m_org"
+        );
+        assert_ne!(legacy, key, "legacy key should differ from original");
+    }
+
+    #[test]
+    fn legacy_sanitized_key_noop_for_simple_keys() {
+        let key = "discord_12345_67890";
+        let legacy = legacy_sanitized_key(key);
+        assert_eq!(legacy, key, "simple keys should be unchanged");
+    }
+
+    #[test]
     fn compact_sender_history_keeps_recent_truncated_messages() {
         let mut histories = HashMap::new();
         let sender = "telegram_u1".to_string();
@@ -5727,6 +6130,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -5849,6 +6253,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -5927,6 +6332,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -6024,6 +6430,7 @@ mod tests {
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -6140,6 +6547,11 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct TelegramDraftRecordingChannel {
+        finalized_drafts: tokio::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    #[derive(Default)]
     struct SlackRecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
@@ -6174,6 +6586,66 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Channel for TelegramDraftRecordingChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("draft-telegram-1".to_string()))
+        }
+
+        async fn update_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            _content: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            content: &str,
+        ) -> anyhow::Result<()> {
+            self.finalized_drafts.lock().await.push((
+                recipient.to_string(),
+                message_id.to_string(),
+                content.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
     #[async_trait::async_trait]
     impl Channel for SlackRecordingChannel {
         fn name(&self) -> &str {
@@ -6608,6 +7080,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -6659,6 +7132,90 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_telegram_streaming_completes_after_tool_loop() {
+        let channel_impl = Arc::new(TelegramDraftRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+        });
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            process_channel_message(
+                runtime_ctx,
+                traits::ChannelMessage {
+                    id: "msg-telegram-draft".to_string(),
+                    sender: "alice".to_string(),
+                    reply_target: "chat-telegram".to_string(),
+                    content: "hello".to_string(),
+                    channel: "telegram".to_string(),
+                    timestamp: 1,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                },
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("streaming telegram turn should not hang after the tool loop finishes");
+
+        let finalized_drafts = channel_impl.finalized_drafts.lock().await;
+        assert_eq!(finalized_drafts.len(), 1);
+        assert_eq!(finalized_drafts[0].0, "chat-telegram");
+        assert_eq!(finalized_drafts[0].1, "draft-telegram-1");
+        assert_eq!(finalized_drafts[0].2, "ok");
+    }
+
+    #[tokio::test]
     async fn process_channel_message_telegram_does_not_persist_tool_summary_prefix() {
         let channel_impl = Arc::new(TelegramRecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -6696,6 +7253,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
@@ -6798,6 +7356,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -6885,6 +7444,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -6982,6 +7542,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7028,6 +7589,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
         let route_key = "telegram_chat-1_alice";
+        // Check ctx-local overrides (set_route_selection writes to both local and global).
         let route = runtime_ctx
             .route_overrides
             .lock()
@@ -7062,7 +7624,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let route_key = "telegram_chat-1_alice".to_string();
         let mut route_overrides = HashMap::new();
         route_overrides.insert(
-            route_key,
+            route_key.clone(),
             ChannelRouteSelection {
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
@@ -7100,6 +7662,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7199,6 +7762,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7313,6 +7877,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7412,6 +7977,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7504,6 +8070,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7722,6 +8289,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7832,6 +8400,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -7902,12 +8471,16 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 2);
         let second_call = &calls[1];
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("forwarded content") }));
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("summarize this") }));
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("forwarded content") })
+        );
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("summarize this") })
+        );
         assert!(
             !second_call.iter().any(|(role, _)| role == "assistant"),
             "cancelled turn should not persist an assistant response"
@@ -7957,6 +8530,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -8027,12 +8601,16 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap_or_else(|e| e.into_inner());
         assert_eq!(calls.len(), 2);
         let second_call = &calls[1];
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("first question") }));
-        assert!(second_call
-            .iter()
-            .any(|(role, content)| { role == "user" && content.contains("second question") }));
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("first question") })
+        );
+        assert!(
+            second_call
+                .iter()
+                .any(|(role, content)| { role == "user" && content.contains("second question") })
+        );
         assert!(
             !second_call.iter().any(|(role, _)| role == "assistant"),
             "cancelled turn should not persist an assistant response"
@@ -8079,6 +8657,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8183,6 +8762,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8270,6 +8850,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8362,6 +8943,33 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("**shell**"));
         assert!(prompt.contains("Run commands"));
         assert!(prompt.contains("**memory_recall**"));
+    }
+
+    #[test]
+    fn prompt_skips_tools_summary_when_native_tools_enabled() {
+        let ws = make_workspace();
+        let tools = vec![
+            ("shell", "Run commands"),
+            ("memory_recall", "Search memory"),
+        ];
+        let prompt = build_system_prompt_with_mode(
+            ws.path(),
+            "gpt-4o",
+            &tools,
+            &[],
+            None,
+            None,
+            true,
+            crate::config::SkillsPromptInjectionMode::Full,
+            AutonomyLevel::default(),
+        );
+
+        assert!(
+            !prompt.contains("## Tools"),
+            "native tools mode should skip the duplicate tools summary"
+        );
+        assert!(prompt.contains("## Safety"));
+        assert!(prompt.contains("## Workspace"));
     }
 
     #[test]
@@ -8513,8 +9121,11 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<description>Review code for bugs</description>"));
         assert!(prompt.contains("SKILL.md</location>"));
         assert!(prompt.contains("<instructions>"));
-        assert!(prompt
-            .contains("<instruction>Always run cargo test before final response.</instruction>"));
+        assert!(
+            prompt.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review.lint</name>"));
@@ -8558,8 +9169,11 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("<location>skills/code-review/SKILL.md</location>"));
         assert!(prompt.contains("loaded on demand"));
         assert!(!prompt.contains("<instructions>"));
-        assert!(!prompt
-            .contains("<instruction>Always run cargo test before final response.</instruction>"));
+        assert!(
+            !prompt.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
         // Compact mode should still include tools so the LLM knows about them.
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
         assert!(prompt.contains("<callable_tools"));
@@ -8697,6 +9311,22 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("Never pretend you are waiting for a human approval"),
             "full autonomy should not simulate interactive approval flows"
         );
+        assert_eq!(
+            prompt.matches("## Autonomy Constraints").count(),
+            1,
+            "autonomy constraints should only be injected once"
+        );
+    }
+
+    #[test]
+    fn autonomy_constraints_prompt_describes_workspace_scope() {
+        let config = crate::config::AutonomyConfig::default();
+        let prompt = autonomy_constraints_prompt(&config, std::path::Path::new("/workspace"));
+
+        assert!(prompt.contains("## Autonomy Constraints"));
+        assert!(prompt.contains("supervised"));
+        assert!(prompt.contains("allowed_roots"));
+        assert!(prompt.contains("/workspace"));
     }
 
     #[test]
@@ -9054,6 +9684,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -9193,6 +9824,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -9329,9 +9961,11 @@ BTC is currently around $65,000 based on latest tool output."#
         }
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert!(sent_messages
-            .iter()
-            .any(|message| { message.contains("Conversation history cleared. Starting fresh.") }));
+        assert!(
+            sent_messages.iter().any(|message| {
+                message.contains("Conversation history cleared. Starting fresh.")
+            })
+        );
     }
 
     #[tokio::test]
@@ -9373,6 +10007,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -9488,6 +10123,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -9833,12 +10469,16 @@ This is an example JSON object for profile settings."#;
 
         let channels = collect_configured_channels(&config, "test");
 
-        assert!(channels
-            .iter()
-            .any(|entry| entry.display_name == "Mattermost"));
-        assert!(channels
-            .iter()
-            .any(|entry| entry.channel.name() == "mattermost"));
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.display_name == "Mattermost")
+        );
+        assert!(
+            channels
+                .iter()
+                .any(|entry| entry.channel.name() == "mattermost")
+        );
     }
 
     struct AlwaysFailChannel {
@@ -9910,10 +10550,12 @@ This is an example JSON object for profile settings."#;
         let component = &snapshot["components"]["channel:test-supervised-fail"];
         assert_eq!(component["status"], "error");
         assert!(component["restart_count"].as_u64().unwrap_or(0) >= 1);
-        assert!(component["last_error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("listen boom"));
+        assert!(
+            component["last_error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("listen boom")
+        );
         assert!(calls.load(Ordering::SeqCst) >= 1);
     }
 
@@ -9937,19 +10579,19 @@ This is an example JSON object for profile settings."#;
         );
 
         tokio::time::sleep(Duration::from_millis(35)).await;
-        let first_last_ok = crate::health::snapshot_json()["components"][&component_name]
-            ["last_ok"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let first_last_ok =
+            crate::health::snapshot_json()["components"][&component_name]["last_ok"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
         assert!(!first_last_ok.is_empty());
 
         tokio::time::sleep(Duration::from_millis(70)).await;
-        let second_last_ok = crate::health::snapshot_json()["components"][&component_name]
-            ["last_ok"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let second_last_ok =
+            crate::health::snapshot_json()["components"][&component_name]["last_ok"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
         let first = chrono::DateTime::parse_from_rfc3339(&first_last_ok)
             .expect("last_ok should be valid RFC3339");
         let second = chrono::DateTime::parse_from_rfc3339(&second_last_ok)
@@ -10067,6 +10709,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10161,6 +10804,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10289,6 +10933,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
@@ -10311,6 +10956,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(debounce::MessageDebouncer::new(std::time::Duration::ZERO)),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(std::time::Duration::ZERO)),
         });
 
         process_channel_message(
@@ -10461,6 +11107,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10579,6 +11226,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10689,6 +11337,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10819,6 +11468,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -10959,6 +11609,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: true,
             matrix: false,
+            whatsapp: false,
         };
         assert!(cfg.enabled_for_channel("mattermost"));
     }
@@ -10971,6 +11622,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(!cfg.enabled_for_channel("mattermost"));
     }
@@ -10983,6 +11635,7 @@ This is an example JSON object for profile settings."#;
             discord: true,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(cfg.enabled_for_channel("discord"));
     }
@@ -10995,6 +11648,7 @@ This is an example JSON object for profile settings."#;
             discord: false,
             mattermost: false,
             matrix: false,
+            whatsapp: false,
         };
         assert!(!cfg.enabled_for_channel("discord"));
     }
@@ -11090,6 +11744,7 @@ This is an example JSON object for profile settings."#;
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -11178,5 +11833,85 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(clean_text, &tools);
 
         assert_eq!(result, clean_text);
+    }
+
+    // ── Tests for #4827: tool context preservation ──────────────
+
+    #[test]
+    fn extract_current_turn_tool_messages_returns_intermediate_messages() {
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("older msg"),
+            ChatMessage::assistant("older reply"),
+            ChatMessage::user("block the iPad"),
+            ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+            ChatMessage::tool("ok"),
+            ChatMessage::assistant("Done, iPad is blocked."),
+        ];
+
+        let tool_msgs = extract_current_turn_tool_messages(&history);
+        assert_eq!(tool_msgs.len(), 2);
+        assert_eq!(tool_msgs[0].role, "assistant");
+        assert!(tool_msgs[0].content.contains("tool_call"));
+        assert_eq!(tool_msgs[1].role, "tool");
+    }
+
+    #[test]
+    fn extract_current_turn_tool_messages_empty_when_no_tools() {
+        let history = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("Hi there!"),
+        ];
+
+        let tool_msgs = extract_current_turn_tool_messages(&history);
+        assert!(tool_msgs.is_empty());
+    }
+
+    #[test]
+    fn extract_current_turn_tool_messages_multiple_tool_rounds() {
+        let history = vec![
+            ChatMessage::user("do two things"),
+            ChatMessage::assistant("{\"tool_call\": \"read_skill\"}"),
+            ChatMessage::tool("skill content"),
+            ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+            ChatMessage::tool("shell output"),
+            ChatMessage::assistant("All done."),
+        ];
+
+        let tool_msgs = extract_current_turn_tool_messages(&history);
+        assert_eq!(tool_msgs.len(), 4);
+    }
+
+    #[test]
+    fn is_tool_call_content_detects_tool_calls() {
+        assert!(is_tool_call_content("{\"tool_call\": \"shell\"}"));
+        assert!(is_tool_call_content("<tool_call>shell</tool_call>"));
+        assert!(is_tool_call_content(
+            "{\"name\": \"read_file\", \"args\": {}}"
+        ));
+        assert!(!is_tool_call_content("The iPad has been blocked."));
+        assert!(!is_tool_call_content(""));
+    }
+
+    #[test]
+    fn normalize_cached_channel_turns_passes_through_tool_messages() {
+        let turns = vec![
+            ChatMessage::user("block the iPad"),
+            ChatMessage::assistant("{\"tool_call\": \"shell\"}"),
+            ChatMessage::tool("ok"),
+            ChatMessage::assistant("iPad blocked."),
+            ChatMessage::user("next question"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        // user, assistant(tool_call), tool, assistant(final), user
+        assert_eq!(normalized.len(), 5);
+        assert_eq!(normalized[2].role, "tool");
+    }
+
+    #[test]
+    fn default_keep_tool_context_turns_is_two() {
+        let config = crate::config::schema::AgentConfig::default();
+        assert_eq!(config.keep_tool_context_turns, 2);
     }
 }

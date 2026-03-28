@@ -232,7 +232,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.93.0
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         if: runner.os != 'Windows'
@@ -309,7 +309,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.93.0
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
@@ -360,6 +360,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist/
+
+      - name: Create Homebrew source archive
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          version="${TAG#v}"
+          workdir="$(mktemp -d)"
+          pkgdir="${workdir}/zeroclaw-${version}"
+          archive_name="zeroclaw-source-${version}.tar.gz"
+
+          mkdir -p "$pkgdir"
+          git archive --format=tar HEAD | tar -xf - -C "$pkgdir"
+          mkdir -p "$pkgdir/web/dist"
+          cp -R web/dist/. "$pkgdir/web/dist/"
+
+          mkdir -p artifacts/zeroclaw-source
+          tar -C "$workdir" -czf "artifacts/zeroclaw-source/${archive_name}" "zeroclaw-${version}"
+          ls -lh "artifacts/zeroclaw-source/${archive_name}"
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -445,7 +470,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.93.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -547,7 +572,6 @@ jobs:
             > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
 
           cp Dockerfile.ci docker-ctx/Dockerfile
-          cp Dockerfile.debian.ci docker-ctx/Dockerfile.debian
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -571,7 +595,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: docker-ctx
-          file: docker-ctx/Dockerfile.debian
+          build-args: VARIANT=debian
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}-debian

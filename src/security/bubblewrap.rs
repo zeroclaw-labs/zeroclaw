@@ -54,6 +54,15 @@ impl Sandbox for BubblewrapSandbox {
             "--ro-bind",
             "/usr",
             "/usr",
+            "--ro-bind",
+            "/usr/local",
+            "/usr/local",
+            "--ro-bind",
+            "/bin",
+            "/bin",
+            "--ro-bind",
+            "/sbin",
+            "/sbin",
             "--dev",
             "/dev",
             "--proc",
@@ -196,6 +205,19 @@ mod tests {
         assert!(
             args.contains(&"--ro-bind".to_string()),
             "must include read-only bind for /usr"
+        );
+        assert!(args.contains(&"/usr".to_string()), "must include /usr bind");
+        assert!(
+            args.contains(&"/usr/local".to_string()),
+            "must include /usr/local bind for tools like python3"
+        );
+        assert!(
+            args.contains(&"/bin".to_string()),
+            "must include /bin bind for core system tools"
+        );
+        assert!(
+            args.contains(&"/sbin".to_string()),
+            "must include /sbin bind for system administration tools"
         );
         assert!(
             args.contains(&"--dev".to_string()),

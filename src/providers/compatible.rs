@@ -9,10 +9,10 @@ use crate::providers::traits::{
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use reqwest::{
-    header::{HeaderMap, HeaderValue, USER_AGENT},
     Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +102,27 @@ impl OpenAiCompatibleProvider {
     ) -> Self {
         Self::new_with_options(
             name, base_url, credential, auth_style, false, false, None, false,
+        )
+    }
+
+    /// Same as `new_with_vision` but skips the /v1/responses fallback on 404.
+    /// Use for custom OpenAI-compatible providers that only support chat completions.
+    pub fn new_with_vision_no_responses_fallback(
+        name: &str,
+        base_url: &str,
+        credential: Option<&str>,
+        auth_style: AuthStyle,
+        supports_vision: bool,
+    ) -> Self {
+        Self::new_with_options(
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            false,
+            None,
+            false,
         )
     }
 
@@ -406,11 +427,27 @@ impl OpenAiCompatibleProvider {
     }
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
-        let id = model.rsplit('/').next().unwrap_or(model);
-        let supports_reasoning_effort = id.starts_with("gpt-5") || id.contains("codex");
-        supports_reasoning_effort
-            .then(|| self.reasoning_effort.clone())
-            .flatten()
+        let id = model.rsplit('/').next().unwrap_or(model).to_lowercase();
+        // Only apply reasoning_effort to known OpenAI o1/o3/gpt-5 models
+        // and only if the provider seems to intend to support it.
+        let is_openai_reasoning_model = id.starts_with("o1-")
+            || id == "o1"
+            || id.starts_with("o3-")
+            || id == "o3"
+            || id.starts_with("gpt-5");
+
+        // Stricter check for 'codex' models: only if it looks like an official OpenAI model
+        // or if the provider name explicitly contains "openai" or "codex".
+        let is_likely_codex_supported = id.contains("codex")
+            && (id.starts_with("gpt-")
+                || self.name.to_lowercase().contains("openai")
+                || self.name.to_lowercase().contains("codex"));
+
+        if is_openai_reasoning_model || is_likely_codex_supported {
+            self.reasoning_effort.clone()
+        } else {
+            None
+        }
     }
 }
 
@@ -1542,16 +1579,18 @@ impl OpenAiCompatibleProvider {
         let lower = error.to_lowercase();
         [
             "unknown parameter: tools",
+            "unknown parameter: tool_choice",
             "unsupported parameter: tools",
+            "invalid parameter: tools",
+            "unexpected parameter 'tools'",
+            "extra fields not allowed",
             "unrecognized field `tools`",
             "does not support tools",
             "function calling is not supported",
-            "tool_choice",
             "tool call validation failed",
-            "was not in request",
         ]
         .iter()
-        .any(|hint| lower.contains(hint))
+        .any(|pattern| lower.contains(pattern))
     }
 }
 
@@ -1634,22 +1673,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &fallback_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1747,22 +1771,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1972,28 +1981,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            usage: None,
-                            reasoning_content: None,
-                        })
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -2428,9 +2416,37 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::traits::ChatRequest;
+    use crate::tools::ToolSpec;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
+    }
+
+    async fn spawn_transport_error_server(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connection_count);
+
+        let handle = tokio::spawn(async move {
+            while let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+            {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        (format!("http://{addr}/v1"), connection_count, handle)
     }
 
     #[test]
@@ -2464,10 +2480,12 @@ mod tests {
             .chat_with_system(None, "hello", "llama-3.3-70b", 0.7)
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Venice API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Venice API key not set")
+        );
     }
 
     #[test]
@@ -2684,9 +2702,101 @@ mod tests {
             .await
             .expect_err("system-only fallback payload should fail");
 
-        assert!(err
-            .to_string()
-            .contains("requires at least one non-system message"));
+        assert!(
+            err.to_string()
+                .contains("requires at least one non-system message")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+
+        let err = provider
+            .chat_with_system(Some("policy"), "hello", "gpt-test", 0.0)
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+
+        let err = provider
+            .chat_with_history(
+                &[ChatMessage::system("policy"), ChatMessage::user("hello")],
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_chat_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+        let messages = [ChatMessage::user("hello")];
+        let tools = [ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell commands".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                }
+            }),
+        }];
+
+        let err = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
     }
 
     #[test]
@@ -3078,18 +3188,46 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_only_applies_to_gpt5_and_codex_models() {
+    fn reasoning_effort_only_applies_to_openai_and_selected_codex_models() {
         let provider = make_provider("test", "https://example.com", None)
             .with_reasoning_effort(Some("high".to_string()));
 
+        // OpenAI reasoning models
         assert_eq!(
-            provider.reasoning_effort_for_model("gpt-5.3-codex"),
+            provider.reasoning_effort_for_model("o1-preview"),
             Some("high".to_string())
         );
         assert_eq!(
-            provider.reasoning_effort_for_model("openai/gpt-5"),
+            provider.reasoning_effort_for_model("openai/o3-mini"),
             Some("high".to_string())
         );
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-5"),
+            Some("high".to_string())
+        );
+
+        // Codex models with gpt- prefix (likely OpenAI)
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-4-codex"),
+            Some("high".to_string())
+        );
+
+        // Non-OpenAI codex models with generic provider name should be REJECTED
+        assert_eq!(
+            provider.reasoning_effort_for_model("llama-3-codex"),
+            None,
+            "Generic codex model should not get reasoning_effort on unknown provider"
+        );
+
+        // But if provider name contains "openai", it should be ACCEPTED
+        let openai_provider = make_provider("openai-proxy", "https://example.com", None)
+            .with_reasoning_effort(Some("high".to_string()));
+        assert_eq!(
+            openai_provider.reasoning_effort_for_model("llama-3-codex"),
+            Some("high".to_string()),
+            "Codex model should get reasoning_effort if provider name contains 'openai'"
+        );
+
         assert_eq!(provider.reasoning_effort_for_model("llama-3.3-70b"), None);
     }
 
@@ -3451,10 +3589,12 @@ mod tests {
 
         let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TestProvider API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TestProvider API key not set")
+        );
     }
 
     #[test]
