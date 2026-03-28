@@ -161,54 +161,6 @@ impl Tool for ContentSearchTool {
             .unwrap_or(MAX_RESULTS)
             .min(MAX_RESULTS);
 
-        // --- Rate limit check ---
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        // --- Path security checks ---
-        // Reject absolute paths unless they fall under an explicit allowed root.
-        if std::path::Path::new(search_path).is_absolute()
-            && !self.security.is_under_allowed_root(search_path)
-        {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Absolute paths are not allowed. Use a relative path.".into()),
-            });
-        }
-
-        if search_path.contains("../") || search_path.contains("..\\") || search_path == ".." {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Path traversal ('..') is not allowed.".into()),
-            });
-        }
-
-        if !self.security.is_path_allowed(search_path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Path '{search_path}' is not allowed by security policy."
-                )),
-            });
-        }
-
-        // Record action to consume rate limit budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
         // --- Resolve search directory ---
         let resolved_path = self.security.resolve_tool_path(search_path);
 
@@ -658,6 +610,7 @@ fn truncate_utf8(input: &str, max_bytes: usize) -> &str {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::{PathGuardedTool, RateLimitedTool};
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -680,6 +633,15 @@ mod tests {
             max_actions_per_hour,
             ..SecurityPolicy::default()
         })
+    }
+
+    fn wrapped_content_search(
+        security: Arc<SecurityPolicy>,
+    ) -> RateLimitedTool<PathGuardedTool<ContentSearchTool>> {
+        RateLimitedTool::new(
+            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            security,
+        )
     }
 
     fn create_test_files(dir: &TempDir) {
@@ -888,26 +850,26 @@ mod tests {
 
     #[tokio::test]
     async fn content_search_rejects_absolute_path() {
-        let tool = ContentSearchTool::new(test_security(std::env::temp_dir()));
+        let tool = wrapped_content_search(test_security(std::env::temp_dir()));
         let result = tool
             .execute(json!({"pattern": "test", "path": "/etc"}))
             .await
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Absolute paths"));
+        assert!(result.error.as_ref().unwrap().contains("blocked"));
     }
 
     #[tokio::test]
     async fn content_search_rejects_path_traversal() {
-        let tool = ContentSearchTool::new(test_security(std::env::temp_dir()));
+        let tool = wrapped_content_search(test_security(std::env::temp_dir()));
         let result = tool
             .execute(json!({"pattern": "test", "path": "../../../etc"}))
             .await
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("Path traversal"));
+        assert!(result.error.as_ref().unwrap().contains("blocked"));
     }
 
     #[tokio::test]
@@ -915,7 +877,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("file.txt"), "test content\n").unwrap();
 
-        let tool = ContentSearchTool::new(test_security_with(
+        let tool = wrapped_content_search(test_security_with(
             dir.path().to_path_buf(),
             AutonomyLevel::Supervised,
             0,
