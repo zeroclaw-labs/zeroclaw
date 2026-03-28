@@ -1,8 +1,8 @@
-use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
+use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
-use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use crate::providers::ProviderRuntimeOptions;
+use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -26,7 +26,7 @@ pub struct OpenAiCodexProvider {
     client: Client,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesRequest {
     model: String,
     input: Vec<ResponsesInput>,
@@ -40,13 +40,13 @@ struct ResponsesRequest {
     parallel_tool_calls: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesInput {
     role: String,
     content: Vec<ResponsesInputContent>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesInputContent {
     #[serde(rename = "type")]
     kind: String,
@@ -56,12 +56,12 @@ struct ResponsesInputContent {
     image_url: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesTextOptions {
     verbosity: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesReasoningOptions {
     effort: String,
     summary: String,
@@ -711,7 +711,54 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        // Try to decode streaming response first
+        match decode_responses_body(response).await {
+            Ok(text) => Ok(text),
+            // If streaming fails, retry with non-streaming request
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "OpenAI Codex streaming failed, retrying with non-streaming request"
+                );
+                let mut non_streaming_request = request.clone();
+                non_streaming_request.stream = false;
+
+                let mut non_streaming_builder = self
+                    .client
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {bearer_token}"))
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("originator", "pi")
+                    .header("Content-Type", "application/json");
+
+                if let Some(account_id) = account_id.as_deref() {
+                    non_streaming_builder =
+                        non_streaming_builder.header("chatgpt-account-id", account_id);
+                }
+
+                if use_gateway_api_key_auth {
+                    if let Some(access_token) = access_token.as_deref() {
+                        non_streaming_builder =
+                            non_streaming_builder.header("x-openai-access-token", access_token);
+                    }
+                    if let Some(account_id) = account_id.as_deref() {
+                        non_streaming_builder =
+                            non_streaming_builder.header("x-openai-account-id", account_id);
+                    }
+                }
+
+                let non_streaming_response = non_streaming_builder
+                    .json(&non_streaming_request)
+                    .send()
+                    .await?;
+
+                if !non_streaming_response.status().is_success() {
+                    return Err(super::api_error("OpenAI Codex", non_streaming_response).await);
+                }
+
+                decode_responses_body(non_streaming_response).await
+            }
+        }
     }
 }
 
@@ -981,8 +1028,7 @@ data: [DONE]
 
     #[test]
     fn decode_utf8_stream_chunks_handles_multibyte_split_across_chunks() {
-        let payload =
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello 世\"}\n\ndata: [DONE]\n";
+        let payload = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello 世\"}\n\ndata: [DONE]\n";
         let bytes = payload.as_bytes();
         let split_at = payload.find('世').unwrap() + 1;
 
@@ -1132,6 +1178,7 @@ data: [DONE]
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
+            provider_max_tokens: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

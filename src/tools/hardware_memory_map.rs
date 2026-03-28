@@ -193,10 +193,11 @@ mod tests {
     fn static_map_nucleo() {
         let tool = HardwareMemoryMapTool::new(vec!["nucleo-f401re".into()]);
         assert!(tool.static_map_for_board("nucleo-f401re").is_some());
-        assert!(tool
-            .static_map_for_board("nucleo-f401re")
-            .unwrap()
-            .contains("Flash"));
+        assert!(
+            tool.static_map_for_board("nucleo-f401re")
+                .unwrap()
+                .contains("Flash")
+        );
     }
 
     #[test]
