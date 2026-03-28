@@ -381,7 +381,7 @@ phone_number = "+1234567890"
 
 **LINE:**
 ```toml
-[channels_config.line]
+[channels.line]
 channel_secret = "your-channel-secret"
 channel_access_token = "your-channel-access-token"
 allowed_users = ["Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]  # LINE user IDs, or ["*"] for all

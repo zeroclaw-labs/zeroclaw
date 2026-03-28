@@ -520,3 +520,61 @@ fn config_empty_parses_with_all_defaults() {
     assert!(parsed.channels_config.whatsapp.is_none());
     assert!((parsed.default_temperature - 0.7).abs() < f64::EPSILON);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// [channels.xxx] new key and [channels_config.xxx] backward compat
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn config_channels_new_key_parses_telegram() {
+    let toml_str = r#"
+[channels.telegram]
+bot_token = "test_token"
+allowed_users = ["zeroclaw_user"]
+"#;
+    let parsed: Config =
+        toml::from_str(toml_str).expect("[channels.telegram] should parse with new key");
+    assert!(parsed.channels_config.telegram.is_some());
+}
+
+#[test]
+fn config_channels_new_key_parses_line() {
+    let toml_str = r#"
+[channels.line]
+channel_secret = "test_secret"
+channel_access_token = "test_token"
+allowed_users = ["*"]
+"#;
+    let parsed: Config =
+        toml::from_str(toml_str).expect("[channels.line] should parse with new key");
+    assert!(parsed.channels_config.line.is_some());
+}
+
+#[test]
+fn config_channels_old_key_backward_compat() {
+    let toml_str = r#"
+[channels_config.telegram]
+bot_token = "test_token"
+allowed_users = ["zeroclaw_user"]
+"#;
+    let parsed: Config =
+        toml::from_str(toml_str).expect("[channels_config.telegram] backward compat should parse");
+    assert!(parsed.channels_config.telegram.is_some());
+}
+
+#[test]
+fn config_channels_new_key_multiple_channels() {
+    let toml_str = r#"
+[channels.telegram]
+bot_token = "test_token"
+allowed_users = ["zeroclaw_user"]
+
+[channels.discord]
+bot_token = "test_token"
+"#;
+    let parsed: Config =
+        toml::from_str(toml_str).expect("[channels.xxx] multi-channel should parse");
+    assert!(parsed.channels_config.telegram.is_some());
+    assert!(parsed.channels_config.discord.is_some());
+    assert!(parsed.channels_config.slack.is_none());
+}
