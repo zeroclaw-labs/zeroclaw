@@ -794,6 +794,51 @@ fn emit_gateway_status(app_handle: &tauri::AppHandle, status: &str, message: &st
 /// 4. On failure, auto-retry up to 3 times before marking as failed
 /// 5. Mark gateway_running = true on success
 ///
+/// Proxy HTTP requests to the local gateway via the Rust backend.
+///
+/// Tauri v2 webview (WebView2 on Windows) may block direct `fetch()` from
+/// the custom protocol origin (`https://tauri.localhost`) to `http://127.0.0.1`.
+/// This command bypasses that restriction by making the request through `reqwest`.
+#[tauri::command]
+async fn gateway_fetch(
+    url: String,
+    method: String,
+    headers: std::collections::HashMap<String, String>,
+    body: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut req = match method.to_uppercase().as_str() {
+        "GET" => client.get(&url),
+        "POST" => client.post(&url),
+        "PUT" => client.put(&url),
+        "DELETE" => client.delete(&url),
+        _ => return Err(format!("Unsupported method: {method}")),
+    };
+
+    for (k, v) in &headers {
+        req = req.header(k.as_str(), v.as_str());
+    }
+    if let Some(b) = body {
+        req = req.body(b);
+    }
+
+    let res = req.send().await.map_err(|e| {
+        format!("__NETWORK_ERROR__:{e}")
+    })?;
+
+    let status = res.status().as_u16();
+    let response_body = res.text().await.unwrap_or_default();
+
+    Ok(serde_json::json!({
+        "status": status,
+        "body": response_body,
+    }))
+}
+
 /// Emits `gateway-status` events to the frontend for user feedback:
 /// - `{ status: "starting", message: "..." }` — launch in progress
 /// - `{ status: "ready", message: "..." }` — gateway is responding
@@ -2234,6 +2279,7 @@ pub fn run() {
             save_document_to_disk,
             generate_channel_pairing_code,
             get_channel_pairing_status,
+            gateway_fetch,
         ])
         .setup(|app| {
             // Override data_dir with Tauri's actual app data path

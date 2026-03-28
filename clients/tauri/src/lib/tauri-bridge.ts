@@ -256,6 +256,38 @@ export async function checkPythonEnv(): Promise<{
   }>;
 }
 
+// ── Gateway HTTP proxy ──────────────────────────────────────────
+
+export interface GatewayFetchResult {
+  status: number;
+  body: string;
+}
+
+/**
+ * Proxy an HTTP request through the Rust backend using reqwest.
+ *
+ * Tauri v2 webview (WebView2 on Windows) may block direct fetch() from
+ * the custom protocol origin to http://127.0.0.1. This function bypasses
+ * that restriction by routing through the Rust backend's reqwest client.
+ *
+ * Returns null in browser mode (caller should use fetch() directly).
+ */
+export async function gatewayFetch(
+  url: string,
+  method: string,
+  headers: Record<string, string>,
+  body?: string,
+): Promise<GatewayFetchResult | null> {
+  const invoke = await getInvoke();
+  if (!invoke) return null;
+  return invoke("gateway_fetch", {
+    url,
+    method,
+    headers,
+    body: body ?? null,
+  }) as Promise<GatewayFetchResult>;
+}
+
 // ── Mobile lifecycle event listeners ─────────────────────────────
 
 /** Register a handler for Tauri lifecycle events. Returns an unlisten fn. */

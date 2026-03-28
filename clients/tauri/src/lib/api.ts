@@ -1,5 +1,6 @@
 import {
   isTauri,
+  gatewayFetch,
   getSyncStatus,
   triggerFullSync,
   getPlatformInfo,
@@ -525,6 +526,28 @@ export class MoAClient {
     }
 
     try {
+      // In Tauri mode, route local gateway requests through Rust backend
+      if (isTauri()) {
+        const headers: Record<string, string> = {};
+        if (init.headers) {
+          const h = init.headers as Record<string, string>;
+          for (const [k, v] of Object.entries(h)) {
+            headers[k] = v;
+          }
+        }
+        const result = await gatewayFetch(
+          `${this.serverUrl}${path}`,
+          init.method || "GET",
+          headers,
+          typeof init.body === "string" ? init.body : undefined,
+        );
+        if (result) {
+          return new Response(result.body, {
+            status: result.status,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+      }
       const res = await fetch(`${this.serverUrl}${path}`, init);
       return res;
     } catch {
@@ -537,16 +560,27 @@ export class MoAClient {
   /** Quick health probe against the local gateway (5s timeout).
    *  If local is down, also checks relay so gateway operations can continue. */
   async checkGatewayHealth(): Promise<boolean> {
-    // Try local first
+    // Try local first — use Tauri IPC proxy when in desktop mode
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3000);
-      const res = await fetch(`${this.serverUrl}/health`, {
-        method: "GET",
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-      if (res.ok) {
+      let ok = false;
+      if (isTauri()) {
+        const result = await gatewayFetch(
+          `${this.serverUrl}/health`,
+          "GET",
+          {},
+        );
+        ok = result !== null && result.status >= 200 && result.status < 300;
+      } else {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 3000);
+        const res = await fetch(`${this.serverUrl}/health`, {
+          method: "GET",
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        ok = res.ok;
+      }
+      if (ok) {
         this.gatewayAlive = true;
         return true;
       }
@@ -705,6 +739,13 @@ export class MoAClient {
     baseUrl: string,
     body: Record<string, unknown>,
   ): Promise<Response | null> {
+    // In Tauri mode, route through Rust backend to bypass webview
+    // security restrictions (WebView2 blocks http://127.0.0.1 fetch
+    // from https://tauri.localhost origin in production builds).
+    if (isTauri()) {
+      return this.tryChatRequestViaTauri(baseUrl, body);
+    }
+
     // 5-minute timeout for chat requests — the agent loop may run tools
     // (web search, browser, shell, etc.) which take significant time.
     const controller = new AbortController();
@@ -729,6 +770,42 @@ export class MoAClient {
       }
       if (err instanceof TypeError && err.message === "Failed to fetch") {
         // Network-level failure (connection refused, DNS, timeout, etc.)
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Tauri-mode chat request: routes through Rust backend's reqwest client.
+   * Returns a synthetic Response object for compatibility with parseChatResponse.
+   */
+  private async tryChatRequestViaTauri(
+    baseUrl: string,
+    body: Record<string, unknown>,
+  ): Promise<Response | null> {
+    try {
+      const result = await gatewayFetch(
+        `${baseUrl}/api/chat`,
+        "POST",
+        {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        JSON.stringify(body),
+      );
+      if (!result) {
+        // gatewayFetch returned null (not in Tauri mode) — shouldn't happen
+        return null;
+      }
+      // Build a synthetic Response for compatibility with existing parsing
+      return new Response(result.body, {
+        status: result.status,
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (err) {
+      // Check for network error marker from Rust backend
+      if (err instanceof Error && err.message.includes("__NETWORK_ERROR__")) {
         return null;
       }
       throw err;
