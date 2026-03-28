@@ -45,6 +45,11 @@ impl Tool for MemoryRecallTool {
                 "until": {
                     "type": "string",
                     "description": "Filter memories created at or before this time (RFC 3339)"
+                },
+                "search_mode": {
+                    "type": "string",
+                    "enum": ["bm25", "embedding", "hybrid"],
+                    "description": "Search strategy: bm25 (keyword), embedding (semantic), or hybrid (both). Defaults to config value."
                 }
             }
         })
@@ -235,5 +240,19 @@ mod tests {
         let tool = MemoryRecallTool::new(mem);
         assert_eq!(tool.name(), "memory_recall");
         assert!(tool.parameters_schema()["properties"]["query"].is_object());
+    }
+
+    #[test]
+    fn schema_includes_search_mode_parameter() {
+        let (_tmp, mem) = seeded_mem();
+        let tool = MemoryRecallTool::new(mem);
+        let schema = tool.parameters_schema();
+        let search_mode = &schema["properties"]["search_mode"];
+        assert_eq!(search_mode["type"], "string");
+        let enum_values = search_mode["enum"].as_array().unwrap();
+        assert_eq!(enum_values.len(), 3);
+        assert!(enum_values.contains(&json!("bm25")));
+        assert!(enum_values.contains(&json!("embedding")));
+        assert!(enum_values.contains(&json!("hybrid")));
     }
 }

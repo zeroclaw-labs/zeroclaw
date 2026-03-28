@@ -6,7 +6,7 @@ pub mod profiles;
 
 use crate::auth::openai_oauth::refresh_access_token;
 use crate::auth::profiles::{
-    profile_id, AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet,
+    AuthProfile, AuthProfileKind, AuthProfilesData, AuthProfilesStore, TokenSet, profile_id,
 };
 use crate::config::Config;
 use anyhow::Result;

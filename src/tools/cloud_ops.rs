@@ -349,10 +349,30 @@ fn scan_iac_cost(input: &str, cloud: &str, threshold: f64) -> Vec<serde_json::Va
 
     // (pattern, message, estimated_monthly_usd, aws_only)
     let expensive_patterns: &[(&str, &str, f64, bool)] = &[
-        ("instance_type", "Review instance sizing. Consider right-sizing or spot/preemptible instances.", 50.0, false),
-        ("nat_gateway", "NAT Gateway detected. These incur hourly + data transfer charges. Consider VPC endpoints for AWS services.", 45.0, true),
-        ("elastic_ip", "Elastic IP detected. Unused EIPs incur charges.", 5.0, true),
-        ("load_balancer", "Load balancer detected. Verify it is needed; consider ALB over NLB/CLB for cost.", 25.0, true),
+        (
+            "instance_type",
+            "Review instance sizing. Consider right-sizing or spot/preemptible instances.",
+            50.0,
+            false,
+        ),
+        (
+            "nat_gateway",
+            "NAT Gateway detected. These incur hourly + data transfer charges. Consider VPC endpoints for AWS services.",
+            45.0,
+            true,
+        ),
+        (
+            "elastic_ip",
+            "Elastic IP detected. Unused EIPs incur charges.",
+            5.0,
+            true,
+        ),
+        (
+            "load_balancer",
+            "Load balancer detected. Verify it is needed; consider ALB over NLB/CLB for cost.",
+            25.0,
+            true,
+        ),
     ];
 
     for (pattern, message, estimated_cost, aws_only) in expensive_patterns {
@@ -381,22 +401,57 @@ fn assess_migration_recommendations(input: &str, cloud: &str) -> Vec<serde_json:
     let mut recs = Vec::new();
 
     let migration_patterns: &[(&str, &str, &str, &str)] = &[
-        ("monolith", "Decompose into microservices or modular containers.",
-         "high", "Consider containerizing with ECS/EKS (AWS), AKS (Azure), or GKE (GCP)."),
-        ("vm", "Migrate VMs to containers or serverless where feasible.",
-         "medium", "Evaluate lift-and-shift to managed container services."),
-        ("on-premises", "Assess workloads for cloud readiness using 6 Rs framework (rehost, replatform, refactor, repurchase, retire, retain).",
-         "high", "Start with rehost for quick migration, then optimize."),
-        ("database", "Evaluate managed database services for reduced operational overhead.",
-         "medium", &format!("Consider managed options: RDS/Aurora (AWS), Azure SQL (Azure), Cloud SQL (GCP) for {}.", cloud)),
-        ("batch", "Consider serverless compute for batch workloads.",
-         "low", "Evaluate Lambda (AWS), Azure Functions, or Cloud Functions for event-driven batch."),
-        ("queue", "Evaluate managed message queue services.",
-         "low", "Consider SQS/SNS (AWS), Service Bus (Azure), or Pub/Sub (GCP)."),
-        ("storage", "Evaluate tiered object storage for cost optimization.",
-         "medium", "Use lifecycle policies for infrequent access data."),
-        ("legacy", "Assess modernization path: replatform or refactor.",
-         "high", "Legacy systems carry tech debt; prioritize incremental modernization."),
+        (
+            "monolith",
+            "Decompose into microservices or modular containers.",
+            "high",
+            "Consider containerizing with ECS/EKS (AWS), AKS (Azure), or GKE (GCP).",
+        ),
+        (
+            "vm",
+            "Migrate VMs to containers or serverless where feasible.",
+            "medium",
+            "Evaluate lift-and-shift to managed container services.",
+        ),
+        (
+            "on-premises",
+            "Assess workloads for cloud readiness using 6 Rs framework (rehost, replatform, refactor, repurchase, retire, retain).",
+            "high",
+            "Start with rehost for quick migration, then optimize.",
+        ),
+        (
+            "database",
+            "Evaluate managed database services for reduced operational overhead.",
+            "medium",
+            &format!(
+                "Consider managed options: RDS/Aurora (AWS), Azure SQL (Azure), Cloud SQL (GCP) for {}.",
+                cloud
+            ),
+        ),
+        (
+            "batch",
+            "Consider serverless compute for batch workloads.",
+            "low",
+            "Evaluate Lambda (AWS), Azure Functions, or Cloud Functions for event-driven batch.",
+        ),
+        (
+            "queue",
+            "Evaluate managed message queue services.",
+            "low",
+            "Consider SQS/SNS (AWS), Service Bus (Azure), or Pub/Sub (GCP).",
+        ),
+        (
+            "storage",
+            "Evaluate tiered object storage for cost optimization.",
+            "medium",
+            "Use lifecycle policies for infrequent access data.",
+        ),
+        (
+            "legacy",
+            "Assess modernization path: replatform or refactor.",
+            "high",
+            "Legacy systems carry tech debt; prioritize incremental modernization.",
+        ),
     ];
 
     for (keyword, recommendation, effort, detail) in migration_patterns {
@@ -431,13 +486,41 @@ fn analyze_cost_opportunities(input: &str, threshold: f64) -> Vec<serde_json::Va
 
     // General cost patterns
     let cost_patterns: &[(&str, &str, &str)] = &[
-        ("reserved", "Review reserved instance utilization. Unused reservations waste budget.", "high"),
-        ("on-demand", "On-demand instances detected. Evaluate savings plans or reserved instances for stable workloads.", "high"),
-        ("data transfer", "Data transfer costs detected. Use VPC endpoints, CDN, or regional placement to reduce.", "medium"),
-        ("storage", "Storage costs detected. Implement lifecycle policies and tiered storage.", "medium"),
-        ("idle", "Idle resources detected. Identify and terminate unused resources.", "high"),
-        ("unattached", "Unattached resources (volumes, IPs) detected. Clean up to reduce waste.", "medium"),
-        ("snapshot", "Snapshot costs detected. Review retention policies and delete stale snapshots.", "low"),
+        (
+            "reserved",
+            "Review reserved instance utilization. Unused reservations waste budget.",
+            "high",
+        ),
+        (
+            "on-demand",
+            "On-demand instances detected. Evaluate savings plans or reserved instances for stable workloads.",
+            "high",
+        ),
+        (
+            "data transfer",
+            "Data transfer costs detected. Use VPC endpoints, CDN, or regional placement to reduce.",
+            "medium",
+        ),
+        (
+            "storage",
+            "Storage costs detected. Implement lifecycle policies and tiered storage.",
+            "medium",
+        ),
+        (
+            "idle",
+            "Idle resources detected. Identify and terminate unused resources.",
+            "high",
+        ),
+        (
+            "unattached",
+            "Unattached resources (volumes, IPs) detected. Clean up to reduce waste.",
+            "medium",
+        ),
+        (
+            "snapshot",
+            "Snapshot costs detected. Review retention policies and delete stale snapshots.",
+            "low",
+        ),
     ];
 
     for (pattern, suggestion, priority) in cost_patterns {
@@ -783,9 +866,11 @@ mod tests {
             );
         }
         // instance_type is cloud-agnostic and should still appear
-        assert!(findings
-            .iter()
-            .any(|f| f["message"].as_str().unwrap().contains("instance sizing")));
+        assert!(
+            findings
+                .iter()
+                .any(|f| f["message"].as_str().unwrap().contains("instance sizing"))
+        );
     }
 
     #[test]

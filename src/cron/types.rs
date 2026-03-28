@@ -127,6 +127,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_source() -> String {
+    "imperative".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronJob {
     pub id: String,
@@ -146,6 +150,9 @@ pub struct CronJob {
     /// When `None`, all tools are available (backward compatible default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// How the job was created: `"imperative"` (CLI/API) or `"declarative"` (config).
+    #[serde(default = "default_source")]
+    pub source: String,
     pub created_at: DateTime<Utc>,
     pub next_run: DateTime<Utc>,
     pub last_run: Option<DateTime<Utc>>,
