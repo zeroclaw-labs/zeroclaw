@@ -80,6 +80,8 @@ const ZAI_GLOBAL_BASE_URL: &str = "https://api.z.ai/api/coding/paas/v4";
 const ZAI_CN_BASE_URL: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
 const QIANFAN_BASE_URL: &str = "https://qianfan.baidubce.com/v2";
 const VERCEL_AI_GATEWAY_BASE_URL: &str = "https://ai-gateway.vercel.sh/v1";
+const CODING_PLAN_INTL_BASE_URL: &str = "https://coding-intl.dashscope.aliyuncs.com/v1";
+const CODING_PLAN_ANTHROPIC_URL: &str = "https://coding-intl.dashscope.aliyuncs.com/apps/anthropic";
 
 pub(crate) fn is_minimax_intl_alias(name: &str) -> bool {
     matches!(
@@ -189,6 +191,10 @@ fn qianfan_base_url(api_url: Option<&str>) -> String {
 
 pub(crate) fn is_doubao_alias(name: &str) -> bool {
     matches!(name, "doubao" | "volcengine" | "ark" | "doubao-cn")
+}
+
+pub(crate) fn is_coding_plan_alias(name: &str) -> bool {
+    matches!(name, "coding-plan" | "alibaba-coding" | "qwen-coding")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -632,6 +638,8 @@ pub(crate) fn canonical_china_provider_name(name: &str) -> Option<&'static str> 
         Some("doubao")
     } else if is_bailian_alias(name) {
         Some("bailian")
+    } else if is_coding_plan_alias(name) {
+        Some("coding-plan")
     } else {
         None
     }
@@ -922,6 +930,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         }
         name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
         name if is_bailian_alias(name) => vec!["BAILIAN_API_KEY", "DASHSCOPE_API_KEY"],
+        name if is_coding_plan_alias(name) => vec!["CODING_PLAN_API_KEY", "DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
@@ -1347,6 +1356,18 @@ fn create_provider_with_url_and_options(
                 true,
             ),
         )),
+        name if is_coding_plan_alias(name) => Ok(compat(OpenAiCompatibleProvider::new(
+            "Alibaba Coding Plan",
+            CODING_PLAN_INTL_BASE_URL,
+            key,
+            AuthStyle::Bearer,
+        ))),
+        "coding-plan-anthropic" | "alibaba-coding-anthropic" | "qwen-coding-anthropic" => {
+            Ok(Box::new(anthropic::AnthropicProvider::with_base_url(
+                key,
+                Some(CODING_PLAN_ANTHROPIC_URL),
+            )))
+        }
         name if qwen_base_url(name).is_some() => {
             Ok(compat(OpenAiCompatibleProvider::new_with_vision(
                 "Qwen",
@@ -2078,6 +2099,18 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "coding-plan",
+            display_name: "Alibaba Coding Plan",
+            aliases: &["alibaba-coding", "qwen-coding"],
+            local: false,
+        },
+        ProviderInfo {
+            name: "coding-plan-anthropic",
+            display_name: "Alibaba Coding Plan (Anthropic)",
+            aliases: &["alibaba-coding-anthropic", "qwen-coding-anthropic"],
+            local: false,
+        },
+        ProviderInfo {
             name: "groq",
             display_name: "Groq",
             aliases: &[],
@@ -2552,6 +2585,9 @@ mod tests {
         assert!(is_doubao_alias("volcengine"));
         assert!(is_doubao_alias("ark"));
         assert!(is_doubao_alias("doubao-cn"));
+        assert!(is_coding_plan_alias("coding-plan"));
+        assert!(is_coding_plan_alias("alibaba-coding"));
+        assert!(is_coding_plan_alias("qwen-coding"));
 
         assert!(!is_moonshot_alias("openrouter"));
         assert!(!is_glm_alias("openai"));
@@ -2559,6 +2595,7 @@ mod tests {
         assert!(!is_zai_alias("anthropic"));
         assert!(!is_qianfan_alias("cohere"));
         assert!(!is_doubao_alias("deepseek"));
+        assert!(!is_coding_plan_alias("openai"));
     }
 
     #[test]
@@ -2584,6 +2621,18 @@ mod tests {
             Some("bailian")
         );
         assert_eq!(canonical_china_provider_name("aliyun"), Some("bailian"));
+        assert_eq!(
+            canonical_china_provider_name("coding-plan"),
+            Some("coding-plan")
+        );
+        assert_eq!(
+            canonical_china_provider_name("alibaba-coding"),
+            Some("coding-plan")
+        );
+        assert_eq!(
+            canonical_china_provider_name("qwen-coding"),
+            Some("coding-plan")
+        );
         assert_eq!(canonical_china_provider_name("openai"), None);
     }
 
@@ -2833,6 +2882,20 @@ mod tests {
         let oauth_provider =
             create_provider("qwen-code", Some("key")).expect("qwen oauth provider should build");
         assert!(oauth_provider.supports_vision());
+    }
+
+    #[test]
+    fn factory_coding_plan() {
+        assert!(create_provider("coding-plan", Some("key")).is_ok());
+        assert!(create_provider("alibaba-coding", Some("key")).is_ok());
+        assert!(create_provider("qwen-coding", Some("key")).is_ok());
+    }
+
+    #[test]
+    fn factory_coding_plan_anthropic() {
+        assert!(create_provider("coding-plan-anthropic", Some("key")).is_ok());
+        assert!(create_provider("alibaba-coding-anthropic", Some("key")).is_ok());
+        assert!(create_provider("qwen-coding-anthropic", Some("key")).is_ok());
     }
 
     #[test]
