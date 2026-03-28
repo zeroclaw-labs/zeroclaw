@@ -33,14 +33,14 @@
     dead_code
 )]
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
@@ -109,6 +109,7 @@ mod skillforge;
 mod skills;
 mod sop;
 mod tools;
+mod trust;
 mod tunnel;
 mod util;
 mod verifiable_intent;
@@ -835,7 +836,8 @@ async fn main() -> Result<()> {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
         }
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir);
+        // SAFETY: called early in main before any threads are spawned.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
     }
 
     // Completions must remain stdout-only and should not load config or initialize logging.
@@ -1102,8 +1104,12 @@ async fn main() -> Result<()> {
                         }
                         Ok(None) => {
                             if config.gateway.require_pairing {
-                                println!("🔐 Gateway pairing is enabled, but no active pairing code available.");
-                                println!("   The gateway may already be paired, or the code has been used.");
+                                println!(
+                                    "🔐 Gateway pairing is enabled, but no active pairing code available."
+                                );
+                                println!(
+                                    "   The gateway may already be paired, or the code has been used."
+                                );
                                 println!("   Restart the gateway to generate a new pairing code.");
                             } else {
                                 println!("⚠️  Gateway pairing is disabled in config.");
@@ -1142,6 +1148,16 @@ async fn main() -> Result<()> {
         }
 
         Commands::Daemon { port, host } => {
+            if let Ok(exe) = std::env::current_exe() {
+                let exe_str = exe.to_string_lossy();
+                if exe_str.contains(".cargo/bin") || exe_str.contains("/home/") {
+                    tracing::warn!(
+                        "Daemon running from user home directory: {}. \
+                         Consider installing to /usr/local/bin for system-wide service.",
+                        exe_str
+                    );
+                }
+            }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -1240,9 +1256,37 @@ async fn main() -> Result<()> {
                 config.autonomy.max_actions_per_hour
             );
             println!(
-                "  Max cost/day:      ${:.2}",
-                f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
+                "  Cost tracking:     {}",
+                if config.cost.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
+            println!("  Max cost/day:      ${:.2}", config.cost.daily_limit_usd);
+            println!("  Max cost/month:    ${:.2}", config.cost.monthly_limit_usd);
+            if config.cost.enabled {
+                match cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+                    Ok(tracker) => match tracker.get_summary() {
+                        Ok(summary) => {
+                            println!(
+                                "  Spent today:       ${:.4} / ${:.2}",
+                                summary.daily_cost_usd, config.cost.daily_limit_usd
+                            );
+                            println!(
+                                "  Spent this month:  ${:.4} / ${:.2}",
+                                summary.monthly_cost_usd, config.cost.monthly_limit_usd
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("  ⚠ Could not load cost usage: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("  ⚠ Could not init cost tracker: {e}");
+                    }
+                }
+            }
             println!("  OTP enabled:       {}", config.security.otp.enabled);
             println!("  E-stop enabled:    {}", config.security.estop.enabled);
             println!();

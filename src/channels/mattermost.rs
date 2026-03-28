@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -1447,7 +1447,7 @@ mod tests {
                 google: None,
                 local_whisper: Some(crate::config::LocalWhisperConfig {
                     url: whisper_url,
-                    bearer_token: "test_token".to_string(),
+                    bearer_token: Some("test_token".to_string()),
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
                 }),
@@ -1497,7 +1497,7 @@ mod tests {
                 google: None,
                 local_whisper: Some(crate::config::LocalWhisperConfig {
                     url: mock_server.uri(),
-                    bearer_token: "test_token".to_string(),
+                    bearer_token: Some("test_token".to_string()),
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
                 }),

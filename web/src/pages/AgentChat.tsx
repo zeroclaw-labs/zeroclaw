@@ -1,23 +1,37 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
-import { WebSocketClient } from '@/lib/ws';
+import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
+import { getSessionMessages } from '@/lib/api';
+import {
+  loadChatHistory,
+  mapServerMessagesToPersisted,
+  persistedToUiMessages,
+  saveChatHistory,
+  uiMessagesToPersisted,
+} from '@/lib/chatHistoryStorage';
 
 interface ChatMessage {
   id: string;
   role: 'user' | 'agent';
   content: string;
+  thinking?: string;
+  markdown?: boolean;
   timestamp: Date;
 }
 
 const DRAFT_KEY = 'agent-chat';
 
 export default function AgentChat() {
+  const sessionIdRef = useRef(getOrCreateSessionId());
   const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [historyReady, setHistoryReady] = useState(false);
   const [input, setInput] = useState(draft);
   const [typing, setTyping] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -28,12 +42,60 @@ export default function AgentChat() {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const pendingContentRef = useRef('');
+  const pendingThinkingRef = useRef('');
+  // Snapshot of thinking captured at chunk_reset, so it survives the reset.
+  const capturedThinkingRef = useRef('');
   const [streamingContent, setStreamingContent] = useState('');
+  const [streamingThinking, setStreamingThinking] = useState('');
 
   // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
     saveDraft(input);
   }, [input, saveDraft]);
+
+  // Hydrate chat from server (preferred) or localStorage fallback
+  useEffect(() => {
+    const sid = sessionIdRef.current;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const res = await getSessionMessages(sid);
+        if (cancelled) return;
+        if (res.session_persistence && res.messages.length > 0) {
+          setMessages((prev) =>
+            prev.length > 0 ? prev : persistedToUiMessages(mapServerMessagesToPersisted(res.messages)),
+          );
+        } else if (!res.session_persistence) {
+          setMessages((prev) => {
+            if (prev.length > 0) return prev;
+            const ls = loadChatHistory(sid);
+            return ls.length ? persistedToUiMessages(ls) : prev;
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setMessages((prev) => {
+            if (prev.length > 0) return prev;
+            const ls = loadChatHistory(sid);
+            return ls.length ? persistedToUiMessages(ls) : prev;
+          });
+        }
+      } finally {
+        if (!cancelled) setHistoryReady(true);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Mirror transcript to localStorage (bounded); server remains source of truth when persistence is on
+  useEffect(() => {
+    if (!historyReady) return;
+    saveChatHistory(sessionIdRef.current, uiMessagesToPersisted(messages));
+  }, [messages, historyReady]);
 
   useEffect(() => {
     const ws = new WebSocketClient();
@@ -56,6 +118,16 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'session_start':
+        case 'connected':
+          break;
+
+        case 'thinking':
+          setTyping(true);
+          pendingThinkingRef.current += msg.content ?? '';
+          setStreamingThinking(pendingThinkingRef.current);
+          break;
+
         case 'chunk':
           setTyping(true);
           pendingContentRef.current += msg.content ?? '';
@@ -63,15 +135,19 @@ export default function AgentChat() {
           break;
 
         case 'chunk_reset':
-          // Server signals that the authoritative done message follows;
-          // clear the draft so it does not duplicate the final content.
+          // Server signals that the authoritative done message follows.
+          // Snapshot thinking before clearing display state.
+          capturedThinkingRef.current = pendingThinkingRef.current;
           pendingContentRef.current = '';
+          pendingThinkingRef.current = '';
           setStreamingContent('');
+          setStreamingThinking('');
           break;
 
         case 'message':
         case 'done': {
           const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
+          const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
           if (content) {
             setMessages((prev) => [
               ...prev,
@@ -79,12 +155,17 @@ export default function AgentChat() {
                 id: generateUUID(),
                 role: 'agent',
                 content,
+                thinking,
+                markdown: true,
                 timestamp: new Date(),
               },
             ]);
           }
           pendingContentRef.current = '';
+          pendingThinkingRef.current = '';
+          capturedThinkingRef.current = '';
           setStreamingContent('');
+          setStreamingThinking('');
           setTyping(false);
           break;
         }
@@ -130,7 +211,9 @@ export default function AgentChat() {
           }
           setTyping(false);
           pendingContentRef.current = '';
+          pendingThinkingRef.current = '';
           setStreamingContent('');
+          setStreamingThinking('');
           break;
       }
     };
@@ -165,6 +248,7 @@ export default function AgentChat() {
       wsRef.current.sendMessage(trimmed);
       setTyping(true);
       pendingContentRef.current = '';
+      pendingThinkingRef.current = '';
     } catch {
       setError(t('agent.send_error'));
     }
@@ -279,7 +363,17 @@ export default function AgentChat() {
                     : { background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)', }
                 }
               >
-                <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
+                {msg.thinking && (
+                  <details className="mb-2">
+                    <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking</summary>
+                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
+                  </details>
+                )}
+                {msg.markdown ? (
+                  <div className="text-sm break-words leading-relaxed chat-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
+                ) : (
+                  <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
+                )}
                 <p
                   className="text-[10px] mt-1.5" style={{ color: msg.role === 'user' ? 'var(--pc-accent-light)' : 'var(--pc-text-faint)' }}>
                   {msg.timestamp.toLocaleTimeString()}
@@ -308,9 +402,15 @@ export default function AgentChat() {
             <div className="flex-shrink-0 w-9 h-9 rounded-2xl flex items-center justify-center border" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>
               <Bot className="h-4 w-4" style={{ color: 'var(--pc-accent)' }} />
             </div>
-            {streamingContent ? (
+            {streamingContent || streamingThinking ? (
               <div className="rounded-2xl px-4 py-3 border max-w-[75%]" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)', color: 'var(--pc-text-primary)' }}>
-                <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{streamingContent}</p>
+                {streamingThinking && (
+                  <details className="mb-2" open={!streamingContent}>
+                    <summary className="text-xs cursor-pointer select-none" style={{ color: 'var(--pc-text-muted)' }}>Thinking{!streamingContent && '...'}</summary>
+                    <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{streamingThinking}</pre>
+                  </details>
+                )}
+                {streamingContent && <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{streamingContent}</p>}
               </div>
             ) : (
               <div className="rounded-2xl px-4 py-3 border flex items-center gap-1.5" style={{ background: 'var(--pc-bg-elevated)', borderColor: 'var(--pc-border)' }}>

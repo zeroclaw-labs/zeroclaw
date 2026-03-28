@@ -8,7 +8,7 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -360,7 +360,7 @@ impl KnowledgeGraph {
         Ok(results)
     }
 
-    /// Find nodes directly related to the given node (outbound edges).
+    /// Find nodes directly related to the given node (both outbound and inbound edges).
     pub fn find_related(&self, node_id: &str) -> anyhow::Result<Vec<(KnowledgeNode, Relation)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
@@ -369,7 +369,14 @@ impl KnowledgeGraph {
                     e.relation
              FROM edges e
              JOIN nodes n ON n.id = e.to_id
-             WHERE e.from_id = ?1",
+             WHERE e.from_id = ?1
+             UNION ALL
+             SELECT n.id, n.node_type, n.title, n.content, n.tags,
+                    n.created_at, n.updated_at, n.source_project,
+                    e.relation
+             FROM edges e
+             JOIN nodes n ON n.id = e.from_id
+             WHERE e.to_id = ?1",
         )?;
 
         let mut results = Vec::new();
@@ -389,6 +396,7 @@ impl KnowledgeGraph {
     /// Extract a subgraph starting from `root_id` up to `depth` hops.
     ///
     /// `depth` must be between 1 and [`Self::MAX_SUBGRAPH_DEPTH`] (100).
+    /// Uses a recursive CTE for efficient single-query bidirectional traversal.
     pub fn get_subgraph(
         &self,
         root_id: &str,
@@ -398,37 +406,51 @@ impl KnowledgeGraph {
             anyhow::bail!("subgraph depth must be greater than 0");
         }
         let depth = depth.min(Self::MAX_SUBGRAPH_DEPTH);
+        let conn = self.conn.lock();
 
-        let mut visited: HashSet<String> = HashSet::new();
+        // Collect reachable node IDs via recursive CTE (bidirectional traversal).
+        let mut node_stmt = conn.prepare(
+            "WITH RECURSIVE reachable(id, depth) AS (
+                SELECT ?1, 0
+                UNION
+                SELECT CASE WHEN e.from_id = r.id THEN e.to_id ELSE e.from_id END, r.depth + 1
+                FROM reachable r
+                JOIN edges e ON e.from_id = r.id OR e.to_id = r.id
+                WHERE r.depth < ?2
+             )
+             SELECT DISTINCT n.id, n.node_type, n.title, n.content, n.tags,
+                    n.created_at, n.updated_at, n.source_project
+             FROM reachable rc
+             JOIN nodes n ON n.id = rc.id",
+        )?;
+
         let mut nodes = Vec::new();
-        let mut edges = Vec::new();
-
-        // Visit the root node first, then expand outward `depth` levels.
-        visited.insert(root_id.to_string());
-        if let Some(root_node) = self.get_node(root_id)? {
-            nodes.push(root_node);
+        let mut node_ids: HashSet<String> = HashSet::new();
+        let mut rows = node_stmt.query(params![root_id, depth as i64])?;
+        while let Some(row) = rows.next()? {
+            let node = row_to_node(row)?;
+            node_ids.insert(node.id.clone());
+            nodes.push(node);
         }
+        drop(rows);
 
-        let mut frontier = vec![root_id.to_string()];
-        for _ in 0..depth {
-            if frontier.is_empty() {
-                break;
+        // Collect all edges where both endpoints are in the subgraph.
+        let mut edge_stmt = conn.prepare("SELECT from_id, to_id, relation FROM edges")?;
+
+        let mut edges = Vec::new();
+        let mut edge_rows = edge_stmt.query([])?;
+        while let Some(row) = edge_rows.next()? {
+            let from_id: String = row.get(0)?;
+            let to_id: String = row.get(1)?;
+            if node_ids.contains(&from_id) && node_ids.contains(&to_id) {
+                let relation_str: String = row.get(2)?;
+                let relation = Relation::parse(&relation_str)?;
+                edges.push(KnowledgeEdge {
+                    from_id,
+                    to_id,
+                    relation,
+                });
             }
-            let mut next_frontier = Vec::new();
-            for nid in &frontier {
-                for (related, relation) in self.find_related(nid)? {
-                    edges.push(KnowledgeEdge {
-                        from_id: nid.clone(),
-                        to_id: related.id.clone(),
-                        relation,
-                    });
-                    if visited.insert(related.id.clone()) {
-                        nodes.push(related.clone());
-                        next_frontier.push(related.id.clone());
-                    }
-                }
-            }
-            frontier = next_frontier;
         }
 
         Ok((nodes, edges))
@@ -621,10 +643,21 @@ mod tests {
 
         graph.add_edge(&id1, &id2, Relation::Uses).unwrap();
 
+        // Outbound: from id1 → id2
         let related = graph.find_related(&id1).unwrap();
-        assert_eq!(related.len(), 1);
-        assert_eq!(related[0].0.id, id2);
-        assert_eq!(related[0].1, Relation::Uses);
+        assert!(
+            related
+                .iter()
+                .any(|(n, r)| n.id == id2 && *r == Relation::Uses)
+        );
+
+        // Inbound: id2 sees id1 via the same edge
+        let related = graph.find_related(&id2).unwrap();
+        assert!(
+            related
+                .iter()
+                .any(|(n, r)| n.id == id1 && *r == Relation::Uses)
+        );
     }
 
     #[test]
@@ -710,7 +743,13 @@ mod tests {
         graph.add_edge(&a, &b, Relation::Extends).unwrap();
         graph.add_edge(&b, &c, Relation::Uses).unwrap();
 
+        // Forward traversal from A reaches all 3 nodes.
         let (nodes, edges) = graph.get_subgraph(&a, 2).unwrap();
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(edges.len(), 2);
+
+        // Bidirectional: starting from C with depth 2 also reaches A.
+        let (nodes, edges) = graph.get_subgraph(&c, 2).unwrap();
         assert_eq!(nodes.len(), 3);
         assert_eq!(edges.len(), 2);
     }

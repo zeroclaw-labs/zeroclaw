@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
 
@@ -623,11 +623,11 @@ impl LocalWhisperProvider {
             parsed.scheme()
         );
 
-        let bearer_token = config.bearer_token.trim().to_string();
-        anyhow::ensure!(
-            !bearer_token.is_empty(),
-            "local_whisper: `bearer_token` must not be empty"
-        );
+        let bearer_token = match config.bearer_token.as_deref().map(str::trim) {
+            None => anyhow::bail!("local_whisper: `bearer_token` must be set"),
+            Some("") => anyhow::bail!("local_whisper: `bearer_token` must not be empty"),
+            Some(t) => t.to_string(),
+        };
 
         anyhow::ensure!(
             config.max_audio_bytes > 0,
@@ -901,9 +901,12 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_api_key() {
         // Ensure all candidate keys are absent for this test.
-        std::env::remove_var("GROQ_API_KEY");
-        std::env::remove_var("OPENAI_API_KEY");
-        std::env::remove_var("TRANSCRIPTION_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("OPENAI_API_KEY") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("TRANSCRIPTION_API_KEY") };
 
         let data = vec![0u8; 100];
         let config = TranscriptionConfig::default();
@@ -919,7 +922,8 @@ mod tests {
 
     #[tokio::test]
     async fn uses_config_api_key_without_groq_env() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let data = vec![0u8; 100];
         let mut config = TranscriptionConfig::default();
@@ -1034,7 +1038,8 @@ mod tests {
 
     #[test]
     fn manager_creation_with_default_config() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let config = TranscriptionConfig::default();
         let manager = TranscriptionManager::new(&config).unwrap();
@@ -1045,7 +1050,8 @@ mod tests {
 
     #[test]
     fn manager_registers_groq_with_key() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let mut config = TranscriptionConfig::default();
         config.api_key = Some("test-groq-key".to_string());
@@ -1057,7 +1063,8 @@ mod tests {
 
     #[test]
     fn manager_registers_multiple_providers() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let mut config = TranscriptionConfig::default();
         config.api_key = Some("test-groq-key".to_string());
@@ -1079,7 +1086,8 @@ mod tests {
 
     #[tokio::test]
     async fn manager_rejects_unconfigured_provider() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let mut config = TranscriptionConfig::default();
         config.api_key = Some("test-groq-key".to_string());
@@ -1097,7 +1105,8 @@ mod tests {
 
     #[test]
     fn manager_default_provider_from_config() {
-        std::env::remove_var("GROQ_API_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("GROQ_API_KEY") };
 
         let mut config = TranscriptionConfig::default();
         config.default_provider = "openai".to_string();
@@ -1161,7 +1170,7 @@ mod tests {
     fn local_whisper_config(url: &str) -> crate::config::LocalWhisperConfig {
         crate::config::LocalWhisperConfig {
             url: url.to_string(),
-            bearer_token: "test-token".to_string(),
+            bearer_token: Some("test-token".to_string()),
             max_audio_bytes: 10 * 1024 * 1024,
             timeout_secs: 30,
         }
@@ -1197,10 +1206,21 @@ mod tests {
     #[test]
     fn local_whisper_rejects_empty_bearer_token() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        cfg.bearer_token = String::new();
+        cfg.bearer_token = Some(String::new());
         let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
         assert!(
             err.to_string().contains("`bearer_token` must not be empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_whisper_rejects_missing_bearer_token() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.bearer_token = None;
+        let err = LocalWhisperProvider::from_config(&cfg).err().unwrap();
+        assert!(
+            err.to_string().contains("`bearer_token` must be set"),
             "got: {err}"
         );
     }
@@ -1251,7 +1271,7 @@ mod tests {
         // surfaces the error: "not configured".
         let mut config = TranscriptionConfig::default();
         let mut bad_cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        bad_cfg.bearer_token = String::new();
+        bad_cfg.bearer_token = Some(String::new());
         config.local_whisper = Some(bad_cfg);
         config.enabled = true;
         config.default_provider = "local_whisper".to_string();

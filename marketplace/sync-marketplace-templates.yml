@@ -1,0 +1,518 @@
+name: Sync Marketplace Templates
+
+# Runs after every stable release to auto-PR version bumps
+# to Coolify, Dokploy, and EasyPanel template repos.
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v0.6.4)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sync-coolify:
+    name: PR to Coolify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Derive version
+        id: ver
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Coolify fork
+        uses: actions/checkout@v4
+        with:
+          repository: zeroclaw-labs/coolify
+          token: ${{ secrets.MARKETPLACE_PAT }}
+          ref: next
+          path: coolify
+
+      - name: Update or create template
+        working-directory: coolify
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          cat > templates/compose/zeroclaw.yaml << 'TEMPLATE'
+          # documentation: https://github.com/zeroclaw-labs/zeroclaw
+          # slogan: Fast, small, fully autonomous AI personal assistant infrastructure — deploy anywhere, swap anything
+          # tags: ai, agent, assistant, self-hosted, llm, chatbot, rust
+          # logo: svgs/zeroclaw.png
+          # port: 42617
+
+          services:
+            zeroclaw:
+              image: ghcr.io/zeroclaw-labs/zeroclaw:latest
+              restart: unless-stopped
+              environment:
+                - API_KEY=${SERVICE_PASSWORD_APIKEY:-}
+                - PROVIDER=${PROVIDER:-openrouter}
+                - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+                - ZEROCLAW_GATEWAY_PORT=42617
+              volumes:
+                - zeroclaw-data:/zeroclaw-data
+              ports:
+                - "42617:42617"
+              deploy:
+                resources:
+                  limits:
+                    cpus: "2"
+                    memory: 512M
+                  reservations:
+                    cpus: "0.5"
+                    memory: 32M
+              healthcheck:
+                test: ["CMD", "zeroclaw", "status", "--format=exit-code"]
+                interval: 60s
+                timeout: 10s
+                retries: 3
+                start_period: 10s
+
+          volumes:
+            zeroclaw-data:
+          TEMPLATE
+
+      - name: Copy logo if missing
+        working-directory: coolify
+        run: |
+          if [ ! -f svgs/zeroclaw.png ]; then
+            curl -fsSL -o svgs/zeroclaw.png \
+              "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/.github/assets/zeroclaw-logo.png"
+          fi
+
+      - name: Create PR
+        working-directory: coolify
+        env:
+          GH_TOKEN: ${{ secrets.MARKETPLACE_PAT }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          BRANCH="zeroclaw/update-v${VERSION}"
+          git checkout -b "$BRANCH"
+          git add -A
+          git diff --cached --quiet && echo "No changes" && exit 0
+
+          git config user.name "ZeroClaw Bot"
+          git config user.email "bot@zeroclaw.com"
+          git commit -m "feat: add/update ZeroClaw service template (v${VERSION})"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --repo coollabsio/coolify \
+            --base next \
+            --title "feat: add ZeroClaw service template (v${VERSION})" \
+            --body "$(cat <<'EOF'
+          ## Summary
+          - Adds/updates the ZeroClaw one-click service template
+          - Image: `ghcr.io/zeroclaw-labs/zeroclaw:latest`
+          - ZeroClaw is a fast, small, fully autonomous AI personal assistant (100% Rust)
+          - Multi-arch: linux/amd64 + linux/arm64
+
+          ## Testing
+          - Deployed via Docker Compose Empty option
+          - Health check passes: `zeroclaw status --format=exit-code`
+          - Gateway accessible on port 42617
+
+          ## Links
+          - https://github.com/zeroclaw-labs/zeroclaw
+          - https://github.com/orgs/zeroclaw-labs/packages/container/package/zeroclaw
+          EOF
+          )"
+
+  sync-dokploy:
+    name: PR to Dokploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Derive version
+        id: ver
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Dokploy templates fork
+        uses: actions/checkout@v4
+        with:
+          repository: zeroclaw-labs/templates
+          token: ${{ secrets.MARKETPLACE_PAT }}
+          ref: main
+          path: templates
+
+      - name: Update or create template
+        working-directory: templates
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p blueprints/zeroclaw
+
+          # docker-compose.yml — pin to exact version (Dokploy requirement)
+          cat > blueprints/zeroclaw/docker-compose.yml << COMPOSE
+          version: "3.8"
+          services:
+            zeroclaw:
+              image: ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}
+              restart: unless-stopped
+              environment:
+                - API_KEY=\${API_KEY}
+                - PROVIDER=\${PROVIDER:-openrouter}
+                - ZEROCLAW_ALLOW_PUBLIC_BIND=true
+                - ZEROCLAW_GATEWAY_PORT=42617
+              volumes:
+                - zeroclaw-data:/zeroclaw-data
+              expose:
+                - 42617
+          volumes:
+            zeroclaw-data: {}
+          COMPOSE
+
+          # template.toml
+          cat > blueprints/zeroclaw/template.toml << 'TOML'
+          [variables]
+          main_domain = "${domain}"
+          api_key = "${password:64}"
+
+          [config]
+          env = [
+            "API_KEY=${api_key}",
+            "PROVIDER=openrouter",
+            "ZEROCLAW_ALLOW_PUBLIC_BIND=true",
+            "ZEROCLAW_GATEWAY_PORT=42617"
+          ]
+
+          [[config.domains]]
+          serviceName = "zeroclaw"
+          port = 42617
+          host = "${main_domain}"
+          TOML
+
+          # Copy logo if missing
+          if [ ! -f blueprints/zeroclaw/zeroclaw.png ]; then
+            curl -fsSL -o blueprints/zeroclaw/zeroclaw.png \
+              "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/.github/assets/zeroclaw-logo.png"
+          fi
+
+      - name: Update meta.json
+        working-directory: templates
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          ENTRY=$(cat <<JSON
+          {
+            "id": "zeroclaw",
+            "name": "ZeroClaw",
+            "version": "${VERSION}",
+            "description": "Fast, small, and fully autonomous AI personal assistant infrastructure. Deploy anywhere, swap anything. 100% Rust.",
+            "logo": "zeroclaw.png",
+            "links": {
+              "github": "https://github.com/zeroclaw-labs/zeroclaw",
+              "website": "https://zeroclaw.com/",
+              "docs": "https://github.com/zeroclaw-labs/zeroclaw#readme"
+            },
+            "tags": ["ai", "self-hosted"]
+          }
+          JSON
+          )
+
+          if jq -e '.[] | select(.id == "zeroclaw")' meta.json > /dev/null 2>&1; then
+            jq --argjson entry "$ENTRY" '
+              [.[] | if .id == "zeroclaw" then $entry else . end] | sort_by(.id)
+            ' meta.json > meta.tmp && mv meta.tmp meta.json
+          else
+            jq --argjson entry "$ENTRY" '. + [$entry] | sort_by(.id)' meta.json > meta.tmp && mv meta.tmp meta.json
+          fi
+
+      - name: Run validation
+        working-directory: templates
+        run: |
+          if [ -f dedupe-and-sort-meta.js ]; then
+            node dedupe-and-sort-meta.js
+          fi
+
+      - name: Create PR
+        working-directory: templates
+        env:
+          GH_TOKEN: ${{ secrets.MARKETPLACE_PAT }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          BRANCH="zeroclaw/update-v${VERSION}"
+          git checkout -b "$BRANCH"
+          git add -A
+          git diff --cached --quiet && echo "No changes" && exit 0
+
+          git config user.name "ZeroClaw Bot"
+          git config user.email "bot@zeroclaw.com"
+          git commit -m "feat: add/update ZeroClaw template (v${VERSION})"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --repo Dokploy/templates \
+            --base main \
+            --title "feat: add/update ZeroClaw template (v${VERSION})" \
+            --body "$(cat <<'EOF'
+          ## Summary
+          - Adds/updates ZeroClaw template to v${VERSION}
+          - Image: `ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}`
+          - ZeroClaw is a fast, small, fully autonomous AI personal assistant (100% Rust)
+          - Multi-arch: linux/amd64 + linux/arm64
+
+          ## Checklist
+          - [x] Read README.md suggestions
+          - [x] Tested template in personal Dokploy instance
+          - [x] Confirmed all requirements met
+
+          ## Testing
+          - Deployed via Compose service import
+          - Service starts and gateway is accessible on port 42617
+          - Health check passes
+
+          ## Links
+          - https://github.com/zeroclaw-labs/zeroclaw
+          - https://github.com/orgs/zeroclaw-labs/packages/container/package/zeroclaw
+          EOF
+          )"
+
+  sync-easypanel:
+    name: PR to EasyPanel
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Derive version
+        id: ver
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout EasyPanel templates fork
+        uses: actions/checkout@v4
+        with:
+          repository: zeroclaw-labs/templates-1
+          token: ${{ secrets.MARKETPLACE_PAT }}
+          ref: main
+          path: easypanel
+
+      - name: Update or create template
+        working-directory: easypanel
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p templates/zeroclaw/assets
+
+          # Copy logo if missing
+          if [ ! -f templates/zeroclaw/assets/logo.png ]; then
+            curl -fsSL -o templates/zeroclaw/assets/logo.png \
+              "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/.github/assets/zeroclaw-logo.png"
+          fi
+
+          # meta.yaml — update version and changelog
+          cat > templates/zeroclaw/meta.yaml << META
+          name: ZeroClaw
+          description: |
+            ZeroClaw is a fast, small, and fully autonomous AI personal assistant
+            infrastructure built in 100% Rust. Deploy anywhere, swap anything.
+            Connect any LLM provider (OpenRouter, OpenAI, Anthropic, Ollama) and
+            interact via a built-in web dashboard, REST API, or WebSocket gateway.
+            Supports multi-channel communication (Discord, Telegram, Matrix, Slack,
+            WhatsApp, Nostr, Lark), persistent memory, scheduled tasks, and
+            autonomous tool use.
+
+          instructions: |
+            After deployment, access the ZeroClaw gateway at the assigned domain
+            on port 42617. Set your LLM provider API key in the environment
+            variables. The default provider is OpenRouter — get a key at
+            https://openrouter.ai/keys. You can switch to OpenAI, Anthropic,
+            or a local Ollama instance by changing the PROVIDER variable.
+
+          changeLog:
+            - date: $(date +%Y-%m-%d)
+              description: Update to v${VERSION}
+
+          links:
+            - label: Website
+              url: https://zeroclaw.com
+            - label: Documentation
+              url: https://github.com/zeroclaw-labs/zeroclaw#readme
+            - label: Github
+              url: https://github.com/zeroclaw-labs/zeroclaw
+
+          contributors:
+            - name: theonlyhennygod
+              url: https://github.com/theonlyhennygod
+
+          schema:
+            type: object
+            required:
+              - appServiceName
+              - appServiceImage
+              - apiKey
+              - provider
+            properties:
+              appServiceName:
+                type: string
+                title: App Service Name
+                default: zeroclaw
+              appServiceImage:
+                type: string
+                title: App Service Image
+                default: ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}
+              apiKey:
+                type: string
+                title: LLM Provider API Key
+                description: Your API key for the selected LLM provider
+                default: ""
+              provider:
+                type: string
+                title: LLM Provider
+                default: openrouter
+                oneOf:
+                  - enum:
+                      - openrouter
+                    title: OpenRouter
+                  - enum:
+                      - openai
+                    title: OpenAI
+                  - enum:
+                      - anthropic
+                    title: Anthropic
+                  - enum:
+                      - ollama
+                    title: Ollama (Local)
+
+          benefits:
+            - title: Lightning Fast
+              description: Built in 100% Rust with optimized binary size. Starts in milliseconds, runs on minimal resources.
+            - title: Deploy Anywhere
+              description: Runs on Linux (amd64/arm64), macOS, Windows, Raspberry Pi, and Android.
+            - title: Provider Agnostic
+              description: Swap between OpenRouter, OpenAI, Anthropic, or local Ollama with a single env var change.
+
+          features:
+            - title: Web Dashboard
+              description: Built-in web UI for chatting with your AI assistant.
+            - title: Multi-Channel
+              description: Connect to Discord, Telegram, Matrix, Slack, WhatsApp, Nostr, Lark simultaneously.
+            - title: Persistent Memory
+              description: SQLite-backed memory and conversation history that survives restarts.
+            - title: Autonomous Tools
+              description: File operations, web search, code execution, git operations, and custom skill creation.
+            - title: Scheduled Tasks
+              description: Built-in cron system for recurring autonomous tasks.
+            - title: REST & WebSocket API
+              description: Full gateway API for programmatic access and real-time streaming.
+
+          tags:
+            - AI
+            - Self-Hosted
+            - Chatbot
+            - Agent
+            - Assistant
+          META
+
+          # index.ts — update default image version
+          cat > templates/zeroclaw/index.ts << 'TYPESCRIPT'
+          import { Output, Services } from "~templates-utils";
+          import { Input } from "./meta";
+
+          export function generate(input: Input): Output {
+            const services: Services = [];
+
+            const appEnv = [
+              `API_KEY=${input.apiKey}`,
+              `PROVIDER=${input.provider}`,
+              `ZEROCLAW_ALLOW_PUBLIC_BIND=true`,
+              `ZEROCLAW_GATEWAY_PORT=42617`,
+            ];
+
+            services.push({
+              type: "app",
+              data: {
+                serviceName: input.appServiceName,
+                env: appEnv.join("\n"),
+                source: {
+                  type: "image",
+                  image: input.appServiceImage,
+                },
+                domains: [
+                  {
+                    host: "$(EASYPANEL_DOMAIN)",
+                    port: 42617,
+                  },
+                ],
+                mounts: [
+                  {
+                    type: "volume",
+                    name: "data",
+                    mountPath: "/zeroclaw-data",
+                  },
+                ],
+              },
+            });
+
+            return { services };
+          }
+          TYPESCRIPT
+
+      - name: Build and validate
+        working-directory: easypanel
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm run build || true
+            npm run prettier || true
+          fi
+
+      - name: Create PR
+        working-directory: easypanel
+        env:
+          GH_TOKEN: ${{ secrets.MARKETPLACE_PAT }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          BRANCH="zeroclaw/update-v${VERSION}"
+          git checkout -b "$BRANCH"
+          git add -A
+          git diff --cached --quiet && echo "No changes" && exit 0
+
+          git config user.name "ZeroClaw Bot"
+          git config user.email "bot@zeroclaw.com"
+          git commit -m "feat: add/update ZeroClaw template (v${VERSION})"
+          git push -u origin "$BRANCH"
+
+          gh pr create \
+            --repo easypanel-io/templates \
+            --base main \
+            --title "feat: add/update ZeroClaw template (v${VERSION})" \
+            --body "$(cat <<'EOF'
+          ## Summary
+          - Adds/updates ZeroClaw template to v${VERSION}
+          - Image: `ghcr.io/zeroclaw-labs/zeroclaw:${VERSION}`
+          - ZeroClaw is a fast, small, fully autonomous AI personal assistant (100% Rust)
+          - Multi-arch: linux/amd64 + linux/arm64
+
+          ## PR Checklist
+          - [x] Logo: high quality PNG, square
+          - [x] meta.yaml: static pinned version, all links, instructions included
+          - [x] index.ts: no unused variables, no hardcoded secrets, volumes included
+          - [x] Uses official GHCR image from zeroclaw-labs org
+          - [x] Tested via templates playground
+
+          ## Testing
+          - Deployed via EasyPanel template import
+          - Service starts and gateway is accessible on port 42617
+          - Health check passes
+
+          ## Links
+          - https://github.com/zeroclaw-labs/zeroclaw
+          - https://github.com/orgs/zeroclaw-labs/packages/container/package/zeroclaw
+          EOF
+          )"

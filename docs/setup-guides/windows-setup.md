@@ -33,7 +33,7 @@ scoop install zeroclaw
 
 ```cmd
 rustup target add x86_64-pc-windows-msvc
-cargo build --release --locked --features channel-matrix,channel-lark,memory-postgres --target x86_64-pc-windows-msvc
+cargo build --release --locked --features channel-matrix,channel-lark --target x86_64-pc-windows-msvc
 copy target\x86_64-pc-windows-msvc\release\zeroclaw.exe %USERPROFILE%\.zeroclaw\bin\
 ```
 
@@ -67,7 +67,6 @@ ZeroClaw uses Cargo feature flags to control which integrations are compiled in:
 | `observability-prometheus` | Prometheus metrics | Yes |
 | `skill-creation` | Auto skill creation | Yes |
 | `channel-matrix` | Matrix protocol | No |
-| `memory-postgres` | PostgreSQL backend | No |
 | `browser-native` | Headless browser | No |
 | `hardware` | USB device support | No |
 | `rag-pdf` | PDF extraction for RAG | No |

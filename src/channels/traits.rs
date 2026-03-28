@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -31,6 +32,8 @@ pub struct SendMessage {
     pub subject: Option<String>,
     /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
     pub thread_ts: Option<String>,
+    /// Optional cancellation token for interruptible delivery (e.g. multi-message mode).
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl SendMessage {
@@ -41,6 +44,7 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            cancellation_token: None,
         }
     }
 
@@ -55,12 +59,19 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: Some(subject.into()),
             thread_ts: None,
+            cancellation_token: None,
         }
     }
 
     /// Set the thread identifier for threaded replies.
     pub fn in_thread(mut self, thread_ts: Option<String>) -> Self {
         self.thread_ts = thread_ts;
+        self
+    }
+
+    /// Attach a cancellation token for interruptible delivery.
+    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 }
@@ -96,6 +107,19 @@ pub trait Channel: Send + Sync {
     /// Whether this channel supports progressive message updates via draft edits.
     fn supports_draft_updates(&self) -> bool {
         false
+    }
+
+    /// Whether this channel supports multi-message streaming delivery, where
+    /// the response is sent as multiple separate messages at paragraph
+    /// boundaries as tokens arrive from the provider.
+    fn supports_multi_message_streaming(&self) -> bool {
+        false
+    }
+
+    /// Minimum delay (ms) between sending each paragraph in multi-message mode.
+    /// Channels should override this to avoid platform rate limits.
+    fn multi_message_delay_ms(&self) -> u64 {
+        800
     }
 
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
@@ -255,24 +279,30 @@ mod tests {
         assert!(channel.health_check().await);
         assert!(channel.start_typing("bob").await.is_ok());
         assert!(channel.stop_typing("bob").await.is_ok());
-        assert!(channel
-            .send(&SendMessage::new("hello", "bob"))
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .send(&SendMessage::new("hello", "bob"))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn default_reaction_methods_return_success() {
         let channel = DummyChannel;
 
-        assert!(channel
-            .add_reaction("chan_1", "msg_1", "\u{1F440}")
-            .await
-            .is_ok());
-        assert!(channel
-            .remove_reaction("chan_1", "msg_1", "\u{1F440}")
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .add_reaction("chan_1", "msg_1", "\u{1F440}")
+                .await
+                .is_ok()
+        );
+        assert!(
+            channel
+                .remove_reaction("chan_1", "msg_1", "\u{1F440}")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -280,16 +310,20 @@ mod tests {
         let channel = DummyChannel;
 
         assert!(!channel.supports_draft_updates());
-        assert!(channel
-            .send_draft(&SendMessage::new("draft", "bob"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            channel
+                .send_draft(&SendMessage::new("draft", "bob"))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(channel.update_draft("bob", "msg_1", "text").await.is_ok());
-        assert!(channel
-            .finalize_draft("bob", "msg_1", "final text")
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .finalize_draft("bob", "msg_1", "final text")
+                .await
+                .is_ok()
+        );
         assert!(channel.cancel_draft("bob", "msg_1").await.is_ok());
     }
 
@@ -310,13 +344,17 @@ mod tests {
     async fn default_redact_message_returns_success() {
         let channel = DummyChannel;
 
-        assert!(channel
-            .redact_message("chan_1", "msg_1", Some("spam".to_string()))
-            .await
-            .is_ok());
-        assert!(channel
-            .redact_message("chan_1", "msg_2", None)
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .redact_message("chan_1", "msg_1", Some("spam".to_string()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            channel
+                .redact_message("chan_1", "msg_2", None)
+                .await
+                .is_ok()
+        );
     }
 }

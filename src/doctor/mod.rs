@@ -1260,10 +1260,12 @@ mod tests {
         let second = workspace_probe_path(tmp.path());
 
         assert_ne!(first, second);
-        assert!(first
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_")));
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_"))
+        );
     }
 
     #[test]
