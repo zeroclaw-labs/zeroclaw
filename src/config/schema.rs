@@ -9261,7 +9261,9 @@ impl Config {
             // so that provider credential resolution picks them up automatically.
             for (key, value) in &config.provider_env {
                 if std::env::var(key).is_err() {
-                    std::env::set_var(key, value);
+                    unsafe {
+                        std::env::set_var(key, value);
+                    }
                     tracing::debug!(key = %key, "Injected provider_env into process environment");
                 }
             }
