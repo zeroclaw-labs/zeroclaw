@@ -18,6 +18,7 @@ concurrency:
 permissions:
   contents: write
   packages: write
+  deployments: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -358,6 +359,9 @@ jobs:
     name: Publish Stable Release
     needs: [validate, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
+    environment:
+      name: stable-release
+      url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -465,6 +469,9 @@ jobs:
     needs: [validate, publish]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/zeroclawlabs
     steps:
       - uses: actions/checkout@v4
 
@@ -521,6 +528,9 @@ jobs:
     name: Trigger Website Redeploy
     needs: [publish]
     runs-on: ubuntu-latest
+    environment:
+      name: website
+      url: https://www.zeroclawlabs.ai
     steps:
       - name: Trigger website redeploy
         env:
@@ -537,6 +547,9 @@ jobs:
     needs: [validate, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment:
+      name: docker
+      url: https://ghcr.io/zeroclaw-labs/zeroclaw
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

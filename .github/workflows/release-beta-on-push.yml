@@ -11,6 +11,7 @@ concurrency:
 permissions:
   contents: write
   packages: write
+  deployments: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -332,6 +333,9 @@ jobs:
     name: Publish Beta Release
     needs: [version, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
+    environment:
+      name: beta-release
+      url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -404,6 +408,9 @@ jobs:
     name: Trigger Website Redeploy
     needs: [publish]
     runs-on: ubuntu-latest
+    environment:
+      name: website
+      url: https://www.zeroclawlabs.ai
     steps:
       - name: Trigger website redeploy
         env:
@@ -420,6 +427,9 @@ jobs:
     needs: [version, build]
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    environment:
+      name: docker
+      url: https://ghcr.io/zeroclaw-labs/zeroclaw
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
