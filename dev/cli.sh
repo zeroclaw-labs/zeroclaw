@@ -127,7 +127,7 @@ case "$1" in
         if [[ $REPLY =~ ^[Yy]$ ]]; then
             docker compose -f "$COMPOSE_FILE" down -v
             rm -rf "$HOST_TARGET_DIR/.zeroclaw"
-            echo -e "${GREEN}🧹 Cleaned up (playground/ remains intact).${NC}"
+            echo -e "${GREEN}🧹 Cleaned up (playground/ workspace data remains intact).${NC}"
         else
             echo "Cancelled."
         fi

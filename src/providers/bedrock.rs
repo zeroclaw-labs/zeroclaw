@@ -1,8 +1,10 @@
 //! AWS Bedrock provider using the Converse API.
 //!
-//! Authentication: AWS AKSK (Access Key ID + Secret Access Key)
-//! via environment variables. SigV4 signing is implemented manually
-//! using hmac/sha2 crates — no AWS SDK dependency.
+//! Authentication: supports two methods:
+//! - **Bearer token**: set `BEDROCK_API_KEY` env var (takes precedence).
+//! - **SigV4 signing**: AWS AKSK (Access Key ID + Secret Access Key)
+//!   via environment variables or EC2 IMDSv2. SigV4 signing is implemented
+//!   manually using hmac/sha2 crates — no AWS SDK dependency.
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -21,6 +23,14 @@ const ENDPOINT_PREFIX: &str = "bedrock-runtime";
 const SIGNING_SERVICE: &str = "bedrock";
 const DEFAULT_REGION: &str = "us-east-1";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+
+// ── Authentication ──────────────────────────────────────────────
+
+/// Authentication method for Bedrock: either SigV4 (AKSK) or Bearer token.
+enum BedrockAuth {
+    SigV4(AwsCredentials),
+    BearerToken(String),
+}
 
 // ── AWS Credentials ─────────────────────────────────────────────
 
@@ -452,19 +462,52 @@ struct ResponseToolUseWrapper {
 // ── BedrockProvider ─────────────────────────────────────────────
 
 pub struct BedrockProvider {
-    credentials: Option<AwsCredentials>,
+    auth: Option<BedrockAuth>,
+    max_tokens: u32,
 }
 
 impl BedrockProvider {
     pub fn new() -> Self {
+        // Bearer token takes precedence over SigV4 credentials.
+        if let Some(token) = env_optional("BEDROCK_API_KEY") {
+            return Self {
+                auth: Some(BedrockAuth::BearerToken(token)),
+                max_tokens: DEFAULT_MAX_TOKENS,
+            };
+        }
         Self {
-            credentials: AwsCredentials::from_env().ok(),
+            auth: AwsCredentials::from_env().ok().map(BedrockAuth::SigV4),
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 
     pub async fn new_async() -> Self {
-        let credentials = AwsCredentials::resolve().await.ok();
-        Self { credentials }
+        // Bearer token takes precedence over SigV4 credentials.
+        if let Some(token) = env_optional("BEDROCK_API_KEY") {
+            return Self {
+                auth: Some(BedrockAuth::BearerToken(token)),
+                max_tokens: DEFAULT_MAX_TOKENS,
+            };
+        }
+        let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
+        Self {
+            auth,
+            max_tokens: DEFAULT_MAX_TOKENS,
+        }
+    }
+
+    /// Create a provider using a Bearer token for authentication.
+    pub fn with_bearer_token(token: &str) -> Self {
+        Self {
+            auth: Some(BedrockAuth::BearerToken(token.to_string())),
+            max_tokens: DEFAULT_MAX_TOKENS,
+        }
+    }
+
+    /// Override the maximum output tokens for API requests.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     fn http_client(&self) -> Client {
@@ -476,6 +519,13 @@ impl BedrockProvider {
     /// may misparse them. Dots, hyphens, and alphanumerics are safe.
     fn encode_model_path(model_id: &str) -> String {
         model_id.replace(':', "%3A")
+    }
+
+    /// Resolve the AWS region from environment variables.
+    fn resolve_region() -> String {
+        env_optional("AWS_REGION")
+            .or_else(|| env_optional("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| DEFAULT_REGION.to_string())
     }
 
     /// Build the actual request URL. Uses raw model ID (reqwest sends colons as-is).
@@ -491,22 +541,38 @@ impl BedrockProvider {
         format!("/model/{encoded}/converse")
     }
 
-    fn require_credentials(&self) -> anyhow::Result<&AwsCredentials> {
-        self.credentials.as_ref().ok_or_else(|| {
+    fn require_auth(&self) -> anyhow::Result<&BedrockAuth> {
+        self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
-                "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and \
-                 AWS_SECRET_ACCESS_KEY environment variables, or run on an EC2 \
-                 instance with an IAM role attached."
+                "AWS Bedrock credentials not set. Set BEDROCK_API_KEY for Bearer \
+                 token auth, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for \
+                 SigV4 auth, or run on an EC2 instance with an IAM role attached."
             )
         })
     }
 
-    /// Resolve credentials: use cached if available, otherwise fetch from IMDS.
-    async fn resolve_credentials(&self) -> anyhow::Result<AwsCredentials> {
-        if let Ok(creds) = AwsCredentials::from_env() {
-            return Ok(creds);
+    /// Resolve auth: use cached if available, otherwise try env vars then IMDS.
+    async fn resolve_auth(&self) -> anyhow::Result<BedrockAuth> {
+        // If we already have auth cached, re-resolve from the same source.
+        if let Some(ref auth) = self.auth {
+            match auth {
+                BedrockAuth::BearerToken(token) => {
+                    return Ok(BedrockAuth::BearerToken(token.clone()));
+                }
+                BedrockAuth::SigV4(_) => {
+                    // Re-resolve SigV4 credentials (they may have rotated).
+                }
+            }
         }
-        AwsCredentials::from_imds().await
+        // Check Bearer token first.
+        if let Some(token) = env_optional("BEDROCK_API_KEY") {
+            return Ok(BedrockAuth::BearerToken(token));
+        }
+        // Fall back to SigV4.
+        if let Ok(creds) = AwsCredentials::from_env() {
+            return Ok(BedrockAuth::SigV4(creds));
+        }
+        Ok(BedrockAuth::SigV4(AwsCredentials::from_imds().await?))
     }
 
     // ── Cache heuristics (same thresholds as AnthropicProvider) ──
@@ -832,6 +898,7 @@ impl BedrockProvider {
         let usage = response.usage.map(|u| TokenUsage {
             input_tokens: u.input_tokens,
             output_tokens: u.output_tokens,
+            cached_input_tokens: None,
         });
 
         if let Some(output) = response.output {
@@ -875,7 +942,7 @@ impl BedrockProvider {
 
     async fn send_converse_request(
         &self,
-        credentials: &AwsCredentials,
+        auth: &BedrockAuth,
         model: &str,
         request_body: &ConverseRequest,
     ) -> anyhow::Result<ConverseResponse> {
@@ -911,44 +978,62 @@ impl BedrockProvider {
                 }
             }
         }
-        let url = Self::endpoint_url(&credentials.region, model);
-        let canonical_uri = Self::canonical_uri(model);
-        let now = chrono::Utc::now();
-        let host = credentials.host();
-        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
 
-        let mut headers_to_sign = vec![
-            ("content-type".to_string(), "application/json".to_string()),
-            ("host".to_string(), host),
-            ("x-amz-date".to_string(), amz_date.clone()),
-        ];
-        if let Some(ref token) = credentials.session_token {
-            headers_to_sign.push(("x-amz-security-token".to_string(), token.clone()));
-        }
-        headers_to_sign.sort_by(|a, b| a.0.cmp(&b.0));
+        let response: reqwest::Response = match auth {
+            BedrockAuth::BearerToken(token) => {
+                let region = Self::resolve_region();
+                let url = Self::endpoint_url(&region, model);
 
-        let authorization = build_authorization_header(
-            credentials,
-            "POST",
-            &canonical_uri,
-            "",
-            &headers_to_sign,
-            &payload,
-            &now,
-        );
+                self.http_client()
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(payload)
+                    .send()
+                    .await?
+            }
+            BedrockAuth::SigV4(credentials) => {
+                let url = Self::endpoint_url(&credentials.region, model);
+                let canonical_uri = Self::canonical_uri(model);
+                let now = chrono::Utc::now();
+                let host = credentials.host();
+                let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
 
-        let mut request = self
-            .http_client()
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("x-amz-date", &amz_date)
-            .header("authorization", &authorization);
+                let mut headers_to_sign = vec![
+                    ("content-type".to_string(), "application/json".to_string()),
+                    ("host".to_string(), host),
+                    ("x-amz-date".to_string(), amz_date.clone()),
+                ];
+                if let Some(ref session_token) = credentials.session_token {
+                    headers_to_sign
+                        .push(("x-amz-security-token".to_string(), session_token.clone()));
+                }
+                headers_to_sign.sort_by(|a, b| a.0.cmp(&b.0));
 
-        if let Some(ref token) = credentials.session_token {
-            request = request.header("x-amz-security-token", token);
-        }
+                let authorization = build_authorization_header(
+                    credentials,
+                    "POST",
+                    &canonical_uri,
+                    "",
+                    &headers_to_sign,
+                    &payload,
+                    &now,
+                );
 
-        let response: reqwest::Response = request.body(payload).send().await?;
+                let mut request = self
+                    .http_client()
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("x-amz-date", &amz_date)
+                    .header("authorization", &authorization);
+
+                if let Some(ref session_token) = credentials.session_token {
+                    request = request.header("x-amz-security-token", session_token);
+                }
+
+                request.body(payload).send().await?
+            }
+        };
 
         if !response.status().is_success() {
             return Err(super::api_error("Bedrock", response).await);
@@ -967,6 +1052,7 @@ impl Provider for BedrockProvider {
         ProviderCapabilities {
             native_tool_calling: true,
             vision: true,
+            prompt_caching: false,
         }
     }
 
@@ -997,7 +1083,7 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let credentials = self.resolve_credentials().await?;
+        let auth = self.resolve_auth().await?;
 
         let system = system_prompt.map(|text| {
             let mut blocks = vec![SystemBlock::Text(TextBlock {
@@ -1018,15 +1104,13 @@ impl Provider for BedrockProvider {
                 content: Self::parse_user_content_blocks(message),
             }],
             inference_config: Some(InferenceConfig {
-                max_tokens: DEFAULT_MAX_TOKENS,
+                max_tokens: self.max_tokens,
                 temperature,
             }),
             tool_config: None,
         };
 
-        let response = self
-            .send_converse_request(&credentials, model, &request)
-            .await?;
+        let response = self.send_converse_request(&auth, model, &request).await?;
 
         Self::parse_converse_response(response)
             .text
@@ -1039,7 +1123,7 @@ impl Provider for BedrockProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credentials = self.resolve_credentials().await?;
+        let auth = self.resolve_auth().await?;
 
         let (system_blocks, mut converse_messages) = Self::convert_messages(request.messages);
 
@@ -1073,24 +1157,27 @@ impl Provider for BedrockProvider {
             system,
             messages: converse_messages,
             inference_config: Some(InferenceConfig {
-                max_tokens: DEFAULT_MAX_TOKENS,
+                max_tokens: self.max_tokens,
                 temperature,
             }),
             tool_config,
         };
 
         let response = self
-            .send_converse_request(&credentials, model, &converse_request)
+            .send_converse_request(&auth, model, &converse_request)
             .await?;
 
         Ok(Self::parse_converse_response(response))
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(ref creds) = self.credentials {
-            let url = format!("https://{ENDPOINT_PREFIX}.{}.amazonaws.com/", creds.region);
-            let _ = self.http_client().get(&url).send().await;
-        }
+        let region = match self.auth {
+            Some(BedrockAuth::SigV4(ref creds)) => creds.region.clone(),
+            Some(BedrockAuth::BearerToken(_)) => Self::resolve_region(),
+            None => return Ok(()),
+        };
+        let url = format!("https://{ENDPOINT_PREFIX}.{region}.amazonaws.com/");
+        let _ = self.http_client().get(&url).send().await;
         Ok(())
     }
 }
@@ -1101,6 +1188,39 @@ impl Provider for BedrockProvider {
 mod tests {
     use super::*;
     use crate::providers::traits::ChatMessage;
+
+    /// RAII guard that sets/unsets an env var and restores the original on drop.
+    struct EnvGuard {
+        key: String,
+        original: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: Option<&str>) -> Self {
+            let original = std::env::var(key).ok();
+            match value {
+                // SAFETY: test-only, single-threaded test runner.
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(key) },
+            }
+            Self {
+                key: key.to_string(),
+                original,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                // SAFETY: test-only, single-threaded test runner.
+                Some(v) => unsafe { std::env::set_var(&self.key, v) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(&self.key) },
+            }
+        }
+    }
 
     // ── SigV4 signing tests ─────────────────────────────────────
 
@@ -1253,7 +1373,10 @@ mod tests {
 
     #[tokio::test]
     async fn chat_fails_without_credentials() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            auth: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+        };
         let result = provider
             .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", 0.7)
             .await;
@@ -1266,6 +1389,45 @@ mod tests {
                 || err.to_lowercase().contains("builder error"),
             "Expected missing-credentials style error, got: {err}"
         );
+    }
+
+    // ── Bearer token tests ──────────────────────────────────────
+
+    #[test]
+    fn creates_with_bearer_token() {
+        let provider = BedrockProvider::with_bearer_token("test-api-key");
+        assert!(provider.auth.is_some());
+        assert!(
+            matches!(provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
+        );
+    }
+
+    #[test]
+    fn bearer_token_from_env() {
+        let _guard = EnvGuard::set("BEDROCK_API_KEY", Some("env-bearer-token"));
+        // Clear SigV4 vars to ensure Bearer is chosen.
+        let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
+        let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
+
+        let provider = BedrockProvider::new();
+        assert!(matches!(
+            provider.auth,
+            Some(BedrockAuth::BearerToken(ref t)) if t == "env-bearer-token"
+        ));
+    }
+
+    #[test]
+    fn bearer_token_precedence() {
+        let _bearer_guard = EnvGuard::set("BEDROCK_API_KEY", Some("bearer-key"));
+        let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
+        let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));
+
+        let provider = BedrockProvider::new();
+        // Bearer token should take priority over SigV4 credentials.
+        assert!(matches!(
+            provider.auth,
+            Some(BedrockAuth::BearerToken(ref t)) if t == "bearer-key"
+        ));
     }
 
     // ── Endpoint URL tests ──────────────────────────────────────
@@ -1548,14 +1710,20 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_credentials_is_noop() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            auth: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+        };
         let result = provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[test]
     fn capabilities_reports_native_tool_calling() {
-        let provider = BedrockProvider { credentials: None };
+        let provider = BedrockProvider {
+            auth: None,
+            max_tokens: DEFAULT_MAX_TOKENS,
+        };
         let caps = provider.capabilities();
         assert!(caps.native_tool_calling);
     }

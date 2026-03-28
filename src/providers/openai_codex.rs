@@ -1,9 +1,10 @@
-use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
+use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
-use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use crate::providers::ProviderRuntimeOptions;
+use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +22,7 @@ pub struct OpenAiCodexProvider {
     responses_url: String,
     custom_endpoint: bool,
     gateway_api_key: Option<String>,
+    reasoning_effort: Option<String>,
     client: Client,
 }
 
@@ -104,9 +106,10 @@ impl OpenAiCodexProvider {
             custom_endpoint: !is_default_responses_url(&responses_url),
             responses_url,
             gateway_api_key: gateway_api_key.map(ToString::to_string),
+            reasoning_effort: options.reasoning_effort.clone(),
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
                 .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(300))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
         })
@@ -303,9 +306,10 @@ fn clamp_reasoning_effort(model: &str, effort: &str) -> String {
     effort.to_string()
 }
 
-fn resolve_reasoning_effort(model_id: &str) -> String {
-    let raw = std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT")
-        .ok()
+fn resolve_reasoning_effort(model_id: &str, configured: Option<&str>) -> String {
+    let raw = configured
+        .map(ToString::to_string)
+        .or_else(|| std::env::var("ZEROCLAW_CODEX_REASONING_EFFORT").ok())
         .and_then(|value| first_nonempty(Some(&value)))
         .unwrap_or_else(|| "xhigh".to_string())
         .to_ascii_lowercase();
@@ -472,8 +476,99 @@ fn extract_stream_error_message(event: &Value) -> Option<String> {
     None
 }
 
+fn append_utf8_stream_chunk(
+    body: &mut String,
+    pending: &mut Vec<u8>,
+    chunk: &[u8],
+) -> anyhow::Result<()> {
+    if pending.is_empty() {
+        if let Ok(text) = std::str::from_utf8(chunk) {
+            body.push_str(text);
+            return Ok(());
+        }
+    }
+
+    if !chunk.is_empty() {
+        pending.extend_from_slice(chunk);
+    }
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            body.push_str(text);
+            pending.clear();
+            Ok(())
+        }
+        Err(err) => {
+            let valid_up_to = err.valid_up_to();
+            if valid_up_to > 0 {
+                // SAFETY: `valid_up_to` always points to the end of a valid UTF-8 prefix.
+                let prefix = std::str::from_utf8(&pending[..valid_up_to])
+                    .expect("valid UTF-8 prefix from Utf8Error::valid_up_to");
+                body.push_str(prefix);
+                pending.drain(..valid_up_to);
+            }
+
+            if err.error_len().is_some() {
+                return Err(anyhow::anyhow!(
+                    "OpenAI Codex response contained invalid UTF-8: {err}"
+                ));
+            }
+
+            // `error_len == None` means we have a valid prefix and an incomplete
+            // multi-byte sequence at the end; keep it buffered until next chunk.
+            Ok(())
+        }
+    }
+}
+
+fn decode_utf8_stream_chunks<'a, I>(chunks: I) -> anyhow::Result<String>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut body = String::new();
+    let mut pending = Vec::new();
+
+    for chunk in chunks {
+        append_utf8_stream_chunk(&mut body, &mut pending, chunk)?;
+    }
+
+    if !pending.is_empty() {
+        let err = std::str::from_utf8(&pending).expect_err("pending bytes should be invalid UTF-8");
+        return Err(anyhow::anyhow!(
+            "OpenAI Codex response ended with incomplete UTF-8: {err}"
+        ));
+    }
+
+    Ok(body)
+}
+
+/// Read the response body incrementally via `bytes_stream()` to avoid
+/// buffering the entire SSE payload in memory.  The previous implementation
+/// used `response.text().await?` which holds the HTTP connection open until
+/// every byte has arrived — on high-latency links the long-lived connection
+/// often drops mid-read, producing the "error decoding response body" failure
+/// reported in #3544.
 async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<String> {
-    let body = response.text().await?;
+    let mut body = String::new();
+    let mut pending_utf8 = Vec::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = chunk
+            .map_err(|err| anyhow::anyhow!("error reading OpenAI Codex response stream: {err}"))?;
+        append_utf8_stream_chunk(&mut body, &mut pending_utf8, &bytes)?;
+    }
+
+    if !pending_utf8.is_empty() {
+        let err = std::str::from_utf8(&pending_utf8)
+            .expect_err("pending bytes should be invalid UTF-8 at end of stream");
+        return Err(anyhow::anyhow!(
+            "OpenAI Codex response ended with incomplete UTF-8: {err}"
+        ));
+    }
 
     if let Some(text) = parse_sse_text(&body)? {
         return Ok(text);
@@ -571,7 +666,10 @@ impl OpenAiCodexProvider {
                 verbosity: "medium".to_string(),
             },
             reasoning: ResponsesReasoningOptions {
-                effort: resolve_reasoning_effort(normalized_model),
+                effort: resolve_reasoning_effort(
+                    normalized_model,
+                    self.reasoning_effort.as_deref(),
+                ),
                 summary: "auto".to_string(),
             },
             include: vec!["reasoning.encrypted_content".to_string()],
@@ -623,6 +721,7 @@ impl Provider for OpenAiCodexProvider {
         ProviderCapabilities {
             native_tool_calling: false,
             vision: true,
+            prompt_caching: false,
         }
     }
 
@@ -668,6 +767,14 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned")
+    }
 
     struct EnvGuard {
         key: &'static str,
@@ -678,8 +785,10 @@ mod tests {
         fn set(key: &'static str, value: Option<&str>) -> Self {
             let original = std::env::var(key).ok();
             match value {
-                Some(next) => std::env::set_var(key, next),
-                None => std::env::remove_var(key),
+                // SAFETY: test-only, single-threaded test runner.
+                Some(next) => unsafe { std::env::set_var(key, next) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(key) },
             }
             Self { key, original }
         }
@@ -688,9 +797,11 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             if let Some(original) = self.original.as_deref() {
-                std::env::set_var(self.key, original);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, original) };
             } else {
-                std::env::remove_var(self.key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }
@@ -742,6 +853,7 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_prefers_explicit_endpoint_env() {
+        let _lock = env_lock();
         let _endpoint_guard = EnvGuard::set(
             CODEX_RESPONSES_URL_ENV,
             Some("https://env.example.com/v1/responses"),
@@ -757,6 +869,7 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_uses_provider_api_url_override() {
+        let _lock = env_lock();
         let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
         let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
 
@@ -859,6 +972,26 @@ mod tests {
     }
 
     #[test]
+    fn resolve_reasoning_effort_prefers_configured_override() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("low"));
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", Some("high")),
+            "high".to_string()
+        );
+    }
+
+    #[test]
+    fn resolve_reasoning_effort_uses_legacy_env_when_unconfigured() {
+        let _lock = env_lock();
+        let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("minimal"));
+        assert_eq!(
+            resolve_reasoning_effort("gpt-5-codex", None),
+            "low".to_string()
+        );
+    }
+
+    #[test]
     fn parse_sse_text_reads_output_text_delta() {
         let payload = r#"data: {"type":"response.created","response":{"id":"resp_123"}}
 
@@ -881,6 +1014,20 @@ data: [DONE]
 "#;
 
         assert_eq!(parse_sse_text(payload).unwrap().as_deref(), Some("Done"));
+    }
+
+    #[test]
+    fn decode_utf8_stream_chunks_handles_multibyte_split_across_chunks() {
+        let payload = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello 世\"}\n\ndata: [DONE]\n";
+        let bytes = payload.as_bytes();
+        let split_at = payload.find('世').unwrap() + 1;
+
+        let decoded = decode_utf8_stream_chunks([&bytes[..split_at], &bytes[split_at..]]).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(
+            parse_sse_text(&decoded).unwrap().as_deref(),
+            Some("Hello 世")
+        );
     }
 
     #[test]
@@ -1017,9 +1164,11 @@ data: [DONE]
             secrets_encrypt: false,
             auth_profile_override: None,
             reasoning_enabled: None,
+            reasoning_effort: None,
             provider_timeout_secs: None,
             extra_headers: std::collections::HashMap::new(),
             api_path: None,
+            provider_max_tokens: None,
         };
         let provider =
             OpenAiCodexProvider::new(&options, None).expect("provider should initialize");

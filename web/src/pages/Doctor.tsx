@@ -9,37 +9,38 @@ import {
 } from 'lucide-react';
 import type { DiagResult } from '@/types/api';
 import { runDoctor } from '@/lib/api';
+import { t } from '@/lib/i18n';
 
 function severityIcon(severity: DiagResult['severity']) {
   switch (severity) {
     case 'ok':
-      return <CheckCircle className="h-4 w-4 text-[#00e68a] flex-shrink-0" />;
+      return <CheckCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-success)' }} />;
     case 'warn':
-      return <AlertTriangle className="h-4 w-4 text-[#ffaa00] flex-shrink-0" />;
+      return <AlertTriangle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-warning)' }} />;
     case 'error':
-      return <XCircle className="h-4 w-4 text-[#ff4466] flex-shrink-0" />;
-  }
-}
-
-function severityBorder(severity: DiagResult['severity']): string {
-  switch (severity) {
-    case 'ok':
-      return 'border-[#00e68a20]';
-    case 'warn':
-      return 'border-[#ffaa0020]';
-    case 'error':
-      return 'border-[#ff446620]';
+      return <XCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-error)' }} />;
   }
 }
 
 function severityBg(severity: DiagResult['severity']): string {
   switch (severity) {
     case 'ok':
-      return 'rgba(0,230,138,0.04)';
+      return 'rgba(0, 230, 138, 0.04)';
     case 'warn':
-      return 'rgba(255,170,0,0.04)';
+      return 'rgba(255, 170, 0, 0.04)';
     case 'error':
-      return 'rgba(255,68,102,0.04)';
+      return 'rgba(239, 68, 68, 0.04)';
+  }
+}
+
+function severityBorder(severity: DiagResult['severity']): string {
+  switch (severity) {
+    case 'ok':
+      return 'border-[rgba(0,230,138,0.3)]';
+    case 'warn':
+      return 'border-[rgba(255,170,0,0.3)]';
+    case 'error':
+      return 'border-[rgba(239,68,68,0.3)]';
   }
 }
 
@@ -79,8 +80,8 @@ export default function Doctor() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Stethoscope className="h-5 w-5 text-[#0080ff]" />
-          <h2 className="text-sm font-semibold text-white uppercase tracking-wider">Diagnostics</h2>
+          <Stethoscope className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+          <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('doctor.diagnostics_title')}</h2>
         </div>
         <button
           onClick={handleRun}
@@ -89,13 +90,13 @@ export default function Doctor() {
         >
           {loading ? (
             <>
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Running...
+            <Loader2 className="h-4 w-4 animate-spin" />
+              {t('doctor.running_btn')}
             </>
           ) : (
             <>
-              <Play className="h-4 w-4" />
-              Run Diagnostics
+            <Play className="h-4 w-4" />
+              {t('doctor.run_diagnostics')}
             </>
           )}
         </button>
@@ -103,7 +104,7 @@ export default function Doctor() {
 
       {/* Error */}
       {error && (
-        <div className="rounded-xl bg-[#ff446615] border border-[#ff446630] p-4 text-[#ff6680] animate-fade-in">
+        <div className="rounded-xl p-4 border animate-fade-in" style={{ background: 'rgba(239,68,68,0.06)', borderColor: 'rgba(239,68,68,0.2)', color: '#f87171' }}>
           {error}
         </div>
       )}
@@ -111,10 +112,10 @@ export default function Doctor() {
       {/* Loading spinner */}
       {loading && (
         <div className="flex flex-col items-center justify-center py-16 animate-fade-in">
-          <div className="h-12 w-12 border-2 border-[#0080ff30] border-t-[#0080ff] rounded-full animate-spin mb-4" />
-          <p className="text-[#8892a8]">Running diagnostics...</p>
-          <p className="text-sm text-[#334060] mt-1">
-            This may take a few seconds.
+          <div className="h-12 w-12 border-2 rounded-full animate-spin mb-4" style={{ borderColor: 'rgba(255,255,255,0.1)', borderTopColor: 'var(--pc-accent)' }}/>
+          <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>{t('doctor.running_desc')}</p>
+          <p className="text-[13px] mt-1" style={{ color: 'var(--pc-text-faint)' }}>
+            {t('doctor.running_hint')}
           </p>
         </div>
       )}
@@ -123,29 +124,29 @@ export default function Doctor() {
       {results && !loading && (
         <>
           {/* Summary Bar */}
-          <div className="glass-card flex items-center gap-4 p-4 animate-slide-in-up">
+          <div className="flex items-center gap-4 p-4 rounded-xl border animate-fade-in" style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)' }}>
             <div className="flex items-center gap-2">
-              <CheckCircle className="h-5 w-5 text-[#00e68a]" />
-              <span className="text-sm text-white font-medium">
-                {okCount} <span className="text-[#556080] font-normal">ok</span>
+              <CheckCircle className="h-5 w-5" style={{ color: 'var(--color-status-success)' }} />
+              <span className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>
+                {okCount}{' '}<span className="text-sm font-normal" style={{ color: 'var(--pc-text-muted)' }}>ok</span>
               </span>
             </div>
-            <div className="w-px h-5 bg-[#1a1a3e]" />
+            <div className="w-px h-5" style={{ background: 'var(--pc-border)' }} />
             <div className="flex items-center gap-2">
-              <AlertTriangle className="h-5 w-5 text-[#ffaa00]" />
-              <span className="text-sm text-white font-medium">
+              <AlertTriangle className="h-5 w-5" style={{ color: 'var(--color-status-warning)' }} />
+              <span className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>
                 {warnCount}{' '}
-                <span className="text-[#556080] font-normal">
+                <span className="text-sm font-normal" style={{ color: 'var(--pc-text-muted)' }}>
                   warning{warnCount !== 1 ? 's' : ''}
                 </span>
               </span>
             </div>
-            <div className="w-px h-5 bg-[#1a1a3e]" />
+            <div className="w-px h-5" style={{ background: 'var(--pc-border)' }} />
             <div className="flex items-center gap-2">
-              <XCircle className="h-5 w-5 text-[#ff4466]" />
-              <span className="text-sm text-white font-medium">
+              <XCircle className="h-5 w-5" style={{ color: 'var(--color-status-error)' }} />
+              <span className="text-sm font-medium" style={{ color: 'var(--pc-text-primary)' }}>
                 {errorCount}{' '}
-                <span className="text-[#556080] font-normal">
+                <span className="text-sm font-normal" style={{ color: 'var(--pc-text-muted)' }}>
                   error{errorCount !== 1 ? 's' : ''}
                 </span>
               </span>
@@ -154,16 +155,16 @@ export default function Doctor() {
             {/* Overall indicator */}
             <div className="ml-auto">
               {errorCount > 0 ? (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#ff4466] border-[#ff446630]" style={{ background: 'rgba(255,68,102,0.06)' }}>
-                  Issues Found
+                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border" style={{ background: 'rgba(239,68,68,0.06)', borderColor: 'rgba(239,68,68,0.3)', color: '#f87171' }}>
+                  {t('doctor.issues_found')}
                 </span>
               ) : warnCount > 0 ? (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#ffaa00] border-[#ffaa0030]" style={{ background: 'rgba(255,170,0,0.06)' }}>
-                  Warnings
+                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border" style={{ background: 'rgba(255,170,0,0.06)', borderColor: 'rgba(255,170,0,0.3)', color: '#fbbf24' }}>
+                  {t('doctor.warnings_summary')}
                 </span>
               ) : (
-                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[10px] font-semibold border text-[#00e68a] border-[#00e68a30]" style={{ background: 'rgba(0,230,138,0.06)' }}>
-                  All Clear
+                <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium border" style={{ background: 'rgba(0,230,138,0.06)', borderColor: 'rgba(0,230,138,0.3)', color: '#34d399' }}>
+                  {t('doctor.all_clear')}
                 </span>
               )}
             </div>
@@ -172,22 +173,21 @@ export default function Doctor() {
           {/* Grouped Results */}
           {Object.entries(grouped)
             .sort(([a], [b]) => a.localeCompare(b))
-            .map(([category, items], catIdx) => (
-              <div key={category} className="animate-slide-in-up" style={{ animationDelay: `${(catIdx + 1) * 100}ms` }}>
-                <h3 className="text-[10px] font-semibold text-[#334060] uppercase tracking-wider mb-3 capitalize">
+            .map(([category, items]) => (
+              <div key={category}>
+                <h3 className="text-sm font-semibold uppercase tracking-wider mb-3 capitalize" style={{ color: 'var(--pc-text-muted)' }}>
                   {category}
                 </h3>
-                <div className="space-y-2 stagger-children">
+                <div className="space-y-2">
                   {items.map((result, idx) => (
                     <div
                       key={`${category}-${idx}`}
-                      className={`flex items-start gap-3 rounded-xl border p-3 transition-all duration-300 hover:translate-x-1 ${severityBorder(result.severity)} animate-slide-in-left`}
-                      style={{ background: severityBg(result.severity) }}
+                      className={`flex items-start gap-3 rounded-xl border p-3 ${severityBorder(result.severity,)} ${severityBg(result.severity)}`}
                     >
                       {severityIcon(result.severity)}
                       <div className="min-w-0">
-                        <p className="text-sm text-white">{result.message}</p>
-                        <p className="text-[10px] text-[#334060] mt-0.5 capitalize uppercase tracking-wider">
+                        <p className="text-sm" style={{ color: 'var(--pc-text-primary)' }}>{result.message}</p>
+                        <p className="text-xs capitalize mt-0.5" style={{ color: 'var(--pc-text-faint)' }}>
                           {result.severity}
                         </p>
                       </div>
@@ -201,13 +201,13 @@ export default function Doctor() {
 
       {/* Empty state */}
       {!results && !loading && !error && (
-        <div className="flex flex-col items-center justify-center py-16 text-[#334060] animate-fade-in">
-          <div className="h-16 w-16 rounded-2xl flex items-center justify-center mb-4 animate-float" style={{ background: 'linear-gradient(135deg, #0080ff15, #0080ff08)' }}>
-            <Stethoscope className="h-8 w-8 text-[#0080ff]" />
+        <div className="flex flex-col items-center justify-center py-16 text-[var(--pc-text-muted)]">
+          <div className="h-16 w-16 rounded-2xl flex items-center justify-center mb-4 animate-float" style={{ background: 'linear-gradient(135deg, var(--pc-accent-glow), transparent)' }}>
+            <Stethoscope className="h-8 w-8" style={{ color: 'var(--pc-accent)' }} />
           </div>
-          <p className="text-lg font-semibold text-white mb-1">System Diagnostics</p>
-          <p className="text-sm text-[#556080]">
-            Click "Run Diagnostics" to check your ZeroClaw installation.
+          <p className="text-lg font-semibold mb-1" style={{ color: 'var(--pc-text-primary)' }}>{t('doctor.system_diagnostics')}</p>
+          <p className="text-sm" style={{ color: 'var(--pc-text-muted)' }}>
+            {t('doctor.empty_hint')}
           </p>
         </div>
       )}

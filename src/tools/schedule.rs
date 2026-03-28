@@ -88,9 +88,6 @@ impl Tool for ScheduleTool {
                 self.handle_get(id)
             }
             "create" | "add" | "once" => {
-                if let Some(blocked) = self.enforce_mutation_allowed(action) {
-                    return Ok(blocked);
-                }
                 let approved = args
                     .get("approved")
                     .and_then(serde_json::Value::as_bool)
@@ -301,6 +298,12 @@ impl ScheduleTool {
             }
         }
 
+        // Enforce rate-limiting AFTER command/args validation so that invalid
+        // requests do not consume the action budget.  (Fixes #3699)
+        if let Some(blocked) = self.enforce_mutation_allowed(action) {
+            return Ok(blocked);
+        }
+
         // All job creation routes through validated cron helpers, which enforce
         // the full security policy (allowlist + risk gate) before persistence.
         if let Some(value) = expression {
@@ -312,6 +315,7 @@ impl ScheduleTool {
                     tz: None,
                 },
                 command,
+                None,
                 approved,
             ) {
                 Ok(job) => job,
@@ -613,11 +617,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!blocked.success);
-        assert!(blocked
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        assert!(
+            blocked
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
 
         let list = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(list.success);
@@ -662,11 +668,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!cancel.success);
-        assert!(cancel
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        assert!(
+            cancel
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
 
         let get = tool
             .execute(json!({"action": "get", "id": id}))
@@ -712,11 +720,13 @@ mod tests {
             .unwrap();
 
         assert!(!create.success);
-        assert!(create
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("cron is disabled"));
+        assert!(
+            create
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cron is disabled")
+        );
     }
 
     #[tokio::test]
@@ -746,11 +756,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("not allowed"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not allowed")
+        );
     }
 
     #[tokio::test]
@@ -779,11 +791,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
 
         let approved = tool
             .execute(json!({

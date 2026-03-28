@@ -101,8 +101,8 @@ Pass Rate:     100%
 ### Step 2: Configure Telegram (if not done)
 
 ```bash
-# Interactive setup
-zeroclaw onboard --interactive
+# Guided setup
+zeroclaw onboard
 
 # Or channels-only setup
 zeroclaw onboard --channels-only

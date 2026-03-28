@@ -181,6 +181,18 @@ impl Tool for SopAdvanceTool {
                     } => {
                         format!("SOP '{sop_name}' run {run_id} failed: {reason}")
                     }
+                    SopRunAction::DeterministicStep { run_id, step, .. } => {
+                        format!(
+                            "Step recorded. Next deterministic step for run {run_id}: {}",
+                            step.title
+                        )
+                    }
+                    SopRunAction::CheckpointWait { run_id, step, .. } => {
+                        format!(
+                            "Step recorded. Run {run_id} paused at checkpoint: {}",
+                            step.title
+                        )
+                    }
                 };
                 Ok(ToolResult {
                     success: true,
@@ -222,6 +234,8 @@ mod tests {
                     body: "Do step one".into(),
                     suggested_tools: vec![],
                     requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
                 },
                 SopStep {
                     number: 2,
@@ -229,11 +243,14 @@ mod tests {
                     body: "Do step two".into(),
                     suggested_tools: vec![],
                     requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
                 },
             ],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
+            deterministic: false,
         }
     }
 

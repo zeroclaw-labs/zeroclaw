@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="ZeroClaw" width="200" />
+  <img src="https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/docs/assets/zeroclaw-banner.png" alt="ZeroClaw" width="600" />
 </p>
 
-<h1 align="center">ZeroClaw 🦀</h1>
+<h1 align="center">🦀 ZeroClaw — Persoonlijke AI-Assistent</h1>
 
 <p align="center">
   <strong>Nul overhead. Nul compromis. 100% Rust. 100% Agnostisch.</strong><br>
@@ -10,22 +10,28 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/zeroclaw-labs/zeroclaw/actions/workflows/ci-run.yml"><img src="https://img.shields.io/github/actions/workflow/status/zeroclaw-labs/zeroclaw/ci-run.yml?branch=master&label=build" alt="Build Status" /></a>
   <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
-  <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
+  <a href="https://www.rust-lang.org"><img src="https://img.shields.io/badge/rust-edition%202024-orange?logo=rust" alt="Rust Edition 2024" /></a>
+  <a href="https://github.com/zeroclaw-labs/zeroclaw/releases/latest"><img src="https://img.shields.io/badge/version-v0.6.5-blue" alt="Version v0.6.5" /></a>
+  <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://zeroclawlabs.cn/group.jpg"><img src="https://img.shields.io/badge/WeChat-Group-B7D7A8?logo=wechat&logoColor=white" alt="WeChat Group" /></a>
-  <a href="https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search"><img src="https://img.shields.io/badge/Xiaohongshu-Official-FF2442?style=flat" alt="Xiaohongshu: Official" /></a>
-  <a href="https://t.me/zeroclawlabs"><img src="https://img.shields.io/badge/Telegram-%40zeroclawlabs-26A5E4?style=flat&logo=telegram&logoColor=white" alt="Telegram: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclaw"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://www.facebook.com/groups/zeroclawlabs"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
+  <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
+  <a href="https://www.instagram.com/therealzeroclaw"><img src="https://img.shields.io/badge/Instagram-%40therealzeroclaw-E4405F?style=flat&logo=instagram&logoColor=white" alt="Instagram: @therealzeroclaw" /></a>
+  <a href="https://www.tiktok.com/@zeroclawlabs"><img src="https://img.shields.io/badge/TikTok-%40zeroclawlabs-000000?style=flat&logo=tiktok&logoColor=white" alt="TikTok: @zeroclawlabs" /></a>
+  <a href="https://www.rednote.com/user/profile/69b735e6000000002603927e"><img src="https://img.shields.io/badge/RedNote-Official-FF2442?style=flat" alt="RedNote" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
-</p>
-<p align="center">
-Gebouwd door studenten en leden van de Harvard, MIT en Sundai.Club gemeenschappen.
 </p>
 
 <p align="center">
-  🌐 <strong>Talen:</strong><a href="README.md">🇺🇸 English</a> ·
+Gebouwd door studenten en leden van de Harvard-, MIT- en Sundai.Club-gemeenschappen.
+</p>
+
+<p align="center">
+  🌐 <strong>Talen:</strong>
+  <a href="README.md">🇺🇸 English</a> ·
   <a href="README.zh-CN.md">🇨🇳 简体中文</a> ·
   <a href="README.ja.md">🇯🇵 日本語</a> ·
   <a href="README.ko.md">🇰🇷 한국어</a> ·
@@ -58,79 +64,190 @@ Gebouwd door studenten en leden van de Harvard, MIT en Sundai.Club gemeenschappe
   <a href="README.nb.md">🇳🇴 Norsk</a>
 </p>
 
-<p align="center">
-  <a href="#snelle-start">Snelle Start</a> |
-  <a href="bootstrap.sh">One-Click Setup</a> |
-  <a href="docs/README.md">Documentatie Hub</a> |
-  <a href="docs/SUMMARY.md">Documentatie Inhoudsopgave</a>
-</p>
+ZeroClaw is een persoonlijke AI-assistent die je op je eigen apparaten draait. Hij beantwoordt je op de kanalen die je al gebruikt (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work en meer). Het heeft een webdashboard voor realtime controle en kan verbinding maken met hardware-randapparatuur (ESP32, STM32, Arduino, Raspberry Pi). De Gateway is slechts het besturingsvlak — het product is de assistent.
+
+Als je een persoonlijke, single-user assistent wilt die lokaal, snel en altijd beschikbaar aanvoelt — dit is het.
 
 <p align="center">
-  <strong>Snelle toegang:</strong>
-  <a href="docs/reference/README.md">Referentie</a> ·
-  <a href="docs/operations/README.md">Operations</a> ·
-  <a href="docs/troubleshooting.md">Probleemoplossing</a> ·
-  <a href="docs/security/README.md">Beveiliging</a> ·
-  <a href="docs/hardware/README.md">Hardware</a> ·
-  <a href="docs/contributing/README.md">Bijdragen</a>
+  <a href="https://zeroclawlabs.ai">Website</a> ·
+  <a href="docs/README.md">Documentatie</a> ·
+  <a href="docs/architecture.md">Architectuur</a> ·
+  <a href="#snelle-start">Aan de slag</a> ·
+  <a href="#migreren-van-openclaw">Migreren van OpenClaw</a> ·
+  <a href="docs/ops/troubleshooting.md">Probleemoplossing</a> ·
+  <a href="https://discord.com/invite/wDshRVqRjx">Discord</a>
 </p>
 
-<p align="center">
-  <strong>Snelle, lichtgewicht en volledig autonome AI-assistent infrastructuur</strong><br />
-  Implementeer overal. Wissel alles.
-</p>
+> **Aanbevolen setup:** voer `zeroclaw onboard` uit in je terminal. ZeroClaw Onboard begeleidt je stap voor stap door het instellen van de gateway, workspace, kanalen en provider. Het is het aanbevolen installatiepad en werkt op macOS, Linux en Windows (via WSL2). Nieuwe installatie? Begin hier: [Aan de slag](#snelle-start)
 
-<p align="center">
-  ZeroClaw is het <strong>runtime besturingssysteem</strong> voor agent workflows — een infrastructuur die modellen, tools, geheugen en uitvoering abstraheert om agenten één keer te bouwen en overal uit te voeren.
-</p>
+### Abonnementsauthenticatie (OAuth)
 
-<p align="center"><code>Trait-gedreven architectuur · veilige runtime standaard · verwisselbare provider/kanaal/tool · alles is plugbaar</code></p>
+- **OpenAI Codex** (ChatGPT-abonnement)
+- **Gemini** (Google OAuth)
+- **Anthropic** (API-sleutel of autorisatietoken)
+
+Modelopmerking: hoewel veel providers/modellen worden ondersteund, gebruik voor de beste ervaring het sterkste beschikbare model van de nieuwste generatie. Zie [Onboarding](#snelle-start).
+
+Modelconfiguratie + CLI: [Providers-referentie](docs/reference/api/providers-reference.md)
+Autorisatieprofiel-rotatie (OAuth vs API-sleutels) + failover: [Model-failover](docs/reference/api/providers-reference.md)
+
+## Installatie (aanbevolen)
+
+Runtime: stabiele Rust-toolchain. Enkel binair bestand, geen runtime-afhankelijkheden.
+
+### Homebrew (macOS/Linuxbrew)
+
+```bash
+brew install zeroclaw
+```
+
+### Installatie met één klik
+
+```bash
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+./install.sh
+```
+
+`zeroclaw onboard` wordt automatisch uitgevoerd na installatie om je workspace en provider te configureren.
+
+## Snelle start (TL;DR)
+
+Volledige beginnersgids (authenticatie, koppeling, kanalen): [Aan de slag](docs/setup-guides/one-click-bootstrap.md)
+
+```bash
+# Installatie + onboarding
+./install.sh --api-key "sk-..." --provider openrouter
+
+# Start de gateway (webhook-server + webdashboard)
+zeroclaw gateway                # standaard: 127.0.0.1:42617
+zeroclaw gateway --port 0       # willekeurige poort (beveiligingsversterkt)
+
+# Praat met de assistent
+zeroclaw agent -m "Hello, ZeroClaw!"
+
+# Interactieve modus
+zeroclaw agent
+
+# Start volledige autonome runtime (gateway + kanalen + cron + hands)
+zeroclaw daemon
+
+# Controleer status
+zeroclaw status
+
+# Voer diagnostiek uit
+zeroclaw doctor
+```
+
+Bijwerken? Voer `zeroclaw doctor` uit na het updaten.
+
+### Vanuit broncode (ontwikkeling)
+
+```bash
+git clone https://github.com/zeroclaw-labs/zeroclaw.git
+cd zeroclaw
+
+cargo build --release --locked
+cargo install --path . --force --locked
+
+zeroclaw onboard
+```
+
+> **Dev-fallback (geen globale installatie):** voeg `cargo run --release --` voor commando's toe (voorbeeld: `cargo run --release -- status`).
+
+## Migreren van OpenClaw
+
+ZeroClaw kan je OpenClaw-workspace, geheugen en configuratie importeren:
+
+```bash
+# Voorbeeld van wat gemigreerd wordt (veilig, alleen-lezen)
+zeroclaw migrate openclaw --dry-run
+
+# Voer de migratie uit
+zeroclaw migrate openclaw
+```
+
+Dit migreert je geheugenregistraties, workspace-bestanden en configuratie van `~/.openclaw/` naar `~/.zeroclaw/`. Configuratie wordt automatisch geconverteerd van JSON naar TOML.
+
+## Standaard beveiligingsinstellingen (DM-toegang)
+
+ZeroClaw verbindt met echte berichtenplatforms. Behandel inkomende DM's als onbetrouwbare invoer.
+
+Volledige beveiligingsgids: [SECURITY.md](SECURITY.md)
+
+Standaardgedrag op alle kanalen:
+
+- **DM-koppeling** (standaard): onbekende afzenders ontvangen een korte koppelingscode en de bot verwerkt hun bericht niet.
+- Goedkeuren met: `zeroclaw pairing approve <channel> <code>` (vervolgens wordt de afzender toegevoegd aan een lokale allowlist).
+- Publieke inkomende DM's vereisen een expliciete opt-in in `config.toml`.
+- Voer `zeroclaw doctor` uit om riskante of verkeerd geconfigureerde DM-beleidsregels te detecteren.
+
+**Autonomieniveaus:**
+
+| Niveau | Gedrag |
+|--------|--------|
+| `ReadOnly` | Agent kan observeren maar niet handelen |
+| `Supervised` (standaard) | Agent handelt met goedkeuring voor medium/hoog risico-operaties |
+| `Full` | Agent handelt autonoom binnen beleidsgrenzen |
+
+**Sandboxing-lagen:** workspace-isolatie, padtraversatieblokkering, commando-allowlisting, verboden paden (`/etc`, `/root`, `~/.ssh`), snelheidsbeperking (max acties/uur, kosten/dag-limieten).
+
+<!-- BEGIN:WHATS_NEW -->
+<!-- END:WHATS_NEW -->
 
 ### 📢 Aankondigingen
 
-Gebruik deze tabel voor belangrijke aankondigingen (compatibiliteitswijzigingen, beveiligingsberichten, onderhoudsvensters en versieblokkades).
+Gebruik dit bord voor belangrijke mededelingen (breaking changes, beveiligingsadviezen, onderhoudsvensters en release-blokkers).
 
-| Datum (UTC) | Niveau      | Aankondiging                                                                                                                                                                                                                                                                                                                                                                                                              | Actie                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Kritiek_  | **We zijn niet gelieerd** met `openagen/zeroclaw` of `zeroclaw.org`. Het domein `zeroclaw.org` wijst momenteel naar de fork `openagen/zeroclaw`, en dit domein/repository imiteert onze officiële website/project.                                                                                                                                                                                 | Vertrouw geen informatie, binaire bestanden, fondsenwerving of aankondigingen van deze bronnen. Gebruik alleen [deze repository](https://github.com/zeroclaw-labs/zeroclaw) en onze geverifieerde sociale media accounts.                                                                                                                                                                                                                                                                                                                                                          |
-| 2026-02-21 | _Belangrijk_ | Onze officiële website is nu online: [zeroclawlabs.ai](https://zeroclawlabs.ai). Bedankt voor je geduld tijdens het wachten. We detecteren nog steeds imitatiepogingen: neem niet deel aan enige investering/fondsenwerving activiteit in naam van ZeroClaw als deze niet via onze officiële kanalen wordt gepubliceerd.                                                                                                                   | Gebruik [deze repository](https://github.com/zeroclaw-labs/zeroclaw) als de enige bron van waarheid. Volg [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Facebook (groep)](https://www.facebook.com/groups/zeroclaw), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), en [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) voor officiële updates. |
-| 2026-02-19 | _Belangrijk_ | Anthropic heeft de gebruiksvoorwaarden voor authenticatie en inloggegevens bijgewerkt op 2026-02-19. OAuth authenticatie (Free, Pro, Max) is exclusief voor Claude Code en Claude.ai; het gebruik van Claude Free/Pro/Max OAuth tokens in enig ander product, tool of service (inclusief Agent SDK) is niet toegestaan en kan in strijd zijn met de Consumenten Gebruiksvoorwaarden. | Vermijd tijdelijk Claude Code OAuth integraties om potentiële verliezen te voorkomen. Originele clausule: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                      |
+| Datum (UTC) | Niveau       | Mededeling                                                                                                                                                                                                                                                                                                                                                 | Actie                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ---------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-02-19 | _Kritiek_  | We zijn **niet gelieerd** aan `openagen/zeroclaw`, `zeroclaw.org` of `zeroclaw.net`. De domeinen `zeroclaw.org` en `zeroclaw.net` verwijzen momenteel naar de `openagen/zeroclaw`-fork, en dat domein/repository doet zich voor als onze officiële website/project.                                                                                       | Vertrouw geen informatie, binaire bestanden, fondswerving of aankondigingen van die bronnen. Gebruik alleen [dit repository](https://github.com/zeroclaw-labs/zeroclaw) en onze geverifieerde sociale accounts.                                                                                                                                                                                                                                                                                                                                                                       |
+| 2026-02-21 | _Belangrijk_ | Onze officiële website is nu live: [zeroclawlabs.ai](https://zeroclawlabs.ai). Bedankt voor je geduld terwijl we de lancering voorbereidden. We zien nog steeds imitatiepogingen, dus **doe niet** mee aan investeringen of fondsenwerving die de ZeroClaw-naam claimt, tenzij deze gepubliceerd is via onze officiële kanalen.                            | Gebruik [dit repository](https://github.com/zeroclaw-labs/zeroclaw) als de enige bron van waarheid. Volg [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Facebook (Groep)](https://www.facebook.com/groups/zeroclawlabs) en [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/) voor officiële updates. |
+| 2026-02-19 | _Belangrijk_ | Anthropic heeft de voorwaarden voor authenticatie en gebruik van inloggegevens bijgewerkt op 2026-02-19. Claude Code OAuth-tokens (Free, Pro, Max) zijn uitsluitend bedoeld voor Claude Code en Claude.ai; het gebruik van OAuth-tokens van Claude Free/Pro/Max in elk ander product, tool of service (inclusief Agent SDK) is niet toegestaan en kan de Consumentenvoorwaarden schenden. | Vermijd tijdelijk Claude Code OAuth-integraties om potentieel verlies te voorkomen. Originele clausule: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                                                    |
 
-### ✨ Functies
+## Hoogtepunten
 
-- 🏎️ **Lichtgewicht Runtime Standaard:** Veelvoorkomende CLI workflows en statuscommando's draaien binnen een geheugenruimte van enkele megabytes in productie builds.
-- 💰 **Kosteneffectieve Implementatie:** Ontworpen voor goedkope boards en kleine cloud instanties zonder zware runtime afhankelijkheden.
-- ⚡ **Snelle Koude Starts:** De single-binary Rust runtime houdt commando en daemon starts bijna direct voor dagelijkse operaties.
-- 🌍 **Draagbare Architectuur:** Een single-binary workflow op ARM, x86 en RISC-V met verwisselbare provider/kanaal/tool.
+- **Lichte runtime standaard** — veelvoorkomende CLI- en statusworkflows draaien in een geheugenomvang van enkele megabytes op release-builds.
+- **Kostenefficiënte implementatie** — ontworpen voor $10-borden en kleine cloud-instances, geen zware runtime-afhankelijkheden.
+- **Snelle koude starts** — single-binary Rust-runtime houdt het opstarten van commando's en daemon vrijwel instant.
+- **Draagbare architectuur** — één binair bestand voor ARM, x86 en RISC-V met verwisselbare providers/kanalen/tools.
+- **Lokale gateway** — enkel besturingsvlak voor sessies, kanalen, tools, cron, SOP's en events.
+- **Multi-channel inbox** — WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work, WebSocket en meer.
+- **Multi-agent-orkestratie (Hands)** — autonome agentenzwermen die op schema draaien en na verloop van tijd slimmer worden.
+- **Standaard Operationele Procedures (SOP's)** — event-gedreven workflowautomatisering met MQTT-, webhook-, cron- en periferie-triggers.
+- **Webdashboard** — React 19 + Vite web-UI met realtime chat, geheugenbrowser, configuratie-editor, cron-manager en tool-inspector.
+- **Hardware-randapparatuur** — ESP32, STM32 Nucleo, Arduino, Raspberry Pi GPIO via de `Peripheral`-trait.
+- **Eersteklas tools** — shell, bestands-I/O, browser, git, web fetch/search, MCP, Jira, Notion, Google Workspace en 70+ meer.
+- **Lifecycle-hooks** — onderschep en wijzig LLM-aanroepen, tool-uitvoeringen en berichten in elke fase.
+- **Skills-platform** — ingebouwde, community- en workspace-skills met beveiligingsaudit.
+- **Tunnelondersteuning** — Cloudflare, Tailscale, ngrok, OpenVPN en aangepaste tunnels voor externe toegang.
 
 ### Waarom teams kiezen voor ZeroClaw
 
-- **Lichtgewicht standaard:** kleine Rust binary, snelle start, laag geheugengebruik.
-- **Veilig door design:** pairing, strikte sandboxing, expliciete allowlists, workspace scope.
+- **Licht standaard:** klein Rust-binair bestand, snelle opstart, laag geheugengebruik.
+- **Veilig by design:** koppeling, strikte sandboxing, expliciete allowlists, workspace-scoping.
 - **Volledig verwisselbaar:** kernsystemen zijn traits (providers, kanalen, tools, geheugen, tunnels).
-- **Geen vendor lock-in:** OpenAI-compatibele provider ondersteuning + plugbare custom endpoints.
+- **Geen vendor lock-in:** OpenAI-compatibele provider-ondersteuning + inplugbare aangepaste endpoints.
 
-## Benchmark Snapshot (ZeroClaw vs OpenClaw, Reproduceerbaar)
+## Benchmark-overzicht (ZeroClaw vs OpenClaw, reproduceerbaar)
 
-Snelle benchmark op lokale machine (macOS arm64, feb. 2026) genormaliseerd voor 0.8 GHz edge hardware.
+Snelle lokale benchmark (macOS arm64, feb 2026) genormaliseerd voor 0.8GHz edge-hardware.
 
-|                              | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀           |
-| ---------------------------- | ------------- | -------------- | --------------- | --------------------- |
-| **Taal**                  | TypeScript    | Python         | Go              | **Rust**              |
-| **RAM**                      | > 1 GB        | > 100 MB       | < 10 MB         | **< 5 MB**            |
-| **Start (0.8 GHz core)** | > 500s        | > 30s          | < 1s            | **< 10ms**            |
-| **Binary Grootte**           | ~28 MB (dist) | N/A (Scripts)  | ~8 MB           | **3.4 MB**            |
-| **Kosten**                     | Mac Mini $599 | Linux SBC ~$50 | Linux board $10 | **Elke hardware $10** |
+|                           | OpenClaw      | NanoBot        | PicoClaw        | ZeroClaw 🦀          |
+| ------------------------- | ------------- | -------------- | --------------- | -------------------- |
+| **Taal**                  | TypeScript    | Python         | Go              | **Rust**             |
+| **RAM**                   | > 1GB         | > 100MB        | < 10MB          | **< 5MB**            |
+| **Opstart (0.8GHz core)** | > 500s       | > 30s          | < 1s            | **< 10ms**           |
+| **Binaire grootte**       | ~28MB (dist)  | N/A (Scripts)  | ~8MB            | **~8.8 MB**          |
+| **Kosten**                | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | **Elke hardware $10** |
 
-> Opmerkingen: ZeroClaw resultaten worden gemeten op productie builds met `/usr/bin/time -l`. OpenClaw vereist de Node.js runtime (typisch ~390 MB extra geheugen overhead), terwijl NanoBot de Python runtime vereist. PicoClaw en ZeroClaw zijn statische binaries. De bovenstaande RAM cijfers zijn runtime geheugen; build-time compilatievereisten zijn hoger.
+> Opmerkingen: ZeroClaw-resultaten zijn gemeten op release-builds met `/usr/bin/time -l`. OpenClaw vereist Node.js-runtime (typisch ~390MB extra geheugenoverhead), terwijl NanoBot Python-runtime vereist. PicoClaw en ZeroClaw zijn statische binaries. De RAM-cijfers hierboven zijn runtime-geheugen; compilatievereisten zijn hoger.
 
 <p align="center">
-  <img src="zero-claw.jpeg" alt="ZeroClaw vs OpenClaw Vergelijking" width="800" />
+  <img src="docs/assets/zeroclaw-comparison.jpeg" alt="ZeroClaw vs OpenClaw Comparison" width="800" />
 </p>
 
-### Reproduceerbare Lokale Meting
-
-Benchmark beweringen kunnen afwijken naarmate code en toolchains evolueren, dus meet altijd je huidige build lokaal:
+### Reproduceerbare lokale meting
 
 ```bash
 cargo build --release
@@ -140,58 +257,304 @@ ls -lh target/release/zeroclaw
 /usr/bin/time -l target/release/zeroclaw status
 ```
 
-Voorbeeld monster (macOS arm64, gemeten op 18 februari 2026):
+## Alles wat we tot nu toe hebben gebouwd
 
-- Release binary grootte: `8.8M`
-- `zeroclaw --help`: werkelijke tijd ongeveer `0.02s`, piek geheugengebruik ~`3.9 MB`
-- `zeroclaw status`: werkelijke tijd ongeveer `0.01s`, piek geheugengebruik ~`4.1 MB`
+### Kernplatform
+
+- Gateway HTTP/WS/SSE besturingsvlak met sessies, aanwezigheid, configuratie, cron, webhooks, webdashboard en koppeling.
+- CLI-oppervlak: `gateway`, `agent`, `onboard`, `doctor`, `status`, `service`, `migrate`, `auth`, `cron`, `channel`, `skills`.
+- Agent-orkestratielus met tool-dispatch, promptconstructie, berichtclassificatie en geheugen laden.
+- Sessiemodel met beveiligingsbeleid-handhaving, autonomieniveaus en goedkeuringspoorten.
+- Veerkrachtige provider-wrapper met failover, retry en modelrouting over 20+ LLM-backends.
+
+### Kanalen
+
+Kanalen: WhatsApp (natief), Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, DingTalk, Lark, Mattermost, Nextcloud Talk, Nostr, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work, WATI, Mochat, Linq, Notion, WebSocket, ClawdTalk.
+
+Feature-gated: Matrix (`channel-matrix`), Lark (`channel-lark`), Nostr (`channel-nostr`).
+
+### Webdashboard
+
+React 19 + Vite 6 + Tailwind CSS 4 webdashboard geserveerd direct vanuit de Gateway:
+
+- **Dashboard** — systeemoverzicht, gezondheidsstatus, uptime, kostentracking
+- **Agent Chat** — interactieve chat met de agent
+- **Geheugen** — bladeren en beheren van geheugenregistraties
+- **Configuratie** — bekijken en bewerken van configuratie
+- **Cron** — beheer van geplande taken
+- **Tools** — bladeren door beschikbare tools
+- **Logs** — bekijken van agent-activiteitslogs
+- **Kosten** — tokengebruik en kostentracking
+- **Doctor** — systeemgezondheidsdiagnostiek
+- **Integraties** — integratiestatus en setup
+- **Koppeling** — apparaatkoppelingsbeheer
+
+### Firmware-doelen
+
+| Doel | Platform | Doel |
+|------|----------|------|
+| ESP32 | Espressif ESP32 | Draadloze perifere agent |
+| ESP32-UI | ESP32 + Display | Agent met visuele interface |
+| STM32 Nucleo | STM32 (ARM Cortex-M) | Industriële periferie |
+| Arduino | Arduino | Basis sensor/actuator-brug |
+| Uno Q Bridge | Arduino Uno | Seriële brug naar agent |
+
+### Tools + automatisering
+
+- **Kern:** shell, bestand lezen/schrijven/bewerken, git-operaties, glob-zoekopdracht, inhoudszoekopdracht
+- **Web:** browserbediening, web fetch, webzoekopdracht, screenshot, afbeeldingsinfo, PDF lezen
+- **Integraties:** Jira, Notion, Google Workspace, Microsoft 365, LinkedIn, Composio, Pushover
+- **MCP:** Model Context Protocol tool-wrapper + uitgestelde toolsets
+- **Planning:** cron add/remove/update/run, planningstool
+- **Geheugen:** recall, store, forget, knowledge, project intel
+- **Geavanceerd:** delegate (agent-to-agent), swarm, model switch/routing, security ops, cloud ops
+- **Hardware:** board info, memory map, memory read (feature-gated)
+
+### Runtime + veiligheid
+
+- **Autonomieniveaus:** ReadOnly, Supervised (standaard), Full.
+- **Sandboxing:** workspace-isolatie, padtraversatieblokkering, commando-allowlists, verboden paden, Landlock (Linux), Bubblewrap.
+- **Snelheidsbeperking:** max acties per uur, max kosten per dag (configureerbaar).
+- **Goedkeuringspoort:** interactieve goedkeuring voor medium/hoog risico-operaties.
+- **E-stop:** noodstopfunctionaliteit.
+- **129+ beveiligingstests** in geautomatiseerd CI.
+
+### Ops + verpakking
+
+- Webdashboard geserveerd direct vanuit de Gateway.
+- Tunnelondersteuning: Cloudflare, Tailscale, ngrok, OpenVPN, aangepast commando.
+- Docker runtime-adapter voor gecontaineriseerde uitvoering.
+- CI/CD: beta (auto bij push) → stable (handmatige dispatch) → Docker, crates.io, Scoop, AUR, Homebrew, tweet.
+- Voorgebouwde binaries voor Linux (x86_64, aarch64, armv7), macOS (x86_64, aarch64), Windows (x86_64).
+
+
+## Configuratie
+
+Minimale `~/.zeroclaw/config.toml`:
+
+```toml
+default_provider = "anthropic"
+api_key = "sk-ant-..."
+```
+
+Volledige configuratiereferentie: [docs/reference/api/config-reference.md](docs/reference/api/config-reference.md).
+
+### Kanaalconfiguratie
+
+**Telegram:**
+```toml
+[channels.telegram]
+bot_token = "123456:ABC-DEF..."
+```
+
+**Discord:**
+```toml
+[channels.discord]
+token = "your-bot-token"
+```
+
+**Slack:**
+```toml
+[channels.slack]
+bot_token = "xoxb-..."
+app_token = "xapp-..."
+```
+
+**WhatsApp:**
+```toml
+[channels.whatsapp]
+enabled = true
+```
+
+**Matrix:**
+```toml
+[channels.matrix]
+homeserver_url = "https://matrix.org"
+username = "@bot:matrix.org"
+password = "..."
+```
+
+**Signal:**
+```toml
+[channels.signal]
+phone_number = "+1234567890"
+```
+
+### Tunnelconfiguratie
+
+```toml
+[tunnel]
+kind = "cloudflare"  # of "tailscale", "ngrok", "openvpn", "custom", "none"
+```
+
+Details: [Kanaalreferentie](docs/reference/api/channels-reference.md) · [Configuratiereferentie](docs/reference/api/config-reference.md)
+
+### Runtime-ondersteuning (huidig)
+
+- **`native`** (standaard) — directe procesuitvoering, snelste pad, ideaal voor vertrouwde omgevingen.
+- **`docker`** — volledige containerisolatie, afgedwongen beveiligingsbeleid, vereist Docker.
+
+Stel `runtime.kind = "docker"` in voor strikte sandboxing of netwerkisolatie.
+
+## Abonnementsauthenticatie (OpenAI Codex / Claude Code / Gemini)
+
+ZeroClaw ondersteunt native abonnementsautorisatieprofielen (meerdere accounts, versleuteld in rust).
+
+- Opslagbestand: `~/.zeroclaw/auth-profiles.json`
+- Versleutelingssleutel: `~/.zeroclaw/.secret_key`
+- Profiel-ID-formaat: `<provider>:<profile_name>` (voorbeeld: `openai-codex:work`)
+
+```bash
+# OpenAI Codex OAuth (ChatGPT-abonnement)
+zeroclaw auth login --provider openai-codex --device-code
+
+# Gemini OAuth
+zeroclaw auth login --provider gemini --profile default
+
+# Anthropic setup-token
+zeroclaw auth paste-token --provider anthropic --profile default --auth-kind authorization
+
+# Controleer / ververs / wissel profiel
+zeroclaw auth status
+zeroclaw auth refresh --provider openai-codex --profile default
+zeroclaw auth use --provider openai-codex --profile work
+
+# Agent draaien met abonnementsauth
+zeroclaw agent --provider openai-codex -m "hello"
+zeroclaw agent --provider anthropic -m "hello"
+```
+
+## Agent-workspace + skills
+
+Workspace-root: `~/.zeroclaw/workspace/` (configureerbaar via config).
+
+Geïnjecteerde promptbestanden:
+- `IDENTITY.md` — persoonlijkheid en rol van de agent
+- `USER.md` — gebruikerscontext en voorkeuren
+- `MEMORY.md` — langetermijnfeiten en lessen
+- `AGENTS.md` — sessieconventies en initialisatieregels
+- `SOUL.md` — kernidentiteit en operationele principes
+
+Skills: `~/.zeroclaw/workspace/skills/<skill>/SKILL.md` of `SKILL.toml`.
+
+```bash
+# Lijst geïnstalleerde skills
+zeroclaw skills list
+
+# Installeer vanuit git
+zeroclaw skills install https://github.com/user/my-skill.git
+
+# Beveiligingsaudit voor installatie
+zeroclaw skills audit https://github.com/user/my-skill.git
+
+# Verwijder een skill
+zeroclaw skills remove my-skill
+```
+
+## CLI-commando's
+
+```bash
+# Workspace-beheer
+zeroclaw onboard              # Begeleide installatiewizard
+zeroclaw status               # Toon daemon/agent-status
+zeroclaw doctor               # Voer systeemdiagnostiek uit
+
+# Gateway + daemon
+zeroclaw gateway              # Start gateway-server (127.0.0.1:42617)
+zeroclaw daemon               # Start volledige autonome runtime
+
+# Agent
+zeroclaw agent                # Interactieve chatmodus
+zeroclaw agent -m "message"   # Enkele berichtmodus
+
+# Servicebeheer
+zeroclaw service install      # Installeer als OS-service (launchd/systemd)
+zeroclaw service start|stop|restart|status
+
+# Kanalen
+zeroclaw channel list         # Lijst geconfigureerde kanalen
+zeroclaw channel doctor       # Controleer kanaalgezondheid
+zeroclaw channel bind-telegram 123456789
+
+# Cron + planning
+zeroclaw cron list            # Lijst geplande taken
+zeroclaw cron add "*/5 * * * *" --prompt "Check system health"
+zeroclaw cron remove <id>
+
+# Geheugen
+zeroclaw memory list          # Lijst geheugenregistraties
+zeroclaw memory get <key>     # Haal een geheugenitem op
+zeroclaw memory stats         # Geheugenstatistieken
+
+# Autorisatieprofielen
+zeroclaw auth login --provider <name>
+zeroclaw auth status
+zeroclaw auth use --provider <name> --profile <profile>
+
+# Hardware-randapparatuur
+zeroclaw hardware discover    # Scan verbonden apparaten
+zeroclaw peripheral list      # Lijst verbonden randapparatuur
+zeroclaw peripheral flash     # Flash firmware naar apparaat
+
+# Migratie
+zeroclaw migrate openclaw --dry-run
+zeroclaw migrate openclaw
+
+# Shell-aanvullingen
+source <(zeroclaw completions bash)
+zeroclaw completions zsh > ~/.zfunc/_zeroclaw
+```
+
+Volledige commandoreferentie: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
+
+<!-- markdownlint-disable MD001 MD024 -->
 
 ## Vereisten
 
 <details>
 <summary><strong>Windows</strong></summary>
 
-### Windows — Vereist
+#### Vereist
 
-1. **Visual Studio Build Tools** (levert MSVC linker en Windows SDK):
+1. **Visual Studio Build Tools** (biedt de MSVC-linker en Windows SDK):
 
     ```powershell
     winget install Microsoft.VisualStudio.2022.BuildTools
     ```
 
-    Selecteer tijdens de installatie (of via Visual Studio Installer) de **"Desktop development with C++"** workload.
+    Selecteer tijdens de installatie (of via de Visual Studio Installer) de **"Desktop development with C++"** workload.
 
-2. **Rust Toolchain:**
+2. **Rust-toolchain:**
 
     ```powershell
     winget install Rustlang.Rustup
     ```
 
-    Na installatie, open een nieuwe terminal en voer `rustup default stable` uit om ervoor te zorgen dat de stabiele toolchain actief is.
+    Open na installatie een nieuwe terminal en voer `rustup default stable` uit om te verzekeren dat de stabiele toolchain actief is.
 
-3. **Verifieer** dat beide werken:
+3. **Controleer** of beide werken:
     ```powershell
     rustc --version
     cargo --version
     ```
 
-### Windows — Optioneel
+#### Optioneel
 
-- **Docker Desktop** — alleen vereist als je de [Docker sandboxed runtime](#huidige-runtime-ondersteuning) gebruikt (`runtime.kind = "docker"`). Installeer via `winget install Docker.DockerDesktop`.
+- **Docker Desktop** — alleen vereist bij gebruik van de [Docker-sandboxed runtime](#runtime-ondersteuning-huidig) (`runtime.kind = "docker"`). Installeer via `winget install Docker.DockerDesktop`.
 
 </details>
 
 <details>
 <summary><strong>Linux / macOS</strong></summary>
 
-### Linux / macOS — Vereist
+#### Vereist
 
-1. **Essentiële build tools:**
+1. **Bouwtools:**
     - **Linux (Debian/Ubuntu):** `sudo apt install build-essential pkg-config`
     - **Linux (Fedora/RHEL):** `sudo dnf group install development-tools && sudo dnf install pkg-config`
     - **macOS:** Installeer Xcode Command Line Tools: `xcode-select --install`
 
-2. **Rust Toolchain:**
+2. **Rust-toolchain:**
 
     ```bash
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
@@ -199,716 +562,197 @@ Voorbeeld monster (macOS arm64, gemeten op 18 februari 2026):
 
     Zie [rustup.rs](https://rustup.rs) voor details.
 
-3. **Verifieer:**
+3. **Controleer** of beide werken:
     ```bash
     rustc --version
     cargo --version
     ```
 
-### Linux / macOS — Optioneel
+#### Eenregelige installer
 
-- **Docker** — alleen vereist als je de [Docker sandboxed runtime](#huidige-runtime-ondersteuning) gebruikt (`runtime.kind = "docker"`).
-    - **Linux (Debian/Ubuntu):** zie [docs.docker.com](https://docs.docker.com/engine/install/ubuntu/)
-    - **Linux (Fedora/RHEL):** zie [docs.docker.com](https://docs.docker.com/engine/install/fedora/)
-    - **macOS:** installeer Docker Desktop via [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
+Of sla bovenstaande stappen over en installeer alles (systeemafhankelijkheden, Rust, ZeroClaw) in één commando:
+
+```bash
+curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
+```
+
+#### Compilatieresource-vereisten
+
+Bouwen vanuit broncode heeft meer resources nodig dan het draaien van het resulterende binaire bestand:
+
+| Resource       | Minimum | Aanbevolen  |
+| -------------- | ------- | ----------- |
+| **RAM + swap** | 2 GB    | 4 GB+       |
+| **Vrije schijf** | 6 GB  | 10 GB+      |
+
+Als je host onder het minimum zit, gebruik dan voorgebouwde binaries:
+
+```bash
+./install.sh --prefer-prebuilt
+```
+
+Om alleen binaire installatie te forceren zonder broncode-fallback:
+
+```bash
+./install.sh --prebuilt-only
+```
+
+#### Optioneel
+
+- **Docker** — alleen vereist bij gebruik van de [Docker-sandboxed runtime](#runtime-ondersteuning-huidig) (`runtime.kind = "docker"`). Installeer via je pakketbeheerder of [docker.com](https://docs.docker.com/engine/install/).
+
+> **Opmerking:** De standaard `cargo build --release` gebruikt `codegen-units=1` om piekcompiledruk te verlagen. Voor snellere builds op krachtige machines, gebruik `cargo build --profile release-fast`.
 
 </details>
 
-## Snelle Start
+<!-- markdownlint-enable MD001 MD024 -->
 
-### Optie 1: Geautomatiseerde setup (aanbevolen)
+### Voorgebouwde binaries
 
-Het `bootstrap.sh` script installeert Rust, kloont ZeroClaw, compileert het, en stelt je initiële ontwikkelomgeving in:
+Release-assets worden gepubliceerd voor:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/bootstrap.sh | bash
-```
+- Linux: `x86_64`, `aarch64`, `armv7`
+- macOS: `x86_64`, `aarch64`
+- Windows: `x86_64`
 
-Dit zal:
+Download de nieuwste assets van:
+<https://github.com/zeroclaw-labs/zeroclaw/releases/latest>
 
-1. Rust installeren (indien afwezig)
-2. De ZeroClaw repository klonen
-3. ZeroClaw compileren in release modus
-4. `zeroclaw` installeren in `~/.cargo/bin/`
-5. De standaard workspace structuur maken in `~/.zeroclaw/workspace/`
-6. Een initiële configuratie `~/.zeroclaw/workspace/config.toml` genereren
+## Documentatie
 
-Na de bootstrap, herlaad je shell of voer `source ~/.cargo/env` uit om het `zeroclaw` commando globaal te gebruiken.
+Gebruik deze wanneer je voorbij de onboarding bent en diepere referentie wilt.
 
-### Optie 2: Handmatige installatie
+- Begin met de [documentatie-index](docs/README.md) voor navigatie en "wat staat waar."
+- Lees het [architectuuroverzicht](docs/architecture.md) voor het volledige systeemmodel.
+- Gebruik de [configuratiereferentie](docs/reference/api/config-reference.md) wanneer je elke sleutel en elk voorbeeld nodig hebt.
+- Draai de Gateway volgens het [operationele draaiboek](docs/ops/operations-runbook.md).
+- Volg [ZeroClaw Onboard](#snelle-start) voor een begeleide setup.
+- Debug veelvoorkomende fouten met de [probleemoplossingsgids](docs/ops/troubleshooting.md).
+- Bekijk de [beveiligingsrichtlijnen](docs/security/README.md) voordat je iets blootstelt.
 
-<details>
-<summary><strong>Klik om handmatige installatiestappen te zien</strong></summary>
+### Referentiedocumentatie
 
-```bash
-# 1. Kloon de repository
-git clone https://github.com/zeroclaw-labs/zeroclaw.git
-cd zeroclaw
+- Documentatiehub: [docs/README.md](docs/README.md)
+- Uniforme inhoudsopgave: [docs/SUMMARY.md](docs/SUMMARY.md)
+- Commandoreferentie: [docs/reference/cli/commands-reference.md](docs/reference/cli/commands-reference.md)
+- Configuratiereferentie: [docs/reference/api/config-reference.md](docs/reference/api/config-reference.md)
+- Providerreferentie: [docs/reference/api/providers-reference.md](docs/reference/api/providers-reference.md)
+- Kanaalreferentie: [docs/reference/api/channels-reference.md](docs/reference/api/channels-reference.md)
+- Operationeel draaiboek: [docs/ops/operations-runbook.md](docs/ops/operations-runbook.md)
+- Probleemoplossing: [docs/ops/troubleshooting.md](docs/ops/troubleshooting.md)
 
-# 2. Compileer in release
-cargo build --release --locked
+### Samenwerkingsdocumentatie
 
-# 3. Installeer de binary
-cargo install --path . --locked
+- Bijdragegids: [CONTRIBUTING.md](CONTRIBUTING.md)
+- PR-workflowbeleid: [docs/contributing/pr-workflow.md](docs/contributing/pr-workflow.md)
+- CI-workflowgids: [docs/contributing/ci-map.md](docs/contributing/ci-map.md)
+- Reviewer-draaiboek: [docs/contributing/reviewer-playbook.md](docs/contributing/reviewer-playbook.md)
+- Beveiligingsonthullingsbeleid: [SECURITY.md](SECURITY.md)
+- Documentatiesjabloon: [docs/contributing/doc-template.md](docs/contributing/doc-template.md)
 
-# 4. Initialiseer de workspace
-zeroclaw init
+### Implementatie + operaties
 
-# 5. Verifieer de installatie
-zeroclaw --version
-zeroclaw status
-```
+- Netwerkimplementatiegids: [docs/ops/network-deployment.md](docs/ops/network-deployment.md)
+- Proxy-agent-draaiboek: [docs/ops/proxy-agent-playbook.md](docs/ops/proxy-agent-playbook.md)
+- Hardwaregidsen: [docs/hardware/README.md](docs/hardware/README.md)
 
-</details>
+## Smooth Crab 🦀
 
-### Na Installatie
+ZeroClaw is gebouwd voor de smooth crab 🦀, een snelle en efficiënte AI-assistent. Gebouwd door Argenis De La Rosa en de gemeenschap.
 
-Eenmaal geïnstalleerd (via bootstrap of handmatig), zou je moeten zien:
+- [zeroclawlabs.ai](https://zeroclawlabs.ai)
+- [@zeroclawlabs](https://x.com/zeroclawlabs)
 
-```
-~/.zeroclaw/workspace/
-├── config.toml          # Hoofdconfiguratie
-├── .pairing             # Pairing geheimen (gegenereerd bij eerste lancering)
-├── logs/                # Daemon/agent logs
-├── skills/              # Aangepaste vaardigheden
-└── memory/              # Gesprekscontext opslag
-```
+## Steun ZeroClaw
 
-**Volgende stappen:**
+Als ZeroClaw je werk helpt en je de voortdurende ontwikkeling wilt steunen, kun je hier doneren:
 
-1. Configureer je AI providers in `~/.zeroclaw/workspace/config.toml`
-2. Bekijk de [configuratie referentie](docs/config-reference.md) voor geavanceerde opties
-3. Start de agent: `zeroclaw agent start`
-4. Test via je voorkeurskanaal (zie [kanalen referentie](docs/channels-reference.md))
+<a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
 
-## Configuratie
+### 🙏 Speciale dank
 
-Bewerk `~/.zeroclaw/workspace/config.toml` om providers, kanalen en systeemgedrag te configureren.
+Een hartelijk dankjewel aan de gemeenschappen en instellingen die dit open-source werk inspireren en voeden:
 
-### Snelle Configuratie Referentie
+- **Harvard University** — voor het bevorderen van intellectuele nieuwsgierigheid en het verleggen van de grenzen van het mogelijke.
+- **MIT** — voor het verdedigen van open kennis, open source en het geloof dat technologie voor iedereen toegankelijk moet zijn.
+- **Sundai Club** — voor de gemeenschap, de energie en de onvermoeibare drang om dingen te bouwen die ertoe doen.
+- **De wereld en verder** 🌍✨ — aan elke bijdrager, dromer en bouwer die open source een kracht ten goede maakt. Dit is voor jou.
 
-```toml
-[providers.anthropic]
-api_key = "sk-ant-..."
-model = "claude-sonnet-4-20250514"
-
-[providers.openai]
-api_key = "sk-..."
-model = "gpt-4o"
-
-[channels.telegram]
-enabled = true
-bot_token = "123456:ABC-DEF..."
-
-[channels.matrix]
-enabled = true
-homeserver_url = "https://matrix.org"
-username = "@bot:matrix.org"
-password = "..."
-
-[memory]
-kind = "markdown"  # of "sqlite" of "none"
-
-[runtime]
-kind = "native"    # of "docker" (vereist Docker)
-```
-
-**Volledige referentie documenten:**
+We bouwen in het open omdat de beste ideeën overal vandaan komen. Als je dit leest, ben je er onderdeel van. Welkom. 🦀❤️
 
-- [Configuratie Referentie](docs/config-reference.md) — alle instellingen, validaties, standaardwaarden
-- [Providers Referentie](docs/providers-reference.md) — AI provider-specifieke configuraties
-- [Kanalen Referentie](docs/channels-reference.md) — Telegram, Matrix, Slack, Discord en meer
-- [Operations](docs/operations-runbook.md) — productie monitoring, geheim rotatie, schaling
-
-### Huidige Runtime Ondersteuning
-
-ZeroClaw ondersteunt twee code uitvoeringsbackends:
-
-- **`native`** (standaard) — directe procesuitvoering, snelste pad, ideaal voor vertrouwde omgevingen
-- **`docker`** — volledige container isolatie, versterkt beveiligingsbeleid, vereist Docker
-
-Gebruik `runtime.kind = "docker"` als je strikte sandboxing of netwerkisolatie nodig hebt. Zie [configuratie referentie](docs/config-reference.md#runtime) voor volledige details.
-
-## Commando's
-
-```bash
-# Workspace beheer
-zeroclaw init                # Initialiseert een nieuwe workspace
-zeroclaw status              # Toont daemon/agent status
-zeroclaw config validate     # Verifieert config.toml syntax en waarden
-
-# Daemon beheer
-zeroclaw daemon start        # Start de daemon in de achtergrond
-zeroclaw daemon stop         # Stopt de draaiende daemon
-zeroclaw daemon restart      # Herstart de daemon (config herladen)
-zeroclaw daemon logs         # Toont daemon logs
-
-# Agent beheer
-zeroclaw agent start         # Start de agent (vereist draaiende daemon)
-zeroclaw agent stop          # Stopt de agent
-zeroclaw agent restart       # Herstart de agent (config herladen)
-
-# Pairing operaties
-zeroclaw pairing init        # Genereert een nieuw pairing geheim
-zeroclaw pairing rotate      # Roteert het bestaande pairing geheim
-
-# Tunneling (voor publieke blootstelling)
-zeroclaw tunnel start        # Start een tunnel naar de lokale daemon
-zeroclaw tunnel stop         # Stopt de actieve tunnel
-
-# Diagnostiek
-zeroclaw doctor              # Voert systeem gezondheidscontroles uit
-zeroclaw version             # Toont versie en build informatie
-```
-
-Zie [Commando's Referentie](docs/commands-reference.md) voor volledige opties en voorbeelden.
-
-## Architectuur
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Kanalen (trait)                          │
-│  Telegram │ Matrix │ Slack │ Discord │ Web │ CLI │ Custom       │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Agent Orchestrator                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │   Bericht    │  │   Context    │  │    Tool      │          │
-│  │   Routing    │  │   Geheugen   │  │  Uitvoering  │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-└─────────────────────────┬───────────────────────────────────────┘
-                          │
-          ┌───────────────┼───────────────┐
-          ▼               ▼               ▼
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│   Providers  │  │   Geheugen   │  │    Tools     │
-│   (trait)    │  │   (trait)    │  │   (trait)    │
-├──────────────┤  ├──────────────┤  ├──────────────┤
-│  Anthropic   │  │   Markdown   │  │  Filesystem  │
-│   OpenAI     │  │    SQLite    │  │     Bash     │
-│   Gemini     │  │     None     │  │   Web Fetch  │
-│   Ollama     │  │    Custom    │  │   Custom     │
-│   Custom     │  └──────────────┘  └──────────────┘
-└──────────────┘
-          │
-          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   Runtime (trait)                               │
-│                  Native │ Docker                                │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-**Belangrijkste principes:**
-
-- Alles is een **trait** — providers, kanalen, tools, geheugen, tunnels
-- Kanalen roepen de orchestrator aan; de orchestrator roept providers + tools aan
-- Het geheugensysteem beheert gesprekscontext (markdown, SQLite, of geen)
-- De runtime abstraheert code-uitvoering (native of Docker)
-- Geen provider lock-in — wissel Anthropic ↔ OpenAI ↔ Gemini ↔ Ollama zonder codewijzigingen
-
-Zie [architectuur documentatie](docs/architecture.svg) voor gedetailleerde diagrammen en implementatiedetails.
-
-## Voorbeelden
-
-### Telegram Bot
-
-```toml
-[channels.telegram]
-enabled = true
-bot_token = "123456:ABC-DEF..."
-allowed_users = [987654321]  # Je Telegram user ID
-```
-
-Start de daemon + agent, stuur dan een bericht naar je bot op Telegram:
-
-```
-/start
-Hallo! Zou je me kunnen helpen met het schrijven van een Python script?
-```
-
-De bot reageert met AI-gegenereerde code, voert tools uit indien gevraagd, en behoudt gesprekscontext.
-
-### Matrix (end-to-end encryptie)
-
-```toml
-[channels.matrix]
-enabled = true
-homeserver_url = "https://matrix.org"
-username = "@zeroclaw:matrix.org"
-password = "..."
-device_name = "zeroclaw-prod"
-e2ee_enabled = true
-```
-
-Nodig `@zeroclaw:matrix.org` uit in een versleutelde kamer, en de bot zal reageren met volledige encryptie. Zie [Matrix E2EE Gids](docs/matrix-e2ee-guide.md) voor apparaatverificatie setup.
-
-### Multi-Provider
-
-```toml
-[providers.anthropic]
-enabled = true
-api_key = "sk-ant-..."
-model = "claude-sonnet-4-20250514"
-
-[providers.openai]
-enabled = true
-api_key = "sk-..."
-model = "gpt-4o"
-
-[orchestrator]
-default_provider = "anthropic"
-fallback_providers = ["openai"]  # Failover bij provider fout
-```
-
-Als Anthropic faalt of rate-limit heeft, schakelt de orchestrator automatisch over naar OpenAI.
-
-### Aangepast Geheugen
-
-```toml
-[memory]
-kind = "sqlite"
-path = "~/.zeroclaw/workspace/memory/conversations.db"
-retention_days = 90  # Automatische opruiming na 90 dagen
-```
-
-Of gebruik Markdown voor mens-leesbare opslag:
-
-```toml
-[memory]
-kind = "markdown"
-path = "~/.zeroclaw/workspace/memory/"
-```
-
-Zie [Configuratie Referentie](docs/config-reference.md#memory) voor alle geheugenopties.
-
-## Provider Ondersteuning
-
-| Provider       | Status      | API Sleutel             | Voorbeeld Modellen                                      |
-| ----------------- | ----------- | ------------------- | ---------------------------------------------------- |
-| **Anthropic**     | ✅ Stabiel   | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514`, `claude-opus-4-20250514` |
-| **OpenAI**        | ✅ Stabiel   | `OPENAI_API_KEY`    | `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`             |
-| **Google Gemini** | ✅ Stabiel   | `GOOGLE_API_KEY`    | `gemini-2.0-flash-exp`, `gemini-exp-1206`            |
-| **Ollama**        | ✅ Stabiel   | N/A (lokaal)         | `llama3.3`, `qwen2.5`, `phi4`                        |
-| **Cerebras**      | ✅ Stabiel   | `CEREBRAS_API_KEY`  | `llama-3.3-70b`                                      |
-| **Groq**          | ✅ Stabiel   | `GROQ_API_KEY`      | `llama-3.3-70b-versatile`                            |
-| **Mistral**       | 🚧 Gepland | `MISTRAL_API_KEY`   | TBD                                                  |
-| **Cohere**        | 🚧 Gepland | `COHERE_API_KEY`    | TBD                                                  |
-
-### Aangepaste Endpoints
-
-ZeroClaw ondersteunt OpenAI-compatibele endpoints:
-
-```toml
-[providers.custom]
-enabled = true
-api_key = "..."
-base_url = "https://api.your-llm-provider.com/v1"
-model = "your-model-name"
-```
-
-Voorbeeld: gebruik [LiteLLM](https://github.com/BerriAI/litellm) als proxy om toegang te krijgen tot elke LLM via de OpenAI interface.
-
-Zie [Providers Referentie](docs/providers-reference.md) voor volledige configuratiedetails.
-
-## Kanaal Ondersteuning
-
-| Kanaal        | Status      | Authenticatie         | Opmerkingen                                                     |
-| ------------ | ----------- | ------------------------ | --------------------------------------------------------- |
-| **Telegram** | ✅ Stabiel   | Bot Token                | Volledige ondersteuning inclusief bestanden, afbeeldingen, inline knoppen |
-| **Matrix**   | ✅ Stabiel   | Wachtwoord of Token    | E2EE ondersteuning met apparaatverificatie              |
-| **Slack**    | 🚧 Gepland | OAuth of Bot Token       | Vereist workspace toegang                                    |
-| **Discord**  | 🚧 Gepland | Bot Token                | Vereist guild permissies                                |
-| **WhatsApp** | 🚧 Gepland | Twilio of officiële API | Vereist business account                                    |
-| **CLI**      | ✅ Stabiel   | Geen                    | Directe conversationele interface                       |
-| **Web**      | 🚧 Gepland | API Sleutel of OAuth         | Browser-gebaseerde chat interface                        |
-
-Zie [Kanalen Referentie](docs/channels-reference.md) voor volledige configuratie-instructies.
+## Bijdragen
 
-## Tool Ondersteuning
+Nieuw bij ZeroClaw? Zoek naar issues gelabeld [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — zie onze [Bijdragegids](CONTRIBUTING.md#first-time-contributors) om te beginnen. AI/vibe-coded PR's welkom! 🤖
 
-ZeroClaw biedt ingebouwde tools voor code-uitvoering, bestandssysteem toegang en web retrieval:
+Zie [CONTRIBUTING.md](CONTRIBUTING.md) en [CLA.md](docs/contributing/cla.md). Implementeer een trait, dien een PR in:
 
-| Tool                | Beschrijving                 | Vereiste Runtime                |
-| -------------------- | --------------------------- | ----------------------------- |
-| **bash**             | Voert shell commando's uit | Native of Docker              |
-| **python**           | Voert Python scripts uit  | Python 3.8+ (native) of Docker |
-| **javascript**       | Voert Node.js code uit     | Node.js 18+ (native) of Docker |
-| **filesystem_read**  | Leest bestanden            | Native of Docker              |
-| **filesystem_write** | Schrijft bestanden          | Native of Docker              |
-| **web_fetch**        | Haalt web inhoud op     | Native of Docker              |
+- CI-workflowgids: [docs/contributing/ci-map.md](docs/contributing/ci-map.md)
+- Nieuwe `Provider` → `src/providers/`
+- Nieuw `Channel` → `src/channels/`
+- Nieuwe `Observer` → `src/observability/`
+- Nieuwe `Tool` → `src/tools/`
+- Nieuw `Memory` → `src/memory/`
+- Nieuwe `Tunnel` → `src/tunnel/`
+- Nieuw `Peripheral` → `src/peripherals/`
+- Nieuwe `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
 
-### Uitvoeringsbeveiliging
+<!-- BEGIN:RECENT_CONTRIBUTORS -->
+<!-- END:RECENT_CONTRIBUTORS -->
 
-- **Native Runtime** — draait als gebruikersproces van de daemon, volledige bestandssysteem toegang
-- **Docker Runtime** — volledige container isolatie, gescheiden bestandssystemen en netwerken
+## ⚠️ Officieel repository & waarschuwing tegen imitatie
 
-Configureer het uitvoeringsbeleid in `config.toml`:
+**Dit is het enige officiële ZeroClaw-repository:**
 
-```toml
-[runtime]
-kind = "docker"
-allowed_tools = ["bash", "python", "filesystem_read"]  # Expliciete allowlist
-```
+> https://github.com/zeroclaw-labs/zeroclaw
 
-Zie [Configuratie Referentie](docs/config-reference.md#runtime) voor volledige beveiligingsopties.
+Elk ander repository, organisatie, domein of pakket dat beweert "ZeroClaw" te zijn of een relatie met ZeroClaw Labs impliceert, is **ongeautoriseerd en niet gelieerd aan dit project**. Bekende ongeautoriseerde forks worden vermeld in [TRADEMARK.md](docs/maintainers/trademark.md).
 
-## Implementatie
-
-### Lokale Implementatie (Ontwikkeling)
-
-```bash
-zeroclaw daemon start
-zeroclaw agent start
-```
-
-### Server Implementatie (Productie)
-
-Gebruik systemd om daemon en agent als services te beheren:
-
-```bash
-# Installeer de binary
-cargo install --path . --locked
-
-# Configureer de workspace
-zeroclaw init
-
-# Maak systemd service bestanden
-sudo cp deployment/systemd/zeroclaw-daemon.service /etc/systemd/system/
-sudo cp deployment/systemd/zeroclaw-agent.service /etc/systemd/system/
-
-# Schakel in en start de services
-sudo systemctl enable zeroclaw-daemon zeroclaw-agent
-sudo systemctl start zeroclaw-daemon zeroclaw-agent
-
-# Verifieer de status
-sudo systemctl status zeroclaw-daemon
-sudo systemctl status zeroclaw-agent
-```
-
-Zie [Netwerk Implementatie Gids](docs/network-deployment.md) voor volledige productie-implementatie instructies.
-
-### Docker
-
-```bash
-# Bouw de image
-docker build -t zeroclaw:latest .
-
-# Draai de container
-docker run -d \
-  --name zeroclaw \
-  -v ~/.zeroclaw/workspace:/workspace \
-  -e ANTHROPIC_API_KEY=sk-ant-... \
-  zeroclaw:latest
-```
-
-Zie [`Dockerfile`](Dockerfile) voor bouw-details en configuratie-opties.
-
-### Edge Hardware
-
-ZeroClaw is ontworpen om te draaien op laagvermogen hardware:
-
-- **Raspberry Pi Zero 2 W** — ~512 MB RAM, enkele ARMv8 core, < $5 hardware kosten
-- **Raspberry Pi 4/5** — 1 GB+ RAM, multi-core, ideaal voor gelijktijdige workloads
-- **Orange Pi Zero 2** — ~512 MB RAM, quad-core ARMv8, ultra-lage kosten
-- **x86 SBCs (Intel N100)** — 4-8 GB RAM, snelle builds, native Docker ondersteuning
-
-Zie [Hardware Gids](docs/hardware/README.md) voor apparaat-specifieke setup instructies.
-
-## Tunneling (Publieke Blootstelling)
-
-Stel je lokale ZeroClaw daemon bloot aan het publieke netwerk via beveiligde tunnels:
-
-```bash
-zeroclaw tunnel start --provider cloudflare
-```
-
-Ondersteunde tunnel providers:
-
-- **Cloudflare Tunnel** — gratis HTTPS, geen poort blootstelling, multi-domein ondersteuning
-- **Ngrok** — snelle setup, aangepaste domeinen (betaald plan)
-- **Tailscale** — privé mesh netwerk, geen publieke poort
-
-Zie [Configuratie Referentie](docs/config-reference.md#tunnel) voor volledige configuratie-opties.
-
-## Beveiliging
-
-ZeroClaw implementeert meerdere beveiligingslagen:
-
-### Pairing
-
-De daemon genereert een pairing geheim bij de eerste lancering opgeslagen in `~/.zeroclaw/workspace/.pairing`. Clients (agent, CLI) moeten dit geheim presenteren om verbinding te maken.
-
-```bash
-zeroclaw pairing rotate  # Genereert een nieuw geheim en invalideert het oude
-```
-
-### Sandboxing
-
-- **Docker Runtime** — volledige container isolatie met gescheiden bestandssystemen en netwerken
-- **Native Runtime** — draait als gebruikersproces, standaard scoped naar workspace
-
-### Allowlists
-
-Kanalen kunnen toegang beperken per user ID:
-
-```toml
-[channels.telegram]
-enabled = true
-allowed_users = [123456789, 987654321]  # Expliciete allowlist
-```
-
-### Encryptie
-
-- **Matrix E2EE** — volledige end-to-end encryptie met apparaatverificatie
-- **TLS Transport** — alle API en tunnel verkeer gebruikt HTTPS/TLS
-
-Zie [Beveiligingsdocumentatie](docs/security/README.md) voor volledig beleid en praktijken.
-
-## Observeerbaarheid
-
-ZeroClaw logt naar `~/.zeroclaw/workspace/logs/` standaard. Logs worden per component opgeslagen:
-
-```
-~/.zeroclaw/workspace/logs/
-├── daemon.log           # Daemon logs (startup, API verzoeken, fouten)
-├── agent.log            # Agent logs (bericht routing, tool uitvoering)
-├── telegram.log         # Kanaal-specifieke logs (indien ingeschakeld)
-└── matrix.log           # Kanaal-specifieke logs (indien ingeschakeld)
-```
-
-### Logging Configuratie
-
-```toml
-[logging]
-level = "info"                           # debug, info, warn, error
-path = "~/.zeroclaw/workspace/logs/"
-rotation = "daily"                       # daily, hourly, size
-max_size_mb = 100                        # Voor grootte-gebaseerde rotatie
-retention_days = 30                      # Automatische opruiming na N dagen
-```
-
-Zie [Configuratie Referentie](docs/config-reference.md#logging) voor alle logging-opties.
-
-### Metrieken (Gepland)
-
-Prometheus metrieken ondersteuning voor productie monitoring komt binnenkort. Tracking in [#234](https://github.com/zeroclaw-labs/zeroclaw/issues/234).
-
-## Vaardigheden
-
-ZeroClaw ondersteunt aangepaste vaardigheden — herbruikbare modules die systeemmogelijkheden uitbreiden.
-
-### Vaardigheidsdefinitie
-
-Vaardigheden worden opgeslagen in `~/.zeroclaw/workspace/skills/<skill-name>/` met deze structuur:
-
-```
-skills/
-└── my-skill/
-    ├── skill.toml       # Vaardigheidsmetadata (naam, beschrijving, afhankelijkheden)
-    ├── prompt.md        # Systeem prompt voor de AI
-    └── tools/           # Optionele aangepaste tools
-        └── my_tool.py
-```
-
-### Vaardigheidsvoorbeeld
-
-```toml
-# skills/web-research/skill.toml
-[skill]
-name = "web-research"
-description = "Zoekt op het web en vat resultaten samen"
-version = "1.0.0"
-
-[dependencies]
-tools = ["web_fetch", "bash"]
-```
-
-```markdown
-<!-- skills/web-research/prompt.md -->
-
-Je bent een onderzoeksassistent. Wanneer gevraagd wordt om iets te onderzoeken:
-
-1. Gebruik web_fetch om inhoud op te halen
-2. Vat resultaten samen in een gemakkelijk leesbaar formaat
-3. Citeer bronnen met URL's
-```
-
-### Vaardigheidsgebruik
-
-Vaardigheden worden automatisch geladen bij agent startup. Referentie ze bij naam in gesprekken:
-
-```
-Gebruiker: Gebruik de web-research vaardigheid om het laatste AI nieuws te vinden
-Bot: [laadt web-research vaardigheid, voert web_fetch uit, vat resultaten samen]
-```
-
-Zie [Vaardigheden](#vaardigheden) sectie voor volledige vaardigheidscreatie-instructies.
-
-## Open Skills
-
-ZeroClaw ondersteunt [Open Skills](https://github.com/openagents-com/open-skills) — een modulair en provider-agnostisch systeem voor het uitbreiden van AI-agent mogelijkheden.
-
-### Open Skills Inschakelen
-
-```toml
-[skills]
-open_skills_enabled = true
-# open_skills_dir = "/path/to/open-skills"  # optioneel
-```
-
-Je kunt ook tijdens runtime overschrijven met `ZEROCLAW_OPEN_SKILLS_ENABLED` en `ZEROCLAW_OPEN_SKILLS_DIR`.
-
-## Ontwikkeling
-
-```bash
-cargo build              # Dev build
-cargo build --release    # Release build (codegen-units=1, werkt op alle apparaten inclusief Raspberry Pi)
-cargo build --profile release-fast    # Snellere build (codegen-units=8, vereist 16 GB+ RAM)
-cargo test               # Voer volledige test suite uit
-cargo clippy --locked --all-targets -- -D clippy::correctness
-cargo fmt                # Formaat
-
-# Voer SQLite vs Markdown vergelijkingsbenchmark uit
-cargo test --test memory_comparison -- --nocapture
-```
-
-### Pre-push hook
-
-Een git hook voert `cargo fmt --check`, `cargo clippy -- -D warnings`, en `cargo test` uit voor elke push. Schakel het één keer in:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-### Build Probleemoplossing (OpenSSL fouten op Linux)
-
-Als je een `openssl-sys` build fout tegenkomt, synchroniseer afhankelijkheden en compileer opnieuw met de repository's lockfile:
-
-```bash
-git pull
-cargo build --release --locked
-cargo install --path . --force --locked
-```
-
-ZeroClaw is geconfigureerd om `rustls` te gebruiken voor HTTP/TLS afhankelijkheden; `--locked` houdt de transitieve grafiek deterministisch in schone omgevingen.
-
-Om de hook over te slaan wanneer je een snelle push nodig hebt tijdens ontwikkeling:
-
-```bash
-git push --no-verify
-```
-
-## Samenwerking & Docs
-
-Begin met de documentatie hub voor een taak-gebaseerde kaart:
-
-- Documentatie Hub: [`docs/README.md`](docs/README.md)
-- Geünificeerde Docs TOC: [`docs/SUMMARY.md`](docs/SUMMARY.md)
-- Commando's Referentie: [`docs/commands-reference.md`](docs/commands-reference.md)
-- Configuratie Referentie: [`docs/config-reference.md`](docs/config-reference.md)
-- Providers Referentie: [`docs/providers-reference.md`](docs/providers-reference.md)
-- Kanalen Referentie: [`docs/channels-reference.md`](docs/channels-reference.md)
-- Operations Runbook: [`docs/operations-runbook.md`](docs/operations-runbook.md)
-- Probleemoplossing: [`docs/troubleshooting.md`](docs/troubleshooting.md)
-- Docs Inventaris/Classificatie: [`docs/docs-inventory.md`](docs/docs-inventory.md)
-- PR/Issue Triage Snapshot (vanaf 18 feb. 2026): [`docs/project-triage-snapshot-2026-02-18.md`](docs/project-triage-snapshot-2026-02-18.md)
-
-Belangrijkste samenwerkingsreferenties:
-
-- Documentatie Hub: [docs/README.md](docs/README.md)
-- Documentatie Sjabloon: [docs/doc-template.md](docs/doc-template.md)
-- Documentatiewijziging Checklist: [docs/README.md#4-documentation-change-checklist](docs/README.md#4-documentation-change-checklist)
-- Kanaal Configuratie Referentie: [docs/channels-reference.md](docs/channels-reference.md)
-- Matrix Versleutelde Kamer Operations: [docs/matrix-e2ee-guide.md](docs/matrix-e2ee-guide.md)
-- Bijdrage Gids: [CONTRIBUTING.md](CONTRIBUTING.md)
-- PR Workflow Beleid: [docs/pr-workflow.md](docs/pr-workflow.md)
-- Reviewer Playbook (triage + diepgaande review): [docs/reviewer-playbook.md](docs/reviewer-playbook.md)
-- Eigendom en CI Triage Kaart: [docs/ci-map.md](docs/ci-map.md)
-- Beveiligingsopenbaarmaking Beleid: [SECURITY.md](SECURITY.md)
-
-Voor implementatie en runtime operaties:
-
-- Netwerk Implementatie Gids: [docs/network-deployment.md](docs/network-deployment.md)
-- Proxy Agent Playbook: [docs/proxy-agent-playbook.md](docs/proxy-agent-playbook.md)
-
-## ZeroClaw Ondersteunen
-
-Als ZeroClaw je werk helpt en je de doorlopende ontwikkeling wilt ondersteunen, kun je hier doneren:
-
-<a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=for-the-badge&logo=buy-me-a-coffee" alt="Koop Een Koffie Voor Mij" /></a>
-
-### 🙏 Speciale Dank
-
-Een oprechte dankjewel aan de gemeenschappen en instellingen die dit open-source werk inspireren en voeden:
-
-- **Harvard University** — voor het bevorderen van intellectuele nieuwsgierigheid en het verleggen van de grenzen van wat mogelijk is.
-- **MIT** — voor het verdedigen van open kennis, open source, en de overtuiging dat technologie toegankelijk moet zijn voor iedereen.
-- **Sundai Club** — voor de gemeenschap, energie, en de onophoudelijke wil om dingen te bouwen die ertoe doen.
-- **De Wereld en Verder** 🌍✨ — aan elke bijdrager, dromer, en bouwer daarbuiten die open source tot een kracht voor goed maakt. Dit is voor jou.
-
-We bouwen in open source omdat de beste ideeën van overal komen. Als je dit leest, ben je er deel van. Welkom. 🦀❤️
-
-## ⚠️ Officiële Repository en Waarschuwing voor Imitatie
-
-**Dit is de enige officiële ZeroClaw repository:**
-
-> <https://github.com/zeroclaw-labs/zeroclaw>
-
-Elke andere repository, organisatie, domein of pakket dat beweert "ZeroClaw" te zijn of affiniteit met ZeroClaw Labs suggereert is **niet-geautoriseerd en niet gelieerd aan dit project**. Bekende niet-geautoriseerde forks worden vermeld in [TRADEMARK.md](TRADEMARK.md).
-
-Als je imitatie of handelsmerk misbruik tegenkomt, [open dan een issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
+Als je imitatie of merkmisbruik tegenkomt, [open dan een issue](https://github.com/zeroclaw-labs/zeroclaw/issues).
 
 ---
 
 ## Licentie
 
-ZeroClaw is dubbel gelicentieerd voor maximale openheid en bijdrager bescherming:
+ZeroClaw heeft een dubbele licentie voor maximale openheid en bescherming van bijdragers:
 
-| Licentie                      | Gebruiksscenario's                                            |
-| ---------------------------- | ------------------------------------------------------------ |
-| [MIT](LICENSE-MIT)               | Open-source, onderzoek, academisch, persoonlijk gebruik          |
-| [Apache 2.0](LICENSE-APACHE) | Patent bescherming, institutioneel, commerciële implementatie |
+| Licentie | Gebruiksscenario |
+|----------|-------------------|
+| [MIT](LICENSE-MIT) | Open-source, onderzoek, academisch, persoonlijk gebruik |
+| [Apache 2.0](LICENSE-APACHE) | Octrooi-bescherming, institutioneel, commerciële implementatie |
 
-Je kunt een van beide licenties kiezen. **Bijdragers verlenen automatisch rechten onder beide** — zie [CLA.md](CLA.md) voor de volledige bijdrager overeenkomst.
+Je kunt een van beide licenties kiezen. **Bijdragers verlenen automatisch rechten onder beide** — zie [CLA.md](docs/contributing/cla.md) voor de volledige bijdrager-overeenkomst.
 
 ### Handelsmerk
 
-De naam **ZeroClaw** en het logo zijn geregistreerde handelsmerken van ZeroClaw Labs. Deze licentie verleent geen toestemming om ze te gebruiken om goedkeuring of affiniteit te impliceren. Zie [TRADEMARK.md](TRADEMARK.md) voor toegestane en verboden gebruiksmogelijkheden.
+De **ZeroClaw**-naam en het logo zijn handelsmerken van ZeroClaw Labs. Deze licentie verleent geen toestemming om ze te gebruiken om goedkeuring of affiliatie te impliceren. Zie [TRADEMARK.md](docs/maintainers/trademark.md) voor toegestaan en verboden gebruik.
 
-### Bijdrager Beschermingen
+### Bijdragerbescherming
 
-- **Je behoudt auteursrechten** op je bijdragen
-- **Patent verlening** (Apache 2.0) beschermt je tegen patent claims door andere bijdragers
-- Je bijdragen worden **permanent toegeschreven** in de commit geschiedenis en [NOTICE](NOTICE)
-- Geen handelsmerk rechten worden overgedragen door bij te dragen
-
-## Bijdragen
-
-Zie [CONTRIBUTING.md](CONTRIBUTING.md) en [CLA.md](CLA.md). Implementeer een trait, dien een PR in:
-
-- CI workflow gids: [docs/ci-map.md](docs/ci-map.md)
-- Nieuwe `Provider` → `src/providers/`
-- Nieuw `Channel` → `src/channels/`
-- Nieuwe `Observer` → `src/observability/`
-- Nieuwe `Tool` → `src/tools/`
-- Nieuwe `Memory` → `src/memory/`
-- Nieuwe `Tunnel` → `src/tunnel/`
-- Nieuwe `Skill` → `~/.zeroclaw/workspace/skills/<n>/`
+- Je **behoudt het auteursrecht** op je bijdragen
+- **Octrooiverlening** (Apache 2.0) beschermt je tegen octrooiclaims van andere bijdragers
+- Je bijdragen worden **permanent toegeschreven** in de commitgeschiedenis en [NOTICE](NOTICE)
+- Er worden geen handelsmerkrechten overgedragen door bij te dragen
 
 ---
 
 **ZeroClaw** — Nul overhead. Nul compromis. Implementeer overal. Wissel alles. 🦀
 
-## Sterren Geschiedenis
+## Bijdragers
+
+<a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=zeroclaw-labs/zeroclaw" alt="ZeroClaw contributors" />
+</a>
+
+Deze lijst wordt gegenereerd vanuit de GitHub-bijdragersgrafiek en wordt automatisch bijgewerkt.
+
+## Sterrengeschiedenis
 
 <p align="center">
   <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
     <picture>
      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Sterren Geschiedenis Grafiek" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>

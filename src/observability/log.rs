@@ -47,6 +47,15 @@ impl Observer for LogObserver {
             ObserverEvent::HeartbeatTick => {
                 info!("heartbeat.tick");
             }
+            ObserverEvent::CacheHit {
+                cache_type,
+                tokens_saved,
+            } => {
+                info!(cache_type = %cache_type, tokens_saved = tokens_saved, "cache.hit");
+            }
+            ObserverEvent::CacheMiss { cache_type } => {
+                info!(cache_type = %cache_type, "cache.miss");
+            }
             ObserverEvent::Error { component, message } => {
                 info!(component = %component, error = %message, "error");
             }
@@ -83,6 +92,38 @@ impl Observer for LogObserver {
                     "llm.response"
                 );
             }
+            ObserverEvent::HandStarted { hand_name } => {
+                info!(hand = %hand_name, "hand.started");
+            }
+            ObserverEvent::HandCompleted {
+                hand_name,
+                duration_ms,
+                findings_count,
+            } => {
+                info!(hand = %hand_name, duration_ms = duration_ms, findings = findings_count, "hand.completed");
+            }
+            ObserverEvent::HandFailed {
+                hand_name,
+                error,
+                duration_ms,
+            } => {
+                info!(hand = %hand_name, error = %error, duration_ms = duration_ms, "hand.failed");
+            }
+            ObserverEvent::DeploymentStarted { deploy_id } => {
+                info!(deploy_id = %deploy_id, "deployment.started");
+            }
+            ObserverEvent::DeploymentCompleted {
+                deploy_id,
+                commit_sha,
+            } => {
+                info!(deploy_id = %deploy_id, commit_sha = %commit_sha, "deployment.completed");
+            }
+            ObserverEvent::DeploymentFailed { deploy_id, reason } => {
+                info!(deploy_id = %deploy_id, reason = %reason, "deployment.failed");
+            }
+            ObserverEvent::RecoveryCompleted { deploy_id } => {
+                info!(deploy_id = %deploy_id, "recovery.completed");
+            }
         }
     }
 
@@ -100,6 +141,27 @@ impl Observer for LogObserver {
             }
             ObserverMetric::QueueDepth(d) => {
                 info!(depth = d, "metric.queue_depth");
+            }
+            ObserverMetric::HandRunDuration {
+                hand_name,
+                duration,
+            } => {
+                let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+                info!(hand = %hand_name, duration_ms = ms, "metric.hand_run_duration");
+            }
+            ObserverMetric::HandFindingsCount { hand_name, count } => {
+                info!(hand = %hand_name, count = count, "metric.hand_findings_count");
+            }
+            ObserverMetric::HandSuccessRate { hand_name, success } => {
+                info!(hand = %hand_name, success = success, "metric.hand_success_rate");
+            }
+            ObserverMetric::DeploymentLeadTime(d) => {
+                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+                info!(lead_time_ms = ms, "metric.deployment_lead_time");
+            }
+            ObserverMetric::RecoveryTime(d) => {
+                let ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+                info!(recovery_time_ms = ms, "metric.recovery_time");
             }
         }
     }
@@ -186,5 +248,40 @@ mod tests {
         obs.record_metric(&ObserverMetric::TokensUsed(u64::MAX));
         obs.record_metric(&ObserverMetric::ActiveSessions(1));
         obs.record_metric(&ObserverMetric::QueueDepth(999));
+    }
+
+    #[test]
+    fn log_observer_hand_events_no_panic() {
+        let obs = LogObserver::new();
+        obs.record_event(&ObserverEvent::HandStarted {
+            hand_name: "review".into(),
+        });
+        obs.record_event(&ObserverEvent::HandCompleted {
+            hand_name: "review".into(),
+            duration_ms: 1500,
+            findings_count: 3,
+        });
+        obs.record_event(&ObserverEvent::HandFailed {
+            hand_name: "review".into(),
+            error: "timeout".into(),
+            duration_ms: 5000,
+        });
+    }
+
+    #[test]
+    fn log_observer_hand_metrics_no_panic() {
+        let obs = LogObserver::new();
+        obs.record_metric(&ObserverMetric::HandRunDuration {
+            hand_name: "review".into(),
+            duration: Duration::from_millis(1500),
+        });
+        obs.record_metric(&ObserverMetric::HandFindingsCount {
+            hand_name: "review".into(),
+            count: 5,
+        });
+        obs.record_metric(&ObserverMetric::HandSuccessRate {
+            hand_name: "review".into(),
+            success: true,
+        });
     }
 }

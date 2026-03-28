@@ -46,12 +46,11 @@ zeroclaw/
 ├── docs/contributing/extension-examples.md  # Extension examples (custom provider/channel/tool/memory)
 ├── firmware/             # Embedded firmware for Arduino, ESP32, Nucleo boards
 ├── web/                  # Web UI (Vite + TypeScript)
-├── python/               # Python SDK / tools bridge
 ├── dev/                  # Local dev tooling (Docker, CI scripts, sandbox)
 ├── scripts/              # CI scripts, release automation, bootstrap
 ├── docs/                 # Documentation system (multilingual, runtime refs)
 ├── .github/              # CI workflows, PR templates, automation
-├── playground/           # (empty, experimental scratch space)
+├── playground/           # (git-ignored) Docker dev workspace, auto-populated at runtime
 ├── Cargo.toml            # Workspace manifest
 ├── Dockerfile            # Container build
 ├── docker-compose.yml    # Service composition
@@ -116,7 +115,7 @@ Tool categories:
 |---|---|---|
 | `memory/` | `traits.rs`, `backend.rs`, `mod.rs`, + 8 backend files | **Persistent knowledge.** `Memory` trait: `store()`, `recall()`, `get()`, `list()`, `forget()`, `count()`. Categories: Core, Daily, Conversation, Custom. |
 
-Backends: `sqlite`, `markdown`, `lucid` (hybrid SQLite + embeddings), `qdrant` (vector DB), `postgres`, `none`
+Backends: `sqlite`, `markdown`, `lucid` (hybrid SQLite + embeddings), `qdrant` (vector DB), `none`
 
 Supporting: `embeddings.rs` (embedding generation), `vector.rs` (vector ops), `chunker.rs` (text splitting), `hygiene.rs` (cleanup), `snapshot.rs` (backup), `response_cache.rs` (caching), `cli.rs` (CLI commands)
 
@@ -200,7 +199,6 @@ Sandboxing: `bubblewrap.rs`, `firejail.rs`, `landlock.rs`, `docker.rs`, `detect.
 | `docs/contributing/extension-examples.md` | Extension examples for custom providers, channels, tools, and memory backends |
 | `firmware/` | Embedded firmware: `arduino/`, `esp32/`, `esp32-ui/`, `nucleo/`, `uno-q-bridge/` |
 | `web/` | Web UI frontend (Vite + TypeScript) |
-| `python/` | Python SDK / tools bridge with its own tests |
 | `dev/` | Local development: Docker Compose, CI script (`ci.sh`), config template, sandbox configs |
 | `scripts/` | CI helpers, release automation, bootstrap, contributor tier computation |
 | `docs/` | Documentation system: multilingual (en/zh-CN/ja/ru/fr/vi), runtime references, operations runbooks, security proposals |
@@ -233,7 +231,7 @@ Traits never import concrete implementations.
 
 ```
 zeroclaw
-├── onboard [--interactive] [--force]     # First-run setup
+├── onboard [--force] [--reinit] [--channels-only]     # First-run setup
 ├── agent [-m "msg"] [-p provider]        # Start agent loop
 ├── daemon [-p port]                      # Full runtime (gateway+channels+cron+heartbeat)
 ├── gateway [-p port]                     # HTTP API server only
