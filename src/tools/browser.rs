@@ -351,31 +351,6 @@ impl BrowserTool {
             .unwrap_or(false)
     }
 
-    /// Resolve the path to the playwright-bridge.js script.
-    fn playwright_bridge_script() -> String {
-        // Look for the bridge script relative to the executable, then fallback
-        let candidates = [
-            // Relative to project root (dev mode)
-            "scripts/playwright-bridge.js".to_string(),
-            // Installed alongside binary
-            {
-                let mut path = std::env::current_exe()
-                    .unwrap_or_default()
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf();
-                path.push("scripts/playwright-bridge.js");
-                path.to_string_lossy().into_owned()
-            },
-        ];
-        for c in &candidates {
-            if Path::new(c).exists() {
-                return c.clone();
-            }
-        }
-        candidates[0].clone()
-    }
-
     fn configured_backend(&self) -> anyhow::Result<BrowserBackendKind> {
         BrowserBackendKind::parse(&self.backend)
     }

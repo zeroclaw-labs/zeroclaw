@@ -1,11 +1,12 @@
 {
   "name": "zeroclaw-browser-scripts",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Browser automation scripts for ZeroClaw (Playwright bridge)",
+  "description": "Browser automation daemon for MoA (persistent Playwright, gstack-inspired)",
   "scripts": {
     "install-browser": "npx playwright install chromium",
-    "test-bridge": "node playwright-bridge.js eyJhY3Rpb24iOiJnZXRfdGl0bGUifQ=="
+    "daemon": "node playwright-daemon.js",
+    "daemon:headed": "node playwright-daemon.js --headed"
   },
   "dependencies": {
     "playwright": "^1.49.0"
