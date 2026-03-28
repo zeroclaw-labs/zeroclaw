@@ -8,8 +8,8 @@ pub mod auth;
 pub mod graph_client;
 pub mod types;
 
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde_json::json;

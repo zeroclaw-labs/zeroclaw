@@ -330,6 +330,7 @@ pub struct TelegramChannel {
     /// Override for local Bot API servers or testing.
     api_base: String,
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
@@ -375,6 +376,7 @@ impl TelegramChannel {
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
+            transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
@@ -423,8 +425,19 @@ impl TelegramChannel {
 
     /// Configure voice transcription.
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
         }
         self
     }
@@ -1135,6 +1148,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         }
 
+        if let Some(forward_info) = Self::extract_forward_info(message) {
+            content = format!("{forward_info}\n\n{content}");
+        }
+
         // Prepend reply context if replying to another message
         if let Some(quote) = self.extract_reply_context(message) {
             content = format!("{quote}\n\n{content}");
@@ -1157,6 +1174,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            attachments: vec![],
         })
     }
 
@@ -1166,6 +1184,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// or the message exceeds duration limits.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let config = self.transcription.as_ref()?;
+        let manager = self.transcription_manager.as_deref()?;
         let message = update.get("message")?;
 
         let (file_id, duration) = Self::parse_voice_metadata(message)?;
@@ -1234,14 +1253,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text =
-            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Voice transcription failed: {e}");
-                    return None;
-                }
-            };
+        let text = match manager.transcribe(&audio_data, &file_name).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Voice transcription failed: {e}");
+                return None;
+            }
+        };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");
@@ -1262,10 +1280,16 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             cache.insert(format!("{chat_id}:{message_id}"), text.clone());
         }
 
+        let mut content = format!("[Voice] {text}");
+
+        if let Some(forward_info) = Self::extract_forward_info(message) {
+            content = format!("{forward_info}\n\n{content}");
+        }
+
         let content = if let Some(quote) = self.extract_reply_context(message) {
-            format!("{quote}\n\n[Voice] {text}")
+            format!("{quote}\n\n{content}")
         } else {
-            format!("[Voice] {text}")
+            content
         };
 
         // Prepend forwarding attribution when the message was forwarded
@@ -1287,6 +1311,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            attachments: vec![],
         })
     }
 
@@ -1401,6 +1426,50 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some(format!("> @{reply_sender}:\n{quoted_lines}"))
     }
 
+    /// Extract forward info from a Telegram `forward_origin`, if present.
+    fn extract_forward_info(message: &serde_json::Value) -> Option<String> {
+        let forward_origin = message.get("forward_origin")?;
+        let origin_type = forward_origin.get("type").and_then(|t| t.as_str())?;
+
+        let attribution = match origin_type {
+            "user" => {
+                let user = forward_origin.get("sender_user")?;
+                if let Some(username) = user.get("username").and_then(|u| u.as_str()) {
+                    format!("@{}", username)
+                } else if let Some(first_name) = user.get("first_name").and_then(|n| n.as_str()) {
+                    let mut name = first_name.to_string();
+                    if let Some(last_name) = user.get("last_name").and_then(|n| n.as_str()) {
+                        name.push(' ');
+                        name.push_str(last_name);
+                    }
+                    name
+                } else {
+                    "unknown user".to_string()
+                }
+            }
+            "hidden_user" => forward_origin
+                .get("sender_user_name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unknown hidden user")
+                .to_string(),
+            "chat" => forward_origin
+                .get("sender_chat")
+                .and_then(|c| c.get("title"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown chat")
+                .to_string(),
+            "channel" => forward_origin
+                .get("chat")
+                .and_then(|c| c.get("title"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown channel")
+                .to_string(),
+            _ => "unknown source".to_string(),
+        };
+
+        Some(format!("[Forwarded from {}]", attribution))
+    }
+
     fn parse_update_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let message = update.get("message")?;
 
@@ -1453,13 +1522,17 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             chat_id.clone()
         };
 
-        let content = if self.mention_only && is_group {
+        let mut content = if self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             Self::normalize_incoming_content(text, bot_username)?
         } else {
             text.to_string()
         };
+
+        if let Some(forward_info) = Self::extract_forward_info(message) {
+            content = format!("{forward_info}\n\n{content}");
+        }
 
         let content = if let Some(quote) = self.extract_reply_context(message) {
             format!("{quote}\n\n{content}")
@@ -1491,6 +1564,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: thread_id,
             interruption_scope_id: None,
+            attachments: vec![],
         })
     }
 
@@ -4240,6 +4314,85 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // extract_forward_info tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn extract_forward_info_user() {
+        let msg = serde_json::json!({
+            "forward_origin": {
+                "type": "user",
+                "sender_user": { "id": 123, "username": "alice" }
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg),
+            Some("[Forwarded from @alice]".to_string())
+        );
+
+        let msg_first_last = serde_json::json!({
+            "forward_origin": {
+                "type": "user",
+                "sender_user": { "id": 123, "first_name": "Alice", "last_name": "Smith" }
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg_first_last),
+            Some("[Forwarded from Alice Smith]".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_forward_info_hidden_user() {
+        let msg = serde_json::json!({
+            "forward_origin": {
+                "type": "hidden_user",
+                "sender_user_name": "Anonymous Sender"
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg),
+            Some("[Forwarded from Anonymous Sender]".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_forward_info_chat() {
+        let msg = serde_json::json!({
+            "forward_origin": {
+                "type": "chat",
+                "sender_chat": { "id": 123, "title": "Secret Group" }
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg),
+            Some("[Forwarded from Secret Group]".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_forward_info_channel() {
+        let msg = serde_json::json!({
+            "forward_origin": {
+                "type": "channel",
+                "chat": { "id": 123, "title": "News Channel" }
+            }
+        });
+        assert_eq!(
+            TelegramChannel::extract_forward_info(&msg),
+            Some("[Forwarded from News Channel]".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_forward_info_none() {
+        let msg = serde_json::json!({
+            "text": "regular message"
+        });
+        assert_eq!(TelegramChannel::extract_forward_info(&msg), None);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // extract_reply_context tests
     // ─────────────────────────────────────────────────────────────────────
 
@@ -4310,6 +4463,80 @@ mod tests {
         assert_eq!(ctx, "> @bob:\n> [Voice] Hello from voice");
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // parse_update_message tests
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_update_message_forwarded() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 10,
+                "text": "look at this news",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "forward_origin": {
+                    "type": "channel",
+                    "chat": { "id": 123, "title": "News Channel" }
+                }
+            }
+        });
+        let parsed = ch.parse_update_message(&update).unwrap();
+        assert!(
+            parsed.content.contains("[Forwarded from News Channel]"),
+            "content should contain forward info: {}",
+            parsed.content
+        );
+        assert!(
+            parsed.content.contains("look at this news"),
+            "content should contain original text"
+        );
+        assert!(
+            parsed.content.starts_with("[Forwarded"),
+            "forward info should be prepended"
+        );
+    }
+
+    #[test]
+    fn parse_update_message_forwarded_with_reply() {
+        let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 10,
+                "text": "look at this news",
+                "from": { "id": 1, "username": "alice" },
+                "chat": { "id": 100, "type": "private" },
+                "reply_to_message": {
+                    "from": { "username": "bot" },
+                    "text": "What do you think?"
+                },
+                "forward_origin": {
+                    "type": "channel",
+                    "chat": { "id": 123, "title": "News Channel" }
+                }
+            }
+        });
+        let parsed = ch.parse_update_message(&update).unwrap();
+        // Quote should be at the very top, then forward info, then text
+        assert!(
+            parsed.content.starts_with("> @bot:"),
+            "content should start with quote block: {}",
+            parsed.content
+        );
+        assert!(
+            parsed.content.contains("[Forwarded from News Channel]"),
+            "content should contain forward info"
+        );
+        let quote_pos = parsed.content.find("> @bot:").unwrap();
+        let fwd_pos = parsed.content.find("[Forwarded").unwrap();
+        let text_pos = parsed.content.find("look at this").unwrap();
+        assert!(
+            quote_pos < fwd_pos && fwd_pos < text_pos,
+            "order must be quote -> forward -> text"
+        );
+    }
+
     #[test]
     fn parse_update_message_includes_reply_context() {
         let ch = TelegramChannel::new("t".into(), vec!["*".into()], false);
@@ -4345,10 +4572,12 @@ mod tests {
     fn with_transcription_sets_config_when_enabled() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
 
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
         assert!(ch.transcription.is_some());
+        assert!(ch.transcription_manager.is_some());
     }
 
     #[test]
@@ -4357,6 +4586,7 @@ mod tests {
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
         assert!(ch.transcription.is_none());
+        assert!(ch.transcription_manager.is_none());
     }
 
     #[tokio::test]
@@ -4379,6 +4609,7 @@ mod tests {
     async fn try_parse_voice_message_skips_when_duration_exceeds_limit() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
         tc.max_duration_secs = 5;
 
         let ch =
@@ -4400,6 +4631,7 @@ mod tests {
     async fn try_parse_voice_message_rejects_unauthorized_sender_before_download() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
         tc.max_duration_secs = 120;
 
         let ch = TelegramChannel::new("token".into(), vec!["alice".into()], false)
@@ -4450,15 +4682,17 @@ mod tests {
             audio_data.len()
         );
 
-        // 2. Call transcribe_audio() — real Groq Whisper API
+        // 2. Call TranscriptionManager.transcribe() — real Groq Whisper API
         let config = crate::config::TranscriptionConfig {
             enabled: true,
             ..Default::default()
         };
-        let transcript: String =
-            crate::channels::transcription::transcribe_audio(audio_data, "hello.mp3", &config)
-                .await
-                .expect("transcribe_audio should succeed with valid GROQ_API_KEY");
+        let manager = crate::channels::transcription::TranscriptionManager::new(&config)
+            .expect("TranscriptionManager::new should succeed with valid GROQ_API_KEY");
+        let transcript: String = manager
+            .transcribe(&audio_data, "hello.mp3")
+            .await
+            .expect("transcribe should succeed with valid GROQ_API_KEY");
 
         // 3. Verify Whisper actually recognized "hello"
         assert!(
@@ -4878,8 +5112,8 @@ mod tests {
     /// guard in `agent/loop_.rs` will reject photo messages.
     #[test]
     fn groq_provider_rejects_photo_with_vision_error() {
-        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
         use crate::providers::Provider;
+        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
 
         let groq = OpenAiCompatibleProvider::new(
             "Groq",

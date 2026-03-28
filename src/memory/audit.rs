@@ -8,7 +8,7 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
