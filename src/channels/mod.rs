@@ -2749,7 +2749,7 @@ pub fn build_system_prompt_with_mode(
     );
     if !skills.is_empty() {
         prompt.push_str(
-            "Note: When executing scripts in skills, they often use relative paths. Either `cd` into the skill's `location` before executing, or resolve relative paths to absolute paths using the `location` and execute from the workspace root. \
+            "CRITICAL RULE: Relative skill script paths in the SKILL.md are relative to the skill root. You MUST always first `cd` into the skill's `location` before executing any shell commands from the skill instructions. \
              Never make up a script name; you must always follow the instructions and tool definitions provided within the skill file.\n\n",
         );
     }
