@@ -34,6 +34,15 @@ pub struct PrometheusObserver {
     hand_runs: IntCounterVec,
     hand_duration: HistogramVec,
     hand_findings: IntCounterVec,
+
+    // DORA
+    deployments_total: IntCounterVec,
+    deployment_lead_time: Histogram,
+    deployment_failure_rate: prometheus::Gauge,
+    recovery_time: Histogram,
+    mttr: prometheus::Gauge,
+    deploy_success_count: std::sync::atomic::AtomicU64,
+    deploy_failure_count: std::sync::atomic::AtomicU64,
 }
 
 impl PrometheusObserver {
@@ -182,6 +191,44 @@ impl PrometheusObserver {
         )
         .expect("valid metric");
 
+        let deployments_total = IntCounterVec::new(
+            prometheus::Opts::new("zeroclaw_deployments_total", "Total deployments by status"),
+            &["status"],
+        )
+        .expect("valid metric");
+
+        let deployment_lead_time = Histogram::with_opts(
+            HistogramOpts::new(
+                "zeroclaw_deployment_lead_time_seconds",
+                "Deployment lead time from commit to deploy in seconds",
+            )
+            .buckets(vec![
+                60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0, 14400.0, 43200.0, 86400.0,
+            ]),
+        )
+        .expect("valid metric");
+
+        let deployment_failure_rate = prometheus::Gauge::new(
+            "zeroclaw_deployment_failure_rate",
+            "Ratio of failed deployments to total deployments",
+        )
+        .expect("valid metric");
+
+        let recovery_time = Histogram::with_opts(
+            HistogramOpts::new(
+                "zeroclaw_recovery_time_seconds",
+                "Time to recover from a failed deployment in seconds",
+            )
+            .buckets(vec![
+                60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0, 14400.0, 43200.0, 86400.0,
+            ]),
+        )
+        .expect("valid metric");
+
+        let mttr =
+            prometheus::Gauge::new("zeroclaw_mttr_seconds", "Mean time to recovery in seconds")
+                .expect("valid metric");
+
         // Register all metrics
         registry.register(Box::new(agent_starts.clone())).ok();
         registry.register(Box::new(llm_requests.clone())).ok();
@@ -205,6 +252,15 @@ impl PrometheusObserver {
         registry.register(Box::new(hand_runs.clone())).ok();
         registry.register(Box::new(hand_duration.clone())).ok();
         registry.register(Box::new(hand_findings.clone())).ok();
+        registry.register(Box::new(deployments_total.clone())).ok();
+        registry
+            .register(Box::new(deployment_lead_time.clone()))
+            .ok();
+        registry
+            .register(Box::new(deployment_failure_rate.clone()))
+            .ok();
+        registry.register(Box::new(recovery_time.clone())).ok();
+        registry.register(Box::new(mttr.clone())).ok();
 
         Self {
             registry,
@@ -228,6 +284,13 @@ impl PrometheusObserver {
             hand_runs,
             hand_duration,
             hand_findings,
+            deployments_total,
+            deployment_lead_time,
+            deployment_failure_rate,
+            recovery_time,
+            mttr,
+            deploy_success_count: std::sync::atomic::AtomicU64::new(0),
+            deploy_failure_count: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -289,7 +352,9 @@ impl Observer for PrometheusObserver {
             }
             ObserverEvent::ToolCallStart { .. }
             | ObserverEvent::TurnComplete
-            | ObserverEvent::LlmRequest { .. } => {}
+            | ObserverEvent::LlmRequest { .. }
+            | ObserverEvent::DeploymentStarted { .. }
+            | ObserverEvent::RecoveryCompleted { .. } => {}
             ObserverEvent::ToolCall {
                 tool,
                 duration,
@@ -361,6 +426,34 @@ impl Observer for PrometheusObserver {
                     .with_label_values(&[hand_name.as_str()])
                     .observe(*duration_ms as f64 / 1000.0);
             }
+            ObserverEvent::DeploymentCompleted { .. } => {
+                self.deployments_total.with_label_values(&["success"]).inc();
+                let s = self
+                    .deploy_success_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                let f = self
+                    .deploy_failure_count
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let total = s + f;
+                if total > 0 {
+                    self.deployment_failure_rate.set(f as f64 / total as f64);
+                }
+            }
+            ObserverEvent::DeploymentFailed { .. } => {
+                self.deployments_total.with_label_values(&["failure"]).inc();
+                let f = self
+                    .deploy_failure_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                let s = self
+                    .deploy_success_count
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let total = s + f;
+                if total > 0 {
+                    self.deployment_failure_rate.set(f as f64 / total as f64);
+                }
+            }
         }
     }
 
@@ -400,6 +493,13 @@ impl Observer for PrometheusObserver {
                 self.hand_runs
                     .with_label_values(&[hand_name.as_str(), success_str])
                     .inc();
+            }
+            ObserverMetric::DeploymentLeadTime(d) => {
+                self.deployment_lead_time.observe(d.as_secs_f64());
+            }
+            ObserverMetric::RecoveryTime(d) => {
+                self.recovery_time.observe(d.as_secs_f64());
+                self.mttr.set(d.as_secs_f64());
             }
         }
     }
@@ -676,5 +776,72 @@ mod tests {
         // Token counters should not appear (no data recorded)
         assert!(!output.contains("zeroclaw_tokens_input_total{"));
         assert!(!output.contains("zeroclaw_tokens_output_total{"));
+    }
+
+    #[test]
+    fn dora_deployment_events_track_counters() {
+        let obs = PrometheusObserver::new();
+
+        obs.record_event(&ObserverEvent::DeploymentCompleted {
+            deploy_id: "d1".into(),
+            commit_sha: "abc123".into(),
+        });
+        obs.record_event(&ObserverEvent::DeploymentCompleted {
+            deploy_id: "d2".into(),
+            commit_sha: "def456".into(),
+        });
+        obs.record_event(&ObserverEvent::DeploymentFailed {
+            deploy_id: "d3".into(),
+            reason: "timeout".into(),
+        });
+
+        let output = obs.encode();
+        assert!(output.contains(r#"zeroclaw_deployments_total{status="success"} 2"#));
+        assert!(output.contains(r#"zeroclaw_deployments_total{status="failure"} 1"#));
+    }
+
+    #[test]
+    fn dora_failure_rate_gauge_updates() {
+        let obs = PrometheusObserver::new();
+
+        obs.record_event(&ObserverEvent::DeploymentCompleted {
+            deploy_id: "d1".into(),
+            commit_sha: "abc".into(),
+        });
+        obs.record_event(&ObserverEvent::DeploymentFailed {
+            deploy_id: "d2".into(),
+            reason: "error".into(),
+        });
+
+        let output = obs.encode();
+        // 1 failure out of 2 total = 0.5
+        assert!(output.contains("zeroclaw_deployment_failure_rate 0.5"));
+    }
+
+    #[test]
+    fn dora_lead_time_and_recovery_metrics() {
+        let obs = PrometheusObserver::new();
+
+        obs.record_metric(&ObserverMetric::DeploymentLeadTime(Duration::from_secs(
+            3600,
+        )));
+        obs.record_metric(&ObserverMetric::RecoveryTime(Duration::from_secs(600)));
+
+        let output = obs.encode();
+        assert!(output.contains("zeroclaw_deployment_lead_time_seconds"));
+        assert!(output.contains("zeroclaw_recovery_time_seconds"));
+        assert!(output.contains("zeroclaw_mttr_seconds 600"));
+    }
+
+    #[test]
+    fn dora_started_and_recovery_events_no_panic() {
+        let obs = PrometheusObserver::new();
+
+        obs.record_event(&ObserverEvent::DeploymentStarted {
+            deploy_id: "d1".into(),
+        });
+        obs.record_event(&ObserverEvent::RecoveryCompleted {
+            deploy_id: "d1".into(),
+        });
     }
 }

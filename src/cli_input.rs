@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::io::{BufRead, Write};
 
 #[derive(Debug, Clone, Default)]
@@ -87,7 +87,7 @@ fn trim_trailing_line_ending(input: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::{trim_trailing_line_ending, Input};
+    use super::{Input, trim_trailing_line_ending};
     use anyhow::Result;
     use std::io::Cursor;
 

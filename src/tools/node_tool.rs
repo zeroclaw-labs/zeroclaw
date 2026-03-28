@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use tokio::time::Duration;
 
 use crate::gateway::nodes::{NodeInvocation, NodeRegistry};
+use crate::tools::node_capabilities::requires_approval;
 use crate::tools::traits::{Tool, ToolResult};
 
 /// Default timeout for node invocations (30 seconds).
@@ -74,6 +75,24 @@ impl Tool for NodeTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // Check if this capability requires approval
+        if requires_approval(&self.capability_name) {
+            let approved = args
+                .get("approved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !approved {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Capability '{}' requires approval. Set approved=true to proceed.",
+                        self.capability_name
+                    )),
+                });
+            }
+        }
+
         // Strip the `approved` field (same as MCP tools)
         let args = match args {
             serde_json::Value::Object(mut map) => {
@@ -249,5 +268,36 @@ mod tests {
         assert_eq!(spec.name, "node:sensor-1:temp.read");
         assert_eq!(spec.description, "Read temperature");
         assert!(spec.parameters["properties"]["unit"]["type"] == "string");
+    }
+
+    #[tokio::test]
+    async fn node_tool_rejects_unapproved_sensitive_operation() {
+        let registry = Arc::new(NodeRegistry::new(10));
+        let tool = NodeTool::new(
+            "phone-1".to_string(),
+            "camera.snap".to_string(),
+            "Take a photo".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "approved": { "type": "boolean" }
+                },
+                "required": ["approved"]
+            }),
+            registry,
+        );
+
+        // Without approved field
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("requires approval"));
+
+        // With approved=false
+        let result = tool
+            .execute(serde_json::json!({"approved": false}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.as_ref().unwrap().contains("requires approval"));
     }
 }
