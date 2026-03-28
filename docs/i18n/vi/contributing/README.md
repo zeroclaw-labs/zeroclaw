@@ -4,7 +4,7 @@ Dành cho contributor, reviewer và maintainer.
 
 ## Chính sách cốt lõi
 
-- Hướng dẫn đóng góp: [CONTRIBUTING.md](../../../../CONTRIBUTING.md)
+- Hướng dẫn đóng góp: [../../../CONTRIBUTING.md](../../../CONTRIBUTING.md)
 - Quy tắc quy trình PR: [../pr-workflow.md](../pr-workflow.md)
 - Sổ tay reviewer: [../reviewer-playbook.md](../reviewer-playbook.md)
 - Bản đồ CI và quyền sở hữu: [../ci-map.md](../ci-map.md)

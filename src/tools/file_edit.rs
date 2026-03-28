@@ -103,7 +103,7 @@ impl Tool for FileEditTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_tool_path(path);
 
         // ── 5. Canonicalize parent ─────────────────────────────────
         let Some(parent) = full_path.parent() else {
@@ -146,6 +146,17 @@ impl Tool for FileEditTool {
         };
 
         let resolved_target = resolved_parent.join(file_name);
+
+        if self.security.is_runtime_config_path(&resolved_target) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(
+                    self.security
+                        .runtime_config_violation_message(&resolved_target),
+                ),
+            });
+        }
 
         // ── 7. Symlink check ───────────────────────────────────────
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
@@ -348,11 +359,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("matches 2 times"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("matches 2 times")
+        );
 
         // File should be unchanged
         let content = tokio::fs::read_to_string(dir.join("test.txt"))
@@ -443,11 +456,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("must not be empty"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("must not be empty")
+        );
 
         let content = tokio::fs::read_to_string(dir.join("test.txt"))
             .await
@@ -495,6 +510,42 @@ mod tests {
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
     }
 
+    #[tokio::test]
+    async fn file_edit_normalizes_workspace_prefixed_relative_path() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_edit_workspace_prefixed");
+        let workspace = root.join("workspace");
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(workspace.join("nested"))
+            .await
+            .unwrap();
+        tokio::fs::write(workspace.join("nested/target.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(workspace.clone()));
+        let workspace_prefixed = workspace
+            .strip_prefix(std::path::Path::new("/"))
+            .unwrap()
+            .join("nested/target.txt");
+        let result = tool
+            .execute(json!({
+                "path": workspace_prefixed.to_string_lossy(),
+                "old_string": "world",
+                "new_string": "zeroclaw"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        let content = tokio::fs::read_to_string(workspace.join("nested/target.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "hello zeroclaw");
+        assert!(!workspace.join(workspace_prefixed).exists());
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn file_edit_blocks_symlink_escape() {
@@ -521,11 +572,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("escapes workspace"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("escapes workspace")
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
@@ -626,11 +679,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Rate limit exceeded")
+        );
 
         let content = tokio::fs::read_to_string(dir.join("test.txt"))
             .await
@@ -657,11 +712,53 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Failed to read file"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to read file")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_absolute_path_in_workspace() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_abs_path");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        // Canonicalize so the workspace dir matches resolved paths on macOS (/private/var/…)
+        let dir = tokio::fs::canonicalize(&dir).await.unwrap();
+
+        tokio::fs::write(dir.join("target.txt"), "old content")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+
+        // Pass an absolute path that is within the workspace
+        let abs_path = dir.join("target.txt");
+        let result = tool
+            .execute(json!({
+                "path": abs_path.to_string_lossy().to_string(),
+                "old_string": "old content",
+                "new_string": "new content"
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "editing via absolute workspace path should succeed, error: {:?}",
+            result.error
+        );
+
+        let content = tokio::fs::read_to_string(dir.join("target.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "new content");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -685,5 +782,45 @@ mod tests {
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_blocks_runtime_config_path() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_edit_runtime_config");
+        let workspace = root.join("workspace");
+        let config_path = root.join("config.toml");
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(&config_path, "always_ask = [\"cron_add\"]")
+            .await
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            workspace_only: false,
+            allowed_roots: vec![root.clone()],
+            forbidden_paths: vec![],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileEditTool::new(security);
+        let result = tool
+            .execute(json!({
+                "path": config_path.to_string_lossy(),
+                "old_string": "always_ask",
+                "new_string": "auto_approve"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("runtime config/state file")
+        );
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

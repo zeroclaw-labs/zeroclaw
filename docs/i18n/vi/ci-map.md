@@ -2,7 +2,7 @@
 
 Tài liệu này giải thích từng GitHub workflow làm gì, khi nào chạy và liệu nó có nên chặn merge hay không.
 
-Để biết hành vi phân phối theo từng sự kiện qua PR, merge, push và release, xem [`.github/workflows/master-branch-flow.md`](../../../.github/workflows/master-branch-flow.md).
+Để biết hành vi phân phối theo từng sự kiện qua PR, merge, push và release, xem [`.github/workflows/master-branch-flow.md`](../../.github/workflows/master-branch-flow.md).
 
 ## Chặn merge và Tùy chọn
 

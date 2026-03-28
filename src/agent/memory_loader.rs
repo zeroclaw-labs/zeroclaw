@@ -1,11 +1,15 @@
-use crate::memory::{self, Memory};
+use crate::memory::{self, Memory, decay};
 use async_trait::async_trait;
 use std::fmt::Write;
 
 #[async_trait]
 pub trait MemoryLoader: Send + Sync {
-    async fn load_context(&self, memory: &dyn Memory, user_message: &str)
-        -> anyhow::Result<String>;
+    async fn load_context(
+        &self,
+        memory: &dyn Memory,
+        user_message: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<String>;
 }
 
 pub struct DefaultMemoryLoader {
@@ -37,15 +41,24 @@ impl MemoryLoader for DefaultMemoryLoader {
         &self,
         memory: &dyn Memory,
         user_message: &str,
+        session_id: Option<&str>,
     ) -> anyhow::Result<String> {
-        let entries = memory.recall(user_message, self.limit, None).await?;
+        let mut entries = memory
+            .recall(user_message, self.limit, session_id, None, None)
+            .await?;
         if entries.is_empty() {
             return Ok(String::new());
         }
 
+        // Apply time decay: older non-Core memories score lower
+        decay::apply_time_decay(&mut entries, decay::DEFAULT_HALF_LIFE_DAYS);
+
         let mut context = String::from("[Memory context]\n");
         for entry in entries {
             if memory::is_assistant_autosave_key(&entry.key) {
+                continue;
+            }
+            if memory::should_skip_autosave_content(&entry.content) {
                 continue;
             }
             if let Some(score) = entry.score {
@@ -61,7 +74,7 @@ impl MemoryLoader for DefaultMemoryLoader {
             return Ok(String::new());
         }
 
-        context.push('\n');
+        context.push_str("[/Memory context]\n\n");
         Ok(context)
     }
 }
@@ -94,6 +107,8 @@ mod tests {
             _query: &str,
             limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             if limit == 0 {
                 return Ok(vec![]);
@@ -106,6 +121,9 @@ mod tests {
                 timestamp: "now".into(),
                 session_id: None,
                 score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
             }])
         }
 
@@ -155,6 +173,8 @@ mod tests {
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(self.entries.as_ref().clone())
         }
@@ -191,7 +211,10 @@ mod tests {
     #[tokio::test]
     async fn default_loader_formats_context() {
         let loader = DefaultMemoryLoader::default();
-        let context = loader.load_context(&MockMemory, "hello").await.unwrap();
+        let context = loader
+            .load_context(&MockMemory, "hello", None)
+            .await
+            .unwrap();
         assert!(context.contains("[Memory context]"));
         assert!(context.contains("- k: v"));
     }
@@ -209,6 +232,9 @@ mod tests {
                     timestamp: "now".into(),
                     session_id: None,
                     score: Some(0.95),
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
                 },
                 MemoryEntry {
                     id: "2".into(),
@@ -218,11 +244,17 @@ mod tests {
                     timestamp: "now".into(),
                     session_id: None,
                     score: Some(0.9),
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
                 },
             ]),
         };
 
-        let context = loader.load_context(&memory, "answer style").await.unwrap();
+        let context = loader
+            .load_context(&memory, "answer style", None)
+            .await
+            .unwrap();
         assert!(context.contains("user_fact"));
         assert!(!context.contains("assistant_resp_legacy"));
         assert!(!context.contains("fabricated detail"));

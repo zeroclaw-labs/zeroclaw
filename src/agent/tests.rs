@@ -1282,8 +1282,12 @@ fn xml_dispatcher_generates_tool_instructions() {
 
     assert!(instructions.contains("## Tool Use Protocol"));
     assert!(instructions.contains("<tool_call>"));
-    assert!(instructions.contains("echo"));
-    assert!(instructions.contains("Echoes the input"));
+    // Tool listing is handled by ToolsSection in prompt.rs, not by the
+    // dispatcher.  prompt_instructions() must only emit the protocol envelope.
+    assert!(
+        !instructions.contains("echo"),
+        "dispatcher should not duplicate tool listing"
+    );
 }
 
 #[test]

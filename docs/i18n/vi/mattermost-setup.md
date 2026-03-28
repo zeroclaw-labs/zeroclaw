@@ -4,14 +4,14 @@ ZeroClaw hỗ trợ tích hợp native với Mattermost thông qua REST API v4. 
 
 ## Điều kiện tiên quyết
 
-1. **Mattermost Server**: Một instance Mattermost đang chạy (self-hosted hoặc cloud).
-2. **Tài khoản Bot**:
+1.  **Mattermost Server**: Một instance Mattermost đang chạy (self-hosted hoặc cloud).
+2.  **Tài khoản Bot**:
     - Vào **Main Menu > Integrations > Bot Accounts**.
     - Nhấn **Add Bot Account**.
     - Đặt username (ví dụ: `zeroclaw-bot`).
     - Bật quyền **post:all** và **channel:read** (hoặc các scope phù hợp).
     - Lưu **Access Token**.
-3. **Channel ID**:
+3.  **Channel ID**:
     - Mở channel Mattermost mà bạn muốn bot theo dõi.
     - Nhấn vào header channel và chọn **View Info**.
     - Sao chép **ID** (ví dụ: `7j8k9l...`).

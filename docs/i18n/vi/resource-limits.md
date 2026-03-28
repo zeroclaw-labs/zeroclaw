@@ -6,7 +6,6 @@
 > Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Vấn đề
-
 ZeroClaw có rate limiting (20 actions/hour) nhưng chưa có giới hạn tài nguyên. Một agent bị lỗi lặp vòng có thể:
 - Làm cạn kiệt bộ nhớ khả dụng
 - Quay CPU liên tục ở 100%
@@ -17,7 +16,6 @@ ZeroClaw có rate limiting (20 actions/hour) nhưng chưa có giới hạn tài 
 ## Các giải pháp đề xuất
 
 ### Tùy chọn 1: cgroups v2 (Linux, khuyến nghị)
-
 Tự động tạo cgroup cho zeroclaw với các giới hạn.
 
 ```bash
@@ -31,7 +29,6 @@ TasksMax=100
 ```
 
 ### Tùy chọn 2: phát hiện deadlock với tokio::task
-
 Ngăn task starvation.
 
 ```rust
@@ -51,7 +48,6 @@ where
 ```
 
 ### Tùy chọn 3: memory monitoring
-
 Theo dõi sử dụng heap và kill nếu vượt giới hạn.
 
 ```rust

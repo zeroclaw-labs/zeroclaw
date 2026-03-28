@@ -11,22 +11,51 @@ use uuid::Uuid;
 pub struct NextcloudTalkChannel {
     base_url: String,
     app_token: String,
+    bot_name: String,
     allowed_users: Vec<String>,
     client: reqwest::Client,
 }
 
 impl NextcloudTalkChannel {
-    pub fn new(base_url: String, app_token: String, allowed_users: Vec<String>) -> Self {
+    pub fn new(
+        base_url: String,
+        app_token: String,
+        bot_name: String,
+        allowed_users: Vec<String>,
+    ) -> Self {
+        Self::new_with_proxy(base_url, app_token, bot_name, allowed_users, None)
+    }
+
+    pub fn new_with_proxy(
+        base_url: String,
+        app_token: String,
+        bot_name: String,
+        allowed_users: Vec<String>,
+        proxy_url: Option<String>,
+    ) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             app_token,
+            bot_name: bot_name.to_ascii_lowercase(),
             allowed_users,
-            client: reqwest::Client::new(),
+            client: crate::config::build_channel_proxy_client(
+                "channel.nextcloud_talk",
+                proxy_url.as_deref(),
+            ),
         }
     }
 
     fn is_user_allowed(&self, actor_id: &str) -> bool {
         self.allowed_users.iter().any(|u| u == "*" || u == actor_id)
+    }
+
+    /// Returns true if the given name/id belongs to this bot itself.
+    ///
+    /// Prevents feedback loops where ZeroClaw reacts to its own messages.
+    fn is_bot_name(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        // Match the configured bot name, or the known bot name "zeroclaw".
+        (!self.bot_name.is_empty() && name == self.bot_name) || name == "zeroclaw"
     }
 
     fn now_unix_secs() -> u64 {
@@ -62,23 +91,175 @@ impl NextcloudTalkChannel {
 
     /// Parse a Nextcloud Talk webhook payload into channel messages.
     ///
-    /// Relevant payload fields:
-    /// - `type` (accepts `message` or `Create`)
-    /// - `object.token` (room token for reply routing)
-    /// - `message.actorType`, `message.actorId`, `message.message`, `message.timestamp`
+    /// Two payload formats are supported:
+    ///
+    /// **Format A — legacy/custom** (`type: "message"`):
+    /// ```json
+    /// {
+    ///   "type": "message",
+    ///   "object": { "token": "<room>" },
+    ///   "message": { "actorId": "...", "message": "...", ... }
+    /// }
+    /// ```
+    ///
+    /// **Format B — Activity Streams 2.0** (`type: "Create"`):
+    /// This is the format actually sent by Nextcloud Talk bot webhooks.
+    /// ```json
+    /// {
+    ///   "type": "Create",
+    ///   "actor": { "type": "Person", "id": "users/alice", "name": "Alice" },
+    ///   "object": { "type": "Note", "id": "177", "content": "{\"message\":\"hi\",\"parameters\":[]}", "mediaType": "text/markdown" },
+    ///   "target": { "type": "Collection", "id": "<room_token>", "name": "Room Name" }
+    /// }
+    /// ```
     pub fn parse_webhook_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+        let messages = Vec::new();
+
+        let event_type = match payload.get("type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return messages,
+        };
+
+        // Activity Streams 2.0 format sent by Nextcloud Talk bot webhooks.
+        if event_type.eq_ignore_ascii_case("create") {
+            return self.parse_as2_payload(payload);
+        }
+
+        // Legacy/custom format.
+        if !event_type.eq_ignore_ascii_case("message") {
+            tracing::debug!("Nextcloud Talk: skipping non-message event: {event_type}");
+            return messages;
+        }
+
+        self.parse_message_payload(payload)
+    }
+
+    /// Parse Activity Streams 2.0 `Create` payload (real Nextcloud Talk bot webhook format).
+    fn parse_as2_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
-        if let Some(event_type) = payload.get("type").and_then(|v| v.as_str()) {
-            // Nextcloud Talk bot webhooks send "Create" for new chat messages,
-            // but some setups may use "message". Accept both.
-            let is_message_event = event_type.eq_ignore_ascii_case("message")
-                || event_type.eq_ignore_ascii_case("create");
-            if !is_message_event {
-                tracing::debug!("Nextcloud Talk: skipping non-message event: {event_type}");
-                return messages;
-            }
+        let obj = match payload.get("object") {
+            Some(o) => o,
+            None => return messages,
+        };
+
+        // Only handle Note objects (= chat messages). Ignore reactions, etc.
+        let object_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if !object_type.eq_ignore_ascii_case("note") {
+            tracing::debug!("Nextcloud Talk: skipping AS2 Create with object.type={object_type}");
+            return messages;
         }
+
+        // Room token is in target.id.
+        let room_token = payload
+            .get("target")
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+
+        let Some(room_token) = room_token else {
+            tracing::warn!("Nextcloud Talk: missing target.id (room token) in AS2 payload");
+            return messages;
+        };
+
+        // Actor — skip bot-originated messages to prevent feedback loops.
+        let actor = payload.get("actor").cloned().unwrap_or_default();
+        let actor_type = actor.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if actor_type.eq_ignore_ascii_case("application") {
+            tracing::debug!(
+                "Nextcloud Talk: skipping bot-originated AS2 message (type=Application)"
+            );
+            return messages;
+        }
+
+        // actor.id is "users/<id>" or "bots/<id>" — strip the prefix.
+        let actor_id = actor
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|id| {
+                id.trim_start_matches("users/")
+                    .trim_start_matches("bots/")
+                    .trim()
+            })
+            .filter(|id| !id.is_empty());
+
+        let Some(actor_id) = actor_id else {
+            tracing::warn!("Nextcloud Talk: missing actor.id in AS2 payload");
+            return messages;
+        };
+
+        // Also skip by actor.id prefix or known bot names — Nextcloud does not always
+        // set actor.type="Application" reliably for bot-sent messages.
+        let raw_actor_id = actor.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if raw_actor_id.starts_with("bots/") {
+            tracing::debug!(
+                "Nextcloud Talk: skipping bot-originated AS2 message (id prefix=bots/)"
+            );
+            return messages;
+        }
+        let actor_name = actor
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if self.is_bot_name(&actor_name) {
+            tracing::debug!(
+                "Nextcloud Talk: skipping bot-originated AS2 message (name={actor_name})"
+            );
+            return messages;
+        }
+
+        if !self.is_user_allowed(actor_id) {
+            tracing::warn!(
+                "Nextcloud Talk: ignoring message from unauthorized actor: {actor_id}. \
+                Add to channels.nextcloud_talk.allowed_users in config.toml, \
+                or run `zeroclaw onboard --channels-only` to configure interactively."
+            );
+            return messages;
+        }
+
+        // Message text is JSON-encoded inside object.content.
+        // e.g. content = "{\"message\":\"hello\",\"parameters\":[]}"
+        let content = obj
+            .get("content")
+            .and_then(|v| v.as_str())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+            .and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::trim)
+                    .map(str::to_string)
+            })
+            .filter(|s| !s.is_empty());
+
+        let Some(content) = content else {
+            tracing::debug!("Nextcloud Talk: empty or unparseable AS2 message content");
+            return messages;
+        };
+
+        let message_id =
+            Self::value_to_string(obj.get("id")).unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        messages.push(ChannelMessage {
+            id: message_id,
+            reply_target: room_token.to_string(),
+            sender: actor_id.to_string(),
+            content,
+            channel: "nextcloud_talk".to_string(),
+            timestamp: Self::now_unix_secs(),
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            observe_group: false,
+        });
+
+        messages
+    }
+
+    /// Parse legacy `type: "message"` payload format.
+    fn parse_message_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
+        let mut messages = Vec::new();
 
         let Some(message_obj) = payload.get("message") else {
             return messages;
@@ -104,8 +285,12 @@ impl NextcloudTalkChannel {
             .unwrap_or("");
 
         // Ignore bot-originated messages to prevent feedback loops.
-        if actor_type.eq_ignore_ascii_case("bots") {
-            tracing::debug!("Nextcloud Talk: skipping bot-originated message");
+        // Nextcloud Talk uses "bots" or "application" depending on version/context.
+        if actor_type.eq_ignore_ascii_case("bots") || actor_type.eq_ignore_ascii_case("application")
+        {
+            tracing::debug!(
+                "Nextcloud Talk: skipping bot-originated message (actorType={actor_type})"
+            );
             return messages;
         }
 
@@ -120,6 +305,12 @@ impl NextcloudTalkChannel {
             tracing::warn!("Nextcloud Talk: missing actorId in webhook payload");
             return messages;
         };
+
+        // Also skip by known bot names in case actorType is not set reliably.
+        if self.is_bot_name(actor_id) {
+            tracing::debug!("Nextcloud Talk: skipping bot-originated message (actorId={actor_id})");
+            return messages;
+        }
 
         if !self.is_user_allowed(actor_id) {
             tracing::warn!(
@@ -172,6 +363,9 @@ impl NextcloudTalkChannel {
             channel: "nextcloud_talk".to_string(),
             timestamp,
             thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            observe_group: false,
         });
 
         messages
@@ -284,6 +478,7 @@ mod tests {
         NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            "zeroclaw".into(),
             vec!["user_a".into()],
         )
     }
@@ -303,6 +498,7 @@ mod tests {
         let wildcard = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            "zeroclaw".into(),
             vec!["*".into()],
         );
         assert!(wildcard.is_user_allowed("any_user"));
@@ -343,33 +539,156 @@ mod tests {
     }
 
     #[test]
-    fn nextcloud_talk_parse_create_event_type() {
-        let channel = make_channel();
+    fn nextcloud_talk_parse_as2_create_payload() {
+        let channel = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            "zeroclaw".into(),
+            vec!["*".into()],
+        );
+        // Real payload format sent by Nextcloud Talk bot webhooks.
         let payload = serde_json::json!({
             "type": "Create",
-            "object": {
-                "id": "42",
-                "token": "room-token-123",
-                "name": "Team Room",
-                "type": "room"
+            "actor": {
+                "type": "Person",
+                "id": "users/user_a",
+                "name": "User A",
+                "talkParticipantType": "1"
             },
-            "message": {
-                "id": 88,
-                "token": "room-token-123",
-                "actorType": "users",
-                "actorId": "user_a",
-                "actorDisplayName": "User A",
-                "timestamp": 1_735_701_300,
-                "messageType": "comment",
-                "systemMessage": "",
-                "message": "Hello via Create event"
+            "object": {
+                "type": "Note",
+                "id": "177",
+                "name": "message",
+                "content": "{\"message\":\"hallo, bist du da?\",\"parameters\":[]}",
+                "mediaType": "text/markdown"
+            },
+            "target": {
+                "type": "Collection",
+                "id": "room-token-123",
+                "name": "HOME"
             }
         });
 
         let messages = channel.parse_webhook_payload(&payload);
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].id, "88");
-        assert_eq!(messages[0].content, "Hello via Create event");
+        assert_eq!(messages[0].reply_target, "room-token-123");
+        assert_eq!(messages[0].sender, "user_a");
+        assert_eq!(messages[0].content, "hallo, bist du da?");
+        assert_eq!(messages[0].channel, "nextcloud_talk");
+    }
+
+    #[test]
+    fn nextcloud_talk_parse_as2_skips_bot_originated() {
+        let channel = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            "zeroclaw".into(),
+            vec!["*".into()],
+        );
+        let payload = serde_json::json!({
+            "type": "Create",
+            "actor": {
+                "type": "Application",
+                "id": "bots/zeroclaw",
+                "name": "zeroclaw"
+            },
+            "object": {
+                "type": "Note",
+                "id": "178",
+                "content": "{\"message\":\"I am the bot\",\"parameters\":[]}",
+                "mediaType": "text/markdown"
+            },
+            "target": {
+                "type": "Collection",
+                "id": "room-token-123",
+                "name": "HOME"
+            }
+        });
+
+        let messages = channel.parse_webhook_payload(&payload);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn nextcloud_talk_parse_as2_skips_bot_by_name() {
+        // Even if actor.type is not "Application", messages from the configured bot
+        // name must be dropped to prevent feedback loops.
+        let channel = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            "zeroclaw".into(),
+            vec!["*".into()],
+        );
+        let payload = serde_json::json!({
+            "type": "Create",
+            "actor": {
+                "type": "Person",        // <- wrong type, but name matches
+                "id": "users/zeroclaw",
+                "name": "zeroclaw"
+            },
+            "object": {
+                "type": "Note",
+                "id": "999",
+                "content": "{\"message\":\"I am the bot\",\"parameters\":[]}",
+                "mediaType": "text/markdown"
+            },
+            "target": {
+                "type": "Collection",
+                "id": "room-token-123",
+                "name": "HOME"
+            }
+        });
+
+        let messages = channel.parse_webhook_payload(&payload);
+        assert!(
+            messages.is_empty(),
+            "bot message should be filtered even if actor.type is wrong"
+        );
+    }
+
+    #[test]
+    fn nextcloud_talk_parse_message_skips_application_actor_type() {
+        // parse_message_payload (legacy format) should also drop actorType=application.
+        let channel = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            "zeroclaw".into(),
+            vec!["*".into()],
+        );
+        let payload = serde_json::json!({
+            "type": "message",
+            "object": {"token": "room-token-123"},
+            "message": {
+                "actorType": "application",
+                "actorId": "zeroclaw",
+                "message": "Self message"
+            }
+        });
+
+        let messages = channel.parse_webhook_payload(&payload);
+        assert!(
+            messages.is_empty(),
+            "application actorType must be filtered in legacy format"
+        );
+    }
+
+    #[test]
+    fn nextcloud_talk_parse_as2_skips_non_note_objects() {
+        let channel = NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            "app-token".into(),
+            "zeroclaw".into(),
+            vec!["*".into()],
+        );
+        let payload = serde_json::json!({
+            "type": "Create",
+            "actor": { "type": "Person", "id": "users/user_a" },
+            "object": { "type": "Reaction", "id": "5" },
+            "target": { "type": "Collection", "id": "room-token-123" }
+        });
+
+        let messages = channel.parse_webhook_payload(&payload);
+        assert!(messages.is_empty());
     }
 
     #[test]
@@ -394,6 +713,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            "zeroclaw".into(),
             vec!["*".into()],
         );
         let payload = serde_json::json!({
@@ -432,6 +752,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            "zeroclaw".into(),
             vec!["*".into()],
         );
         let payload = serde_json::json!({
@@ -455,6 +776,7 @@ mod tests {
         let channel = NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            "zeroclaw".into(),
             vec!["*".into()],
         );
         let payload = serde_json::json!({

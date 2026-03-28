@@ -31,20 +31,20 @@ Nếu đây là lần cài đặt đầu tiên, hãy bắt đầu từ [one-clic
 zeroclaw status
 ```
 
-1. Kiểm tra chẩn đoán:
+2. Kiểm tra chẩn đoán:
 
 ```bash
 zeroclaw doctor
 zeroclaw channel doctor
 ```
 
-1. Khởi động runtime:
+3. Khởi động runtime:
 
 ```bash
 zeroclaw daemon
 ```
 
-1. Để chạy như user session service liên tục:
+4. Để chạy như user session service liên tục:
 
 ```bash
 zeroclaw service install
@@ -84,22 +84,22 @@ zeroclaw doctor
 zeroclaw channel doctor
 ```
 
-1. Kiểm tra trạng thái service:
+2. Kiểm tra trạng thái service:
 
 ```bash
 zeroclaw service status
 ```
 
-1. Nếu service không khoẻ, khởi động lại sạch:
+3. Nếu service không khoẻ, khởi động lại sạch:
 
 ```bash
 zeroclaw service stop
 zeroclaw service start
 ```
 
-1. Nếu các channel vẫn thất bại, kiểm tra allowlist và thông tin xác thực trong `~/.zeroclaw/config.toml`.
+4. Nếu các channel vẫn thất bại, kiểm tra allowlist và thông tin xác thực trong `~/.zeroclaw/config.toml`.
 
-2. Nếu liên quan đến gateway, kiểm tra cài đặt bind/auth (`[gateway]`) và khả năng tiếp cận cục bộ.
+5. Nếu liên quan đến gateway, kiểm tra cài đặt bind/auth (`[gateway]`) và khả năng tiếp cận cục bộ.
 
 ## Quy trình Thay đổi An toàn
 

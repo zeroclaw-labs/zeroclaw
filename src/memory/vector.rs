@@ -126,6 +126,7 @@ pub fn hybrid_merge(
         b.final_score
             .partial_cmp(&a.final_score)
             .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
     });
     results.truncate(limit);
     results
