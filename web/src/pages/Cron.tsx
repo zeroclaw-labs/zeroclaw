@@ -293,7 +293,7 @@ export default function Cron() {
   }
 
   return (
-    <div className="p-6 space-y-6 animate-fade-in">
+    <div className="flex flex-col h-full p-6 gap-6 animate-fade-in overflow-hidden">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -415,7 +415,7 @@ export default function Cron() {
           <p style={{ color: 'var(--pc-text-muted)' }}>{t('cron.empty')}</p>
         </div>
       ) : (
-        <div className="card overflow-x-auto rounded-2xl">
+        <div className="card overflow-auto rounded-2xl flex-1 min-h-0">
           <table className="table-electric">
             <thead>
               <tr>

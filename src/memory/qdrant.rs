@@ -373,6 +373,9 @@ impl Memory for QdrantMemory {
                     timestamp: payload.timestamp,
                     session_id: payload.session_id,
                     score: Some(point.score),
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
                 })
             })
             .collect();
@@ -437,6 +440,9 @@ impl Memory for QdrantMemory {
                 timestamp: payload.timestamp,
                 session_id: payload.session_id,
                 score: None,
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
             })
         });
 
@@ -514,6 +520,9 @@ impl Memory for QdrantMemory {
                     timestamp: payload.timestamp,
                     session_id: payload.session_id,
                     score: None,
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
                 })
             })
             .collect();
