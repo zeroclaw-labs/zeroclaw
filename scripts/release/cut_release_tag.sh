@@ -77,7 +77,9 @@ echo "Created annotated tag: $TAG"
 if [[ "$PUSH_TAG" == "true" ]]; then
   git push origin "$TAG"
   echo "Pushed tag to origin: $TAG"
-  echo "GitHub release pipeline will run via .github/workflows/pub-release.yml"
+  echo "Release Stable workflow will auto-trigger via tag push."
+  echo "Monitor: gh workflow view 'Release Stable' --web"
 else
   echo "Next step: git push origin $TAG"
+  echo "This will auto-trigger the Release Stable workflow (builds, Docker, crates.io, website, Scoop, AUR, Homebrew, tweet)."
 fi

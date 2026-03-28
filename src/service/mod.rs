@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -137,6 +137,9 @@ pub fn handle_command(
         crate::ServiceCommands::Restart => restart(config, init_system),
         crate::ServiceCommands::Status => status(config, init_system),
         crate::ServiceCommands::Uninstall => uninstall(config, init_system),
+        crate::ServiceCommands::Logs { lines, follow } => {
+            logs(config, init_system, *lines, *follow)
+        }
     }
 }
 
@@ -345,6 +348,182 @@ fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             println!("Unit: /etc/init.d/zeroclaw");
         }
         InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+    }
+    Ok(())
+}
+
+fn logs(config: &Config, init_system: InitSystem, lines: usize, follow: bool) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        return logs_macos(config, lines, follow);
+    }
+    if cfg!(target_os = "linux") {
+        let resolved = init_system.resolve()?;
+        return logs_linux(config, resolved, lines, follow);
+    }
+    if cfg!(target_os = "windows") {
+        return logs_windows(config, lines, follow);
+    }
+    anyhow::bail!("Service log viewing is supported on macOS, Linux, and Windows only")
+}
+
+fn logs_macos(config: &Config, lines: usize, follow: bool) -> Result<()> {
+    // Try the launchd log files first (StandardOutPath / StandardErrorPath from the plist).
+    // These are the most reliable source since they capture all daemon output.
+    let exe = std::env::current_exe().ok();
+    let homebrew_var_dir = exe.as_ref().and_then(|e| detect_homebrew_var_dir(e));
+    let logs_dir = if let Some(ref var_dir) = homebrew_var_dir {
+        var_dir.join("logs")
+    } else {
+        config
+            .config_path
+            .parent()
+            .map_or_else(|| PathBuf::from("."), PathBuf::from)
+            .join("logs")
+    };
+
+    let stderr_log = logs_dir.join("daemon.stderr.log");
+    let stdout_log = logs_dir.join("daemon.stdout.log");
+
+    // Prefer stderr log (most informative), fall back to stdout
+    let log_file = if stderr_log.exists() {
+        stderr_log
+    } else if stdout_log.exists() {
+        stdout_log
+    } else {
+        bail!(
+            "No log files found in {}. Is the service installed?",
+            logs_dir.display()
+        );
+    };
+
+    if follow {
+        let status = Command::new("tail")
+            .args(["-n", &lines.to_string(), "-f"])
+            .arg(&log_file)
+            .status()
+            .context("Failed to run tail")?;
+        if !status.success() {
+            bail!("tail exited with non-zero status");
+        }
+    } else {
+        let status = Command::new("tail")
+            .args(["-n", &lines.to_string()])
+            .arg(&log_file)
+            .status()
+            .context("Failed to run tail")?;
+        if !status.success() {
+            bail!("tail exited with non-zero status");
+        }
+    }
+    Ok(())
+}
+
+fn logs_linux(config: &Config, init_system: InitSystem, lines: usize, follow: bool) -> Result<()> {
+    match init_system {
+        InitSystem::Systemd => {
+            let mut args = vec![
+                "--user".to_string(),
+                "-u".to_string(),
+                "zeroclaw.service".to_string(),
+                "-n".to_string(),
+                lines.to_string(),
+                "--no-pager".to_string(),
+            ];
+            if follow {
+                args.push("-f".to_string());
+            }
+            let status = Command::new("journalctl")
+                .args(&args)
+                .status()
+                .context("Failed to run journalctl")?;
+            if !status.success() {
+                bail!("journalctl exited with non-zero status");
+            }
+        }
+        InitSystem::Openrc => {
+            // OpenRC logs go to /var/log/zeroclaw/error.log (as configured in the init script)
+            let log_file = Path::new("/var/log/zeroclaw/error.log");
+            if !log_file.exists() {
+                // Fall back to access log
+                let access_log = Path::new("/var/log/zeroclaw/access.log");
+                if !access_log.exists() {
+                    bail!("No log files found at /var/log/zeroclaw/. Is the service installed?");
+                }
+                return tail_file(access_log, lines, follow);
+            }
+            tail_file(log_file, lines, follow)?;
+        }
+        InitSystem::Auto => unreachable!("Auto should be resolved before this point"),
+    }
+    let _ = config;
+    Ok(())
+}
+
+fn logs_windows(config: &Config, lines: usize, follow: bool) -> Result<()> {
+    let logs_dir = config
+        .config_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), PathBuf::from)
+        .join("logs");
+
+    let stderr_log = logs_dir.join("daemon.stderr.log");
+    let stdout_log = logs_dir.join("daemon.stdout.log");
+
+    let log_file = if stderr_log.exists() {
+        stderr_log
+    } else if stdout_log.exists() {
+        stdout_log
+    } else {
+        bail!(
+            "No log files found in {}. Is the service installed?",
+            logs_dir.display()
+        );
+    };
+
+    if follow {
+        // Windows: use PowerShell Get-Content -Wait for tail -f equivalent
+        let status = Command::new("powershell")
+            .args([
+                "-Command",
+                &format!(
+                    "Get-Content -Path '{}' -Tail {} -Wait",
+                    log_file.display(),
+                    lines
+                ),
+            ])
+            .status()
+            .context("Failed to run PowerShell Get-Content")?;
+        if !status.success() {
+            bail!("PowerShell Get-Content exited with non-zero status");
+        }
+    } else {
+        let status = Command::new("powershell")
+            .args([
+                "-Command",
+                &format!("Get-Content -Path '{}' -Tail {}", log_file.display(), lines),
+            ])
+            .status()
+            .context("Failed to run PowerShell Get-Content")?;
+        if !status.success() {
+            bail!("PowerShell Get-Content exited with non-zero status");
+        }
+    }
+    Ok(())
+}
+
+/// Tail a log file using the system `tail` command.
+fn tail_file(path: &Path, lines: usize, follow: bool) -> Result<()> {
+    let mut args = vec!["-n".to_string(), lines.to_string()];
+    if follow {
+        args.push("-f".to_string());
+    }
+    let status = Command::new("tail")
+        .args(&args)
+        .arg(path)
+        .status()
+        .context("Failed to run tail")?;
+    if !status.success() {
+        bail!("tail exited with non-zero status");
     }
     Ok(())
 }
@@ -638,7 +817,9 @@ fn check_zeroclaw_user() -> Result<()> {
                     bail!(
                         "User 'zeroclaw' exists but has unexpected UID {} (expected system UID < 1000).\n\
                          Recreate with: sudo {} && sudo {}",
-                        uid, del_cmd, add_cmd
+                        uid,
+                        del_cmd,
+                        add_cmd
                     );
                 }
 
@@ -1492,5 +1673,40 @@ mod tests {
                 "zeroclaw".to_string()
             ]
         );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn tail_file_errors_on_missing_file() {
+        let missing = Path::new("/tmp/zeroclaw-test-nonexistent-log-file.log");
+        let result = tail_file(missing, 10, false);
+        assert!(result.is_err(), "tail on missing file should fail");
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn tail_file_reads_existing_file() {
+        let dir = tempfile::tempdir().expect("failed to create temp dir");
+        let log = dir.path().join("test-tail.log");
+        fs::write(&log, "line1\nline2\nline3\nline4\nline5\n").unwrap();
+        // tail should succeed on existing file
+        let result = tail_file(&log, 3, false);
+        assert!(result.is_ok(), "tail on existing file should succeed");
+    }
+
+    #[test]
+    fn logs_variant_is_recognized() {
+        // Ensure the Logs variant can be constructed and matched
+        let cmd = crate::ServiceCommands::Logs {
+            lines: 25,
+            follow: true,
+        };
+        match &cmd {
+            crate::ServiceCommands::Logs { lines, follow } => {
+                assert_eq!(*lines, 25);
+                assert!(*follow);
+            }
+            _ => panic!("Expected Logs variant"),
+        }
     }
 }

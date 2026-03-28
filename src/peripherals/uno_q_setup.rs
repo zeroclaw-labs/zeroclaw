@@ -141,3 +141,122 @@ fn copy_dir(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_app_name_is_correct() {
+        assert_eq!(BRIDGE_APP_NAME, "uno-q-bridge");
+    }
+
+    #[test]
+    fn write_embedded_bridge_creates_all_files() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let dest = tmp.path();
+
+        write_embedded_bridge(dest).expect("write_embedded_bridge failed");
+
+        // Verify all expected files exist
+        assert!(dest.join("app.yaml").exists(), "app.yaml should exist");
+        assert!(
+            dest.join("sketch").join("sketch.ino").exists(),
+            "sketch/sketch.ino should exist"
+        );
+        assert!(
+            dest.join("sketch").join("sketch.yaml").exists(),
+            "sketch/sketch.yaml should exist"
+        );
+        assert!(
+            dest.join("python").join("main.py").exists(),
+            "python/main.py should exist"
+        );
+        assert!(
+            dest.join("python").join("requirements.txt").exists(),
+            "python/requirements.txt should exist"
+        );
+    }
+
+    #[test]
+    fn write_embedded_bridge_files_are_non_empty() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let dest = tmp.path();
+
+        write_embedded_bridge(dest).expect("write_embedded_bridge failed");
+
+        let app_yaml = std::fs::read_to_string(dest.join("app.yaml")).unwrap();
+        assert!(!app_yaml.trim().is_empty(), "app.yaml should not be empty");
+
+        let sketch = std::fs::read_to_string(dest.join("sketch").join("sketch.ino")).unwrap();
+        assert!(!sketch.trim().is_empty(), "sketch.ino should not be empty");
+
+        let main_py = std::fs::read_to_string(dest.join("python").join("main.py")).unwrap();
+        assert!(!main_py.trim().is_empty(), "main.py should not be empty");
+    }
+
+    #[test]
+    fn write_embedded_bridge_main_py_contains_zeroclaw() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let dest = tmp.path();
+
+        write_embedded_bridge(dest).expect("write_embedded_bridge failed");
+
+        let main_py = std::fs::read_to_string(dest.join("python").join("main.py")).unwrap();
+        assert!(
+            main_py.contains("ZeroClaw") || main_py.contains("zeroclaw"),
+            "main.py should contain ZeroClaw marker"
+        );
+    }
+
+    #[test]
+    fn write_embedded_bridge_idempotent() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let dest = tmp.path();
+
+        // Write twice — should not fail
+        write_embedded_bridge(dest).expect("first write failed");
+        write_embedded_bridge(dest).expect("second write should overwrite without error");
+
+        assert!(dest.join("app.yaml").exists());
+    }
+
+    #[test]
+    fn copy_dir_copies_files_and_subdirs() {
+        let src_tmp = tempfile::tempdir().expect("create src dir");
+        let dst_tmp = tempfile::tempdir().expect("create dst dir");
+
+        // Create a source tree: file.txt and sub/nested.txt
+        std::fs::write(src_tmp.path().join("file.txt"), "hello").unwrap();
+        std::fs::create_dir(src_tmp.path().join("sub")).unwrap();
+        std::fs::write(src_tmp.path().join("sub").join("nested.txt"), "world").unwrap();
+
+        copy_dir(src_tmp.path(), dst_tmp.path()).expect("copy_dir failed");
+
+        assert_eq!(
+            std::fs::read_to_string(dst_tmp.path().join("file.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst_tmp.path().join("sub").join("nested.txt")).unwrap(),
+            "world"
+        );
+    }
+
+    #[test]
+    fn bridge_dir_resolves_from_cargo_manifest() {
+        // Verify that the bridge directory path is correctly derived from CARGO_MANIFEST_DIR.
+        let bridge_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("firmware")
+            .join("uno-q-bridge");
+        assert!(
+            bridge_dir.exists(),
+            "firmware/uno-q-bridge should exist at {:?}",
+            bridge_dir
+        );
+        assert!(
+            bridge_dir.join("app.yaml").exists(),
+            "app.yaml should exist in bridge dir"
+        );
+    }
+}

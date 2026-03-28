@@ -4,7 +4,7 @@
 //! validation, FIDO2/passkey verification, and session management. Maps Nevis
 //! roles to ZeroClaw tool permissions via [`super::iam_policy::IamPolicy`].
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
