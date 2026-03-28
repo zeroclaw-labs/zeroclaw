@@ -5,7 +5,7 @@
 //! results are returned as structured context for the agent's LLM to
 //! consume directly.
 //!
-//! This is intentionally separate from the Sonar-based `web_search_tool`
+//! This is intentionally separate from the Sonar-based `web_search`
 //! provider: Sonar generates its own answer (duplicating MoA's LLM layer),
 //! whereas this tool returns **search index data only**, which is cheaper
 //! and fits the MoA "search is a tool, answer is the LLM's job" design.
