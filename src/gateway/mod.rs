@@ -1797,7 +1797,11 @@ async fn handle_line_webhook(
     if !crate::channels::line::verify_line_signature(channel_secret, body_str, signature) {
         tracing::warn!(
             "LINE webhook signature verification failed ({})",
-            if signature.is_empty() { "missing" } else { "invalid" }
+            if signature.is_empty() {
+                "missing"
+            } else {
+                "invalid"
+            }
         );
         return (
             StatusCode::UNAUTHORIZED,
