@@ -1072,7 +1072,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_optional_secret(&mut google_stt.api_key);
     }
     if let Some(local_whisper) = masked.transcription.local_whisper.as_mut() {
-        mask_required_secret(&mut local_whisper.bearer_token);
+        mask_optional_secret(&mut local_whisper.bearer_token);
     }
 
     masked
@@ -1296,7 +1296,7 @@ fn restore_masked_sensitive_fields(
         incoming.transcription.local_whisper.as_mut(),
         current.transcription.local_whisper.as_ref(),
     ) {
-        restore_required_secret(&mut incoming_stt.bearer_token, &current_stt.bearer_token);
+        restore_optional_secret(&mut incoming_stt.bearer_token, &current_stt.bearer_token);
     }
 }
 
