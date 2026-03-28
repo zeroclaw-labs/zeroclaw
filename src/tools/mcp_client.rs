@@ -3,23 +3,23 @@
 //! Supports multiple transports: stdio (spawn local process), HTTP, and SSE.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(not(target_has_atomic = "64"))]
 use std::sync::atomic::AtomicU32;
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::json;
 use tokio::sync::Mutex;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 use crate::config::schema::McpServerConfig;
 use crate::tools::mcp_protocol::{
-    JsonRpcRequest, McpToolDef, McpToolsListResult, MCP_PROTOCOL_VERSION,
+    JsonRpcRequest, MCP_PROTOCOL_VERSION, McpToolDef, McpToolsListResult,
 };
-use crate::tools::mcp_transport::{create_transport, McpTransportConn};
+use crate::tools::mcp_transport::{McpTransportConn, create_transport};
 
 /// Timeout for receiving a response from an MCP server during init/list.
 /// Prevents a hung server from blocking the daemon indefinitely.

@@ -122,17 +122,181 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 
 After updating config, restart daemon and send a new message (not just old timeline history).
 
+### G. Finding your `device_id`
+
+ZeroClaw needs a stable `device_id` for E2EE session restore. Without it, a new device is registered on every restart, breaking key sharing and device verification.
+
+#### Option 1: From `whoami` (easiest)
+
+```bash
+curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
+  "https://your.homeserver/_matrix/client/v3/account/whoami"
+```
+
+Response includes `device_id` if the token is bound to a device session:
+
+```json
+{"user_id": "@bot:example.com", "device_id": "ABCDEF1234"}
+```
+
+If `device_id` is missing, the token was created without a device login (e.g., via admin API). Use Option 2 instead.
+
+#### Option 2: From a password login
+
+```bash
+curl -sS -X POST "https://your.homeserver/_matrix/client/v3/login" \
+  -H "Content-Type: application/json" \
+  -d '{"type": "m.login.password", "user": "@bot:example.com", "password": "...", "initial_device_display_name": "ZeroClaw"}'
+```
+
+Response:
+
+```json
+{"user_id": "@bot:example.com", "access_token": "syt_...", "device_id": "NEWDEVICE"}
+```
+
+Use both the returned `access_token` and `device_id` in your config. This creates a proper device session.
+
+#### Option 3: From Element or another Matrix client
+
+1. Log in as the bot account in Element
+2. Go to Settings → Sessions
+3. Copy the Device ID for the active session
+
+**Once you have it**, set both in `config.toml`:
+
+```toml
+[channels_config.matrix]
+user_id = "@bot:example.com"
+device_id = "ABCDEF1234"
+```
+
+Keep `device_id` stable — changing it forces a new device registration, which breaks existing key sharing and device verification.
+
+### H. One-time key (OTK) upload conflict
+
+**Symptom:** ZeroClaw logs `Matrix one-time key upload conflict detected; stopping sync to avoid infinite retry loop.` and the Matrix channel becomes unavailable.
+
+**Cause:** The bot's local crypto store was reset (e.g., deleted data directory, reinstalled) without deregistering the old device on the homeserver. The homeserver still has old one-time keys for this device, and the SDK fails to upload new ones.
+
+#### Fix
+
+1. Stop ZeroClaw.
+
+2. Deregister the stale device. From a session with admin access to the bot account:
+
+```bash
+# List devices
+curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
+  "https://your.homeserver/_matrix/client/v3/devices"
+
+# Delete the stale device (requires UIA — interactive auth)
+curl -sS -X DELETE -H "Authorization: Bearer $MATRIX_TOKEN" \
+  -H "Content-Type: application/json" \
+  "https://your.homeserver/_matrix/client/v3/devices/STALE_DEVICE_ID" \
+  -d '{"auth": {"type": "m.login.password", "user": "@bot:example.com", "password": "..."}}'
+```
+
+3. Delete the local crypto store. The log message includes the store path, typically:
+
+```
+~/.zeroclaw/state/matrix/
+```
+
+Delete this directory.
+
+4. Re-login to get a fresh `device_id` and `access_token` (see section 4G, Option 2).
+
+5. Update `config.toml` with the new `access_token` and `device_id`.
+
+6. Restart ZeroClaw.
+
+**Prevention:** Do not delete the local state directory without also deregistering the device. If you need a fresh start, always deregister first.
+
+### I. Recovery key (recommended for E2EE)
+
+A recovery key lets ZeroClaw automatically restore room keys and cross-signing secrets from server-side backup. This means device resets, crypto store deletions, and fresh installs recover automatically — no emoji verification, no manual key sharing.
+
+#### Step 1: Get your recovery key from Element
+
+1. Log into the bot account in Element (web or desktop)
+2. Go to Settings → Security & Privacy → Encryption → Secure Backup
+3. If backup is already set up, your recovery key was shown when you first enabled it. If you saved it, use that.
+4. If backup is not set up, click "Set up Secure Backup" and choose "Generate a Security Key". Save the key — it looks like `EsTj 3yST y93F SLpB ...`
+5. Log out of Element when done
+
+#### Step 2: Add the recovery key to ZeroClaw
+
+Option A — during onboarding:
+
+```bash
+zeroclaw onboard
+# or
+zeroclaw onboard --channels-only
+```
+
+When configuring the Matrix channel, the wizard prompts:
+
+```
+E2EE recovery key (or Enter to skip): EsTj 3yST y93F SLpB jJsz ...
+```
+
+Paste the recovery key. It will be stored in `config.toml` as `channels_config.matrix.recovery_key`.
+
+Option B — edit `config.toml` directly:
+
+```toml
+[channels_config.matrix]
+recovery_key = "EsTj 3yST y93F SLpB jJsz ..."
+```
+
+If `secrets.encrypt = true` (the default), the value will be encrypted on next config save.
+
+#### Step 3: Restart ZeroClaw
+
+On startup you should see:
+
+```
+Matrix E2EE recovery successful — room keys and cross-signing secrets restored from server backup.
+```
+
+From now on, even if the local crypto store is deleted, ZeroClaw will recover automatically on next startup.
+
 ---
 
-## 5. Operational Notes
+## 5. Debug Logging
+
+For detailed E2EE diagnostics, run ZeroClaw with debug-level logging for the Matrix channel:
+
+```bash
+RUST_LOG=zeroclaw::channels::matrix=debug zeroclaw daemon
+```
+
+This surfaces:
+- Session restore confirmation
+- Each sync cycle completion
+- OTK conflict flag state
+- Health check results
+- Transient vs. fatal sync error classification
+
+For even more detail from the Matrix SDK itself:
+
+```bash
+RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemon
+```
+
+---
+
+## 6. Operational Notes
 
 - Keep Matrix tokens out of logs and screenshots.
 - Start with permissive `allowed_users`, then tighten to explicit user IDs.
 - Prefer canonical room IDs in production to avoid alias drift.
+- **Threading behavior:** ZeroClaw always replies in a thread rooted at the user's original message. Each thread maintains its own isolated conversation context. The main room timeline is unaffected — threads do not share context with each other or with the room. In encrypted rooms, threading works identically — the SDK decrypts events transparently before thread context is evaluated.
 
 ---
 
-## 6. Related Docs
+## 7. Related Docs
 
 - [Channels Reference](../reference/api/channels-reference.md)
 - [Operations log keyword appendix](../reference/api/channels-reference.md#7-operations-appendix-log-keywords-matrix)
