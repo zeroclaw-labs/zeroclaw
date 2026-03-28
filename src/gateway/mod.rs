@@ -1516,7 +1516,7 @@ async fn handle_webhook(
             messages_count: 1,
         });
 
-    match run_gateway_chat_simple(&state, message).await {
+    match run_gateway_chat_with_tools(&state, message).await {
         Ok(response) => {
             let duration = started_at.elapsed();
             state
