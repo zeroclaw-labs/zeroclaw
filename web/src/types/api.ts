@@ -120,8 +120,6 @@ export interface ChannelDetail {
   type: string;
   enabled: boolean;
   status: 'active' | 'inactive' | 'error';
-  message_count: number;
-  last_message_at: string | null;
   health: 'healthy' | 'degraded' | 'down';
 }
 

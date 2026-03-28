@@ -810,10 +810,6 @@ pub async fn handle_api_channels(
                 "type": channel.name(),
                 "enabled": enabled,
                 "status": status,
-                // TODO: track per-channel message counts
-                "message_count": 0,
-                // TODO: track per-channel last message timestamp
-                "last_message_at": null,
                 "health": health,
             })
         })

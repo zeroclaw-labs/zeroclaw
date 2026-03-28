@@ -802,18 +802,6 @@ function ChannelsTab() {
             style={{ borderColor: "var(--pc-border)" }}
           >
             <div className="flex justify-between text-xs">
-              <span style={{ color: "var(--pc-text-muted)" }}>{t("dashboard.channel_messages")}</span>
-              <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
-                {channel.message_count.toLocaleString()}
-              </span>
-            </div>
-            <div className="flex justify-between text-xs">
-              <span style={{ color: "var(--pc-text-muted)" }}>{t("dashboard.channel_last_message")}</span>
-              <span className="font-mono" style={{ color: "var(--pc-text-primary)" }}>
-                {channel.last_message_at ? formatRelative(channel.last_message_at) : t("dashboard.never")}
-              </span>
-            </div>
-            <div className="flex justify-between text-xs">
               <span style={{ color: "var(--pc-text-muted)" }}>{t("dashboard.health")}</span>
               <span className="capitalize" style={{ color: healthColor(channel.health) }}>
                 {channel.health}
