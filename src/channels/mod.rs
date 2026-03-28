@@ -10533,7 +10533,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10622,7 +10624,7 @@ This is an example JSON object for profile settings."#;
         );
         drop(sent);
 
-        let histories = runtime_ctx
+        let mut histories = runtime_ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
