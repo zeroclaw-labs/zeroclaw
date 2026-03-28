@@ -930,7 +930,10 @@ mod tests {
         let ch = LineChannel::new("tok".to_string(), vec!["*".to_string()])
             .with_mention_only(true, Some("ZeroClaw".to_string()));
         assert!(ch.mention_only);
-        assert_eq!(ch.bot_display_name.get().map(|s| s.as_str()), Some("ZeroClaw"));
+        assert_eq!(
+            ch.bot_display_name.get().map(|s| s.as_str()),
+            Some("ZeroClaw")
+        );
     }
 
     #[test]
@@ -995,7 +998,10 @@ mod tests {
         });
         let msgs = ch.parse_webhook_payload(&raw).await;
         assert_eq!(msgs.len(), 1);
-        assert_eq!(msgs[0].content, "what is rust?", "@mention must be stripped");
+        assert_eq!(
+            msgs[0].content, "what is rust?",
+            "@mention must be stripped"
+        );
         assert_eq!(msgs[0].reply_target, "C_GROUP");
     }
 
