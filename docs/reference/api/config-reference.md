@@ -122,6 +122,34 @@ tools = ["mcp_browser_*"]
 keywords = ["browse", "navigate", "open url", "screenshot"]
 ```
 
+## `[pacing]`
+
+Pacing controls for slow/local LLM workloads (Ollama, llama.cpp, vLLM). All keys are optional; when absent, existing behavior is preserved.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `step_timeout_secs` | _none_ | Per-step timeout: maximum seconds for a single LLM inference turn. Catches a truly hung model without terminating the overall task loop |
+| `loop_detection_min_elapsed_secs` | _none_ | Minimum elapsed seconds before loop detection activates. Tasks completing under this threshold get aggressive loop protection; longer-running tasks receive a grace period |
+| `loop_ignore_tools` | `[]` | Tool names excluded from identical-output loop detection. Useful for browser workflows where `browser_screenshot` structurally resembles a loop |
+| `message_timeout_scale_max` | `4` | Override for the hardcoded timeout scaling cap. The channel message timeout budget is `message_timeout_secs * min(max_tool_iterations, message_timeout_scale_max)` |
+
+Notes:
+
+- These settings are intended for local/slow LLM deployments. Cloud-provider users typically do not need them.
+- `step_timeout_secs` operates independently of the total channel message timeout budget. A step timeout abort does not consume the overall budget; the loop simply stops.
+- `loop_detection_min_elapsed_secs` delays loop-detection counting, not the task itself. Loop protection remains fully active for short tasks (the default).
+- `loop_ignore_tools` only suppresses tool-output-based loop detection for the listed tools. Other safety features (max iterations, overall timeout) remain active.
+- `message_timeout_scale_max` must be >= 1. Setting it higher than `max_tool_iterations` has no additional effect (the formula uses `min()`).
+- Example configuration for a slow local Ollama deployment:
+
+```toml
+[pacing]
+step_timeout_secs = 120
+loop_detection_min_elapsed_secs = 60
+loop_ignore_tools = ["browser_screenshot", "browser_navigate"]
+message_timeout_scale_max = 8
+```
+
 ## `[security.otp]`
 
 | Key | Default | Purpose |
@@ -425,6 +453,12 @@ Notes:
 | `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
+| `path_prefix` | _(none)_ | URL path prefix for reverse-proxy deployments (e.g. `"/zeroclaw"`) |
+
+When deploying behind a reverse proxy that maps ZeroClaw to a sub-path,
+set `path_prefix` to that sub-path (e.g. `"/zeroclaw"`). All gateway
+routes will be served under this prefix. The value must start with `/`
+and must not end with `/`.
 
 ## `[autonomy]`
 
@@ -473,30 +507,6 @@ allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 Notes:
 
 - Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
-
-### `[memory.mem0]`
-
-Mem0 (OpenMemory) backend — connects to a self-hosted mem0 server for vector-based memory with LLM-powered fact extraction. Requires feature flag `memory-mem0` at build time and `backend = "mem0"` in config.
-
-| Key | Default | Env var | Purpose |
-|---|---|---|---|
-| `url` | `http://localhost:8765` | `MEM0_URL` | OpenMemory server URL |
-| `user_id` | `zeroclaw` | `MEM0_USER_ID` | User ID for scoping memories |
-| `app_name` | `zeroclaw` | `MEM0_APP_NAME` | Application name registered in mem0 |
-| `infer` | `true` | — | Use LLM to extract facts from stored text (`true`) or store raw (`false`) |
-| `extraction_prompt` | unset | `MEM0_EXTRACTION_PROMPT` | Custom prompt for LLM fact extraction (e.g. for non-English content) |
-
-```toml
-[memory]
-backend = "mem0"
-
-[memory.mem0]
-url = "http://192.168.0.171:8765"
-user_id = "zeroclaw-bot"
-extraction_prompt = "Extract facts in the original language..."
-```
-
-Server deployment scripts are in `deploy/mem0/`.
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 
@@ -597,7 +607,7 @@ Top-level channel options are configured under `channels_config`.
 
 | Key | Default | Purpose |
 |---|---|---|
-| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x) |
+| `message_timeout_secs` | `300` | Base timeout in seconds for channel message processing; runtime scales this with tool-loop depth (up to 4x, overridable via `[pacing].message_timeout_scale_max`) |
 
 Examples:
 
@@ -612,7 +622,7 @@ Examples:
 Notes:
 
 - Default `300s` is optimized for on-device LLMs (Ollama) which are slower than cloud APIs.
-- Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, 4)` and a minimum of `1`.
+- Runtime timeout budget is `message_timeout_secs * scale`, where `scale = min(max_tool_iterations, cap)` and a minimum of `1`. The default cap is `4`; override with `[pacing].message_timeout_scale_max`.
 - This scaling avoids false timeouts when the first LLM turn is slow/retried but later tool-loop turns still need to complete.
 - If using cloud APIs (OpenAI, Anthropic, etc.), you can reduce this to `60` or lower.
 - Values below `30` are clamped to `30` to avoid immediate timeout churn.
@@ -692,6 +702,7 @@ Native Nextcloud Talk bot integration (webhook receive + OCS send API).
 | `app_token` | Yes | Bot app token used for OCS bearer auth |
 | `webhook_secret` | Optional | Enables webhook signature verification |
 | `allowed_users` | Recommended | Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all) |
+| `bot_name` | Optional | Display name of the bot in Nextcloud Talk (e.g. `"zeroclaw"`). Used to filter out the bot's own messages and prevent feedback loops. |
 
 Notes:
 

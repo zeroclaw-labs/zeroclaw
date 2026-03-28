@@ -25,6 +25,18 @@ pub enum PluginError {
     #[error("plugin capability not supported: {0}")]
     UnsupportedCapability(String),
 
+    #[error("plugin '{0}' is unsigned and signature verification is required")]
+    UnsignedPlugin(String),
+
+    #[error("plugin '{plugin}' signed by untrusted publisher key '{publisher_key}'")]
+    UntrustedPublisher {
+        plugin: String,
+        publisher_key: String,
+    },
+
+    #[error("invalid plugin signature: {0}")]
+    SignatureInvalid(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

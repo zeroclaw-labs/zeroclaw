@@ -13,9 +13,12 @@ import Cost from './pages/Cost';
 import Logs from './pages/Logs';
 import Doctor from './pages/Doctor';
 import Pairing from './pages/Pairing';
+import Canvas from './pages/Canvas';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { DraftContext, useDraftStore } from './hooks/useDraft';
 import { setLocale, type Locale } from './lib/i18n';
+import { loadLocale, saveLocale } from './contexts/localeStorage';
+import { basePath } from './lib/basePath';
 import { getAdminPairCode } from './lib/api';
 
 // Locale context
@@ -131,7 +134,7 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
         <div className="text-center mb-8">
           <img
-            src="/_app/zeroclaw-trans.png"
+            src={`${basePath}/_app/zeroclaw-trans.png`}
             alt="ZeroClaw"
             className="h-20 w-20 rounded-2xl object-cover mx-auto mb-4 animate-float"
             onError={(e) => { e.currentTarget.style.display = 'none'; }}
@@ -185,12 +188,14 @@ function PairingDialog({ onPair }: { onPair: (code: string) => Promise<void> }) 
 
 function AppContent() {
   const { isAuthenticated, requiresPairing, loading, pair, logout } = useAuth();
-  const [locale, setLocaleState] = useState('en');
+  const [locale, setLocaleState] = useState(loadLocale());
   const draftStore = useDraftStore();
+  setLocale(locale as Locale);
 
   const setAppLocale = (newLocale: string) => {
     setLocaleState(newLocale);
     setLocale(newLocale as Locale);
+    saveLocale(newLocale);
   };
 
   // Listen for 401 events to force logout
@@ -233,6 +238,7 @@ function AppContent() {
             <Route path="/logs" element={<Logs />} />
             <Route path="/doctor" element={<Doctor />} />
             <Route path="/pairing" element={<Pairing />} />
+            <Route path="/canvas" element={<Canvas />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Route>
         </Routes>

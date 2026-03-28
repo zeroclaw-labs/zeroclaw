@@ -172,7 +172,18 @@ guild_id = "123456789012345678"   # optional
 allowed_users = ["*"]
 listen_to_bots = false
 mention_only = false
+stream_mode = "multi_message"     # optional: off | partial | multi_message (default: multi_message via wizard)
+draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
+multi_message_delay_ms = 800      # optional: delay between paragraph sends in multi_message mode
 ```
+
+Discord notes:
+
+- `stream_mode = "partial"` sends an editable draft message that updates token-by-token as the LLM streams its response, then finalizes with the complete text.
+- `stream_mode = "multi_message"` delivers the response incrementally as separate messages, splitting at paragraph boundaries (`\n\n`) as tokens arrive from the provider. Each paragraph appears in Discord as soon as it completes.
+- `draft_update_interval_ms` controls edit throttling in partial mode (default: 1000ms).
+- `multi_message_delay_ms` controls minimum delay between paragraph sends in multi_message mode to avoid Discord rate limits (default: 800ms).
+- Code fences are never split across messages in multi_message mode.
 
 ### 4.3 Slack
 
@@ -181,11 +192,13 @@ mention_only = false
 bot_token = "xoxb-..."
 app_token = "xapp-..."             # optional
 channel_id = "C1234567890"         # optional: single channel; omit or "*" for all accessible channels
+channel_ids = ["C1234567890"]      # optional: explicit channel list; takes precedence over channel_id
 allowed_users = ["*"]
 ```
 
 Slack listen behavior:
 
+- `channel_ids = ["C123...", "D456..."]`: listen only on the listed channels/DMs.
 - `channel_id = "C123..."`: listen only on that channel.
 - `channel_id = "*"` or omitted: auto-discover and listen across all accessible channels.
 
@@ -209,7 +222,19 @@ user_id = "@zeroclaw:matrix.example.com"   # optional, recommended for E2EE
 device_id = "DEVICEID123"                  # optional, recommended for E2EE
 room_id = "!room:matrix.example.com"       # or room alias (#ops:matrix.example.com)
 allowed_users = ["*"]
+stream_mode = "partial"                    # optional: off | partial | multi_message (default: partial via wizard)
+draft_update_interval_ms = 1500            # optional: edit throttle for partial streaming
+multi_message_delay_ms = 800               # optional: delay between paragraph sends in multi_message mode
 ```
+
+Matrix streaming notes:
+
+- `stream_mode = "partial"` sends an editable draft message that updates token-by-token via Matrix `m.replace` edits as the LLM streams its response.
+- `stream_mode = "multi_message"` delivers the response incrementally as separate messages, splitting at paragraph boundaries (`\n\n`) as tokens arrive. Code fences are never split across messages.
+- `draft_update_interval_ms` controls edit throttling in partial mode (default: 1500ms, higher than Telegram to account for E2EE re-encryption overhead and federation latency).
+- `multi_message_delay_ms` controls minimum delay between paragraph sends in multi_message mode (default: 800ms).
+- Both modes work in encrypted and unencrypted rooms — the matrix-sdk handles E2EE transparently.
+- Existing configs without `stream_mode` default to `off` (no behavior change).
 
 See [Matrix E2EE Guide](../../security/matrix-e2ee-guide.md) for encrypted-room troubleshooting.
 
@@ -395,6 +420,7 @@ base_url = "https://cloud.example.com"
 app_token = "nextcloud-talk-app-token"
 webhook_secret = "optional-webhook-secret"  # optional but recommended
 allowed_users = ["*"]
+# bot_name = "zeroclaw"  # display name of the bot; filters own messages to prevent feedback loops
 ```
 
 Notes:

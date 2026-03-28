@@ -226,6 +226,9 @@ impl LucidMemory {
                 timestamp: now.clone(),
                 session_id: None,
                 score: Some((1.0 - rank as f64 * 0.05).max(0.1)),
+                namespace: "default".into(),
+                importance: None,
+                superseded_by: None,
             });
         }
 
@@ -583,9 +586,11 @@ exit 1
 
         let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
 
-        assert!(entries
-            .iter()
-            .any(|e| e.content.contains("Local sqlite auth fallback note")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.content.contains("Local sqlite auth fallback note"))
+        );
         assert!(entries.iter().any(|e| e.content.contains("token refresh")));
     }
 
@@ -607,12 +612,16 @@ exit 1
 
         let entries = memory.recall("auth", 5, None, None, None).await.unwrap();
 
-        assert!(entries
-            .iter()
-            .any(|e| e.content.contains("Local sqlite auth fallback note")));
-        assert!(entries
-            .iter()
-            .any(|e| e.content.contains("Delayed token refresh guidance")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.content.contains("Local sqlite auth fallback note"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.content.contains("Delayed token refresh guidance"))
+        );
     }
 
     #[tokio::test]
@@ -644,9 +653,11 @@ exit 1
             .unwrap();
 
         let entries = memory.recall("rust", 5, None, None, None).await.unwrap();
-        assert!(entries
-            .iter()
-            .any(|e| e.content.contains("Rust should stay local-first")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.content.contains("Rust should stay local-first"))
+        );
 
         let context_calls = tokio::fs::read_to_string(&marker).await.unwrap_or_default();
         assert!(

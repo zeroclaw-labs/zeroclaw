@@ -109,6 +109,7 @@ Options:
   --api-key <key>            API key (skips interactive prompt)
   --provider <id>            Provider (default: openrouter)
   --model <id>               Model (optional)
+  --cargo-features <list>    Extra cargo features (comma/space separated)
   --skip-onboard             Skip provider/API key configuration
   --skip-build               Skip build step
   --skip-install             Skip cargo install step
@@ -138,6 +139,7 @@ Environment:
   ZEROCLAW_API_KEY           Used when --api-key is not provided
   ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
   ZEROCLAW_MODEL             Used when --model is not provided
+  ZEROCLAW_CARGO_FEATURES    Extra cargo features for source builds (comma/space separated)
   ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
   ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
   ZEROCLAW_DISABLE_ALPINE_AUTO_DEPS
@@ -147,6 +149,37 @@ USAGE
 
 have_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+append_cargo_feature() {
+  local feature="${1:-}"
+  [[ -n "$feature" ]] || return 0
+  case ",${CARGO_FEATURES_CSV:-}," in
+    *,"$feature",*) return 0 ;;
+  esac
+  if [[ -n "${CARGO_FEATURES_CSV:-}" ]]; then
+    CARGO_FEATURES_CSV+=",${feature}"
+  else
+    CARGO_FEATURES_CSV="$feature"
+  fi
+}
+
+append_cargo_features_from_input() {
+  local raw="${1:-}" token
+  raw="${raw//,/ }"
+  for token in $raw; do
+    append_cargo_feature "$token"
+  done
+}
+
+refresh_cargo_feature_args() {
+  CARGO_FEATURE_ARGS=()
+  if [[ "${CARGO_NO_DEFAULT_FEATURES:-false}" == true ]]; then
+    CARGO_FEATURE_ARGS+=(--no-default-features)
+  fi
+  if [[ -n "${CARGO_FEATURES_CSV:-}" ]]; then
+    CARGO_FEATURE_ARGS+=(--features "$CARGO_FEATURES_CSV")
+  fi
 }
 
 get_total_memory_mb() {
@@ -226,6 +259,49 @@ detect_release_target() {
       ;;
     *)
       return 1
+      ;;
+  esac
+}
+
+detect_device_class() {
+  # Containers are never desktops
+  if _is_container_runtime; then
+    echo "container"
+    return
+  fi
+
+  # Termux / Android
+  if [[ -n "${TERMUX_VERSION:-}" || -d "/data/data/com.termux" ]]; then
+    echo "mobile"
+    return
+  fi
+
+  local os arch
+  os="$(uname -s)"
+  arch="$(uname -m)"
+
+  case "$os" in
+    Darwin)
+      # macOS is always a desktop
+      echo "desktop"
+      ;;
+    Linux)
+      # Raspberry Pi / ARM SBCs — treat as embedded (typically headless)
+      case "$arch" in
+        armv6l|armv7l)
+          echo "embedded"
+          return
+          ;;
+      esac
+      # Check for a display server (X11 or Wayland)
+      if [[ -n "${DISPLAY:-}" || -n "${WAYLAND_DISPLAY:-}" || -n "${XDG_SESSION_TYPE:-}" ]]; then
+        echo "desktop"
+      else
+        echo "server"
+      fi
+      ;;
+    *)
+      echo "server"
       ;;
   esac
 }
@@ -569,11 +645,29 @@ MSG
         exit 0
       fi
       # Detect un-accepted Xcode/CLT license (causes `cc` to exit 69).
-      if ! /usr/bin/xcrun --show-sdk-path >/dev/null 2>&1; then
-        warn "Xcode license has not been accepted. Run:"
-        warn "  sudo xcodebuild -license accept"
-        warn "then re-run this installer."
-        exit 1
+      # xcrun --show-sdk-path can succeed even without an accepted license,
+      # so we test-compile a trivial C file which reliably triggers the error.
+      _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
+      printf 'int main(){return 0;}\n' > "$_xcode_test_file"
+      if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
+        rm -f "$_xcode_test_file"
+        warn "Xcode/CLT license has not been accepted. Attempting to accept it now..."
+        _xcode_accept_ok=false
+        if [[ "$(id -u)" -eq 0 ]]; then
+          xcodebuild -license accept && _xcode_accept_ok=true
+        elif [[ -c /dev/tty ]] && have_cmd sudo; then
+          sudo xcodebuild -license accept < /dev/tty && _xcode_accept_ok=true
+        fi
+        if [[ "$_xcode_accept_ok" == true ]]; then
+          step_ok "Xcode license accepted"
+        else
+          error "Could not accept Xcode license. Run manually:"
+          error "  sudo xcodebuild -license accept"
+          error "then re-run this installer."
+          exit 1
+        fi
+      else
+        rm -f "$_xcode_test_file"
       fi
       if ! have_cmd git; then
         warn "git is not available. Install git (e.g., Homebrew) and re-run bootstrap."
@@ -897,12 +991,32 @@ You are **${agent_name}**. Built in Rust. 3MB binary. Zero bloat.
   unset -f _write_if_missing
 }
 
+_is_wsl() {
+  # Detect Windows Subsystem for Linux (WSL)
+  # WSL typically has microsoft-standard or microsoft in the kernel release
+  if [[ -f /proc/version ]] && grep -qi 'microsoft' /proc/version; then
+    return 0
+  fi
+  # WSL2 sets WSL_DISTRO_NAME or WSL_INTEROP environment variables
+  if [[ -n "${WSL_DISTRO_NAME:-}" || -n "${WSL_INTEROP:-}" ]]; then
+    return 0
+  fi
+  return 1
+}
+
 resolve_container_cli() {
   local requested_cli
   requested_cli="${ZEROCLAW_CONTAINER_CLI:-docker}"
 
   if have_cmd "$requested_cli"; then
     CONTAINER_CLI="$requested_cli"
+    return 0
+  fi
+
+  # WSL: try docker.exe (Docker Desktop for Windows) if docker is not found
+  if [[ "$requested_cli" == "docker" ]] && _is_wsl && have_cmd docker.exe; then
+    info "Detected WSL environment with Docker Desktop"
+    CONTAINER_CLI="docker.exe"
     return 0
   fi
 
@@ -1048,6 +1162,10 @@ CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
 API_KEY="${ZEROCLAW_API_KEY:-}"
 PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
 MODEL="${ZEROCLAW_MODEL:-}"
+CARGO_FEATURES_INPUT="${ZEROCLAW_CARGO_FEATURES:-}"
+CARGO_NO_DEFAULT_FEATURES=false
+CARGO_FEATURES_CSV=""
+CARGO_FEATURE_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1111,6 +1229,14 @@ while [[ $# -gt 0 ]]; do
       }
       shift 2
       ;;
+    --cargo-features)
+      CARGO_FEATURES_INPUT="${2:-}"
+      [[ -n "$CARGO_FEATURES_INPUT" ]] || {
+        error "--cargo-features requires a value"
+        exit 1
+      }
+      shift 2
+      ;;
     --build-first)
       SKIP_BUILD=false
       shift
@@ -1136,7 +1262,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+append_cargo_features_from_input "$CARGO_FEATURES_INPUT"
+refresh_cargo_feature_args
+
 OS_NAME="$(uname -s)"
+DEVICE_CLASS="$(detect_device_class)"
+step_dot "Device: $OS_NAME/$(uname -m) ($DEVICE_CLASS)"
+
 if [[ "$GUIDED_MODE" == "auto" ]]; then
   if [[ "$OS_NAME" == "Linux" && "$ORIGINAL_ARG_COUNT" -eq 0 && -t 0 && -t 1 ]]; then
     GUIDED_MODE="on"
@@ -1173,6 +1305,43 @@ else
 
   if [[ "$INSTALL_SYSTEM_DEPS" == true ]]; then
     install_system_deps
+  fi
+
+  # Always check Xcode/CLT license on macOS, regardless of --install-system-deps.
+  # An un-accepted license causes `cc` to exit 69, breaking all Rust builds.
+  if [[ "$OS_NAME" == "Darwin" ]]; then
+    _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
+    printf 'int main(){return 0;}\n' > "$_xcode_test_file"
+    if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
+      rm -f "$_xcode_test_file"
+      warn "Xcode/CLT license has not been accepted. Attempting to accept it now..."
+      # Use /dev/tty so sudo can prompt for a password even in a curl|bash pipe.
+      _xcode_accept_ok=false
+      if [[ "$(id -u)" -eq 0 ]]; then
+        xcodebuild -license accept && _xcode_accept_ok=true
+      elif [[ -c /dev/tty ]] && have_cmd sudo; then
+        sudo xcodebuild -license accept < /dev/tty && _xcode_accept_ok=true
+      fi
+      if [[ "$_xcode_accept_ok" == true ]]; then
+        step_ok "Xcode license accepted"
+        # Re-test compilation to confirm it's fixed.
+        _xcode_test_file="$(mktemp /tmp/zeroclaw-xcode-check.XXXXXX.c)"
+        printf 'int main(){return 0;}\n' > "$_xcode_test_file"
+        if ! cc -x c "$_xcode_test_file" -o /dev/null 2>/dev/null; then
+          rm -f "$_xcode_test_file"
+          error "C compiler still failing after license accept. Check your Xcode/CLT installation."
+          exit 1
+        fi
+        rm -f "$_xcode_test_file"
+      else
+        error "Could not accept Xcode license. Run manually:"
+        error "  sudo xcodebuild -license accept"
+        error "then re-run this installer."
+        exit 1
+      fi
+    else
+      rm -f "$_xcode_test_file"
+    fi
   fi
 
   if [[ "$INSTALL_RUST" == true ]]; then
@@ -1361,8 +1530,25 @@ if [[ "$SKIP_BUILD" == false ]]; then
     step_dot "Cleaning stale build cache (upgrade detected)"
     cargo clean --release 2>/dev/null || true
   fi
+
+  # Determine cargo feature flags — disable prometheus on 32-bit targets
+  # (prometheus crate requires AtomicU64, unavailable on armv7l/armv6l)
+  _build_arch="$(uname -m)"
+  case "$_build_arch" in
+    armv7l|armv6l|armhf)
+      step_dot "32-bit ARM detected ($_build_arch) — disabling prometheus (requires 64-bit atomics)"
+      CARGO_NO_DEFAULT_FEATURES=true
+      append_cargo_feature "channel-nostr"
+      append_cargo_feature "skill-creation"
+      ;;
+  esac
+  refresh_cargo_feature_args
+  if [[ ${#CARGO_FEATURE_ARGS[@]} -gt 0 ]]; then
+    step_dot "Cargo feature flags: ${CARGO_FEATURE_ARGS[*]}"
+  fi
+
   step_dot "Building release binary"
-  cargo build --release --locked
+  cargo build --release --locked "${CARGO_FEATURE_ARGS[@]}"
   step_ok "Release binary built"
 else
   step_dot "Skipping build"
@@ -1381,7 +1567,7 @@ if [[ "$SKIP_INSTALL" == false ]]; then
     fi
   fi
 
-  cargo install --path "$WORK_DIR" --force --locked
+  cargo install --path "$WORK_DIR" --force --locked "${CARGO_FEATURE_ARGS[@]}"
   step_ok "ZeroClaw installed"
 
   # Sync binary to ~/.local/bin so PATH lookups find the fresh version
@@ -1391,6 +1577,85 @@ if [[ "$SKIP_INSTALL" == false ]]; then
   fi
 else
   step_dot "Skipping install"
+fi
+
+# --- Build web dashboard ---
+if [[ "$SKIP_BUILD" == false && -d "$WORK_DIR/web" ]]; then
+  if have_cmd node && have_cmd npm; then
+    step_dot "Building web dashboard"
+    if (cd "$WORK_DIR/web" && npm ci --ignore-scripts 2>/dev/null && npm run build 2>/dev/null); then
+      step_ok "Web dashboard built"
+    else
+      warn "Web dashboard build failed — dashboard will not be available"
+    fi
+  else
+    warn "node/npm not found — skipping web dashboard build"
+    warn "Install Node.js (>=18) and re-run, or build manually: cd web && npm ci && npm run build"
+  fi
+else
+  if [[ "$SKIP_BUILD" == true ]]; then
+    step_dot "Skipping web dashboard build"
+  fi
+fi
+
+# --- Companion desktop app (device-class-aware) ---
+# The desktop app is a pre-built download from the website, not built from source.
+# This keeps the one-liner install fast and the CLI binary small.
+DESKTOP_DOWNLOAD_URL="https://www.zeroclawlabs.ai/download"
+DESKTOP_APP_DETECTED=false
+
+if [[ "$DEVICE_CLASS" == "desktop" ]]; then
+  # Check if the companion app is already installed
+  case "$OS_NAME" in
+    Darwin)
+      if [[ -d "/Applications/ZeroClaw.app" ]] || [[ -d "$HOME/Applications/ZeroClaw.app" ]]; then
+        DESKTOP_APP_DETECTED=true
+        step_ok "Companion app found (ZeroClaw.app)"
+      fi
+      ;;
+    Linux)
+      if have_cmd zeroclaw-desktop; then
+        DESKTOP_APP_DETECTED=true
+        step_ok "Companion app found (zeroclaw-desktop)"
+      elif [[ -x "$HOME/.local/bin/zeroclaw-desktop" ]]; then
+        DESKTOP_APP_DETECTED=true
+        step_ok "Companion app found (~/.local/bin/zeroclaw-desktop)"
+      fi
+      ;;
+  esac
+
+  if [[ "$DESKTOP_APP_DETECTED" == false ]]; then
+    echo
+    echo -e "${BOLD}Companion App${RESET}"
+    echo -e "  Menu bar access to your ZeroClaw agent."
+    echo -e "  Works alongside the CLI — connects to the same gateway."
+    echo
+    case "$OS_NAME" in
+      Darwin)
+        echo -e "  ${BOLD}Download for macOS:${RESET} ${BLUE}${DESKTOP_DOWNLOAD_URL}${RESET}"
+        ;;
+      Linux)
+        echo -e "  ${BOLD}Download for Linux:${RESET} ${BLUE}${DESKTOP_DOWNLOAD_URL}${RESET}"
+        ;;
+    esac
+    echo -e "  ${DIM}Or run: zeroclaw desktop --install${RESET}"
+  fi
+elif [[ "$DEVICE_CLASS" != "desktop" ]]; then
+  # Non-desktop device — explain why companion app is not offered
+  case "$DEVICE_CLASS" in
+    mobile)
+      step_dot "Mobile device — use the web dashboard at http://127.0.0.1:42617"
+      ;;
+    embedded)
+      step_dot "Embedded device ($(uname -m)) — use the web dashboard"
+      ;;
+    container)
+      step_dot "Container runtime — use the web dashboard"
+      ;;
+    server)
+      step_dot "Headless server — use the web dashboard"
+      ;;
+  esac
 fi
 
 ZEROCLAW_BIN=""
@@ -1467,25 +1732,6 @@ if [[ -n "$ZEROCLAW_BIN" ]]; then
     if "$ZEROCLAW_BIN" service restart 2>/dev/null; then
       step_ok "Gateway service restarted"
 
-      # Fetch and display pairing code from running gateway
-      PAIR_CODE=""
-      for i in 1 2 3 4 5; do
-        sleep 2
-        if PAIR_CODE=$("$ZEROCLAW_BIN" gateway get-paircode 2>/dev/null | grep -oE '[0-9]{6}'); then
-          break
-        fi
-      done
-      if [[ -n "$PAIR_CODE" ]]; then
-        echo
-        echo -e "  ${BOLD_BLUE}🔐 Gateway Pairing Code${RESET}"
-        echo
-        echo -e "  ${BOLD_BLUE}┌──────────────┐${RESET}"
-        echo -e "  ${BOLD_BLUE}│${RESET}  ${BOLD}${PAIR_CODE}${RESET}  ${BOLD_BLUE}│${RESET}"
-        echo -e "  ${BOLD_BLUE}└──────────────┘${RESET}"
-        echo
-        echo -e "  ${DIM}Enter this code in the dashboard to pair your device.${RESET}"
-        echo -e "  ${DIM}Run 'zeroclaw gateway get-paircode --new' anytime to generate a fresh code.${RESET}"
-      fi
     else
       step_fail "Gateway service restart failed — re-run with zeroclaw service start"
     fi
@@ -1532,7 +1778,6 @@ GATEWAY_PORT=42617
 DASHBOARD_URL="http://127.0.0.1:${GATEWAY_PORT}"
 echo
 echo -e "${BOLD}Dashboard URL:${RESET} ${BLUE}${DASHBOARD_URL}${RESET}"
-echo -e "${DIM}  Run 'zeroclaw gateway get-paircode' to get your pairing code.${RESET}"
 
 # --- Copy to clipboard ---
 COPIED_TO_CLIPBOARD=false
@@ -1579,6 +1824,13 @@ echo -e "${BOLD}Next steps:${RESET}"
 echo -e "  ${DIM}zeroclaw status${RESET}"
 echo -e "  ${DIM}zeroclaw agent -m \"Hello, ZeroClaw!\"${RESET}"
 echo -e "  ${DIM}zeroclaw gateway${RESET}"
+if [[ "$DEVICE_CLASS" == "desktop" ]]; then
+  if [[ "$DESKTOP_APP_DETECTED" == true ]]; then
+    echo -e "  ${DIM}zeroclaw desktop${RESET}                ${DIM}# Launch the menu bar app${RESET}"
+  else
+    echo -e "  ${DIM}zeroclaw desktop --install${RESET}      ${DIM}# Download the companion app${RESET}"
+  fi
+fi
 echo
 echo -e "${BOLD}Docs:${RESET} ${BLUE}https://www.zeroclawlabs.ai/docs${RESET}"
 echo
