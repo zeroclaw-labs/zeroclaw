@@ -22,6 +22,29 @@ pub struct ChannelMessage {
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
     pub attachments: Vec<super::media_pipeline::MediaAttachment>,
+    /// When true, the message is stored in session history for context
+    /// but the agent does not generate a response.  Used by channels with
+    /// `mention_only` to passively observe group conversation.
+    #[cfg_attr(test, allow(dead_code))]
+    pub observe_group: bool,
+}
+
+#[allow(clippy::derivable_impls)]
+impl Default for ChannelMessage {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            sender: String::new(),
+            reply_target: String::new(),
+            content: String::new(),
+            channel: String::new(),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+            observe_group: false,
+        }
+    }
 }
 
 /// Message to send through a channel
@@ -271,6 +294,7 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -289,6 +313,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         let cloned = message.clone();

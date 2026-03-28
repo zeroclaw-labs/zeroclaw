@@ -142,6 +142,7 @@ impl Channel for MatrixTestChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -731,6 +732,7 @@ fn channel_message_thread_ts_preserved_on_clone() {
         thread_ts: Some("1700000000.000001".into()),
         interruption_scope_id: None,
         attachments: vec![],
+        observe_group: false,
     };
 
     let cloned = msg.clone();
@@ -749,6 +751,7 @@ fn channel_message_none_thread_ts_preserved() {
         thread_ts: None,
         interruption_scope_id: None,
         attachments: vec![],
+        observe_group: false,
     };
 
     assert!(msg.clone().thread_ts.is_none());
@@ -804,6 +807,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "discord" => ChannelMessage {
             id: "dc_1".into(),
@@ -815,6 +819,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "slack" => ChannelMessage {
             id: "sl_1".into(),
@@ -826,6 +831,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: Some("1700000000.000001".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "imessage" => ChannelMessage {
             id: "im_1".into(),
@@ -837,6 +843,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "irc" => ChannelMessage {
             id: "irc_1".into(),
@@ -848,6 +855,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "email" => ChannelMessage {
             id: "email_1".into(),
@@ -859,6 +867,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "signal" => ChannelMessage {
             id: "sig_1".into(),
@@ -870,6 +879,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "mattermost" => ChannelMessage {
             id: "mm_1".into(),
@@ -881,6 +891,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: Some("root_msg_id".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "whatsapp" => ChannelMessage {
             id: "wa_1".into(),
@@ -892,6 +903,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "nextcloud_talk" => ChannelMessage {
             id: "nc_1".into(),
@@ -903,6 +915,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "wecom" => ChannelMessage {
             id: "wc_1".into(),
@@ -914,6 +927,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "dingtalk" => ChannelMessage {
             id: "dt_1".into(),
@@ -925,6 +939,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "qq" => ChannelMessage {
             id: "qq_1".into(),
@@ -936,6 +951,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "linq" => ChannelMessage {
             id: "lq_1".into(),
@@ -947,6 +963,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "wati" => ChannelMessage {
             id: "wt_1".into(),
@@ -958,6 +975,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
@@ -969,6 +987,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         },
         _ => panic!("Unknown platform: {platform}"),
     }
@@ -1272,6 +1291,7 @@ fn channel_message_zero_timestamp() {
         thread_ts: None,
         interruption_scope_id: None,
         attachments: vec![],
+        observe_group: false,
     };
     assert_eq!(msg.timestamp, 0);
 }
@@ -1288,6 +1308,7 @@ fn channel_message_max_timestamp() {
         thread_ts: None,
         interruption_scope_id: None,
         attachments: vec![],
+        observe_group: false,
     };
     assert_eq!(msg.timestamp, u64::MAX);
 }
