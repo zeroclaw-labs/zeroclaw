@@ -1,11 +1,11 @@
 [workspace]
-members = [".", "crates/robot-kit", "crates/aardvark-sys"]
+members = [".", "crates/robot-kit", "crates/aardvark-sys", "apps/tauri"]
 resolver = "2"
 
 [package]
 name = "zeroclawlabs"
-version = "0.5.9"
-edition = "2021"
+version = "0.6.5"
+edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
@@ -52,8 +52,6 @@ matrix-sdk = { version = "0.16", optional = true, default-features = false, feat
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-serde_ignored = "0.1"
-serde_yaml = "0.9"
 
 # Config
 directories = "6.0"
@@ -77,6 +75,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
+# CIDR-range matching for SSRF validator
+ipnetwork = "0.20"
+
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
@@ -89,8 +90,12 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
+# Tar/gzip extraction (update pipeline)
+flate2 = "1.1"
+tar = "0.4"
+
 # Zip extraction for ClawhHub / OpenClaw registry installers
-zip = { version = "8.1", default-features = false, features = ["deflate"] }
+zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 
 # Error handling
 anyhow = "1.0"
@@ -131,9 +136,11 @@ ring = "0.17"
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 
+# LRU cache for bounded sender state
+lru = "0.16"
+
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
-postgres = { version = "0.19", features = ["with-chrono-0_4"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 chrono-tz = "0.10"
 cron = "0.15"
@@ -150,11 +157,13 @@ which = "8.0"
 
 # WebSocket client channels (Discord/Lark/DingTalk/Nostr)
 tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+tokio-socks = "0.5"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"], optional = true }
 regex = "1.10"
 hostname = "0.4.2"
 rustls = "0.23"
+rustls-pemfile = "2"
 rustls-pki-types = "1.14.0"
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.6"
@@ -166,7 +175,9 @@ async-imap = { version = "0.11",features = ["runtime-tokio"], default-features =
 
 # HTTP server (gateway) — replaces raw TCP for proper HTTP/1.1 compliance
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws", "macros"] }
-tower = { version = "0.5", default-features = false }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "server-graceful"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 tower-http = { version = "0.6", default-features = false, features = ["limit", "timeout"] }
 http-body-util = "0.1"
 
@@ -200,7 +211,7 @@ pdf-extract = { version = "0.10", optional = true }
 extism = { version = "1.20", optional = true }
 
 # Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.17", optional = true }
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
@@ -224,13 +235,12 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["observability-prometheus", "channel-nostr", "skill-creation"]
+default = ["observability-prometheus", "channel-nostr", "channel-lark", "skill-creation"]
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
 channel-lark = ["dep:prost"]
 channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
-memory-postgres = ["dep:postgres"]
 observability-prometheus = ["dep:prometheus"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]
@@ -257,6 +267,8 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 voice-wake = ["dep:cpal"]
 # WASM plugin system (extism-based)
 plugins-wasm = ["dep:extism"]
+# WebAuthn / FIDO2 hardware key authentication
+webauthn = []
 # Meta-feature for CI: all features except those requiring system C libraries
 # not available on standard CI runners (e.g., voice-wake needs libasound2-dev).
 ci-all = [
@@ -264,7 +276,6 @@ ci-all = [
     "hardware",
     "channel-matrix",
     "channel-lark",
-    "memory-postgres",
     "observability-prometheus",
     "observability-otel",
     "peripheral-rpi",
@@ -277,6 +288,10 @@ ci-all = [
     "whatsapp-web",
     "plugins-wasm",
 ]
+
+[profile.dev]
+incremental = true
+opt-level = 1
 
 [profile.release]
 opt-level = "z"      # Optimize for size
@@ -309,6 +324,7 @@ tempfile = "3.26"
 criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
+rcgen = "0.13"
 
 [[test]]
 name = "component"

@@ -616,6 +616,33 @@ code, kbd, pre {
 .markdown-body th { background: var(--pc-accent-glow); }
 .markdown-body img { max-width: 100%; border-radius: 8px; }
 
+/* ── Chat markdown (agent bubbles) ── */
+.chat-markdown p { margin: 0.5em 0; }
+.chat-markdown p:first-child { margin-top: 0; }
+.chat-markdown p:last-child { margin-bottom: 0; }
+.chat-markdown ul, .chat-markdown ol { margin: 0.5em 0; padding-left: 1.5em; }
+.chat-markdown ul { list-style-type: disc; }
+.chat-markdown ol { list-style-type: decimal; }
+.chat-markdown li { margin: 0.25em 0; }
+.chat-markdown li > ul { list-style-type: circle; }
+.chat-markdown li > ul > li > ul { list-style-type: square; }
+.chat-markdown blockquote { border-left: 3px solid var(--pc-accent-dim); padding-left: 0.75em; margin: 0.5em 0; color: var(--pc-text-muted); }
+.chat-markdown h1, .chat-markdown h2, .chat-markdown h3, .chat-markdown h4 { margin: 0.75em 0 0.25em; font-weight: 600; }
+.chat-markdown h1 { font-size: 1.25em; }
+.chat-markdown h2 { font-size: 1.125em; }
+.chat-markdown h3 { font-size: 1em; }
+.chat-markdown hr { border: none; border-top: 1px solid var(--pc-border); margin: 0.75em 0; }
+.chat-markdown a { color: var(--pc-accent-light); text-decoration: underline; }
+.chat-markdown strong { font-weight: 600; color: var(--pc-text-primary); }
+.chat-markdown em { font-style: italic; }
+.chat-markdown code { background: var(--pc-accent-glow); padding: 0.125em 0.375em; border-radius: 0.375em; font-size: 0.875em; font-family: var(--pc-font-mono); }
+.chat-markdown pre { background: var(--pc-bg-code); border: 1px solid var(--pc-border); border-radius: 0.5em; padding: 0.75em; margin: 0.5em 0; overflow-x: auto; font-family: var(--pc-font-mono); font-size: 0.85em; line-height: 1.5; }
+.chat-markdown pre code { background: transparent; padding: 0; border-radius: 0; font-size: inherit; }
+.chat-markdown table { border-collapse: collapse; margin: 0.5em 0; display: block; overflow-x: auto; max-width: 100%; }
+.chat-markdown th, .chat-markdown td { border: 1px solid var(--pc-border); padding: 0.375em 0.75em; font-size: 0.875em; }
+.chat-markdown th { background: var(--pc-accent-glow); font-weight: 600; }
+.chat-markdown img { max-width: 100%; border-radius: 0.5em; }
+
 /* ── Accessibility: reduced motion ── */
 @media (prefers-reduced-motion: reduce) {
   .animate-fade-in,
@@ -645,4 +672,46 @@ code, kbd, pre {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }
+}
+
+/* ── Tool call cards (AgentChat) ── */
+.tool-card {
+  border-left: 3px solid var(--pc-accent);
+  background: var(--pc-bg-surface);
+  padding: 0.5rem 0.75rem;
+  border-radius: 0.5rem;
+}
+
+.tool-card__header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.8125rem;
+  font-weight: 500;
+}
+
+.tool-card details summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.75rem;
+  color: var(--pc-text-muted);
+  margin-top: 0.25rem;
+}
+
+.tool-card pre {
+  font-size: 0.75rem;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 12rem;
+  overflow-y: auto;
+  margin-top: 0.25rem;
+  padding: 0.5rem;
+  border-radius: 0.375rem;
+  background: var(--pc-bg-code);
+}
+
+.tool-card__inline {
+  font-size: 0.75rem;
+  color: var(--pc-text-muted);
+  margin-top: 0.25rem;
 }
