@@ -1349,6 +1349,13 @@ pub struct AgentConfig {
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
+    /// When `true`, only native/structured tool calls from the provider are
+    /// honoured.  Text-based fallback parsing (XML tags, markdown blocks, GLM
+    /// format) is skipped entirely.  This is useful for providers that reliably
+    /// emit structured tool calls and where text artefacts should be treated as
+    /// regular assistant output rather than tool invocations.  Default: `false`.
+    #[serde(default)]
+    pub native_tool_calls_only: bool,
     /// Per-turn MCP tool schema filtering groups.
     ///
     /// When non-empty, only MCP tools matched by an active group are included in the
@@ -1439,6 +1446,7 @@ impl Default for AgentConfig {
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
+            native_tool_calls_only: false,
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::agent::thinking::ThinkingConfig::default(),
