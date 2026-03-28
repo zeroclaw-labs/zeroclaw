@@ -1383,6 +1383,39 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         }
     }
 
+    // Gemini via OpenRouter sometimes returns multiple JSON objects separated by
+    // newlines (JSONL) — e.g. one line with tool_calls and a follow-up line with
+    // tool_code. Only match lines that carry both "content" and "tool_calls" keys
+    // (the Gemini envelope shape) to avoid accidentally treating arbitrary JSON
+    // in tool output or user messages as tool calls.
+    {
+        let mut jsonl_calls = Vec::new();
+        let mut jsonl_text_parts = Vec::new();
+        for line in response.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(line) {
+                if json_value.get("content").is_none() || json_value.get("tool_calls").is_none() {
+                    continue;
+                }
+                let line_calls = parse_tool_calls_from_json_value(&json_value);
+                if !line_calls.is_empty() {
+                    if let Some(content) = json_value.get("content").and_then(|v| v.as_str()) {
+                        if !content.trim().is_empty() {
+                            jsonl_text_parts.push(content.trim().to_string());
+                        }
+                    }
+                    jsonl_calls.extend(line_calls);
+                }
+            }
+        }
+        if !jsonl_calls.is_empty() {
+            return (jsonl_text_parts.join("\n"), jsonl_calls);
+        }
+    }
+
     if let Some((minimax_text, minimax_calls)) = parse_minimax_invoke_calls(response) {
         if !minimax_calls.is_empty() {
             return (minimax_text, minimax_calls);
@@ -8242,6 +8275,33 @@ Final answer."#;
         // When tool_calls is empty, the entire JSON is returned as text
         assert!(text.contains("Hello"));
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_gemini_jsonl_multi_object() {
+        // Gemini via OpenRouter sometimes returns multiple JSON objects on separate
+        // lines: the first carries real tool_calls, the second has tool_code noise.
+        let response = concat!(
+            "{\"content\":\"Of course!\",\"tool_calls\":[{\"arguments\":\"{\\\"job_id\\\":\\\"abc123\\\"}\",\"id\":\"tool_cron_remove_x\",\"name\":\"cron_remove\"}]}\n",
+            "{\"content\":\"Done.\",\"tool_code\":\"print(default_api.cron_list())\"}"
+        );
+        let (text, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 1, "should parse the tool call from the first JSON line");
+        assert_eq!(calls[0].name, "cron_remove");
+        assert_eq!(text, "Of course!");
+    }
+
+    #[test]
+    fn parse_tool_calls_jsonl_ignores_bare_name_json_lines() {
+        // Lines with only "name"/"arguments" (no "content"+"tool_calls" envelope)
+        // must not trigger the JSONL path — prevents accidental tool execution from
+        // JSON that appears in tool output or echoed user content.
+        let response = concat!(
+            "Here is the result:\n",
+            "{\"name\":\"shell\",\"arguments\":{\"command\":\"id\"}}"
+        );
+        let (_, calls) = parse_tool_calls(response);
+        assert!(calls.is_empty(), "bare JSON name/arguments line must not be treated as a tool call");
     }
 
     #[test]
