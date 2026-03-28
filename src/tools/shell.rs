@@ -1,15 +1,15 @@
 use super::traits::{Tool, ToolResult};
 use crate::runtime::RuntimeAdapter;
-use crate::security::traits::Sandbox;
 use crate::security::SecurityPolicy;
+use crate::security::traits::Sandbox;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Maximum shell command execution time before kill.
-const SHELL_TIMEOUT_SECS: u64 = 60;
+/// Default maximum shell command execution time before kill.
+const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
@@ -46,6 +46,7 @@ pub struct ShellTool {
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
+    timeout_secs: u64,
 }
 
 impl ShellTool {
@@ -54,6 +55,7 @@ impl ShellTool {
             security,
             runtime,
             sandbox: Arc::new(crate::security::NoopSandbox),
+            timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
         }
     }
 
@@ -66,7 +68,14 @@ impl ShellTool {
             security,
             runtime,
             sandbox,
+            timeout_secs: DEFAULT_SHELL_TIMEOUT_SECS,
         }
+    }
+
+    /// Override the command execution timeout (in seconds).
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        self.timeout_secs = secs;
+        self
     }
 }
 
@@ -203,8 +212,8 @@ impl Tool for ShellTool {
             }
         }
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
+        let timeout_secs = self.timeout_secs;
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -248,7 +257,7 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!(
-                    "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
+                    "Command timed out after {timeout_secs}s and was killed"
                 )),
             }),
         }
@@ -290,10 +299,12 @@ mod tests {
         let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["command"].is_object());
-        assert!(schema["required"]
-            .as_array()
-            .expect("schema required field should be an array")
-            .contains(&json!("command")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .expect("schema required field should be an array")
+                .contains(&json!("command"))
+        );
         assert!(schema["properties"]["approved"].is_object());
     }
 
@@ -329,11 +340,13 @@ mod tests {
             .await
             .expect("readonly command execution should return a result");
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_ref()
-            .expect("error field should be present for blocked command")
-            .contains("not allowed"));
+        assert!(
+            result
+                .error
+                .as_ref()
+                .expect("error field should be present for blocked command")
+                .contains("not allowed")
+        );
     }
 
     #[tokio::test]
@@ -369,11 +382,13 @@ mod tests {
             .await
             .expect("absolute path argument should be blocked");
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Path blocked"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked")
+        );
     }
 
     #[tokio::test]
@@ -384,11 +399,13 @@ mod tests {
             .await
             .expect("option-assigned forbidden path should be blocked");
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Path blocked"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked")
+        );
     }
 
     #[tokio::test]
@@ -399,11 +416,13 @@ mod tests {
             .await
             .expect("short option attached forbidden path should be blocked");
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Path blocked"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked")
+        );
     }
 
     #[tokio::test]
@@ -414,11 +433,13 @@ mod tests {
             .await
             .expect("tilde-user path should be blocked");
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Path blocked"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Path blocked")
+        );
     }
 
     #[tokio::test]
@@ -429,11 +450,13 @@ mod tests {
             .await
             .expect("input redirection bypass should be blocked");
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("not allowed"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not allowed")
+        );
     }
 
     fn test_security_with_env_cmd() -> Arc<SecurityPolicy> {
@@ -465,7 +488,8 @@ mod tests {
     impl EnvGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let original = std::env::var(key).ok();
-            std::env::set_var(key, value);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var(key, value) };
             Self { key, original }
         }
     }
@@ -473,8 +497,10 @@ mod tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.original {
-                Some(val) => std::env::set_var(self.key, val),
-                None => std::env::remove_var(self.key),
+                // SAFETY: test-only, single-threaded test runner.
+                Some(val) => unsafe { std::env::set_var(self.key, val) },
+                // SAFETY: test-only, single-threaded test runner.
+                None => unsafe { std::env::remove_var(self.key) },
             }
         }
     }
@@ -527,11 +553,13 @@ mod tests {
             .await
             .expect("plain variable expansion should be blocked");
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("not allowed"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("not allowed")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -547,9 +575,11 @@ mod tests {
             .await
             .expect("env command execution should succeed");
         assert!(result.success);
-        assert!(result
-            .output
-            .contains("ZEROCLAW_TEST_PASSTHROUGH=db://unit-test"));
+        assert!(
+            result
+                .output
+                .contains("ZEROCLAW_TEST_PASSTHROUGH=db://unit-test")
+        );
     }
 
     #[test]
@@ -585,11 +615,13 @@ mod tests {
             .await
             .expect("unapproved command should return a result");
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("explicit approval")
+        );
 
         let allowed = tool
             .execute(json!({
@@ -607,8 +639,18 @@ mod tests {
     // ── shell timeout enforcement tests ─────────────────
 
     #[test]
-    fn shell_timeout_constant_is_reasonable() {
-        assert_eq!(SHELL_TIMEOUT_SECS, 60, "shell timeout must be 60 seconds");
+    fn shell_timeout_default_is_reasonable() {
+        assert_eq!(
+            DEFAULT_SHELL_TIMEOUT_SECS, 60,
+            "default shell timeout must be 60 seconds"
+        );
+    }
+
+    #[test]
+    fn shell_timeout_can_be_overridden() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime())
+            .with_timeout_secs(120);
+        assert_eq!(tool.timeout_secs, 120);
     }
 
     #[test]

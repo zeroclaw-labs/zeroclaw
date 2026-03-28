@@ -60,6 +60,11 @@ enum ChannelEvent {
         channel_id: String,
         message_id: String,
     },
+    RedactMessage {
+        channel_id: String,
+        message_id: String,
+        reason: Option<String>,
+    },
 }
 
 /// Full-featured matrix test channel that tracks every trait method invocation.
@@ -125,6 +130,7 @@ impl Channel for MatrixTestChannel {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -253,6 +259,23 @@ impl Channel for MatrixTestChannel {
             .push(ChannelEvent::UnpinMessage {
                 channel_id: channel_id.to_string(),
                 message_id: message_id.to_string(),
+            });
+        Ok(())
+    }
+
+    async fn redact_message(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(ChannelEvent::RedactMessage {
+                channel_id: channel_id.to_string(),
+                message_id: message_id.to_string(),
+                reason,
             });
         Ok(())
     }
@@ -552,7 +575,44 @@ async fn pin_multiple_messages_in_same_channel() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 6. CHANNEL MESSAGE IDENTITY & FIELD SEMANTICS
+// 6. MESSAGE REDACTION SUPPORT
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Tests that MatrixTestChannel correctly records redaction events.
+/// This validates the mock contract, not the trait default or real implementation.
+/// Trait default coverage: `src/channels/traits.rs::default_redact_message_returns_success`
+/// Real implementation coverage: requires live Matrix integration tests (not in this suite).
+#[tokio::test]
+async fn redact_message_lifecycle() {
+    let ch = MatrixTestChannel::new("matrix");
+
+    ch.redact_message("room_1", "msg_1", Some("spam".to_string()))
+        .await
+        .unwrap();
+    ch.redact_message("room_1", "msg_2", None).await.unwrap();
+
+    let events = ch.events();
+    assert_eq!(events.len(), 2);
+    assert!(matches!(
+        &events[0],
+        ChannelEvent::RedactMessage {
+            channel_id,
+            message_id,
+            reason
+        } if channel_id == "room_1" && message_id == "msg_1" && reason == &Some("spam".to_string())
+    ));
+    assert!(matches!(
+        &events[1],
+        ChannelEvent::RedactMessage {
+            channel_id,
+            message_id,
+            reason
+        } if channel_id == "room_1" && message_id == "msg_2" && reason.is_none()
+    ));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. CHANNEL MESSAGE IDENTITY & FIELD SEMANTICS
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[test]
@@ -566,6 +626,7 @@ fn channel_message_thread_ts_preserved_on_clone() {
         timestamp: 1700000000,
         thread_ts: Some("1700000000.000001".into()),
         interruption_scope_id: None,
+        attachments: vec![],
     };
 
     let cloned = msg.clone();
@@ -583,6 +644,7 @@ fn channel_message_none_thread_ts_preserved() {
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
+        attachments: vec![],
     };
 
     assert!(msg.clone().thread_ts.is_none());
@@ -616,7 +678,7 @@ fn send_message_with_subject_preserves_thread() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 7. CROSS-CHANNEL IDENTITY SEMANTICS PER PLATFORM
+// 8. CROSS-CHANNEL IDENTITY SEMANTICS PER PLATFORM
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Simulates the identity mapping for each platform:
@@ -637,6 +699,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "discord" => ChannelMessage {
             id: "dc_1".into(),
@@ -647,6 +710,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "slack" => ChannelMessage {
             id: "sl_1".into(),
@@ -657,6 +721,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: Some("1700000000.000001".into()),
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "imessage" => ChannelMessage {
             id: "im_1".into(),
@@ -667,6 +732,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "irc" => ChannelMessage {
             id: "irc_1".into(),
@@ -677,6 +743,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "email" => ChannelMessage {
             id: "email_1".into(),
@@ -687,6 +754,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "signal" => ChannelMessage {
             id: "sig_1".into(),
@@ -697,6 +765,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "mattermost" => ChannelMessage {
             id: "mm_1".into(),
@@ -707,6 +776,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: Some("root_msg_id".into()),
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "whatsapp" => ChannelMessage {
             id: "wa_1".into(),
@@ -717,6 +787,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "nextcloud_talk" => ChannelMessage {
             id: "nc_1".into(),
@@ -727,6 +798,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "wecom" => ChannelMessage {
             id: "wc_1".into(),
@@ -737,6 +809,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "dingtalk" => ChannelMessage {
             id: "dt_1".into(),
@@ -747,6 +820,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "qq" => ChannelMessage {
             id: "qq_1".into(),
@@ -757,6 +831,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "linq" => ChannelMessage {
             id: "lq_1".into(),
@@ -767,6 +842,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "wati" => ChannelMessage {
             id: "wt_1".into(),
@@ -777,6 +853,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
@@ -787,6 +864,7 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         },
         _ => panic!("Unknown platform: {platform}"),
     }
@@ -902,7 +980,7 @@ fn threaded_platforms_have_thread_ts() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 8. SEND → REPLY ROUNDTRIP CONSISTENCY
+// 9. SEND → REPLY ROUNDTRIP CONSISTENCY
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -944,7 +1022,7 @@ async fn threaded_reply_preserves_thread_ts() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 9. CONCURRENT OPERATIONS
+// 10. CONCURRENT OPERATIONS
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1018,7 +1096,7 @@ async fn concurrent_reactions_all_recorded() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 10. EDGE CASES & BOUNDARY CONDITIONS
+// 11. EDGE CASES & BOUNDARY CONDITIONS
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1031,10 +1109,11 @@ async fn send_empty_content() {
 async fn send_very_long_content() {
     let ch = MatrixTestChannel::new("test");
     let long_content = "a".repeat(100_000);
-    assert!(ch
-        .send(&SendMessage::new(&long_content, "user_1"))
-        .await
-        .is_ok());
+    assert!(
+        ch.send(&SendMessage::new(&long_content, "user_1"))
+            .await
+            .is_ok()
+    );
 
     let events = ch.events();
     match &events[0] {
@@ -1088,6 +1167,7 @@ fn channel_message_zero_timestamp() {
         timestamp: 0,
         thread_ts: None,
         interruption_scope_id: None,
+        attachments: vec![],
     };
     assert_eq!(msg.timestamp, 0);
 }
@@ -1103,6 +1183,7 @@ fn channel_message_max_timestamp() {
         timestamp: u64::MAX,
         thread_ts: None,
         interruption_scope_id: None,
+        attachments: vec![],
     };
     assert_eq!(msg.timestamp, u64::MAX);
 }
@@ -1121,7 +1202,7 @@ fn send_message_empty_subject() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 11. MULTI-CHANNEL SIMULATION (CROSS-CHANNEL ROUTING)
+// 12. MULTI-CHANNEL SIMULATION (CROSS-CHANNEL ROUTING)
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
@@ -1184,7 +1265,7 @@ async fn multi_channel_listen_produces_channel_tagged_messages() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 12. CAPABILITY MATRIX DECLARATIONS
+// 13. CAPABILITY MATRIX DECLARATIONS
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Documents the expected capability matrix for all channels. This test serves
@@ -1223,7 +1304,7 @@ async fn capability_matrix_spec() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 13. DEFAULT TRAIT METHOD CONTRACT (via dyn dispatch)
+// 14. DEFAULT TRAIT METHOD CONTRACT (via dyn dispatch)
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Minimal channel with ONLY required methods — validates all defaults work.
@@ -1253,11 +1334,12 @@ async fn minimal_channel_all_defaults_succeed() {
     assert!(ch.start_typing("user").await.is_ok());
     assert!(ch.stop_typing("user").await.is_ok());
     assert!(!ch.supports_draft_updates());
-    assert!(ch
-        .send_draft(&SendMessage::new("d", "u"))
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        ch.send_draft(&SendMessage::new("d", "u"))
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(ch.update_draft("u", "m", "t").await.is_ok());
     assert!(ch.finalize_draft("u", "m", "t").await.is_ok());
     assert!(ch.cancel_draft("u", "m").await.is_ok());
@@ -1265,6 +1347,12 @@ async fn minimal_channel_all_defaults_succeed() {
     assert!(ch.remove_reaction("c", "m", "\u{1F440}").await.is_ok());
     assert!(ch.pin_message("c", "m").await.is_ok());
     assert!(ch.unpin_message("c", "m").await.is_ok());
+    assert!(
+        ch.redact_message("c", "m", Some("test".to_string()))
+            .await
+            .is_ok()
+    );
+    assert!(ch.redact_message("c", "m", None).await.is_ok());
 }
 
 #[tokio::test]
@@ -1286,7 +1374,7 @@ async fn dyn_channel_dispatch_works() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 14. MIXED OPERATION SEQUENCES
+// 15. MIXED OPERATION SEQUENCES
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]

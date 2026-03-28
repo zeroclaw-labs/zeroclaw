@@ -106,8 +106,14 @@ impl SkillCreator {
         // Trim leading/trailing hyphens, then truncate.
         let trimmed = collapsed.trim_matches('-');
         if trimmed.len() > 64 {
-            // Truncate at a hyphen boundary if possible.
-            let truncated = &trimmed[..64];
+            // Find the nearest valid character boundary at or before 64 bytes.
+            let safe_index = trimmed
+                .char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= 64)
+                .last()
+                .unwrap_or(0);
+            let truncated = &trimmed[..safe_index];
             truncated.trim_end_matches('-').to_string()
         } else {
             trimmed.to_string()
@@ -623,18 +629,22 @@ tags = ["auto-generated"]
         // High similarity provider -> should detect as duplicate.
         let provider = MockEmbeddingProvider::new(0.95);
         let creator = SkillCreator::new(dir.path().to_path_buf(), config.clone());
-        assert!(creator
-            .is_duplicate("Build the project", &provider)
-            .await
-            .unwrap());
+        assert!(
+            creator
+                .is_duplicate("Build the project", &provider)
+                .await
+                .unwrap()
+        );
 
         // Low similarity provider -> not a duplicate.
         let provider_low = MockEmbeddingProvider::new(0.3);
         let creator2 = SkillCreator::new(dir.path().to_path_buf(), config);
-        assert!(!creator2
-            .is_duplicate("Completely different task", &provider_low)
-            .await
-            .unwrap());
+        assert!(
+            !creator2
+                .is_duplicate("Completely different task", &provider_low)
+                .await
+                .unwrap()
+        );
     }
 
     // ── LRU eviction ─────────────────────────────────────────────

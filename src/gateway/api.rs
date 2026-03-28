@@ -5,7 +5,7 @@
 use super::AppState;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
@@ -23,7 +23,7 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
-fn require_auth(
+pub(super) fn require_auth(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
@@ -50,6 +50,10 @@ fn require_auth(
 pub struct MemoryQuery {
     pub query: Option<String>,
     pub category: Option<String>,
+    /// Filter memories created at or after (RFC 3339 / ISO 8601)
+    pub since: Option<String>,
+    /// Filter memories created at or before (RFC 3339 / ISO 8601)
+    pub until: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -76,6 +80,14 @@ pub struct CronAddBody {
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub delete_after_run: Option<bool>,
+}
+
+#[derive(Deserialize)]
+pub struct CronPatchBody {
+    pub name: Option<String>,
+    pub schedule: Option<String>,
+    pub command: Option<String>,
+    pub prompt: Option<String>,
 }
 
 // ── Handlers ────────────────────────────────────────────────────
@@ -228,27 +240,7 @@ pub async fn handle_api_cron_list(
 
     let config = state.config.lock().clone();
     match crate::cron::list_jobs(&config) {
-        Ok(jobs) => {
-            let jobs_json: Vec<serde_json::Value> = jobs
-                .iter()
-                .map(|job| {
-                    serde_json::json!({
-                        "id": job.id,
-                        "name": job.name,
-                        "job_type": job.job_type,
-                        "command": job.command,
-                        "prompt": job.prompt,
-                        "schedule": job.schedule,
-                        "next_run": job.next_run.to_rfc3339(),
-                        "last_run": job.last_run.map(|t| t.to_rfc3339()),
-                        "last_status": job.last_status,
-                        "enabled": job.enabled,
-                        "delivery": job.delivery,
-                    })
-                })
-                .collect();
-            Json(serde_json::json!({"jobs": jobs_json})).into_response()
-        }
+        Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to list cron jobs: {e}")})),
@@ -344,20 +336,7 @@ pub async fn handle_api_cron_add(
     };
 
     match result {
-        Ok(job) => Json(serde_json::json!({
-            "status": "ok",
-            "job": {
-                "id": job.id,
-                "name": job.name,
-                "job_type": job.job_type,
-                "command": job.command,
-                "prompt": job.prompt,
-                "schedule": job.schedule,
-                "enabled": job.enabled,
-                "delivery": job.delivery,
-            }
-        }))
-        .into_response(),
+        Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
@@ -410,6 +389,66 @@ pub async fn handle_api_cron_runs(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to list cron runs: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// PATCH /api/cron/:id — update an existing cron job
+pub async fn handle_api_cron_patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<CronPatchBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    // Build the schedule from the provided expression string (if any).
+    let schedule = match body.schedule {
+        Some(expr) if !expr.trim().is_empty() => Some(crate::cron::Schedule::Cron {
+            expr: expr.trim().to_string(),
+            tz: None,
+        }),
+        _ => None,
+    };
+
+    // Route the edited text to the correct field based on the job's stored type.
+    // The frontend sends a single textarea value; for agent jobs it is the prompt,
+    // for shell jobs it is the command.
+    let existing = match crate::cron::get_job(&config, &id) {
+        Ok(j) => j,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("Cron job not found: {e}")})),
+            )
+                .into_response();
+        }
+    };
+    let is_agent = matches!(existing.job_type, crate::cron::JobType::Agent);
+    let (patch_command, patch_prompt) = if is_agent {
+        (None, body.command.or(body.prompt))
+    } else {
+        (body.command.or(body.prompt), None)
+    };
+
+    let patch = crate::cron::CronJobPatch {
+        name: body.name,
+        schedule,
+        command: patch_command,
+        prompt: patch_prompt,
+        ..crate::cron::CronJobPatch::default()
+    };
+
+    match crate::cron::update_shell_job_with_approval(&config, &id, patch, false) {
+        Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to update cron job: {e}")})),
         )
             .into_response(),
     }
@@ -598,9 +637,12 @@ pub async fn handle_api_memory_list(
         return e.into_response();
     }
 
-    if let Some(ref query) = params.query {
-        // Search mode
-        match state.mem.recall(query, 50, None).await {
+    // Use recall when query or time range is provided
+    if params.query.is_some() || params.since.is_some() || params.until.is_some() {
+        let query = params.query.as_deref().unwrap_or("");
+        let since = params.since.as_deref();
+        let until = params.until.as_deref();
+        match state.mem.recall(query, 50, None, since, until).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1014,6 +1056,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(email) = masked.channels_config.email.as_mut() {
         mask_required_secret(&mut email.password);
     }
+    mask_optional_secret(&mut masked.transcription.api_key);
     masked
 }
 
@@ -1201,6 +1244,10 @@ fn restore_masked_sensitive_fields(
     ) {
         restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
+    restore_optional_secret(
+        &mut incoming.transcription.api_key,
+        &current.transcription.api_key,
+    );
 }
 
 fn hydrate_config_for_save(
@@ -1238,16 +1285,54 @@ pub async fn handle_api_sessions_list(
         .into_iter()
         .filter_map(|meta| {
             let session_id = meta.key.strip_prefix("gw_")?;
-            Some(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "session_id": session_id,
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
-            }))
+            });
+            if let Some(name) = meta.name {
+                entry["name"] = serde_json::Value::String(name);
+            }
+            Some(entry)
         })
         .collect();
 
     Json(serde_json::json!({ "sessions": gw_sessions })).into_response()
+}
+
+/// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
+pub async fn handle_api_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "session_id": id,
+            "messages": [],
+            "session_persistence": false,
+        }))
+        .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    let msgs = backend.load(&session_key);
+    let messages: Vec<serde_json::Value> = msgs
+        .into_iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+
+    Json(serde_json::json!({
+        "session_id": id,
+        "messages": messages,
+        "session_persistence": true,
+    }))
+    .into_response()
 }
 
 /// DELETE /api/sessions/{id} — delete a gateway session
@@ -1284,10 +1369,168 @@ pub async fn handle_api_session_delete(
     }
 }
 
+/// PUT /api/sessions/{id} — rename a gateway session
+pub async fn handle_api_session_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let name = body["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name is required"})),
+        )
+            .into_response();
+    }
+
+    let session_key = format!("gw_{id}");
+
+    // Verify the session exists before renaming
+    let sessions = backend.list_sessions();
+    if !sessions.contains(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
+    match backend.set_session_name(&session_key, name) {
+        Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/sessions/running — list sessions currently in "running" state
+pub async fn handle_api_sessions_running(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "sessions": [],
+            "message": "Session persistence is disabled"
+        }))
+        .into_response();
+    };
+
+    let running = backend.list_running_sessions();
+    let sessions: Vec<serde_json::Value> = running
+        .into_iter()
+        .filter_map(|meta| {
+            let session_id = meta.key.strip_prefix("gw_")?;
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "created_at": meta.created_at.to_rfc3339(),
+                "last_activity": meta.last_activity.to_rfc3339(),
+                "message_count": meta.message_count,
+            }))
+        })
+        .collect();
+
+    Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// GET /api/sessions/{id}/state — get session state
+pub async fn handle_api_session_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    match backend.get_session_state(&session_key) {
+        Ok(Some(ss)) => {
+            let mut resp = serde_json::json!({
+                "session_id": id,
+                "state": ss.state,
+            });
+            if let Some(turn_id) = ss.turn_id {
+                resp["turn_id"] = serde_json::Value::String(turn_id);
+            }
+            if let Some(started) = ss.turn_started_at {
+                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
+            }
+            Json(resp).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+// ── Claude Code hook endpoint ────────────────────────────────────
+
+/// POST /hooks/claude-code — receives HTTP hook events from Claude Code
+/// sessions spawned by [`ClaudeCodeRunnerTool`].
+///
+/// Claude Code posts structured JSON describing tool executions, completions,
+/// and errors. This handler logs the event and (when a Slack channel is
+/// configured) could be wired to update a Slack message in-place.
+pub async fn handle_claude_code_hook(
+    State(state): State<AppState>,
+    Json(payload): Json<crate::tools::claude_code_runner::ClaudeCodeHookEvent>,
+) -> impl IntoResponse {
+    // Do not require bearer-token auth: Claude Code subprocesses cannot easily
+    // obtain a pairing token, and the hook carries a session_id that ties it
+    // back to a session we spawned.
+    let _ = &state; // retained for future Slack update wiring
+
+    tracing::info!(
+        session_id = %payload.session_id,
+        event_type = %payload.event_type,
+        tool_name = ?payload.tool_name,
+        summary = ?payload.summary,
+        "Claude Code hook event received"
+    );
+
+    Json(serde_json::json!({ "ok": true }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::{nodes, AppState, GatewayRateLimiter, IdempotencyStore};
+    use crate::gateway::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
     use crate::security::pairing::PairingGuard;
@@ -1321,6 +1564,8 @@ mod tests {
             _query: &str,
             _limit: usize,
             _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
         ) -> anyhow::Result<Vec<MemoryEntry>> {
             Ok(Vec::new())
         }
@@ -1377,6 +1622,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(crate::gateway::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
@@ -1385,6 +1631,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             wati: None,
+            gmail_push: None,
             observer: Arc::new(crate::observability::NoopObserver),
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
@@ -1392,8 +1639,15 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            session_queue: Arc::new(crate::gateway::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
             device_registry: None,
             pending_pairings: None,
+            path_prefix: String::new(),
+            canvas_store: crate::tools::canvas::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         }
     }
 
@@ -1422,6 +1676,7 @@ mod tests {
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
             allowed_numbers: vec![],
+            proxy_url: None,
         });
         cfg.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_aabbcc".to_string(),
@@ -1431,6 +1686,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         cfg.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),
@@ -1556,6 +1812,7 @@ mod tests {
             api_url: "https://live-mt-server.wati.io".to_string(),
             tenant_id: None,
             allowed_numbers: vec![],
+            proxy_url: None,
         });
         current.channels_config.feishu = Some(crate::config::schema::FeishuConfig {
             app_id: "cli_current".to_string(),
@@ -1565,6 +1822,7 @@ mod tests {
             allowed_users: vec!["*".to_string()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         current.channels_config.email = Some(crate::channels::email_channel::EmailConfig {
             imap_host: "imap.example.com".to_string(),
@@ -1804,14 +2062,18 @@ mod tests {
             Some("route-embed-key-1")
         );
         assert_eq!(hydrated.embedding_routes[2].api_key, None);
-        assert!(hydrated
-            .model_routes
-            .iter()
-            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
-        assert!(hydrated
-            .embedding_routes
-            .iter()
-            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
+        assert!(
+            hydrated
+                .model_routes
+                .iter()
+                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
+        );
+        assert!(
+            hydrated
+                .embedding_routes
+                .iter()
+                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
+        );
     }
 
     #[tokio::test]
@@ -1933,10 +2195,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("delivery.to is required"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("delivery.to is required")
+        );
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
@@ -1975,10 +2239,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("unsupported delivery channel"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported delivery channel")
+        );
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());

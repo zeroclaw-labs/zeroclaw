@@ -1,0 +1,25 @@
+[package]
+name = "aardvark-sys"
+version = "0.1.0"
+edition = "2024"
+authors = ["theonlyhennygod"]
+license = "MIT OR Apache-2.0"
+description = "Low-level bindings for the Total Phase Aardvark I2C/SPI/GPIO USB adapter"
+repository = "https://github.com/zeroclaw-labs/zeroclaw"
+
+# NOTE: This crate is the ONLY place in ZeroClaw where unsafe code is permitted.
+# The rest of the workspace remains #![forbid(unsafe_code)].
+#
+# Stub implementation: the Total Phase SDK (aardvark.h + aardvark.so) is NOT
+# yet committed.  All AardvarkHandle methods return Err(AardvarkError::NotFound)
+# at runtime.  No unsafe code is needed for the stub.
+#
+# To enable real hardware (once SDK files are in vendor/):
+#   1. Add `bindgen = "0.69"` to [build-dependencies]
+#   2. Add `libc = "0.2"` to [dependencies]
+#   3. Uncomment the build.rs bindgen call
+#   4. Replace stub method bodies with FFI calls via mod bindings
+
+[dependencies]
+libloading = "0.9"
+thiserror = "2.0"
