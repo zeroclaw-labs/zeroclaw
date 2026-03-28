@@ -1840,6 +1840,10 @@ pub(super) async fn run_gateway_chat_with_tools(
         config.web_search = disk_config.web_search;
         config.web_fetch = disk_config.web_fetch;
         config.model_routes = disk_config.model_routes;
+        config.provider_api_keys = disk_config.provider_api_keys;
+        config.api_key = disk_config.api_key.or(config.api_key);
+        config.default_provider = disk_config.default_provider.or(config.default_provider);
+        config.default_model = disk_config.default_model.or(config.default_model);
         // Update the in-memory state so the gateway stays consistent.
         *state.config.lock() = config.clone();
     }
