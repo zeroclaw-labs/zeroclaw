@@ -35,11 +35,38 @@ impl FirejailSandbox {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+
+    /// Check if seccomp is available for syscall filtering
+    fn seccomp_available() -> bool {
+        Command::new("firejail")
+            .arg("--help")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("--seccomp"))
+            .unwrap_or(false)
+    }
+
+    /// Check if caps.drop=all is available
+    fn caps_drop_available() -> bool {
+        Command::new("firejail")
+            .arg("--help")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("--caps.drop"))
+            .unwrap_or(false)
+    }
+
+    /// Check if --noroot is available
+    fn noroot_available() -> bool {
+        Command::new("firejail")
+            .arg("--help")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("--noroot"))
+            .unwrap_or(false)
+    }
 }
 
 impl Sandbox for FirejailSandbox {
     fn wrap_command(&self, cmd: &mut Command) -> std::io::Result<()> {
-        // Prepend firejail to the command
+        // Prepend firejail to command
         let program = cmd.get_program().to_string_lossy().to_string();
         let args: Vec<String> = cmd
             .get_args()
@@ -60,11 +87,33 @@ impl Sandbox for FirejailSandbox {
             "--quiet",        // Suppress warnings
         ]);
 
-        // Add the original command
+        // Try to enable seccomp for syscall filtering
+        if Self::seccomp_available() {
+            tracing::info!("Enabling seccomp BPF filter for firejail sandbox");
+            firejail_cmd.arg("--seccomp");
+        } else {
+            tracing::warn!(
+                "seccomp not available in firejail. Install firejail with seccomp support for enhanced syscall filtering."
+            );
+        }
+
+        // Try to drop all capabilities
+        if Self::caps_drop_available() {
+            tracing::info!("Dropping all capabilities in firejail sandbox");
+            firejail_cmd.arg("--caps.drop=all");
+        }
+
+        // Try to prevent root
+        if Self::noroot_available() {
+            tracing::info!("Preventing root in firejail sandbox");
+            firejail_cmd.arg("--noroot");
+        }
+
+        // Add original command
         firejail_cmd.arg(&program);
         firejail_cmd.args(&args);
 
-        // Replace the command
+        // Replace command
         *cmd = firejail_cmd;
         Ok(())
     }

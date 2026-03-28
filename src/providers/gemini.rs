@@ -5,7 +5,9 @@
 //! - Google Cloud ADC (`GOOGLE_APPLICATION_CREDENTIALS`)
 
 use crate::auth::AuthService;
-use crate::providers::traits::{ChatMessage, Provider, TokenUsage};
+use crate::providers::traits::{
+    ChatMessage, ChatRequest, ChatResponse, Provider, TokenUsage, ToolsPayload,
+};
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
@@ -977,6 +979,50 @@ impl GeminiProvider {
 }
 
 impl GeminiProvider {
+    /// Internal helper: multi-turn chat returning both text and token usage.
+    async fn chat_with_history_full(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<(String, Option<TokenUsage>)> {
+        let mut system_parts: Vec<&str> = Vec::new();
+        let mut contents: Vec<Content> = Vec::new();
+
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => {
+                    system_parts.push(&msg.content);
+                }
+                "user" => {
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts: build_parts(&msg.content),
+                    });
+                }
+                "assistant" => {
+                    contents.push(Content {
+                        role: Some("model".to_string()),
+                        parts: vec![Part::text(&msg.content)],
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        let system_instruction = if system_parts.is_empty() {
+            None
+        } else {
+            Some(Content {
+                role: None,
+                parts: vec![Part::text(system_parts.join("\n\n"))],
+            })
+        };
+
+        self.send_generate_content(contents, system_instruction, model, temperature)
+            .await
+    }
+
     async fn send_generate_content(
         &self,
         contents: Vec<Content>,
@@ -1227,44 +1273,55 @@ impl Provider for GeminiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<String> {
-        let mut system_parts: Vec<&str> = Vec::new();
-        let mut contents: Vec<Content> = Vec::new();
-
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" => {
-                    system_parts.push(&msg.content);
-                }
-                "user" => {
-                    contents.push(Content {
-                        role: Some("user".to_string()),
-                        parts: build_parts(&msg.content),
-                    });
-                }
-                "assistant" => {
-                    // Gemini API uses "model" role instead of "assistant"
-                    contents.push(Content {
-                        role: Some("model".to_string()),
-                        parts: vec![Part::text(&msg.content)],
-                    });
-                }
-                _ => {}
-            }
-        }
-
-        let system_instruction = if system_parts.is_empty() {
-            None
-        } else {
-            Some(Content {
-                role: None,
-                parts: vec![Part::text(system_parts.join("\n\n"))],
-            })
-        };
-
         let (text, _usage) = self
-            .send_generate_content(contents, system_instruction, model, temperature)
+            .chat_with_history_full(messages, model, temperature)
             .await?;
         Ok(text)
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        let messages = if let Some(tools) = request.tools {
+            if !tools.is_empty() && !self.supports_native_tools() {
+                let tool_instructions = match self.convert_tools(tools) {
+                    ToolsPayload::PromptGuided { instructions } => instructions,
+                    payload => {
+                        anyhow::bail!(
+                            "Provider returned non-prompt-guided tools payload ({payload:?}) \
+                             while supports_native_tools() is false"
+                        )
+                    }
+                };
+                let mut modified = request.messages.to_vec();
+                if let Some(sys) = modified.iter_mut().find(|m| m.role == "system") {
+                    if !sys.content.is_empty() {
+                        sys.content.push_str("\n\n");
+                    }
+                    sys.content.push_str(&tool_instructions);
+                } else {
+                    modified.insert(0, ChatMessage::system(tool_instructions));
+                }
+                std::borrow::Cow::Owned(modified)
+            } else {
+                std::borrow::Cow::Borrowed(request.messages)
+            }
+        } else {
+            std::borrow::Cow::Borrowed(request.messages)
+        };
+
+        let (text, usage) = self
+            .chat_with_history_full(&messages, model, temperature)
+            .await?;
+        Ok(ChatResponse {
+            text: Some(text),
+            tool_calls: Vec::new(),
+            usage,
+            reasoning_content: None,
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -1321,7 +1378,7 @@ impl Provider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::{header::AUTHORIZATION, StatusCode};
+    use reqwest::{StatusCode, header::AUTHORIZATION};
 
     /// Helper to create a test OAuth auth variant.
     fn test_oauth_auth(token: &str) -> GeminiAuth {
@@ -2103,10 +2160,12 @@ mod tests {
 
         let result = provider.warmup().await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("ManagedOAuth requires auth_service"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("ManagedOAuth requires auth_service")
+        );
     }
 
     /// Validates that warmup() for CLI OAuth skips validation (existing behavior).
@@ -2216,11 +2275,10 @@ mod tests {
 
     #[test]
     fn build_parts_multiple_images() {
-        let content =
-            "Image A: [IMAGE:data:image/png;base64,AAAA] Image B: [IMAGE:data:image/jpeg;base64,BBBB]";
+        let content = "Image A: [IMAGE:data:image/png;base64,AAAA] Image B: [IMAGE:data:image/jpeg;base64,BBBB]";
         let parts = build_parts(content);
         assert_eq!(parts.len(), 3); // text + 2 images
-                                    // Verify both inline parts
+        // Verify both inline parts
         let inline_parts: Vec<_> = parts
             .iter()
             .filter(|p| matches!(p, Part::Inline { .. }))

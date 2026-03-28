@@ -9,6 +9,9 @@ import type {
   CostSummary,
   CliTool,
   HealthSnapshot,
+  Session,
+  ChannelDetail,
+  SessionMessagesResponse,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
@@ -95,6 +98,13 @@ export async function pair(code: string): Promise<{ token: string }> {
 }
 
 export async function getAdminPairCode(): Promise<{ pairing_code: string | null; pairing_required: boolean }> {
+  // Use the public /pair/code endpoint which works in Docker and remote environments
+  // (no localhost restriction). Falls back to the admin endpoint for backward compat.
+  const publicResp = await fetch(`${basePath}/pair/code`);
+  if (publicResp.ok) {
+    return publicResp.json() as Promise<{ pairing_code: string | null; pairing_required: boolean }>;
+  }
+
   const response = await fetch('/admin/paircode');
   if (!response.ok) {
     throw new Error(`Failed to fetch pairing code (${response.status})`);
@@ -288,6 +298,37 @@ export function deleteMemory(key: string): Promise<void> {
 export function getCost(): Promise<CostSummary> {
   return apiFetch<CostSummary | { cost: CostSummary }>('/api/cost').then((data) =>
     unwrapField(data, 'cost'),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sessions
+// ---------------------------------------------------------------------------
+
+export function getSessions(): Promise<Session[]> {
+  return apiFetch<Session[] | { sessions: Session[] }>('/api/sessions').then((data) =>
+    unwrapField(data, 'sessions'),
+  );
+}
+
+export function getSession(id: string): Promise<Session> {
+  return apiFetch<Session>(`/api/sessions/${encodeURIComponent(id)}`);
+}
+
+/** Load persisted gateway WebSocket chat transcript for the dashboard Agent Chat. */
+export function getSessionMessages(id: string): Promise<SessionMessagesResponse> {
+  return apiFetch<SessionMessagesResponse>(
+    `/api/sessions/${encodeURIComponent(id)}/messages`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Channels (detailed)
+// ---------------------------------------------------------------------------
+
+export function getChannels(): Promise<ChannelDetail[]> {
+  return apiFetch<ChannelDetail[] | { channels: ChannelDetail[] }>('/api/channels').then((data) =>
+    unwrapField(data, 'channels'),
   );
 }
 

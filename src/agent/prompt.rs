@@ -1,3 +1,4 @@
+use crate::agent::personality;
 use crate::config::IdentityConfig;
 use crate::i18n::ToolDescriptions;
 use crate::identity;
@@ -8,8 +9,6 @@ use anyhow::Result;
 use chrono::{Datelike, Local, Timelike};
 use std::fmt::Write;
 use std::path::Path;
-
-const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
@@ -115,18 +114,10 @@ impl PromptSection for IdentitySection {
                 "The following workspace files define your identity, behavior, and context.\n\n",
             );
         }
-        for file in [
-            "AGENTS.md",
-            "SOUL.md",
-            "TOOLS.md",
-            "IDENTITY.md",
-            "USER.md",
-            "HEARTBEAT.md",
-            "BOOTSTRAP.md",
-            "MEMORY.md",
-        ] {
-            inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
-        }
+
+        // Use the personality module for structured file loading.
+        let profile = personality::load_personality(ctx.workspace_dir);
+        prompt.push_str(&profile.render());
 
         Ok(prompt)
     }
@@ -196,23 +187,18 @@ impl PromptSection for SafetySection {
         out.push_str("- Prefer `trash` over `rm`.\n");
         out.push_str(match ctx.autonomy_level {
             AutonomyLevel::Full => {
-                "- Respect the runtime autonomy policy: if a tool or action is allowed, \
-                 execute it directly instead of asking the user for extra approval.\n\
-                 - If a tool or action is blocked by policy or unavailable, explain that \
-                 concrete restriction instead of simulating an approval dialog."
+                "- Execute tools and actions directly — no extra approval needed.\n\
+                 - You have full access to all configured tools. Use them confidently to accomplish tasks.\n\
+                 - Only refuse an action if the runtime explicitly rejects it — do not preemptively decline."
             }
             AutonomyLevel::ReadOnly => {
-                "- This runtime is read-only for side effects unless a tool explicitly \
-                 reports otherwise.\n\
-                 - If a requested action is blocked by policy, explain the restriction \
-                 directly instead of simulating an approval dialog."
+                "- This runtime is read-only. Write operations will be rejected by the runtime if attempted.\n\
+                 - Use read-only tools freely and confidently."
             }
             AutonomyLevel::Supervised => {
-                "- When in doubt, ask before acting externally.\n\
-                 - Respect the runtime autonomy policy: ask for approval only when the \
-                 current runtime policy actually requires it.\n\
-                 - If a tool or action is blocked by policy or unavailable, explain that \
-                 concrete restriction instead of simulating an approval dialog."
+                "- Ask for approval when the runtime policy requires it for the specific action.\n\
+                 - Do not preemptively refuse actions — attempt them and let the runtime enforce restrictions.\n\
+                 - Use available tools confidently; the security policy will enforce boundaries."
             }
         });
 
@@ -307,40 +293,6 @@ impl PromptSection for ChannelMediaSection {
             - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
             - `[Document: <name>] <path>` — A file attachment saved to the workspace."
             .into())
-    }
-}
-
-fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &str) {
-    let path = workspace_dir.join(filename);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            let _ = writeln!(prompt, "### {filename}\n");
-            let truncated = if trimmed.chars().count() > BOOTSTRAP_MAX_CHARS {
-                trimmed
-                    .char_indices()
-                    .nth(BOOTSTRAP_MAX_CHARS)
-                    .map(|(idx, _)| &trimmed[..idx])
-                    .unwrap_or(trimmed)
-            } else {
-                trimmed
-            };
-            prompt.push_str(truncated);
-            if truncated.len() < trimmed.len() {
-                let _ = writeln!(
-                    prompt,
-                    "\n\n[... truncated at {BOOTSTRAP_MAX_CHARS} chars — use `read` for full file]\n"
-                );
-            } else {
-                prompt.push_str("\n\n");
-            }
-        }
-        Err(_) => {
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
-        }
     }
 }
 
@@ -695,7 +647,7 @@ mod tests {
             "full autonomy should NOT include 'bypass oversight' instructions"
         );
         assert!(
-            output.contains("execute it directly"),
+            output.contains("Execute tools and actions directly"),
             "full autonomy should instruct to execute directly"
         );
         assert!(

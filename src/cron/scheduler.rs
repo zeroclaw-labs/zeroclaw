@@ -1,3 +1,5 @@
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
 #[cfg(feature = "channel-matrix")]
 use crate::channels::MatrixChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -7,15 +9,16 @@ use crate::channels::{
     SlackChannel, TelegramChannel,
 };
 use crate::config::Config;
+use crate::config::schema::{CronJobDecl, CronScheduleDecl};
 use crate::cron::{
-    all_overdue_jobs, due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job,
-    reschedule_after_run, sync_declarative_jobs, update_job, CronJob, CronJobPatch, DeliveryConfig,
-    JobType, Schedule, SessionTarget,
+    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, all_overdue_jobs,
+    due_jobs, next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run,
+    sync_declarative_jobs, update_job,
 };
 use crate::security::SecurityPolicy;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::process::Command;
@@ -37,11 +40,36 @@ pub async fn run(config: Config) -> Result<()> {
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
     // ── Declarative job sync: reconcile config-defined jobs with the DB.
-    match sync_declarative_jobs(&config, &config.cron.jobs) {
+    let mut jobs_with_builtin = config.cron.jobs.clone();
+    if let Some(ref schedule_cron) = config.backup.schedule_cron {
+        let backup_job = CronJobDecl {
+            id: "__builtin_backup".to_string(),
+            name: Some("Scheduled backup".to_string()),
+            job_type: "shell".to_string(),
+            schedule: CronScheduleDecl::Cron {
+                expr: schedule_cron.clone(),
+                tz: config.backup.schedule_timezone.clone(),
+            },
+            command: Some("backup create".to_string()),
+            prompt: None,
+            enabled: true,
+            model: None,
+            allowed_tools: None,
+            session_target: None,
+            delivery: None,
+        };
+        tracing::debug!(
+            schedule = %schedule_cron,
+            "Synthesizing builtin backup cron job from config.backup.schedule_cron"
+        );
+        jobs_with_builtin.push(backup_job);
+    }
+
+    match sync_declarative_jobs(&config, &jobs_with_builtin) {
         Ok(()) => {
-            if !config.cron.jobs.is_empty() {
+            if !jobs_with_builtin.is_empty() {
                 tracing::info!(
-                    count = config.cron.jobs.len(),
+                    count = jobs_with_builtin.len(),
                     "Synced declarative cron jobs from config"
                 );
             }
@@ -233,7 +261,28 @@ async fn run_agent_job(
     }
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
-    let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
+
+    // Recall relevant memories so cron jobs have context awareness.
+    let memory_context = match crate::memory::create_memory(
+        &config.memory,
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    ) {
+        Ok(mem) => match mem.recall(&prompt, 5, None, None, None).await {
+            Ok(entries) if !entries.is_empty() => {
+                let ctx: String = entries
+                    .iter()
+                    .map(|e| format!("- {}: {}", e.key, e.content))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("[Memory context]\n{ctx}\n\n")
+            }
+            _ => String::new(),
+        },
+        Err(_) => String::new(),
+    };
+
+    let prefixed_prompt = format!("{memory_context}[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
     let run_result = match job.session_target {
@@ -254,14 +303,7 @@ async fn run_agent_job(
     };
 
     match run_result {
-        Ok(response) => (
-            true,
-            if response.trim().is_empty() {
-                "agent job executed".to_string()
-            } else {
-                response
-            },
-        ),
+        Ok(response) => (true, response),
         Err(e) => (false, format!("agent job failed: {e}")),
     }
 }
@@ -378,6 +420,16 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         return Ok(());
     }
 
+    // Skip delivery for empty, whitespace-only, or "NONE" output
+    let trimmed = output.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+        tracing::debug!(
+            "Cron job '{}': skipping delivery (no actionable output)",
+            job.name.as_deref().unwrap_or(&job.id)
+        );
+        return Ok(());
+    }
+
     let channel = delivery
         .channel
         .as_deref()
@@ -477,7 +529,8 @@ pub(crate) async fn deliver_announcement(
                 Vec::new(),
                 sl.allowed_users.clone(),
             )
-            .with_workspace_dir(config.workspace_dir.clone());
+            .with_workspace_dir(config.workspace_dir.clone())
+            .with_markdown_blocks(sl.use_markdown_blocks);
             channel
                 .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
@@ -591,6 +644,22 @@ pub(crate) async fn deliver_announcement(
             channel
                 .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
+        }
+        "lark" | "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lark = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = LarkChannel::from_config(lark);
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("lark delivery channel requires `channel-lark` feature");
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
@@ -1328,9 +1397,10 @@ mod tests {
         let err = deliver_if_configured(&config, &job, "hello")
             .await
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("matrix delivery channel requires `channel-matrix` feature"));
+        assert!(
+            err.to_string()
+                .contains("matrix delivery channel requires `channel-matrix` feature")
+        );
     }
 
     #[test]

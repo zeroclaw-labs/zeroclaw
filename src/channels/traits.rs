@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -54,6 +55,8 @@ pub struct SendMessage {
     pub subject: Option<String>,
     /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
     pub thread_ts: Option<String>,
+    /// Optional cancellation token for interruptible delivery (e.g. multi-message mode).
+    pub cancellation_token: Option<CancellationToken>,
 }
 
 impl SendMessage {
@@ -64,6 +67,7 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            cancellation_token: None,
         }
     }
 
@@ -78,12 +82,19 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: Some(subject.into()),
             thread_ts: None,
+            cancellation_token: None,
         }
     }
 
     /// Set the thread identifier for threaded replies.
     pub fn in_thread(mut self, thread_ts: Option<String>) -> Self {
         self.thread_ts = thread_ts;
+        self
+    }
+
+    /// Attach a cancellation token for interruptible delivery.
+    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
         self
     }
 }
@@ -121,6 +132,19 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// Whether this channel supports multi-message streaming delivery, where
+    /// the response is sent as multiple separate messages at paragraph
+    /// boundaries as tokens arrive from the provider.
+    fn supports_multi_message_streaming(&self) -> bool {
+        false
+    }
+
+    /// Minimum delay (ms) between sending each paragraph in multi-message mode.
+    /// Channels should override this to avoid platform rate limits.
+    fn multi_message_delay_ms(&self) -> u64 {
+        800
+    }
+
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
     async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
         Ok(None)
@@ -128,6 +152,18 @@ pub trait Channel: Send + Sync {
 
     /// Update a previously sent draft message with new accumulated content.
     async fn update_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Show a progress/status update (e.g. tool execution status).
+    /// Channels can display this in a status bar rather than in the message body.
+    /// Default: no-op (progress is ignored).
+    async fn update_draft_progress(
         &self,
         _recipient: &str,
         _message_id: &str,
@@ -196,6 +232,34 @@ pub trait Channel: Send + Sync {
         _message_id: &str,
         _reason: Option<String>,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Create a room/channel/conversation on the platform.
+    ///
+    /// `name` is the human-readable room name.
+    /// `topic` is an optional room description or purpose.
+    /// `invites` is a list of user IDs to invite to the room.
+    /// `visibility` is an optional visibility setting ("public" or "private").
+    /// `encryption` is an optional flag to enable end-to-end encryption.
+    ///
+    /// Returns the platform-scoped room identifier.
+    async fn create_room(
+        &self,
+        _name: Option<&str>,
+        _topic: Option<&str>,
+        _invites: Vec<String>,
+        _visibility: Option<&str>,
+        _encryption: Option<bool>,
+    ) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    /// Invite a user to a room/channel/conversation.
+    ///
+    /// `room_id` is the platform-scoped room identifier.
+    /// `user_id` is the platform-scoped user identifier.
+    async fn invite_user(&self, _room_id: &str, _user_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -268,24 +332,30 @@ mod tests {
         assert!(channel.health_check().await);
         assert!(channel.start_typing("bob").await.is_ok());
         assert!(channel.stop_typing("bob").await.is_ok());
-        assert!(channel
-            .send(&SendMessage::new("hello", "bob"))
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .send(&SendMessage::new("hello", "bob"))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn default_reaction_methods_return_success() {
         let channel = DummyChannel;
 
-        assert!(channel
-            .add_reaction("chan_1", "msg_1", "\u{1F440}")
-            .await
-            .is_ok());
-        assert!(channel
-            .remove_reaction("chan_1", "msg_1", "\u{1F440}")
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .add_reaction("chan_1", "msg_1", "\u{1F440}")
+                .await
+                .is_ok()
+        );
+        assert!(
+            channel
+                .remove_reaction("chan_1", "msg_1", "\u{1F440}")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -293,16 +363,20 @@ mod tests {
         let channel = DummyChannel;
 
         assert!(!channel.supports_draft_updates());
-        assert!(channel
-            .send_draft(&SendMessage::new("draft", "bob"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            channel
+                .send_draft(&SendMessage::new("draft", "bob"))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(channel.update_draft("bob", "msg_1", "text").await.is_ok());
-        assert!(channel
-            .finalize_draft("bob", "msg_1", "final text")
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .finalize_draft("bob", "msg_1", "final text")
+                .await
+                .is_ok()
+        );
         assert!(channel.cancel_draft("bob", "msg_1").await.is_ok());
     }
 
@@ -323,12 +397,44 @@ mod tests {
     async fn default_redact_message_returns_success() {
         let channel = DummyChannel;
 
-        assert!(channel
-            .redact_message("chan_1", "msg_1", Some("spam".to_string()))
+        assert!(
+            channel
+                .redact_message("chan_1", "msg_1", Some("spam".to_string()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            channel
+                .redact_message("chan_1", "msg_2", None)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn default_create_room_returns_success() {
+        let channel = DummyChannel;
+
+        let room_id = channel
+            .create_room(
+                Some("Test Room"),
+                Some("Test Topic"),
+                vec!["@user:example.com".to_string()],
+                Some("private"),
+                Some(true),
+            )
             .await
-            .is_ok());
+            .unwrap();
+
+        assert_eq!(room_id, "");
+    }
+
+    #[tokio::test]
+    async fn default_invite_user_returns_success() {
+        let channel = DummyChannel;
+
         assert!(channel
-            .redact_message("chan_1", "msg_2", None)
+            .invite_user("room_1", "@user:example.com")
             .await
             .is_ok());
     }

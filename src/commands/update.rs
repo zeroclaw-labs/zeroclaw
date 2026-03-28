@@ -1,6 +1,7 @@
 //! `zeroclaw update` — self-update pipeline with rollback.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -14,6 +15,8 @@ pub struct UpdateInfo {
     pub current_version: String,
     pub latest_version: String,
     pub download_url: Option<String>,
+    /// Download URL for the SHA256SUMS file associated with this release.
+    pub sha256sums_url: Option<String>,
     pub is_newer: bool,
 }
 
@@ -58,12 +61,14 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
         .to_string();
 
     let download_url = find_asset_url(&release);
+    let sha256sums_url = find_sha256sums_url(&release);
     let is_newer = version_is_newer(&current, &tag);
 
     Ok(UpdateInfo {
         current_version: current,
         latest_version: tag,
         download_url,
+        sha256sums_url,
         is_newer,
     })
 }
@@ -97,7 +102,12 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     info!("Phase 2/6: Downloading...");
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let download_path = temp_dir.path().join("zeroclaw_new");
-    download_binary(&download_url, &download_path).await?;
+    download_binary(
+        &download_url,
+        update_info.sha256sums_url.as_deref(),
+        &download_path,
+    )
+    .await?;
 
     // Phase 3: Backup
     info!("Phase 3/6: Creating backup...");
@@ -115,7 +125,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     if let Err(e) = swap_binary(&download_path, &current_exe).await {
         // Rollback
         warn!("Swap failed, rolling back: {e}");
-        if let Err(rollback_err) = tokio::fs::copy(&backup_path, &current_exe).await {
+        if let Err(rollback_err) = rollback_binary(&backup_path, &current_exe).await {
             eprintln!("CRITICAL: Rollback also failed: {rollback_err}");
             eprintln!(
                 "Manual recovery: cp {} {}",
@@ -137,7 +147,7 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
         }
         Err(e) => {
             warn!("Smoke test failed, rolling back: {e}");
-            tokio::fs::copy(&backup_path, &current_exe)
+            rollback_binary(&backup_path, &current_exe)
                 .await
                 .context("rollback after smoke test failure")?;
             bail!("Update rolled back — smoke test failed: {e}");
@@ -158,6 +168,22 @@ fn find_asset_url(release: &serde_json::Value) -> Option<String> {
                 .unwrap_or(false)
         })
         .and_then(|asset| asset["browser_download_url"].as_str().map(String::from))
+}
+
+/// Find the download URL of the SHA256SUMS asset in a GitHub release payload.
+///
+/// Looks for an asset whose name is exactly `SHA256SUMS` (case-insensitive) or
+/// ends with `.sha256sums` / `sha256sums.txt`.
+fn find_sha256sums_url(release: &serde_json::Value) -> Option<String> {
+    release["assets"].as_array()?.iter().find_map(|asset| {
+        let name = asset["name"].as_str()?;
+        let lower = name.to_ascii_lowercase();
+        if lower == "sha256sums" || lower == "sha256sums.txt" || lower.ends_with(".sha256sums") {
+            asset["browser_download_url"].as_str().map(String::from)
+        } else {
+            None
+        }
+    })
 }
 
 /// Return the exact Rust target triple for the current platform.
@@ -190,7 +216,17 @@ fn version_is_newer(current: &str, candidate: &str) -> bool {
     cand > cur
 }
 
-async fn download_binary(url: &str, dest: &Path) -> Result<()> {
+/// Download a binary asset, optionally verifying it against a SHA256SUMS file.
+///
+/// When `sha256sums_url` is provided the function:
+///   1. Downloads the SHA256SUMS file.
+///   2. Finds the expected digest for the asset filename (last path component of `url`).
+///   3. Computes the SHA-256 digest of the downloaded bytes.
+///   4. Fails with a clear error if the digests do not match.
+///
+/// If `sha256sums_url` is `None` the download proceeds without checksum verification
+/// and a warning is emitted so the caller is aware.
+async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(format!("zeroclaw/{}", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(300))
@@ -206,9 +242,29 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     }
 
     let bytes = resp.bytes().await.context("failed to read download body")?;
-    tokio::fs::write(dest, &bytes)
-        .await
-        .context("failed to write downloaded binary")?;
+
+    // Verify checksum before writing to disk.
+    match sha256sums_url {
+        Some(sums_url) => {
+            verify_checksum(&bytes, url, sums_url, &client).await?;
+        }
+        None => {
+            warn!(
+                "No SHA256SUMS asset found for this release — skipping checksum verification. \
+                 The download has not been integrity-checked."
+            );
+        }
+    }
+
+    // Release assets are .tar.gz archives containing a single `zeroclaw` binary.
+    // Extract the binary from the archive instead of writing the raw tarball.
+    if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+        extract_tar_gz(&bytes, dest).context("failed to extract binary from tar.gz archive")?;
+    } else {
+        tokio::fs::write(dest, &bytes)
+            .await
+            .context("failed to write downloaded binary")?;
+    }
 
     // Make executable on Unix
     #[cfg(unix)]
@@ -219,6 +275,96 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Fetch the SHA256SUMS file and verify `bytes` match the expected digest for
+/// the asset identified by the last path component of `asset_url`.
+async fn verify_checksum(
+    bytes: &[u8],
+    asset_url: &str,
+    sha256sums_url: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
+    // Derive the asset filename from its URL.
+    let asset_name = asset_url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .context("cannot derive asset filename from download URL")?;
+
+    // Download the SHA256SUMS file.
+    let sums_resp = client
+        .get(sha256sums_url)
+        .send()
+        .await
+        .context("failed to fetch SHA256SUMS")?;
+    if !sums_resp.status().is_success() {
+        bail!("SHA256SUMS fetch returned {}", sums_resp.status());
+    }
+    let sums_text = sums_resp
+        .text()
+        .await
+        .context("failed to read SHA256SUMS body")?;
+
+    // Parse lines of the form: "<hex-digest>  <filename>" or "<hex-digest> <filename>"
+    let expected_hex = sums_text
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.splitn(2, ' ');
+            let digest = parts.next()?.trim();
+            let name = parts.next()?.trim().trim_start_matches('*'); // strip leading '*' (binary mode marker)
+            if name == asset_name {
+                Some(digest.to_string())
+            } else {
+                None
+            }
+        })
+        .with_context(|| {
+            format!("asset '{asset_name}' not found in SHA256SUMS — cannot verify download")
+        })?;
+
+    // Compute the actual digest of the downloaded bytes.
+    let actual_hash = Sha256::digest(bytes);
+    let actual_hex = hex::encode(actual_hash);
+
+    if actual_hex != expected_hex {
+        bail!(
+            "checksum mismatch for '{asset_name}':\n  expected: {expected_hex}\n  actual:   {actual_hex}\n\
+             The downloaded file may be corrupted or tampered with. Aborting update."
+        );
+    }
+
+    info!("Checksum verified for '{asset_name}': {actual_hex}");
+    Ok(())
+}
+
+/// Extract the `zeroclaw` binary from a `.tar.gz` archive.
+fn extract_tar_gz(archive_bytes: &[u8], dest: &Path) -> Result<()> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+    use tar::Archive;
+
+    let gz = GzDecoder::new(archive_bytes);
+    let mut archive = Archive::new(gz);
+
+    for entry in archive.entries().context("failed to read tar entries")? {
+        let mut entry = entry.context("failed to read tar entry")?;
+        let path = entry.path().context("failed to read entry path")?;
+
+        // The archive contains a single binary named "zeroclaw" (or "zeroclaw.exe" on Windows).
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if file_name == "zeroclaw" || file_name == "zeroclaw.exe" {
+            let mut buf = Vec::new();
+            entry
+                .read_to_end(&mut buf)
+                .context("failed to read binary from archive")?;
+            std::fs::write(dest, &buf).context("failed to write extracted binary")?;
+            return Ok(());
+        }
+    }
+
+    bail!("archive does not contain a 'zeroclaw' binary")
 }
 
 async fn validate_binary(path: &Path) -> Result<()> {
@@ -328,9 +474,24 @@ fn host_architecture() -> Option<&'static str> {
 }
 
 async fn swap_binary(new: &Path, target: &Path) -> Result<()> {
+    // On Linux, a running binary cannot be overwritten in place (ETXTBSY).
+    // Remove the old file first, then copy the new one into the now-free path.
+    // This works because the kernel keeps the inode alive until the process exits.
+    tokio::fs::remove_file(target)
+        .await
+        .context("failed to remove old binary")?;
     tokio::fs::copy(new, target)
         .await
-        .context("failed to overwrite binary")?;
+        .context("failed to write new binary")?;
+    Ok(())
+}
+
+async fn rollback_binary(backup: &Path, target: &Path) -> Result<()> {
+    // Remove-then-copy to avoid ETXTBSY if the target is somehow still mapped.
+    let _ = tokio::fs::remove_file(target).await;
+    tokio::fs::copy(backup, target)
+        .await
+        .context("failed to restore backup binary")?;
     Ok(())
 }
 
@@ -470,6 +631,118 @@ mod tests {
         assert!(
             host_architecture().is_some(),
             "host architecture should be detected on CI platforms"
+        );
+    }
+
+    // ---- SHA256SUMS helpers ----
+
+    #[test]
+    fn find_sha256sums_url_exact_name() {
+        let release = make_release(&["SHA256SUMS", "zeroclaw-x86_64-apple-darwin.tar.gz"]);
+        let url = find_sha256sums_url(&release);
+        assert_eq!(url, Some("https://example.com/SHA256SUMS".to_string()));
+    }
+
+    #[test]
+    fn find_sha256sums_url_txt_suffix() {
+        let release = make_release(&["sha256sums.txt", "zeroclaw-x86_64-unknown-linux-gnu"]);
+        let url = find_sha256sums_url(&release);
+        assert_eq!(url, Some("https://example.com/sha256sums.txt".to_string()));
+    }
+
+    #[test]
+    fn find_sha256sums_url_dot_sha256sums_suffix() {
+        let release = make_release(&["checksums.sha256sums"]);
+        let url = find_sha256sums_url(&release);
+        assert_eq!(
+            url,
+            Some("https://example.com/checksums.sha256sums".to_string())
+        );
+    }
+
+    #[test]
+    fn find_sha256sums_url_case_insensitive() {
+        let release = make_release(&["Sha256Sums"]);
+        let url = find_sha256sums_url(&release);
+        assert_eq!(url, Some("https://example.com/Sha256Sums".to_string()));
+    }
+
+    #[test]
+    fn find_sha256sums_url_returns_none_when_absent() {
+        let release = make_release(&["zeroclaw-x86_64-apple-darwin.tar.gz"]);
+        assert!(find_sha256sums_url(&release).is_none());
+    }
+
+    #[test]
+    fn extract_tar_gz_finds_binary() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        // Build a tar.gz in memory containing a fake "zeroclaw" binary.
+        let fake_binary = b"#!/bin/sh\necho zeroclaw";
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(fake_binary.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "zeroclaw", &fake_binary[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut gz_buf = Vec::new();
+        {
+            let mut encoder = GzEncoder::new(&mut gz_buf, Compression::fast());
+            encoder.write_all(&tar_buf).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("zeroclaw_extracted");
+        extract_tar_gz(&gz_buf, &dest).unwrap();
+
+        let content = std::fs::read(&dest).unwrap();
+        assert_eq!(content, fake_binary);
+    }
+
+    #[test]
+    fn extract_tar_gz_errors_on_missing_binary() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+
+        // Build a tar.gz with a file that is NOT named "zeroclaw".
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(5);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "README.md", &b"hello"[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+
+        let mut gz_buf = Vec::new();
+        {
+            let mut encoder = GzEncoder::new(&mut gz_buf, Compression::fast());
+            encoder.write_all(&tar_buf).unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("zeroclaw_extracted");
+        let result = extract_tar_gz(&gz_buf, &dest);
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("does not contain"),
+            "should report missing binary"
         );
     }
 }
