@@ -17,9 +17,6 @@
 //!
 //! # Limitations
 //!
-//! - **Conversation history**: Only the system prompt (if present) and the last
-//!   user message are forwarded. Full multi-turn history is not preserved because
-//!   the CLI accepts a single prompt per invocation.
 //! - **System prompt**: The system prompt is prepended to the user message with a
 //!   blank-line separator, as the CLI does not provide a dedicated system-prompt flag.
 //! - **Temperature**: The CLI does not expose a temperature parameter.
@@ -34,12 +31,12 @@
 //!
 //! - `CLAUDE_CODE_PATH` — override the path to the `claude` binary (default: `"claude"`)
 
-use crate::providers::traits::{ChatRequest, ChatResponse, Provider, TokenUsage};
+use crate::providers::traits::{ChatMessage, ChatRequest, ChatResponse, Provider, TokenUsage};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// Environment variable for overriding the path to the `claude` binary.
 pub const CLAUDE_CODE_PATH_ENV: &str = "CLAUDE_CODE_PATH";
@@ -93,17 +90,31 @@ impl ClaudeCodeProvider {
             .any(|v| (temperature - v).abs() < TEMP_EPSILON)
     }
 
-    fn validate_temperature(temperature: f64) -> anyhow::Result<()> {
+    fn validate_temperature(temperature: f64) -> anyhow::Result<f64> {
         if !temperature.is_finite() {
             anyhow::bail!("Claude Code provider received non-finite temperature value");
         }
-        if !Self::supports_temperature(temperature) {
-            anyhow::bail!(
-                "temperature unsupported by Claude Code CLI: {temperature}. \
-                 Supported values: 0.7 or 1.0"
-            );
+        if Self::supports_temperature(temperature) {
+            return Ok(temperature);
         }
-        Ok(())
+        // Clamp to the nearest supported value — the CLI ignores temperature
+        // anyway, so a hard error just blocks callers like memory consolidation
+        // that legitimately request low temperatures.
+        let clamped = *CLAUDE_CODE_SUPPORTED_TEMPERATURES
+            .iter()
+            .min_by(|a, b| {
+                (temperature - **a)
+                    .abs()
+                    .partial_cmp(&(temperature - **b).abs())
+                    .unwrap()
+            })
+            .unwrap();
+        tracing::debug!(
+            requested = temperature,
+            clamped = clamped,
+            "Clamped unsupported temperature to nearest Claude Code CLI value"
+        );
+        Ok(clamped)
     }
 
     fn redact_stderr(stderr: &[u8]) -> String {
@@ -212,6 +223,54 @@ impl Provider for ClaudeCodeProvider {
         self.invoke_cli(&full_message, model).await
     }
 
+    async fn chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        Self::validate_temperature(temperature)?;
+
+        // Separate system prompt from conversation messages.
+        let system = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| m.content.as_str());
+
+        // Build conversation turns (skip system messages).
+        let turns: Vec<&ChatMessage> = messages.iter().filter(|m| m.role != "system").collect();
+
+        // If there's only one user message, use the simple path.
+        if turns.len() <= 1 {
+            let last_user = turns.first().map(|m| m.content.as_str()).unwrap_or("");
+            let full_message = match system {
+                Some(s) if !s.is_empty() => format!("{s}\n\n{last_user}"),
+                _ => last_user.to_string(),
+            };
+            return self.invoke_cli(&full_message, model).await;
+        }
+
+        // Format multi-turn conversation into a single prompt.
+        let mut parts = Vec::new();
+        if let Some(s) = system {
+            if !s.is_empty() {
+                parts.push(format!("[system]\n{s}"));
+            }
+        }
+        for msg in &turns {
+            let label = match msg.role.as_str() {
+                "user" => "[user]",
+                "assistant" => "[assistant]",
+                other => other,
+            };
+            parts.push(format!("{label}\n{}", msg.content));
+        }
+        parts.push("[assistant]".to_string());
+
+        let full_message = parts.join("\n\n");
+        self.invoke_cli(&full_message, model).await
+    }
+
     async fn chat(
         &self,
         request: ChatRequest<'_>,
@@ -243,16 +302,32 @@ mod tests {
             .expect("env lock poisoned")
     }
 
+    /// Serialize tests that spawn the echo-provider script.
+    ///
+    /// On Linux, writing a shell script and exec'ing it from parallel threads
+    /// can trigger `ETXTBSY` ("Text file busy") even with unique file paths,
+    /// because the kernel briefly holds `deny_write_access` on the interpreter
+    /// page cache. Serializing these tests eliminates the race.
+    ///
+    /// Uses `tokio::sync::Mutex` so the guard can be held across `.await`.
+    fn script_mutex() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[test]
     fn new_uses_env_override() {
         let _guard = env_lock();
         let orig = std::env::var(CLAUDE_CODE_PATH_ENV).ok();
-        std::env::set_var(CLAUDE_CODE_PATH_ENV, "/usr/local/bin/claude");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, "/usr/local/bin/claude") };
         let provider = ClaudeCodeProvider::new();
         assert_eq!(provider.binary_path, PathBuf::from("/usr/local/bin/claude"));
         match orig {
-            Some(v) => std::env::set_var(CLAUDE_CODE_PATH_ENV, v),
-            None => std::env::remove_var(CLAUDE_CODE_PATH_ENV),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var(CLAUDE_CODE_PATH_ENV) },
         }
     }
 
@@ -260,11 +335,13 @@ mod tests {
     fn new_defaults_to_claude() {
         let _guard = env_lock();
         let orig = std::env::var(CLAUDE_CODE_PATH_ENV).ok();
-        std::env::remove_var(CLAUDE_CODE_PATH_ENV);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var(CLAUDE_CODE_PATH_ENV) };
         let provider = ClaudeCodeProvider::new();
         assert_eq!(provider.binary_path, PathBuf::from("claude"));
         if let Some(v) = orig {
-            std::env::set_var(CLAUDE_CODE_PATH_ENV, v);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, v) };
         }
     }
 
@@ -272,12 +349,15 @@ mod tests {
     fn new_ignores_blank_env_override() {
         let _guard = env_lock();
         let orig = std::env::var(CLAUDE_CODE_PATH_ENV).ok();
-        std::env::set_var(CLAUDE_CODE_PATH_ENV, "   ");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, "   ") };
         let provider = ClaudeCodeProvider::new();
         assert_eq!(provider.binary_path, PathBuf::from("claude"));
         match orig {
-            Some(v) => std::env::set_var(CLAUDE_CODE_PATH_ENV, v),
-            None => std::env::remove_var(CLAUDE_CODE_PATH_ENV),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var(CLAUDE_CODE_PATH_ENV) },
         }
     }
 
@@ -307,11 +387,18 @@ mod tests {
     }
 
     #[test]
-    fn validate_temperature_rejects_custom_value() {
-        let err = ClaudeCodeProvider::validate_temperature(0.2).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("temperature unsupported by Claude Code CLI"));
+    fn validate_temperature_clamps_custom_value() {
+        let clamped = ClaudeCodeProvider::validate_temperature(0.2).unwrap();
+        assert!((clamped - 0.7).abs() < 1e-9, "0.2 should clamp to 0.7");
+
+        let clamped = ClaudeCodeProvider::validate_temperature(0.9).unwrap();
+        assert!((clamped - 1.0).abs() < 1e-9, "0.9 should clamp to 1.0");
+    }
+
+    #[test]
+    fn validate_temperature_rejects_non_finite() {
+        assert!(ClaudeCodeProvider::validate_temperature(f64::NAN).is_err());
+        assert!(ClaudeCodeProvider::validate_temperature(f64::INFINITY).is_err());
     }
 
     #[tokio::test]
@@ -325,6 +412,119 @@ mod tests {
         assert!(
             msg.contains("Failed to spawn Claude Code binary"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    /// Helper: create a provider that uses a shell script echoing stdin back.
+    /// The script ignores CLI flags (`--print`, `--model`, `-`) and just cats stdin.
+    ///
+    /// Each invocation places the script in its own unique directory and writes
+    /// the file atomically via `std::fs::write` to avoid `ETXTBSY` ("Text file
+    /// busy") races that occur when parallel test threads create and exec
+    /// scripts concurrently on the same filesystem.
+    fn echo_provider() -> ClaudeCodeProvider {
+        static SCRIPT_ID: AtomicUsize = AtomicUsize::new(0);
+        let script_id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_claude_code_{}_{}",
+            std::process::id(),
+            script_id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let path = dir.join("fake_claude.sh");
+        std::fs::write(&path, "#!/bin/sh\ncat /dev/stdin\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        ClaudeCodeProvider { binary_path: path }
+    }
+
+    #[test]
+    fn echo_provider_uses_unique_script_paths() {
+        let first = echo_provider();
+        let second = echo_provider();
+        assert_ne!(first.binary_path, second.binary_path);
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_single_user_message() {
+        let _lock = script_mutex().lock().await;
+        let provider = echo_provider();
+        let messages = vec![ChatMessage::user("hello")];
+        let result = provider
+            .chat_with_history(&messages, "default", 1.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "hello");
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_single_user_with_system() {
+        let _lock = script_mutex().lock().await;
+        let provider = echo_provider();
+        let messages = vec![
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("hello"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "default", 1.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "You are helpful.\n\nhello");
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_multi_turn_includes_all_messages() {
+        let _lock = script_mutex().lock().await;
+        let provider = echo_provider();
+        let messages = vec![
+            ChatMessage::system("Be concise."),
+            ChatMessage::user("What is 2+2?"),
+            ChatMessage::assistant("4"),
+            ChatMessage::user("And 3+3?"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "default", 1.0)
+            .await
+            .unwrap();
+        assert!(result.contains("[system]\nBe concise."));
+        assert!(result.contains("[user]\nWhat is 2+2?"));
+        assert!(result.contains("[assistant]\n4"));
+        assert!(result.contains("[user]\nAnd 3+3?"));
+        assert!(result.ends_with("[assistant]"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_multi_turn_without_system() {
+        let _lock = script_mutex().lock().await;
+        let provider = echo_provider();
+        let messages = vec![
+            ChatMessage::user("hi"),
+            ChatMessage::assistant("hello"),
+            ChatMessage::user("bye"),
+        ];
+        let result = provider
+            .chat_with_history(&messages, "default", 1.0)
+            .await
+            .unwrap();
+        assert!(!result.contains("[system]"));
+        assert!(result.contains("[user]\nhi"));
+        assert!(result.contains("[assistant]\nhello"));
+        assert!(result.contains("[user]\nbye"));
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_clamps_bad_temperature() {
+        let _lock = script_mutex().lock().await;
+        let provider = echo_provider();
+        let messages = vec![ChatMessage::user("test")];
+        let result = provider.chat_with_history(&messages, "default", 0.5).await;
+        assert!(
+            result.is_ok(),
+            "unsupported temperature should be clamped, not rejected"
         );
     }
 }

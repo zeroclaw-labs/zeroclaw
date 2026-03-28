@@ -3,10 +3,13 @@
 //! Uses `rust-embed` to bundle the `web/dist/` directory into the binary at compile time.
 
 use axum::{
-    http::{header, StatusCode, Uri},
+    extract::State,
+    http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use rust_embed::Embed;
+
+use super::AppState;
 
 #[derive(Embed)]
 #[folder = "web/dist/"]
@@ -23,16 +26,51 @@ pub async fn handle_static(uri: Uri) -> Response {
     serve_embedded_file(path)
 }
 
-/// SPA fallback: serve index.html for any non-API, non-static GET request
-pub async fn handle_spa_fallback() -> Response {
-    if WebAssets::get("index.html").is_none() {
+/// SPA fallback: serve index.html for any non-API, non-static GET request.
+/// Injects `window.__ZEROCLAW_BASE__` so the frontend knows the path prefix.
+pub async fn handle_spa_fallback(State(state): State<AppState>) -> Response {
+    let Some(content) = WebAssets::get("index.html") else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Web dashboard not available. Build it with: cd web && npm ci && npm run build",
+            concat!(
+                "Web dashboard not available in this build.\n\n",
+                "If you installed via Homebrew, the web assets may not have been bundled.\n",
+                "Try reinstalling: brew reinstall zeroclaw\n\n",
+                "To build manually from source:\n",
+                "  git clone https://github.com/zeroclaw-labs/zeroclaw\n",
+                "  cd zeroclaw/web && npm ci && npm run build\n",
+                "  cd .. && cargo build --release\n\n",
+                "For Docker users, the official image includes the web dashboard:\n",
+                "  docker run -p 42617:42617 ghcr.io/zeroclaw-labs/zeroclaw\n",
+            ),
         )
             .into_response();
-    }
-    serve_embedded_file("index.html")
+    };
+
+    let html = String::from_utf8_lossy(&content.data);
+
+    // Inject path prefix for the SPA and rewrite asset paths in the HTML
+    let html = if state.path_prefix.is_empty() {
+        html.into_owned()
+    } else {
+        let pfx = &state.path_prefix;
+        // JSON-encode the prefix to safely embed in a <script> block
+        let json_pfx = serde_json::to_string(pfx).unwrap_or_else(|_| "\"\"".to_string());
+        let script = format!("<script>window.__ZEROCLAW_BASE__={json_pfx};</script>");
+        // Rewrite absolute /_app/ references so the browser requests {prefix}/_app/...
+        html.replace("/_app/", &format!("{pfx}/_app/"))
+            .replace("<head>", &format!("<head>{script}"))
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+        ],
+        html,
+    )
+        .into_response()
 }
 
 fn serve_embedded_file(path: &str) -> Response {

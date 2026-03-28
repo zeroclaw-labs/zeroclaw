@@ -1,17 +1,22 @@
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall,
+    Provider, ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
+    StreamResult, TokenUsage, ToolCall as ProviderToolCall,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use base64::Engine as _;
+use futures_util::stream::{self, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 pub struct AnthropicProvider {
     credential: Option<String>,
     base_url: String,
+    max_tokens: u32,
 }
+
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u32 = 4096;
 
 #[derive(Debug, Serialize)]
 struct ChatRequest {
@@ -52,6 +57,10 @@ struct NativeChatRequest<'a> {
     temperature: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<NativeToolSpec<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,7 +194,14 @@ impl AnthropicProvider {
                 .filter(|k| !k.is_empty())
                 .map(ToString::to_string),
             base_url,
+            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
         }
+    }
+
+    /// Override the maximum output tokens for API requests.
+    pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     fn is_setup_token(token: &str) -> bool {
@@ -200,9 +216,38 @@ impl AnthropicProvider {
         if Self::is_setup_token(credential) {
             request
                 .header("Authorization", format!("Bearer {credential}"))
-                .header("anthropic-beta", "oauth-2025-04-20")
+                .header(
+                    "anthropic-beta",
+                    "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                )
+                .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
             request.header("x-api-key", credential)
+        }
+    }
+
+    /// For OAuth tokens, Anthropic requires the system prompt to start with the
+    /// Claude Code identity prefix. This prepends it to any existing system prompt.
+    fn apply_oauth_system_prompt(system: Option<SystemPrompt>) -> Option<SystemPrompt> {
+        let prefix = SystemBlock {
+            block_type: "text".to_string(),
+            text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            cache_control: Some(CacheControl::ephemeral()),
+        };
+        match system {
+            Some(SystemPrompt::Blocks(mut blocks)) => {
+                blocks.insert(0, prefix);
+                Some(SystemPrompt::Blocks(blocks))
+            }
+            Some(SystemPrompt::String(s)) => Some(SystemPrompt::Blocks(vec![
+                prefix,
+                SystemBlock {
+                    block_type: "text".to_string(),
+                    text: s,
+                    cache_control: Some(CacheControl::ephemeral()),
+                },
+            ])),
+            None => Some(SystemPrompt::Blocks(vec![prefix])),
         }
     }
 
@@ -211,9 +256,9 @@ impl AnthropicProvider {
         text.len() > 3072
     }
 
-    /// Cache conversations with more than 4 messages (excluding system)
+    /// Cache conversations with more than 1 non-system message (i.e. after first exchange)
     fn should_cache_conversation(messages: &[ChatMessage]) -> bool {
-        messages.iter().filter(|m| m.role != "system").count() > 4
+        messages.iter().filter(|m| m.role != "system").count() > 1
     }
 
     /// Apply cache control to the last message content block
@@ -447,17 +492,13 @@ impl AnthropicProvider {
             }
         }
 
-        // Convert system text to SystemPrompt with cache control if large
+        // Always use Blocks format with cache_control for system prompts
         let system_prompt = system_text.map(|text| {
-            if Self::should_cache_system(&text) {
-                SystemPrompt::Blocks(vec![SystemBlock {
-                    block_type: "text".to_string(),
-                    text,
-                    cache_control: Some(CacheControl::ephemeral()),
-                }])
-            } else {
-                SystemPrompt::String(text)
-            }
+            SystemPrompt::Blocks(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text,
+                cache_control: Some(CacheControl::ephemeral()),
+            }])
         });
 
         (system_prompt, native_messages)
@@ -524,6 +565,188 @@ impl AnthropicProvider {
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.anthropic", 120, 10)
     }
+
+    /// Build a streaming request body from a `NativeChatRequest`.
+    fn build_streaming_request(request: &NativeChatRequest<'_>) -> serde_json::Value {
+        let mut body =
+            serde_json::to_value(request).expect("NativeChatRequest should serialize to JSON");
+        body["stream"] = serde_json::Value::Bool(true);
+        body
+    }
+
+    /// Parse Anthropic SSE lines from `response` and send `StreamEvent`s to `tx`.
+    async fn parse_anthropic_sse(
+        response: reqwest::Response,
+        tx: &tokio::sync::mpsc::Sender<StreamResult<StreamEvent>>,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+        use tokio_util::io::StreamReader;
+
+        let byte_stream = response
+            .bytes_stream()
+            .map(|result| result.map_err(std::io::Error::other));
+        let reader = StreamReader::new(byte_stream);
+        let mut lines = reader.lines();
+
+        let mut tool_id: Option<String> = None;
+        let mut tool_name: Option<String> = None;
+        let mut tool_input_json = String::new();
+
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim().to_string();
+            if !line.starts_with("data: ") {
+                continue;
+            }
+            let json_str = &line["data: ".len()..];
+
+            let event: serde_json::Value = match serde_json::from_str(json_str) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let event_type = event
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default();
+
+            match event_type {
+                "message_start" => {
+                    let model = event
+                        .get("message")
+                        .and_then(|m| m.get("model"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown");
+                    let input_tokens = event
+                        .get("message")
+                        .and_then(|m| m.get("usage"))
+                        .and_then(|u| u.get("input_tokens"))
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    tracing::debug!(
+                        model = %model,
+                        input_tokens = input_tokens,
+                        "Anthropic stream: message_start"
+                    );
+                }
+                "content_block_start" => {
+                    if let Some(block) = event.get("content_block") {
+                        let block_type = block
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default();
+                        if block_type == "tool_use" {
+                            if let Some(id) = tool_id.take() {
+                                let name = tool_name.take().unwrap_or_default();
+                                let input = std::mem::take(&mut tool_input_json);
+                                let _ = tx
+                                    .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
+                                        id,
+                                        name,
+                                        arguments: input,
+                                    })))
+                                    .await;
+                            }
+                            tool_id = block
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string);
+                            tool_name = block
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string);
+                            tool_input_json.clear();
+                        }
+                    }
+                }
+                "content_block_delta" => {
+                    if let Some(delta) = event.get("delta") {
+                        let delta_type = delta
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or_default();
+                        match delta_type {
+                            "text_delta" => {
+                                if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
+                                    if !text.is_empty()
+                                        && tx
+                                            .send(Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                                                text.to_string(),
+                                            ))))
+                                            .await
+                                            .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                            }
+                            "input_json_delta" => {
+                                if let Some(json) =
+                                    delta.get("partial_json").and_then(|j| j.as_str())
+                                {
+                                    tool_input_json.push_str(json);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                "content_block_stop" => {
+                    if let Some(id) = tool_id.take() {
+                        let name = tool_name.take().unwrap_or_default();
+                        let input = std::mem::take(&mut tool_input_json);
+                        let _ = tx
+                            .send(Ok(StreamEvent::ToolCall(ProviderToolCall {
+                                id,
+                                name,
+                                arguments: input,
+                            })))
+                            .await;
+                    }
+                }
+                "message_delta" => {
+                    let stop_reason = event
+                        .get("delta")
+                        .and_then(|d| d.get("stop_reason"))
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("none");
+                    let output_tokens = event
+                        .get("usage")
+                        .and_then(|u| u.get("output_tokens"))
+                        .and_then(|t| t.as_u64())
+                        .unwrap_or(0);
+                    if stop_reason == "max_tokens" {
+                        tracing::warn!(
+                            output_tokens = output_tokens,
+                            "Anthropic response truncated: hit max_tokens limit. Increase provider_max_tokens in config."
+                        );
+                    } else {
+                        tracing::debug!(
+                            stop_reason = %stop_reason,
+                            output_tokens = output_tokens,
+                            "Anthropic stream: message_delta"
+                        );
+                    }
+                }
+                "message_stop" => {
+                    tracing::debug!("Anthropic stream: message_stop");
+                    let _ = tx.send(Ok(StreamEvent::Final)).await;
+                    return;
+                }
+                "error" => {
+                    let msg = event
+                        .get("error")
+                        .and_then(|e| e.get("message"))
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("unknown streaming error");
+                    let _ = tx.send(Err(StreamError::Provider(msg.to_string()))).await;
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let _ = tx.send(Ok(StreamEvent::Final)).await;
+    }
 }
 
 #[async_trait]
@@ -541,15 +764,29 @@ impl Provider for AnthropicProvider {
             )
         })?;
 
-        let request = ChatRequest {
+        let system = system_prompt.map(|s| SystemPrompt::String(s.to_string()));
+        let system = if Self::is_setup_token(credential) {
+            Self::apply_oauth_system_prompt(system)
+        } else {
+            system
+        };
+
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic API request");
+        let request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: 4096,
-            system: system_prompt.map(ToString::to_string),
-            messages: vec![Message {
+            max_tokens: self.max_tokens,
+            system,
+            messages: vec![NativeMessage {
                 role: "user".to_string(),
-                content: message.to_string(),
+                content: vec![NativeContentOut::Text {
+                    text: message.to_string(),
+                    cache_control: None,
+                }],
             }],
             temperature,
+            tools: None,
+            tool_choice: None,
+            stream: None,
         };
 
         let mut request = self
@@ -567,8 +804,11 @@ impl Provider for AnthropicProvider {
             return Err(super::api_error("Anthropic", response).await);
         }
 
-        let chat_response: ChatResponse = response.json().await?;
-        Self::parse_text_response(chat_response)
+        let chat_response: NativeChatResponse = response.json().await?;
+        let parsed = Self::parse_native_response(chat_response);
+        parsed
+            .text
+            .ok_or_else(|| anyhow::anyhow!("No response from Anthropic"))
     }
 
     async fn chat(
@@ -590,13 +830,35 @@ impl Provider for AnthropicProvider {
             Self::apply_cache_to_last_message(&mut messages);
         }
 
+        // Check for tool_choice override from the agent loop (e.g. "any"
+        // to force tool use for hardware requests).
+        let tool_choice_override = crate::agent::loop_::TOOL_CHOICE_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let native_tools = Self::convert_tools(request.tools);
+        let tool_choice = if native_tools.is_some() {
+            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+        } else {
+            None
+        };
+
+        // For OAuth tokens, prepend Claude Code identity to system prompt
+        let system_prompt = if Self::is_setup_token(credential) {
+            Self::apply_oauth_system_prompt(system_prompt)
+        } else {
+            system_prompt
+        };
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic streaming API request");
         let native_request = NativeChatRequest {
             model: model.to_string(),
-            max_tokens: 4096,
+            max_tokens: self.max_tokens,
             system: system_prompt,
             messages,
             temperature,
-            tools: Self::convert_tools(request.tools),
+            tools: native_tools,
+            tool_choice,
+            stream: None,
         };
 
         let req = self
@@ -687,12 +949,132 @@ impl Provider for AnthropicProvider {
         }
         Ok(())
     }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn supports_streaming_tool_events(&self) -> bool {
+        true
+    }
+
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+        }
+
+        let credential = match self.credential.as_ref() {
+            Some(c) => c.clone(),
+            None => {
+                return stream::once(async {
+                    Err(StreamError::Provider(
+                        "Anthropic credentials not set".to_string(),
+                    ))
+                })
+                .boxed();
+            }
+        };
+
+        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+        if Self::should_cache_conversation(request.messages) {
+            Self::apply_cache_to_last_message(&mut messages);
+        }
+
+        let tool_choice_override = crate::agent::loop_::TOOL_CHOICE_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let native_tools = Self::convert_tools(request.tools);
+        let tool_choice = if native_tools.is_some() {
+            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
+        } else {
+            None
+        };
+
+        let system_prompt = if Self::is_setup_token(&credential) {
+            Self::apply_oauth_system_prompt(system_prompt)
+        } else {
+            system_prompt
+        };
+
+        tracing::debug!(max_tokens = self.max_tokens, model = %model, "Anthropic stream_chat request");
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            max_tokens: self.max_tokens,
+            system: system_prompt,
+            messages,
+            temperature,
+            tools: native_tools,
+            tool_choice,
+            stream: Some(true),
+        };
+
+        let body = Self::build_streaming_request(&native_request);
+        let client = self.http_client();
+        let url = format!("{}/v1/messages", self.base_url);
+        let is_oauth = Self::is_setup_token(&credential);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
+
+        tokio::spawn(async move {
+            let mut req = client
+                .post(&url)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&body);
+
+            if is_oauth {
+                req = req
+                    .header("Authorization", format!("Bearer {credential}"))
+                    .header(
+                        "anthropic-beta",
+                        "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
+                    )
+                    .header("anthropic-dangerous-direct-browser-access", "true");
+            } else {
+                req = req.header("x-api-key", &credential);
+            }
+
+            let response = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{status}: {error}"))))
+                    .await;
+                return;
+            }
+
+            Self::parse_anthropic_sse(response, &tx).await;
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::anthropic_token::{detect_auth_kind, AnthropicAuthKind};
+    use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
 
     #[test]
     fn creates_with_key() {
@@ -789,7 +1171,14 @@ mod tests {
                 .headers()
                 .get("anthropic-beta")
                 .and_then(|v| v.to_str().ok()),
-            Some("oauth-2025-04-20")
+            Some("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get("anthropic-dangerous-direct-browser-access")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
         );
         assert!(request.headers().get("x-api-key").is_none());
     }
@@ -1063,12 +1452,8 @@ mod tests {
                 role: "user".to_string(),
                 content: "Hello".to_string(),
             },
-            ChatMessage {
-                role: "assistant".to_string(),
-                content: "Hi".to_string(),
-            },
         ];
-        // Only 2 non-system messages
+        // Only 1 non-system message — should not cache
         assert!(!AnthropicProvider::should_cache_conversation(&messages));
     }
 
@@ -1078,8 +1463,8 @@ mod tests {
             role: "system".to_string(),
             content: "System prompt".to_string(),
         }];
-        // Add 5 non-system messages
-        for i in 0..5 {
+        // Add 3 non-system messages
+        for i in 0..3 {
             messages.push(ChatMessage {
                 role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
                 content: format!("Message {i}"),
@@ -1090,21 +1475,24 @@ mod tests {
 
     #[test]
     fn should_cache_conversation_boundary() {
-        let mut messages = vec![];
-        // Add exactly 4 non-system messages
-        for i in 0..4 {
-            messages.push(ChatMessage {
-                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
-                content: format!("Message {i}"),
-            });
-        }
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hello".to_string(),
+        }];
+        // Exactly 1 non-system message — should not cache
         assert!(!AnthropicProvider::should_cache_conversation(&messages));
 
-        // Add one more to cross boundary
-        messages.push(ChatMessage {
-            role: "user".to_string(),
-            content: "One more".to_string(),
-        });
+        // Add one more to cross boundary (>1)
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "Hi".to_string(),
+            },
+        ];
         assert!(AnthropicProvider::should_cache_conversation(&messages));
     }
 
@@ -1217,7 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_messages_small_system_prompt() {
+    fn convert_messages_small_system_prompt_uses_blocks_with_cache() {
         let messages = vec![ChatMessage {
             role: "system".to_string(),
             content: "Short system prompt".to_string(),
@@ -1226,10 +1614,17 @@ mod tests {
         let (system_prompt, _) = AnthropicProvider::convert_messages(&messages);
 
         match system_prompt.unwrap() {
-            SystemPrompt::String(s) => {
-                assert_eq!(s, "Short system prompt");
+            SystemPrompt::Blocks(blocks) => {
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(blocks[0].text, "Short system prompt");
+                assert!(
+                    blocks[0].cache_control.is_some(),
+                    "Small system prompts should have cache_control"
+                );
             }
-            SystemPrompt::Blocks(_) => panic!("Expected String variant for small prompt"),
+            SystemPrompt::String(_) => {
+                panic!("Expected Blocks variant with cache_control for small prompt")
+            }
         }
     }
 
@@ -1254,12 +1649,16 @@ mod tests {
     }
 
     #[test]
-    fn backward_compatibility_native_chat_request() {
-        // Test that requests without cache_control serialize identically to old format
+    fn native_chat_request_with_blocks_system() {
+        // System prompts now always use Blocks format with cache_control
         let req = NativeChatRequest {
             model: "claude-3-opus".to_string(),
             max_tokens: 4096,
-            system: Some(SystemPrompt::String("System".to_string())),
+            system: Some(SystemPrompt::Blocks(vec![SystemBlock {
+                block_type: "text".to_string(),
+                text: "System".to_string(),
+                cache_control: Some(CacheControl::ephemeral()),
+            }])),
             messages: vec![NativeMessage {
                 role: "user".to_string(),
                 content: vec![NativeContentOut::Text {
@@ -1269,11 +1668,16 @@ mod tests {
             }],
             temperature: 0.7,
             tools: None,
+            tool_choice: None,
+            stream: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
-        assert!(!json.contains("cache_control"));
-        assert!(json.contains(r#""system":"System""#));
+        assert!(json.contains("System"));
+        assert!(
+            json.contains(r#""cache_control":{"type":"ephemeral"}"#),
+            "System prompt should include cache_control"
+        );
     }
 
     #[tokio::test]
@@ -1320,7 +1724,7 @@ mod tests {
     /// ALL conversation turns and native tool definitions.
     #[tokio::test]
     async fn chat_with_tools_sends_full_history_and_native_tools() {
-        use axum::{routing::post, Json, Router};
+        use axum::{Json, Router, routing::post};
         use std::sync::{Arc, Mutex};
         use tokio::net::TcpListener;
 
@@ -1358,13 +1762,16 @@ mod tests {
         let provider = AnthropicProvider {
             credential: Some("test-key".to_string()),
             base_url: format!("http://{addr}"),
+            max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
         };
 
         // Multi-turn conversation: system → user (Go code) → assistant (code response) → user (follow-up)
         let messages = vec![
             ChatMessage::system("You are a helpful assistant."),
             ChatMessage::user("gen a 2 sum in golang"),
-            ChatMessage::assistant("```go\nfunc twoSum(nums []int, target int) []int {\n    m := make(map[int]int)\n    for i, n := range nums {\n        if j, ok := m[target-n]; ok {\n            return []int{j, i}\n        }\n        m[n] = i\n    }\n    return nil\n}\n```"),
+            ChatMessage::assistant(
+                "```go\nfunc twoSum(nums []int, target int) []int {\n    m := make(map[int]int)\n    for i, n := range nums {\n        if j, ok := m[target-n]; ok {\n            return []int{j, i}\n        }\n        m[n] = i\n    }\n    return nil\n}\n```",
+            ),
             ChatMessage::user("what's meaning of make here?"),
         ];
 

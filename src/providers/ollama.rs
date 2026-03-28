@@ -56,6 +56,9 @@ struct OutgoingFunction {
 #[derive(Debug, Serialize)]
 struct Options {
     temperature: f64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    num_ctx: Option<u32>,
 }
 
 // ─── Response Structures ──────────────────────────────────────────────────────
@@ -119,10 +122,24 @@ impl OllamaProvider {
         }
 
         trimmed
-            .strip_suffix("/api")
+            .strip_suffix("/api/chat")
+            .or_else(|| trimmed.strip_suffix("/api"))
             .unwrap_or(trimmed)
             .trim_end_matches('/')
             .to_string()
+    }
+
+    fn runtime_num_ctx() -> Option<u32> {
+        match std::env::var("ZEROCLAW_OLLAMA_NUM_CTX") {
+            Ok(v) => match v.parse::<u32>() {
+                Ok(n) => Some(n),
+                Err(_) => {
+                    tracing::warn!("Invalid ZEROCLAW_OLLAMA_NUM_CTX value '{}', ignoring", v);
+                    None
+                }
+            },
+            Err(_) => None,
+        }
     }
 
     pub fn new(base_url: Option<&str>, api_key: Option<&str>) -> Self {
@@ -153,13 +170,19 @@ impl OllamaProvider {
             .is_some_and(|host| matches!(host.as_str(), "localhost" | "127.0.0.1" | "::1"))
     }
 
+    fn is_ollama_cloud_endpoint(&self) -> bool {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(|host| host.to_string()))
+            .is_some_and(|host| host == "ollama.com")
+    }
+
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.ollama", 300, 10)
     }
 
     fn resolve_request_details(&self, model: &str) -> anyhow::Result<(String, bool)> {
         let requests_cloud = model.ends_with(":cloud");
-        let normalized_model = model.strip_suffix(":cloud").unwrap_or(model).to_string();
 
         if requests_cloud && self.is_local_endpoint() {
             anyhow::bail!(
@@ -168,16 +191,26 @@ impl OllamaProvider {
             );
         }
 
-        if requests_cloud && self.api_key.is_none() {
-            anyhow::bail!(
-                "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
-                model
-            );
+        // When targeting Ollama Cloud (ollama.com), strip the :cloud suffix and require auth.
+        // Ollama Cloud maps the base model name (e.g. "glm-5") to the cloud-hosted version.
+        //
+        // When targeting a private remote Ollama server, preserve the full model name including
+        // the :cloud tag, since local Ollama stores cloud-proxy models under their full name
+        // (e.g. "glm-5:cloud"). No auth header is sent to private servers.
+        if requests_cloud && self.is_ollama_cloud_endpoint() {
+            if self.api_key.is_none() {
+                anyhow::bail!(
+                    "Model '{}' requested cloud routing, but no API key is configured. Set OLLAMA_API_KEY or config api_key.",
+                    model
+                );
+            }
+            let normalized_model = model.strip_suffix(":cloud").unwrap_or(model).to_string();
+            return Ok((normalized_model, true));
         }
 
         let should_auth = self.api_key.is_some() && !self.is_local_endpoint();
 
-        Ok((normalized_model, should_auth))
+        Ok((model.to_string(), should_auth))
     }
 
     fn parse_tool_arguments(arguments: &str) -> serde_json::Value {
@@ -297,7 +330,10 @@ impl OllamaProvider {
             model: model.to_string(),
             messages,
             stream: false,
-            options: Options { temperature },
+            options: Options {
+                temperature,
+                num_ctx: Self::runtime_num_ctx(),
+            },
             think,
             tools: tools.map(|t| t.to_vec()),
         }
@@ -446,13 +482,14 @@ impl OllamaProvider {
         let url = format!("{}/api/chat", self.base_url);
 
         tracing::debug!(
-            "Ollama request: url={} model={} message_count={} temperature={} think={:?} tool_count={}",
+            "Ollama request: url={} model={} message_count={} temperature={} think={:?} tool_count={} num_ctx={:?}",
             url,
             model,
             request.messages.len(),
             temperature,
             request.think,
             request.tools.as_ref().map_or(0, |t| t.len()),
+            request.options.num_ctx
         );
 
         let mut request_builder = self.http_client().post(&url).json(&request);
@@ -630,7 +667,7 @@ impl OllamaProvider {
 impl Provider for OllamaProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
-            native_tool_calling: true,
+            native_tool_calling: false,
             vision: true,
             prompt_caching: false,
         }
@@ -824,10 +861,13 @@ impl Provider for OllamaProvider {
     }
 
     fn supports_native_tools(&self) -> bool {
-        // Ollama's /api/chat supports native function-calling for capable models
-        // (qwen2.5, llama3.1, mistral-nemo, etc.). chat_with_tools() sends tool
-        // definitions in the request and returns structured ToolCall objects.
-        true
+        // Default to prompt-guided tool calling (XML instructions in system prompt)
+        // because many Ollama-served models do not support Ollama's native
+        // /api/chat tool-calling parameter. Models that lack support silently
+        // ignore the tools array and emit tool-call JSON as plain text, which the
+        // agent loop cannot parse without the XML protocol instructions.
+        // See: https://github.com/zeroclaw-labs/zeroclaw/issues/3999
+        false
     }
 
     async fn chat(
@@ -902,6 +942,12 @@ mod tests {
     }
 
     #[test]
+    fn custom_url_strips_api_chat_suffix() {
+        let p = OllamaProvider::new(Some("http://172.30.30.50:11434/api/chat"), None);
+        assert_eq!(p.base_url, "http://172.30.30.50:11434");
+    }
+
+    #[test]
     fn empty_url_uses_empty() {
         let p = OllamaProvider::new(Some(""), None);
         assert_eq!(p.base_url, "");
@@ -921,9 +967,11 @@ mod tests {
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should fail on local endpoint");
-        assert!(error
-            .to_string()
-            .contains("requested cloud routing, but Ollama endpoint is local"));
+        assert!(
+            error
+                .to_string()
+                .contains("requested cloud routing, but Ollama endpoint is local")
+        );
     }
 
     #[test]
@@ -932,9 +980,11 @@ mod tests {
         let error = p
             .resolve_request_details("qwen3:cloud")
             .expect_err("cloud suffix should require API key");
-        assert!(error
-            .to_string()
-            .contains("requested cloud routing, but no API key is configured"));
+        assert!(
+            error
+                .to_string()
+                .contains("requested cloud routing, but no API key is configured")
+        );
     }
 
     #[test]
@@ -942,6 +992,26 @@ mod tests {
         let p = OllamaProvider::new(Some("https://ollama.com"), Some("ollama-key"));
         let (_model, should_auth) = p.resolve_request_details("qwen3").unwrap();
         assert!(should_auth);
+    }
+
+    #[test]
+    fn private_remote_server_cloud_suffix_preserves_model_name() {
+        // A private Ollama server stores cloud-proxy models with the :cloud tag intact
+        // (e.g. "glm-5:cloud"). The model name must NOT be stripped — unlike Ollama Cloud
+        // which maps "glm-5" to the cloud version, a private server would 404 on "glm-5".
+        let p = OllamaProvider::new(Some("http://192.168.1.100:11434"), Some("ollama-key"));
+        let (model, should_auth) = p.resolve_request_details("glm-5:cloud").unwrap();
+        assert_eq!(model, "glm-5:cloud");
+        assert!(should_auth);
+    }
+
+    #[test]
+    fn private_remote_server_cloud_suffix_no_key_still_works() {
+        // Private Ollama servers typically don't require an API key.
+        let p = OllamaProvider::new(Some("http://192.168.1.100:11434"), None);
+        let (model, should_auth) = p.resolve_request_details("glm-5:cloud").unwrap();
+        assert_eq!(model, "glm-5:cloud");
+        assert!(!should_auth);
     }
 
     #[test]
@@ -1214,10 +1284,13 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_include_native_tools_and_vision() {
+    fn capabilities_disable_native_tools_and_enable_vision() {
         let provider = OllamaProvider::new(None, None);
         let caps = <OllamaProvider as Provider>::capabilities(&provider);
-        assert!(caps.native_tool_calling);
+        assert!(
+            !caps.native_tool_calling,
+            "Ollama should default to prompt-guided tool calling"
+        );
         assert!(caps.vision);
     }
 
@@ -1310,11 +1383,13 @@ mod tests {
     fn effective_content_returns_none_when_both_empty() {
         assert!(OllamaProvider::effective_content("", None).is_none());
         assert!(OllamaProvider::effective_content("", Some("")).is_none());
-        assert!(OllamaProvider::effective_content(
-            "<think>only thinking</think>",
-            Some("<think>also only thinking</think>")
-        )
-        .is_none());
+        assert!(
+            OllamaProvider::effective_content(
+                "<think>only thinking</think>",
+                Some("<think>also only thinking</think>")
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1364,5 +1439,23 @@ mod tests {
         let text = result.unwrap();
         assert!(text.contains("<tool_call>"));
         assert!(text.contains("date"));
+    }
+
+    #[test]
+    fn runtime_num_ctx_reads_env_variable() {
+        std::env::set_var("ZEROCLAW_OLLAMA_NUM_CTX", "16384");
+
+        let ctx = OllamaProvider::runtime_num_ctx();
+
+        assert_eq!(ctx, Some(16384));
+    }
+
+    #[test]
+    fn runtime_num_ctx_handles_invalid_value() {
+        std::env::set_var("ZEROCLAW_OLLAMA_NUM_CTX", "invalid");
+
+        let ctx = OllamaProvider::runtime_num_ctx();
+
+        assert_eq!(ctx, None);
     }
 }
