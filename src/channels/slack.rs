@@ -2507,6 +2507,7 @@ impl SlackChannel {
                 .map(str::to_string),
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
     }
 
@@ -2837,6 +2838,7 @@ impl SlackChannel {
                     },
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                     attachments: vec![],
+                    observe_group: false,
                 };
 
                 // Track thread context so start_typing can set assistant status.
@@ -3839,6 +3841,7 @@ impl Channel for SlackChannel {
                             },
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                             attachments: vec![],
+                            observe_group: false,
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -3923,6 +3926,7 @@ impl Channel for SlackChannel {
                         thread_ts: Some(thread_ts.clone()),
                         interruption_scope_id: Some(thread_ts.clone()),
                         attachments: vec![],
+                        observe_group: false,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -4935,6 +4939,7 @@ mod tests {
             thread_ts: None, // thread_replies=false → no fallback to ts
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         let msg1 = make_msg("100.000");
@@ -4961,6 +4966,7 @@ mod tests {
             thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         let msg1 = make_msg("100.000");
