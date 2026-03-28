@@ -240,7 +240,12 @@ impl Channel for DiscordHistoryChannel {
         let ws_url = format!("{gw_url}/?v=10&encoding=json");
         tracing::info!("DiscordHistory: connecting to gateway...");
 
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+        let (ws_stream, _) = crate::config::ws_connect_with_proxy(
+            &ws_url,
+            "channel.discord",
+            self.proxy_url.as_deref(),
+        )
+        .await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)
@@ -494,6 +499,8 @@ impl Channel for DiscordHistoryChannel {
                                 .as_secs(),
                             thread_ts: None,
                             interruption_scope_id: None,
+                            attachments: Vec::new(),
+                            observe_group: false,
                         };
                         if tx.send(channel_msg).await.is_err() {
                             break;

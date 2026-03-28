@@ -11,8 +11,6 @@ use crate::sop::{SopEngine, SopMetricsCollector};
 pub struct SopStatusTool {
     engine: Arc<Mutex<SopEngine>>,
     collector: Option<Arc<SopMetricsCollector>>,
-    #[cfg(feature = "ampersona-gates")]
-    gate_eval: Option<Arc<crate::sop::GateEvalState>>,
 }
 
 impl SopStatusTool {
@@ -20,8 +18,6 @@ impl SopStatusTool {
         Self {
             engine,
             collector: None,
-            #[cfg(feature = "ampersona-gates")]
-            gate_eval: None,
         }
     }
 
@@ -30,61 +26,11 @@ impl SopStatusTool {
         self
     }
 
-    #[cfg(feature = "ampersona-gates")]
-    pub fn with_gate_eval(mut self, gate_eval: Arc<crate::sop::GateEvalState>) -> Self {
-        self.gate_eval = Some(gate_eval);
-        self
-    }
-
     fn append_gate_status(&self, output: &mut String, include_gate_status: bool) {
-        #[cfg(feature = "ampersona-gates")]
-        if include_gate_status {
-            if let Some(ref ge) = self.gate_eval {
-                if let Some(snap) = ge.phase_state_snapshot() {
-                    let _ = writeln!(output, "\nGate Status:");
-                    let _ = writeln!(
-                        output,
-                        "  current_phase: {}",
-                        snap.current_phase.as_deref().unwrap_or("(none)")
-                    );
-                    let _ = writeln!(output, "  state_rev: {}", snap.state_rev);
-                    let _ = writeln!(output, "  gates_loaded: {}", ge.gate_count());
-                    if let Some(ref tr) = snap.last_transition {
-                        let _ = writeln!(
-                            output,
-                            "  last_transition: {} ({} → {})",
-                            tr.at.to_rfc3339(),
-                            tr.from_phase.as_deref().unwrap_or("(none)"),
-                            tr.to_phase,
-                        );
-                    } else {
-                        let _ = writeln!(output, "  last_transition: none");
-                    }
-                    if let Some(ref pt) = snap.pending_transition {
-                        let _ = writeln!(
-                            output,
-                            "  pending_transition: {} → {} ({})",
-                            pt.from_phase.as_deref().unwrap_or("(none)"),
-                            pt.to_phase,
-                            pt.decision,
-                        );
-                    } else {
-                        let _ = writeln!(output, "  pending_transition: none");
-                    }
-                }
-            } else {
-                let _ = writeln!(
-                    output,
-                    "\nGate Status: not available (gate eval not configured)"
-                );
-            }
-        }
-
-        #[cfg(not(feature = "ampersona-gates"))]
         if include_gate_status {
             let _ = writeln!(
                 output,
-                "\nGate Status: not available (ampersona-gates feature not enabled)"
+                "\nGate Status: not available (gate evaluation not supported)"
             );
         }
     }
@@ -309,10 +255,13 @@ mod tests {
                 body: "Do it".into(),
                 suggested_tools: vec![],
                 requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
             }],
             cooldown_secs: 0,
             max_concurrent: 2,
             location: None,
+            deterministic: false,
         }
     }
 
@@ -431,6 +380,7 @@ mod tests {
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
             }],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         collector.record_run_complete(&run);
 
@@ -466,6 +416,7 @@ mod tests {
                 completed_at: Some("2026-02-19T12:01:00Z".into()),
             }],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         collector.record_run_complete(&run);
 

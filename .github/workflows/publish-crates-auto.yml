@@ -41,6 +41,14 @@ jobs:
           echo "Current version: ${current}"
           echo "Previous version: ${previous}"
 
+          # Skip if stable release workflow will handle this version
+          # (indicated by an existing or imminent stable tag)
+          if git ls-remote --exit-code --tags origin "refs/tags/v${current}" >/dev/null 2>&1; then
+            echo "Stable tag v${current} exists — stable release workflow handles crates.io"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           if [[ "$current" != "$previous" && -n "$current" ]]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "version=${current}" >> "$GITHUB_OUTPUT"
@@ -87,7 +95,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.93.0
 
       - uses: Swatinem/rust-cache@v2
 

@@ -8,10 +8,10 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::unnecessary_map_or)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+use async_imap::Session;
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
-use async_imap::Session;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use lettre::message::SinglePart;
@@ -26,10 +26,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{sleep, timeout};
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -244,7 +244,16 @@ impl EmailChannel {
         Ok(session)
     }
 
-    /// Fetch and process unseen messages from the selected mailbox
+    /// Maximum number of messages fetched per IMAP round-trip.
+    /// Bounds peak memory when the mailbox has a large unseen backlog.
+    const MAX_FETCH_BATCH: usize = 10;
+
+    /// Fetch and process unseen messages from the selected mailbox.
+    ///
+    /// UIDs are fetched in chunks of [`Self::MAX_FETCH_BATCH`] to bound the
+    /// number of message bodies (and any audio attachments) held in memory at
+    /// once. Each chunk is marked `\Seen` immediately after fetch so that
+    /// successfully retrieved messages are not re-fetched if a later chunk fails.
     async fn fetch_unseen(&self, session: &mut ImapSession) -> Result<Vec<ParsedEmail>> {
         // Search for unseen messages
         let uids = session.uid_search("UNSEEN").await?;
@@ -254,68 +263,70 @@ impl EmailChannel {
 
         debug!("Found {} unseen messages", uids.len());
 
+        let uid_list: Vec<u32> = uids.into_iter().collect();
         let mut results = Vec::new();
-        let uid_set: String = uids
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
 
-        // Fetch message bodies
-        let messages = session.uid_fetch(&uid_set, "RFC822").await?;
-        let messages: Vec<Fetch> = messages.try_collect().await?;
+        for chunk in uid_list.chunks(Self::MAX_FETCH_BATCH) {
+            let uid_set: String = chunk
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
 
-        for msg in messages {
-            let uid = msg.uid.unwrap_or(0);
-            if let Some(body) = msg.body() {
-                if let Some(parsed) = MessageParser::default().parse(body) {
-                    let sender = Self::extract_sender(&parsed);
-                    let subject = parsed.subject().unwrap_or("(no subject)").to_string();
-                    let body_text = Self::extract_text(&parsed);
-                    let content = format!("Subject: {}\n\n{}", subject, body_text);
-                    let msg_id = parsed
-                        .message_id()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+            // Fetch message bodies for this chunk
+            let messages = session.uid_fetch(&uid_set, "RFC822").await?;
+            let messages: Vec<Fetch> = messages.try_collect().await?;
 
-                    #[allow(clippy::cast_sign_loss)]
-                    let ts = parsed
-                        .date()
-                        .map(|d| {
-                            let naive = chrono::NaiveDate::from_ymd_opt(
-                                d.year as i32,
-                                u32::from(d.month),
-                                u32::from(d.day),
-                            )
-                            .and_then(|date| {
-                                date.and_hms_opt(
-                                    u32::from(d.hour),
-                                    u32::from(d.minute),
-                                    u32::from(d.second),
+            for msg in messages {
+                let uid = msg.uid.unwrap_or(0);
+                if let Some(body) = msg.body() {
+                    if let Some(parsed) = MessageParser::default().parse(body) {
+                        let sender = Self::extract_sender(&parsed);
+                        let subject = parsed.subject().unwrap_or("(no subject)").to_string();
+                        let body_text = Self::extract_text(&parsed);
+                        let content = format!("Subject: {}\n\n{}", subject, body_text);
+                        let msg_id = parsed
+                            .message_id()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+
+                        #[allow(clippy::cast_sign_loss)]
+                        let ts = parsed
+                            .date()
+                            .map(|d| {
+                                let naive = chrono::NaiveDate::from_ymd_opt(
+                                    d.year as i32,
+                                    u32::from(d.month),
+                                    u32::from(d.day),
                                 )
+                                .and_then(|date| {
+                                    date.and_hms_opt(
+                                        u32::from(d.hour),
+                                        u32::from(d.minute),
+                                        u32::from(d.second),
+                                    )
+                                });
+                                naive.map_or(0, |n| n.and_utc().timestamp() as u64)
+                            })
+                            .unwrap_or_else(|| {
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0)
                             });
-                            naive.map_or(0, |n| n.and_utc().timestamp() as u64)
-                        })
-                        .unwrap_or_else(|| {
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0)
-                        });
 
-                    results.push(ParsedEmail {
-                        _uid: uid,
-                        msg_id,
-                        sender,
-                        content,
-                        timestamp: ts,
-                    });
+                        results.push(ParsedEmail {
+                            _uid: uid,
+                            msg_id,
+                            sender,
+                            content,
+                            timestamp: ts,
+                        });
+                    }
                 }
             }
-        }
 
-        // Mark fetched messages as seen
-        if !results.is_empty() {
+            // Mark this chunk as seen before fetching the next
             let _ = session
                 .uid_store(&uid_set, "+FLAGS (\\Seen)")
                 .await?
@@ -468,6 +479,8 @@ impl EmailChannel {
                 timestamp: email.timestamp,
                 thread_ts: None,
                 interruption_scope_id: None,
+                attachments: vec![],
+                observe_group: false,
             };
 
             if tx.send(msg).await.is_err() {
@@ -592,6 +605,31 @@ mod tests {
     #[test]
     fn default_idle_timeout_is_29_minutes() {
         assert_eq!(default_idle_timeout(), 1740);
+    }
+
+    #[test]
+    fn max_fetch_batch_bounds_chunk_size() {
+        let cap = EmailChannel::MAX_FETCH_BATCH;
+        assert_eq!(cap, 10);
+
+        // Under cap: single chunk
+        let uids: Vec<u32> = (1..=3).collect();
+        let chunks: Vec<&[u32]> = uids.chunks(cap).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 3);
+
+        // Exactly at cap: single chunk
+        let uids: Vec<u32> = (1..=10).collect();
+        let chunks: Vec<&[u32]> = uids.chunks(cap).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 10);
+
+        // Over cap: two chunks
+        let uids: Vec<u32> = (1..=15).collect();
+        let chunks: Vec<&[u32]> = uids.chunks(cap).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 10);
+        assert_eq!(chunks[1].len(), 5);
     }
 
     #[tokio::test]

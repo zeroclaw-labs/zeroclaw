@@ -401,7 +401,7 @@ fn config_nested_optional_sections_default_when_absent() {
     assert!(parsed.channels_config.telegram.is_none());
     assert!(!parsed.composio.enabled);
     assert!(parsed.composio.api_key.is_none());
-    assert!(!parsed.browser.enabled);
+    assert!(parsed.browser.enabled);
 }
 
 #[test]
@@ -454,4 +454,69 @@ allowed_users = ["@user:example.com"]
         "cli should default to true when omitted"
     );
     assert!(parsed.channels_config.matrix.is_some());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #3456 – top-level [cli] section must not clash with channels_config.cli
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn config_toplevel_cli_section_with_whatsapp_parses() {
+    // Exact config from issue #3456
+    let toml_str = r#"
+[cli]
+
+[channels_config.whatsapp]
+session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
+allowed_numbers = ["*"]
+"#;
+    let parsed: Config = toml::from_str(toml_str)
+        .expect("top-level [cli] section with [channels_config.whatsapp] should parse");
+    assert!(parsed.channels_config.whatsapp.is_some());
+    let wa = parsed.channels_config.whatsapp.unwrap();
+    assert_eq!(
+        wa.session_path.as_deref(),
+        Some("~/.zeroclaw/state/whatsapp-web/session.db")
+    );
+    assert_eq!(wa.allowed_numbers, vec!["*".to_string()]);
+}
+
+#[test]
+fn config_only_whatsapp_channel_parses() {
+    let toml_str = r#"
+[channels_config.whatsapp]
+session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
+allowed_numbers = ["*"]
+"#;
+    let parsed: Config =
+        toml::from_str(toml_str).expect("config with only whatsapp channel should parse");
+    assert!(parsed.channels_config.whatsapp.is_some());
+    assert!(
+        parsed.channels_config.cli,
+        "cli should default to true when omitted"
+    );
+}
+
+#[test]
+fn config_channels_explicit_cli_true_with_whatsapp() {
+    let toml_str = r#"
+[channels_config]
+cli = true
+
+[channels_config.whatsapp]
+session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
+allowed_numbers = ["*"]
+"#;
+    let parsed: Config = toml::from_str(toml_str)
+        .expect("explicit channels_config.cli=true with whatsapp should parse");
+    assert!(parsed.channels_config.cli);
+    assert!(parsed.channels_config.whatsapp.is_some());
+}
+
+#[test]
+fn config_empty_parses_with_all_defaults() {
+    let parsed: Config = toml::from_str("").expect("empty config should parse with all defaults");
+    assert!(parsed.channels_config.cli);
+    assert!(parsed.channels_config.whatsapp.is_none());
+    assert!((parsed.default_temperature - 0.7).abs() < f64::EPSILON);
 }
