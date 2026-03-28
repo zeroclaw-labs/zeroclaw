@@ -8,6 +8,8 @@ import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
 import { getSessionMessages } from '@/lib/api';
+import ToolCallCard from '@/components/ToolCallCard';
+import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -22,6 +24,7 @@ interface ChatMessage {
   content: string;
   thinking?: string;
   markdown?: boolean;
+  toolCall?: ToolCallInfo;
   timestamp: Date;
 }
 
@@ -170,29 +173,62 @@ export default function AgentChat() {
           break;
         }
 
-        case 'tool_call':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: `${t('agent.tool_call_prefix')} ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
-              timestamp: new Date(),
-            },
-          ]);
-          break;
+        case 'tool_call': {
+          const toolName = msg.name ?? 'unknown';
+          const toolArgs = msg.args;
+          setMessages((prev) => {
+            // Dedup: backend streaming may re-send tool_call events before execution.
+            // Skip if an unresolved card with the same name+args already exists.
+            const argsKey = JSON.stringify(toolArgs ?? {});
+            const isDuplicate = prev.some(
+              (m) => m.toolCall
+                && m.toolCall.output === undefined
+                && m.toolCall.name === toolName
+                && JSON.stringify(m.toolCall.args ?? {}) === argsKey,
+            );
+            if (isDuplicate) return prev;
 
-        case 'tool_result':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              timestamp: new Date(),
-            },
-          ]);
+            return [
+              ...prev,
+              {
+                id: generateUUID(),
+                role: 'agent' as const,
+                content: `${t('agent.tool_call_prefix')} ${toolName}(${argsKey})`,
+                toolCall: { name: toolName, args: toolArgs },
+                timestamp: new Date(),
+              },
+            ];
+          });
           break;
+        }
+
+        case 'tool_result': {
+          setMessages((prev) => {
+            // Forward scan: find the FIRST unresolved toolCall (order-guaranteed by backend)
+            const idx = prev.findIndex((m) => m.toolCall && m.toolCall.output === undefined);
+            if (idx !== -1) {
+              const updated = [...prev];
+              const existing = prev[idx]!;
+              updated[idx] = {
+                ...existing,
+                toolCall: { ...existing.toolCall!, output: msg.output ?? '' },
+              };
+              return updated;
+            }
+            // Fallback: no unresolved call found — append standalone card
+            return [
+              ...prev,
+              {
+                id: generateUUID(),
+                role: 'agent' as const,
+                content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
+                toolCall: { name: msg.name ?? 'unknown', output: msg.output ?? '' },
+                timestamp: new Date(),
+              },
+            ];
+          });
+          break;
+        }
 
         case 'error':
           setMessages((prev) => [
@@ -369,7 +405,9 @@ export default function AgentChat() {
                     <pre className="text-xs mt-1 whitespace-pre-wrap break-words leading-relaxed overflow-auto max-h-60 p-2 rounded-lg" style={{ color: 'var(--pc-text-muted)', background: 'var(--pc-bg-surface)' }}>{msg.thinking}</pre>
                   </details>
                 )}
-                {msg.markdown ? (
+                {msg.toolCall ? (
+                  <ToolCallCard toolCall={msg.toolCall} />
+                ) : msg.markdown ? (
                   <div className="text-sm break-words leading-relaxed chat-markdown"><ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown></div>
                 ) : (
                   <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">{msg.content}</p>
