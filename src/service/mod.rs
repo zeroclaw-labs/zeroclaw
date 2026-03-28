@@ -1,5 +1,5 @@
 use crate::config::Config;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -190,6 +190,7 @@ fn start_linux(init_system: InitSystem) -> Result<()> {
         InitSystem::Systemd => {
             run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
             run_checked(Command::new("systemctl").args(["--user", "start", "zeroclaw.service"]))?;
+            warn_if_linger_disabled();
         }
         InitSystem::Openrc => {
             run_checked(Command::new("rc-service").args(["zeroclaw", "start"]))?;
@@ -737,6 +738,55 @@ fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
     }
 }
 
+/// Parse the output of `loginctl show-user $USER --property=Linger` and return
+/// whether linger is enabled. Returns `None` if the output cannot be parsed.
+fn parse_linger_property(output: &str) -> Option<bool> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(value) = trimmed.strip_prefix("Linger=") {
+            return Some(value.eq_ignore_ascii_case("yes"));
+        }
+    }
+    None
+}
+
+/// Check whether loginctl linger is enabled for the current user and print a
+/// warning if it is not. Silently skipped when `loginctl` is unavailable.
+#[cfg(target_os = "linux")]
+fn warn_if_linger_disabled() {
+    let user = match std::env::var("USER") {
+        Ok(u) if !u.is_empty() => u,
+        _ => return,
+    };
+
+    let output = Command::new("loginctl")
+        .args(["show-user", &user, "--property=Linger"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        // loginctl not available or failed — skip silently
+        _ => return,
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(enabled) = parse_linger_property(&stdout) {
+        if !enabled {
+            eprintln!(
+                "\n\u{26a0}\u{fe0f}  Warning: loginctl linger is not enabled for your user.\n\
+                 The service will stop when your session ends (e.g., SSH disconnect).\n\
+                 To fix this, run: sudo loginctl enable-linger {}\n",
+                user,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn warn_if_linger_disabled() {
+    // Linger is a systemd/Linux concept — no-op on other platforms.
+}
+
 fn install_linux_systemd(config: &Config) -> Result<()> {
     let file = linux_service_file(config)?;
     if let Some(parent) = file.parent() {
@@ -770,7 +820,53 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "zeroclaw.service"]));
     println!("✅ Installed systemd user service: {}", file.display());
     println!("   Start with: zeroclaw service start");
+
+    warn_if_linger_disabled();
+
+    warn_if_linger_disabled();
     Ok(())
+}
+
+/// Check whether loginctl linger is enabled for the current user and, if not,
+/// print a prominent warning explaining that the daemon will die on logout.
+///
+/// This is a best-effort check: if `loginctl` is absent or returns an error we
+/// stay silent rather than surfacing a confusing secondary failure.
+pub fn warn_if_linger_disabled() {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "$(whoami)".to_string());
+
+    let Ok(output) = Command::new("loginctl")
+        .args(["show-user", &user, "--property=Linger"])
+        .output()
+    else {
+        return; // loginctl not available â skip silently
+    };
+
+    if !output.status.success() {
+        return; // user not logged in via logind or other transient error
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // loginctl outputs lines like "Linger=no" or "Linger=yes"
+    let linger_enabled = stdout
+        .lines()
+        .any(|line| line.trim().eq_ignore_ascii_case("linger=yes"));
+
+    if !linger_enabled {
+        eprintln!();
+        eprintln!(
+            "⚠️  Linger is not enabled for user \"{user}\". \
+             Your daemon will stop when you log out."
+        );
+        eprintln!("   Run:  sudo loginctl enable-linger {user}");
+        eprintln!(
+            "   Without linger, user-level systemd services are stopped \
+             when the last session for that user ends (e.g. SSH disconnect)."
+        );
+        eprintln!();
+    }
 }
 
 /// Check if the current process is running as root (Unix only)
@@ -817,7 +913,9 @@ fn check_zeroclaw_user() -> Result<()> {
                     bail!(
                         "User 'zeroclaw' exists but has unexpected UID {} (expected system UID < 1000).\n\
                          Recreate with: sudo {} && sudo {}",
-                        uid, del_cmd, add_cmd
+                        uid,
+                        del_cmd,
+                        add_cmd
                     );
                 }
 
@@ -1402,6 +1500,77 @@ fn xml_escape(raw: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+// ── Linger detection (systemd user services) ────────────────────
+
+/// Check whether `loginctl enable-linger` is active for the current user.
+/// Returns `Some(true)` if linger is enabled, `Some(false)` if disabled,
+/// or `None` if the check could not be performed (non-Linux, loginctl missing, etc.).
+pub fn is_linger_enabled() -> Option<bool> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let user = current_username()?;
+    let output = Command::new("loginctl")
+        .args(["show-user", &user, "--property=Linger"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Output is "Linger=yes\n" or "Linger=no\n"
+    Some(stdout.trim().eq_ignore_ascii_case("Linger=yes"))
+}
+
+/// Warn and prompt if linger is not enabled (called after systemd install/start).
+fn warn_if_linger_disabled() {
+    use std::io::IsTerminal;
+
+    if let Some(false) = is_linger_enabled() {
+        let user = current_username().unwrap_or_else(|| "$USER".to_string());
+        println!();
+        println!(
+            "  ⚠️  Linger is not enabled for user \"{user}\". Your daemon will stop when you log out."
+        );
+
+        if !std::io::stdin().is_terminal() {
+            println!("     Run: sudo loginctl enable-linger {user}");
+            println!();
+            return;
+        }
+
+        println!();
+        print!("  Enable linger now? (requires sudo) [Y/n] ");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_ok() {
+            let answer = answer.trim().to_lowercase();
+            if answer.is_empty() || answer == "y" || answer == "yes" {
+                match Command::new("sudo")
+                    .args(["loginctl", "enable-linger", &user])
+                    .status()
+                {
+                    Ok(status) if status.success() => {
+                        println!("  ✅ Linger enabled for user \"{user}\".");
+                    }
+                    _ => {
+                        println!("  ❌ Failed to enable linger. Run manually:");
+                        println!("     sudo loginctl enable-linger {user}");
+                    }
+                }
+            } else {
+                println!("  Skipped. To enable later, run:");
+                println!("     sudo loginctl enable-linger {user}");
+            }
+        }
+        println!();
+    }
+}
+
+fn current_username() -> Option<String> {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1653,6 +1822,41 @@ mod tests {
         let exe = PathBuf::from("/home/user/.cargo/bin/zeroclaw");
         let var_dir = detect_homebrew_var_dir(&exe);
         assert_eq!(var_dir, None);
+    }
+
+    #[test]
+    fn parse_linger_property_detects_yes() {
+        assert_eq!(parse_linger_property("Linger=yes\n"), Some(true));
+    }
+
+    #[test]
+    fn parse_linger_property_detects_no() {
+        assert_eq!(parse_linger_property("Linger=no\n"), Some(false));
+    }
+
+    #[test]
+    fn parse_linger_property_case_insensitive() {
+        assert_eq!(parse_linger_property("Linger=Yes\n"), Some(true));
+        assert_eq!(parse_linger_property("Linger=YES\n"), Some(true));
+        assert_eq!(parse_linger_property("Linger=NO\n"), Some(false));
+    }
+
+    #[test]
+    fn parse_linger_property_empty_output() {
+        assert_eq!(parse_linger_property(""), None);
+    }
+
+    #[test]
+    fn parse_linger_property_unrelated_output() {
+        assert_eq!(
+            parse_linger_property("State=active\nSomething=else\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_linger_property_with_surrounding_whitespace() {
+        assert_eq!(parse_linger_property("  Linger=yes  \n"), Some(true));
     }
 
     #[cfg(unix)]

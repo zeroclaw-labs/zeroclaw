@@ -251,6 +251,10 @@ impl ContextCompressor {
         let protect_start = self.config.protect_first_n.min(history.len());
         let protect_end = history.len().saturating_sub(self.config.protect_last_n);
 
+        if protect_start >= protect_end {
+            return 0;
+        }
+
         for msg in &mut history[protect_start..protect_end] {
             if msg.role != "tool" {
                 continue;

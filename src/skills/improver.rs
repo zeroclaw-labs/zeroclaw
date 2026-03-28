@@ -5,7 +5,7 @@
 // in `src/skills/mod.rs`.
 
 use crate::config::SkillImprovementConfig;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;

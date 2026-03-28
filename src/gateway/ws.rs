@@ -20,10 +20,10 @@
 use super::AppState;
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
         Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
-    http::{header, HeaderMap},
+    http::{HeaderMap, header},
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -226,6 +226,25 @@ async fn handle_socket(
     let _ = sender
         .send(Message::Text(session_start.to_string().into()))
         .await;
+
+    // Replay persisted history so the client can display previous messages.
+    // Each message is sent as a `{"type":"history","role":"...","content":"..."}`
+    // frame, followed by a `{"type":"history_end"}` sentinel.
+    if resumed {
+        if let Some(ref backend) = state.session_backend {
+            let history = backend.load(&session_key);
+            for msg in &history {
+                let frame = serde_json::json!({
+                    "type": "history",
+                    "role": msg.role,
+                    "content": msg.content,
+                });
+                let _ = sender.send(Message::Text(frame.to_string().into())).await;
+            }
+        }
+        let end = serde_json::json!({ "type": "history_end" });
+        let _ = sender.send(Message::Text(end.to_string().into())).await;
+    }
 
     // ── Optional connect handshake ──────────────────────────────────
     // The first message may be a `{"type":"connect",...}` frame carrying

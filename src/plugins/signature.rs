@@ -5,8 +5,8 @@
 //! the canonical manifest bytes (TOML content without the `signature` field).
 //! Publisher public keys are stored in the config as hex-encoded strings.
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::signature::{self, Ed25519KeyPair, KeyPair};
 
 use super::error::PluginError;
@@ -160,7 +160,7 @@ pub fn verify_manifest(
         Err(e) => {
             return VerificationResult::Invalid {
                 reason: format!("invalid publisher key: {e}"),
-            }
+            };
         }
     };
 
@@ -170,7 +170,7 @@ pub fn verify_manifest(
         Err(e) => {
             return VerificationResult::Invalid {
                 reason: format!("invalid signature encoding: {e}"),
-            }
+            };
         }
     };
 

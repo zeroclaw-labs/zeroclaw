@@ -5,7 +5,7 @@
 use super::AppState;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
@@ -787,6 +787,37 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/channels — list all configured channels with status details
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let channels: Vec<serde_json::Value> = config
+        .channels_config
+        .channels()
+        .into_iter()
+        .map(|(channel, enabled)| {
+            let status = if enabled { "active" } else { "inactive" };
+            let health = if enabled { "healthy" } else { "down" };
+            serde_json::json!({
+                "name": channel.name(),
+                "type": channel.name(),
+                "enabled": enabled,
+                "status": status,
+                "health": health,
+            })
+        })
+        .collect();
+
+    Json(channels).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn is_masked_secret(value: &str) -> bool {
@@ -1000,7 +1031,8 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_optional_secret(&mut slack.app_token);
     }
     if let Some(mattermost) = masked.channels_config.mattermost.as_mut() {
-        mask_required_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_password);
     }
     if let Some(webhook) = masked.channels_config.webhook.as_mut() {
         mask_optional_secret(&mut webhook.secret);
@@ -1134,7 +1166,7 @@ fn restore_masked_sensitive_fields(
         incoming.channels_config.mattermost.as_mut(),
         current.channels_config.mattermost.as_ref(),
     ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+        restore_optional_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.webhook.as_mut(),
@@ -1290,6 +1322,7 @@ pub async fn handle_api_sessions_list(
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
+                "name": meta.name
             });
             if let Some(name) = meta.name {
                 entry["name"] = serde_json::Value::String(name);
@@ -1419,6 +1452,8 @@ pub async fn handle_api_session_rename(
     }
 }
 
+/// GET /api/sessions/{id}/history — get message history for a gateway session
+pub async fn handle_api_session_history(
 /// GET /api/sessions/running — list sessions currently in "running" state
 pub async fn handle_api_sessions_running(
     State(state): State<AppState>,
@@ -1459,48 +1494,67 @@ pub async fn handle_api_session_state(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    #[allow(clippy::unused_async)]
-    async fn inner(state: &AppState, headers: &HeaderMap, id: &str) -> impl IntoResponse {
-        if let Err(e) = require_auth(state, headers) {
-            return e.into_response();
-        }
-
-        let Some(ref backend) = state.session_backend else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session persistence is disabled"})),
-            )
-                .into_response();
-        };
-
-        let session_key = format!("gw_{id}");
-        match backend.get_session_state(&session_key) {
-            Ok(Some(ss)) => {
-                let mut resp = serde_json::json!({
-                    "session_id": id,
-                    "state": ss.state,
-                });
-                if let Some(turn_id) = ss.turn_id {
-                    resp["turn_id"] = serde_json::Value::String(turn_id);
-                }
-                if let Some(started) = ss.turn_started_at {
-                    resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
-                }
-                Json(resp).into_response()
-            }
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "Session not found"})),
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
-            )
-                .into_response(),
-        }
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
     }
-    inner(&state, &headers, &id).await
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+
+    // Verify the session exists
+    let sessions = backend.list_sessions();
+    if !sessions.contains(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
+    let messages = backend.load(&session_key);
+    let history: Vec<serde_json::Value> = messages
+        .into_iter()
+        .map(|msg| {
+            serde_json::json!({
+                "role": msg.role,
+                "content": msg.content,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "session_id": id, "history": history })).into_response()
+    match backend.get_session_state(&session_key) {
+        Ok(Some(ss)) => {
+            let mut resp = serde_json::json!({
+                "session_id": id,
+                "state": ss.state,
+            });
+            if let Some(turn_id) = ss.turn_id {
+                resp["turn_id"] = serde_json::Value::String(turn_id);
+            }
+            if let Some(started) = ss.turn_started_at {
+                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
+            }
+            Json(resp).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
+        )
+            .into_response(),
+    }
 }
 
 // ── Claude Code hook endpoint ────────────────────────────────────
@@ -1534,7 +1588,7 @@ pub async fn handle_claude_code_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::{nodes, AppState, GatewayRateLimiter, IdempotencyStore};
+    use crate::gateway::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
     use crate::security::pairing::PairingGuard;
@@ -1630,6 +1684,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2066,14 +2122,18 @@ mod tests {
             Some("route-embed-key-1")
         );
         assert_eq!(hydrated.embedding_routes[2].api_key, None);
-        assert!(hydrated
-            .model_routes
-            .iter()
-            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
-        assert!(hydrated
-            .embedding_routes
-            .iter()
-            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
+        assert!(
+            hydrated
+                .model_routes
+                .iter()
+                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
+        );
+        assert!(
+            hydrated
+                .embedding_routes
+                .iter()
+                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
+        );
     }
 
     #[tokio::test]
@@ -2195,10 +2255,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("delivery.to is required"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("delivery.to is required")
+        );
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
@@ -2237,10 +2299,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("unsupported delivery channel"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported delivery channel")
+        );
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());

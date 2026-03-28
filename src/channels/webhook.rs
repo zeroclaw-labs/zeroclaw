@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -145,11 +145,11 @@ impl Channel for WebhookChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         use axum::{
+            Router,
             body::Bytes,
             extract::State,
             http::{HeaderMap, StatusCode},
             routing::post,
-            Router,
         };
         use portable_atomic::{AtomicU64, Ordering};
         use std::sync::Arc;
@@ -239,6 +239,7 @@ impl Channel for WebhookChannel {
                 thread_ts: payload.thread_id,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             };
 
             if state.tx.send(msg).await.is_err() {
