@@ -460,6 +460,21 @@ set `path_prefix` to that sub-path (e.g. `"/zeroclaw"`). All gateway
 routes will be served under this prefix. The value must start with `/`
 and must not end with `/`.
 
+### Admin endpoints
+
+| Method | Path | Access | Purpose |
+|---|---|---|---|
+| `POST` | `/admin/reload-config` | localhost only | Hot-reload `config.toml` from disk |
+| `POST` | `/admin/shutdown` | localhost only | Graceful daemon shutdown |
+| `GET` | `/admin/paircode` | localhost only | Show current pairing code |
+| `POST` | `/admin/paircode/new` | localhost only | Generate new pairing code |
+
+`/admin/reload-config` re-reads, decrypts, validates, and swaps the in-memory config. Non-loopback requests return `403`. If the resolved config path differs from the running instance (e.g. `ZEROCLAW_WORKSPACE` changed), the endpoint returns `409 Conflict`.
+
+Known limitation: only `state.config` is swapped. Fields derived at startup (`default_provider`, `default_model`, `webhook_secret_hash`, pairing state) are **not** updated by reload. The response includes `restart_required: true` and `restart_warnings` when such changes are detected.
+
+CLI shorthand: `zeroclaw config reload`
+
 ## `[autonomy]`
 
 | Key | Default | Purpose |
@@ -507,30 +522,6 @@ allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
 Notes:
 
 - Memory context injection ignores legacy `assistant_resp*` auto-save keys to prevent old model-authored summaries from being treated as facts.
-
-### `[memory.mem0]`
-
-Mem0 (OpenMemory) backend — connects to a self-hosted mem0 server for vector-based memory with LLM-powered fact extraction. Requires feature flag `memory-mem0` at build time and `backend = "mem0"` in config.
-
-| Key | Default | Env var | Purpose |
-|---|---|---|---|
-| `url` | `http://localhost:8765` | `MEM0_URL` | OpenMemory server URL |
-| `user_id` | `zeroclaw` | `MEM0_USER_ID` | User ID for scoping memories |
-| `app_name` | `zeroclaw` | `MEM0_APP_NAME` | Application name registered in mem0 |
-| `infer` | `true` | — | Use LLM to extract facts from stored text (`true`) or store raw (`false`) |
-| `extraction_prompt` | unset | `MEM0_EXTRACTION_PROMPT` | Custom prompt for LLM fact extraction (e.g. for non-English content) |
-
-```toml
-[memory]
-backend = "mem0"
-
-[memory.mem0]
-url = "http://192.168.0.171:8765"
-user_id = "zeroclaw-bot"
-extraction_prompt = "Extract facts in the original language..."
-```
-
-Server deployment scripts are in `deploy/mem0/`.
 
 ## `[[model_routes]]` and `[[embedding_routes]]`
 
@@ -726,6 +717,7 @@ Native Nextcloud Talk bot integration (webhook receive + OCS send API).
 | `app_token` | Yes | Bot app token used for OCS bearer auth |
 | `webhook_secret` | Optional | Enables webhook signature verification |
 | `allowed_users` | Recommended | Allowed Nextcloud actor IDs (`[]` = deny all, `"*"` = allow all) |
+| `bot_name` | Optional | Display name of the bot in Nextcloud Talk (e.g. `"zeroclaw"`). Used to filter out the bot's own messages and prevent feedback loops. |
 
 Notes:
 

@@ -363,6 +363,21 @@ methods = ["list", "get", "create", "update"]
 | `require_pairing` | `true` | bearer 认证前需要配对 |
 | `allow_public_bind` | `false` | 阻止意外公共暴露 |
 
+### 管理端点
+
+| 方法 | 路径 | 访问 | 用途 |
+|---|---|---|---|
+| `POST` | `/admin/reload-config` | 仅限本地 | 从磁盘热重载 `config.toml` |
+| `POST` | `/admin/shutdown` | 仅限本地 | 优雅关闭守护进程 |
+| `GET` | `/admin/paircode` | 仅限本地 | 显示当前配对码 |
+| `POST` | `/admin/paircode/new` | 仅限本地 | 生成新配对码 |
+
+`/admin/reload-config` 重新读取、解密、验证并替换内存中的配置。非回环请求返回 `403`。如果解析的配置路径与运行实例不同（例如 `ZEROCLAW_WORKSPACE` 已更改），端点返回 `409 Conflict`。
+
+已知限制：仅替换 `state.config`。启动时派生的字段（`default_provider`、`default_model`、`webhook_secret_hash`、配对状态）**不会**通过重载更新。当检测到此类更改时，响应包含 `restart_required: true` 和 `restart_warnings`。
+
+CLI 快捷方式：`zeroclaw config reload`
+
 ## `[autonomy]`
 
 | 键 | 默认值 | 用途 |
@@ -410,30 +425,6 @@ allowed_roots = [\"~/Desktop/projects\", \"/opt/shared-repo\"]
 注意事项：
 
 - 内存上下文注入忽略旧的 `assistant_resp*` 自动保存键，以防止旧模型生成的摘要被视为事实。
-
-### `[memory.mem0]`
-
-Mem0 (OpenMemory) 后端 — 连接自托管 mem0 服务器，提供基于向量的记忆存储和 LLM 事实提取。构建时需要 `memory-mem0` feature flag，配置需设置 `backend = "mem0"`。
-
-| 键 | 默认值 | 环境变量 | 用途 |
-|---|---|---|---|
-| `url` | `http://localhost:8765` | `MEM0_URL` | OpenMemory 服务器地址 |
-| `user_id` | `zeroclaw` | `MEM0_USER_ID` | 记忆作用域的用户 ID |
-| `app_name` | `zeroclaw` | `MEM0_APP_NAME` | 在 mem0 中注册的应用名称 |
-| `infer` | `true` | — | 使用 LLM 从存储文本中提取事实 (`true`) 或原样存储 (`false`) |
-| `extraction_prompt` | 未设置 | `MEM0_EXTRACTION_PROMPT` | 自定义 LLM 事实提取提示词（如适用于非英文内容） |
-
-```toml
-[memory]
-backend = "mem0"
-
-[memory.mem0]
-url = "http://192.168.0.171:8765"
-user_id = "zeroclaw-bot"
-extraction_prompt = "用原始语言提取事实..."
-```
-
-服务器部署脚本位于 `deploy/mem0/`。
 
 ## `[[model_routes]]` 和 `[[embedding_routes]]`
 

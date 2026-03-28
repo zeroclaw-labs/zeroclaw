@@ -8,6 +8,8 @@
 //! This two-phase approach replaces the naive raw-message auto-save with
 //! semantic extraction, similar to Nanobot's `save_memory` tool call pattern.
 
+use crate::memory::conflict;
+use crate::memory::importance;
 use crate::memory::traits::{Memory, MemoryCategory};
 use crate::providers::traits::Provider;
 
@@ -18,6 +20,12 @@ pub struct ConsolidationResult {
     pub history_entry: String,
     /// New facts/preferences/decisions to store long-term, or None.
     pub memory_update: Option<String>,
+    /// Atomic facts extracted from the turn (when consolidation_extract_facts is enabled).
+    #[serde(default)]
+    pub facts: Vec<String>,
+    /// Observed trend or pattern (when consolidation_extract_facts is enabled).
+    #[serde(default)]
+    pub trend: Option<String>,
 }
 
 const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
@@ -33,6 +41,17 @@ Do not include any text outside the JSON object."#;
 /// Phase 2: Write a memory update to the Core category (if the LLM identified new facts).
 ///
 /// This function is designed to be called fire-and-forget via `tokio::spawn`.
+/// Strip channel media markers (e.g. `[IMAGE:/local/path]`, `[DOCUMENT:...]`)
+/// that contain local filesystem paths.  These must never be forwarded to
+/// upstream provider APIs — they would leak local paths and cause API errors.
+fn strip_media_markers(text: &str) -> String {
+    // Matches [IMAGE:...], [DOCUMENT:...], [FILE:...], [VIDEO:...], [VOICE:...], [AUDIO:...]
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\[(?:IMAGE|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]").unwrap()
+    });
+    RE.replace_all(text, "[media attachment]").into_owned()
+}
+
 pub async fn consolidate_turn(
     provider: &dyn Provider,
     model: &str,
@@ -40,7 +59,11 @@ pub async fn consolidate_turn(
     user_message: &str,
     assistant_response: &str,
 ) -> anyhow::Result<()> {
-    let turn_text = format!("User: {user_message}\nAssistant: {assistant_response}");
+    let turn_text = format!(
+        "User: {}\nAssistant: {}",
+        strip_media_markers(user_message),
+        strip_media_markers(assistant_response),
+    );
 
     // Truncate very long turns to avoid wasting tokens on consolidation.
     // Use char-boundary-safe slicing to prevent panic on multi-byte UTF-8 (e.g. CJK text).
@@ -78,8 +101,33 @@ pub async fn consolidate_turn(
     if let Some(ref update) = result.memory_update {
         if !update.trim().is_empty() {
             let mem_key = format!("core_{}", uuid::Uuid::new_v4());
+
+            // Compute importance score heuristically.
+            let imp = importance::compute_importance(update, &MemoryCategory::Core);
+
+            // Check for conflicts with existing Core memories.
+            if let Err(e) = conflict::check_and_resolve_conflicts(
+                memory,
+                &mem_key,
+                update,
+                &MemoryCategory::Core,
+                0.85,
+            )
+            .await
+            {
+                tracing::debug!("conflict check skipped: {e}");
+            }
+
+            // Store with importance metadata.
             memory
-                .store(&mem_key, update, MemoryCategory::Core, None)
+                .store_with_metadata(
+                    &mem_key,
+                    update,
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    Some(imp),
+                )
                 .await?;
         }
     }
@@ -114,6 +162,8 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
         ConsolidationResult {
             history_entry: summary,
             memory_update: None,
+            facts: Vec::new(),
+            trend: None,
         }
     })
 }
@@ -171,9 +221,11 @@ mod tests {
         // inside a character. This must not panic.
         let cjk_text = "二手书项目".repeat(50); // 250 chars = 750 bytes
         let result = parse_consolidation_response("invalid", &cjk_text);
-        assert!(result
-            .history_entry
-            .is_char_boundary(result.history_entry.len()));
+        assert!(
+            result
+                .history_entry
+                .is_char_boundary(result.history_entry.len())
+        );
         assert!(result.history_entry.ends_with('…'));
     }
 }

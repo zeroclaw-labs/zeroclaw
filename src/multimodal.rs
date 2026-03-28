@@ -1,6 +1,6 @@
-use crate::config::{build_runtime_proxy_client_with_timeouts, MultimodalConfig};
+use crate::config::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 use crate::providers::ChatMessage;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use std::path::Path;
 
@@ -24,7 +24,9 @@ pub enum MultimodalError {
     #[error("multimodal image limit exceeded: max_images={max_images}, found={found}")]
     TooManyImages { max_images: usize, found: usize },
 
-    #[error("multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes")]
+    #[error(
+        "multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes"
+    )]
     ImageTooLarge {
         input: String,
         size_bytes: usize,
@@ -141,6 +143,7 @@ pub async fn prepare_messages_for_provider(
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
 
     let mut normalized_messages = Vec::with_capacity(trimmed.len());
+    let mut has_successful_images = false;
     for message in &trimmed {
         if message.role != "user" {
             normalized_messages.push(message.clone());
@@ -154,13 +157,40 @@ pub async fn prepare_messages_for_provider(
         }
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
+        let mut skipped_refs = Vec::new();
         for reference in &refs {
-            let data_uri =
-                normalize_image_reference(reference, config, max_bytes, &remote_client).await?;
-            normalized_refs.push(data_uri);
+            match normalize_image_reference(reference, config, max_bytes, &remote_client).await {
+                Ok(data_uri) => normalized_refs.push(data_uri),
+                Err(e) => {
+                    tracing::warn!(
+                        image = %reference,
+                        error = %e,
+                        "Multimodal: skipping unresolvable image, continuing without it"
+                    );
+                    skipped_refs.push(reference.as_str());
+                }
+            }
         }
 
-        let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
+        // If all images failed, fall back to text-only with a note
+        let effective_text = if normalized_refs.is_empty() && !skipped_refs.is_empty() {
+            format!(
+                "{cleaned_text}\n\n(Note: {} attached image(s) could not be loaded)",
+                skipped_refs.len()
+            )
+        } else if !skipped_refs.is_empty() {
+            format!(
+                "{cleaned_text}\n\n(Note: {} of {} image(s) could not be loaded)",
+                skipped_refs.len(),
+                refs.len()
+            )
+        } else {
+            cleaned_text.clone()
+        };
+        if !normalized_refs.is_empty() {
+            has_successful_images = true;
+        }
+        let content = compose_multimodal_message(&effective_text, &normalized_refs);
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
@@ -169,7 +199,7 @@ pub async fn prepare_messages_for_provider(
 
     Ok(PreparedMessages {
         messages: normalized_messages,
-        contains_images: true,
+        contains_images: has_successful_images,
     })
 }
 
@@ -458,11 +488,7 @@ fn detect_mime(
 
 fn normalize_content_type(content_type: &str) -> Option<String> {
     let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
-    if mime.is_empty() {
-        None
-    } else {
-        Some(mime)
-    }
+    if mime.is_empty() { None } else { Some(mime) }
 }
 
 fn mime_from_extension(ext: &str) -> Option<&'static str> {
@@ -762,6 +788,7 @@ mod tests {
             max_images: 2,
             max_image_size_mb: 5,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let result = prepare_messages_for_provider(&messages, &config)
@@ -779,22 +806,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_remote_url_when_disabled() {
+    async fn prepare_messages_skips_remote_url_when_disabled() {
         let messages = vec![ChatMessage::user(
             "Look [IMAGE:https://example.com/img.png]".to_string(),
         )];
 
-        let error = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+        let result = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
             .await
-            .expect_err("should reject remote image URL when fetch is disabled");
+            .expect("should succeed with skipped image note");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal remote image fetch is disabled"));
+        // The image should be skipped and a note appended
+        assert!(result.messages[0]
+            .content
+            .contains("image(s) could not be loaded"));
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_oversized_local_image() {
+    async fn prepare_messages_skips_oversized_local_image() {
         let temp = tempfile::tempdir().unwrap();
         let image_path = temp.path().join("big.png");
 
@@ -809,15 +837,16 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let result = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect_err("should reject oversized local image");
+            .expect("should succeed with skipped image note");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
+        assert!(result.messages[0]
+            .content
+            .contains("image(s) could not be loaded"));
     }
 
     #[test]

@@ -4,6 +4,13 @@ use crate::config::{SandboxBackend, SecurityConfig};
 use crate::security::traits::Sandbox;
 use std::sync::Arc;
 
+/// Check if fallback to NoopSandbox is allowed via environment variable
+fn allow_noop_fallback() -> bool {
+    std::env::var("ZEROCLAW_ALLOW_NO_SANDBOX")
+        .map(|v| !v.is_empty() && v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(false)
+}
+
 /// Create a sandbox based on auto-detection or explicit config
 pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
     let backend = &config.sandbox.backend;
@@ -25,9 +32,7 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     }
                 }
             }
-            tracing::warn!(
-                "Landlock requested but not available, falling back to application-layer"
-            );
+            log_sandbox_unavailable_fallback("Landlock");
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Firejail => {
@@ -37,9 +42,7 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     return Arc::new(sandbox);
                 }
             }
-            tracing::warn!(
-                "Firejail requested but not available, falling back to application-layer"
-            );
+            log_sandbox_unavailable_fallback("Firejail");
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Bubblewrap => {
@@ -52,16 +55,26 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
                     }
                 }
             }
-            tracing::warn!(
-                "Bubblewrap requested but not available, falling back to application-layer"
-            );
+            log_sandbox_unavailable_fallback("Bubblewrap");
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Docker => {
             if let Ok(sandbox) = super::docker::DockerSandbox::new() {
                 return Arc::new(sandbox);
             }
-            tracing::warn!("Docker requested but not available, falling back to application-layer");
+            log_sandbox_unavailable_fallback("Docker");
+            Arc::new(super::traits::NoopSandbox)
+        }
+        SandboxBackend::SandboxExec => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::new() {
+                    return Arc::new(sandbox);
+                }
+            }
+            tracing::warn!(
+                "sandbox-exec requested but not available, falling back to application-layer"
+            );
             Arc::new(super::traits::NoopSandbox)
         }
         SandboxBackend::Auto | SandboxBackend::None => {
@@ -71,7 +84,24 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
     }
 }
 
-/// Auto-detect the best available sandbox
+/// Log sandbox unavailability and log fallback behavior
+fn log_sandbox_unavailable_fallback(sandbox_name: &str) {
+    let allow_fallback = allow_noop_fallback();
+
+    if allow_fallback {
+        tracing::warn!(
+            "{sandbox_name} requested but not available, falling back to application-layer. \
+             Set ZEROCLAW_ALLOW_NO_SANDBOX=0 to require sandbox availability."
+        );
+    } else {
+        tracing::error!(
+            "{sandbox_name} requested but not available. \
+             Set ZEROCLAW_ALLOW_NO_SANDBOX=1 to allow fallback to application-layer."
+        );
+    }
+}
+
+/// Auto-detect best available sandbox
 fn detect_best_sandbox() -> Arc<dyn Sandbox> {
     #[cfg(target_os = "linux")]
     {
@@ -101,12 +131,25 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
                 return Arc::new(sandbox);
             }
         }
+
+        // Try sandbox-exec (Seatbelt) — built into macOS
+        if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::probe() {
+            tracing::info!("macOS sandbox-exec (Seatbelt) enabled");
+            return Arc::new(sandbox);
+        }
     }
 
     // Docker is heavy but works everywhere if docker is installed
     if let Ok(sandbox) = super::docker::DockerSandbox::probe() {
         tracing::info!("Docker sandbox enabled");
         return Arc::new(sandbox);
+    }
+
+    // Path-validation fallback: software-only deny/allow list enforcement
+    let pv = super::path_validation::PathValidationSandbox::new();
+    if pv.is_available() {
+        tracing::info!("Path-validation sandbox enabled (software-only fallback)");
+        return Arc::new(pv);
     }
 
     // Fallback: application-layer security only
@@ -138,6 +181,29 @@ mod tests {
         };
         let sandbox = create_sandbox(&config);
         assert_eq!(sandbox.name(), "none");
+    }
+
+    #[test]
+    fn auto_allow_noop_fallback_returns_true() {
+        // Set env var and check
+        std::env::set_var("ZEROCLAW_ALLOW_NO_SANDBOX", "1");
+        assert!(allow_noop_fallback());
+        std::env::remove_var("ZEROCLAW_ALLOW_NO_SANDBOX");
+    }
+
+    #[test]
+    fn auto_deny_noop_fallback_returns_false() {
+        // Set env var to deny fallback
+        std::env::set_var("ZEROCLAW_ALLOW_NO_SANDBOX", "0");
+        assert!(!allow_noop_fallback());
+        std::env::remove_var("ZEROCLAW_ALLOW_NO_SANDBOX");
+    }
+
+    #[test]
+    fn auto_missing_env_denies_fallback() {
+        // Missing env var should deny fallback (fail-closed by default)
+        std::env::remove_var("ZEROCLAW_ALLOW_NO_SANDBOX");
+        assert!(!allow_noop_fallback());
     }
 
     #[test]
