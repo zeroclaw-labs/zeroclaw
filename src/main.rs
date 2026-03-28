@@ -1088,10 +1088,15 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
                     let host = &config.gateway.host;
+                    let path_prefix = config
+                        .gateway
+                        .path_prefix
+                        .as_deref()
+                        .filter(|p| !p.is_empty());
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, new).await {
+                    match fetch_paircode(host, port, path_prefix, new).await {
                         Ok(Some(code)) => {
                             println!("🔐 Gateway pairing is enabled.");
                             println!();
@@ -1887,12 +1892,18 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 
 /// Fetch the current pairing code from a running gateway.
 /// If `new` is true, generates a fresh pairing code via POST request.
-async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
+async fn fetch_paircode(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    new: bool,
+) -> Result<Option<String>> {
     let client = reqwest::Client::new();
+    let pfx = path_prefix.unwrap_or("");
 
     let response = if new {
         // Generate a new pairing code via POST
-        let url = format!("http://{host}:{port}/admin/paircode/new");
+        let url = format!("http://{host}:{port}{pfx}/admin/paircode/new");
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -1900,7 +1911,7 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
             .await
     } else {
         // Get existing pairing code via GET
-        let url = format!("http://{host}:{port}/admin/paircode");
+        let url = format!("http://{host}:{port}{pfx}/admin/paircode");
         client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
