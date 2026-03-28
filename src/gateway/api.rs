@@ -787,6 +787,37 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/channels — list all configured channels with status details
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let channels: Vec<serde_json::Value> = config
+        .channels_config
+        .channels()
+        .into_iter()
+        .map(|(channel, enabled)| {
+            let status = if enabled { "active" } else { "inactive" };
+            let health = if enabled { "healthy" } else { "down" };
+            serde_json::json!({
+                "name": channel.name(),
+                "type": channel.name(),
+                "enabled": enabled,
+                "status": status,
+                "health": health,
+            })
+        })
+        .collect();
+
+    Json(channels).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn is_masked_secret(value: &str) -> bool {
@@ -1000,7 +1031,8 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_optional_secret(&mut slack.app_token);
     }
     if let Some(mattermost) = masked.channels_config.mattermost.as_mut() {
-        mask_required_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_password);
     }
     if let Some(webhook) = masked.channels_config.webhook.as_mut() {
         mask_optional_secret(&mut webhook.secret);
@@ -1056,7 +1088,25 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(email) = masked.channels_config.email.as_mut() {
         mask_required_secret(&mut email.password);
     }
+
+    // Transcription provider API keys (Groq top-level + sub-providers).
     mask_optional_secret(&mut masked.transcription.api_key);
+    if let Some(openai_stt) = masked.transcription.openai.as_mut() {
+        mask_optional_secret(&mut openai_stt.api_key);
+    }
+    if let Some(deepgram) = masked.transcription.deepgram.as_mut() {
+        mask_optional_secret(&mut deepgram.api_key);
+    }
+    if let Some(assemblyai) = masked.transcription.assemblyai.as_mut() {
+        mask_optional_secret(&mut assemblyai.api_key);
+    }
+    if let Some(google_stt) = masked.transcription.google.as_mut() {
+        mask_optional_secret(&mut google_stt.api_key);
+    }
+    if let Some(local_whisper) = masked.transcription.local_whisper.as_mut() {
+        mask_optional_secret(&mut local_whisper.bearer_token);
+    }
+
     masked
 }
 
@@ -1134,7 +1184,7 @@ fn restore_masked_sensitive_fields(
         incoming.channels_config.mattermost.as_mut(),
         current.channels_config.mattermost.as_ref(),
     ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+        restore_optional_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.webhook.as_mut(),
@@ -1244,10 +1294,42 @@ fn restore_masked_sensitive_fields(
     ) {
         restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
+
+    // Transcription provider API keys (Groq top-level + sub-providers).
     restore_optional_secret(
         &mut incoming.transcription.api_key,
         &current.transcription.api_key,
     );
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.openai.as_mut(),
+        current.transcription.openai.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.deepgram.as_mut(),
+        current.transcription.deepgram.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.assemblyai.as_mut(),
+        current.transcription.assemblyai.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.google.as_mut(),
+        current.transcription.google.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.local_whisper.as_mut(),
+        current.transcription.local_whisper.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.bearer_token, &current_stt.bearer_token);
+    }
 }
 
 fn hydrate_config_for_save(
@@ -1290,6 +1372,7 @@ pub async fn handle_api_sessions_list(
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
+                "name": meta.name
             });
             if let Some(name) = meta.name {
                 entry["name"] = serde_json::Value::String(name);
@@ -1419,6 +1502,8 @@ pub async fn handle_api_session_rename(
     }
 }
 
+/// GET /api/sessions/{id}/history — get message history for a gateway session
+pub async fn handle_api_session_history(
 /// GET /api/sessions/running — list sessions currently in "running" state
 pub async fn handle_api_sessions_running(
     State(state): State<AppState>,
@@ -1472,6 +1557,29 @@ pub async fn handle_api_session_state(
     };
 
     let session_key = format!("gw_{id}");
+
+    // Verify the session exists
+    let sessions = backend.list_sessions();
+    if !sessions.contains(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
+    let messages = backend.load(&session_key);
+    let history: Vec<serde_json::Value> = messages
+        .into_iter()
+        .map(|msg| {
+            serde_json::json!({
+                "role": msg.role,
+                "content": msg.content,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "session_id": id, "history": history })).into_response()
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
             let mut resp = serde_json::json!({
@@ -1626,6 +1734,8 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,

@@ -96,6 +96,7 @@ mod integrations;
 mod memory;
 mod migration;
 mod multimodal;
+mod nodes;
 mod observability;
 mod onboard;
 mod peripherals;
@@ -158,6 +159,11 @@ struct Cli {
     #[arg(long, global = true)]
     config_dir: Option<String>,
 
+    /// Print every message sent to the LLM provider (system prompt, history, user turn).
+    /// Shows the full payload on the first turn and the growing history on subsequent turns.
+    #[arg(long, global = true)]
+    log_llm: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -177,6 +183,10 @@ enum Commands {
         /// Reconfigure channels only (fast repair flow)
         #[arg(long)]
         channels_only: bool,
+
+        /// Force interactive wizard mode (override TTY auto-detection)
+        #[arg(long)]
+        interactive: bool,
 
         /// API key for provider configuration
         #[arg(long)]
@@ -849,11 +859,17 @@ async fn main() -> Result<()> {
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO
-    let subscriber = fmt::Subscriber::builder()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    let base_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = if cli.log_llm {
+        base_filter.add_directive(
+            "zeroclaw::providers::reliable=trace"
+                .parse()
+                .expect("valid directive"),
         )
-        .finish();
+    } else {
+        base_filter
+    };
+    let subscriber = fmt::Subscriber::builder().with_env_filter(filter).finish();
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
@@ -868,6 +884,7 @@ async fn main() -> Result<()> {
         force,
         reinit,
         channels_only,
+        interactive,
         api_key,
         provider,
         model,
@@ -878,6 +895,7 @@ async fn main() -> Result<()> {
         let force = *force;
         let reinit = *reinit;
         let channels_only = *channels_only;
+        let interactive = *interactive;
         let api_key = api_key.clone();
         let provider = provider.clone();
         let model = model.clone();
@@ -942,6 +960,8 @@ async fn main() -> Result<()> {
 
         // Auto-detect: run the interactive wizard when in a TTY with no
         // provider flags, quick setup otherwise (scriptable path).
+        // --interactive flag forces interactive mode regardless of TTY detection.
+        // --interactive flag forces interactive mode regardless of TTY detection.
         let has_provider_flags =
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
@@ -958,7 +978,7 @@ async fn main() -> Result<()> {
                 force,
             ))
             .await
-        } else if is_tty || env_interactive {
+        } else if interactive || is_tty || env_interactive {
             Box::pin(onboard::run_wizard(force)).await
         } else {
             Box::pin(onboard::run_quick_setup(
@@ -1055,7 +1075,8 @@ async fn main() -> Result<()> {
                     info!("🔄 Restarting ZeroClaw Gateway on {addr}");
 
                     // Try to gracefully shutdown existing gateway via admin endpoint
-                    match shutdown_gateway(&host, port).await {
+                    match shutdown_gateway(&host, port, config.gateway.path_prefix.as_deref()).await
+                    {
                         Ok(()) => {
                             info!("   ✓ Existing gateway on {addr} shut down gracefully");
                             // Poll until the port is free (connection refused) or timeout
@@ -1088,10 +1109,15 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
                     let host = &config.gateway.host;
+                    let path_prefix = config
+                        .gateway
+                        .path_prefix
+                        .as_deref()
+                        .filter(|p| !p.is_empty());
 
                     // Fetch live pairing code from running gateway
                     // If --new is specified, generate a fresh pairing code
-                    match fetch_paircode(host, port, new).await {
+                    match fetch_paircode(host, port, path_prefix, new).await {
                         Ok(Some(code)) => {
                             println!("🔐 Gateway pairing is enabled.");
                             println!();
@@ -1866,8 +1892,9 @@ fn log_gateway_start(host: &str, port: u16) {
 }
 
 /// Gracefully shutdown a running gateway via the admin endpoint.
-async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
-    let url = format!("http://{host}:{port}/admin/shutdown");
+async fn shutdown_gateway(host: &str, port: u16, path_prefix: Option<&str>) -> Result<()> {
+    let prefix = path_prefix.unwrap_or("");
+    let url = format!("http://{host}:{port}{prefix}/admin/shutdown");
     let client = reqwest::Client::new();
 
     match client
@@ -1887,12 +1914,18 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
 
 /// Fetch the current pairing code from a running gateway.
 /// If `new` is true, generates a fresh pairing code via POST request.
-async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<String>> {
+async fn fetch_paircode(
+    host: &str,
+    port: u16,
+    path_prefix: Option<&str>,
+    new: bool,
+) -> Result<Option<String>> {
     let client = reqwest::Client::new();
+    let pfx = path_prefix.unwrap_or("");
 
     let response = if new {
         // Generate a new pairing code via POST
-        let url = format!("http://{host}:{port}/admin/paircode/new");
+        let url = format!("http://{host}:{port}{pfx}/admin/paircode/new");
         client
             .post(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -1900,7 +1933,7 @@ async fn fetch_paircode(host: &str, port: u16, new: bool) -> Result<Option<Strin
             .await
     } else {
         // Get existing pairing code via GET
-        let url = format!("http://{host}:{port}/admin/paircode");
+        let url = format!("http://{host}:{port}{pfx}/admin/paircode");
         client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
@@ -2709,9 +2742,15 @@ mod tests {
     }
 
     #[test]
-    fn onboard_cli_rejects_removed_interactive_flag() {
-        // --interactive was removed; onboard auto-detects TTY instead.
-        assert!(Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"]).is_err());
+    fn onboard_cli_accepts_interactive_flag() {
+        // --interactive forces interactive wizard mode regardless of TTY detection.
+        let cli = Cli::try_parse_from(["zeroclaw", "onboard", "--interactive"])
+            .expect("onboard --interactive should parse");
+
+        match cli.command {
+            Commands::Onboard { interactive, .. } => assert!(interactive),
+            other => panic!("expected onboard command, got {other:?}"),
+        }
     }
 
     #[test]
