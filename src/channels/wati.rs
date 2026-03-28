@@ -212,6 +212,7 @@ impl WatiChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         });
 
         messages
@@ -355,6 +356,7 @@ impl WatiChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         });
 
         messages
@@ -717,12 +719,14 @@ mod tests {
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -746,12 +750,14 @@ mod tests {
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -788,12 +794,14 @@ mod tests {
             model: "distil-whisper-large-v3-en".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -929,6 +937,7 @@ mod tests {
             model: "whisper-1".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -936,10 +945,11 @@ mod tests {
             google: None,
             local_whisper: Some(crate::config::LocalWhisperConfig {
                 url: format!("{}/v1/transcribe", whisper_server.uri()),
-                bearer_token: "test-token".to_string(),
+                bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 25 * 1024 * 1024,
                 timeout_secs: 300,
             }),
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -981,6 +991,7 @@ mod tests {
             model: "whisper-1".to_string(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: 120,
             openai: None,
             deepgram: None,
@@ -988,10 +999,11 @@ mod tests {
             google: None,
             local_whisper: Some(crate::config::LocalWhisperConfig {
                 url: "http://localhost:8000/v1/transcribe".to_string(),
-                bearer_token: "test-token".to_string(),
+                bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 25 * 1024 * 1024,
                 timeout_secs: 300,
             }),
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -1033,7 +1045,7 @@ mod tests {
             default_provider: "local_whisper".into(),
             local_whisper: Some(crate::config::LocalWhisperConfig {
                 url: "http://localhost:8001/v1/transcribe".into(),
-                bearer_token: "test-token".into(),
+                bearer_token: Some("test-token".into()),
                 max_audio_bytes: 25 * 1024 * 1024,
                 timeout_secs: 120,
             }),

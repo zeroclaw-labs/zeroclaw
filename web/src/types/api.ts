@@ -106,6 +106,24 @@ export interface CliTool {
   category: string;
 }
 
+export interface Session {
+  session_id: string;
+  created_at: string;
+  last_activity: string;
+  message_count: number;
+  name?: string;
+}
+
+export interface ChannelDetail {
+  name: string;
+  type: string;
+  enabled: boolean;
+  status: 'active' | 'inactive' | 'error';
+  message_count: number;
+  last_message_at: string | null;
+  health: 'healthy' | 'degraded' | 'down';
+}
+
 export interface SSEEvent {
   type: string;
   timestamp?: string;
@@ -113,7 +131,20 @@ export interface SSEEvent {
 }
 
 export interface WsMessage {
-  type: 'message' | 'chunk' | 'chunk_reset' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type: 'session_start' | 'message' | 'chunk' | 'chunk_reset' | 'thinking' | 'tool_call' | 'tool_result' | 'done' | 'error';
+  type:
+    | 'message'
+    | 'chunk'
+    | 'chunk_reset'
+    | 'thinking'
+    | 'tool_call'
+    | 'tool_result'
+    | 'done'
+    | 'error'
+    | 'session_start'
+    | 'connected'
+    | 'history'
+    | 'history_end';
   content?: string;
   full_response?: string;
   name?: string;
@@ -121,4 +152,23 @@ export interface WsMessage {
   output?: string;
   message?: string;
   code?: string;
+  session_id?: string;
+  resumed?: boolean;
+  message_count?: number;
+  role?: string;
+  session_id?: string;
+  resumed?: boolean;
+  message_count?: number;
+}
+
+/** Row from GET /api/sessions/{id}/messages */
+export interface SessionMessageRow {
+  role: string;
+  content: string;
+}
+
+export interface SessionMessagesResponse {
+  session_id: string;
+  messages: SessionMessageRow[];
+  session_persistence: boolean;
 }

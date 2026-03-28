@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -76,7 +76,15 @@ impl MattermostChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_channel_proxy_client("channel.mattermost", self.proxy_url.as_deref())
+        // Use timeout-enabled client to prevent connection pool exhaustion
+        // when custom OpenAI providers (like sub2api) respond slowly or hang.
+        // Fixes issue #4299: 502 Gateway Error after Mattermost integration.
+        crate::config::build_channel_proxy_client_with_timeouts(
+            "channel.mattermost",
+            self.proxy_url.as_deref(),
+            30, // 30 second request timeout
+            10, // 10 second connect timeout
+        )
     }
 
     /// Check if a user ID is in the allowlist.
@@ -465,6 +473,7 @@ impl MattermostChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
     }
 }
@@ -1206,12 +1215,14 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,
                 assemblyai: None,
                 google: None,
                 local_whisper: None,
+                transcribe_non_ptt_audio: false,
             },
         );
         assert!(ch.transcription_manager.is_some());
@@ -1228,12 +1239,14 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,
                 assemblyai: None,
                 google: None,
                 local_whisper: None,
+                transcribe_non_ptt_audio: false,
             },
         );
         assert!(ch.transcription_manager.is_none());
@@ -1370,12 +1383,14 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 3600,
                 openai: None,
                 deepgram: None,
                 assemblyai: None,
                 google: None,
                 local_whisper: None,
+                transcribe_non_ptt_audio: false,
             },
         );
 
@@ -1437,6 +1452,7 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,
@@ -1444,10 +1460,11 @@ mod tests {
                 google: None,
                 local_whisper: Some(crate::config::LocalWhisperConfig {
                     url: whisper_url,
-                    bearer_token: "test_token".to_string(),
+                    bearer_token: Some("test_token".to_string()),
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
                 }),
+                transcribe_non_ptt_audio: false,
             });
 
             let post = json!({
@@ -1486,6 +1503,7 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,
@@ -1493,10 +1511,11 @@ mod tests {
                 google: None,
                 local_whisper: Some(crate::config::LocalWhisperConfig {
                     url: mock_server.uri(),
-                    bearer_token: "test_token".to_string(),
+                    bearer_token: Some("test_token".to_string()),
                     max_audio_bytes: 25_000_000,
                     timeout_secs: 300,
                 }),
+                transcribe_non_ptt_audio: false,
             });
 
             let post = json!({

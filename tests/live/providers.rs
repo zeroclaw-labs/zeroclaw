@@ -3,8 +3,8 @@
 //! All tests in this module require real external API credentials and are
 //! marked with `#[ignore]`. Run with: `cargo test --test live -- --ignored`
 
-use zeroclaw::providers::traits::{ChatMessage, Provider};
 use zeroclaw::providers::ProviderRuntimeOptions;
+use zeroclaw::providers::traits::{ChatMessage, Provider};
 
 /// Sends a real multi-turn conversation to OpenAI Codex and verifies
 /// the model retains context from earlier messages.
