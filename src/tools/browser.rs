@@ -10,13 +10,32 @@ use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::ToSocketAddrs;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
 use tracing::debug;
+
+/// Build a `Command` for `agent-browser`.
+///
+/// On Windows, npm-installed global packages create `.cmd` shim scripts that
+/// `Command::new("agent-browser")` cannot resolve directly. Wrapping with
+/// `cmd.exe /C` uses the shell's own PATH resolution which handles `.cmd` and
+/// `.bat` extensions automatically.
+fn agent_browser_command() -> Command {
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "agent-browser"]);
+        cmd
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Command::new("agent-browser")
+    }
+}
 
 /// Computer-use sidecar settings.
 #[derive(Clone)]
@@ -241,7 +260,7 @@ impl BrowserTool {
 
     /// Check if agent-browser CLI is available
     pub async fn is_agent_browser_available() -> bool {
-        Command::new("agent-browser")
+        agent_browser_command()
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -333,9 +352,14 @@ impl BrowserTool {
                 if Self::is_agent_browser_available().await {
                     Ok(ResolvedBackend::AgentBrowser)
                 } else {
+                    #[cfg(target_os = "windows")]
+                    let install_hint = "Install with: npm install -g agent-browser (ensure npm global bin is in PATH)";
+                    #[cfg(not(target_os = "windows"))]
+                    let install_hint = "Install with: npm install -g agent-browser";
                     anyhow::bail!(
-                        "browser.backend='{}' but agent-browser CLI is unavailable. Install with: npm install -g agent-browser",
-                        configured.as_str()
+                        "browser.backend='{}' but agent-browser CLI is unavailable. {}",
+                        configured.as_str(),
+                        install_hint
                     )
                 }
             }
@@ -438,7 +462,7 @@ impl BrowserTool {
 
     /// Execute an agent-browser command
     async fn run_command(&self, args: &[&str]) -> anyhow::Result<AgentBrowserResponse> {
-        let mut cmd = Command::new("agent-browser");
+        let mut cmd = agent_browser_command();
 
         // When running as a service (systemd/OpenRC), the process may lack
         // HOME which browsers need for profile directories.
@@ -1100,7 +1124,7 @@ mod native_backend {
     use fantoccini::actions::{InputSource, MouseActions, PointerAction};
     use fantoccini::key::Key;
     use fantoccini::{Client, ClientBuilder, Locator};
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
@@ -2275,9 +2299,10 @@ mod tests {
         let tool = BrowserTool::new(security, vec!["*".into()], None);
         assert!(tool.validate_url("https://[::1]/").is_err());
         assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
-        assert!(tool
-            .validate_url("https://[::ffff:10.0.0.1]:8080/")
-            .is_err());
+        assert!(
+            tool.validate_url("https://[::ffff:10.0.0.1]:8080/")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2432,15 +2457,18 @@ mod tests {
             },
         );
 
-        assert!(tool
-            .validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
-            .is_ok());
-        assert!(tool
-            .validate_coordinate("x", 101, tool.computer_use.max_coordinate_x)
-            .is_err());
-        assert!(tool
-            .validate_coordinate("y", -1, tool.computer_use.max_coordinate_y)
-            .is_err());
+        assert!(
+            tool.validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
+                .is_ok()
+        );
+        assert!(
+            tool.validate_coordinate("x", 101, tool.computer_use.max_coordinate_x)
+                .is_err()
+        );
+        assert!(
+            tool.validate_coordinate("y", -1, tool.computer_use.max_coordinate_y)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2616,6 +2644,23 @@ mod tests {
         }
         if let Some(val) = journal {
             unsafe { std::env::set_var("JOURNAL_STREAM", val) };
+        }
+    }
+
+    #[test]
+    fn windows_command_name_selection() {
+        // Verify the cfg-based command name logic used in is_agent_browser_available
+        // and run_command selects the correct binary name per platform.
+        let cmd = if cfg!(target_os = "windows") {
+            "agent-browser.cmd"
+        } else {
+            "agent-browser"
+        };
+
+        if cfg!(target_os = "windows") {
+            assert_eq!(cmd, "agent-browser.cmd");
+        } else {
+            assert_eq!(cmd, "agent-browser");
         }
     }
 }

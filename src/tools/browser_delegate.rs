@@ -17,7 +17,7 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// Configuration for browser delegation (`[browser_delegate]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -641,10 +641,12 @@ mod tests {
         let tool = test_tool(config_with_domains(vec![], vec![]));
         let result = tool.validate_url("ftp://example.com/file");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported URL scheme"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported URL scheme")
+        );
     }
 
     #[test]
@@ -652,10 +654,12 @@ mod tests {
         let tool = test_tool(config_with_domains(vec![], vec![]));
         let result = tool.validate_url("file:///etc/passwd");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported URL scheme"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported URL scheme")
+        );
     }
 
     #[test]
@@ -663,10 +667,12 @@ mod tests {
         let tool = test_tool(config_with_domains(vec![], vec![]));
         let result = tool.validate_url("javascript:alert(1)");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported URL scheme"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported URL scheme")
+        );
     }
 
     #[test]
@@ -674,10 +680,12 @@ mod tests {
         let tool = test_tool(config_with_domains(vec![], vec![]));
         let result = tool.validate_url("data:text/html,<h1>hi</h1>");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("unsupported URL scheme"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported URL scheme")
+        );
     }
 
     #[test]
@@ -708,17 +716,19 @@ mod tests {
     #[test]
     fn validate_task_urls_allows_permitted_embedded_url() {
         let tool = test_tool(config_with_domains(vec!["corp.example.com".into()], vec![]));
-        assert!(tool
-            .validate_task_urls("read https://corp.example.com/page and summarize")
-            .is_ok());
+        assert!(
+            tool.validate_task_urls("read https://corp.example.com/page and summarize")
+                .is_ok()
+        );
     }
 
     #[test]
     fn validate_task_urls_allows_text_without_urls() {
         let tool = test_tool(config_with_domains(vec![], vec!["evil.com".into()]));
-        assert!(tool
-            .validate_task_urls("read the last 10 messages from engineering channel")
-            .is_ok());
+        assert!(
+            tool.validate_task_urls("read the last 10 messages from engineering channel")
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -747,11 +757,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("unsupported extract_format"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("unsupported extract_format")
+        );
         assert!(result.error.as_deref().unwrap().contains("xml"));
     }
 }
