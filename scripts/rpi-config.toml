@@ -493,8 +493,10 @@ user_agent = "ZeroClaw/1.0"
 
 [web_search]
 enabled = false
+# Provider options: "duckduckgo" (free, default), "brave" (requires brave_api_key),
+# "searxng" (self-hosted, requires searxng_instance_url), "tavily" (requires tavily_api_key)
 provider = "duckduckgo"
-# searxng_url = "http://localhost:8080"   # Required when provider = "searxng" (JSON format must be enabled)
+# tavily_api_key = ""
 fallback_providers = []
 retries_per_provider = 0
 retry_backoff_ms = 250

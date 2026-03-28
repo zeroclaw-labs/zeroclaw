@@ -166,6 +166,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"], optional = true }
 regex = "1.10"
 hostname = "0.4.2"
+socket2 = { version = "0.5", features = ["all"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 rustls-pki-types = "1.14.0"
