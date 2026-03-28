@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolResult};
-use super::web_search_provider_routing::{resolve_web_search_provider, WebSearchProviderRoute};
+use super::web_search_provider_routing::{WebSearchProviderRoute, resolve_web_search_provider};
 use async_trait::async_trait;
 use regex::Regex;
 use serde_json::json;
@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
+/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key),
+/// SearXNG (self-hosted, requires instance URL).
 ///
 /// The Brave API key is resolved lazily at execution time: if the boot-time key
 /// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
@@ -18,7 +19,8 @@ pub struct WebSearchTool {
     provider: String,
     /// Boot-time key snapshot (may be `None` if not yet configured at startup).
     boot_brave_api_key: Option<String>,
-    boot_searxng_url: Option<String>,
+    /// SearXNG instance base URL (e.g. "https://searx.example.com").
+    searxng_instance_url: Option<String>,
     max_results: usize,
     timeout_secs: u64,
     /// Path to `config.toml` for lazy re-read of keys at execution time.
@@ -31,14 +33,13 @@ impl WebSearchTool {
     pub fn new(
         provider: String,
         brave_api_key: Option<String>,
-        searxng_url: Option<String>,
         max_results: usize,
         timeout_secs: u64,
     ) -> Self {
         Self {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
-            boot_searxng_url: searxng_url,
+            searxng_instance_url: None,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path: PathBuf::new(),
@@ -54,7 +55,7 @@ impl WebSearchTool {
     pub fn new_with_config(
         provider: String,
         brave_api_key: Option<String>,
-        searxng_url: Option<String>,
+        searxng_instance_url: Option<String>,
         max_results: usize,
         timeout_secs: u64,
         config_path: PathBuf,
@@ -63,7 +64,7 @@ impl WebSearchTool {
         Self {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
-            boot_searxng_url: searxng_url,
+            searxng_instance_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
@@ -122,109 +123,15 @@ impl WebSearchTool {
         }
     }
 
-    fn resolve_searxng_url(&self) -> anyhow::Result<String> {
-        if let Some(ref url) = self.boot_searxng_url {
-            if !url.is_empty() {
-                return Ok(url.clone());
-            }
-        }
-
-        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read config file {} for SearXNG URL: {e}",
-                self.config_path.display()
-            )
-        })?;
-
-        let config: crate::config::Config = toml::from_str(&contents).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse config file {} for SearXNG URL: {e}",
-                self.config_path.display()
-            )
-        })?;
-
-        let raw_url = config
-            .web_search
-            .searxng_url
-            .filter(|u| !u.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("SearXNG URL not configured"))?;
-
-        Ok(raw_url)
-    }
-
-    async fn search_searxng(&self, query: &str) -> anyhow::Result<String> {
-        let searxng_url = self.resolve_searxng_url()?;
-        let encoded_query = urlencoding::encode(query);
-        let search_url = format!(
-            "{}/search?q={}&format=json",
-            searxng_url.trim_end_matches('/'),
-            encoded_query
-        );
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .build()?;
-
-        let response = client.get(&search_url).send().await?;
-
-        if !response.status().is_success() {
-            anyhow::bail!(
-                "SearXNG search failed with status: {} (configured URL: {})",
-                response.status(),
-                searxng_url
-            );
-        }
-
-        let json: serde_json::Value = response.json().await?;
-        self.parse_searxng_results(&json, query)
-    }
-
-    fn parse_searxng_results(
-        &self,
-        json: &serde_json::Value,
-        query: &str,
-    ) -> anyhow::Result<String> {
-        let results = json
-            .get("results")
-            .and_then(|r| r.as_array())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Invalid SearXNG API response (results key missing or not an array)"
-                )
-            })?;
-
-        if results.is_empty() {
-            return Ok(format!("No results found for: {}", query));
-        }
-
-        let mut lines = vec![format!("Search results for: {} (via SearXNG)", query)];
-
-        for (i, result) in results.iter().take(self.max_results).enumerate() {
-            let title = result
-                .get("title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("No title");
-            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
-            let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
-
-            lines.push(format!("{}. {}", i + 1, title));
-            lines.push(format!("   {}", url));
-            if !content.is_empty() {
-                lines.push(format!("   {}", content));
-            }
-        }
-
-        Ok(lines.join("\n"))
-    }
-
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
         let encoded_query = urlencoding::encode(query);
         let search_url = format!("https://html.duckduckgo.com/html/?q={}", encoded_query);
 
-        let client = reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-            .build()?;
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
 
         let response = client.get(&search_url).send().await?;
 
@@ -296,9 +203,9 @@ impl WebSearchTool {
             encoded_query, self.max_results
         );
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(self.timeout_secs))
-            .build()?;
+        let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
 
         let response = client
             .get(&search_url)
@@ -343,6 +250,106 @@ impl WebSearchTool {
             lines.push(format!("   {}", url));
             if !description.is_empty() {
                 lines.push(format!("   {}", description));
+            }
+        }
+
+        Ok(lines.join("\n"))
+    }
+
+    /// Resolve the SearXNG instance URL from the boot-time config or by
+    /// re-reading `config.toml` at runtime.
+    fn resolve_searxng_instance_url(&self) -> anyhow::Result<String> {
+        if let Some(ref url) = self.searxng_instance_url {
+            if !url.is_empty() {
+                return Ok(url.clone());
+            }
+        }
+
+        // Slow path: re-read config.toml to pick up values set after boot.
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read config file {} for SearXNG instance URL: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        let config: crate::config::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse config file {} for SearXNG instance URL: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        config
+            .web_search
+            .searxng_instance_url
+            .filter(|u| !u.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "SearXNG instance URL not configured. Set [web_search] searxng_instance_url \
+                     in config.toml or the SEARXNG_INSTANCE_URL environment variable."
+                )
+            })
+    }
+
+    async fn search_searxng(&self, query: &str) -> anyhow::Result<String> {
+        let instance_url = self.resolve_searxng_instance_url()?;
+        let base_url = instance_url.trim_end_matches('/');
+
+        let encoded_query = urlencoding::encode(query);
+        let search_url = format!(
+            "{}/search?q={}&format=json&pageno=1",
+            base_url, encoded_query
+        );
+
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .user_agent("ZeroClaw/1.0");
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_search");
+        let client = builder.build()?;
+
+        let response = client
+            .get(&search_url)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("SearXNG search failed with status: {}", response.status());
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        self.parse_searxng_results(&json, query)
+    }
+
+    fn parse_searxng_results(
+        &self,
+        json: &serde_json::Value,
+        query: &str,
+    ) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Invalid SearXNG API response"))?;
+
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via SearXNG)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let content = result.get("content").and_then(|c| c.as_str()).unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+            if !content.is_empty() {
+                lines.push(format!("   {}", content));
             }
         }
 
@@ -431,19 +438,19 @@ mod tests {
 
     #[test]
     fn test_tool_name() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         assert_eq!(tool.name(), "web_search_tool");
     }
 
     #[test]
     fn test_tool_description() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         assert!(tool.description().contains("Search the web"));
     }
 
     #[test]
     fn test_parameters_schema() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["query"].is_object());
@@ -457,7 +464,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_empty() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         let result = tool
             .parse_duckduckgo_results("<html>No results here</html>", "test")
             .unwrap();
@@ -466,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_with_data() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -478,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_decodes_redirect_url() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         let html = r#"
             <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -490,7 +497,7 @@ mod tests {
 
     #[test]
     fn test_constructor_clamps_web_search_limits() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 0, 0);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -501,21 +508,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_missing_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_empty_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
         let result = tool.execute(json!({"query": ""})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_brave_without_api_key() {
-        let tool = WebSearchTool::new("brave".to_string(), None, None, 5, 15);
+        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));
@@ -526,7 +533,6 @@ mod tests {
         let tool = WebSearchTool::new(
             "brave".to_string(),
             Some("sk-plaintext-key".to_string()),
-            None,
             5,
             15,
         );
@@ -585,6 +591,115 @@ mod tests {
         assert_eq!(key, "brave-secret-key");
     }
 
+    #[tokio::test]
+    async fn test_execute_searxng_without_instance_url() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+
+        let tool = WebSearchTool::new_with_config(
+            "searxng".to_string(),
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            false,
+        );
+        let result = tool.execute(json!({"query": "test"})).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("SearXNG instance URL not configured")
+        );
+    }
+
+    #[test]
+    fn test_parse_searxng_results_empty() {
+        let tool = WebSearchTool::new("searxng".to_string(), None, 5, 15);
+        let json = serde_json::json!({"results": []});
+        let result = tool.parse_searxng_results(&json, "test").unwrap();
+        assert!(result.contains("No results found"));
+    }
+
+    #[test]
+    fn test_parse_searxng_results_with_data() {
+        let tool = WebSearchTool::new("searxng".to_string(), None, 5, 15);
+        let json = serde_json::json!({
+            "results": [
+                {
+                    "title": "SearXNG Example",
+                    "url": "https://example.com",
+                    "content": "A privacy-respecting metasearch engine"
+                },
+                {
+                    "title": "Another Result",
+                    "url": "https://example.org",
+                    "content": "More information here"
+                }
+            ]
+        });
+        let result = tool.parse_searxng_results(&json, "test").unwrap();
+        assert!(result.contains("SearXNG Example"));
+        assert!(result.contains("https://example.com"));
+        assert!(result.contains("A privacy-respecting metasearch engine"));
+        assert!(result.contains("via SearXNG"));
+    }
+
+    #[test]
+    fn test_parse_searxng_results_invalid_response() {
+        let tool = WebSearchTool::new("searxng".to_string(), None, 5, 15);
+        let json = serde_json::json!({"error": "bad request"});
+        let result = tool.parse_searxng_results(&json, "test");
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid SearXNG API response")
+        );
+    }
+
+    #[test]
+    fn test_resolve_searxng_instance_url_from_boot() {
+        let tool = WebSearchTool {
+            provider: "searxng".to_string(),
+            boot_brave_api_key: None,
+            searxng_instance_url: Some("https://searx.example.com".to_string()),
+            max_results: 5,
+            timeout_secs: 15,
+            config_path: PathBuf::new(),
+            secrets_encrypt: false,
+        };
+        let url = tool.resolve_searxng_instance_url().unwrap();
+        assert_eq!(url, "https://searx.example.com");
+    }
+
+    #[test]
+    fn test_resolve_searxng_instance_url_reloads_from_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nsearxng_instance_url = \"https://search.local\"\n",
+        )
+        .unwrap();
+
+        let tool = WebSearchTool::new_with_config(
+            "searxng".to_string(),
+            None,
+            None,
+            5,
+            15,
+            config_path,
+            false,
+        );
+        let url = tool.resolve_searxng_instance_url().unwrap();
+        assert_eq!(url, "https://search.local");
+    }
+
     #[test]
     fn test_resolve_brave_api_key_picks_up_runtime_update() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -616,105 +731,5 @@ mod tests {
         // Now should succeed with the updated key
         let key = tool.resolve_brave_api_key().unwrap();
         assert_eq!(key, "runtime-updated-key");
-    }
-
-    #[test]
-    fn test_resolve_searxng_url_uses_boot_url() {
-        let tool = WebSearchTool::new(
-            "searxng".to_string(),
-            None,
-            Some("http://localhost:8080".to_string()),
-            5,
-            15,
-        );
-        let url = tool.resolve_searxng_url().unwrap();
-        assert_eq!(url, "http://localhost:8080");
-    }
-
-    #[test]
-    fn test_resolve_searxng_url_reloads_from_config() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(
-            &config_path,
-            "[web_search]\nsearxng_url = \"http://config-url:8080\"\n",
-        )
-        .unwrap();
-
-        let tool = WebSearchTool::new_with_config(
-            "searxng".to_string(),
-            None,
-            None,
-            5,
-            15,
-            config_path,
-            false,
-        );
-        let url = tool.resolve_searxng_url().unwrap();
-        assert_eq!(url, "http://config-url:8080");
-    }
-
-    #[test]
-    fn test_resolve_searxng_url_missing_returns_error() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let config_path = tmp.path().join("config.toml");
-        std::fs::write(&config_path, "[web_search]\n").unwrap();
-
-        let tool = WebSearchTool::new_with_config(
-            "searxng".to_string(),
-            None,
-            None,
-            5,
-            15,
-            config_path,
-            false,
-        );
-        assert!(tool.resolve_searxng_url().is_err());
-    }
-
-    #[test]
-    fn test_parse_searxng_results_empty() {
-        let tool = WebSearchTool::new("searxng".to_string(), None, None, 5, 15);
-        let json = json!({ "results": [] });
-        let result = tool.parse_searxng_results(&json, "test query").unwrap();
-        assert!(result.contains("No results found"));
-    }
-
-    #[test]
-    fn test_parse_searxng_results_with_data() {
-        let tool = WebSearchTool::new("searxng".to_string(), None, None, 5, 15);
-        let json = json!({
-            "results": [
-                {
-                    "title": "Example",
-                    "url": "https://example.com",
-                    "content": "Description info"
-                }
-            ]
-        });
-        let result = tool.parse_searxng_results(&json, "test query").unwrap();
-        assert!(result.contains("1. Example"));
-        assert!(result.contains("https://example.com"));
-        assert!(result.contains("Description info"));
-    }
-
-    #[test]
-    fn test_parse_searxng_results_missing_key() {
-        let tool = WebSearchTool::new("searxng".to_string(), None, None, 5, 15);
-        let json = json!({ "other": "data" });
-        let result = tool.parse_searxng_results(&json, "test query");
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("results key missing"));
-    }
-
-    #[tokio::test]
-    async fn test_execute_searxng_without_url() {
-        let tool = WebSearchTool::new("searxng".to_string(), None, None, 5, 15);
-        let result = tool.execute(json!({"query": "test"})).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("SearXNG URL"));
     }
 }
