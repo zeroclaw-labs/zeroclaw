@@ -36,7 +36,7 @@ use async_trait::async_trait;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// Environment variable for overriding the path to the `claude` binary.
 pub const CLAUDE_CODE_PATH_ENV: &str = "CLAUDE_CODE_PATH";
@@ -302,16 +302,32 @@ mod tests {
             .expect("env lock poisoned")
     }
 
+    /// Serialize tests that spawn the echo-provider script.
+    ///
+    /// On Linux, writing a shell script and exec'ing it from parallel threads
+    /// can trigger `ETXTBSY` ("Text file busy") even with unique file paths,
+    /// because the kernel briefly holds `deny_write_access` on the interpreter
+    /// page cache. Serializing these tests eliminates the race.
+    ///
+    /// Uses `tokio::sync::Mutex` so the guard can be held across `.await`.
+    fn script_mutex() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
     #[test]
     fn new_uses_env_override() {
         let _guard = env_lock();
         let orig = std::env::var(CLAUDE_CODE_PATH_ENV).ok();
-        std::env::set_var(CLAUDE_CODE_PATH_ENV, "/usr/local/bin/claude");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, "/usr/local/bin/claude") };
         let provider = ClaudeCodeProvider::new();
         assert_eq!(provider.binary_path, PathBuf::from("/usr/local/bin/claude"));
         match orig {
-            Some(v) => std::env::set_var(CLAUDE_CODE_PATH_ENV, v),
-            None => std::env::remove_var(CLAUDE_CODE_PATH_ENV),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var(CLAUDE_CODE_PATH_ENV) },
         }
     }
 
@@ -319,11 +335,13 @@ mod tests {
     fn new_defaults_to_claude() {
         let _guard = env_lock();
         let orig = std::env::var(CLAUDE_CODE_PATH_ENV).ok();
-        std::env::remove_var(CLAUDE_CODE_PATH_ENV);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var(CLAUDE_CODE_PATH_ENV) };
         let provider = ClaudeCodeProvider::new();
         assert_eq!(provider.binary_path, PathBuf::from("claude"));
         if let Some(v) = orig {
-            std::env::set_var(CLAUDE_CODE_PATH_ENV, v);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, v) };
         }
     }
 
@@ -331,12 +349,15 @@ mod tests {
     fn new_ignores_blank_env_override() {
         let _guard = env_lock();
         let orig = std::env::var(CLAUDE_CODE_PATH_ENV).ok();
-        std::env::set_var(CLAUDE_CODE_PATH_ENV, "   ");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, "   ") };
         let provider = ClaudeCodeProvider::new();
         assert_eq!(provider.binary_path, PathBuf::from("claude"));
         match orig {
-            Some(v) => std::env::set_var(CLAUDE_CODE_PATH_ENV, v),
-            None => std::env::remove_var(CLAUDE_CODE_PATH_ENV),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var(CLAUDE_CODE_PATH_ENV, v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var(CLAUDE_CODE_PATH_ENV) },
         }
     }
 
@@ -396,23 +417,23 @@ mod tests {
 
     /// Helper: create a provider that uses a shell script echoing stdin back.
     /// The script ignores CLI flags (`--print`, `--model`, `-`) and just cats stdin.
+    ///
+    /// Each invocation places the script in its own unique directory and writes
+    /// the file atomically via `std::fs::write` to avoid `ETXTBSY` ("Text file
+    /// busy") races that occur when parallel test threads create and exec
+    /// scripts concurrently on the same filesystem.
     fn echo_provider() -> ClaudeCodeProvider {
-        use std::io::Write;
-        use tempfile::Builder;
+        static SCRIPT_ID: AtomicUsize = AtomicUsize::new(0);
+        let script_id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_claude_code_{}_{}",
+            std::process::id(),
+            script_id
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
 
-        let mut file = Builder::new()
-            .prefix("fake_claude_")
-            .suffix(".sh")
-            .tempfile()
-            .unwrap();
-
-        writeln!(file, "#!/bin/sh\ncat /dev/stdin").unwrap();
-        file.flush().unwrap();
-
-        // Close the file handle before changing permissions and executing
-        let (f, path) = file.keep().unwrap();
-        drop(f);
-
+        let path = dir.join("fake_claude.sh");
+        std::fs::write(&path, "#!/bin/sh\ncat /dev/stdin\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -430,6 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_single_user_message() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![ChatMessage::user("hello")];
         let result = provider
@@ -441,6 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_single_user_with_system() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![
             ChatMessage::system("You are helpful."),
@@ -455,6 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_multi_turn_includes_all_messages() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![
             ChatMessage::system("Be concise."),
@@ -475,6 +499,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_multi_turn_without_system() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![
             ChatMessage::user("hi"),
@@ -493,6 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_with_history_clamps_bad_temperature() {
+        let _lock = script_mutex().lock().await;
         let provider = echo_provider();
         let messages = vec![ChatMessage::user("test")];
         let result = provider.chat_with_history(&messages, "default", 0.5).await;

@@ -463,7 +463,7 @@ mod safety_tests {
 mod integration_tests {
     use crate::config::RobotConfig;
     use crate::traits::Tool;
-    use crate::{create_tools, DriveTool, SenseTool};
+    use crate::{DriveTool, SenseTool, create_tools};
     use serde_json::json;
 
     #[tokio::test]
@@ -515,8 +515,8 @@ mod integration_tests {
     #[cfg(feature = "safety")]
     #[tokio::test]
     async fn safe_drive_blocks_on_obstacle() {
-        use crate::safety::SafetyMonitor;
         use crate::SafeDrive;
+        use crate::safety::SafetyMonitor;
         use std::sync::Arc;
 
         let config = RobotConfig::default();

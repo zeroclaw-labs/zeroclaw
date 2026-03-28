@@ -1,12 +1,12 @@
 use crate::config::Config;
 use crate::cron::{
-    next_run_for_schedule, schedule_cron_expression, validate_delivery_config, validate_schedule,
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    next_run_for_schedule, schedule_cron_expression, validate_delivery_config, validate_schedule,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use uuid::Uuid;
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
@@ -261,7 +261,13 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.delete_after_run = delete_after_run;
     }
     if let Some(allowed_tools) = patch.allowed_tools {
-        job.allowed_tools = Some(allowed_tools);
+        // Empty list means "clear the allowlist" (all tools available),
+        // not "allow zero tools".
+        if allowed_tools.is_empty() {
+            job.allowed_tools = None;
+        } else {
+            job.allowed_tools = Some(allowed_tools);
+        }
     }
 
     if schedule_changed {

@@ -2,7 +2,6 @@
 pub enum MemoryBackendKind {
     Sqlite,
     Lucid,
-    Postgres,
     Qdrant,
     Markdown,
     None,
@@ -45,15 +44,6 @@ const MARKDOWN_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
     uses_sqlite_hygiene: false,
     sqlite_based: false,
     optional_dependency: false,
-};
-
-const POSTGRES_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
-    key: "postgres",
-    label: "PostgreSQL — remote durable storage via [storage.provider.config]",
-    auto_save_default: true,
-    uses_sqlite_hygiene: false,
-    sqlite_based: false,
-    optional_dependency: true,
 };
 
 const QDRANT_PROFILE: MemoryBackendProfile = MemoryBackendProfile {
@@ -102,7 +92,6 @@ pub fn classify_memory_backend(backend: &str) -> MemoryBackendKind {
     match backend {
         "sqlite" => MemoryBackendKind::Sqlite,
         "lucid" => MemoryBackendKind::Lucid,
-        "postgres" => MemoryBackendKind::Postgres,
         "qdrant" => MemoryBackendKind::Qdrant,
         "markdown" => MemoryBackendKind::Markdown,
         "none" => MemoryBackendKind::None,
@@ -114,7 +103,6 @@ pub fn memory_backend_profile(backend: &str) -> MemoryBackendProfile {
     match classify_memory_backend(backend) {
         MemoryBackendKind::Sqlite => SQLITE_PROFILE,
         MemoryBackendKind::Lucid => LUCID_PROFILE,
-        MemoryBackendKind::Postgres => POSTGRES_PROFILE,
         MemoryBackendKind::Qdrant => QDRANT_PROFILE,
         MemoryBackendKind::Markdown => MARKDOWN_PROFILE,
         MemoryBackendKind::None => NONE_PROFILE,
@@ -130,10 +118,6 @@ mod tests {
     fn classify_known_backends() {
         assert_eq!(classify_memory_backend("sqlite"), MemoryBackendKind::Sqlite);
         assert_eq!(classify_memory_backend("lucid"), MemoryBackendKind::Lucid);
-        assert_eq!(
-            classify_memory_backend("postgres"),
-            MemoryBackendKind::Postgres
-        );
         assert_eq!(
             classify_memory_backend("markdown"),
             MemoryBackendKind::Markdown
