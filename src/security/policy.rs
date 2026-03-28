@@ -418,6 +418,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 fn contains_unquoted_single_ampersand(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let mut prev_unquoted = ' ';
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -443,6 +444,7 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::None => {
                 if escaped {
                     escaped = false;
+                    prev_unquoted = ch;
                     continue;
                 }
                 if ch == '\\' {
@@ -453,12 +455,22 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     '&' => {
-                        if chars.next_if_eq(&'&').is_none() {
-                            return true;
+                        // `&&` is a logical AND — allowed, skip.
+                        if chars.next_if_eq(&'&').is_some() {
+                            prev_unquoted = '&';
+                            continue;
                         }
+                        // `>&` is fd duplication (e.g. `2>&1`) — safe, skip.
+                        if prev_unquoted == '>' {
+                            prev_unquoted = '&';
+                            continue;
+                        }
+                        // Standalone `&` — background operator, block.
+                        return true;
                     }
                     _ => {}
                 }
+                prev_unquoted = ch;
             }
         }
     }
@@ -508,6 +520,139 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                 }
             }
         }
+    }
+
+    false
+}
+
+/// Returns `true` when the command contains an unquoted shell redirection
+/// (`>`, `>>`, `<`) whose target is **not** one of the safe patterns:
+///
+/// - `/dev/null` (discard output/input)
+/// - fd duplication: `&1`, `&2`, etc.  (e.g. `2>&1`)
+///
+/// Quoted redirects (inside `"..."` or `'...'`) are ignored.
+fn contains_unsafe_redirect(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    let len = chars.len();
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    let mut i = 0;
+
+    while i < len {
+        let ch = chars[i];
+
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+                i += 1;
+                continue;
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    i += 1;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    i += 1;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                i += 1;
+                continue;
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    i += 1;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    i += 1;
+                    continue;
+                }
+                match ch {
+                    '\'' => {
+                        quote = QuoteState::Single;
+                        i += 1;
+                        continue;
+                    }
+                    '"' => {
+                        quote = QuoteState::Double;
+                        i += 1;
+                        continue;
+                    }
+                    '>' | '<' => {
+                        // Found an unquoted redirect operator.
+                        // Determine the full operator and target.
+                        let is_input = ch == '<';
+
+                        // Skip optional leading fd digit (e.g. the `2` in `2>`)
+                        // We already consumed it as a normal char, so just
+                        // advance past the operator.
+                        let mut j = i + 1;
+
+                        // Handle `>>` (append)
+                        if !is_input && j < len && chars[j] == '>' {
+                            j += 1;
+                        }
+
+                        // Handle `>&` fd duplication (e.g. `2>&1`)
+                        if j < len && chars[j] == '&' {
+                            j += 1;
+                            // Consume digits after `&` (e.g. `&1`, `&2`)
+                            let fd_start = j;
+                            while j < len && chars[j].is_ascii_digit() {
+                                j += 1;
+                            }
+                            // If we consumed at least one digit after `&`,
+                            // this is a pure fd duplication — safe.
+                            if j > fd_start {
+                                i = j;
+                                continue;
+                            }
+                            // `>&` followed by a path — still a redirect to
+                            // a file; fall through to target check.
+                            // Reset j back before the `&` and continue with
+                            // normal target extraction below.
+                            j = fd_start - 1;
+                        }
+
+                        // Skip whitespace between operator and target
+                        while j < len && chars[j] == ' ' {
+                            j += 1;
+                        }
+
+                        // Extract target path
+                        let target_start = j;
+                        while j < len && !chars[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+
+                        let target: String = chars[target_start..j].iter().collect();
+
+                        // Allow redirect to /dev/null
+                        if target == "/dev/null" {
+                            i = j;
+                            continue;
+                        }
+
+                        // Any other redirect target is unsafe
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        i += 1;
     }
 
     false
@@ -958,10 +1103,13 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
-        // arbitrary paths and bypass path checks.
-        // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
-        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
+        // Block shell redirections (`<`, `>`, `>>`) that target arbitrary
+        // paths.  Safe patterns are allowed:
+        //   - `>/dev/null`, `2>/dev/null` (discard output)
+        //   - `2>&1`, `1>&2`             (fd duplication)
+        // Quoted literals (e.g. `echo "a>b"`) are already ignored by the
+        // quote-aware scanner.
+        if contains_unsafe_redirect(command) {
             return false;
         }
 
@@ -2213,6 +2361,24 @@ mod tests {
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
         assert!(!p.is_command_allowed("cat </etc/passwd"));
         assert!(!p.is_command_allowed("cat</etc/passwd"));
+    }
+
+    #[test]
+    fn safe_redirect_patterns_allowed() {
+        let p = default_policy();
+        // Discard stdout to /dev/null
+        assert!(p.is_command_allowed("ls >/dev/null"));
+        assert!(p.is_command_allowed("ls > /dev/null"));
+        // Discard stderr to /dev/null
+        assert!(p.is_command_allowed("ls 2>/dev/null"));
+        assert!(p.is_command_allowed("ls 2> /dev/null"));
+        // Discard both stdout and stderr
+        assert!(p.is_command_allowed("ls >/dev/null 2>&1"));
+        assert!(p.is_command_allowed("ls 2>/dev/null 1>&2"));
+        // fd duplication alone
+        assert!(p.is_command_allowed("ls 2>&1"));
+        // Combined with pipes (allowed commands on both sides)
+        assert!(p.is_command_allowed("ls 2>/dev/null | grep foo"));
     }
 
     #[test]
