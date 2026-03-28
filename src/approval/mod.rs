@@ -122,12 +122,21 @@ impl ApprovalManager {
         }
 
         // always_ask overrides everything.
-        if self.always_ask.contains(tool_name) {
+        if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
             return true;
         }
 
+        // Channel-driven shell execution is still guarded by the shell tool's
+        // own command allowlist and risk policy. Skipping the outer approval
+        // gate here lets low-risk allowlisted commands (e.g. `ls`) work in
+        // non-interactive channels without silently allowing medium/high-risk
+        // commands.
+        if self.non_interactive && tool_name == "shell" {
+            return false;
+        }
+
         // auto_approve skips the prompt.
-        if self.auto_approve.contains(tool_name) {
+        if self.auto_approve.contains("*") || self.auto_approve.contains(tool_name) {
             return false;
         }
 
@@ -457,6 +466,12 @@ mod tests {
     }
 
     #[test]
+    fn non_interactive_shell_skips_outer_approval_by_default() {
+        let mgr = ApprovalManager::for_non_interactive(&AutonomyConfig::default());
+        assert!(!mgr.needs_approval("shell"));
+    }
+
+    #[test]
     fn non_interactive_always_ask_tools_need_approval() {
         let mgr = ApprovalManager::for_non_interactive(&supervised_config());
         // always_ask tools (shell) still report as needing approval,
@@ -546,5 +561,51 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
+    }
+
+    // ── Regression: #4247 default approved tools in channels ──
+
+    #[test]
+    fn non_interactive_allows_default_auto_approve_tools() {
+        let config = AutonomyConfig::default();
+        let mgr = ApprovalManager::for_non_interactive(&config);
+
+        for tool in &config.auto_approve {
+            assert!(
+                !mgr.needs_approval(tool),
+                "default auto_approve tool '{tool}' should not need approval in non-interactive mode"
+            );
+        }
+    }
+
+    #[test]
+    fn non_interactive_denies_unknown_tools() {
+        let config = AutonomyConfig::default();
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert!(
+            mgr.needs_approval("some_unknown_tool"),
+            "unknown tool should need approval"
+        );
+    }
+
+    #[test]
+    fn non_interactive_weather_is_auto_approved() {
+        let config = AutonomyConfig::default();
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert!(
+            !mgr.needs_approval("weather"),
+            "weather tool must not need approval — it is in the default auto_approve list"
+        );
+    }
+
+    #[test]
+    fn always_ask_overrides_auto_approve() {
+        let mut config = AutonomyConfig::default();
+        config.always_ask = vec!["weather".into()];
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert!(
+            mgr.needs_approval("weather"),
+            "always_ask must override auto_approve"
+        );
     }
 }

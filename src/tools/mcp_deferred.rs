@@ -121,11 +121,7 @@ impl DeferredMcpToolSet {
                     .iter()
                     .filter(|t| haystack.contains(t.as_str()))
                     .count();
-                if hits > 0 {
-                    Some((stub, hits))
-                } else {
-                    None
-                }
+                if hits > 0 { Some((stub, hits)) } else { None }
             })
             .collect();
 
@@ -161,8 +157,7 @@ impl DeferredMcpToolSet {
 /// The agent loop consults this each iteration to decide which tool_specs
 /// to include in the LLM request.
 pub struct ActivatedToolSet {
-    /// name -> activated Tool
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
 }
 
 impl ActivatedToolSet {
@@ -172,27 +167,53 @@ impl ActivatedToolSet {
         }
     }
 
-    /// Mark a tool as activated, storing its live wrapper.
-    pub fn activate(&mut self, name: String, tool: Box<dyn Tool>) {
+    pub fn activate(&mut self, name: String, tool: Arc<dyn Tool>) {
         self.tools.insert(name, tool);
     }
 
-    /// Whether a tool has been activated.
     pub fn is_activated(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
 
-    /// Get an activated tool for execution.
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(|t| t.as_ref())
+    /// Clone the Arc so the caller can drop the mutex guard before awaiting.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
     }
 
-    /// All currently activated tool specs (to include in LLM requests).
+    /// Resolve an activated tool by exact name first, then by unique MCP suffix.
+    ///
+    /// Some providers occasionally strip the `<server>__` prefix when calling a
+    /// deferred MCP tool after `tool_search` activation. When the suffix maps to
+    /// exactly one activated tool, allow that call to proceed.
+    pub fn get_resolved(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        if let Some(tool) = self.get(name) {
+            return Some(tool);
+        }
+        if name.contains("__") {
+            return None;
+        }
+
+        let mut resolved = None;
+        for (tool_name, tool) in &self.tools {
+            let Some((_, suffix)) = tool_name.split_once("__") else {
+                continue;
+            };
+            if suffix != name {
+                continue;
+            }
+            if resolved.is_some() {
+                return None;
+            }
+            resolved = Some(Arc::clone(tool));
+        }
+
+        resolved
+    }
+
     pub fn tool_specs(&self) -> Vec<ToolSpec> {
         self.tools.values().map(|t| t.spec()).collect()
     }
 
-    /// All activated tools for execution dispatch.
     pub fn tool_names(&self) -> Vec<&str> {
         self.tools.keys().map(|s| s.as_str()).collect()
     }
@@ -208,14 +229,26 @@ impl Default for ActivatedToolSet {
 
 /// Build the `<available-deferred-tools>` section for the system prompt.
 /// Lists only tool names so the LLM knows what is available without
-/// consuming context window on full schemas.
+/// consuming context window on full schemas. Includes an instruction
+/// block that tells the LLM to call `tool_search` to activate them.
 pub fn build_deferred_tools_section(deferred: &DeferredMcpToolSet) -> String {
     if deferred.is_empty() {
         return String::new();
     }
-    let mut out = String::from("<available-deferred-tools>\n");
+    let mut out = String::new();
+    out.push_str("## Deferred Tools\n\n");
+    out.push_str(
+        "The tools listed below are available but NOT yet loaded. \
+         To use any of them you MUST first call the `tool_search` tool \
+         to fetch their full schemas. Use `\"select:name1,name2\"` for \
+         exact tools or keywords to search. Once activated, the tools \
+         become callable for the rest of the conversation.\n\n",
+    );
+    out.push_str("<available-deferred-tools>\n");
     for stub in &deferred.stubs {
         out.push_str(&stub.prefixed_name);
+        out.push_str(" - ");
+        out.push_str(&stub.description);
         out.push('\n');
     }
     out.push_str("</available-deferred-tools>\n");
@@ -280,10 +313,79 @@ mod tests {
 
         let mut set = ActivatedToolSet::new();
         assert!(!set.is_activated("fake"));
-        set.activate("fake".into(), Box::new(FakeTool));
+        set.activate("fake".into(), Arc::new(FakeTool));
         assert!(set.is_activated("fake"));
         assert!(set.get("fake").is_some());
         assert_eq!(set.tool_specs().len(), 1);
+    }
+
+    #[test]
+    fn activated_set_resolves_unique_suffix() {
+        use crate::tools::traits::ToolResult;
+        use async_trait::async_trait;
+
+        struct FakeTool;
+        #[async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                "docker-mcp__extract_text"
+            }
+            fn description(&self) -> &str {
+                "fake tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                })
+            }
+        }
+
+        let mut set = ActivatedToolSet::new();
+        set.activate("docker-mcp__extract_text".into(), Arc::new(FakeTool));
+        assert!(set.get_resolved("extract_text").is_some());
+    }
+
+    #[test]
+    fn activated_set_rejects_ambiguous_suffix() {
+        use crate::tools::traits::ToolResult;
+        use async_trait::async_trait;
+
+        struct FakeTool(&'static str);
+        #[async_trait]
+        impl Tool for FakeTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "fake tool"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: String::new(),
+                    error: None,
+                })
+            }
+        }
+
+        let mut set = ActivatedToolSet::new();
+        set.activate(
+            "docker-mcp__extract_text".into(),
+            Arc::new(FakeTool("docker-mcp__extract_text")),
+        );
+        set.activate(
+            "ocr-mcp__extract_text".into(),
+            Arc::new(FakeTool("ocr-mcp__extract_text")),
+        );
+        assert!(set.get_resolved("extract_text").is_none());
     }
 
     #[test]
@@ -317,9 +419,58 @@ mod tests {
         };
         let section = build_deferred_tools_section(&set);
         assert!(section.contains("<available-deferred-tools>"));
-        assert!(section.contains("fs__read_file"));
-        assert!(section.contains("git__status"));
+        assert!(section.contains("fs__read_file - Read a file"));
+        assert!(section.contains("git__status - Git status"));
         assert!(section.contains("</available-deferred-tools>"));
+    }
+
+    #[test]
+    fn build_deferred_section_includes_tool_search_instruction() {
+        let stubs = vec![make_stub("fs__read_file", "Read a file")];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+        };
+        let section = build_deferred_tools_section(&set);
+        assert!(
+            section.contains("tool_search"),
+            "deferred section must instruct the LLM to use tool_search"
+        );
+        assert!(
+            section.contains("## Deferred Tools"),
+            "deferred section must include a heading"
+        );
+    }
+
+    #[test]
+    fn build_deferred_section_multiple_servers() {
+        let stubs = vec![
+            make_stub("server_a__list", "List items"),
+            make_stub("server_a__create", "Create item"),
+            make_stub("server_b__query", "Query records"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+        };
+        let section = build_deferred_tools_section(&set);
+        assert!(section.contains("server_a__list"));
+        assert!(section.contains("server_a__create"));
+        assert!(section.contains("server_b__query"));
+        assert!(
+            section.contains("tool_search"),
+            "section must mention tool_search for multi-server setups"
+        );
     }
 
     #[test]
@@ -362,5 +513,36 @@ mod tests {
         };
         assert!(set.get_by_name("a__one").is_some());
         assert!(set.get_by_name("nonexistent").is_none());
+    }
+
+    #[test]
+    fn search_across_multiple_servers() {
+        let stubs = vec![
+            make_stub("server_a__read_file", "Read a file from disk"),
+            make_stub("server_b__read_config", "Read configuration from database"),
+        ];
+        let set = DeferredMcpToolSet {
+            stubs,
+            registry: std::sync::Arc::new(
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(McpRegistry::connect_all(&[]))
+                    .unwrap(),
+            ),
+        };
+
+        // "read" should match stubs from both servers
+        let results = set.search("read", 10);
+        assert_eq!(results.len(), 2);
+
+        // "file" should match only server_a
+        let results = set.search("file", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].prefixed_name, "server_a__read_file");
+
+        // "config database" should rank server_b highest (2 hits)
+        let results = set.search("config database", 10);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].prefixed_name, "server_b__read_config");
     }
 }

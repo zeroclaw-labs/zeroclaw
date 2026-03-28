@@ -1,0 +1,184 @@
+name: Pub AUR Package
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+      dry_run:
+        description: "Generate PKGBUILD only (no push)"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      AUR_SSH_KEY:
+        required: false
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing release tag (vX.Y.Z)"
+        required: true
+        type: string
+      dry_run:
+        description: "Generate PKGBUILD only (no push)"
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: aur-publish-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish-aur:
+    name: Update AUR Package
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate and compute metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release_tag must be vX.Y.Z format."
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          tarball_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${RELEASE_TAG}.tar.gz"
+          tarball_sha="$(curl -fsSL "$tarball_url" | sha256sum | awk '{print $1}')"
+
+          if [[ -z "$tarball_sha" ]]; then
+            echo "::error::Could not compute SHA256 for source tarball."
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "tarball_url=$tarball_url"
+            echo "tarball_sha=$tarball_sha"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### AUR Package Metadata"
+            echo "- version: \`${version}\`"
+            echo "- tarball_url: \`${tarball_url}\`"
+            echo "- tarball_sha: \`${tarball_sha}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate PKGBUILD
+        id: pkgbuild
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TARBALL_SHA: ${{ steps.meta.outputs.tarball_sha }}
+        run: |
+          set -euo pipefail
+
+          pkgbuild_file="$(mktemp)"
+          sed -e "s/^pkgver=.*/pkgver=${VERSION}/" \
+              -e "s/^sha256sums=.*/sha256sums=('${TARBALL_SHA}')/" \
+              dist/aur/PKGBUILD > "$pkgbuild_file"
+
+          echo "pkgbuild_file=$pkgbuild_file" >> "$GITHUB_OUTPUT"
+
+          echo "### Generated PKGBUILD" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          cat "$pkgbuild_file" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Generate .SRCINFO
+        id: srcinfo
+        shell: bash
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          TARBALL_SHA: ${{ steps.meta.outputs.tarball_sha }}
+        run: |
+          set -euo pipefail
+
+          srcinfo_file="$(mktemp)"
+          sed -e "s/pkgver = .*/pkgver = ${VERSION}/" \
+              -e "s/sha256sums = .*/sha256sums = ${TARBALL_SHA}/" \
+              -e "s|zeroclaw-[0-9.]*.tar.gz|zeroclaw-${VERSION}.tar.gz|g" \
+              -e "s|/v[0-9.]*\.tar\.gz|/v${VERSION}.tar.gz|g" \
+              dist/aur/.SRCINFO > "$srcinfo_file"
+
+          echo "srcinfo_file=$srcinfo_file" >> "$GITHUB_OUTPUT"
+
+      - name: Push to AUR
+        if: inputs.dry_run == false
+        shell: bash
+        env:
+          AUR_SSH_KEY: ${{ secrets.AUR_SSH_KEY }}
+          PKGBUILD_FILE: ${{ steps.pkgbuild.outputs.pkgbuild_file }}
+          SRCINFO_FILE: ${{ steps.srcinfo.outputs.srcinfo_file }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${AUR_SSH_KEY}" ]]; then
+            echo "::error::Secret AUR_SSH_KEY is required for non-dry-run."
+            exit 1
+          fi
+
+          # Set up SSH key — normalize line endings and ensure trailing newline
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_KEY" | tr -d '\r' > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+
+          cat > ~/.ssh/config <<'SSH_CONFIG'
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+            StrictHostKeyChecking accept-new
+          SSH_CONFIG
+          chmod 600 ~/.ssh/config
+
+          # Verify key is valid and print fingerprint for debugging
+          echo "::group::SSH key diagnostics"
+          ssh-keygen -l -f ~/.ssh/aur || { echo "::error::AUR_SSH_KEY is not a valid SSH private key"; exit 1; }
+          echo "::endgroup::"
+
+          # Test SSH connectivity before attempting clone — fail fast with actionable error
+          if ! ssh -T -o BatchMode=yes -o ConnectTimeout=10 aur@aur.archlinux.org 2>&1 | grep -qi "authenticated"; then
+            echo "::warning::SSH connectivity test did not confirm authentication."
+            echo "::warning::Ensure the AUR_SSH_KEY public key is registered at https://aur.archlinux.org/account (SSH Keys tab) for the account that owns the zeroclaw package."
+          fi
+
+          tmp_dir="$(mktemp -d)"
+          git clone ssh://aur@aur.archlinux.org/zeroclaw.git "$tmp_dir/aur"
+
+          cp "$PKGBUILD_FILE" "$tmp_dir/aur/PKGBUILD"
+          cp "$SRCINFO_FILE" "$tmp_dir/aur/.SRCINFO"
+
+          cd "$tmp_dir/aur"
+          git config user.name "zeroclaw-bot"
+          git config user.email "bot@zeroclaw.dev"
+          git add PKGBUILD .SRCINFO
+          git commit -m "zeroclaw ${VERSION}"
+          git push origin HEAD
+
+          echo "AUR package updated to ${VERSION}"
+
+      - name: Summary
+        shell: bash
+        run: |
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "Dry run complete: PKGBUILD generated, no push performed."
+          else
+            echo "Publish complete: AUR package pushed."
+          fi

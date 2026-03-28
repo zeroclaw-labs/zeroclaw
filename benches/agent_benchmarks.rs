@@ -9,7 +9,7 @@
 //!
 //! Ref: https://github.com/zeroclaw-labs/zeroclaw/issues/618 (item 7)
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 
@@ -263,7 +263,7 @@ fn bench_memory_operations(c: &mut Criterion) {
     c.bench_function("memory_recall_top10", |b| {
         b.iter(|| {
             rt.block_on(async {
-                mem.recall(black_box("zeroclaw agent"), 10, None)
+                mem.recall(black_box("zeroclaw agent"), 10, None, None, None)
                     .await
                     .unwrap()
             })

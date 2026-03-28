@@ -1,0 +1,42 @@
+# Dockerfile.ci — CI/release image using pre-built binaries.
+# Used by release workflows to skip the ~60 min Rust compilation.
+#
+# Variants (via --build-arg):
+#   Distroless (default):  docker build -f Dockerfile.ci .
+#   Debian (with shell):   docker build -f Dockerfile.ci --build-arg VARIANT=debian .
+
+ARG VARIANT=distroless
+
+# ── Distroless base ────────────────────────────────────────────
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:9c4fe2381c2e6d53c4cfdefeff6edbd2a67ec7713e2c3ca6653806cbdbf27a1e AS base-distroless
+
+# ── Debian base (with shell tools) ─────────────────────────────
+FROM debian:bookworm-slim AS base-debian
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Runtime ────────────────────────────────────────────────────
+FROM base-${VARIANT} AS runtime
+
+ARG TARGETARCH
+
+# Copy the pre-built binary for this platform (amd64 or arm64)
+COPY bin/${TARGETARCH}/zeroclaw /usr/local/bin/zeroclaw
+
+# Runtime directory structure and default config
+COPY --chown=65534:65534 zeroclaw-data/ /zeroclaw-data/
+
+ENV LANG=C.UTF-8
+ENV ZEROCLAW_WORKSPACE=/zeroclaw-data/workspace
+ENV HOME=/zeroclaw-data
+ENV ZEROCLAW_GATEWAY_PORT=42617
+
+WORKDIR /zeroclaw-data
+USER 65534:65534
+EXPOSE 42617
+ENTRYPOINT ["zeroclaw"]
+CMD ["gateway"]

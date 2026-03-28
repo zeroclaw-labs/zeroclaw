@@ -77,7 +77,7 @@ pub async fn handle_command(cmd: crate::PeripheralCommands, config: &Config) -> 
                 Some(path.clone())
             };
 
-            let mut cfg = crate::config::Config::load_or_init().await?;
+            let mut cfg = Box::pin(crate::config::Config::load_or_init()).await?;
             cfg.peripherals.enabled = true;
 
             if cfg
@@ -232,6 +232,31 @@ pub async fn create_peripheral_tools(config: &PeripheralsConfig) -> Result<Vec<B
 #[allow(clippy::unused_async)]
 pub async fn create_peripheral_tools(_config: &PeripheralsConfig) -> Result<Vec<Box<dyn Tool>>> {
     Ok(Vec::new())
+}
+
+/// Create probe-rs / static board info tools (hardware_board_info, hardware_memory_map,
+/// hardware_memory_read). These use USB/probe-rs or static datasheet data — they never
+/// open a serial port, so they are safe to register regardless of the `hardware` feature.
+#[cfg(feature = "hardware")]
+pub fn create_board_info_tools(config: &PeripheralsConfig) -> Vec<Box<dyn Tool>> {
+    if !config.enabled || config.boards.is_empty() {
+        return Vec::new();
+    }
+    let board_names: Vec<String> = config.boards.iter().map(|b| b.board.clone()).collect();
+    vec![
+        Box::new(crate::tools::HardwareMemoryMapTool::new(
+            board_names.clone(),
+        )),
+        Box::new(crate::tools::HardwareBoardInfoTool::new(
+            board_names.clone(),
+        )),
+        Box::new(crate::tools::HardwareMemoryReadTool::new(board_names)),
+    ]
+}
+
+#[cfg(not(feature = "hardware"))]
+pub fn create_board_info_tools(_config: &PeripheralsConfig) -> Vec<Box<dyn Tool>> {
+    Vec::new()
 }
 
 #[cfg(test)]

@@ -6,13 +6,11 @@
 > Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Vấn đề
-
 ZeroClaw hiện có application-layer security (allowlists, path blocking, command injection protection) nhưng thiếu cơ chế cách ly cấp hệ điều hành. Nếu kẻ tấn công nằm trong allowlist, họ có thể chạy bất kỳ lệnh nào được cho phép với quyền của user zeroclaw.
 
 ## Các giải pháp đề xuất
 
 ### Tùy chọn 1: tích hợp Firejail (khuyến nghị cho Linux)
-
 Firejail cung cấp sandboxing ở user-space với overhead tối thiểu.
 
 ```rust
@@ -75,7 +73,6 @@ sandbox_backend = "firejail"  # hoặc "none", "bubblewrap", "docker"
 ---
 
 ### Tùy chọn 2: Bubblewrap (di động, không cần root)
-
 Bubblewrap dùng user namespaces để tạo container.
 
 ```bash
@@ -96,7 +93,6 @@ bwrap --ro-bind /usr /usr \
 ---
 
 ### Tùy chọn 3: Docker-in-Docker (nặng nhưng cách ly hoàn toàn)
-
 Chạy các công cụ agent trong container tạm thời.
 
 ```rust
@@ -127,7 +123,6 @@ impl DockerSandbox {
 ---
 
 ### Tùy chọn 4: Landlock (Linux kernel LSM, Rust native)
-
 Landlock cung cấp kiểm soát truy cập hệ thống file mà không cần container.
 
 ```rust
