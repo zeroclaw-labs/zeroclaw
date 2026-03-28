@@ -108,8 +108,12 @@ zeroclaw service start
 1. 备份 `~/.zeroclaw/config.toml`
 2. 每次只应用一个逻辑变更
 3. 运行 `zeroclaw doctor`
-4. 重启守护进程/服务
+4. 应用变更：
+   - **热重载**（无停机）：`zeroclaw config reload`
+   - **完全重启**（provider/model/pairing 更改时需要）：重启守护进程/服务
 5. 使用 `status` + `channel doctor` 验证
+
+`config reload` 保留会话历史和子代理状态。如果更改需要重启，命令会打印警告并列出受影响的字段。
 
 ## 回滚流程
 

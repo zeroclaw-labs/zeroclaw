@@ -889,6 +889,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
+        .route("/admin/reload-config", post(handle_admin_reload_config))
         // ── Existing routes ──
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
@@ -2212,6 +2213,105 @@ async fn handle_admin_paircode_new(
             Ok((StatusCode::BAD_REQUEST, Json(body)))
         }
     }
+}
+
+/// POST /admin/reload-config -- hot-reload config from disk (localhost only)
+///
+/// Reloads `config.toml` via `load_or_init()`, which re-resolves the config
+/// path, decrypts secrets, applies env overrides, and validates. The resolved
+/// path is verified against the running instance's `config_path` to prevent
+/// silent config-file switches (e.g. from a changed `ZEROCLAW_WORKSPACE`).
+///
+/// **Known limitation:** Only `state.config` is swapped. Other `AppState`
+/// fields derived at startup (`model`, `temperature`, `provider`,
+/// `webhook_secret_hash`, `pairing`, `auto_save`) are NOT updated. A full
+/// daemon restart is required to pick up changes to those fields.
+async fn handle_admin_reload_config(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_localhost(&peer)?;
+    tracing::info!(peer = %peer, "Admin config reload request received");
+
+    let expected_path = state.config.lock().config_path.clone();
+
+    let new_config = Box::pin(crate::config::Config::load_or_init())
+        .await
+        .map_err(|e| {
+            tracing::error!(peer = %peer, "Config reload failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": "Config reload failed"
+                })),
+            )
+        })?;
+
+    if new_config.config_path != expected_path {
+        tracing::error!(
+            peer = %peer,
+            expected = %expected_path.display(),
+            resolved = %new_config.config_path.display(),
+            "Config path mismatch -- refusing reload"
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Config path mismatch: gateway loaded from '{}' but reload resolved to '{}'. \
+                     Restart the daemon to switch config files.",
+                    expected_path.display(),
+                    new_config.config_path.display()
+                )
+            })),
+        ));
+    }
+
+    // Detect changes to fields that require a daemon restart.
+    let mut restart_warnings: Vec<String> = Vec::new();
+    {
+        let old = state.config.lock();
+        if old.default_provider != new_config.default_provider {
+            restart_warnings.push(format!(
+                "default_provider changed ({} -> {}) -- restart required",
+                old.default_provider.as_deref().unwrap_or("(none)"),
+                new_config.default_provider.as_deref().unwrap_or("(none)")
+            ));
+        }
+        if old.default_model != new_config.default_model {
+            restart_warnings.push(format!(
+                "default_model changed ({} -> {}) -- restart required",
+                old.default_model.as_deref().unwrap_or("(none)"),
+                new_config.default_model.as_deref().unwrap_or("(none)")
+            ));
+        }
+    }
+
+    for w in &restart_warnings {
+        tracing::warn!(peer = %peer, "{w}");
+    }
+
+    *state.config.lock() = new_config;
+    tracing::info!(peer = %peer, "Config reloaded from disk successfully");
+
+    let message = if restart_warnings.is_empty() {
+        "Config reloaded from disk -- changes are now active.".to_string()
+    } else {
+        format!(
+            "Config reloaded, but some changes need a daemon restart:\n{}",
+            restart_warnings.join("\n")
+        )
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "message": message,
+            "restart_required": !restart_warnings.is_empty(),
+            "restart_warnings": restart_warnings,
+        })),
+    ))
 }
 
 /// GET /pair/code — fetch the initial pairing code (no auth, no localhost restriction).

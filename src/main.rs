@@ -616,6 +616,15 @@ enum PluginCommands {
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+    /// Hot-reload config from disk into the running gateway
+    Reload {
+        /// Gateway port (defaults to config gateway.port)
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Gateway host (defaults to config gateway.host)
+        #[arg(long)]
+        host: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1606,6 +1615,11 @@ async fn main() -> Result<()> {
                 );
                 Ok(())
             }
+            ConfigCommands::Reload { port, host } => {
+                let port = port.unwrap_or(config.gateway.port);
+                let host = host.as_deref().unwrap_or(&config.gateway.host);
+                reload_config(host, port).await
+            }
         },
 
         #[cfg(feature = "plugins-wasm")]
@@ -1882,6 +1896,87 @@ async fn shutdown_gateway(host: &str, port: u16) -> Result<()> {
             response.status()
         )),
         Err(e) => Err(anyhow::anyhow!("Failed to connect to gateway: {e}")),
+    }
+}
+
+/// Hot-reload config on a running gateway via the admin endpoint.
+async fn reload_config(host: &str, port: u16) -> Result<()> {
+    let is_loopback = host == "localhost"
+        || host
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+            .or(Some(host))
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+            .is_some_and(|ip| ip.is_loopback());
+    if !is_loopback {
+        anyhow::bail!(
+            "Refusing to send admin request to non-loopback host '{host}'. \
+             Only loopback addresses (127.0.0.0/8, ::1) and 'localhost' are allowed."
+        );
+    }
+
+    let authority = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let url = format!("http://{authority}/admin/reload-config");
+    let client = reqwest::Client::new();
+
+    match client
+        .post(url)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => {
+            let body: serde_json::Value = response.json().await?;
+            let msg = body
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Config reloaded");
+            let restart = body
+                .get("restart_required")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if restart {
+                let warnings = body
+                    .get("restart_warnings")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                println!("✅ Config reloaded from disk.");
+                println!();
+                println!("⚠️  Some changes need a daemon restart:");
+                for w in &warnings {
+                    if let Some(s) = w.as_str() {
+                        println!("  - {s}");
+                    }
+                }
+                println!();
+                println!("Run: sudo systemctl restart zeroclaw");
+            } else {
+                println!("✅ {msg}");
+            }
+            Ok(())
+        }
+        Ok(response) => {
+            let status = response.status();
+            let err_msg = match response.json::<serde_json::Value>().await {
+                Ok(body) => body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown error")
+                    .to_string(),
+                Err(_) => "non-JSON error response".to_string(),
+            };
+            Err(anyhow::anyhow!(
+                "Gateway responded with {status}: {err_msg}"
+            ))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to connect to gateway at {authority}: {e}"
+        )),
     }
 }
 

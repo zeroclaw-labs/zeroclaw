@@ -108,8 +108,12 @@ Trước khi áp dụng thay đổi cấu hình:
 1. sao lưu `~/.zeroclaw/config.toml`
 2. chỉ áp dụng một thay đổi logic tại một thời điểm
 3. chạy `zeroclaw doctor`
-4. khởi động lại daemon/service
+4. áp dụng thay đổi:
+   - **Tải lại nóng** (không downtime): `zeroclaw config reload`
+   - **Khởi động lại hoàn toàn** (cần cho thay đổi provider/model/pairing): khởi động lại daemon/service
 5. xác minh bằng `status` + `channel doctor`
+
+`config reload` bảo toàn lịch sử hội thoại và trạng thái sub-agent. Nếu thay đổi cần khởi động lại, lệnh sẽ in cảnh báo liệt kê các trường bị ảnh hưởng.
 
 ## Quy trình Rollback
 

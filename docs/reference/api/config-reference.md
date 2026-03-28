@@ -460,6 +460,21 @@ set `path_prefix` to that sub-path (e.g. `"/zeroclaw"`). All gateway
 routes will be served under this prefix. The value must start with `/`
 and must not end with `/`.
 
+### Admin endpoints
+
+| Method | Path | Access | Purpose |
+|---|---|---|---|
+| `POST` | `/admin/reload-config` | localhost only | Hot-reload `config.toml` from disk |
+| `POST` | `/admin/shutdown` | localhost only | Graceful daemon shutdown |
+| `GET` | `/admin/paircode` | localhost only | Show current pairing code |
+| `POST` | `/admin/paircode/new` | localhost only | Generate new pairing code |
+
+`/admin/reload-config` re-reads, decrypts, validates, and swaps the in-memory config. Non-loopback requests return `403`. If the resolved config path differs from the running instance (e.g. `ZEROCLAW_WORKSPACE` changed), the endpoint returns `409 Conflict`.
+
+Known limitation: only `state.config` is swapped. Fields derived at startup (`default_provider`, `default_model`, `webhook_secret_hash`, pairing state) are **not** updated by reload. The response includes `restart_required: true` and `restart_warnings` when such changes are detected.
+
+CLI shorthand: `zeroclaw config reload`
+
 ## `[autonomy]`
 
 | Key | Default | Purpose |
