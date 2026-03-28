@@ -64,6 +64,18 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
             tracing::warn!("Docker requested but not available, falling back to application-layer");
             Arc::new(super::traits::NoopSandbox)
         }
+        SandboxBackend::SandboxExec => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::new() {
+                    return Arc::new(sandbox);
+                }
+            }
+            tracing::warn!(
+                "sandbox-exec requested but not available, falling back to application-layer"
+            );
+            Arc::new(super::traits::NoopSandbox)
+        }
         SandboxBackend::Auto | SandboxBackend::None => {
             // Auto-detect best available
             detect_best_sandbox()
@@ -101,12 +113,25 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
                 return Arc::new(sandbox);
             }
         }
+
+        // Try sandbox-exec (Seatbelt) — built into macOS
+        if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::probe() {
+            tracing::info!("macOS sandbox-exec (Seatbelt) enabled");
+            return Arc::new(sandbox);
+        }
     }
 
     // Docker is heavy but works everywhere if docker is installed
     if let Ok(sandbox) = super::docker::DockerSandbox::probe() {
         tracing::info!("Docker sandbox enabled");
         return Arc::new(sandbox);
+    }
+
+    // Path-validation fallback: software-only deny/allow list enforcement
+    let pv = super::path_validation::PathValidationSandbox::new();
+    if pv.is_available() {
+        tracing::info!("Path-validation sandbox enabled (software-only fallback)");
+        return Arc::new(pv);
     }
 
     // Fallback: application-layer security only

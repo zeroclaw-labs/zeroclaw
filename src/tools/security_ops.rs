@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use super::traits::{Tool, ToolResult};
 use crate::config::SecurityOpsConfig;
 use crate::security::playbook::{
-    evaluate_step, load_playbooks, severity_level, Playbook, StepStatus,
+    Playbook, StepStatus, evaluate_step, load_playbooks, severity_level,
 };
 use crate::security::vulnerability::{generate_summary, parse_vulnerability_json};
 
@@ -459,10 +459,12 @@ mod tests {
         assert_eq!(tool.name(), "security_ops");
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["action"].is_object());
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("action")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("action"))
+        );
     }
 
     #[tokio::test]
