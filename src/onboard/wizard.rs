@@ -143,6 +143,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         provider_timeout_secs: 120,
         provider_max_tokens: None,
         extra_headers: std::collections::HashMap::new(),
+        provider_env: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         trust: crate::trust::TrustConfig::default(),
@@ -491,6 +492,17 @@ fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
         }
     }
 
+    // If the binary was installed via Homebrew, use the Homebrew var path
+    // instead of ~/.zeroclaw so the Homebrew service finds the same config.
+    if let Some(prefix) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(homebrew_prefix_for_exe)
+    {
+        let config_dir = PathBuf::from(prefix).join("var").join("zeroclaw");
+        return (config_dir.clone(), config_dir.join("workspace"));
+    }
+
     let config_dir = home.join(".zeroclaw");
     (config_dir.clone(), config_dir.join("workspace"))
 }
@@ -590,6 +602,7 @@ async fn run_quick_setup_with_home(
         provider_timeout_secs: 120,
         provider_max_tokens: None,
         extra_headers: std::collections::HashMap::new(),
+        provider_env: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
         trust: crate::trust::TrustConfig::default(),
@@ -4251,6 +4264,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1500,
                     multi_message_delay_ms: 800,
                     recovery_key,
+                    mention_only: false,
                 });
             }
             ChannelMenuChoice::Signal => {
@@ -4449,6 +4463,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         self_chat_mode: false,
                         dm_mention_patterns: vec![],
                         group_mention_patterns: vec![],
+                        interrupt_on_new_message: false,
                         proxy_url: None,
                     });
 
@@ -4557,6 +4572,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     self_chat_mode: false,
                     dm_mention_patterns: vec![],
                     group_mention_patterns: vec![],
+                    interrupt_on_new_message: false,
                     proxy_url: None,
                 });
             }

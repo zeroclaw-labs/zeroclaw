@@ -21,7 +21,6 @@
   <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
   <a href="https://www.instagram.com/therealzeroclaw"><img src="https://img.shields.io/badge/Instagram-%40therealzeroclaw-E4405F?style=flat&logo=instagram&logoColor=white" alt="Instagram: @therealzeroclaw" /></a>
   <a href="https://www.tiktok.com/@zeroclawlabs"><img src="https://img.shields.io/badge/TikTok-%40zeroclawlabs-000000?style=flat&logo=tiktok&logoColor=white" alt="TikTok: @zeroclawlabs" /></a>
-  <a href="https://www.rednote.com/user/profile/69b735e6000000002603927e"><img src="https://img.shields.io/badge/RedNote-Official-FF2442?style=flat" alt="RedNote" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 
@@ -32,36 +31,36 @@ Built by students and members of the Harvard, MIT, and Sundai.Club communities.
 <p align="center">
   🌐 <strong>Languages:</strong>
   <a href="README.md">🇺🇸 English</a> ·
-  <a href="README.zh-CN.md">🇨🇳 简体中文</a> ·
-  <a href="README.ja.md">🇯🇵 日本語</a> ·
-  <a href="README.ko.md">🇰🇷 한국어</a> ·
-  <a href="README.vi.md">🇻🇳 Tiếng Việt</a> ·
-  <a href="README.tl.md">🇵🇭 Tagalog</a> ·
-  <a href="README.es.md">🇪🇸 Español</a> ·
-  <a href="README.pt.md">🇧🇷 Português</a> ·
-  <a href="README.it.md">🇮🇹 Italiano</a> ·
-  <a href="README.de.md">🇩🇪 Deutsch</a> ·
-  <a href="README.fr.md">🇫🇷 Français</a> ·
-  <a href="README.ar.md">🇸🇦 العربية</a> ·
-  <a href="README.hi.md">🇮🇳 हिन्दी</a> ·
-  <a href="README.ru.md">🇷🇺 Русский</a> ·
-  <a href="README.bn.md">🇧🇩 বাংলা</a> ·
-  <a href="README.he.md">🇮🇱 עברית</a> ·
-  <a href="README.pl.md">🇵🇱 Polski</a> ·
-  <a href="README.cs.md">🇨🇿 Čeština</a> ·
-  <a href="README.nl.md">🇳🇱 Nederlands</a> ·
-  <a href="README.tr.md">🇹🇷 Türkçe</a> ·
-  <a href="README.uk.md">🇺🇦 Українська</a> ·
-  <a href="README.id.md">🇮🇩 Bahasa Indonesia</a> ·
-  <a href="README.th.md">🇹🇭 ไทย</a> ·
-  <a href="README.ur.md">🇵🇰 اردو</a> ·
-  <a href="README.ro.md">🇷🇴 Română</a> ·
-  <a href="README.sv.md">🇸🇪 Svenska</a> ·
-  <a href="README.el.md">🇬🇷 Ελληνικά</a> ·
-  <a href="README.hu.md">🇭🇺 Magyar</a> ·
-  <a href="README.fi.md">🇫🇮 Suomi</a> ·
-  <a href="README.da.md">🇩🇰 Dansk</a> ·
-  <a href="README.nb.md">🇳🇴 Norsk</a>
+  <a href="docs/i18n/zh-CN/PROJECT-README.md">🇨🇳 简体中文</a> ·
+  <a href="docs/i18n/ja/PROJECT-README.md">🇯🇵 日本語</a> ·
+  <a href="docs/i18n/ko/PROJECT-README.md">🇰🇷 한국어</a> ·
+  <a href="docs/i18n/vi/PROJECT-README.md">🇻🇳 Tiếng Việt</a> ·
+  <a href="docs/i18n/tl/PROJECT-README.md">🇵🇭 Tagalog</a> ·
+  <a href="docs/i18n/es/PROJECT-README.md">🇪🇸 Español</a> ·
+  <a href="docs/i18n/pt/PROJECT-README.md">🇧🇷 Português</a> ·
+  <a href="docs/i18n/it/PROJECT-README.md">🇮🇹 Italiano</a> ·
+  <a href="docs/i18n/de/PROJECT-README.md">🇩🇪 Deutsch</a> ·
+  <a href="docs/i18n/fr/PROJECT-README.md">🇫🇷 Français</a> ·
+  <a href="docs/i18n/ar/PROJECT-README.md">🇸🇦 العربية</a> ·
+  <a href="docs/i18n/hi/PROJECT-README.md">🇮🇳 हिन्दी</a> ·
+  <a href="docs/i18n/ru/PROJECT-README.md">🇷🇺 Русский</a> ·
+  <a href="docs/i18n/bn/PROJECT-README.md">🇧🇩 বাংলা</a> ·
+  <a href="docs/i18n/he/PROJECT-README.md">🇮🇱 עברית</a> ·
+  <a href="docs/i18n/pl/PROJECT-README.md">🇵🇱 Polski</a> ·
+  <a href="docs/i18n/cs/PROJECT-README.md">🇨🇿 Čeština</a> ·
+  <a href="docs/i18n/nl/PROJECT-README.md">🇳🇱 Nederlands</a> ·
+  <a href="docs/i18n/tr/PROJECT-README.md">🇹🇷 Türkçe</a> ·
+  <a href="docs/i18n/uk/PROJECT-README.md">🇺🇦 Українська</a> ·
+  <a href="docs/i18n/id/PROJECT-README.md">🇮🇩 Bahasa Indonesia</a> ·
+  <a href="docs/i18n/th/PROJECT-README.md">🇹🇭 ไทย</a> ·
+  <a href="docs/i18n/ur/PROJECT-README.md">🇵🇰 اردو</a> ·
+  <a href="docs/i18n/ro/PROJECT-README.md">🇷🇴 Română</a> ·
+  <a href="docs/i18n/sv/PROJECT-README.md">🇸🇪 Svenska</a> ·
+  <a href="docs/i18n/el/PROJECT-README.md">🇬🇷 Ελληνικά</a> ·
+  <a href="docs/i18n/hu/PROJECT-README.md">🇭🇺 Magyar</a> ·
+  <a href="docs/i18n/fi/PROJECT-README.md">🇫🇮 Suomi</a> ·
+  <a href="docs/i18n/da/PROJECT-README.md">🇩🇰 Dansk</a> ·
+  <a href="docs/i18n/nb/PROJECT-README.md">🇳🇴 Norsk</a>
 </p>
 
 ZeroClaw is a personal AI assistant you run on your own devices. It answers you on the channels you already use (WhatsApp, Telegram, Slack, Discord, Signal, iMessage, Matrix, IRC, Email, Bluesky, Nostr, Mattermost, Nextcloud Talk, DingTalk, Lark, QQ, Reddit, LinkedIn, Twitter, MQTT, WeChat Work, and more). It has a web dashboard for real-time control and can connect to hardware peripherals (ESP32, STM32, Arduino, Raspberry Pi). The Gateway is just the control plane — the product is the assistant.
