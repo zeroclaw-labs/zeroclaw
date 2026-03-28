@@ -1718,7 +1718,7 @@ impl Channel for MatrixChannel {
                 let sent_so_far = sent_map.get(&room_id).copied().unwrap_or(0);
 
                 if text.len() > sent_so_far {
-                    let remaining = text[sent_so_far..].trim().to_string();
+                    let remaining = multi_message_remaining_text(text, sent_so_far).to_string();
                     if !remaining.is_empty() {
                         let thread_ts = self
                             .multi_message_thread_ts
@@ -1759,6 +1759,22 @@ impl Channel for MatrixChannel {
                 Ok(())
             }
         }
+    }
+}
+
+/// Compute the unsent tail for MultiMessage finalize.
+///
+/// `update_draft` sends all complete paragraphs (delimited by `\n\n`)
+/// via recursion, so the only remaining content is the tail after the
+/// last boundary.  Using `rsplit_once` avoids relying on a byte offset
+/// that may not align with the (sanitized) finalize text.
+fn multi_message_remaining_text<'a>(text: &'a str, sent_so_far: usize) -> &'a str {
+    if sent_so_far > 0 {
+        text.rsplit_once("\n\n")
+            .map_or(text, |(_, tail)| tail)
+            .trim()
+    } else {
+        text.trim()
     }
 }
 
@@ -2316,5 +2332,208 @@ mod tests {
         let sanitized = MatrixChannel::sanitize_error_for_log(&"auth failed: sk-proj-abc123xyz");
         assert!(!sanitized.contains("sk-proj-abc123xyz"));
         assert!(sanitized.contains("[REDACTED]"));
+    }
+
+
+    // ── media marker tests ──
+
+    #[test]
+    fn extract_image_marker() {
+        let (cleaned, markers) =
+            extract_media_markers("Here is the chart [IMAGE:/tmp/chart.png] for you");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].path, "/tmp/chart.png");
+        assert_eq!(markers[0].msgtype, "m.image");
+        assert_eq!(cleaned, "Here is the chart  for you");
+    }
+
+    #[test]
+    fn extract_file_marker() {
+        let (_, markers) = extract_media_markers("[FILE:/tmp/report.pdf]");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].path, "/tmp/report.pdf");
+        assert_eq!(markers[0].msgtype, "m.file");
+    }
+
+    #[test]
+    fn extract_document_marker_alias() {
+        let (_, markers) = extract_media_markers("[DOCUMENT:/tmp/doc.txt]");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].msgtype, "m.file");
+    }
+
+    #[test]
+    fn extract_audio_marker() {
+        let (_, markers) = extract_media_markers("[AUDIO:/tmp/clip.mp3]");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].msgtype, "m.audio");
+    }
+
+    #[test]
+    fn extract_voice_marker_alias() {
+        let (_, markers) = extract_media_markers("[VOICE:/tmp/voice.ogg]");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].msgtype, "m.audio");
+    }
+
+    #[test]
+    fn extract_video_marker() {
+        let (_, markers) = extract_media_markers("[VIDEO:/tmp/clip.mp4]");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].msgtype, "m.video");
+    }
+
+    #[test]
+    fn extract_multiple_markers() {
+        let (cleaned, markers) =
+            extract_media_markers("See [IMAGE:/a.png] and [FILE:/b.pdf] attached");
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].msgtype, "m.image");
+        assert_eq!(markers[1].msgtype, "m.file");
+        assert_eq!(cleaned, "See  and  attached");
+    }
+
+    #[test]
+    fn extract_no_markers() {
+        let (cleaned, markers) = extract_media_markers("Just a regular message");
+        assert!(markers.is_empty());
+        assert_eq!(cleaned, "Just a regular message");
+    }
+
+    #[test]
+    fn extract_unknown_marker_preserved() {
+        let (cleaned, markers) = extract_media_markers("Check [UNKNOWN:data] out");
+        assert!(markers.is_empty());
+        assert_eq!(cleaned, "Check [UNKNOWN:data] out");
+    }
+
+    #[test]
+    fn extract_empty_target_skipped() {
+        let (cleaned, markers) = extract_media_markers("[IMAGE:] nothing");
+        assert!(markers.is_empty());
+        assert_eq!(cleaned, "[IMAGE:] nothing");
+    }
+
+    #[test]
+    fn extract_case_insensitive() {
+        let (_, markers) = extract_media_markers("[image:/tmp/pic.jpg]");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].msgtype, "m.image");
+    }
+
+    #[test]
+    fn extract_photo_alias() {
+        let (_, markers) = extract_media_markers("[PHOTO:/tmp/pic.jpg]");
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].msgtype, "m.image");
+    }
+
+    // ── mention_only tests ──
+
+    #[test]
+    fn mention_detected_with_full_user_id() {
+        assert!(MatrixChannel::body_contains_mention(
+            "@bot:matrix.org hello there",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_detected_mid_message() {
+        assert!(MatrixChannel::body_contains_mention(
+            "hey @bot:matrix.org what do you think?",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_not_detected_when_absent() {
+        assert!(!MatrixChannel::body_contains_mention(
+            "hello there",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn mention_not_detected_partial_match() {
+        assert!(!MatrixChannel::body_contains_mention(
+            "@bot:other.org hello",
+            "@bot:matrix.org"
+        ));
+    }
+
+    #[test]
+    fn strip_mention_from_start() {
+        let result =
+            MatrixChannel::strip_mention("@bot:matrix.org what is rust?", "@bot:matrix.org");
+        assert_eq!(result, "what is rust?");
+    }
+
+    #[test]
+    fn strip_mention_from_middle() {
+        let result =
+            MatrixChannel::strip_mention("hey @bot:matrix.org explain this", "@bot:matrix.org");
+        assert_eq!(result, "hey  explain this");
+    }
+
+    #[test]
+    fn strip_mention_only_mention_yields_empty() {
+        let result = MatrixChannel::strip_mention("@bot:matrix.org", "@bot:matrix.org");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn strip_mention_no_mention_unchanged() {
+        let result = MatrixChannel::strip_mention("hello world", "@bot:matrix.org");
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn is_dm_room_two_members() {
+        assert!(MatrixChannel::is_dm_room(2));
+    }
+
+    #[test]
+    fn is_dm_room_one_member() {
+        assert!(MatrixChannel::is_dm_room(1));
+    }
+
+    #[test]
+    fn is_dm_room_group() {
+        assert!(!MatrixChannel::is_dm_room(3));
+        assert!(!MatrixChannel::is_dm_room(50));
+    }
+
+    #[test]
+    fn multi_message_remaining_leading_newlines_trimmed_by_sanitize() {
+        // accumulated was "\n\nHello world", sent_so_far=2 from empty paragraph.
+        // Sanitized text has leading \n\n stripped.
+        assert_eq!(super::multi_message_remaining_text("Hello world", 2), "Hello world");
+    }
+
+    #[test]
+    fn multi_message_remaining_after_sent_paragraph() {
+        // "Para 1\n\nPara 2" — Para 1 was sent, tail is Para 2.
+        assert_eq!(super::multi_message_remaining_text("Para 1\n\nPara 2", 15), "Para 2");
+    }
+
+    #[test]
+    fn multi_message_remaining_nothing_sent() {
+        // No paragraphs sent, flush everything.
+        assert_eq!(super::multi_message_remaining_text("Hello world", 0), "Hello world");
+    }
+
+    #[test]
+    fn multi_message_remaining_all_paragraphs_sent() {
+        // All paragraphs sent (sent_so_far exceeds sanitized text length).
+        // Guard in finalize_draft prevents entering this path, but the
+        // helper still returns the tail safely.
+        assert_eq!(super::multi_message_remaining_text("Para 1\n\nPara 2", 28), "Para 2");
+    }
+
+    #[test]
+    fn multi_message_remaining_leading_whitespace_no_paragraphs() {
+        // accumulated was "  Hello", sent_so_far=0, sanitized trimmed.
+        assert_eq!(super::multi_message_remaining_text("Hello", 0), "Hello");
     }
 }
