@@ -491,6 +491,17 @@ fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
         }
     }
 
+    // If the binary was installed via Homebrew, use the Homebrew var path
+    // instead of ~/.zeroclaw so the Homebrew service finds the same config.
+    if let Some(prefix) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(homebrew_prefix_for_exe)
+    {
+        let config_dir = PathBuf::from(prefix).join("var").join("zeroclaw");
+        return (config_dir.clone(), config_dir.join("workspace"));
+    }
+
     let config_dir = home.join(".zeroclaw");
     (config_dir.clone(), config_dir.join("workspace"))
 }
