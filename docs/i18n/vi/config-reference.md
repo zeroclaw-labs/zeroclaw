@@ -476,6 +476,8 @@ Chế độ Cloud API (webhook Meta):
 | `verify_token` | Có | Token xác minh webhook |
 | `app_secret` | Tùy chọn | Bật xác minh chữ ký webhook (`X-Hub-Signature-256`) |
 | `allowed_numbers` | Khuyến nghị | Số điện thoại cho phép gửi đến (`[]` = từ chối tất cả, `"*"` = cho phép tất cả) |
+| `dm_mention_patterns` | Tùy chọn | Regex pattern cho DM mention gating (không phân biệt hoa thường). Khi không rỗng, chỉ DM khớp ít nhất một pattern mới được xử lý; đoạn khớp sẽ bị loại bỏ. Ví dụ: `["@?ZeroClaw"]` |
+| `group_mention_patterns` | Tùy chọn | Regex pattern cho group-chat mention gating (không phân biệt hoa thường). Khi không rỗng, chỉ tin nhắn nhóm khớp ít nhất một pattern mới được xử lý; đoạn khớp sẽ bị loại bỏ. Ví dụ: `["@?ZeroClaw"]` |
 
 Chế độ WhatsApp Web (client gốc):
 
@@ -485,6 +487,8 @@ Chế độ WhatsApp Web (client gốc):
 | `pair_phone` | Tùy chọn | Số điện thoại cho luồng pair-code (chỉ chữ số) |
 | `pair_code` | Tùy chọn | Mã pair tùy chỉnh (nếu không sẽ tự tạo) |
 | `allowed_numbers` | Khuyến nghị | Số điện thoại cho phép gửi đến (`[]` = từ chối tất cả, `"*"` = cho phép tất cả) |
+| `dm_mention_patterns` | Tùy chọn | Regex pattern cho DM mention gating (không phân biệt hoa thường). Khi không rỗng, chỉ DM khớp ít nhất một pattern mới được xử lý; đoạn khớp sẽ bị loại bỏ. Ví dụ: `["@?ZeroClaw"]` |
+| `group_mention_patterns` | Tùy chọn | Regex pattern cho group-chat mention gating (không phân biệt hoa thường). Khi không rỗng, chỉ tin nhắn nhóm khớp ít nhất một pattern mới được xử lý; đoạn khớp sẽ bị loại bỏ. Ví dụ: `["@?ZeroClaw"]` |
 
 Lưu ý:
 

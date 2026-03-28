@@ -674,6 +674,8 @@ Cloud API mode (Meta webhook):
 | `verify_token` | Yes | Webhook verification token |
 | `app_secret` | Optional | Enables webhook signature verification (`X-Hub-Signature-256`) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+| `dm_mention_patterns` | Optional | Regex patterns for DM mention gating (case-insensitive); matched fragments are stripped |
+| `group_mention_patterns` | Optional | Regex patterns for group-chat mention gating (case-insensitive); matched fragments are stripped |
 
 WhatsApp Web mode (native client):
 
@@ -684,6 +686,8 @@ WhatsApp Web mode (native client):
 | `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
 | `mention_only` | Optional | When `true`, only respond to group messages that @-mention the bot (DMs always processed) |
+| `dm_mention_patterns` | Optional | Regex patterns for DM mention gating (case-insensitive); matched fragments are stripped |
+| `group_mention_patterns` | Optional | Regex patterns for group-chat mention gating (case-insensitive); matched fragments are stripped |
 
 Notes:
 
