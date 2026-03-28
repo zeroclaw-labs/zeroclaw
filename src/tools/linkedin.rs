@@ -229,16 +229,20 @@ impl Tool for LinkedInTool {
 
                 // Image generation flow
                 if generate_image && self.image_config.enabled {
-                    let image_prompt =
-                        args.get("image_prompt")
-                            .and_then(|v| v.as_str())
-                            .map(String::from)
-                            .unwrap_or_else(|| {
-                                format!(
+                    let image_prompt = args
+                        .get("image_prompt")
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| {
+                            format!(
                                 "Professional, modern illustration for a LinkedIn post about: {}",
-                                if text.len() > 200 { &text[..200] } else { &text }
+                                if text.len() > 200 {
+                                    &text[..200]
+                                } else {
+                                    &text
+                                }
                             )
-                            });
+                        });
 
                     let generator =
                         ImageGenerator::new(self.image_config.clone(), self.workspace_dir.clone());

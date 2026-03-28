@@ -5,15 +5,15 @@
 use super::AppState;
 use axum::{
     extract::State,
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse,
+        sse::{Event, KeepAlive, Sse},
     },
 };
 use std::convert::Infallible;
-use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
 /// GET /api/events — SSE event stream
 pub async fn handle_sse_events(
@@ -69,6 +69,10 @@ impl BroadcastObserver {
         tx: tokio::sync::broadcast::Sender<serde_json::Value>,
     ) -> Self {
         Self { inner, tx }
+    }
+
+    pub fn inner(&self) -> &dyn crate::observability::Observer {
+        self.inner.as_ref()
     }
 }
 

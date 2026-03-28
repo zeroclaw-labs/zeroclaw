@@ -489,7 +489,7 @@ impl DeviceRegistry {
     pub async fn discover() -> Self {
         use super::{
             discover::scan_serial_devices,
-            serial::{HardwareSerialTransport, DEFAULT_BAUD},
+            serial::{DEFAULT_BAUD, HardwareSerialTransport},
         };
 
         let mut registry = Self::new();
@@ -563,7 +563,7 @@ impl DeviceRegistry {
     /// pass `None` to reuse the device's current path.
     #[cfg(feature = "hardware")]
     pub async fn reconnect(&mut self, alias: &str, new_port: Option<&str>) -> anyhow::Result<()> {
-        use super::serial::{HardwareSerialTransport, DEFAULT_BAUD};
+        use super::serial::{DEFAULT_BAUD, HardwareSerialTransport};
 
         let entry = self
             .devices
