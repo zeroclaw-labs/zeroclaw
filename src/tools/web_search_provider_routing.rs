@@ -2,6 +2,7 @@
 pub enum WebSearchProviderRoute {
     DuckDuckGo,
     Brave,
+    SearXNG,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,6 +14,7 @@ pub struct WebSearchProviderResolution {
 
 pub const DEFAULT_WEB_SEARCH_PROVIDER: &str = "duckduckgo";
 const BRAVE_PROVIDER: &str = "brave";
+const SEARXNG_PROVIDER: &str = "searxng";
 
 pub fn resolve_web_search_provider(raw_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_provider.trim().to_ascii_lowercase();
@@ -27,6 +29,11 @@ pub fn resolve_web_search_provider(raw_provider: &str) -> WebSearchProviderResol
         "brave" | "brave-search" | "brave_search" => WebSearchProviderResolution {
             route: WebSearchProviderRoute::Brave,
             canonical_provider: BRAVE_PROVIDER,
+            used_fallback: false,
+        },
+        "searxng" | "searx" | "searx-ng" | "searx_ng" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::SearXNG,
+            canonical_provider: SEARXNG_PROVIDER,
             used_fallback: false,
         },
         _ => WebSearchProviderResolution {
@@ -59,6 +66,17 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Brave);
             assert_eq!(resolved.canonical_provider, BRAVE_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_searxng() {
+        let searxng_aliases = ["searxng", "searx", "searx-ng", "searx_ng"];
+        for alias in searxng_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::SearXNG);
+            assert_eq!(resolved.canonical_provider, SEARXNG_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }

@@ -1,7 +1,7 @@
 use crate::config::LinkedInImageConfig;
 use anyhow::Context;
-use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::Method;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -1638,10 +1638,12 @@ mod tests {
         let generator = ImageGenerator::new(config, tmp.path().to_path_buf());
         let result = generator.generate("Test").await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("All image generation providers failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("All image generation providers failed")
+        );
     }
 
     #[tokio::test]
@@ -1706,10 +1708,12 @@ mod tests {
 
         let result = ImageGenerator::read_env_var(tmp.path(), "STABILITY_API_KEY").await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("STABILITY_API_KEY"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("STABILITY_API_KEY")
+        );
     }
 
     #[test]

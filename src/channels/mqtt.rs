@@ -33,7 +33,7 @@ pub async fn run_mqtt_sop_listener(
     );
     mqtt_options.set_keep_alive(std::time::Duration::from_secs(config.keep_alive_secs));
 
-    if let (Some(ref user), Some(ref pass)) = (&config.username, &config.password) {
+    if let (Some(user), Some(pass)) = (&config.username, &config.password) {
         mqtt_options.set_credentials(user, pass);
     }
 

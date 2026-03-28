@@ -24,7 +24,13 @@ function eventTypeStyle(type: string): { color: string; bg: string; border: stri
       return { color: 'var(--color-status-warning)', bg: 'rgba(255, 170, 0, 0.06)', border: 'rgba(255, 170, 0, 0.2)' };
     case 'tool_call':
     case 'tool_result':
+    case 'tool_call_start':
       return { color: '#a78bfa', bg: 'rgba(167, 139, 250, 0.06)', border: 'rgba(167, 139, 250, 0.2)' };
+    case 'llm_request':
+      return { color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.06)', border: 'rgba(56, 189, 248, 0.2)' };
+    case 'agent_start':
+    case 'agent_end':
+      return { color: '#34d399', bg: 'rgba(52, 211, 153, 0.06)', border: 'rgba(52, 211, 153, 0.2)' };
     case 'message':
     case 'chat':
       return { color: 'var(--pc-accent)', bg: 'var(--pc-accent-glow)', border: 'var(--pc-accent-dim)' };
@@ -43,6 +49,7 @@ export default function Logs() {
   const [paused, setPaused] = useState(false);
   const [connected, setConnected] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [infoDismissed, setInfoDismissed] = useState(false);
   const [typeFilters, setTypeFilters] = useState<Set<string>>(new Set());
   const containerRef = useRef<HTMLDivElement>(null);
   const sseRef = useRef<SSEClient | null>(null);
@@ -121,21 +128,12 @@ export default function Logs() {
   const filteredEntries = typeFilters.size === 0 ? entries : entries.filter((e) => typeFilters.has(e.event.type));
 
   return (
-    <div className="flex flex-col h-[calc(100vh-3.5rem)]">
+    <div className="flex flex-col h-full">
       {/* Toolbar */}
       <div className="flex items-center justify-between px-6 py-3 border-b animate-fade-in" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
         <div className="flex items-center gap-3">
           <Activity className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
           <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('logs.live_logs')}</h2>
-          <div className="flex items-center gap-2 ml-2">
-            <span className="status-dot" style={
-              connected ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' } : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
-            }
-            />
-            <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
-              {connected ? t('logs.connected') : t('logs.disconnected')}
-            </span>
-          </div>
           <span className="text-[10px] font-mono ml-2" style={{ color: 'var(--pc-text-faint)' }}>
             {filteredEntries.length} {t('logs.events')}
           </span>
@@ -195,11 +193,32 @@ export default function Logs() {
         </div>
       )}
 
+      {/* Informational banner — what appears here and what does not */}
+      {!infoDismissed && (
+        <div className="flex items-start gap-3 px-6 py-3 border-b flex-shrink-0" style={{ borderColor: 'rgba(56, 189, 248, 0.2)', background: 'rgba(56, 189, 248, 0.05)' }}>
+          <div className="flex-1 text-xs" style={{ color: 'var(--pc-text-secondary)' }}>
+            <span className="font-semibold" style={{ color: '#38bdf8' }}>What appears here: </span>
+            agent activity over SSE — LLM requests, tool calls, agent start/end, and errors.
+            {' '}<span className="font-semibold" style={{ color: 'var(--pc-text-muted)' }}>What does not: </span>
+            daemon stdout and <code>RUST_LOG</code> tracing output go to the terminal or log file, not this stream.
+            {' '}To see tracing logs, run the daemon with <code>RUST_LOG=info zeroclaw</code> and check your terminal.
+          </div>
+          <button
+            onClick={() => setInfoDismissed(true)}
+            className="flex-shrink-0 text-[10px] btn-icon"
+            aria-label="Dismiss"
+            style={{ color: 'var(--pc-text-faint)' }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* Log entries */}
       <div
         ref={containerRef}
         onScroll={handleScroll}
-        className="flex-1 overflow-y-auto p-4 space-y-2"
+        className="flex-1 overflow-y-auto p-4 space-y-2 min-h-0"
       >
         {filteredEntries.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
@@ -248,6 +267,15 @@ export default function Logs() {
             );
           })
           )}
+      </div>
+      {/* Footer: connection status */}
+      <div className="flex items-center justify-center gap-2 px-6 py-2 border-t flex-shrink-0" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+        <span className="status-dot" style={
+          connected ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' } : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
+        } />
+        <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
+          {connected ? t('logs.connected') : t('logs.disconnected')}
+        </span>
       </div>
     </div>
   );

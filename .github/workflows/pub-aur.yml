@@ -153,8 +153,11 @@ jobs:
           ssh-keygen -l -f ~/.ssh/aur || { echo "::error::AUR_SSH_KEY is not a valid SSH private key"; exit 1; }
           echo "::endgroup::"
 
-          # Test SSH connectivity before attempting clone
-          ssh -T -o BatchMode=yes -o ConnectTimeout=10 aur@aur.archlinux.org 2>&1 || true
+          # Test SSH connectivity before attempting clone — fail fast with actionable error
+          if ! ssh -T -o BatchMode=yes -o ConnectTimeout=10 aur@aur.archlinux.org 2>&1 | grep -qi "authenticated"; then
+            echo "::warning::SSH connectivity test did not confirm authentication."
+            echo "::warning::Ensure the AUR_SSH_KEY public key is registered at https://aur.archlinux.org/account (SSH Keys tab) for the account that owns the zeroclaw package."
+          fi
 
           tmp_dir="$(mktemp -d)"
           git clone ssh://aur@aur.archlinux.org/zeroclaw.git "$tmp_dir/aur"
