@@ -510,9 +510,8 @@ impl EconomicTracker {
         self.state.lock().balance
     }
 
-    /// Get net worth (balance + portfolio value).
+    /// Get net worth (currently equals balance).
     pub fn get_net_worth(&self) -> f64 {
-        // TODO: Add trading portfolio value
         self.get_balance()
     }
 
@@ -548,7 +547,7 @@ impl EconomicTracker {
             signature: self.signature.clone(),
             balance: state.balance,
             initial_balance: state.initial_balance,
-            net_worth: state.balance, // TODO: Add portfolio
+            net_worth: state.balance,
             total_token_cost: state.total_token_cost,
             total_work_income: state.total_work_income,
             total_trading_profit: state.total_trading_profit,

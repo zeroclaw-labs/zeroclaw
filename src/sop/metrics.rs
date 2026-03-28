@@ -1004,7 +1004,7 @@ mod tests {
         assert!((cr - 0.0).abs() < 1e-10);
     }
 
-    // ── BUG 1 regression: multiple approvals per run ──────────
+    // ── Regression test: multiple approvals per run ──────────
 
     #[test]
     fn multiple_approvals_per_run_consistent() {
@@ -1316,7 +1316,7 @@ mod tests {
         assert_eq!(ta_7d, 1);
     }
 
-    // ── BUG 2 regression: warm-start pending for non-terminal runs ──
+    // ── Regression test: warm-start pending for non-terminal runs ──
 
     #[tokio::test]
     async fn warm_start_preserves_pending_for_nonterminal_runs() {

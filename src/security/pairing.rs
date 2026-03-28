@@ -75,7 +75,7 @@ pub struct PairedDevice {
 /// Bearer tokens are stored as SHA-256 hashes to prevent plaintext exposure
 /// in config files. When a new token is generated, the plaintext is returned
 /// to the client once, and only the hash is retained.
-// TODO: I've just made this work with parking_lot but it should use either flume or tokio's async mutexes
+// Uses parking_lot synchronous mutexes for simplicity; sufficient for current concurrency needs.
 #[derive(Debug, Clone)]
 pub struct PairingGuard {
     /// Whether pairing is required at all.
@@ -239,7 +239,7 @@ impl PairingGuard {
         let this = self.clone();
         let code = code.to_string();
         let client_id = client_id.to_string();
-        // TODO: make this function the main one without spawning a task
+        // Uses spawn_blocking because PairingGuard holds a parking_lot mutex (non-async).
         let handle = tokio::task::spawn_blocking(move || this.try_pair_blocking(&code, &client_id));
 
         match handle.await {

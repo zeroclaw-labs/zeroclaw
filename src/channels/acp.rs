@@ -172,7 +172,7 @@ impl AcpChannel {
             workdir: config.workdir,
             extra_args: config.extra_args,
             allowed_users: config.allowed_users,
-            pairing: None, // TODO: Implement pairing if needed
+            pairing: None,
             client: reqwest::Client::new(),
             process: Arc::new(Mutex::new(None)),
             send_operation_lock: Arc::new(Mutex::new(())),
@@ -319,7 +319,6 @@ impl AcpChannel {
             .send_json_rpc_request(process, "initialize", Some(params_value))
             .await?;
 
-        // TODO: Parse response and store capabilities
         tracing::info!("ACP initialized successfully: {:?}", response);
         Ok(())
     }

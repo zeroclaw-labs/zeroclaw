@@ -13150,7 +13150,7 @@ default_temperature = 0.7
     #[test]
     async fn config_validate_rejects_unknown_browser_backend_value() {
         let mut config = Config::default();
-        config.browser.backend = "playwright".into();
+        config.browser.backend = "unknown_browser_xyz".into();
 
         let error = config
             .validate()
