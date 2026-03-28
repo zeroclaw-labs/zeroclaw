@@ -6127,6 +6127,8 @@ pub struct ChannelsConfig {
     /// Voice wake word detection channel configuration.
     #[cfg(feature = "voice-wake")]
     pub voice_wake: Option<VoiceWakeConfig>,
+    /// MQTT channel configuration (SOP listener).
+    pub mqtt: Option<MqttConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -6263,6 +6265,10 @@ impl ChannelsConfig {
             (
                 Box::new(ConfigWrapper::new(self.voice_wake.as_ref())),
                 self.voice_wake.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.mqtt.as_ref())),
+                self.mqtt.is_some(),
             ),
         ]
     }
@@ -6956,6 +6962,104 @@ impl WhatsAppConfig {
     pub fn is_ambiguous_config(&self) -> bool {
         self.phone_number_id.is_some() && self.session_path.is_some()
     }
+}
+
+/// MQTT channel configuration (SOP listener).
+///
+/// Subscribes to MQTT topics and dispatches incoming messages
+/// to the SOP engine for processing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MqttConfig {
+    /// MQTT broker URL (e.g., `mqtt://localhost:1883` or `mqtts://broker.example.com:8883`).
+    /// Use `mqtt://` for plain connections or `mqtts://` for TLS.
+    pub broker_url: String,
+    /// MQTT client ID (must be unique per broker).
+    pub client_id: String,
+    /// Topics to subscribe to (e.g., `sensors/#`, `alerts/+/critical`).
+    /// At least one topic is required.
+    #[serde(default)]
+    pub topics: Vec<String>,
+    /// MQTT QoS level (0 = at-most-once, 1 = at-least-once, 2 = exactly-once). Default: 1.
+    #[serde(default = "default_mqtt_qos")]
+    pub qos: u8,
+    /// Username for authentication (optional).
+    pub username: Option<String>,
+    /// Password for authentication (optional).
+    pub password: Option<String>,
+    /// Enable TLS encryption. Must match the broker_url scheme:
+    /// - `mqtt://` → `use_tls: false`
+    /// - `mqtts://` → `use_tls: true`
+    #[serde(default)]
+    pub use_tls: bool,
+    /// Keep-alive interval in seconds (default: 30). Prevents broker disconnect on idle.
+    #[serde(default = "default_mqtt_keep_alive_secs")]
+    pub keep_alive_secs: u64,
+}
+
+impl MqttConfig {
+    /// Validate the MQTT configuration.
+    ///
+    /// Checks:
+    /// - QoS is 0, 1, or 2
+    /// - broker_url uses valid scheme (`mqtt://` or `mqtts://`)
+    /// - `use_tls` flag matches broker_url scheme
+    /// - At least one topic is configured
+    /// - client_id is non-empty
+    pub fn validate(&self) -> anyhow::Result<()> {
+        // QoS validation
+        if self.qos > 2 {
+            anyhow::bail!("qos must be 0, 1, or 2, got {}", self.qos);
+        }
+
+        // Broker URL validation
+        let is_tls_scheme = self.broker_url.starts_with("mqtts://");
+        let is_mqtt_scheme = self.broker_url.starts_with("mqtt://");
+
+        if !is_tls_scheme && !is_mqtt_scheme {
+            anyhow::bail!(
+                "broker_url must start with 'mqtt://' or 'mqtts://', got: {}",
+                self.broker_url
+            );
+        }
+
+        // TLS flag validation
+        if is_mqtt_scheme && self.use_tls {
+            anyhow::bail!("use_tls is true but broker_url uses 'mqtt://' (not 'mqtts://')");
+        }
+
+        if is_tls_scheme && !self.use_tls {
+            anyhow::bail!("use_tls is false but broker_url uses 'mqtts://' (requires use_tls: true)");
+        }
+
+        // Topics validation
+        if self.topics.is_empty() {
+            anyhow::bail!("at least one topic must be configured");
+        }
+
+        // Client ID validation
+        if self.client_id.is_empty() {
+            anyhow::bail!("client_id must not be empty");
+        }
+
+        Ok(())
+    }
+}
+
+impl ChannelConfig for MqttConfig {
+    fn name() -> &'static str {
+        "MQTT"
+    }
+    fn desc() -> &'static str {
+        "MQTT SOP Listener"
+    }
+}
+
+fn default_mqtt_qos() -> u8 {
+    1
+}
+
+fn default_mqtt_keep_alive_secs() -> u64 {
+    30
 }
 
 /// IRC channel configuration.

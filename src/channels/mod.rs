@@ -35,6 +35,7 @@ pub mod matrix;
 pub mod mattermost;
 pub mod media_pipeline;
 pub mod mochat;
+pub mod mqtt;
 pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
