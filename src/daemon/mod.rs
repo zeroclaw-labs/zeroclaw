@@ -920,6 +920,7 @@ mod tests {
             url: "https://mattermost.example.com".into(),
             bot_token: Some("token".into()),
             channel_id: Some("channel-id".into()),
+            channel_ids: vec![],
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
