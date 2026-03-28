@@ -1256,12 +1256,14 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
-            "Z.AI",
-            zai_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::Bearer,
-        ))),
+        name if zai_base_url(name).is_some() => {
+            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+                "Z.AI",
+                zai_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::Bearer,
+            )))
+        }
         name if glm_base_url(name).is_some() => {
             Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",
