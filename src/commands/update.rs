@@ -1,6 +1,7 @@
 //! `zeroclaw update` — self-update pipeline with rollback.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -14,6 +15,8 @@ pub struct UpdateInfo {
     pub current_version: String,
     pub latest_version: String,
     pub download_url: Option<String>,
+    /// Download URL for the SHA256SUMS file associated with this release.
+    pub sha256sums_url: Option<String>,
     pub is_newer: bool,
 }
 
@@ -58,12 +61,14 @@ pub async fn check(target_version: Option<&str>) -> Result<UpdateInfo> {
         .to_string();
 
     let download_url = find_asset_url(&release);
+    let sha256sums_url = find_sha256sums_url(&release);
     let is_newer = version_is_newer(&current, &tag);
 
     Ok(UpdateInfo {
         current_version: current,
         latest_version: tag,
         download_url,
+        sha256sums_url,
         is_newer,
     })
 }
@@ -97,7 +102,12 @@ pub async fn run(target_version: Option<&str>) -> Result<()> {
     info!("Phase 2/6: Downloading...");
     let temp_dir = tempfile::tempdir().context("failed to create temp dir")?;
     let download_path = temp_dir.path().join("zeroclaw_new");
-    download_binary(&download_url, &download_path).await?;
+    download_binary(
+        &download_url,
+        update_info.sha256sums_url.as_deref(),
+        &download_path,
+    )
+    .await?;
 
     // Phase 3: Backup
     info!("Phase 3/6: Creating backup...");
@@ -154,10 +164,30 @@ fn find_asset_url(release: &serde_json::Value) -> Option<String> {
         .find(|asset| {
             asset["name"]
                 .as_str()
-                .map(|name| name.contains(target))
+                .map(|name| {
+                    name.starts_with("zeroclaw-")
+                        && name.contains(target)
+                        && (name.ends_with(".tar.gz") || name.ends_with(".zip"))
+                })
                 .unwrap_or(false)
         })
         .and_then(|asset| asset["browser_download_url"].as_str().map(String::from))
+}
+
+/// Find the download URL of the SHA256SUMS asset in a GitHub release payload.
+///
+/// Looks for an asset whose name is exactly `SHA256SUMS` (case-insensitive) or
+/// ends with `.sha256sums` / `sha256sums.txt`.
+fn find_sha256sums_url(release: &serde_json::Value) -> Option<String> {
+    release["assets"].as_array()?.iter().find_map(|asset| {
+        let name = asset["name"].as_str()?;
+        let lower = name.to_ascii_lowercase();
+        if lower == "sha256sums" || lower == "sha256sums.txt" || lower.ends_with(".sha256sums") {
+            asset["browser_download_url"].as_str().map(String::from)
+        } else {
+            None
+        }
+    })
 }
 
 /// Return the exact Rust target triple for the current platform.
@@ -190,7 +220,17 @@ fn version_is_newer(current: &str, candidate: &str) -> bool {
     cand > cur
 }
 
-async fn download_binary(url: &str, dest: &Path) -> Result<()> {
+/// Download a binary asset, optionally verifying it against a SHA256SUMS file.
+///
+/// When `sha256sums_url` is provided the function:
+///   1. Downloads the SHA256SUMS file.
+///   2. Finds the expected digest for the asset filename (last path component of `url`).
+///   3. Computes the SHA-256 digest of the downloaded bytes.
+///   4. Fails with a clear error if the digests do not match.
+///
+/// If `sha256sums_url` is `None` the download proceeds without checksum verification
+/// and a warning is emitted so the caller is aware.
+async fn download_binary(url: &str, sha256sums_url: Option<&str>, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .user_agent(format!("zeroclaw/{}", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(300))
@@ -206,6 +246,19 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
     }
 
     let bytes = resp.bytes().await.context("failed to read download body")?;
+
+    // Verify checksum before writing to disk.
+    match sha256sums_url {
+        Some(sums_url) => {
+            verify_checksum(&bytes, url, sums_url, &client).await?;
+        }
+        None => {
+            warn!(
+                "No SHA256SUMS asset found for this release — skipping checksum verification. \
+                 The download has not been integrity-checked."
+            );
+        }
+    }
 
     // Release assets are .tar.gz archives containing a single `zeroclaw` binary.
     // Extract the binary from the archive instead of writing the raw tarball.
@@ -225,6 +278,67 @@ async fn download_binary(url: &str, dest: &Path) -> Result<()> {
         tokio::fs::set_permissions(dest, perms).await?;
     }
 
+    Ok(())
+}
+
+/// Fetch the SHA256SUMS file and verify `bytes` match the expected digest for
+/// the asset identified by the last path component of `asset_url`.
+async fn verify_checksum(
+    bytes: &[u8],
+    asset_url: &str,
+    sha256sums_url: &str,
+    client: &reqwest::Client,
+) -> Result<()> {
+    // Derive the asset filename from its URL.
+    let asset_name = asset_url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .context("cannot derive asset filename from download URL")?;
+
+    // Download the SHA256SUMS file.
+    let sums_resp = client
+        .get(sha256sums_url)
+        .send()
+        .await
+        .context("failed to fetch SHA256SUMS")?;
+    if !sums_resp.status().is_success() {
+        bail!("SHA256SUMS fetch returned {}", sums_resp.status());
+    }
+    let sums_text = sums_resp
+        .text()
+        .await
+        .context("failed to read SHA256SUMS body")?;
+
+    // Parse lines of the form: "<hex-digest>  <filename>" or "<hex-digest> <filename>"
+    let expected_hex = sums_text
+        .lines()
+        .find_map(|line| {
+            let mut parts = line.splitn(2, ' ');
+            let digest = parts.next()?.trim();
+            let name = parts.next()?.trim().trim_start_matches('*'); // strip leading '*' (binary mode marker)
+            if name == asset_name {
+                Some(digest.to_string())
+            } else {
+                None
+            }
+        })
+        .with_context(|| {
+            format!("asset '{asset_name}' not found in SHA256SUMS — cannot verify download")
+        })?;
+
+    // Compute the actual digest of the downloaded bytes.
+    let actual_hash = Sha256::digest(bytes);
+    let actual_hex = hex::encode(actual_hash);
+
+    if actual_hex != expected_hex {
+        bail!(
+            "checksum mismatch for '{asset_name}':\n  expected: {expected_hex}\n  actual:   {actual_hex}\n\
+             The downloaded file may be corrupted or tampered with. Aborting update."
+        );
+    }
+
+    info!("Checksum verified for '{asset_name}': {actual_hex}");
     Ok(())
 }
 
@@ -404,6 +518,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_find_asset_url_prefers_gnu_over_android() {
+        let release = serde_json::json!({
+            "assets": [
+                {
+                    "name": "zeroclaw-aarch64-linux-android.tar.gz",
+                    "browser_download_url": "https://example.com/android"
+                },
+                {
+                    "name": "zeroclaw-aarch64-unknown-linux-gnu.tar.gz",
+                    "browser_download_url": "https://example.com/linux-gnu"
+                },
+                {
+                    "name": "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+                    "browser_download_url": "https://example.com/x86-linux-gnu"
+                },
+                {
+                    "name": "zeroclaw-x86_64-pc-windows-msvc.zip",
+                    "browser_download_url": "https://example.com/windows"
+                },
+                {
+                    "name": "zeroclaw-aarch64-apple-darwin.tar.gz",
+                    "browser_download_url": "https://example.com/macos-arm"
+                }
+            ]
+        });
+
+        let url = find_asset_url(&release);
+
+        // The result depends on the compile target, but it must never be the
+        // Android asset.  On any recognised platform it should resolve to a
+        // URL that is NOT the android one.
+        if let Some(ref u) = url {
+            assert!(
+                !u.contains("android"),
+                "find_asset_url must not match Android binary, got: {u}"
+            );
+        }
+
+        // Platform-specific assertions (compile-time).
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        assert_eq!(url.as_deref(), Some("https://example.com/linux-gnu"));
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(url.as_deref(), Some("https://example.com/x86-linux-gnu"));
+
+        #[cfg(target_os = "windows")]
+        assert_eq!(url.as_deref(), Some("https://example.com/windows"));
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(url.as_deref(), Some("https://example.com/macos-arm"));
+    }
+
+    #[test]
+    fn test_find_asset_url_ignores_non_archive_assets() {
+        let release = serde_json::json!({
+            "assets": [
+                {
+                    "name": "zeroclaw-x86_64-unknown-linux-gnu.sha256",
+                    "browser_download_url": "https://example.com/checksum"
+                },
+                {
+                    "name": "zeroclaw-x86_64-unknown-linux-gnu.tar.gz",
+                    "browser_download_url": "https://example.com/archive"
+                }
+            ]
+        });
+
+        let url = find_asset_url(&release);
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(url.as_deref(), Some("https://example.com/archive"));
+    }
+
+    #[test]
     fn test_version_comparison() {
         assert!(version_is_newer("0.4.3", "0.5.0"));
         assert!(version_is_newer("0.4.3", "0.4.4"));
@@ -524,10 +711,49 @@ mod tests {
         );
     }
 
+    // ---- SHA256SUMS helpers ----
+
+    #[test]
+    fn find_sha256sums_url_exact_name() {
+        let release = make_release(&["SHA256SUMS", "zeroclaw-x86_64-apple-darwin.tar.gz"]);
+        let url = find_sha256sums_url(&release);
+        assert_eq!(url, Some("https://example.com/SHA256SUMS".to_string()));
+    }
+
+    #[test]
+    fn find_sha256sums_url_txt_suffix() {
+        let release = make_release(&["sha256sums.txt", "zeroclaw-x86_64-unknown-linux-gnu"]);
+        let url = find_sha256sums_url(&release);
+        assert_eq!(url, Some("https://example.com/sha256sums.txt".to_string()));
+    }
+
+    #[test]
+    fn find_sha256sums_url_dot_sha256sums_suffix() {
+        let release = make_release(&["checksums.sha256sums"]);
+        let url = find_sha256sums_url(&release);
+        assert_eq!(
+            url,
+            Some("https://example.com/checksums.sha256sums".to_string())
+        );
+    }
+
+    #[test]
+    fn find_sha256sums_url_case_insensitive() {
+        let release = make_release(&["Sha256Sums"]);
+        let url = find_sha256sums_url(&release);
+        assert_eq!(url, Some("https://example.com/Sha256Sums".to_string()));
+    }
+
+    #[test]
+    fn find_sha256sums_url_returns_none_when_absent() {
+        let release = make_release(&["zeroclaw-x86_64-apple-darwin.tar.gz"]);
+        assert!(find_sha256sums_url(&release).is_none());
+    }
+
     #[test]
     fn extract_tar_gz_finds_binary() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // Build a tar.gz in memory containing a fake "zeroclaw" binary.
@@ -562,8 +788,8 @@ mod tests {
 
     #[test]
     fn extract_tar_gz_errors_on_missing_binary() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         // Build a tar.gz with a file that is NOT named "zeroclaw".

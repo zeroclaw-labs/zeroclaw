@@ -10,8 +10,8 @@
 //!
 //! Detection triggers escalating responses: `Warning` -> `Block` -> `Break`.
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 // ── Configuration ────────────────────────────────────────────────

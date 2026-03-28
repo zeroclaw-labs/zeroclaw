@@ -2,9 +2,9 @@ use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::cost::types::BudgetCheck;
 use crate::i18n::ToolDescriptions;
-use crate::memory::{self, decay, Memory, MemoryCategory};
+use crate::memory::{self, Memory, MemoryCategory, decay};
 use crate::multimodal;
-use crate::observability::{self, runtime_trace, Observer, ObserverEvent};
+use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::providers::traits::StreamEvent;
 use crate::providers::{
     self, ChatMessage, ChatRequest, Provider, ProviderCapabilityError, ToolCall,
@@ -27,8 +27,8 @@ use uuid::Uuid;
 
 // Cost tracking moved to `super::cost`.
 pub(crate) use super::cost::{
-    check_tool_loop_budget, record_tool_loop_cost_usage, ToolLoopCostTrackingContext,
-    TOOL_LOOP_COST_TRACKING_CONTEXT,
+    TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, check_tool_loop_budget,
+    record_tool_loop_cost_usage,
 };
 
 /// Minimum characters per chunk when relaying LLM text to a streaming draft.
@@ -240,6 +240,10 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+/// Shown when the model returns no displayable assistant text so channel APIs (e.g. Telegram)
+/// that reject empty message bodies still deliver user-visible feedback.
+pub(crate) const EMPTY_MODEL_REPLY_PLACEHOLDER: &str = "I didn't receive any text from the model (empty response). Please try again, or check your provider or gateway if this persists.";
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -379,8 +383,8 @@ fn build_hardware_context(
 
 // Tool execution moved to `super::tool_execution`.
 pub(crate) use super::tool_execution::{
-    execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
-    ToolExecutionOutcome,
+    ToolExecutionOutcome, execute_tools_parallel, execute_tools_sequential,
+    should_execute_tools_in_parallel,
 };
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
@@ -620,11 +624,7 @@ fn parse_xml_tool_calls(xml_content: &str) -> Option<Vec<ParsedToolCall>> {
         });
     }
 
-    if calls.is_empty() {
-        None
-    } else {
-        Some(calls)
-    }
+    if calls.is_empty() { None } else { Some(calls) }
 }
 
 /// Parse MiniMax-style XML tool calls with attributed invoke/parameter tags.
@@ -1176,7 +1176,8 @@ fn default_param_for_tool(tool: &str) -> &'static str {
         | "websearch" | "search" => "query",
         "memory_store" | "memorystore" | "store" | "memstore" => "content",
         // HTTP and browser tools default to "url"
-        "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser" => "url",
+        "http_request" | "http" | "fetch" | "curl" | "wget" | "browser_open" | "browser"
+        | "web_fetch" | "webfetch" => "url",
         _ => "input",
     }
 }
@@ -1938,6 +1939,14 @@ fn resolve_display_text(
     }
 }
 
+fn ensure_trailing_newline(text: &str) -> String {
+    if text.ends_with('\n') {
+        text.to_string()
+    } else {
+        format!("{text}\n")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedToolCall {
     pub(crate) name: String,
@@ -2121,6 +2130,7 @@ pub(crate) async fn agent_turn(
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
+    native_tool_calls_only: bool,
 ) -> Result<String> {
     run_tool_call_loop(
         provider,
@@ -2147,6 +2157,7 @@ pub(crate) async fn agent_turn(
         0,    // max_tool_result_chars: 0 = disabled (legacy callers)
         0,    // context_token_budget: 0 = disabled (legacy callers)
         None, // shared_budget: no shared budget for legacy callers
+        native_tool_calls_only,
     )
     .await
 }
@@ -2163,7 +2174,7 @@ fn maybe_inject_channel_delivery_defaults(
 
     if !matches!(
         channel_name,
-        "telegram" | "discord" | "slack" | "mattermost" | "matrix"
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "lark" | "feishu"
     ) {
         return;
     }
@@ -2285,6 +2296,7 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    native_tool_calls_only: bool,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -2501,7 +2513,9 @@ pub(crate) async fn run_tool_call_loop(
         {
             return Err(anyhow::anyhow!(
                 "Budget exceeded: ${:.4} of ${:.2} {:?} limit. Cannot make further API calls until the budget resets.",
-                current_usd, limit_usd, period
+                current_usd,
+                limit_usd,
+                period
             ));
         }
 
@@ -2686,7 +2700,7 @@ pub(crate) async fn run_tool_call_loop(
                     .collect();
                 let mut parsed_text = String::new();
 
-                if calls.is_empty() {
+                if calls.is_empty() && !native_tool_calls_only {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
                     if !fallback_text.is_empty() {
                         parsed_text = fallback_text;
@@ -2823,10 +2837,24 @@ pub(crate) async fn run_tool_call_loop(
             }
         };
 
-        let display_text = if parsed_text.is_empty() {
-            response_text.clone()
+        let display_text = resolve_display_text(
+            &response_text,
+            &parsed_text,
+            !tool_calls.is_empty(),
+            !native_tool_calls.is_empty(),
+        );
+        let display_text = strip_tool_result_blocks(&display_text);
+        let display_text = if tool_calls.is_empty() && display_text.trim().is_empty() {
+            tracing::warn!(
+                channel = %channel_name,
+                iteration = iteration + 1,
+                provider = %provider_name,
+                model = %model,
+                "final LLM reply has no displayable text; substituting user-visible placeholder"
+            );
+            EMPTY_MODEL_REPLY_PLACEHOLDER.to_string()
         } else {
-            parsed_text
+            display_text
         };
 
         // ── Progress: LLM responded ─────────────────────────────
@@ -2863,6 +2891,17 @@ pub(crate) async fn run_tool_call_loop(
                 let should_emit_post_hoc_chunks =
                     !response_streamed_live || display_text != response_text;
                 if !should_emit_post_hoc_chunks {
+                    // Capture any pending model switch into callback before returning.
+                    if let Some((sw_provider, sw_model)) = get_model_switch_state()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        if let Some(ref cb) = model_switch_callback {
+                            *cb.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some((sw_provider, sw_model));
+                        }
+                    }
                     history.push(ChatMessage::assistant(response_text.clone()));
                     return Ok(display_text);
                 }
@@ -2890,6 +2929,16 @@ pub(crate) async fn run_tool_call_loop(
                 }
                 if !chunk.is_empty() {
                     let _ = tx.send(DraftEvent::Content(chunk)).await;
+                }
+            }
+            // Capture any pending model switch into callback before returning.
+            if let Some((sw_provider, sw_model)) = get_model_switch_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                if let Some(ref cb) = model_switch_callback {
+                    *cb.lock().unwrap_or_else(|e| e.into_inner()) = Some((sw_provider, sw_model));
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
@@ -3966,6 +4015,7 @@ pub async fn run(
                 config.agent.max_tool_result_chars,
                 config.agent.max_context_tokens,
                 None, // shared_budget
+                config.agent.native_tool_calls_only,
             )
             .await
             {
@@ -4074,7 +4124,9 @@ pub async fn run(
                     println!("  /help             Show this help message");
                     println!("  /clear /new       Clear conversation history");
                     println!("  /quit /exit       Exit interactive mode");
-                    println!("  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n");
+                    println!(
+                        "  /think:<level>    Set reasoning depth (off|minimal|low|medium|high|max)\n"
+                    );
                     continue;
                 }
                 "/clear" | "/new" => {
@@ -4270,6 +4322,7 @@ pub async fn run(
                     config.agent.max_tool_result_chars,
                     config.agent.max_context_tokens,
                     None, // shared_budget
+                    config.agent.native_tool_calls_only,
                 )
                 .await
                 {
@@ -4774,6 +4827,7 @@ pub async fn process_message(
         &config.agent.tool_call_dedup_exempt,
         activated_handle_pm.as_ref(),
         None,
+        config.agent.native_tool_calls_only,
     )
     .await
 }
@@ -4784,7 +4838,7 @@ mod tests {
         emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
         load_interactive_session_history, save_interactive_session_history, truncate_tool_result,
     };
-    use crate::agent::history::{InteractiveSessionState, DEFAULT_MAX_HISTORY_MESSAGES};
+    use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
     use crate::providers::ChatMessage;
     use tempfile::tempdir;
@@ -4851,7 +4905,7 @@ mod tests {
     fn truncate_tool_result_utf8_boundary_safety() {
         // Create string with multi-byte chars: each emoji is 4 bytes
         let output = "🦀".repeat(100); // 400 bytes
-                                       // This should not panic even with a limit that falls mid-char
+        // This should not panic even with a limit that falls mid-char
         let result = truncate_tool_result(&output, 50);
         assert!(result.contains("[... "));
         // Verify the result is valid UTF-8 (would panic otherwise)
@@ -5009,8 +5063,8 @@ mod tests {
 
     #[test]
     fn shared_budget_decrement_logic() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
         let budget = Arc::new(AtomicUsize::new(3));
 
@@ -5073,7 +5127,7 @@ mod tests {
 
     use super::*;
     use async_trait::async_trait;
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -5150,9 +5204,9 @@ mod tests {
 
     use crate::memory::{Memory, MemoryCategory, SqliteMemory};
     use crate::observability::NoopObserver;
+    use crate::providers::ChatResponse;
     use crate::providers::router::{Route, RouterProvider};
     use crate::providers::traits::{ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions};
-    use crate::providers::ChatResponse;
     use tempfile::TempDir;
 
     struct NonVisionProvider {
@@ -5783,6 +5837,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5793,9 +5848,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_tool_call_loop_rejects_oversized_image_payload() {
+    async fn run_tool_call_loop_rejects_image_for_non_vision_provider() {
+        // Non-vision providers reject image markers before prepare_messages
+        // gets a chance to skip oversized images. This is correct: the pre-check
+        // guards against sending [IMAGE:] markers to providers that can't handle them.
         let calls = Arc::new(AtomicUsize::new(0));
-        let provider = VisionProvider {
+        let provider = NonVisionProvider {
             calls: Arc::clone(&calls),
         };
 
@@ -5838,13 +5896,12 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
-        .expect_err("oversized payload must fail");
+        .expect_err("non-vision provider must reject image markers");
 
-        assert!(err
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
+        assert!(err.to_string().contains("does not support vision"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -5886,6 +5943,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5934,6 +5992,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("should fail without vision_provider config");
@@ -5989,6 +6048,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -6044,6 +6104,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("text-only messages should succeed with default provider");
@@ -6100,6 +6161,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -6154,6 +6216,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -6208,6 +6271,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
@@ -6345,6 +6409,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("parallel execution should complete");
@@ -6419,6 +6484,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6485,6 +6551,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6546,6 +6613,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("loop should finish after deduplicating repeated calls");
@@ -6619,6 +6687,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6683,6 +6752,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("loop should finish with exempt tool executing twice");
@@ -6767,6 +6837,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("loop should complete");
@@ -6828,6 +6899,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("native fallback id flow should complete");
@@ -6913,6 +6985,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -6982,6 +7055,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("streaming provider should complete");
@@ -7053,6 +7127,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("streaming tool loop should execute tool and finish");
@@ -7128,6 +7203,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("native streaming events should preserve tool loop semantics");
@@ -7212,6 +7288,7 @@ mod tests {
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("routed streaming provider should complete");
@@ -7298,6 +7375,7 @@ mod tests {
                 &[],
                 Some(&activated),
                 None,
+                false,
             )
             .await
             .expect("wrapper path should execute activated tools");
@@ -7339,6 +7417,22 @@ mod tests {
     fn resolve_display_text_uses_response_text_for_final_turns() {
         let display = resolve_display_text("Final answer", "", false, false);
         assert_eq!(display, "Final answer");
+    }
+
+    #[test]
+    fn ensure_trailing_newline_appends_missing_linebreak() {
+        assert_eq!(
+            ensure_trailing_newline("Let me check that."),
+            "Let me check that.\n"
+        );
+    }
+
+    #[test]
+    fn ensure_trailing_newline_preserves_existing_linebreak() {
+        assert_eq!(
+            ensure_trailing_newline("Let me check that.\n"),
+            "Let me check that.\n"
+        );
     }
 
     #[test]
@@ -7976,7 +8070,7 @@ Tail"#;
         assert_eq!(history[0].content, "system prompt");
         // Trimmed to limit
         assert_eq!(history.len(), DEFAULT_MAX_HISTORY_MESSAGES + 1); // +1 for system
-                                                                     // Most recent messages preserved
+        // Most recent messages preserved
         let last = &history[history.len() - 1];
         assert_eq!(
             last.content,
@@ -8447,10 +8541,12 @@ Final answer."#;
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "shell");
         assert!(calls[0].1["command"].as_str().unwrap().contains("curl"));
-        assert!(calls[0].1["command"]
-            .as_str()
-            .unwrap()
-            .contains("example.com"));
+        assert!(
+            calls[0].1["command"]
+                .as_str()
+                .unwrap()
+                .contains("example.com")
+        );
     }
 
     #[test]
@@ -8735,9 +8831,8 @@ Let me check the result."#;
     }
 
     /// When `build_system_prompt_with_mode` is called with `native_tools = true`,
-    /// the output must contain ZERO XML protocol artifacts. In the native path
-    /// `build_tool_instructions` is never called, so the system prompt alone
-    /// must be clean of XML tool-call protocol.
+    /// the output must contain ZERO XML protocol artifacts and must not inject
+    /// the duplicate non-native tools summary.
     #[test]
     fn native_tools_system_prompt_contains_zero_xml() {
         use crate::channels::build_system_prompt_with_mode;
@@ -8781,10 +8876,10 @@ Let me check the result."#;
             "Native prompt must not contain XML protocol header"
         );
 
-        // Positive: native prompt should still list tools and contain task instructions
+        // Positive: native prompt should still contain the native-task framing.
         assert!(
-            system_prompt.contains("shell"),
-            "Native prompt must list tool names"
+            !system_prompt.contains("## Tools"),
+            "Native prompt should skip the duplicate tools summary"
         );
         assert!(
             system_prompt.contains("## Your Task"),
@@ -8947,6 +9042,9 @@ Let me check the result."#;
         assert_eq!(default_param_for_tool("search"), "query");
         assert_eq!(default_param_for_tool("http_request"), "url");
         assert_eq!(default_param_for_tool("browser_open"), "url");
+        assert_eq!(default_param_for_tool("web_search_tool"), "query");
+        assert_eq!(default_param_for_tool("web_search"), "query");
+        assert_eq!(default_param_for_tool("web_fetch"), "url");
         assert_eq!(default_param_for_tool("unknown_tool"), "input");
     }
 
@@ -9223,6 +9321,7 @@ Let me check the result."#;
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("tool loop should complete");
@@ -9312,7 +9411,7 @@ Let me check the result."#;
     #[tokio::test]
     async fn cost_tracking_records_usage_when_scoped() {
         use super::{
-            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
         };
         use crate::config::schema::ModelPricing;
         use crate::cost::CostTracker;
@@ -9395,7 +9494,7 @@ Let me check the result."#;
     #[tokio::test]
     async fn cost_tracking_enforces_budget() {
         use super::{
-            run_tool_call_loop, ToolLoopCostTrackingContext, TOOL_LOOP_COST_TRACKING_CONTEXT,
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext, run_tool_call_loop,
         };
         use crate::config::schema::ModelPricing;
         use crate::cost::CostTracker;
@@ -9520,6 +9619,7 @@ Let me check the result."#;
             0,
             0,
             None,
+            false,
         )
         .await
         .expect("should succeed without cost scope");

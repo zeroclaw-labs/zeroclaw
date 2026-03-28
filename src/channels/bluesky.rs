@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -253,6 +253,7 @@ impl BlueskyChannel {
             thread_ts: Some(notif.uri.clone()),
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
     }
 

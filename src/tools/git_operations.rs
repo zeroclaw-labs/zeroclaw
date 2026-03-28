@@ -807,11 +807,13 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         // can_act() returns false for ReadOnly, so we get the "higher autonomy level" message
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("higher autonomy"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("higher autonomy")
+        );
     }
 
     #[tokio::test]
@@ -870,11 +872,13 @@ mod tests {
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Missing 'operation'"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Missing 'operation'")
+        );
     }
 
     #[tokio::test]
@@ -891,11 +895,13 @@ mod tests {
 
         let result = tool.execute(json!({"operation": "push"})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Unknown operation"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Unknown operation")
+        );
     }
 
     #[test]

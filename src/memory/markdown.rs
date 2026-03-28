@@ -326,9 +326,11 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert!(results.len() >= 2);
-        assert!(results
-            .iter()
-            .all(|r| r.content.to_lowercase().contains("rust")));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.content.to_lowercase().contains("rust"))
+        );
     }
 
     #[tokio::test]
