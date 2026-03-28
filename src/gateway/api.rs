@@ -1811,6 +1811,7 @@ mod tests {
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
             default_subject: "ZeroClaw Message".to_string(),
+            max_attachment_bytes: 25 * 1024 * 1024,
         });
         cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
@@ -1947,6 +1948,7 @@ mod tests {
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
             default_subject: "ZeroClaw Message".to_string(),
+            max_attachment_bytes: 25 * 1024 * 1024,
         });
         current.model_routes = vec![
             crate::config::schema::ModelRouteConfig {

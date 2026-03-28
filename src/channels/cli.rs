@@ -80,6 +80,7 @@ mod tests {
                 subject: None,
                 thread_ts: None,
                 cancellation_token: None,
+                attachments: vec![],
             })
             .await;
         assert!(result.is_ok());
@@ -95,6 +96,7 @@ mod tests {
                 subject: None,
                 thread_ts: None,
                 cancellation_token: None,
+                attachments: vec![],
             })
             .await;
         assert!(result.is_ok());
