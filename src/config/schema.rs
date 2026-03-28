@@ -64,6 +64,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 ///
 /// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[allow(clippy::unsafe_derive_deserialize)]
 pub struct Config {
     /// Workspace directory - computed from home, not serialized
     #[serde(skip)]
@@ -9279,7 +9280,10 @@ impl Config {
             // so that provider credential resolution picks them up automatically.
             for (key, value) in &config.provider_env {
                 if std::env::var(key).is_err() {
-                    std::env::set_var(key, value);
+                    // SAFETY: called during single-threaded config init before async runtime starts.
+                    unsafe {
+                        std::env::set_var(key, value);
+                    }
                     tracing::debug!(key = %key, "Injected provider_env into process environment");
                 }
             }
