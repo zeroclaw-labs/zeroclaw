@@ -1,7 +1,7 @@
+use super::Provider;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
-use super::Provider;
 use crate::config::schema::ModelPricing;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -255,6 +255,44 @@ impl Provider for RouterProvider {
             .await
     }
 
+    fn supports_streaming(&self) -> bool {
+        self.providers
+            .get(self.default_index)
+            .map(|(_, p)| p.supports_streaming())
+            .unwrap_or(false)
+    }
+
+    fn stream_chat_with_system(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider.stream_chat_with_system(
+            system_prompt,
+            message,
+            &resolved_model,
+            temperature,
+            options,
+        )
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        let (_, provider) = &self.providers[provider_idx];
+        provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
+    }
+
     fn supports_native_tools(&self) -> bool {
         self.providers
             .get(self.default_index)
@@ -320,8 +358,8 @@ mod tests {
     use super::*;
     use crate::tools::ToolSpec;
     use futures_util::StreamExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockProvider {
         calls: Arc<AtomicUsize>,
@@ -359,6 +397,16 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.last_model.lock() = model.to_string();
             Ok(self.response.to_string())
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            stream::empty().boxed()
         }
     }
 
@@ -413,6 +461,17 @@ mod tests {
             self.as_ref()
                 .chat_with_system(system_prompt, message, model, temperature)
                 .await
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            model: &str,
+            temperature: f64,
+            options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.as_ref()
+                .stream_chat_with_history(messages, model, temperature, options)
         }
     }
 
@@ -775,6 +834,70 @@ mod tests {
         assert_eq!(mocks[1].call_count(), 1);
         assert_eq!(mocks[1].last_model(), "claude-opus");
         assert_eq!(mocks[0].call_count(), 0);
+    }
+
+    #[test]
+    fn supports_streaming_delegates_to_default_provider() {
+        let (router, _) = make_router(vec![("default", "ok")], vec![]);
+        // MockProvider uses trait default (false)
+        assert!(!router.supports_streaming());
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_system_delegates_to_resolved_provider() {
+        let (router, _) = make_router(
+            vec![("default", "ok"), ("smart", "ok")],
+            vec![("reasoning", "smart", "claude-opus")],
+        );
+
+        // The default MockProvider returns an empty stream (trait default).
+        // Verify that it does NOT return the "unknown does not support streaming" error.
+        let options = StreamOptions::new(true);
+        let mut stream =
+            router.stream_chat_with_system(Some("sys"), "hello", "hint:reasoning", 0.5, options);
+
+        // MockProvider uses the trait default for stream_chat_with_system
+        // which returns stream::empty(). The router should delegate to the
+        // resolved provider, NOT fall through to the stream_chat_with_history
+        // default that returns "unknown does not support streaming".
+        let mut chunks = vec![];
+        while let Some(result) = stream.next().await {
+            if let Ok(chunk) = result {
+                chunks.push(chunk);
+            }
+        }
+        // stream::empty() yields no chunks — no "unknown" error
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| c.delta.contains("does not support streaming")),
+            "router should delegate to underlying provider, not return 'unknown' error"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_delegates_to_resolved_provider() {
+        let (router, _) = make_router(vec![("default", "ok")], vec![]);
+
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let options = StreamOptions::new(true);
+        let mut stream = router.stream_chat_with_history(&messages, "model", 0.5, options);
+
+        let mut chunks = vec![];
+        while let Some(result) = stream.next().await {
+            if let Ok(chunk) = result {
+                chunks.push(chunk);
+            }
+        }
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| c.delta.contains("does not support streaming")),
+            "router should delegate to underlying provider, not return 'unknown' error"
+        );
     }
 
     // ── Cost-optimized routing tests ────────────────────────────────

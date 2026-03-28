@@ -1187,36 +1187,14 @@ impl Provider for BedrockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::test_util::{env_lock, EnvGuard};
     use crate::providers::traits::ChatMessage;
+    use std::sync::Mutex;
 
-    /// RAII guard that sets/unsets an env var and restores the original on drop.
-    struct EnvGuard {
-        key: String,
-        original: Option<String>,
-    }
+    /// Mutex to serialize tests that mutate process-wide environment variables,
+    /// preventing race conditions during parallel `cargo test` execution.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
-    impl EnvGuard {
-        fn set(key: &str, value: Option<&str>) -> Self {
-            let original = std::env::var(key).ok();
-            match value {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
-            Self {
-                key: key.to_string(),
-                original,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.original {
-                Some(v) => std::env::set_var(&self.key, v),
-                None => std::env::remove_var(&self.key),
-            }
-        }
-    }
 
     // ── SigV4 signing tests ─────────────────────────────────────
 
@@ -1369,9 +1347,12 @@ mod tests {
 
     #[tokio::test]
     async fn chat_fails_without_credentials() {
-        let provider = BedrockProvider {
-            auth: None,
-            max_tokens: DEFAULT_MAX_TOKENS,
+        let provider = {
+            let _env_lock = env_lock();
+            BedrockProvider {
+                auth: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+            }
         };
         let result = provider
             .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", 0.7)
@@ -1400,6 +1381,7 @@ mod tests {
 
     #[test]
     fn bearer_token_from_env() {
+        let _env_lock = env_lock();
         let _guard = EnvGuard::set("BEDROCK_API_KEY", Some("env-bearer-token"));
         // Clear SigV4 vars to ensure Bearer is chosen.
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
@@ -1414,6 +1396,7 @@ mod tests {
 
     #[test]
     fn bearer_token_precedence() {
+        let _env_lock = env_lock();
         let _bearer_guard = EnvGuard::set("BEDROCK_API_KEY", Some("bearer-key"));
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));

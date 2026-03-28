@@ -26,11 +26,52 @@ interface ChatMessage {
 }
 
 const DRAFT_KEY = 'agent-chat';
+const CHAT_STORAGE_PREFIX = 'zeroclaw_agent_chat_';
+const MAX_VISIBLE_MESSAGES = 100;
+
+function chatStorageKey(): string {
+  return `${CHAT_STORAGE_PREFIX}${getOrCreateSessionId()}`;
+}
+
+function capMessages(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length <= MAX_VISIBLE_MESSAGES) {
+    return messages;
+  }
+  return messages.slice(messages.length - MAX_VISIBLE_MESSAGES);
+}
+
+function loadPersistedMessages(): ChatMessage[] {
+  try {
+    const raw = sessionStorage.getItem(chatStorageKey());
+    if (!raw) {
+      return [];
+    }
+    const parsed = JSON.parse(raw) as Array<
+      Omit<ChatMessage, 'timestamp'> & { timestamp: string }
+    >;
+    return capMessages(
+      parsed.map((message) => ({
+        ...message,
+        timestamp: new Date(message.timestamp),
+      })),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function persistMessages(messages: ChatMessage[]): void {
+  try {
+    sessionStorage.setItem(chatStorageKey(), JSON.stringify(capMessages(messages)));
+  } catch {
+    // Ignore storage failures and keep the in-memory chat usable.
+  }
+}
 
 export default function AgentChat() {
   const sessionIdRef = useRef(getOrCreateSessionId());
   const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => loadPersistedMessages());
   const [historyReady, setHistoryReady] = useState(false);
   const [input, setInput] = useState(draft);
   const [typing, setTyping] = useState(false);
@@ -47,6 +88,20 @@ export default function AgentChat() {
   const capturedThinkingRef = useRef('');
   const [streamingContent, setStreamingContent] = useState('');
   const [streamingThinking, setStreamingThinking] = useState('');
+
+  const updateMessages = useCallback(
+    (
+      updater:
+        | ChatMessage[]
+        | ((prev: ChatMessage[]) => ChatMessage[]),
+    ) => {
+      setMessages((prev) => {
+        const next = typeof updater === 'function' ? updater(prev) : updater;
+        return capMessages(next);
+      });
+    },
+    [],
+  );
 
   // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
@@ -118,8 +173,26 @@ export default function AgentChat() {
 
     ws.onMessage = (msg: WsMessage) => {
       switch (msg.type) {
+        case 'history': {
+          // Replay of a persisted message from a resumed session.
+          const role = msg.role === 'user' ? 'user' : 'agent';
+          if (msg.content) {
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: generateUUID(),
+                role: role as 'user' | 'agent',
+                content: msg.content!,
+                timestamp: new Date(),
+              },
+            ]);
+          }
+          break;
+        }
+        case 'history_end':
         case 'session_start':
         case 'connected':
+          // Informational frames — no action needed.
           break;
 
         case 'thinking':
@@ -149,7 +222,7 @@ export default function AgentChat() {
           const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
           const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
           if (content) {
-            setMessages((prev) => [
+            updateMessages((prev) => [
               ...prev,
               {
                 id: generateUUID(),
@@ -171,31 +244,17 @@ export default function AgentChat() {
         }
 
         case 'tool_call':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: `${t('agent.tool_call_prefix')} ${msg.name ?? 'unknown'}(${JSON.stringify(msg.args ?? {})})`,
-              timestamp: new Date(),
-            },
-          ]);
+          // Intermediate tool invocations are not surfaced as chat messages.
+          // The final consolidated response is delivered via the 'done' event.
           break;
 
         case 'tool_result':
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: generateUUID(),
-              role: 'agent',
-              content: `${t('agent.tool_result_prefix')} ${msg.output ?? ''}`,
-              timestamp: new Date(),
-            },
-          ]);
+          // Tool results are internal agent steps; suppress them as chat messages
+          // so the user receives a single consolidated reply per request.
           break;
 
         case 'error':
-          setMessages((prev) => [
+          updateMessages((prev) => [
             ...prev,
             {
               id: generateUUID(),
@@ -224,7 +283,11 @@ export default function AgentChat() {
     return () => {
       ws.disconnect();
     };
-  }, []);
+  }, [updateMessages]);
+
+  useEffect(() => {
+    persistMessages(messages);
+  }, [messages]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -234,7 +297,7 @@ export default function AgentChat() {
     const trimmed = input.trim();
     if (!trimmed || !wsRef.current?.connected) return;
 
-    setMessages((prev) => [
+    updateMessages((prev) => [
       ...prev,
       {
         id: generateUUID(),

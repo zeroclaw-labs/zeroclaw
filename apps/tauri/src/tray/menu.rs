@@ -1,8 +1,8 @@
 //! Tray menu construction.
 
 use tauri::{
-    menu::{Menu, MenuItemBuilder, PredefinedMenuItem},
     App, Runtime,
+    menu::{Menu, MenuItemBuilder, PredefinedMenuItem},
 };
 
 pub fn create_tray_menu<R: Runtime>(app: &App<R>) -> Result<Menu<R>, tauri::Error> {

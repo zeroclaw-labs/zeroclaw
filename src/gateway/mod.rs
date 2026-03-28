@@ -16,34 +16,35 @@ pub mod api_webauthn;
 pub mod auth_rate_limit;
 pub mod canvas;
 pub mod nodes;
+pub mod session_queue;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
 pub mod ws;
 
 use crate::channels::{
-    session_backend::SessionBackend, session_sqlite::SqliteSessionBackend, Channel,
-    GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
+    Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
+    WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
+use crate::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use crate::tools;
 use crate::tools::canvas::CanvasStore;
 use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
+    Router,
     body::Bytes,
     extract::{ConnectInfo, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{delete, get, post, put},
-    Router,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -361,6 +362,8 @@ pub struct AppState {
     pub path_prefix: String,
     /// Session backend for persisting gateway WS chat sessions
     pub session_backend: Option<Arc<dyn SessionBackend>>,
+    /// Per-session actor queue for serializing concurrent turns
+    pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
@@ -378,11 +381,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
-        tracing::warn!(
-            "⚠️  Binding to {host} — gateway will be exposed to all network interfaces.\n\
-             Suggestion: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
-             [gateway] allow_public_bind = true in config.toml to silence this warning.\n\n\
-             Docker/VM: if you are running inside a container or VM, this is expected."
+        anyhow::bail!(
+            "🛑 Refusing to bind to {host} — gateway would be exposed on all network interfaces.\n\
+             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
+             [gateway] allow_public_bind = true in config.toml.\n\n\
+             Docker / VM / container: if you need to reach the gateway from another\n\
+             container or host, set [gateway] host = \"0.0.0.0\" and allow_public_bind = true\n\
+             in config.toml, then connect via ws://host.docker.internal:{port}."
         );
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
@@ -844,6 +849,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         shutdown_tx,
         node_registry,
         session_backend,
+        session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
@@ -931,11 +937,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions/running", get(api::handle_api_sessions_running))
         .route(
             "/api/sessions/{id}/messages",
             get(api::handle_api_session_messages),
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
@@ -1126,7 +1134,9 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 fn prometheus_disabled_hint() -> String {
-    String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+    String::from(
+        "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
+    )
 }
 
 #[cfg(feature = "observability-prometheus")]
@@ -1274,13 +1284,18 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
     // workspace-aware system context before model invocation.
     let system_prompt = {
         let config_guard = state.config.lock();
-        crate::channels::build_system_prompt(
+        crate::channels::build_system_prompt_with_mode_and_autonomy(
             &config_guard.workspace_dir,
             &state.model,
             &[], // tools - empty for simple chat
             &[], // skills
             Some(&config_guard.identity),
             None, // bootstrap_max_chars - use default
+            Some(&config_guard.autonomy),
+            false,
+            config_guard.skills.prompt_injection_mode,
+            false,
+            0,
         )
     };
 
@@ -2265,7 +2280,8 @@ mod tests {
     #[test]
     fn gateway_timeout_falls_back_to_default() {
         // When env var is not set, should return the default constant
-        std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS") };
         assert_eq!(gateway_request_timeout_secs(), 30);
     }
 
@@ -2328,6 +2344,9 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2393,6 +2412,9 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2606,6 +2628,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -2684,6 +2707,84 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok("ok".into())
         }
+    }
+
+    #[derive(Default)]
+    struct CaptureSystemPromptProvider {
+        last_system_prompt: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for CaptureSystemPromptProvider {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            *self.last_system_prompt.lock() = system_prompt.map(std::string::ToString::to_string);
+            Ok("ok".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn run_gateway_chat_simple_uses_runtime_autonomy_config() {
+        let provider_impl = Arc::new(CaptureSystemPromptProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let mut config = Config::default();
+        config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
+        config.autonomy.workspace_only = false;
+        config.autonomy.allowed_roots = vec!["/var/data".into()];
+
+        let state = AppState {
+            config: Arc::new(Mutex::new(config)),
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            webhook_secret_hash: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            wati: None,
+            gmail_push: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            path_prefix: String::new(),
+            session_backend: None,
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+        };
+
+        run_gateway_chat_simple(&state, "hello").await.unwrap();
+        let prompt = provider_impl
+            .last_system_prompt
+            .lock()
+            .clone()
+            .expect("system prompt should be present");
+
+        assert!(prompt.contains("## Autonomy Constraints"));
+        assert!(prompt.contains("Current autonomy level: `read-only`."));
+        assert!(prompt.contains("/var/data"));
+        assert!(
+            !prompt.contains("Current autonomy level: `supervised`."),
+            "prompt should not fall back to synthetic default autonomy config"
+        );
     }
 
     #[derive(Default)]
@@ -2784,6 +2885,9 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2859,6 +2963,9 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2946,6 +3053,9 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3005,6 +3115,9 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3069,6 +3182,9 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3138,6 +3254,9 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3204,6 +3323,9 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),

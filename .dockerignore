@@ -76,5 +76,4 @@ apps/tauri/capabilities/
 apps/tauri/tauri.conf.json
 apps/tauri/build.rs
 !apps/tauri/Cargo.toml
-python/
 scripts/
