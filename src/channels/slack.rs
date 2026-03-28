@@ -2163,9 +2163,8 @@ impl SlackChannel {
             .is_some_and(|ext| Self::AUDIO_EXTENSIONS.contains(&ext))
     }
 
-    /// Download an audio file attachment and transcribe it using the configured
-    /// transcription provider. Returns `None` if transcription is not configured
-    /// or if the download/transcription fails.
+    /// Download an audio file attachment and transcribe it via TranscriptionManager.
+    /// Returns `None` if transcription is not configured or if download/transcription fails.
     async fn try_transcribe_audio_file(&self, file: &serde_json::Value) -> Option<String> {
         let manager = self.transcription_manager.as_deref()?;
 
@@ -2177,16 +2176,16 @@ impl SlackChannel {
         let status = resp.status();
         if !status.is_success() {
             tracing::warn!(
-                "Slack voice file download failed for {} ({status})",
+                "Slack audio download failed for {} ({status})",
                 redacted_url
             );
             return None;
         }
 
         let audio_data = match resp.bytes().await {
-            Ok(bytes) => bytes.to_vec(),
+            Ok(bytes) => bytes,
             Err(e) => {
-                tracing::warn!("Slack voice file read failed for {}: {e}", redacted_url);
+                tracing::warn!("Slack audio read failed for {}: {e}", redacted_url);
                 return None;
             }
         };
@@ -2507,6 +2506,7 @@ impl SlackChannel {
                 .map(str::to_string),
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
     }
 
@@ -2837,6 +2837,7 @@ impl SlackChannel {
                     },
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                     attachments: vec![],
+                    observe_group: false,
                 };
 
                 // Track thread context so start_typing can set assistant status.
@@ -3516,6 +3517,7 @@ impl Channel for SlackChannel {
         let real_ts = self.resolve_draft_ts(message_id).await;
         // Clean up lazy mapping
         self.lazy_draft_ts.lock().await.remove(message_id);
+        self.set_assistant_status(recipient, "").await;
 
         let Some(real_ts) = real_ts else {
             // Draft was never materialized — just send as a fresh message
@@ -3577,6 +3579,7 @@ impl Channel for SlackChannel {
             .remove(recipient);
         let real_ts = self.resolve_draft_ts(message_id).await;
         self.lazy_draft_ts.lock().await.remove(message_id);
+        self.set_assistant_status(recipient, "").await;
         if let Some(ts) = real_ts {
             self.delete_message(recipient, &ts).await
         } else {
@@ -3839,6 +3842,7 @@ impl Channel for SlackChannel {
                             },
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                             attachments: vec![],
+                            observe_group: false,
                         };
 
                         if tx.send(channel_msg).await.is_err() {
@@ -3923,6 +3927,7 @@ impl Channel for SlackChannel {
                         thread_ts: Some(thread_ts.clone()),
                         interruption_scope_id: Some(thread_ts.clone()),
                         attachments: vec![],
+                        observe_group: false,
                     };
 
                     if tx.send(channel_msg).await.is_err() {
@@ -3998,7 +4003,7 @@ impl Channel for SlackChannel {
     async fn stop_typing(&self, recipient: &str) -> anyhow::Result<()> {
         // When using draft streaming, the final response is delivered via
         // chat.update (not chat.postMessage), so the Assistants API status
-        // does not auto-clear. Explicitly clear it.
+        // does not auto-clear. Explicitly clear it here as well.
         if self.stream_drafts {
             self.set_assistant_status(recipient, "").await;
         }
@@ -4935,6 +4940,7 @@ mod tests {
             thread_ts: None, // thread_replies=false → no fallback to ts
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         let msg1 = make_msg("100.000");
@@ -4961,6 +4967,7 @@ mod tests {
             thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         let msg1 = make_msg("100.000");

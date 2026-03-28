@@ -1,0 +1,51 @@
+# Movie Extension Configuration Example
+# Copy this file to ~/.zeroclaw/movie_config.toml and fill in your API keys
+
+# Enable or disable the movie query feature
+enabled = true
+
+# China region configuration (Douban API - FREE!)
+[china]
+enabled = true
+# Douban API is FREE and doesn't require an API key!
+# Uses community-maintained proxy: https://douban.uieee.com
+# Optional: Custom API endpoint
+# api_url = "https://douban.uieee.com"
+
+# US region configuration (TMDB API - FREE with registration!)
+[us]
+enabled = true
+# Get your FREE TMDB API key at: https://www.themoviedb.org/settings/api
+# 1. Register at themoviedb.org (free, no credit card required)
+# 2. Go to Settings > API > Create new API Key
+# 3. Copy the "API Key (v3 auth)" value here
+api_key = "your_tmdb_api_key_here"
+# Optional: Custom API endpoint
+# api_url = "https://api.themoviedb.org/3"
+
+# Default search parameters
+[defaults]
+# Search window in hours (e.g., show showtimes in next 3 hours)
+hours_ahead = 3
+# Maximum showtimes to return per cinema
+max_results_per_cinema = 10
+# Maximum total showtimes across all cinemas
+max_total_results = 50
+
+# HTTP client configuration
+[http]
+# Request timeout in seconds
+timeout_seconds = 30
+# Number of retries on failure
+retry_count = 3
+# Delay between retries in milliseconds
+retry_delay_ms = 1000
+
+# Cache configuration
+[cache]
+# Enable response caching
+enabled = true
+# Cache time-to-live in seconds (5 minutes)
+ttl_seconds = 300
+# Maximum number of cached responses
+max_size = 100

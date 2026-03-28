@@ -121,6 +121,19 @@ pub struct Config {
     #[serde(default)]
     pub extra_headers: HashMap<String, String>,
 
+    /// Provider-specific environment variables injected at daemon startup.
+    ///
+    /// Use this to store API keys for secondary providers without relying on
+    /// shell environment or wrapper scripts.
+    ///
+    /// ```toml
+    /// [provider_env]
+    /// MODELSTUDIO_API_KEY = "sk-sp-..."
+    /// DASHSCOPE_API_KEY = "sk-..."
+    /// ```
+    #[serde(default)]
+    pub provider_env: HashMap<String, String>,
+
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -818,7 +831,7 @@ pub struct TranscriptionConfig {
     /// Enable voice transcription for channels that support it.
     #[serde(default)]
     pub enabled: bool,
-    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google".
+    /// Default STT provider: "groq", "openai", "deepgram", "assemblyai", "google", "local_whisper".
     #[serde(default = "default_transcription_provider")]
     pub default_provider: String,
     /// API key used for transcription requests (Groq provider).
@@ -840,6 +853,15 @@ pub struct TranscriptionConfig {
     /// Whisper API request.
     #[serde(default)]
     pub initial_prompt: Option<String>,
+    /// Global audio size cap in bytes, applied before dispatching to any provider.
+    ///
+    /// When unset, no global cap is applied by `TranscriptionManager`; each provider
+    /// enforces its own limit independently (25 MB for cloud providers via
+    /// `validate_audio()`, `local_whisper.max_audio_bytes` for the local provider).
+    /// Set this to enforce a uniform upper limit regardless of which provider handles
+    /// the request.
+    #[serde(default)]
+    pub max_audio_bytes: Option<u64>,
     /// Maximum voice duration in seconds (messages longer than this are skipped).
     #[serde(default = "default_transcription_max_duration_secs")]
     pub max_duration_secs: u64,
@@ -874,6 +896,7 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             initial_prompt: None,
+            max_audio_bytes: None,
             max_duration_secs: default_transcription_max_duration_secs(),
             openai: None,
             deepgram: None,
@@ -1003,6 +1026,9 @@ pub struct NodesConfig {
     /// Optional bearer token for node authentication.
     #[serde(default)]
     pub auth_token: Option<String>,
+    /// mDNS local peer discovery.
+    #[serde(default)]
+    pub mdns: crate::nodes::MdnsConfig,
 }
 
 fn default_max_nodes() -> usize {
@@ -1015,6 +1041,7 @@ impl Default for NodesConfig {
             enabled: false,
             max_nodes: default_max_nodes(),
             auth_token: None,
+            mdns: crate::nodes::MdnsConfig::default(),
         }
     }
 }
@@ -1326,6 +1353,13 @@ pub struct AgentConfig {
     /// Tools exempt from the within-turn duplicate-call dedup check. Default: `[]`.
     #[serde(default)]
     pub tool_call_dedup_exempt: Vec<String>,
+    /// When `true`, only native/structured tool calls from the provider are
+    /// honoured.  Text-based fallback parsing (XML tags, markdown blocks, GLM
+    /// format) is skipped entirely.  This is useful for providers that reliably
+    /// emit structured tool calls and where text artefacts should be treated as
+    /// regular assistant output rather than tool invocations.  Default: `false`.
+    #[serde(default)]
+    pub native_tool_calls_only: bool,
     /// Per-turn MCP tool schema filtering groups.
     ///
     /// When non-empty, only MCP tools matched by an active group are included in the
@@ -1416,6 +1450,7 @@ impl Default for AgentConfig {
             parallel_tools: false,
             tool_dispatcher: default_agent_tool_dispatcher(),
             tool_call_dedup_exempt: Vec::new(),
+            native_tool_calls_only: false,
             tool_filter_groups: Vec::new(),
             max_system_prompt_chars: default_max_system_prompt_chars(),
             thinking: crate::agent::thinking::ThinkingConfig::default(),
@@ -2520,6 +2555,11 @@ pub struct HttpRequestConfig {
     /// Default: false (deny private hosts for SSRF protection).
     #[serde(default)]
     pub allow_private_hosts: bool,
+    /// Named secrets for auth headers, resolved via SecretStore at execution time.
+    /// Keys are secret names, values are auth header values (e.g. `"Bearer sk-ant-..."`).
+    /// Referenced in tool calls via the `auth_secret` parameter.
+    #[serde(default)]
+    pub secrets: std::collections::HashMap<String, String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -2530,6 +2570,7 @@ impl Default for HttpRequestConfig {
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
+            secrets: std::collections::HashMap::new(),
         }
     }
 }
@@ -2759,12 +2800,15 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), or "searxng" (self-hosted)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "searxng" (self-hosted), or "tavily" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// Tavily API key (required if provider is "tavily")
+    #[serde(default)]
+    pub tavily_api_key: Option<String>,
     /// SearXNG instance URL (required if provider is "searxng"), e.g. "https://searx.example.com"
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -2794,6 +2838,7 @@ impl Default for WebSearchConfig {
             enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            tavily_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -5279,6 +5324,15 @@ pub struct AutonomyConfig {
     /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
+
+    /// Maximum shell command execution time in seconds before the process is
+    /// killed.  Default: `60`.
+    #[serde(default = "default_shell_timeout_secs")]
+    pub shell_timeout_secs: u64,
+}
+
+fn default_shell_timeout_secs() -> u64 {
+    60
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -5374,6 +5428,7 @@ impl Default for AutonomyConfig {
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
             non_cli_excluded_tools: Vec::new(),
+            shell_timeout_secs: default_shell_timeout_secs(),
         }
     }
 }
@@ -6088,6 +6143,8 @@ pub struct ChannelsConfig {
     pub signal: Option<SignalConfig>,
     /// WhatsApp channel configuration (Cloud API or Web mode).
     pub whatsapp: Option<WhatsAppConfig>,
+    /// LINE Messaging API channel configuration.
+    pub line: Option<LineConfig>,
     /// Linq Partner API channel configuration.
     pub linq: Option<LinqConfig>,
     /// WATI WhatsApp Business API channel configuration.
@@ -6108,6 +6165,8 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// WeCom (WeChat Enterprise) Bot Webhook channel configuration.
     pub wecom: Option<WeComConfig>,
+    /// WeChat personal iLink Bot channel configuration (QR code login).
+    pub wechat: Option<WeChatConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
     /// X/Twitter channel configuration.
@@ -6199,6 +6258,10 @@ impl ChannelsConfig {
                 self.whatsapp.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.line.as_ref())),
+                self.line.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.linq.as_ref())),
                 self.linq.is_some(),
             ),
@@ -6237,6 +6300,10 @@ impl ChannelsConfig {
             (
                 Box::new(ConfigWrapper::new(self.wecom.as_ref())),
                 self.wecom.is_some(),
+            ),
+            (
+                Box::new(ConfigWrapper::new(self.wechat.as_ref())),
+                self.wechat.is_some(),
             ),
             (
                 Box::new(ConfigWrapper::new(self.qq.as_ref())),
@@ -6299,6 +6366,7 @@ impl Default for ChannelsConfig {
             matrix: None,
             signal: None,
             whatsapp: None,
+            line: None,
             linq: None,
             wati: None,
             nextcloud_talk: None,
@@ -6309,6 +6377,7 @@ impl Default for ChannelsConfig {
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -6552,9 +6621,17 @@ pub struct MattermostConfig {
     /// Mattermost server URL (e.g. `"https://mattermost.example.com"`).
     pub url: String,
     /// Mattermost bot access token.
-    pub bot_token: String,
+    /// Optional when `bot_id` + `bot_password` are provided; the channel will
+    /// obtain a session token via `POST /api/v4/users/login` at runtime.
+    #[serde(default)]
+    pub bot_token: Option<String>,
     /// Optional channel ID to restrict the bot to a single channel.
     pub channel_id: Option<String>,
+    /// Optional list of channel IDs to monitor. Takes precedence over
+    /// `channel_id`. Use `["*"]` or omit both to listen on all accessible
+    /// channels (wildcard / auto-discovery mode).
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     /// Allowed Mattermost user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
@@ -6574,6 +6651,17 @@ pub struct MattermostConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Listening mode: `"polling"` (default) or `"websocket"`.
+    /// WebSocket mode requires `bot_id` and `bot_password` for login-based authentication.
+    #[serde(default)]
+    pub listen_mode: Option<String>,
+    /// Bot ID (username or email) for login-based authentication.
+    /// Used with `bot_password` to obtain a session token via `POST /api/v4/users/login`.
+    #[serde(default)]
+    pub bot_id: Option<String>,
+    /// Bot password for login-based authentication.
+    #[serde(default)]
+    pub bot_password: Option<String>,
 }
 
 impl ChannelConfig for MattermostConfig {
@@ -6673,6 +6761,10 @@ pub struct MatrixConfig {
     /// When set, ZeroClaw recovers room keys and cross-signing secrets on startup.
     #[serde(default)]
     pub recovery_key: Option<String>,
+    /// When true, only respond to messages that @-mention the bot in group rooms.
+    /// DMs bypass this gate.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 impl ChannelConfig for MatrixConfig {
@@ -6815,6 +6907,10 @@ pub struct WhatsAppConfig {
     /// Example: `["@?ZeroClaw", "\\+?15555550123"]`
     #[serde(default)]
     pub group_mention_patterns: Vec<String>,
+    /// When true, a newer WhatsApp message from the same sender in the same chat
+    /// cancels the in-flight request and starts a fresh response with preserved history.
+    #[serde(default)]
+    pub interrupt_on_new_message: bool,
     /// Per-channel proxy URL (http, https, socks5, socks5h).
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
@@ -6827,6 +6923,61 @@ impl ChannelConfig for WhatsAppConfig {
     }
     fn desc() -> &'static str {
         "Business Cloud API"
+    }
+}
+
+/// Outbound message delivery mode for the LINE channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LineReplyMode {
+    /// Use Reply API when a `replyToken` is available (free, no quota cost),
+    /// fall back to Push API when no token is present (e.g. proactive messages).
+    /// **This is the recommended default** — it conserves Push quota on free plans.
+    #[default]
+    ReplyFirst,
+    /// Always use Push API regardless of whether a `replyToken` is available.
+    /// Compatible with all message types but consumes Push quota every time.
+    PushOnly,
+    /// Always use Reply API. Fails for proactive/scheduled messages that have
+    /// no `replyToken`. Suitable when Push API is not available on the plan.
+    ReplyOnly,
+}
+
+/// LINE Messaging API channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LineConfig {
+    /// LINE Channel Secret — used to verify `X-Line-Signature` webhook headers.
+    /// Can also be set via `ZEROCLAW_LINE_CHANNEL_SECRET` env var.
+    pub channel_secret: String,
+    /// LINE Channel Access Token — used for outbound push messages and content download.
+    pub channel_access_token: String,
+    /// Allowed LINE user IDs that the bot will respond to.
+    /// Use `["*"]` to allow all users (not recommended for public bots).
+    pub allowed_users: Vec<String>,
+    /// Outbound delivery mode: `reply_first` (default), `push_only`, or `reply_only`.
+    ///
+    /// - `reply_first` — Reply API when `replyToken` available, Push API as fallback.
+    /// - `push_only`   — Always Push API (current legacy behavior).
+    /// - `reply_only`  — Always Reply API; fails without a `replyToken`.
+    #[serde(default)]
+    pub reply_mode: LineReplyMode,
+    /// When `true`, the bot only responds in group chats when @mentioned by
+    /// `bot_display_name`.  1:1 messages are always processed regardless.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// Display name the bot uses inside LINE groups (e.g. `"ZeroClaw"`).
+    /// Required when `mention_only = true`; ignored otherwise.
+    #[serde(default)]
+    pub bot_display_name: Option<String>,
+}
+
+impl ChannelConfig for LineConfig {
+    fn name() -> &'static str {
+        "LINE"
+    }
+    fn desc() -> &'static str {
+        "LINE Messaging API bot"
     }
 }
 
@@ -7624,6 +7775,38 @@ impl ChannelConfig for WeComConfig {
     }
 }
 
+/// WeChat personal iLink Bot channel configuration.
+///
+/// Uses the iLink Bot API (`ilinkai.weixin.qq.com`) with QR-code login.
+/// The bot token is obtained by scanning a QR code and persisted to disk
+/// so subsequent restarts do not require re-scanning.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WeChatConfig {
+    /// Allowed WeChat user IDs (e.g. `"xxx@im.wechat"`).
+    /// Empty = deny all, `"*"` = allow all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Override the iLink API base URL. Default: `https://ilinkai.weixin.qq.com`.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    /// Override the CDN base URL. Default: `https://novac2c.cdn.weixin.qq.com/c2c`.
+    #[serde(default)]
+    pub cdn_base_url: Option<String>,
+    /// Directory to persist bot token and sync cursor.
+    /// Default: `~/.zeroclaw/wechat/`.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+}
+
+impl ChannelConfig for WeChatConfig {
+    fn name() -> &'static str {
+        "WeChat"
+    }
+    fn desc() -> &'static str {
+        "WeChat iLink Bot (QR login)"
+    }
+}
+
 /// QQ Official Bot configuration (Tencent QQ Bot SDK)
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct QQConfig {
@@ -8227,6 +8410,7 @@ impl Default for Config {
             provider_timeout_secs: default_provider_timeout_secs(),
             provider_max_tokens: None,
             extra_headers: HashMap::new(),
+            provider_env: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             trust: crate::trust::TrustConfig::default(),
@@ -8333,9 +8517,27 @@ fn active_workspace_state_path(default_dir: &Path) -> PathBuf {
 /// Returns `true` if `path` lives under the OS temp directory.
 fn is_temp_directory(path: &Path) -> bool {
     let temp = std::env::temp_dir();
+
+    // Fast path: exact lexical prefix match.
+    // Handles the case where canonicalization fails but paths match directly.
+    if path.starts_with(&temp) {
+        return true;
+    }
+
     // Canonicalize when possible to handle symlinks (macOS /var → /private/var)
     let canon_temp = temp.canonicalize().unwrap_or_else(|_| temp.clone());
-    let canon_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    // If the path doesn't exist yet, canonicalize() will fail (io::Error NotFound).
+    // In that case, we can try to canonicalize its parent directory to resolve symlinks.
+    let canon_path = path.canonicalize().unwrap_or_else(|_| {
+        if let Some(parent) = path.parent() {
+            if let Ok(canon_parent) = parent.canonicalize() {
+                return canon_parent.join(path.file_name().unwrap_or_default());
+            }
+        }
+        path.to_path_buf()
+    });
+
     canon_path.starts_with(&canon_temp)
 }
 
@@ -8649,7 +8851,7 @@ fn encrypt_secret(
     value: &mut String,
     field_name: &str,
 ) -> Result<()> {
-    if !crate::security::SecretStore::is_encrypted(value) {
+    if !crate::security::SecretStore::is_encrypted(value) && !value.starts_with("op://") {
         *value = store
             .encrypt(value)
             .with_context(|| format!("Failed to encrypt {field_name}"))?;
@@ -8910,6 +9112,12 @@ impl Config {
 
             decrypt_optional_secret(
                 &store,
+                &mut config.web_search.tavily_api_key,
+                "config.web_search.tavily_api_key",
+            )?;
+
+            decrypt_optional_secret(
+                &store,
                 &mut config.storage.provider.config.db_url,
                 "config.storage.provider.config.db_url",
             )?;
@@ -9029,10 +9237,15 @@ impl Config {
                 )?;
             }
             if let Some(ref mut mm) = config.channels_config.mattermost {
-                decrypt_secret(
+                decrypt_optional_secret(
                     &store,
                     &mut mm.bot_token,
                     "config.channels_config.mattermost.bot_token",
+                )?;
+                decrypt_optional_secret(
+                    &store,
+                    &mut mm.bot_password,
+                    "config.channels_config.mattermost.bot_password",
                 )?;
             }
             if let Some(ref mut mx) = config.channels_config.matrix {
@@ -9224,6 +9437,16 @@ impl Config {
             }
 
             config.apply_env_overrides();
+
+            // Inject provider_env entries as process environment variables
+            // so that provider credential resolution picks them up automatically.
+            for (key, value) in &config.provider_env {
+                if std::env::var(key).is_err() {
+                    std::env::set_var(key, value);
+                    tracing::debug!(key = %key, "Injected provider_env into process environment");
+                }
+            }
+
             config.validate()?;
             tracing::info!(
                 path = %config.config_path.display(),
@@ -9927,6 +10150,11 @@ impl Config {
                     );
                 }
             }
+            if let Some(cap) = self.transcription.max_audio_bytes {
+                if cap == 0 {
+                    anyhow::bail!("transcription.max_audio_bytes must be greater than zero");
+                }
+            }
         }
 
         // Delegate tool global defaults
@@ -10186,6 +10414,16 @@ impl Config {
             }
         }
 
+        // Tavily API key: ZEROCLAW_TAVILY_API_KEY or TAVILY_API_KEY
+        if let Ok(api_key) =
+            std::env::var("ZEROCLAW_TAVILY_API_KEY").or_else(|_| std::env::var("TAVILY_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.tavily_api_key = Some(api_key.to_string());
+            }
+        }
+
         // SearXNG instance URL: ZEROCLAW_SEARXNG_INSTANCE_URL or SEARXNG_INSTANCE_URL
         if let Ok(instance_url) = std::env::var("ZEROCLAW_SEARXNG_INSTANCE_URL")
             .or_else(|_| std::env::var("SEARXNG_INSTANCE_URL"))
@@ -10384,6 +10622,12 @@ impl Config {
 
         encrypt_optional_secret(
             &store,
+            &mut config_to_save.web_search.tavily_api_key,
+            "config.web_search.tavily_api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
             &mut config_to_save.storage.provider.config.db_url,
             "config.storage.provider.config.db_url",
         )?;
@@ -10503,10 +10747,15 @@ impl Config {
             )?;
         }
         if let Some(ref mut mm) = config_to_save.channels_config.mattermost {
-            encrypt_secret(
+            encrypt_optional_secret(
                 &store,
                 &mut mm.bot_token,
                 "config.channels_config.mattermost.bot_token",
+            )?;
+            encrypt_optional_secret(
+                &store,
+                &mut mm.bot_password,
+                "config.channels_config.mattermost.bot_password",
             )?;
         }
         if let Some(ref mut mx) = config_to_save.channels_config.matrix {
@@ -10808,7 +11057,7 @@ async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         let dir = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
@@ -10898,7 +11147,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
+    #[cfg(unix)]
     use tempfile::TempDir;
+
     use tokio::sync::{Mutex, MutexGuard};
     use tokio::test;
     use tokio_stream::StreamExt;
@@ -11310,6 +11561,7 @@ auto_save = true
             provider_timeout_secs: 120,
             provider_max_tokens: None,
             extra_headers: HashMap::new(),
+            provider_env: HashMap::new(),
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -11328,6 +11580,7 @@ auto_save = true
                 always_ask: vec![],
                 allowed_roots: vec![],
                 non_cli_excluded_tools: vec![],
+                shell_timeout_secs: default_shell_timeout_secs(),
             },
             trust: crate::trust::TrustConfig::default(),
             backup: BackupConfig::default(),
@@ -11378,6 +11631,7 @@ auto_save = true
                 matrix: None,
                 signal: None,
                 whatsapp: None,
+                line: None,
                 linq: None,
                 wati: None,
                 nextcloud_talk: None,
@@ -11388,6 +11642,7 @@ auto_save = true
                 feishu: None,
                 dingtalk: None,
                 wecom: None,
+                wechat: None,
                 qq: None,
                 twitter: None,
                 mochat: None,
@@ -11917,6 +12172,7 @@ default_temperature = 0.7
             provider_timeout_secs: 120,
             provider_max_tokens: None,
             extra_headers: HashMap::new(),
+            provider_env: HashMap::new(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             trust: crate::trust::TrustConfig::default(),
@@ -12287,6 +12543,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            mention_only: false,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12313,6 +12570,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            mention_only: false,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12411,9 +12669,11 @@ allowed_users = ["@ops:matrix.org"]
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
                 recovery_key: None,
+                mention_only: false,
             }),
             signal: None,
             whatsapp: None,
+            line: None,
             linq: None,
             wati: None,
             nextcloud_talk: None,
@@ -12424,6 +12684,7 @@ allowed_users = ["@ops:matrix.org"]
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -12639,6 +12900,7 @@ channel_ids = ["C123", "D456"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            interrupt_on_new_message: false,
             proxy_url: None,
         };
         let json = serde_json::to_string(&wc).unwrap();
@@ -12666,6 +12928,7 @@ channel_ids = ["C123", "D456"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            interrupt_on_new_message: false,
             proxy_url: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
@@ -12698,6 +12961,7 @@ channel_ids = ["C123", "D456"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            interrupt_on_new_message: false,
             proxy_url: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
@@ -12722,6 +12986,7 @@ channel_ids = ["C123", "D456"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            interrupt_on_new_message: false,
             proxy_url: None,
         };
         assert!(wc.is_ambiguous_config());
@@ -12745,10 +13010,25 @@ channel_ids = ["C123", "D456"]
             self_chat_mode: false,
             dm_mention_patterns: vec![],
             group_mention_patterns: vec![],
+            interrupt_on_new_message: false,
             proxy_url: None,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
+    }
+
+    #[test]
+    async fn whatsapp_config_default_interrupt_on_new_message_is_false() {
+        let json = r#"{"session_path":"/tmp/wa"}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    async fn whatsapp_config_deserializes_interrupt_on_new_message_true() {
+        let json = r#"{"session_path":"/tmp/wa","interrupt_on_new_message":true}"#;
+        let parsed: WhatsAppConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.interrupt_on_new_message);
     }
 
     #[test]
@@ -12779,8 +13059,10 @@ channel_ids = ["C123", "D456"]
                 self_chat_mode: false,
                 dm_mention_patterns: vec![],
                 group_mention_patterns: vec![],
+                interrupt_on_new_message: false,
                 proxy_url: None,
             }),
+            line: None,
             linq: None,
             wati: None,
             nextcloud_talk: None,
@@ -12791,6 +13073,7 @@ channel_ids = ["C123", "D456"]
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -14589,6 +14872,7 @@ default_model = "persisted-profile"
 
     #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
+        let _lock = env_override_lock().await;
         let service_key = format!(
             "provider.cache_test.{}",
             std::time::SystemTime::now()
@@ -14610,6 +14894,7 @@ default_model = "persisted-profile"
 
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
+        let _lock = env_override_lock().await;
         let service_key = format!(
             "provider.cache_timeout_test.{}",
             std::time::SystemTime::now()
@@ -15875,7 +16160,7 @@ require_otp_to_resume = true
 
     // ── Docker baked config template ────────────────────────────
 
-    /// The TOML template baked into Docker images (Dockerfile + Dockerfile.debian).
+    /// The TOML template baked into Docker images (Dockerfile, targets: dev/release/debian).
     /// Kept here so changes to the Dockerfiles can be validated by `cargo test`.
     const DOCKER_CONFIG_TEMPLATE: &str = r#"
 workspace_dir = "/zeroclaw-data/workspace"

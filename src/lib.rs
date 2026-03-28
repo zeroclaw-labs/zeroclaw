@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
+pub mod calendar;
 pub mod channels;
 pub(crate) mod cli_input;
 pub mod commands;
@@ -78,6 +79,7 @@ pub(crate) mod trust;
 pub(crate) mod tunnel;
 pub(crate) mod util;
 pub mod verifiable_intent;
+pub mod voice;
 
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins;

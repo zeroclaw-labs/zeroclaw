@@ -78,6 +78,7 @@ impl SecretStore {
     /// Decrypt a secret.
     /// - `enc2:` prefix → ChaCha20-Poly1305 (current format)
     /// - `enc:` prefix → legacy XOR cipher (backward compatibility for migration)
+    /// - `op://` prefix → resolved via 1Password CLI (`op read`)
     /// - No prefix → returned as-is (plaintext config)
     ///
     /// **Warning**: Legacy `enc:` values are insecure. Use `decrypt_and_migrate` to
@@ -87,6 +88,8 @@ impl SecretStore {
             self.decrypt_chacha20(hex_str)
         } else if let Some(hex_str) = value.strip_prefix("enc:") {
             self.decrypt_legacy_xor(hex_str)
+        } else if value.starts_with("op://") {
+            resolve_onepassword_ref(value)
         } else {
             Ok(value.to_string())
         }
@@ -113,6 +116,10 @@ impl SecretStore {
             let plaintext = self.decrypt_legacy_xor(hex_str)?;
             let migrated = self.encrypt(&plaintext)?;
             Ok((plaintext, Some(migrated)))
+        } else if value.starts_with("op://") {
+            // 1Password reference — resolve but no migration needed
+            let resolved = resolve_onepassword_ref(value)?;
+            Ok((resolved, None))
         } else {
             // Plaintext — no migration needed
             Ok((value.to_string(), None))
@@ -157,9 +164,9 @@ impl SecretStore {
             .context("Decrypted legacy secret is not valid UTF-8 — wrong key or corrupt data")
     }
 
-    /// Check if a value is already encrypted (current or legacy format).
+    /// Check if a value needs resolution (encrypted or external secret reference).
     pub fn is_encrypted(value: &str) -> bool {
-        value.starts_with("enc2:") || value.starts_with("enc:")
+        value.starts_with("enc2:") || value.starts_with("enc:") || value.starts_with("op://")
     }
 
     /// Check if a value uses the secure `enc2:` format.
@@ -309,6 +316,69 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+/// Resolve a 1Password secret reference by invoking the `op` CLI.
+///
+/// The `op://vault/item/field` URI format is the standard 1Password
+/// secret reference. The CLI command `op read <ref>` outputs the
+/// secret value to stdout.
+fn resolve_onepassword_ref(reference: &str) -> Result<String> {
+    use std::process::Command;
+
+    let path = reference.strip_prefix("op://").unwrap_or("");
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() < 2 || segments.iter().any(|s| s.is_empty()) {
+        anyhow::bail!(
+            "Invalid 1Password reference \"{reference}\". \
+             Expected format: op://vault-name/item-name/field-name"
+        );
+    }
+
+    let output = Command::new("op")
+        .args(["read", reference])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!(
+                    "1Password CLI (`op`) not found. Install it from \
+                     https://1password.com/downloads/command-line/ to use \
+                     op:// secret references in config."
+                )
+            } else {
+                anyhow::anyhow!("Failed to run 1Password CLI: {e}")
+            }
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let hint = if stderr.contains("not signed in") || stderr.contains("session expired") {
+            " (hint: run `op signin` first)"
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "1Password CLI failed to resolve \"{reference}\": {}{hint}",
+            stderr.trim()
+        );
+    }
+
+    let secret = String::from_utf8(output.stdout)
+        .context("1Password CLI returned non-UTF-8 output")?
+        .trim_end_matches('\n')
+        .to_string();
+
+    if secret.is_empty() {
+        anyhow::bail!(
+            "1Password CLI returned empty value for \"{reference}\". \
+             Verify the vault/item/field path is correct."
+        );
+    }
+
+    Ok(secret)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,8 +429,46 @@ mod tests {
     fn is_encrypted_detects_prefix() {
         assert!(SecretStore::is_encrypted("enc2:aabbcc"));
         assert!(SecretStore::is_encrypted("enc:aabbcc")); // legacy
+        assert!(SecretStore::is_encrypted("op://vault/item/field")); // 1Password
         assert!(!SecretStore::is_encrypted("sk-plaintext"));
         assert!(!SecretStore::is_encrypted(""));
+    }
+
+    // ── 1Password (op://) resolution ──────────────────────────────
+
+    #[test]
+    fn op_invalid_reference_format() {
+        let result = resolve_onepassword_ref("op://");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid 1Password reference"));
+
+        let result = resolve_onepassword_ref("op://vault-only");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid 1Password reference"));
+    }
+
+    #[test]
+    fn op_reference_never_passes_through_as_plaintext() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        let result = store.decrypt("op://vault/item/field");
+        // Should fail (CLI not found or not signed in), never return "op://..." as plaintext
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decrypt_and_migrate_resolves_op_reference() {
+        let tmp = TempDir::new().unwrap();
+        let store = SecretStore::new(tmp.path(), true);
+        let result = store.decrypt_and_migrate("op://vault/item/field");
+        // Should fail (CLI not available), but proves the op:// branch is hit
+        assert!(result.is_err());
     }
 
     #[tokio::test]
