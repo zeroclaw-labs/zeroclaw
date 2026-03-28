@@ -6165,6 +6165,8 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// WeCom (WeChat Enterprise) Bot Webhook channel configuration.
     pub wecom: Option<WeComConfig>,
+    /// WeChat personal iLink Bot channel configuration (QR code login).
+    pub wechat: Option<WeChatConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
     /// X/Twitter channel configuration.
@@ -6300,6 +6302,10 @@ impl ChannelsConfig {
                 self.wecom.is_some(),
             ),
             (
+                Box::new(ConfigWrapper::new(self.wechat.as_ref())),
+                self.wechat.is_some(),
+            ),
+            (
                 Box::new(ConfigWrapper::new(self.qq.as_ref())),
                 self.qq.is_some()
             ),
@@ -6371,6 +6377,7 @@ impl Default for ChannelsConfig {
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -7765,6 +7772,38 @@ impl ChannelConfig for WeComConfig {
     }
     fn desc() -> &'static str {
         "WeCom Bot Webhook"
+    }
+}
+
+/// WeChat personal iLink Bot channel configuration.
+///
+/// Uses the iLink Bot API (`ilinkai.weixin.qq.com`) with QR-code login.
+/// The bot token is obtained by scanning a QR code and persisted to disk
+/// so subsequent restarts do not require re-scanning.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WeChatConfig {
+    /// Allowed WeChat user IDs (e.g. `"xxx@im.wechat"`).
+    /// Empty = deny all, `"*"` = allow all.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Override the iLink API base URL. Default: `https://ilinkai.weixin.qq.com`.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    /// Override the CDN base URL. Default: `https://novac2c.cdn.weixin.qq.com/c2c`.
+    #[serde(default)]
+    pub cdn_base_url: Option<String>,
+    /// Directory to persist bot token and sync cursor.
+    /// Default: `~/.zeroclaw/wechat/`.
+    #[serde(default)]
+    pub state_dir: Option<String>,
+}
+
+impl ChannelConfig for WeChatConfig {
+    fn name() -> &'static str {
+        "WeChat"
+    }
+    fn desc() -> &'static str {
+        "WeChat iLink Bot (QR login)"
     }
 }
 
@@ -11603,6 +11642,7 @@ auto_save = true
                 feishu: None,
                 dingtalk: None,
                 wecom: None,
+                wechat: None,
                 qq: None,
                 twitter: None,
                 mochat: None,
@@ -12644,6 +12684,7 @@ allowed_users = ["@ops:matrix.org"]
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,
@@ -13032,6 +13073,7 @@ channel_ids = ["C123", "D456"]
             feishu: None,
             dingtalk: None,
             wecom: None,
+            wechat: None,
             qq: None,
             twitter: None,
             mochat: None,

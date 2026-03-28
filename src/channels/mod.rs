@@ -60,6 +60,7 @@ pub mod voice_call;
 pub mod voice_wake;
 pub mod wati;
 pub mod webhook;
+pub mod wechat;
 pub mod wecom;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
@@ -104,6 +105,7 @@ pub use voice_call::{VoiceCallChannel, VoiceCallConfig};
 pub use voice_wake::VoiceWakeChannel;
 pub use wati::WatiChannel;
 pub use webhook::WebhookChannel;
+pub use wechat::WeChatChannel;
 pub use wecom::WeComChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -764,6 +766,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - v1 only supports uploading local file paths. Remote URLs may be skipped.\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n",
+        ),
+        "wechat" => Some(
+            "When responding on WeChat:\n\
+             - Be concise and direct\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
+               [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use absolute local paths when sending generated files whenever possible.\n",
         ),
         _ => None,
     }
@@ -3641,22 +3651,64 @@ async fn process_channel_message(
                         .await
                     {
                         tracing::warn!("Failed to finalize draft: {e}; sending as new message");
-                        let _ = channel
+                        match channel
                             .send(
                                 &SendMessage::new(&delivered_response, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
-                            .await;
+                            .await
+                        {
+                            Ok(()) => {
+                                if let Some(hooks) = &ctx.hooks {
+                                    hooks
+                                        .fire_message_sent(
+                                            &msg.channel,
+                                            &msg.reply_target,
+                                            &delivered_response,
+                                        )
+                                        .await;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("  ❌ Failed fallback send on {}: {e}", channel.name());
+                            }
+                        }
+                    } else {
+                        // ── Hook: fire_message_sent after successful finalize_draft ──
+                        if let Some(hooks) = &ctx.hooks {
+                            hooks
+                                .fire_message_sent(
+                                    &msg.channel,
+                                    &msg.reply_target,
+                                    &delivered_response,
+                                )
+                                .await;
+                        }
                     }
-                } else if let Err(e) = channel
-                    .send(
-                        &SendMessage::new(&delivered_response, &msg.reply_target)
-                            .in_thread(msg.thread_ts.clone())
-                            .with_cancellation(cancellation_token.clone()),
-                    )
-                    .await
-                {
-                    eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                } else {
+                    match channel
+                        .send(
+                            &SendMessage::new(&delivered_response, &msg.reply_target)
+                                .in_thread(msg.thread_ts.clone()),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            // ── Hook: fire_message_sent (void) ─────────
+                            if let Some(hooks) = &ctx.hooks {
+                                hooks
+                                    .fire_message_sent(
+                                        &msg.channel,
+                                        &msg.reply_target,
+                                        &delivered_response,
+                                    )
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
+                        }
+                    }
                 }
             }
         }
@@ -5349,6 +5401,21 @@ fn collect_configured_channels(
                 wc.webhook_key.clone(),
                 wc.allowed_users.clone(),
             )),
+        });
+    }
+
+    if let Some(ref wechat) = config.channels_config.wechat {
+        channels.push(ConfiguredChannel {
+            display_name: "WeChat",
+            channel: Arc::new(
+                WeChatChannel::new(
+                    wechat.allowed_users.clone(),
+                    wechat.api_base_url.clone(),
+                    wechat.cdn_base_url.clone(),
+                    wechat.state_dir.as_ref().map(std::path::PathBuf::from),
+                )
+                .with_workspace_dir(config.workspace_dir.clone()),
+            ),
         });
     }
 
@@ -11580,6 +11647,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(debounce::MessageDebouncer::new(std::time::Duration::ZERO)),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
         });
 
         process_channel_message(

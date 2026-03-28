@@ -75,6 +75,9 @@ prometheus = { version = "0.14", default-features = false, optional = true }
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+aes = "0.8"
+ecb = "0.1"
+md5 = "0.8"
 
 # URL encoding for web search
 urlencoding = "2.1"
@@ -218,8 +221,8 @@ extism = { version = "1.20", optional = true }
 # Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
 cpal = { version = "0.17", optional = true }
 
-# Terminal QR rendering for WhatsApp Web pairing flow.
-qrcode = { version = "0.14", optional = true }
+# Terminal QR rendering for pairing/login flows.
+qrcode = "0.14"
 
 # WhatsApp Web client (wa-rs) — optional, enable with --features whatsapp-web
 # Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
@@ -267,7 +270,7 @@ rag-pdf = ["dep:pdf-extract"]
 # skill-creation = Autonomous skill creation from successful multi-step tasks
 skill-creation = []
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
+whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
 # voice-wake = Voice wake word detection via microphone (cpal)
 voice-wake = ["dep:cpal"]
 # WASM plugin system (extism-based)
