@@ -569,6 +569,7 @@ impl Channel for SignalChannel {
                                                         timestamp: timestamp / 1000,
                                                         thread_ts: None,
                                                         interruption_scope_id: None,
+                                                        attachments: vec![],
                                                     };
                                                     if tx.send(msg).await.is_err() {
                                                         return Ok(());
@@ -628,6 +629,7 @@ impl Channel for SignalChannel {
                                             timestamp: timestamp / 1000,
                                             thread_ts: None,
                                             interruption_scope_id: None,
+                                            attachments: vec![],
                                         };
                                         let _ = tx.send(msg).await;
                                     }
@@ -740,10 +742,11 @@ mod tests {
             google: None,
             local_whisper: Some(crate::config::LocalWhisperConfig {
                 url: "http://127.0.0.1:9999/v1/transcribe".to_string(),
-                bearer_token: "test-bearer".to_string(),
+                bearer_token: Some("test-bearer".to_string()),
                 max_audio_bytes: 10 * 1024 * 1024,
                 timeout_secs: 30,
             }),
+            transcribe_non_ptt_audio: false,
         }
     }
 
@@ -1409,7 +1412,7 @@ mod tests {
         config.default_provider = "local_whisper".to_string();
         config.local_whisper = Some(crate::config::LocalWhisperConfig {
             url: format!("{}/v1/transcribe", whisper_server.uri()),
-            bearer_token: "test-bearer".to_string(),
+            bearer_token: Some("test-bearer".to_string()),
             max_audio_bytes: 10 * 1024 * 1024,
             timeout_secs: 30,
         });
