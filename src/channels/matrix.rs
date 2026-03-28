@@ -2481,7 +2481,8 @@ mod tests {
 
     #[test]
     fn extract_image_marker() {
-        let (cleaned, markers) = extract_media_markers("Here is the chart [IMAGE:/tmp/chart.png] for you");
+        let (cleaned, markers) =
+            extract_media_markers("Here is the chart [IMAGE:/tmp/chart.png] for you");
         assert_eq!(markers.len(), 1);
         assert_eq!(markers[0].path, "/tmp/chart.png");
         assert_eq!(markers[0].msgtype, "m.image");

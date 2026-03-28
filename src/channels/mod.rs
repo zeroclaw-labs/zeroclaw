@@ -601,7 +601,9 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Use Markdown formatting (bold, italic, code blocks)\n\
              - Be concise and direct\n\
              - When you receive a [Voice message], the user spoke to you. Respond naturally as in conversation.\n\
-             - Your text reply will automatically be converted to audio and sent back as a voice message.\n",
+             - Your text reply will automatically be converted to audio and sent back as a voice message.\n\
+             - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [FILE:<path>], [VIDEO:<path>], [AUDIO:<path>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
         ),
         "telegram" => Some(
             "When responding on Telegram:\n\
