@@ -8,8 +8,8 @@
 //! The timestamp is stored in an [`AtomicU64`] so `touch()` is lock-free and
 //! safe to call from any async context.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -138,7 +138,7 @@ mod tests {
     #[tokio::test]
     async fn is_stalled_after_timeout() {
         let wd = StallWatchdog::new(0); // 0-second timeout → always stalled
-                                        // Force last_event into the past
+        // Force last_event into the past
         wd.last_event.store(0, Ordering::Relaxed);
         assert!(wd.is_stalled());
     }
@@ -149,13 +149,16 @@ mod tests {
         let fired_clone = Arc::clone(&fired);
 
         let wd = StallWatchdog::new(1);
-        // Force last_event far into the past so the very first check triggers.
-        wd.last_event.store(0, Ordering::Relaxed);
 
         wd.start(move || {
             fired_clone.store(true, Ordering::Relaxed);
         })
         .await;
+
+        // Force last_event far into the past *after* start() so the next poll
+        // detects a stall (start() calls touch() which would overwrite an
+        // earlier store).
+        wd.last_event.store(0, Ordering::Relaxed);
 
         // Wait long enough for the poll interval (1 / 2 = clamped to 1s) + margin.
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -168,12 +171,13 @@ mod tests {
         let fired_clone = Arc::clone(&fired);
 
         let wd = StallWatchdog::new(1);
-        wd.last_event.store(0, Ordering::Relaxed);
 
         wd.start(move || {
             fired_clone.store(true, Ordering::Relaxed);
         })
         .await;
+
+        wd.last_event.store(0, Ordering::Relaxed);
 
         // Stop immediately before the poll task can fire.
         wd.stop().await;
