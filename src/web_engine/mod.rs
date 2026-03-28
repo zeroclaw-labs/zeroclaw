@@ -1,17 +1,27 @@
-use anyhow::{Context, Result};
-use chromiumoxide::browser::{Browser, BrowserConfig};
-use chromiumoxide::handler::viewport::Viewport;
-use chromiumoxide::page::Page;
-use futures_util::StreamExt;
+use anyhow::Result;
+#[cfg(feature = "browser-native")]
 use std::sync::Arc;
+#[cfg(feature = "browser-native")]
 use tokio::sync::Mutex;
+
+#[cfg(feature = "browser-native")]
+use chromiumoxide::browser::{Browser, BrowserConfig};
+#[cfg(feature = "browser-native")]
+use chromiumoxide::handler::viewport::Viewport;
+#[cfg(feature = "browser-native")]
+use chromiumoxide::page::Page;
+#[cfg(feature = "browser-native")]
+use futures_util::StreamExt;
+#[cfg(feature = "browser-native")]
 use tracing::{debug, error};
 
+#[cfg(feature = "browser-native")]
 pub struct BrowserBackend {
     browser: Browser,
     _handler_handle: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(feature = "browser-native")]
 impl BrowserBackend {
     pub async fn launch(headless: bool, chrome_path: Option<&str>) -> Result<Self> {
         let mut builder = BrowserConfig::builder()
@@ -62,16 +72,19 @@ impl BrowserBackend {
 }
 
 pub struct ChromiumManager {
+    #[cfg(feature = "browser-native")]
     backend: Arc<Mutex<Option<BrowserBackend>>>,
 }
 
 impl ChromiumManager {
     pub fn new() -> Self {
         Self {
+            #[cfg(feature = "browser-native")]
             backend: Arc::new(Mutex::new(None)),
         }
     }
 
+    #[cfg(feature = "browser-native")]
     pub async fn get_page(&self, headless: bool, chrome_path: Option<&str>) -> Result<Page> {
         let mut lock = self.backend.lock().await;
         if lock.is_none() {
@@ -90,9 +103,12 @@ impl ChromiumManager {
     }
 
     pub async fn close(&self) -> Result<()> {
-        let mut lock = self.backend.lock().await;
-        if let Some(backend) = lock.take() {
-            backend.close().await?;
+        #[cfg(feature = "browser-native")]
+        {
+            let mut lock = self.backend.lock().await;
+            if let Some(backend) = lock.take() {
+                backend.close().await?;
+            }
         }
         Ok(())
     }
@@ -106,12 +122,14 @@ impl Default for ChromiumManager {
 
 // ── Core Actions ─────────────────────────────────────────────────────────────
 
+#[cfg(feature = "browser-native")]
 pub async fn navigate(page: &Page, url: &str) -> Result<()> {
     page.goto(url).await?;
     page.wait_for_navigation().await?;
     Ok(())
 }
 
+#[cfg(feature = "browser-native")]
 pub async fn click(page: &Page, selector: &str) -> Result<()> {
     page.find_element(selector)
         .await
@@ -122,6 +140,7 @@ pub async fn click(page: &Page, selector: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "browser-native")]
 pub async fn type_text(page: &Page, selector: &str, text: &str) -> Result<()> {
     let element = page.find_element(selector)
         .await
@@ -132,14 +151,9 @@ pub async fn type_text(page: &Page, selector: &str, text: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "browser-native")]
 pub async fn get_content(page: &Page) -> Result<String> {
     page.content().await.context("Failed to get page content")
-}
-
-pub async fn screenshot(page: &Page) -> Result<Vec<u8>> {
-    page.screenshot(chromiumoxide::page::ScreenshotParams::builder().build())
-        .await
-        .context("Failed to take screenshot")
 }
 
 pub async fn open_in_brave(url: &str) -> anyhow::Result<()> {
@@ -202,6 +216,14 @@ pub async fn open_in_brave(url: &str) -> anyhow::Result<()> {
     }
 }
 
+#[cfg(feature = "browser-native")]
+pub async fn screenshot(page: &Page) -> Result<Vec<u8>> {
+    page.screenshot(chromiumoxide::page::ScreenshotParams::builder().build())
+        .await
+        .context("Failed to take screenshot")
+}
+
+#[cfg(feature = "browser-native")]
 pub async fn snapshot(
     page: &Page,
     interactive_only: bool,

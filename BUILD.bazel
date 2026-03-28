@@ -1,0 +1,219 @@
+"""Root BUILD file for ZeroClaw.
+
+Defines the main library and binary targets with feature flag support.
+Use `bazel run //:gazelle` to regenerate BUILD files from Cargo.toml.
+"""
+
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@gazelle//:def.bzl", "gazelle")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+package(default_visibility = ["//visibility:public"])
+
+# -----------------------------------------------------------------------------
+# Gazelle - Auto-generate BUILD files from Cargo.toml
+# Run: bazel run //:gazelle
+# gazelle:rust_lockfile Cargo.lock
+# gazelle:rust_crates_prefix @crates//
+# -----------------------------------------------------------------------------
+
+gazelle(
+    name = "gazelle",
+    gazelle = "@gazelle_rust//:gazelle_bin",
+)
+
+# -----------------------------------------------------------------------------
+# Feature Flag Config Settings
+# Enable with: bazel build //:zeroclaw --define=feature_<name>=true
+# -----------------------------------------------------------------------------
+
+config_setting(
+    name = "feature_matrix",
+    define_values = {"feature_matrix": "true"},
+)
+
+config_setting(
+    name = "feature_lark",
+    define_values = {"feature_lark": "true"},
+)
+
+config_setting(
+    name = "feature_postgres",
+    define_values = {"feature_postgres": "true"},
+)
+
+config_setting(
+    name = "feature_otel",
+    define_values = {"feature_otel": "true"},
+)
+
+config_setting(
+    name = "feature_hardware",
+    define_values = {"feature_hardware": "true"},
+)
+
+config_setting(
+    name = "feature_rpi",
+    define_values = {"feature_rpi": "true"},
+)
+
+config_setting(
+    name = "feature_browser_native",
+    define_values = {"feature_browser_native": "true"},
+)
+
+config_setting(
+    name = "feature_landlock",
+    define_values = {"feature_landlock": "true"},
+)
+
+config_setting(
+    name = "feature_probe",
+    define_values = {"feature_probe": "true"},
+)
+
+config_setting(
+    name = "feature_rag_pdf",
+    define_values = {"feature_rag_pdf": "true"},
+)
+
+config_setting(
+    name = "feature_whatsapp",
+    define_values = {"feature_whatsapp": "true"},
+)
+
+# -----------------------------------------------------------------------------
+# Core Library
+# Contains all src/**/*.rs except main.rs
+# -----------------------------------------------------------------------------
+
+rust_library(
+    name = "zeroclaw_lib",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = ["src/main.rs"],
+    ),
+    aliases = aliases(),
+    crate_features = select({
+        ":feature_matrix": ["channel-matrix"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_lark": ["channel-lark"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_postgres": ["memory-postgres"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_otel": ["observability-otel"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_hardware": ["hardware"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_rpi": ["peripheral-rpi"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_browser_native": ["browser-native"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_landlock": ["sandbox-landlock"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_probe": ["probe"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_rag_pdf": ["rag-pdf"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_whatsapp": ["whatsapp-web"],
+        "//conditions:default": [],
+    }),
+    compile_data = glob(["web/**"]),  # Embedded web assets
+    crate_name = "zeroclaw",
+    deps = all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+# -----------------------------------------------------------------------------
+# Main Binary
+# The binary has its own module tree (main.rs declares mod X) and also
+# imports from the library crate. Include all sources so mod declarations work.
+# -----------------------------------------------------------------------------
+
+rust_binary(
+    name = "zeroclaw",
+    srcs = glob(["src/**/*.rs"]),
+    aliases = aliases(),
+    compile_data = glob(["web/**"]),  # Embedded web assets
+    crate_features = select({
+        ":feature_matrix": ["channel-matrix"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_lark": ["channel-lark"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_postgres": ["memory-postgres"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_otel": ["observability-otel"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_hardware": ["hardware"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_rpi": ["peripheral-rpi"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_browser_native": ["browser-native"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_landlock": ["sandbox-landlock"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_probe": ["probe"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_rag_pdf": ["rag-pdf"],
+        "//conditions:default": [],
+    }) + select({
+        ":feature_whatsapp": ["whatsapp-web"],
+        "//conditions:default": [],
+    }),
+    crate_name = "zeroclaw",
+    deps = [
+        ":zeroclaw_lib",
+    ] + all_crate_deps(normal = True),
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+)
+
+# -----------------------------------------------------------------------------
+# Installation Target
+# Run: bazel run //:install
+# -----------------------------------------------------------------------------
+
+sh_binary(
+    name = "install",
+    srcs = ["scripts/bazel_install.sh"],
+    data = [":zeroclaw"],
+)
+
+# -----------------------------------------------------------------------------
+# Unit Tests (src/ inline tests)
+# -----------------------------------------------------------------------------
+
+rust_test(
+    name = "zeroclaw_lib_test",
+    crate = ":zeroclaw_lib",
+    deps = all_crate_deps(normal_dev = True),
+    proc_macro_deps = all_crate_deps(proc_macro_dev = True),
+)
+
+# -----------------------------------------------------------------------------
+# Exports
+# -----------------------------------------------------------------------------
+
+exports_files([
+    "Cargo.toml",
+    "Cargo.lock",
+])

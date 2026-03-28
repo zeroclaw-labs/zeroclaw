@@ -4,6 +4,30 @@ use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 
+/// Classification of model capability tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ModelTier {
+    /// Weak fallback models (e.g. 7B-14B parameter models).
+    Bronze = 0,
+    /// Capable mid-tier models (e.g. 30B-70B parameter models).
+    Silver = 1,
+    /// Frontier state-of-the-art models (e.g. GPT-4o, Claude 3.5 Sonnet, DeepSeek-R1).
+    Gold = 2,
+}
+
+impl ModelTier {
+    pub fn from_model_name(name: &str) -> Self {
+        let n = name.to_lowercase();
+        if n.contains("gpt-4") || n.contains("sonnet") || n.contains("opus") || n.contains("r1") || n.contains("o1") || n.contains("flash-exp") {
+            Self::Gold
+        } else if n.contains("70b") || n.contains("minimax-m2.5") || n.contains("qwen2.5-72b") || n.contains("llama-3.3") {
+            Self::Silver
+        } else {
+            Self::Bronze
+        }
+    }
+}
+
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -38,6 +62,11 @@ impl ChatMessage {
             role: "tool".into(),
             content: content.into(),
         }
+    }
+
+    /// Estimate token count using a fast heuristic (chars / 4).
+    pub fn estimated_tokens(&self) -> usize {
+        (self.content.chars().count() / 4).max(1)
     }
 }
 
@@ -264,6 +293,30 @@ pub trait Provider: Send + Sync {
         ProviderCapabilities::default()
     }
 
+    /// Returns an optional allowlist of tool names permitted for this provider.
+    /// If None, all registered tools are permitted.
+    fn allowed_tools(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Returns a list of MCP server commands to be injected for this provider.
+    fn mcp_servers(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Returns the current native session ID if applicable.
+    fn native_session_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Returns the number of messages successfully processed in the native session.
+    fn native_session_len(&self) -> usize {
+        0
+    }
+
+    /// Restores a previously saved native session state.
+    fn set_native_session_state(&self, _id: String, _len: usize) {}
+
     /// Convert tool specifications to provider-native format.
     ///
     /// Default implementation returns `PromptGuided` payload, which injects
@@ -462,10 +515,13 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     let mut instructions = String::new();
 
     instructions.push_str("## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags. ");
+    instructions.push_str("YOU MUST use this exact format:\n\n");
     instructions.push_str("<tool_call>\n");
-    instructions.push_str(r#"{"name": "tool_name", "arguments": {"param": "value"}}"#);
+    instructions.push_str(r#"{"name": "tool_name", "arguments": {"param1": "value1", "param2": "value2"}}"#);
     instructions.push_str("\n</tool_call>\n\n");
+    instructions.push_str("CRITICAL: All parameters must be inside the \"arguments\" object. ");
+    instructions.push_str("Do NOT use \"parameters\" or \"type: function\".\n\n");
     instructions.push_str("You may use multiple tool calls in a single response. ");
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
     instructions

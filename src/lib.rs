@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
-pub mod browser;
+pub mod web_engine;
 pub mod channels;
 pub mod config;
 pub(crate) mod cost;
@@ -321,14 +321,16 @@ pub enum MemoryCommands {
         /// Delete a single entry by key (supports prefix match)
         #[arg(long)]
         key: Option<String>,
-        /// Only clear entries in this category
+        /// Filter by category
         #[arg(long)]
         category: Option<String>,
         /// Skip confirmation prompt
-        #[arg(long)]
+        #[arg(long, short)]
         yes: bool,
     },
-}
+    /// Research and update prioritized list of free models based on benchmarks
+    RefreshRankings,
+    }
 
 /// Integration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

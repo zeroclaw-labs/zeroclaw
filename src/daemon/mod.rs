@@ -201,6 +201,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 Some(prompt),
                 None,
                 None,
+                "heartbeat".to_string(),
                 temp,
                 vec![],
                 false,

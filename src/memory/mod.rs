@@ -79,11 +79,14 @@ pub fn effective_memory_backend_name(
     memory_backend.trim().to_ascii_lowercase()
 }
 
-/// Legacy auto-save key used for model-authored assistant summaries.
-/// These entries are treated as untrusted context and should not be re-injected.
-pub fn is_assistant_autosave_key(key: &str) -> bool {
+/// Internal system keys used for state persistence rather than long-term memories.
+/// These entries are treated as internal state and should not be re-injected as context.
+pub fn is_internal_memory_key(key: &str) -> bool {
     let normalized = key.trim().to_ascii_lowercase();
-    normalized == "assistant_resp" || normalized.starts_with("assistant_resp_")
+    normalized == "assistant_resp"
+        || normalized.starts_with("assistant_resp_")
+        || normalized.starts_with("history_")
+        || normalized.starts_with("user_msg_")
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -376,12 +379,14 @@ mod tests {
     }
 
     #[test]
-    fn assistant_autosave_key_detection_matches_legacy_patterns() {
-        assert!(is_assistant_autosave_key("assistant_resp"));
-        assert!(is_assistant_autosave_key("assistant_resp_1234"));
-        assert!(is_assistant_autosave_key("ASSISTANT_RESP_abcd"));
-        assert!(!is_assistant_autosave_key("assistant_response"));
-        assert!(!is_assistant_autosave_key("user_msg_1234"));
+    fn internal_memory_key_detection() {
+        assert!(is_internal_memory_key("assistant_resp"));
+        assert!(is_internal_memory_key("assistant_resp_1234"));
+        assert!(is_internal_memory_key("history_default"));
+        assert!(is_internal_memory_key("user_msg_abcd"));
+        assert!(is_internal_memory_key("ASSISTANT_RESP_abcd"));
+        assert!(!is_internal_memory_key("assistant_response"));
+        assert!(!is_internal_memory_key("user_fact"));
     }
 
     #[test]

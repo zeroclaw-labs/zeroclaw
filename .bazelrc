@@ -1,0 +1,65 @@
+# ZeroClaw Bazel Configuration
+# Mirrors Cargo.toml release profile settings for parity
+
+# -----------------------------------------------------------------------------
+# Experimental Features (required for gazelle_rust)
+# -----------------------------------------------------------------------------
+common --experimental_isolated_extension_usages
+
+# -----------------------------------------------------------------------------
+# Rust Settings
+# -----------------------------------------------------------------------------
+# Note: experimental_per_crate_rustc_flag removed - incompatible with rules_rust 0.68+
+
+# -----------------------------------------------------------------------------
+# Release Profile (matches Cargo.toml [profile.release])
+# opt-level = "z", lto = "fat", codegen-units = 1, strip = true, panic = "abort"
+# Note: embed-bitcode=yes required for LTO (overrides rules_rust default)
+# -----------------------------------------------------------------------------
+build:release --compilation_mode=opt
+build:release --@rules_rust//rust/settings:extra_rustc_flags=-Copt-level=z,-Clto=fat,-Ccodegen-units=1,-Cpanic=abort,-Cembed-bitcode=yes
+build:release --strip=always
+
+# -----------------------------------------------------------------------------
+# Release-Fast Profile (matches Cargo.toml [profile.release-fast])
+# Same as release but with codegen-units = 8 for faster builds
+# -----------------------------------------------------------------------------
+build:release-fast --compilation_mode=opt
+build:release-fast --@rules_rust//rust/settings:extra_rustc_flags=-Copt-level=z,-Clto=fat,-Ccodegen-units=8,-Cpanic=abort,-Cembed-bitcode=yes
+build:release-fast --strip=always
+
+# -----------------------------------------------------------------------------
+# Dist Profile (matches Cargo.toml [profile.dist])
+# Identical to release for distribution builds
+# -----------------------------------------------------------------------------
+build:dist --compilation_mode=opt
+build:dist --@rules_rust//rust/settings:extra_rustc_flags=-Copt-level=z,-Clto=fat,-Ccodegen-units=1,-Cpanic=abort,-Cembed-bitcode=yes
+build:dist --strip=always
+
+# -----------------------------------------------------------------------------
+# Development (default)
+# -----------------------------------------------------------------------------
+build --compilation_mode=fastbuild
+
+# -----------------------------------------------------------------------------
+# Test Settings
+# -----------------------------------------------------------------------------
+test --test_output=errors
+
+# -----------------------------------------------------------------------------
+# Platform Configurations
+# -----------------------------------------------------------------------------
+build:linux --platforms=@rules_rust//rust/platform:linux
+build:macos --platforms=@rules_rust//rust/platform:darwin
+
+# -----------------------------------------------------------------------------
+# Remote Cache (optional - uncomment to enable)
+# -----------------------------------------------------------------------------
+# build --remote_cache=grpcs://cache.example.com
+
+# -----------------------------------------------------------------------------
+# CI Configuration
+# -----------------------------------------------------------------------------
+build:ci --config=release
+build:ci --verbose_failures
+test:ci --test_output=all

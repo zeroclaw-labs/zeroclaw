@@ -18,6 +18,7 @@
 
 pub mod anthropic;
 pub mod bedrock;
+pub mod cli;
 pub mod compatible;
 pub mod copilot;
 pub mod gemini;
@@ -41,6 +42,7 @@ use compatible::{AuthStyle, OpenAiCompatibleProvider};
 use reliable::ReliableProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::collections::HashMap;
 
 const MAX_API_ERROR_CHARS: usize = 200;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -675,6 +677,11 @@ pub struct ProviderRuntimeOptions {
     pub zeroclaw_dir: Option<PathBuf>,
     pub secrets_encrypt: bool,
     pub reasoning_enabled: Option<bool>,
+    pub cli_path: Option<String>,
+    pub cli_timeout_secs: Option<u64>,
+    pub cli_allowed_tools: Option<Vec<String>>,
+    pub cli_mcp_servers: Option<Vec<String>>,
+    pub cli_provider_overrides: HashMap<String, crate::config::schema::CliIndividualProviderConfig>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -684,6 +691,11 @@ impl Default for ProviderRuntimeOptions {
             zeroclaw_dir: None,
             secrets_encrypt: true,
             reasoning_enabled: None,
+            cli_path: None,
+            cli_timeout_secs: None,
+            cli_allowed_tools: None,
+            cli_mcp_servers: None,
+            cli_provider_overrides: HashMap::new(),
         }
     }
 }
@@ -835,7 +847,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
         "synthetic" => vec!["SYNTHETIC_API_KEY"],
-        "opencode" | "opencode-zen" => vec!["OPENCODE_API_KEY"],
+        "opencode-zen" => vec!["OPENCODE_API_KEY"],
         "vercel" | "vercel-ai" => vec!["VERCEL_API_KEY"],
         "cloudflare" | "cloudflare-ai" => vec!["CLOUDFLARE_API_KEY"],
         "ovhcloud" | "ovh" => vec!["OVH_AI_ENDPOINTS_ACCESS_TOKEN"],
@@ -981,6 +993,38 @@ fn create_provider_with_url_and_options(
         }
         "telnyx" => Ok(Box::new(telnyx::TelnyxProvider::new(key))),
 
+        // ── CLI-based providers (subprocess) ────────────────
+        "claude-cli" | "claude" => {
+            let config = options.cli_provider_overrides.get("claude").cloned().unwrap_or_default();
+            Ok(Box::new(cli::CliProvider::new_with_options(
+                "claude",
+                config.cli_path.as_deref().or(options.cli_path.as_deref()),
+                config.timeout_secs.or(options.cli_timeout_secs).unwrap_or(1800),
+                config.allowed_tools.or_else(|| options.cli_allowed_tools.clone()),
+                config.mcp_servers.or_else(|| options.cli_mcp_servers.clone()),
+            )))
+        }
+        "gemini-cli" => {
+            let config = options.cli_provider_overrides.get("gemini").cloned().unwrap_or_default();
+            Ok(Box::new(cli::CliProvider::new_with_options(
+                "gemini",
+                config.cli_path.as_deref().or(options.cli_path.as_deref()),
+                config.timeout_secs.or(options.cli_timeout_secs).unwrap_or(1800),
+                config.allowed_tools.or_else(|| options.cli_allowed_tools.clone()),
+                config.mcp_servers.or_else(|| options.cli_mcp_servers.clone()),
+            )))
+        }
+        "opencode-cli" | "opencode" => {
+            let config = options.cli_provider_overrides.get("opencode").cloned().unwrap_or_default();
+            Ok(Box::new(cli::CliProvider::new_with_options(
+                "opencode",
+                config.cli_path.as_deref().or(options.cli_path.as_deref()),
+                config.timeout_secs.or(options.cli_timeout_secs).unwrap_or(1800),
+                config.allowed_tools.or_else(|| options.cli_allowed_tools.clone()),
+                config.mcp_servers.or_else(|| options.cli_mcp_servers.clone()),
+            )))
+        }
+
         // ── OpenAI-compatible providers ──────────────────────
         "venice" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Venice", "https://api.venice.ai", key, AuthStyle::Bearer,
@@ -1015,7 +1059,7 @@ fn create_provider_with_url_and_options(
         "synthetic" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Synthetic", "https://api.synthetic.new/openai/v1", key, AuthStyle::Bearer,
         ))),
-        "opencode" | "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
+        "opencode-zen" => Ok(Box::new(OpenAiCompatibleProvider::new(
             "OpenCode Zen", "https://opencode.ai/zen/v1", key, AuthStyle::Bearer,
         ))),
         name if zai_base_url(name).is_some() => Ok(Box::new(OpenAiCompatibleProvider::new(
@@ -1314,13 +1358,30 @@ pub fn create_resilient_provider_with_options(
         }
     }
 
+    let mut fallbacks = reliability.model_fallbacks.clone();
+    
+    // Inject automatic silver-tier fallbacks for known volatile gold models
+    let gold_volatiles = [
+        "openrouter/deepseek/deepseek-r1:free",
+        "openrouter/google/gemini-2.0-flash-exp:free",
+        "openrouter/google/gemini-2.0-pro-exp-02-05:free",
+    ];
+    let silver_safe_bet = "opencode/minimax-m2.5-free".to_string();
+
+    for volatile in gold_volatiles {
+        let entry = fallbacks.entry(volatile.to_string()).or_default();
+        if !entry.contains(&silver_safe_bet) {
+            entry.push(silver_safe_bet.clone());
+        }
+    }
+
     let reliable = ReliableProvider::new(
         providers,
         reliability.provider_retries,
         reliability.provider_backoff_ms,
     )
     .with_api_keys(reliability.api_keys.clone())
-    .with_model_fallbacks(reliability.model_fallbacks.clone());
+    .with_model_fallbacks(fallbacks);
 
     Ok(Box::new(reliable))
 }
@@ -1463,6 +1524,12 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
+            name: "claude",
+            display_name: "Claude CLI",
+            aliases: &["claude-cli", "anthropic-cli"],
+            local: true,
+        },
+        ProviderInfo {
             name: "openai-codex",
             display_name: "OpenAI Codex (OAuth)",
             aliases: &["openai_codex", "codex"],
@@ -1475,10 +1542,10 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: true,
         },
         ProviderInfo {
-            name: "gemini",
-            display_name: "Google Gemini",
-            aliases: &["google", "google-gemini"],
-            local: false,
+            name: "gemini-cli",
+            display_name: "Google Gemini CLI",
+            aliases: &["gemini", "google", "google-gemini"],
+            local: true,
         },
         // ── OpenAI-compatible providers ──────────────────────
         ProviderInfo {
@@ -1518,9 +1585,15 @@ pub fn list_providers() -> Vec<ProviderInfo> {
             local: false,
         },
         ProviderInfo {
-            name: "opencode",
+            name: "opencode-cli",
+            display_name: "OpenCode CLI",
+            aliases: &["opencode"],
+            local: true,
+        },
+        ProviderInfo {
+            name: "opencode-zen",
             display_name: "OpenCode Zen",
-            aliases: &["opencode-zen"],
+            aliases: &[],
             local: false,
         },
         ProviderInfo {
@@ -2046,7 +2119,8 @@ mod tests {
 
     #[test]
     fn factory_opencode() {
-        assert!(create_provider("opencode", Some("key")).is_ok());
+        assert!(create_provider("opencode", None).is_ok());
+        assert!(create_provider("opencode-cli", None).is_ok());
         assert!(create_provider("opencode-zen", Some("key")).is_ok());
     }
 

@@ -461,7 +461,7 @@ async fn run_quick_setup_with_home(
         .await
         .context("Failed to create workspace directory")?;
 
-    let provider_name = provider.unwrap_or("openrouter").to_string();
+    let provider_name = provider.unwrap_or("opencode-cli").to_string();
     let model = model_override
         .map(str::to_string)
         .unwrap_or_else(|| default_model_for_provider(&provider_name));
@@ -626,7 +626,9 @@ fn canonical_provider_name(provider_name: &str) -> &str {
     match provider_name {
         "grok" => "xai",
         "together" => "together-ai",
-        "google" | "google-gemini" => "gemini",
+        "google" | "google-gemini" | "gemini" | "gemini-cli" => "gemini-cli",
+        "claude-cli" | "anthropic-cli" => "claude-cli",
+        "opencode-cli" | "opencode" => "opencode-cli",
         "kimi_coding" | "kimi_for_coding" => "kimi-code",
         "nvidia-nim" | "build.nvidia.com" => "nvidia",
         "aws-bedrock" => "bedrock",
@@ -678,10 +680,12 @@ fn default_model_for_provider(provider: &str) -> String {
         "minimax" => "MiniMax-M2.5".into(),
         "qwen" => "qwen-plus".into(),
         "qwen-code" => "qwen3-coder-plus".into(),
+        "opencode-cli" => "default".into(),
+        "claude-cli" => "default".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "sglang" | "vllm" | "osaurus" => "default".into(),
-        "gemini" => "gemini-2.5-pro".into(),
+        "gemini-cli" => "default".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
@@ -721,6 +725,14 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Llama 4 Maverick (open model)".to_string(),
             ),
         ],
+        "opencode-cli" => vec![(
+            "default".to_string(),
+            "Default (uses opencode best-free heuristic)".to_string(),
+        )],
+        "claude-cli" => vec![(
+            "default".to_string(),
+            "Default (native CLI mode)".to_string(),
+        )],
         "anthropic" => vec![
             (
                 "claude-sonnet-4-5-20250929".to_string(),
@@ -1074,7 +1086,13 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Claude Sonnet 4.5".to_string(),
             ),
         ],
-        "gemini" => vec![
+        "gemini-cli" => vec![
+            (
+                "default".to_string(),
+                "Default (uses gemini CLI session/auth)".to_string(),
+            ),
+        ],
+        "gemini-api" => vec![
             (
                 "gemini-3-pro-preview".to_string(),
                 "Gemini 3 Pro Preview (latest frontier reasoning)".to_string(),

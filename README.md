@@ -234,7 +234,7 @@ cd zeroclaw
 ./bootstrap.sh --prebuilt-only
 
 # Optional: run onboarding in the same flow
-./bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+./bootstrap.sh --onboard --api-key "sk-..." --provider opencode-cli [--model "default"]
 
 # Optional: run bootstrap + onboarding fully in Docker-compatible mode
 ./bootstrap.sh --docker
@@ -283,7 +283,7 @@ cargo install --path . --force --locked
 export PATH="$HOME/.cargo/bin:$PATH"
 
 # Quick setup (no prompts, optional model specification)
-zeroclaw onboard --api-key sk-... --provider openrouter [--model "openrouter/auto"]
+zeroclaw onboard --api-key sk-... --provider opencode-cli [--model "default"]
 
 # Or interactive wizard
 zeroclaw onboard --interactive
@@ -622,8 +622,8 @@ are hot-applied on the next inbound channel message.
 
 ```toml
 api_key = "sk-..."
-default_provider = "openrouter"
-default_model = "anthropic/claude-sonnet-4-6"
+default_provider = "opencode-cli"
+default_model = "default"
 default_temperature = 0.7
 
 # Custom OpenAI-compatible endpoint

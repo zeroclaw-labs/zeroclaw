@@ -38,7 +38,7 @@ Options:
   --onboard                  Run onboarding after install
   --interactive-onboard      Run interactive onboarding (implies --onboard)
   --api-key <key>            API key for non-interactive onboarding
-  --provider <id>            Provider for non-interactive onboarding (default: openrouter)
+  --provider <id>            Provider for non-interactive onboarding (default: opencode-cli)
   --model <id>               Model for non-interactive onboarding (optional)
   --build-first              Alias for explicitly enabling separate `cargo build --release --locked`
   --skip-build               Skip build step (`cargo build --release --locked` or Docker image build)
@@ -51,7 +51,7 @@ Examples:
   ./zeroclaw_install.sh --install-system-deps --install-rust
   ./zeroclaw_install.sh --prefer-prebuilt
   ./zeroclaw_install.sh --prebuilt-only
-  ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+  ./zeroclaw_install.sh --onboard --api-key "sk-..." --provider opencode-cli [--model "default"]
   ./zeroclaw_install.sh --interactive-onboard
 
   # Compatibility entrypoint:
@@ -65,7 +65,7 @@ Environment:
   ZEROCLAW_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
   ZEROCLAW_DOCKER_IMAGE      Docker image tag to build/run (default: zeroclaw-bootstrap:local)
   ZEROCLAW_API_KEY           Used when --api-key is not provided
-  ZEROCLAW_PROVIDER          Used when --provider is not provided (default: openrouter)
+  ZEROCLAW_PROVIDER          Used when --provider is not provided (default: opencode-cli)
   ZEROCLAW_MODEL             Used when --model is not provided
   ZEROCLAW_BOOTSTRAP_MIN_RAM_MB   Minimum RAM threshold for source build preflight (default: 2048)
   ZEROCLAW_BOOTSTRAP_MIN_DISK_MB  Minimum free disk threshold for source build preflight (default: 6144)
@@ -738,7 +738,7 @@ SKIP_INSTALL=false
 PREBUILT_INSTALLED=false
 CONTAINER_CLI="${ZEROCLAW_CONTAINER_CLI:-docker}"
 API_KEY="${ZEROCLAW_API_KEY:-}"
-PROVIDER="${ZEROCLAW_PROVIDER:-openrouter}"
+PROVIDER="${ZEROCLAW_PROVIDER:-opencode-cli}"
 MODEL="${ZEROCLAW_MODEL:-}"
 
 while [[ $# -gt 0 ]]; do
@@ -946,7 +946,7 @@ DONE
 
 Next steps:
   ./zeroclaw_install.sh --docker --interactive-onboard
-  ./zeroclaw_install.sh --docker --api-key "sk-..." --provider openrouter
+  ./zeroclaw_install.sh --docker --api-key "sk-..." --provider opencode-cli
 DONE
   exit 0
 fi

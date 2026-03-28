@@ -39,6 +39,7 @@ impl SystemPromptBuilder {
                 Box::new(WorkspaceSection),
                 Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
+                Box::new(DailyLogSection),
                 Box::new(IdentitySection),
             ],
         }
@@ -70,6 +71,27 @@ pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
 pub struct DateTimeSection;
+pub struct DailyLogSection;
+
+impl PromptSection for DailyLogSection {
+    fn name(&self) -> &str {
+        "daily_log"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        let mut prompt = String::new();
+        let date = Local::now().format("%Y-%m-%d").to_string();
+        let log_file = format!("memory/{}.md", date);
+        
+        inject_workspace_file(&mut prompt, ctx.workspace_dir, &log_file);
+        
+        if prompt.is_empty() {
+            Ok(String::new())
+        } else {
+            Ok(format!("## Today's Activity Log\n\n{}", prompt))
+        }
+    }
+}
 
 impl PromptSection for IdentitySection {
     fn name(&self) -> &str {
@@ -198,9 +220,12 @@ impl PromptSection for DateTimeSection {
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         let now = Local::now();
+        // Limit to Date (not exact time) to ensure the system prompt remains identical
+        // across turns during a session. This is critical for all API Context Caching
+        // strategies (e.g. Gemini Implicit Caching, Anthropic Prefix Caching).
         Ok(format!(
-            "## Current Date & Time\n\n{} ({})",
-            now.format("%Y-%m-%d %H:%M:%S"),
+            "## Current Date\n\n{} ({})",
+            now.format("%Y-%m-%d"),
             now.format("%Z")
         ))
     }
@@ -425,9 +450,9 @@ mod tests {
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
-        assert!(rendered.starts_with("## Current Date & Time\n\n"));
+        assert!(rendered.starts_with("## Current Date\n\n"));
 
-        let payload = rendered.trim_start_matches("## Current Date & Time\n\n");
+        let payload = rendered.trim_start_matches("## Current Date\n\n");
         assert!(payload.chars().any(|c| c.is_ascii_digit()));
         assert!(payload.contains(" ("));
         assert!(payload.ends_with(')'));

@@ -312,10 +312,10 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        // Outer: model fallback chain. Middle: provider priority. Inner: retries.
-        // Each iteration: attempt one (provider, model) call. On success, return
-        // immediately. On non-retryable error, break to next provider. On
-        // retryable error, sleep with exponential backoff and retry.
+        // ── Failover Strategy ────────────────────────────────────────────────
+        // We prioritize getting the HIGHEST quality model first.
+        // Therefore, we iterate through the models in the chain (Gold -> Silver -> Bronze).
+        // For EACH model, we try all available providers.
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
                 let mut backoff_ms = self.base_backoff_ms;
@@ -354,75 +354,23 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            // Rate-limit with rotatable keys: cycle to the next API key
-                            // so the retry hits a different quota bucket.
-                            if rate_limited && !non_retryable_rate_limit {
-                                if let Some(new_key) = self.rotate_key() {
-                                    tracing::warn!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        "Rate limited; key rotation selected key ending ...{} \
-                                         but cannot apply (Provider trait has no set_api_key). \
-                                         Retrying with original key.",
-                                        &new_key[new_key.len().saturating_sub(4)..]
-                                    );
-                                }
-                            }
-
                             if non_retryable {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
-
-                                if is_context_window_exceeded(&e) {
-                                    anyhow::bail!(
-                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
-                                        failures.join("\n")
-                                    );
-                                }
-
-                                break;
+                                break; // Try next provider for the same model
                             }
 
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "Provider call failed, retrying"
-                                );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
-            }
-
-            if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
-                );
             }
         }
 
         anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
+            "All providers and models failed. Final attempt trail:\n{}",
             failures.join("\n")
         )
     }
@@ -474,65 +422,23 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            if rate_limited && !non_retryable_rate_limit {
-                                if let Some(new_key) = self.rotate_key() {
-                                    tracing::warn!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        "Rate limited; key rotation selected key ending ...{} \
-                                         but cannot apply (Provider trait has no set_api_key). \
-                                         Retrying with original key.",
-                                        &new_key[new_key.len().saturating_sub(4)..]
-                                    );
-                                }
-                            }
-
                             if non_retryable {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
-
-                                if is_context_window_exceeded(&e) {
-                                    anyhow::bail!(
-                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
-                                        failures.join("\n")
-                                    );
-                                }
-
                                 break;
                             }
 
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "Provider call failed, retrying"
-                                );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
             }
         }
 
         anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
+            "All providers and models failed. Final attempt trail:\n{}",
             failures.join("\n")
         )
     }
@@ -598,65 +504,23 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            if rate_limited && !non_retryable_rate_limit {
-                                if let Some(new_key) = self.rotate_key() {
-                                    tracing::warn!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        "Rate limited; key rotation selected key ending ...{} \
-                                         but cannot apply (Provider trait has no set_api_key). \
-                                         Retrying with original key.",
-                                        &new_key[new_key.len().saturating_sub(4)..]
-                                    );
-                                }
-                            }
-
                             if non_retryable {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
-
-                                if is_context_window_exceeded(&e) {
-                                    anyhow::bail!(
-                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
-                                        failures.join("\n")
-                                    );
-                                }
-
                                 break;
                             }
 
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "Provider call failed, retrying"
-                                );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
             }
         }
 
         anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
+            "All providers and models failed. Final attempt trail:\n{}",
             failures.join("\n")
         )
     }
@@ -709,73 +573,23 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            if rate_limited && !non_retryable_rate_limit {
-                                if let Some(new_key) = self.rotate_key() {
-                                    tracing::warn!(
-                                        provider = provider_name,
-                                        error = %error_detail,
-                                        "Rate limited; key rotation selected key ending ...{} \
-                                         but cannot apply (Provider trait has no set_api_key). \
-                                         Retrying with original key.",
-                                        &new_key[new_key.len().saturating_sub(4)..]
-                                    );
-                                }
-                            }
-
                             if non_retryable {
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    error = %error_detail,
-                                    "Non-retryable error, moving on"
-                                );
-
-                                if is_context_window_exceeded(&e) {
-                                    anyhow::bail!(
-                                        "Request exceeds model context window; retries and fallbacks were skipped. Attempts:\n{}",
-                                        failures.join("\n")
-                                    );
-                                }
-
                                 break;
                             }
 
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
-                                tracing::warn!(
-                                    provider = provider_name,
-                                    model = *current_model,
-                                    attempt = attempt + 1,
-                                    backoff_ms = wait,
-                                    reason = failure_reason,
-                                    error = %error_detail,
-                                    "Provider call failed, retrying"
-                                );
                                 tokio::time::sleep(Duration::from_millis(wait)).await;
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
-            }
-
-            if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
-                );
             }
         }
 
         anyhow::bail!(
-            "All providers/models failed. Attempts:\n{}",
+            "All providers and models failed. Final attempt trail:\n{}",
             failures.join("\n")
         )
     }

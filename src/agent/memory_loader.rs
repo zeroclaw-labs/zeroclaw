@@ -45,7 +45,7 @@ impl MemoryLoader for DefaultMemoryLoader {
 
         let mut context = String::from("[Memory context]\n");
         for entry in entries {
-            if memory::is_assistant_autosave_key(&entry.key) {
+            if memory::is_internal_memory_key(&entry.key) {
                 continue;
             }
             if let Some(score) = entry.score {
@@ -197,7 +197,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_loader_skips_legacy_assistant_autosave_entries() {
+    async fn default_loader_skips_internal_keys() {
         let loader = DefaultMemoryLoader::new(5, 0.0);
         let memory = MockMemoryWithEntries {
             entries: Arc::new(vec![
@@ -212,6 +212,15 @@ mod tests {
                 },
                 MemoryEntry {
                     id: "2".into(),
+                    key: "history_bloat".into(),
+                    content: "massive JSON blob".into(),
+                    category: MemoryCategory::Conversation,
+                    timestamp: "now".into(),
+                    session_id: None,
+                    score: Some(0.99),
+                },
+                MemoryEntry {
+                    id: "3".into(),
                     key: "user_fact".into(),
                     content: "User prefers concise answers".into(),
                     category: MemoryCategory::Conversation,
@@ -225,6 +234,7 @@ mod tests {
         let context = loader.load_context(&memory, "answer style").await.unwrap();
         assert!(context.contains("user_fact"));
         assert!(!context.contains("assistant_resp_legacy"));
-        assert!(!context.contains("fabricated detail"));
+        assert!(!context.contains("history_bloat"));
+        assert!(!context.contains("massive JSON blob"));
     }
 }

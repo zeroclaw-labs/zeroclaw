@@ -311,7 +311,16 @@ Use these rules to keep the trait/factory architecture stable under growth.
 
 ## 8) Validation Matrix
 
+**Preferred build system: Bazel.** Use Bazel for all build and test operations whenever possible.
+
 Default local checks for code changes:
+
+```bash
+bazel build //:zeroclaw
+bazel test //tests:all
+```
+
+Fallback Cargo commands (if Bazel is unavailable):
 
 ```bash
 cargo fmt --all -- --check
@@ -327,8 +336,9 @@ Preferred local pre-PR validation path (recommended, not required):
 
 Notes:
 
+- Local Bazel-based validation is strongly preferred for consistency with CI.
 - Local Docker-based CI is strongly recommended when Docker is available.
-- Contributors are not blocked from opening a PR if local Docker CI is unavailable; in that case run the most relevant native checks and document what was run.
+- Contributors are not blocked from opening a PR if local Bazel/Docker CI is unavailable; in that case run the most relevant native checks and document what was run.
 
 Additional expectations by change type:
 

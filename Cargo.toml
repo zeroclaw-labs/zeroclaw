@@ -59,6 +59,7 @@ urlencoding = "2.1"
 
 # Optional Rust-native browser automation backend
 fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
+chromiumoxide = { version = "0.7", optional = true, default-features = false, features = ["tokio-runtime"] }
 
 # Error handling
 anyhow = "1.0"
@@ -87,6 +88,9 @@ parking_lot = "0.12"
 # Async traits
 async-trait = "0.1"
 
+# Temporary files for context management
+tempfile = "3.14"
+
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
 
@@ -106,6 +110,7 @@ console = "0.16"
 
 # Hardware discovery (device path globbing)
 glob = "0.3"
+trash = "5.2"
 
 # Binary discovery (init system detection)
 which = "8.0"
@@ -185,7 +190,7 @@ memory-postgres = ["dep:postgres"]
 observability-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
-browser-native = ["dep:fantoccini"]
+browser-native = ["dep:fantoccini", "dep:chromiumoxide"]
 # Backward-compatible alias for older invocations
 fantoccini = ["browser-native"]
 # Sandbox feature aliases used by cfg(feature = "sandbox-*")

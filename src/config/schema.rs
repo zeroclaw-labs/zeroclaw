@@ -1988,6 +1988,10 @@ pub struct RuntimeConfig {
     /// - `Some(false)`: disable reasoning/thinking when supported
     #[serde(default)]
     pub reasoning_enabled: Option<bool>,
+
+    /// CLI provider settings (used when `default_provider` is a CLI provider).
+    #[serde(default)]
+    pub cli: CliProviderConfig,
 }
 
 /// Docker runtime configuration (`[runtime.docker]` section).
@@ -2056,12 +2060,71 @@ impl Default for DockerRuntimeConfig {
     }
 }
 
+/// Individual CLI provider override configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct CliIndividualProviderConfig {
+    /// Path to the CLI binary.
+    #[serde(default)]
+    pub cli_path: Option<String>,
+    /// Timeout in seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Tools allowed for this specific provider.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    /// MCP servers to inject for this specific provider.
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<String>>,
+}
+
+/// CLI provider configuration (`[runtime.cli]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CliProviderConfig {
+    /// Path to the CLI binary (e.g., `/usr/local/bin/claude`).
+    /// If not specified, uses the CLI name from the provider (claude, gemini, opencode).
+    #[serde(default)]
+    pub cli_path: Option<String>,
+
+    /// Timeout in seconds for CLI command execution.
+    #[serde(default = "default_cli_timeout")]
+    pub timeout_secs: u64,
+
+    /// Global allowed tools for all CLI providers.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+
+    /// Global MCP servers for all CLI providers.
+    #[serde(default)]
+    pub mcp_servers: Option<Vec<String>>,
+
+    /// Per-provider overrides (e.g., `providers.opencode-cli`).
+    #[serde(default)]
+    pub providers: HashMap<String, CliIndividualProviderConfig>,
+}
+
+fn default_cli_timeout() -> u64 {
+    300
+}
+
+impl Default for CliProviderConfig {
+    fn default() -> Self {
+        Self {
+            cli_path: None,
+            timeout_secs: default_cli_timeout(),
+            allowed_tools: None,
+            mcp_servers: None,
+            providers: HashMap::new(),
+        }
+    }
+}
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             kind: default_runtime_kind(),
             docker: DockerRuntimeConfig::default(),
             reasoning_enabled: None,
+            cli: CliProviderConfig::default(),
         }
     }
 }
@@ -3428,8 +3491,8 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
             api_url: None,
-            default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
+            default_provider: Some("opencode-cli".to_string()),
+            default_model: Some("default".to_string()),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),

@@ -443,11 +443,15 @@ impl Memory for SqliteMemory {
         category: MemoryCategory,
         session_id: Option<&str>,
     ) -> anyhow::Result<()> {
-        // Compute embedding (async, before blocking work)
-        let embedding_bytes = self
-            .get_or_compute_embedding(content)
-            .await?
-            .map(|emb| vector::vec_to_bytes(&emb));
+        // Skip embedding for internal system keys (history, autosaves, etc.)
+        let embedding_bytes = if super::is_internal_memory_key(key) {
+            None
+        } else {
+            // Compute embedding (async, before blocking work)
+            self.get_or_compute_embedding(content)
+                .await?
+                .map(|emb| vector::vec_to_bytes(&emb))
+        };
 
         let conn = self.conn.clone();
         let key = key.to_string();

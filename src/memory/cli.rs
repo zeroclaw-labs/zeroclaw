@@ -23,7 +23,32 @@ pub async fn handle_command(command: crate::MemoryCommands, config: &Config) -> 
         crate::MemoryCommands::Clear { key, category, yes } => {
             handle_clear(config, key, category, yes).await
         }
+        crate::MemoryCommands::RefreshRankings => handle_refresh_rankings().await,
     }
+}
+
+async fn handle_refresh_rankings() -> Result<()> {
+    println!("🔍 Researching latest LLM benchmarks and updating free model priorities...");
+    
+    // Look for the script in the current directory or relative to the binary
+    let script_path = std::env::current_dir()?.join("scripts").join("refresh_model_priorities.sh");
+    
+    if !script_path.exists() {
+        bail!("Priority refresh script not found at: {}. Please ensure you are in the project root.", script_path.display());
+    }
+
+    let mut cmd = tokio::process::Command::new("bash");
+    cmd.arg(script_path);
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let status = cmd.status().await?;
+    if !status.success() {
+        bail!("Priority refresh failed with exit code: {:?}", status.code());
+    }
+
+    println!("\n{} Model rankings updated successfully.", style("✓").green().bold());
+    Ok(())
 }
 
 /// Create a lightweight memory backend for CLI management operations.

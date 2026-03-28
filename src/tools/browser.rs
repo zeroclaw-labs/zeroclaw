@@ -6,6 +6,7 @@
 //! Computer-use (OS-level) actions are supported via an optional sidecar endpoint.
 
 use super::traits::{Tool, ToolResult};
+use crate::web_engine as browser_mod;
 use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
@@ -67,7 +68,7 @@ pub struct BrowserTool {
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
-    chromium_manager: Arc<crate::browser::ChromiumManager>,
+    chromium_manager: Arc<browser_mod::ChromiumManager>,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -208,7 +209,7 @@ impl BrowserTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
         session_name: Option<String>,
-        chromium_manager: Arc<crate::browser::ChromiumManager>,
+        chromium_manager: Arc<browser_mod::ChromiumManager>,
     ) -> Self {
         Self::new_with_backend(
             security,
@@ -233,7 +234,7 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
-        chromium_manager: Arc<crate::browser::ChromiumManager>,
+        chromium_manager: Arc<browser_mod::ChromiumManager>,
     ) -> Self {
         Self {
             security,
@@ -379,6 +380,7 @@ impl BrowserTool {
         }
     }
 
+    #[cfg(feature = "browser-native")]
     async fn execute_chromiumoxide_action(
         &self,
         action: BrowserAction,
@@ -391,7 +393,7 @@ impl BrowserTool {
         match action {
             BrowserAction::Open { url } => {
                 self.validate_url(&url)?;
-                crate::browser::navigate(&page, &url).await?;
+                browser_mod::navigate(&page, &url).await?;
                 Ok(ToolResult {
                     success: true,
                     output: format!("Navigated to {}", url),
@@ -403,7 +405,7 @@ impl BrowserTool {
                 compact,
                 depth,
             } => {
-                let data = crate::browser::snapshot(&page, interactive_only, compact, depth).await?;
+                let data = browser_mod::snapshot(&page, interactive_only, compact, depth).await?;
                 Ok(ToolResult {
                     success: true,
                     output: serde_json::to_string_pretty(&data)?,
@@ -411,7 +413,7 @@ impl BrowserTool {
                 })
             }
             BrowserAction::Click { selector } => {
-                crate::browser::click(&page, &selector).await?;
+                browser_mod::click(&page, &selector).await?;
                 Ok(ToolResult {
                     success: true,
                     output: format!("Clicked element: {}", selector),
@@ -419,7 +421,7 @@ impl BrowserTool {
                 })
             }
             BrowserAction::Fill { selector, value } => {
-                crate::browser::type_text(&page, &selector, &value).await?;
+                browser_mod::type_text(&page, &selector, &value).await?;
                 Ok(ToolResult {
                     success: true,
                     output: format!("Filled {} into {}", value, selector),
@@ -427,7 +429,7 @@ impl BrowserTool {
                 })
             }
             BrowserAction::Type { selector, text } => {
-                crate::browser::type_text(&page, &selector, &text).await?;
+                browser_mod::type_text(&page, &selector, &text).await?;
                 Ok(ToolResult {
                     success: true,
                     output: format!("Typed text into {}", selector),
@@ -460,7 +462,7 @@ impl BrowserTool {
                 })
             }
             BrowserAction::Screenshot { .. } => {
-                let bytes = crate::browser::screenshot(&page).await?;
+                let bytes = browser_mod::screenshot(&page).await?;
                 let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
                 Ok(ToolResult {
                     success: true,
@@ -478,7 +480,7 @@ impl BrowserTool {
             }
             BrowserAction::Launch { url } => {
                 self.validate_url(&url)?;
-                crate::browser::open_in_brave(&url).await?;
+                browser_mod::open_in_brave(&url).await?;
                 Ok(ToolResult {
                     success: true,
                     output: format!("Launched Brave Browser at {}", url),
@@ -497,7 +499,10 @@ impl BrowserTool {
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
+            #[cfg(feature = "browser-native")]
             ResolvedBackend::Chromiumoxide => self.execute_chromiumoxide_action(action).await,
+            #[cfg(not(feature = "browser-native"))]
+            ResolvedBackend::Chromiumoxide => anyhow::bail!("chromiumoxide backend requires 'browser-native' feature"),
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
@@ -727,6 +732,16 @@ impl BrowserTool {
                 let resp = self.run_command(&args).await?;
                 self.to_result(resp)
             }
+
+            BrowserAction::Launch { url } => {
+                self.validate_url(&url)?;
+                browser_mod::open_in_brave(&url).await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Launched Brave Browser at {}", url),
+                    error: None,
+                })
+            }
         }
     }
 
@@ -935,20 +950,6 @@ impl BrowserTool {
                 body.trim()
             )),
         })
-    }
-
-    async fn execute_action(
-        &self,
-        action: BrowserAction,
-        backend: ResolvedBackend,
-    ) -> anyhow::Result<ToolResult> {
-        match backend {
-            ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
-            ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
-            ResolvedBackend::ComputerUse => anyhow::bail!(
-                "Internal error: computer_use backend must be handled before BrowserAction parsing"
-            ),
-        }
     }
 
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
@@ -2050,6 +2051,7 @@ fn backend_name(backend: ResolvedBackend) -> &'static str {
         ResolvedBackend::AgentBrowser => "agent_browser",
         ResolvedBackend::RustNative => "rust_native",
         ResolvedBackend::ComputerUse => "computer_use",
+        ResolvedBackend::Chromiumoxide => "chromiumoxide",
     }
 }
 
@@ -2294,7 +2296,7 @@ mod tests {
     #[test]
     fn validate_url_blocks_ipv6_ssrf() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["*".into()], None);
+        let tool = BrowserTool::new(security, vec!["*".into()], None, Arc::new(browser_mod::ChromiumManager::new()));
         assert!(tool.validate_url("https://[::1]/").is_err());
         assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
         assert!(tool
@@ -2353,7 +2355,7 @@ mod tests {
     #[test]
     fn browser_tool_default_backend_is_agent_browser() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None, Arc::new(browser_mod::ChromiumManager::new()));
         assert_eq!(
             tool.configured_backend().unwrap(),
             BrowserBackendKind::AgentBrowser
@@ -2372,6 +2374,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Arc::new(browser_mod::ChromiumManager::new()),
         );
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
@@ -2388,6 +2391,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            Arc::new(browser_mod::ChromiumManager::new()),
         );
         assert_eq!(
             tool.configured_backend().unwrap(),
@@ -2410,6 +2414,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            Arc::new(browser_mod::ChromiumManager::new()),
         );
 
         assert!(tool.computer_use_endpoint_url().is_err());
@@ -2431,6 +2436,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            Arc::new(browser_mod::ChromiumManager::new()),
         );
 
         assert!(tool.computer_use_endpoint_url().is_ok());
@@ -2452,6 +2458,7 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            Arc::new(browser_mod::ChromiumManager::new()),
         );
 
         assert!(tool
@@ -2468,14 +2475,14 @@ mod tests {
     #[test]
     fn browser_tool_name() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None, Arc::new(browser_mod::ChromiumManager::new()));
         assert_eq!(tool.name(), "browser");
     }
 
     #[test]
     fn browser_tool_validates_url() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec!["example.com".into()], None);
+        let tool = BrowserTool::new(security, vec!["example.com".into()], None, Arc::new(browser_mod::ChromiumManager::new()));
 
         // Valid
         assert!(tool.validate_url("https://example.com").is_ok());
@@ -2498,7 +2505,7 @@ mod tests {
     #[test]
     fn browser_tool_empty_allowlist_blocks() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = BrowserTool::new(security, vec![], None);
+        let tool = BrowserTool::new(security, vec![], None, Arc::new(browser_mod::ChromiumManager::new()));
         assert!(tool.validate_url("https://example.com").is_err());
     }
 

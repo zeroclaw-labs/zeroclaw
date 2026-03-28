@@ -70,6 +70,7 @@ mod integrations;
 mod memory;
 mod migration;
 mod multimodal;
+mod web_engine;
 mod observability;
 mod onboard;
 mod peripherals;
@@ -124,8 +125,13 @@ enum EstopLevelArg {
 #[command(version)]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
+    /// Override the default configuration directory (~/.zeroclaw)
     #[arg(long, global = true)]
     config_dir: Option<String>,
+
+    /// Use a dedicated profile (config stored in ~/.zeroclaw-<profile>)
+    #[arg(long, global = true)]
+    profile: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -186,6 +192,10 @@ Examples:
         /// Model to use
         #[arg(long)]
         model: Option<String>,
+
+        /// Session ID for conversation and memory isolation
+        #[arg(short, long, default_value = "default")]
+        session: String,
 
         /// Temperature (0.0 - 2.0)
         #[arg(short, long, default_value = "0.7", value_parser = parse_temperature)]
@@ -405,7 +415,7 @@ Examples:
         peripheral_command: zeroclaw::PeripheralCommands,
     },
 
-    /// Manage agent memory (list, get, stats, clear)
+    /// Manage agent memory (list, get, stats, clear, refresh-rankings)
     #[command(long_about = "\
 Manage agent memory entries.
 
@@ -418,7 +428,8 @@ Examples:
   zeroclaw memory list
   zeroclaw memory list --category core --limit 10
   zeroclaw memory get <key>
-  zeroclaw memory clear --category conversation --yes")]
+  zeroclaw memory clear --category conversation --yes
+  zeroclaw memory refresh-rankings")]
     Memory {
         #[command(subcommand)]
         memory_command: MemoryCommands,
@@ -638,6 +649,8 @@ enum MemoryCommands {
         #[arg(long)]
         yes: bool,
     },
+    /// Research and update prioritized list of free models based on benchmarks
+    RefreshRankings,
 }
 
 #[tokio::main]
@@ -651,6 +664,14 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+
+    if let Some(profile) = &cli.profile {
+        if let Some(base) = directories::BaseDirs::new() {
+            let profile_dir = base.home_dir().join(".zeroclaw").join("profiles").join(profile);
+            let dir_str = profile_dir.to_string_lossy().to_string();
+            std::env::set_var("ZEROCLAW_CONFIG_DIR", dir_str);
+        }
+    }
 
     if let Some(config_dir) = &cli.config_dir {
         if config_dir.trim().is_empty() {
@@ -756,6 +777,7 @@ async fn main() -> Result<()> {
             message,
             provider,
             model,
+            session,
             temperature,
             peripheral,
         } => agent::run(
@@ -763,6 +785,7 @@ async fn main() -> Result<()> {
             message,
             provider,
             model,
+            session,
             temperature,
             peripheral,
             true,

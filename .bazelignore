@@ -1,0 +1,18 @@
+# Directories to exclude from Bazel build
+# These contain separate build systems or complex cross-compilation targets
+
+# Firmware targets (ESP32, Arduino, Nucleo) - complex cross-compilation
+# Out of scope for initial migration
+firmware/
+
+# Fuzz testing has its own Cargo setup
+fuzz/
+
+# Target directory (Cargo build artifacts)
+target/
+
+# Python scripts (not Bazel-managed)
+python/
+
+# Development scripts
+dev/

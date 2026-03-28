@@ -165,6 +165,11 @@ async fn run_agent_job(
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
     let model_override = job.model.clone();
 
+    let session_id = match job.session_target {
+        SessionTarget::Main => "default".to_string(),
+        SessionTarget::Isolated => format!("cron-{}", job.id),
+    };
+
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             crate::agent::run(
@@ -172,6 +177,7 @@ async fn run_agent_job(
                 Some(prefixed_prompt),
                 None,
                 model_override,
+                session_id,
                 config.default_temperature,
                 vec![],
                 false,

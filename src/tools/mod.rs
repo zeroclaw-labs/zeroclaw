@@ -28,9 +28,11 @@ pub mod cron_update;
 pub mod delegate;
 pub mod file_edit;
 pub mod file_read;
+pub mod file_remove;
 pub mod file_write;
 pub mod git_operations;
 pub mod glob_search;
+pub mod mcp;
 pub mod hardware_board_info;
 pub mod hardware_memory_map;
 pub mod hardware_memory_read;
@@ -47,6 +49,8 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod shell;
+pub mod status_update;
+pub mod skills;
 pub mod traits;
 pub mod web_search_tool;
 
@@ -62,12 +66,10 @@ pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
+pub use file_remove::FileRemoveTool;
 pub use file_write::FileWriteTool;
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
-pub use hardware_board_info::HardwareBoardInfoTool;
-pub use hardware_memory_map::HardwareMemoryMapTool;
-pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
@@ -200,6 +202,7 @@ pub fn all_tools_with_runtime(
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
         Arc::new(FileWriteTool::new(security.clone())),
+        Arc::new(FileRemoveTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
         Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(ContentSearchTool::new(security.clone())),
@@ -226,9 +229,14 @@ pub fn all_tools_with_runtime(
             security.clone(),
             workspace_dir.to_path_buf(),
         )),
+        Arc::new(status_update::StatusUpdateTool::new()),
+        Arc::new(skills::SkillDeveloperTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
     ];
 
-    let chromium_manager = Arc::new(crate::browser::ChromiumManager::new());
+    let chromium_manager = Arc::new(crate::web_engine::ChromiumManager::new());
 
     if browser_config.enabled {
         // Add full browser automation tool (unified CDP + launcher)
@@ -316,6 +324,8 @@ pub fn all_tools_with_runtime(
                 cli_path: None,
                 cli_timeout_secs: None,
                 cli_allowed_tools: None,
+                cli_mcp_servers: None,
+                cli_provider_overrides: std::collections::HashMap::new(),
             },
         )
         .with_parent_tools(parent_tools)

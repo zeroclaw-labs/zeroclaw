@@ -1,0 +1,52 @@
+"""Bazel module configuration for ZeroClaw.
+
+This module migrates ZeroClaw from Cargo to Bazel using rules_rust, crate_universe,
+and gazelle_rust for automatic BUILD file generation.
+"""
+
+module(
+    name = "zeroclaw",
+    version = "0.1.6",
+)
+
+# Core rules (updated for Bazel 9.0.0 compatibility)
+bazel_dep(name = "rules_rust", version = "0.68.1")
+bazel_dep(name = "rules_foreign_cc", version = "0.15.1")
+bazel_dep(name = "rules_go", version = "0.59.0")
+bazel_dep(name = "rules_shell", version = "0.6.1")
+bazel_dep(name = "gazelle", version = "0.47.0")
+
+# Gazelle Rust - auto-generate BUILD files from Cargo.toml
+# No releases yet, so using latest commit
+GAZELLE_RUST_COMMIT = "47fbd90383fb504460e75ff208f0bce4ca5861c1"
+
+bazel_dep(name = "gazelle_rust", version = "0.1.0")
+
+archive_override(
+    module_name = "gazelle_rust",
+    strip_prefix = "gazelle_rust-{}".format(GAZELLE_RUST_COMMIT),
+    urls = ["https://github.com/Calsign/gazelle_rust/archive/{}.zip".format(GAZELLE_RUST_COMMIT)],
+)
+
+# Rust toolchain configuration
+# Requires Rust 1.91+ for floor_char_boundary (zeroclaw src), let_chains (rules_rust), edition 2024 (getrandom)
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["1.91.0"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains("@rust_toolchains//:all")
+
+# Crate dependencies from Cargo.toml via crate_universe
+crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = [
+        "//:Cargo.toml",
+        "//crates/robot-kit:Cargo.toml",
+    ],
+)
+use_repo(crate, "crates")

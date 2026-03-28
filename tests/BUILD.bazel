@@ -55,6 +55,9 @@ rust_test(
         "@crates//:serde_json",
         "@crates//:anyhow",
     ],
+    proc_macro_deps = [
+        "@crates//:async-trait",
+    ],
 )
 
 rust_test(
@@ -67,6 +70,7 @@ rust_test(
         "@crates//:tokio",
         "@crates//:serde_json",
         "@crates//:anyhow",
+        "@crates//:toml",
     ],
 )
 
@@ -80,6 +84,7 @@ rust_test(
         "@crates//:tokio",
         "@crates//:serde_json",
         "@crates//:anyhow",
+        "@crates//:toml",
     ],
 )
 
@@ -105,6 +110,9 @@ rust_test(
         "@crates//:tokio",
         "@crates//:serde_json",
         "@crates//:anyhow",
+    ],
+    proc_macro_deps = [
+        "@crates//:async-trait",
     ],
 )
 
@@ -138,6 +146,7 @@ rust_test(
     name = "otel_dependency_feature_regression",
     srcs = ["otel_dependency_feature_regression.rs"],
     data = glob(["fixtures/**"]),
+    compile_data = ["//:Cargo.toml"],
     deps = [
         "//:zeroclaw_lib",
         "@crates//:anyhow",
@@ -192,6 +201,7 @@ rust_test(
         "@crates//:tokio",
         "@crates//:serde_json",
         "@crates//:anyhow",
+        "@crates//:wiremock",
     ],
 )
 
@@ -204,6 +214,9 @@ rust_test(
         "@crates//:tokio",
         "@crates//:serde_json",
         "@crates//:anyhow",
+        "@crates//:hmac",
+        "@crates//:sha2",
+        "@crates//:hex",
     ],
 )
 

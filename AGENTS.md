@@ -45,6 +45,13 @@ These codebase realities should drive every design decision:
 5. **The project now runs in high-concurrency collaboration mode**
     - CI + docs governance + label routing are part of the product delivery system.
     - PR throughput is a design constraint; not just a maintainer inconvenience.
+6. **Build system is Bazel for reproducible builds**
+    - Bazel provides reproducible builds across environments
+    - Build targets are defined in `BUILD.bazel` files
+    - Use `bazel build //...` for complete builds, `bazel build //src:zeroclaw` for specific targets
+    - Bazel ensures consistent dependency resolution and compilation
+    - Cross-compilation and multi-language builds are supported
+    - Caching and incremental builds optimize development workflow
 
 ## 3) Engineering Principles (Normative)
 
@@ -312,24 +319,28 @@ Use these rules to keep the trait/factory architecture stable under growth.
 
 ## 8) Validation Matrix
 
-Default local checks for code changes:
+Default local checks for code changes (Bazel is the primary build system):
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-```
+# Build all targets
+bazel build //...
 
-Preferred local pre-PR validation path (recommended, not required):
+# Run all tests
+bazel test //...
 
-```bash
-./dev/ci.sh all
+# Run specific target (e.g., the main binary)
+bazel run //:zeroclaw -- --help
 ```
 
 Notes:
 
+- Bazel is the **primary build system** and should be used for all reproducible builds and tests.
 - Local Docker-based CI is strongly recommended when Docker is available.
 - Contributors are not blocked from opening a PR if local Docker CI is unavailable; in that case run the most relevant native checks and document what was run.
+- Bazel ensures consistent dependency resolution and compilation across environments.
+- Cross-compilation and multi-language builds are supported with Bazel.
+- Caching and incremental builds optimize development workflow with Bazel.
+- Cargo commands (`cargo build`, `cargo test`) are supported for local development but Bazel is the source of truth for CI and releases.
 
 Additional expectations by change type:
 

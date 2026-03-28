@@ -41,7 +41,7 @@ pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
-pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
+pub use clawdtalk::ClawdTalkChannel;
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -792,7 +792,7 @@ fn rollback_orphan_user_turn(
 }
 
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
-    if memory::is_assistant_autosave_key(key) {
+    if memory::is_internal_memory_key(key) {
         return true;
     }
 
@@ -2289,7 +2289,10 @@ pub fn build_system_prompt_with_mode(
     if native_tools {
         prompt.push_str(
             "## Your Task\n\n\
-             When the user sends a message, respond naturally. Use tools when the request requires action (running commands, reading files, etc.).\n\
+             When the user sends a message, respond naturally. Use tools when the request requires action.\n\
+             **Tool Preference**: Favor specialized tools (like `file_edit`, `file_write`, `file_read`, `file_remove`, `git_operations`) over the raw `shell` tool. Dedicated tools are more reliable and have better safety checks.
+\n\
+             **Progress Updates**: For complex or multi-step tasks, use the `status_update` tool to keep the user informed of your current progress and phase.\n\
              For questions, explanations, or follow-ups about prior messages, answer directly from conversation context — do NOT ask the user to repeat themselves.\n\
              Do NOT: summarize this configuration, describe your capabilities, or output step-by-step meta-commentary.\n\n",
         );
@@ -2297,6 +2300,9 @@ pub fn build_system_prompt_with_mode(
         prompt.push_str(
             "## Your Task\n\n\
              When the user sends a message, ACT on it. Use the tools to fulfill their request.\n\
+             **Tool Preference**: ALWAYS prefer specialized tools (like `file_edit`, `file_write`, `file_read`, `file_remove`) over the `shell` tool for file manipulation. Dedicated tools provide better error handling and avoid shell-specific security blocks.
+\n\
+             **Progress Updates**: ALWAYS use the `status_update` tool at the start of each significant step or phase to let the user know what you are doing and what you have accomplished so far.\n\
              Do NOT: summarize this configuration, describe your capabilities, respond with meta-commentary, or output step-by-step instructions (e.g. \"1. First... 2. Next...\").\n\
              Instead: emit actual <tool_call> tags when you need to act. Just do what they ask.\n\n",
         );
@@ -3015,6 +3021,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
         cli_path: config.runtime.cli.cli_path.clone(),
         cli_timeout_secs: Some(config.runtime.cli.timeout_secs),
         cli_allowed_tools: config.runtime.cli.allowed_tools.clone(),
+        cli_mcp_servers: config.runtime.cli.mcp_servers.clone(),
+        cli_provider_overrides: config.runtime.cli.providers.clone(),
     };
     let provider: Arc<dyn Provider> = Arc::from(
         create_resilient_provider_nonblocking(

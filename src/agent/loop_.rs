@@ -167,7 +167,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str, min_relevance_score: f6
         if !relevant.is_empty() {
             context.push_str("[Memory context]\n");
             for entry in &relevant {
-                if memory::is_assistant_autosave_key(&entry.key) {
+                if memory::is_internal_memory_key(&entry.key) {
                     continue;
                 }
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
@@ -316,8 +316,24 @@ fn parse_tool_call_value(value: &serde_json::Value) -> Option<ParsedToolCall> {
         return None;
     }
 
-    let arguments =
+    let mut arguments =
         parse_arguments_value(value.get("arguments").or_else(|| value.get("parameters")));
+
+    // Fallback: If arguments is empty and this is a flat JSON structure,
+    // extract all other keys as arguments. This handles cases where the LLM
+    // hallucinates the schema and omits the "arguments" wrapper.
+    if arguments.is_object() && arguments.as_object().unwrap().is_empty() && value.is_object() {
+        let mut flat_args = serde_json::Map::new();
+        for (k, v) in value.as_object().unwrap() {
+            if k != "name" && k != "id" && k != "type" && k != "tool_call_id" {
+                flat_args.insert(k.clone(), v.clone());
+            }
+        }
+        if !flat_args.is_empty() {
+            arguments = serde_json::Value::Object(flat_args);
+        }
+    }
+
     Some(ParsedToolCall {
         name,
         arguments,
@@ -364,6 +380,9 @@ fn is_xml_meta_tag(tag: &str) -> bool {
             | "toolcall"
             | "tool-call"
             | "invoke"
+            | "parameter"
+            | "minimax:tool_call"
+            | "minimax:toolcall"
             | "thinking"
             | "thought"
             | "analysis"
@@ -374,7 +393,10 @@ fn is_xml_meta_tag(tag: &str) -> bool {
 
 /// Match opening XML tags: `<tag_name>`.  Does NOT use backreferences.
 static XML_OPEN_TAG_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_-]*)>").unwrap());
+    LazyLock::new(|| Regex::new(r"<([a-zA-Z_][a-zA-Z0-9_:-]*)(?:\s+[^>]*)?>").unwrap());
+
+static MINIMAX_WRAPPER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?is)</?minimax:tool[_-]?call\b[^>]*>"#).unwrap());
 
 /// MiniMax XML invoke format:
 /// `<invoke name="shell"><parameter name="command">pwd</parameter></invoke>`
@@ -400,13 +422,27 @@ fn extract_xml_pairs(input: &str) -> Vec<(&str, &str)> {
         let tag_name = open_cap.get(1).unwrap().as_str();
         let open_end = search_start + full_open.end();
 
+        // For closing tags, we ignore any namespace prefix if the tag matches
         let closing_tag = format!("</{tag_name}>");
         if let Some(close_pos) = input[open_end..].find(&closing_tag) {
             let inner = &input[open_end..open_end + close_pos];
             results.push((tag_name, inner.trim()));
             search_start = open_end + close_pos + closing_tag.len();
         } else {
-            search_start = open_end;
+            // Also try closing tag without namespace if the opening had one
+            let base_tag = if let Some(colon_idx) = tag_name.find(':') {
+                &tag_name[colon_idx + 1..]
+            } else {
+                tag_name
+            };
+            let alt_closing = format!("</{base_tag}>");
+            if let Some(close_pos) = input[open_end..].find(&alt_closing) {
+                let inner = &input[open_end..open_end + close_pos];
+                results.push((tag_name, inner.trim()));
+                search_start = open_end + close_pos + alt_closing.len();
+            } else {
+                search_start = open_end;
+            }
         }
     }
     results
@@ -563,14 +599,8 @@ fn parse_minimax_invoke_calls(response: &str) -> Option<(String, Vec<ParsedToolC
         text_parts.push(after.to_string());
     }
 
-    let text = text_parts
-        .join("\n")
-        .replace("<minimax:tool_call>", "")
-        .replace("</minimax:tool_call>", "")
-        .replace("<minimax:toolcall>", "")
-        .replace("</minimax:toolcall>", "")
-        .trim()
-        .to_string();
+    let joined = text_parts.join("\n");
+    let text = MINIMAX_WRAPPER_RE.replace_all(&joined, "").trim().to_string();
 
     Some((text, calls))
 }
@@ -1279,9 +1309,13 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
             }
 
             if !parsed_any {
-                tracing::warn!(
-                    "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM)"
-                );
+                let inner_trimmed = inner.trim();
+                if !inner_trimmed.is_empty() {
+                    tracing::warn!(
+                        body = %inner_trimmed,
+                        "Malformed <tool_call>: expected tool-call object in tag body (JSON/XML/GLM)"
+                    );
+                }
             }
 
             remaining = &after_open[close_idx + close_tag.len()..];
@@ -1849,9 +1883,21 @@ pub(crate) async fn run_tool_call_loop(
         max_tool_iterations
     };
 
+    let allowed_tools = provider.allowed_tools();
     let tool_specs: Vec<crate::tools::ToolSpec> = tools_registry
         .iter()
-        .filter(|tool| !excluded_tools.iter().any(|ex| ex == tool.name()))
+        .filter(|tool| {
+            let name = tool.name();
+            // 1. Must not be explicitly excluded by the caller
+            if excluded_tools.iter().any(|ex| ex == name) {
+                return false;
+            }
+            // 2. If provider defines an allowlist, tool must be in it
+            if let Some(ref allowed) = allowed_tools {
+                return allowed.iter().any(|a: &String| a == name);
+            }
+            true
+        })
         .map(|tool| tool.spec())
         .collect();
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
@@ -1869,7 +1915,7 @@ pub(crate) async fn run_tool_call_loop(
         // Use initial_message_override for the very first LLM call if provided.
         // This allows providing context (like RAG) that shouldn't be persisted.
         let mut loop_history = if iteration == 0 {
-            if let Some(ref override_msg) = initial_message_override {
+            let mut h = if let Some(ref override_msg) = initial_message_override {
                 let mut h = conversation_manager.history().to_vec();
                 if let Some(last) = h.last_mut() {
                     if last.role == "user" {
@@ -1879,7 +1925,20 @@ pub(crate) async fn run_tool_call_loop(
                 h
             } else {
                 conversation_manager.history().to_vec()
+            };
+
+            // For non-native providers, inject tool definitions into the user message
+            // if not already present in the system prompt.
+            if !use_native_tools && !tool_specs.is_empty() {
+                let has_system_tools = h.iter().any(|m| m.role == "system" && m.content.contains("## Tool Use Protocol"));
+                if !has_system_tools {
+                    if let Some(last_user) = h.iter_mut().rfind(|m| m.role == "user") {
+                        let instructions = build_tool_instructions(tools_registry);
+                        last_user.content = format!("{}\n\n{}", last_user.content, instructions);
+                    }
+                }
             }
+            h
         } else {
             conversation_manager.history().to_vec()
         };
@@ -1961,7 +2020,7 @@ pub(crate) async fn run_tool_call_loop(
             chat_future.await
         };
 
-        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
+        let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls, parse_issue) =
             match chat_result {
                 Ok(resp) => {
                     let (resp_input_tokens, resp_output_tokens) = resp
@@ -1996,8 +2055,8 @@ pub(crate) async fn run_tool_call_loop(
                         calls = fallback_calls;
                     }
 
-                    if let Some(parse_issue) = detect_tool_call_parse_issue(&response_text, &calls)
-                    {
+                    let parse_issue = detect_tool_call_parse_issue(&response_text, &calls);
+                    if let Some(ref issue) = parse_issue {
                         runtime_trace::record_event(
                             "tool_call_parse_issue",
                             Some(channel_name),
@@ -2005,7 +2064,7 @@ pub(crate) async fn run_tool_call_loop(
                             Some(model),
                             Some(&turn_id),
                             Some(false),
-                            Some(&parse_issue),
+                            Some(issue),
                             serde_json::json!({
                                 "iteration": iteration + 1,
                                 "response_excerpt": truncate_with_ellipsis(
@@ -2057,6 +2116,19 @@ pub(crate) async fn run_tool_call_loop(
                         )
                     };
 
+                    // Show reasoning/thinking content if available
+                    if let Some(ref reasoning) = reasoning_content {
+                        if !silent {
+                            println!("\n\u{1f9e0} Thinking:\n{}\n", reasoning);
+                        }
+                    }
+
+                    // Update native session ID if provider emitted one
+                    if let Some(native_id) = provider.native_session_id() {
+                        let len = provider.native_session_len();
+                        conversation_manager.set_native_session_state(Some(native_id), len);
+                    }
+
                     let native_calls = resp.tool_calls;
                     (
                         response_text,
@@ -2064,6 +2136,7 @@ pub(crate) async fn run_tool_call_loop(
                         calls,
                         assistant_history_content,
                         native_calls,
+                        parse_issue,
                     )
                 }
                 Err(e) => {
@@ -2114,6 +2187,30 @@ pub(crate) async fn run_tool_call_loop(
         }
 
         if tool_calls.is_empty() {
+            // Check for parse issues before exiting. If there was a suspected tool call
+            // that failed to parse, trigger a reflection turn to let the model self-correct.
+            if let Some(issue) = parse_issue {
+                let reflection_prompt = format!(
+                    "ERROR: Your previous response contained a suspected tool call that could not be parsed: {}.\n\n\
+                    Please ensure you follow the tool use protocol strictly:\n\
+                    1. Use <tool_call> tags.\n\
+                    2. Use a valid JSON object with \"name\" and \"arguments\" keys.\n\
+                    3. Do not omit the \"arguments\" object.\n\n\
+                    Please try again.",
+                    issue
+                );
+
+                tracing::warn!(%issue, "Triggering reflection turn for malformed tool call");
+                
+                if let Some(ref tx) = on_delta {
+                    let _ = tx.send(format!("\u{26a0}\u{fe0f} Tool parse error: {issue}. Triggering self-correction...\n")).await;
+                }
+
+                conversation_manager.add_message(ChatMessage::assistant(response_text)).await?;
+                conversation_manager.add_message(ChatMessage::user(reflection_prompt)).await?;
+                continue;
+            }
+
             runtime_trace::record_event(
                 "turn_final_response",
                 Some(channel_name),
@@ -2516,6 +2613,7 @@ pub async fn run(
     message: Option<String>,
     provider_override: Option<String>,
     model_override: Option<String>,
+    session_id: String,
     temperature: f64,
     peripheral_overrides: Vec<String>,
     interactive: bool,
@@ -2571,6 +2669,26 @@ pub async fn run(
         &config,
     );
 
+    // ── MCP Tool Discovery ───────────────────────────────────────
+    if let Some(ref mcp_servers) = config.runtime.cli.mcp_servers {
+        for server_cmd in mcp_servers {
+            let parts: Vec<&str> = server_cmd.split_whitespace().collect();
+            if !parts.is_empty() {
+                let cmd = parts[0];
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                match tools::mcp::discover_mcp_tools(cmd, &args, security.clone()).await {
+                    Ok(mcp_tools) => {
+                        tracing::info!(count = mcp_tools.len(), server = cmd, "Discovered MCP tools");
+                        tools_registry.extend(mcp_tools);
+                    }
+                    Err(e) => {
+                        tracing::warn!(server = cmd, error = %e, "Failed to discover MCP tools");
+                    }
+                }
+            }
+        }
+    }
+
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     if !peripheral_tools.is_empty() {
@@ -2587,7 +2705,7 @@ pub async fn run(
     let model_name = model_override
         .as_deref()
         .or(config.default_model.as_deref())
-        .unwrap_or("anthropic/claude-sonnet-4");
+        .unwrap_or("default");
 
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -2597,6 +2715,8 @@ pub async fn run(
         cli_path: config.runtime.cli.cli_path.clone(),
         cli_timeout_secs: Some(config.runtime.cli.timeout_secs),
         cli_allowed_tools: config.runtime.cli.allowed_tools.clone(),
+        cli_mcp_servers: config.runtime.cli.mcp_servers.clone(),
+        cli_provider_overrides: config.runtime.cli.providers.clone(),
     };
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
@@ -2650,6 +2770,10 @@ pub async fn run(
             "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain.",
         ),
         (
+            "file_remove",
+            "Remove a file or directory. Supports trash by default. Use when: deleting temporary files, cleaning workspace, removing redundant notes.",
+        ),
+        (
             "memory_store",
             "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need.",
         ),
@@ -2660,6 +2784,10 @@ pub async fn run(
         (
             "memory_forget",
             "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
+        ),
+        (
+            "status_update",
+            "Provide a progress update or status report to the user. Use ALWAYS at the start of each significant step in a multi-step task.",
         ),
     ];
     tool_descs.push((
@@ -2805,9 +2933,16 @@ pub async fn run(
 
         let mut conversation_manager = ConversationManager::new(
             mem.clone(),
-            "default".to_string(), // TODO: allow session ID configuration
+            session_id.clone(),
             Some(config.agent.max_history_messages),
         );
+        // Attempt to resume previous native session
+        let _ = conversation_manager.load_from_memory().await;
+        if let Some(native_id) = conversation_manager.native_session_id() {
+            let len = conversation_manager.native_session_len();
+            provider.set_native_session_state(native_id.to_string(), len);
+        }
+
         // Single message mode: typically starts a fresh context unless we implement session resumption here too.
         conversation_manager.add_message(ChatMessage::system(&system_prompt)).await?;
         conversation_manager.add_message(ChatMessage::user(&enriched)).await?;
@@ -2841,12 +2976,17 @@ pub async fn run(
         // Persistent conversation history across turns
         let mut conversation_manager = ConversationManager::new(
             mem.clone(),
-            "cli".to_string(),
+            session_id.clone(),
             Some(config.agent.max_history_messages),
         );
 
         // Attempt to resume previous session
         let resumed = conversation_manager.load_from_memory().await.unwrap_or(false);
+        if let Some(native_id) = conversation_manager.native_session_id() {
+            let len = conversation_manager.native_session_len();
+            provider.set_native_session_state(native_id.to_string(), len);
+        }
+
         if resumed {
             println!("🦀 Resumed previous session.");
         } else {
@@ -3053,6 +3193,26 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         config.api_key.as_deref(),
         &config,
     );
+
+    // ── MCP Tool Discovery ───────────────────────────────────────
+    if let Some(ref mcp_servers) = config.runtime.cli.mcp_servers {
+        for server_cmd in mcp_servers {
+            let parts: Vec<&str> = server_cmd.split_whitespace().collect();
+            if !parts.is_empty() {
+                let cmd = parts[0];
+                let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+                match tools::mcp::discover_mcp_tools(cmd, &args, security.clone()).await {
+                    Ok(mcp_tools) => {
+                        tracing::info!(count = mcp_tools.len(), server = cmd, "Discovered MCP tools");
+                        tools_registry.extend(mcp_tools);
+                    }
+                    Err(e) => {
+                        tracing::warn!(server = cmd, error = %e, "Failed to discover MCP tools");
+                    }
+                }
+            }
+        }
+    }
     let peripheral_tools: Vec<Box<dyn Tool>> =
         crate::peripherals::create_peripheral_tools(&config.peripherals).await?;
     tools_registry.extend(peripheral_tools);
@@ -3061,7 +3221,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let model_name = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        .unwrap_or_else(|| "default".into());
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
         zeroclaw_dir: config.config_path.parent().map(std::path::PathBuf::from),
@@ -3070,6 +3230,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         cli_path: config.runtime.cli.cli_path.clone(),
         cli_timeout_secs: Some(config.runtime.cli.timeout_secs),
         cli_allowed_tools: config.runtime.cli.allowed_tools.clone(),
+        cli_mcp_servers: config.runtime.cli.mcp_servers.clone(),
+        cli_provider_overrides: config.runtime.cli.providers.clone(),
     };
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
@@ -3101,9 +3263,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
         ("file_write", "Write file contents."),
+        ("file_remove", "Remove a file or directory."),
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
+        ("status_update", "Provide a progress update or status report to the user."),
         (
             "model_routing_config",
             "Configure default model, scenario routing, and delegate agents.",
@@ -3182,6 +3346,13 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         "channel".to_string(), // TODO: allow session ID from channel
         Some(config.agent.max_history_messages),
     );
+    // Attempt to resume previous native session
+    let _ = conversation_manager.load_from_memory().await;
+    if let Some(native_id) = conversation_manager.native_session_id() {
+        let len = conversation_manager.native_session_len();
+        provider.set_native_session_state(native_id.to_string(), len);
+    }
+
     conversation_manager.add_message(ChatMessage::system(&system_prompt)).await?;
     conversation_manager.add_message(ChatMessage::user(&enriched)).await?;
 
@@ -3943,6 +4114,26 @@ Some text after."#;
     }
 
     #[test]
+    fn parse_tool_calls_handles_flat_json_hallucination() {
+        let response = r#"<tool_call>
+{"name": "shell", "command": "./gradlew tasks"}
+</tool_call>
+<tool_call>
+{"name": "content_search", "pattern": "sdk.dir", "path": "local.properties"}
+</tool_call>"#;
+
+        let (_, calls) = parse_tool_calls(response);
+        assert_eq!(calls.len(), 2);
+        
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments.get("command").unwrap().as_str().unwrap(), "./gradlew tasks");
+        
+        assert_eq!(calls[1].name, "content_search");
+        assert_eq!(calls[1].arguments.get("pattern").unwrap().as_str().unwrap(), "sdk.dir");
+        assert_eq!(calls[1].arguments.get("path").unwrap().as_str().unwrap(), "local.properties");
+    }
+
+    #[test]
     fn parse_tool_calls_text_before_and_after() {
         let response = r#"Before text.
 <tool_call>
@@ -4214,29 +4405,33 @@ Done."#;
     }
 
     #[test]
-    fn parse_tool_calls_handles_minimax_invoke_with_surrounding_text() {
-        let response = r#"Preface
-<minimax:tool_call>
-<invoke name='http_request'>
-<parameter name='url'>https://example.com</parameter>
-<parameter name='method'>GET</parameter>
-</invoke>
-</minimax:tool_call>
-Tail"#;
+    fn parse_tool_calls_handles_minimax_nested_tags() {
+        let response = r#"<minimax:tool_call>
+<tool_call>
+{"name": "shell", "arguments": {"command": "ls -la"}}
+</tool_call>
+</minimax:tool_call>"#;
 
         let (text, calls) = parse_tool_calls(response);
-        assert!(text.contains("Preface"));
-        assert!(text.contains("Tail"));
+        assert!(text.is_empty());
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].name, "http_request");
-        assert_eq!(
-            calls[0].arguments.get("url").unwrap().as_str().unwrap(),
-            "https://example.com"
-        );
-        assert_eq!(
-            calls[0].arguments.get("method").unwrap().as_str().unwrap(),
-            "GET"
-        );
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "ls -la");
+    }
+
+    #[test]
+    fn parse_tool_calls_handles_minimax_with_attributes() {
+        let response = r#"<minimax:toolcall provider="minimax">
+<invoke name="shell">
+<parameter name="command">whoami</parameter>
+</invoke>
+</minimax:toolcall>"#;
+
+        let (text, calls) = parse_tool_calls(response);
+        assert!(text.is_empty());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
+        assert_eq!(calls[0].arguments["command"], "whoami");
     }
 
     #[test]
@@ -4387,7 +4582,7 @@ Tail"#;
         .await
         .unwrap();
         mem.store(
-            "user_msg_real",
+            "user_fact_real",
             "User asked for concise status updates",
             MemoryCategory::Conversation,
             None,
@@ -4396,7 +4591,7 @@ Tail"#;
         .unwrap();
 
         let context = build_context(&mem, "status updates", 0.0).await;
-        assert!(context.contains("user_msg_real"));
+        assert!(context.contains("user_fact_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
     }
@@ -5069,6 +5264,57 @@ Let me check the result."#;
         // Tool names with special characters should be rejected
         assert!(parse_glm_shortened_body("not-a-tool>value").is_none());
         assert!(parse_glm_shortened_body("tool name>value").is_none());
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_triggers_reflection_on_malformed_call() {
+        // First turn: Malformed call (invalid JSON)
+        // Second turn: Success (after receiving reflection error)
+        // Third turn: Final answer
+        let responses = vec![
+            "I will call a tool: <tool_call>{\"name\": \"counting\", \"value\":",
+            "Sorry, let me try again: <tool_call>{\"name\": \"counting\", \"arguments\": {\"value\": \"ref\"}}</tool_call>",
+            "Done.",
+        ];
+        let mock = ScriptedProvider::from_text_responses(responses);
+
+        let mem = Arc::new(crate::memory::none::NoneMemory::new());
+        let mut cm = ConversationManager::new(mem, "test".into(), None);
+        cm.add_message(ChatMessage::user("List files")).await.unwrap();
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new("counting", invocations.clone()))];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &mock,
+            &mut cm,
+            &registry,
+            &observer,
+            "mock",
+            "model",
+            0.7,
+            true,
+            None,
+            "test",
+            &crate::config::MultimodalConfig::default(),
+            5,
+            None,
+            None,
+            None,
+            &[],
+            None,
+        ).await.unwrap();
+
+        assert_eq!(result, "Done.");
+        // History should contain: 1. User original, 2. Assistant malformed, 3. User reflection error, 4. Assistant valid call, 5. Tool result, 6. Assistant final
+        assert!(cm.history().len() >= 6);
+        let reflection_msg = &cm.history()[2];
+        assert_eq!(reflection_msg.role, "user");
+        assert!(reflection_msg.content.contains("ERROR: Your previous response contained a suspected tool call that could not be parsed"));
+        
+        // Ensure the tool was eventually called exactly once
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
