@@ -100,6 +100,8 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 # HOME: Ensures config discovery works under the non-root user.
 ENV ZEROCLAW_HOST=0.0.0.0
 ENV ZEROCLAW_PORT=8080
+ENV ZEROCLAW_ALLOW_PUBLIC_BIND=true
+ENV ZEROCLAW_REQUIRE_PAIRING=false
 ENV HOME=/app
 
 # Expose the gateway port.

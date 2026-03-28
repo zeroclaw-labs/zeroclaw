@@ -789,7 +789,16 @@ fn resolve_operator_llm_key(provider_name: &str) -> Option<String> {
         "anthropic" => "ADMIN_ANTHROPIC_API_KEY",
         "openai" => "ADMIN_OPENAI_API_KEY",
         "gemini" | "google" | "google-gemini" => "ADMIN_GEMINI_API_KEY",
+        "openrouter" => "ADMIN_OPENROUTER_API_KEY",
+        "deepseek" => "ADMIN_DEEPSEEK_API_KEY",
+        "groq" => "ADMIN_GROQ_API_KEY",
+        "mistral" => "ADMIN_MISTRAL_API_KEY",
+        "xai" | "grok" => "ADMIN_XAI_API_KEY",
         "perplexity" => "ADMIN_PERPLEXITY_API_KEY",
+        "together" | "together-ai" => "ADMIN_TOGETHER_API_KEY",
+        "fireworks" | "fireworks-ai" => "ADMIN_FIREWORKS_API_KEY",
+        "cohere" => "ADMIN_COHERE_API_KEY",
+        "venice" => "ADMIN_VENICE_API_KEY",
         _ => return None,
     };
     std::env::var(admin_env_var)

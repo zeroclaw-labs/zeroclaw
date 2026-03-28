@@ -37,6 +37,21 @@ TOML
         chmod 600 "${ZEROCLAW_DIR}/config.toml"
     fi
 
+    # Ensure [gateway] section has allow_public_bind = true (upgrade path).
+    if ! grep -q 'allow_public_bind' "${ZEROCLAW_DIR}/config.toml" 2>/dev/null; then
+        if grep -q '^\[gateway\]' "${ZEROCLAW_DIR}/config.toml" 2>/dev/null; then
+            sed -i '/^\[gateway\]/a allow_public_bind = true' "${ZEROCLAW_DIR}/config.toml"
+        else
+            printf '\n[gateway]\nallow_public_bind = true\nrequire_pairing = false\n' \
+                >> "${ZEROCLAW_DIR}/config.toml"
+        fi
+    fi
+
+    # Ensure require_pairing = false for Railway (upgrade path).
+    if grep -q 'require_pairing = true' "${ZEROCLAW_DIR}/config.toml" 2>/dev/null; then
+        sed -i 's/require_pairing = true/require_pairing = false/' "${ZEROCLAW_DIR}/config.toml"
+    fi
+
     # Ensure [auth] section exists in config (upgrade path for existing deploys).
     if ! grep -q '^\[auth\]' "${ZEROCLAW_DIR}/config.toml" 2>/dev/null; then
         printf '\n[auth]\nenabled = true\nallow_registration = true\n' \
