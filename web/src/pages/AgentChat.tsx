@@ -93,16 +93,17 @@ export default function AgentChat() {
 
     const nextLimit = loadedTotal + HISTORY_PAGE_SIZE;
     getSessionMessages(sessionId, nextLimit).then((result) => {
+      const msgs = result?.messages ?? [];
       setMessages(
-        result.messages.map((m) => ({
+        msgs.map((m) => ({
           id: generateUUID(),
           role: m.role === 'assistant' ? 'agent' : 'user',
           content: m.content,
           timestamp: new Date(),
         })) as ChatMessage[],
       );
-      setHasMore(result.has_more ?? false);
-      setLoadedTotal(result.messages.length);
+      setHasMore(result?.has_more ?? false);
+      setLoadedTotal(msgs.length);
 
       // Restore scroll position after DOM update
       requestAnimationFrame(() => {
@@ -161,16 +162,17 @@ export default function AgentChat() {
             setSessionId(sid);
             // First load should scroll to bottom to show latest messages
             getSessionMessages(sid, HISTORY_PAGE_SIZE).then((result) => {
+              const msgs = result?.messages ?? [];
               setMessages(
-                result.messages.map((m) => ({
+                msgs.map((m) => ({
                   id: generateUUID(),
                   role: m.role === 'assistant' ? 'agent' : 'user',
                   content: m.content,
                   timestamp: new Date(),
                 })) as ChatMessage[],
               );
-              setHasMore(result.has_more ?? false);
-              setLoadedTotal(result.messages.length);
+              setHasMore(result?.has_more ?? false);
+              setLoadedTotal(msgs.length);
             }).catch(() => {});
           } else if (msg.session_id) {
             setSessionId(msg.session_id);
