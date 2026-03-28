@@ -61,7 +61,15 @@ RUN cargo build --profile railway --locked -p zeroclaw 2>/dev/null || true
 RUN rm -rf src
 
 # Copy only source files needed for the final build.
+# include_str! and rust-embed reference these at compile time:
+#   - src/           → main source
+#   - templates/     → src/skills/templates.rs (include_str!)
+#   - firmware/      → src/peripherals/ (include_str!)
+#   - web/dist/      → src/gateway/static_files.rs (rust-embed)
+#   - benches/       → Cargo.toml [[bench]]
 COPY src/ src/
+COPY templates/ templates/
+COPY firmware/ firmware/
 COPY benches/ benches/
 # Use freshly built frontend assets from web-builder stage.
 COPY --from=web-builder /web/dist/ web/dist/
