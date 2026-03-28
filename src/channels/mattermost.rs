@@ -120,7 +120,11 @@ impl MattermostChannel {
         self
     }
 
-    pub fn with_credentials(mut self, bot_id: Option<String>, bot_password: Option<String>) -> Self {
+    pub fn with_credentials(
+        mut self,
+        bot_id: Option<String>,
+        bot_password: Option<String>,
+    ) -> Self {
         self.bot_id = bot_id;
         self.bot_password = bot_password;
         self
@@ -206,9 +210,7 @@ impl MattermostChannel {
                 channel_ids.join(", ")
             );
         } else {
-            tracing::info!(
-                "Mattermost channel listening (websocket) on all accessible channels"
-            );
+            tracing::info!("Mattermost channel listening (websocket) on all accessible channels");
         }
 
         let mut reconnect_attempt: u32 = 0;
@@ -299,7 +301,7 @@ impl MattermostChannel {
                             }
                         }
                     }
-                    Ok(Some(Ok(_))) => continue,
+                    Ok(Some(Ok(_))) => {}
                     _ => break,
                 }
             }
@@ -362,7 +364,7 @@ impl MattermostChannel {
                                 tracing::warn!("Mattermost WS: server closed connection");
                                 break;
                             }
-                            Some(Ok(_)) => continue,
+                            Some(Ok(_)) => {}
                             Some(Err(e)) => {
                                 tracing::warn!("Mattermost WS: read error: {e}");
                                 break;
@@ -495,10 +497,7 @@ impl MattermostChannel {
             .send()
             .await?;
         if !teams_resp.status().is_success() {
-            bail!(
-                "Mattermost: failed to list teams ({})",
-                teams_resp.status()
-            );
+            bail!("Mattermost: failed to list teams ({})", teams_resp.status());
         }
         let teams: Vec<serde_json::Value> = teams_resp.json().await?;
 
@@ -525,9 +524,7 @@ impl MattermostChannel {
             let ch_resp = match ch_resp {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!(
-                        "Mattermost: failed to list channels for team {team_id}: {e}"
-                    );
+                    tracing::warn!("Mattermost: failed to list channels for team {team_id}: {e}");
                     continue;
                 }
             };
@@ -733,19 +730,13 @@ impl Channel for MattermostChannel {
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         // Validate that we have at least one auth method.
-        if self.bot_token.is_none()
-            && (self.bot_id.is_none() || self.bot_password.is_none())
-        {
-            bail!(
-                "Mattermost requires either bot_token or both bot_id and bot_password"
-            );
+        if self.bot_token.is_none() && (self.bot_id.is_none() || self.bot_password.is_none()) {
+            bail!("Mattermost requires either bot_token or both bot_id and bot_password");
         }
         match self.listen_mode {
             ListenMode::WebSocket => {
                 if self.bot_id.is_none() || self.bot_password.is_none() {
-                    bail!(
-                        "Mattermost WebSocket mode requires both bot_id and bot_password"
-                    );
+                    bail!("Mattermost WebSocket mode requires both bot_id and bot_password");
                 }
                 self.listen_ws(tx).await
             }
@@ -2150,10 +2141,7 @@ mod tests {
             false,
             false,
         );
-        assert_eq!(
-            ch.scoped_channel_ids(),
-            Some(vec!["C_SINGLE".to_string()])
-        );
+        assert_eq!(ch.scoped_channel_ids(), Some(vec!["C_SINGLE".to_string()]));
     }
 
     #[test]
