@@ -28,5 +28,5 @@ jobs:
           file: docker/builder-aarch64.Dockerfile
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/zeroclaw-builder:latest
-            ghcr.io/${{ github.repository_owner }}/zeroclaw-builder:rust-1.93.0
+            ghcr.io/kairotan/zeroclaw-builder:latest
+            ghcr.io/kairotan/zeroclaw-builder:rust-1.93.0
