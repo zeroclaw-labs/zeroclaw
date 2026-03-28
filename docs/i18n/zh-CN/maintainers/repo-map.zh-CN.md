@@ -50,7 +50,7 @@ zeroclaw/
 ├── scripts/              # CI 脚本、发布自动化、引导脚本
 ├── docs/                 # 文档系统（多语言、运行时参考）
 ├── .github/              # CI 工作流、PR 模板、自动化
-├── playground/           # （空，实验性临时空间）
+├── playground/           # （git 忽略）Docker 开发工作区，运行时自动填充
 ├── Cargo.toml            # 工作区清单
 ├── Dockerfile            # 容器构建文件
 ├── docker-compose.yml    # 服务编排

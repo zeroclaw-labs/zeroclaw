@@ -50,7 +50,7 @@ zeroclaw/
 ├── scripts/              # CI scripts, release automation, bootstrap
 ├── docs/                 # Documentation system (multilingual, runtime refs)
 ├── .github/              # CI workflows, PR templates, automation
-├── playground/           # (empty, experimental scratch space)
+├── playground/           # (git-ignored) Docker dev workspace, auto-populated at runtime
 ├── Cargo.toml            # Workspace manifest
 ├── Dockerfile            # Container build
 ├── docker-compose.yml    # Service composition
