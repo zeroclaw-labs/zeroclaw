@@ -15875,7 +15875,7 @@ require_otp_to_resume = true
 
     // ── Docker baked config template ────────────────────────────
 
-    /// The TOML template baked into Docker images (Dockerfile + Dockerfile.debian).
+    /// The TOML template baked into Docker images (Dockerfile, targets: dev/release/debian).
     /// Kept here so changes to the Dockerfiles can be validated by `cargo test`.
     const DOCKER_CONFIG_TEMPLATE: &str = r#"
 workspace_dir = "/zeroclaw-data/workspace"
