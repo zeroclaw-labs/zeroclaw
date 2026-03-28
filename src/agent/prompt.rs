@@ -277,20 +277,57 @@ impl PromptSection for DateTimeSection {
     }
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
+        use chrono::{Duration, TimeZone as _};
+
         let now = Local::now();
         // Force Gregorian year to avoid confusion with local calendars (e.g. Buddhist calendar).
         let (year, month, day) = (now.year(), now.month(), now.day());
         let (hour, minute, second) = (now.hour(), now.minute(), now.second());
         let tz = now.format("%Z");
+        let offset = now.format("%:z");
+
+        // Pre-compute common relative date windows so small models don't have
+        // to do calendar arithmetic themselves (which they often get wrong).
+        let today_start = now
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|dt| now.timezone().from_local_datetime(&dt).unwrap())
+            .unwrap_or(now);
+        let today_end = now
+            .date_naive()
+            .and_hms_opt(23, 59, 59)
+            .map(|dt| now.timezone().from_local_datetime(&dt).unwrap())
+            .unwrap_or(now);
+
+        let fmt =
+            |dt: chrono::DateTime<chrono::Local>| dt.format("%Y-%m-%dT%H:%M:%S%:z").to_string();
+        let since_7d = fmt(today_start - Duration::days(7));
+        let since_30d = fmt(today_start - Duration::days(30));
+        let since_1d = fmt(today_start - Duration::days(1));
+        let until_now = fmt(today_end);
+
+        let tomorrow_start = fmt(today_start + Duration::days(1));
+        let tomorrow_end = fmt(today_end + Duration::days(1));
+        let until_7d_ahead = fmt(today_end + Duration::days(7));
+        let until_30d_ahead = fmt(today_end + Duration::days(30));
+        let today_start_s = fmt(today_start);
+        let yesterday_end = fmt(today_start - Duration::days(1) + Duration::seconds(86399));
 
         Ok(format!(
             "## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n\
              The following is the ABSOLUTE TRUTH regarding the current date and time. \
-             Use this for all relative time calculations (e.g. \"last 7 days\").\n\n\
+             Use these pre-computed values directly — do NOT recalculate them.\n\n\
              Date: {year:04}-{month:02}-{day:02}\n\
              Time: {hour:02}:{minute:02}:{second:02} ({tz})\n\
-             ISO 8601: {year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{}",
-            now.format("%:z")
+             ISO 8601: {year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{offset}\n\n\
+             Pre-computed date ranges (use these for time-range tool parameters):\n\
+             - \"today\"         → since={today_start_s} until={until_now}\n\
+             - \"yesterday\"     → since={since_1d} until={yesterday_end}\n\
+             - \"last 7 days\"   → since={since_7d} until={until_now}\n\
+             - \"last 30 days\"  → since={since_30d} until={until_now}\n\
+             - \"tomorrow\"      → since={tomorrow_start} until={tomorrow_end}\n\
+             - \"next 7 days\"   → since={today_start_s} until={until_7d_ahead}\n\
+             - \"next 30 days\"  → since={today_start_s} until={until_30d_ahead}"
         ))
     }
 }
