@@ -1,10 +1,10 @@
 use crate::cli_input::Input;
-#[cfg(feature = "channel-nostr")]
-use crate::config::schema::{default_nostr_relays, NostrConfig};
 use crate::config::schema::{
-    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NextcloudTalkConfig, QQConfig,
-    SignalConfig, StreamMode, WhatsAppChatPolicy, WhatsAppConfig, WhatsAppWebMode,
+    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, MattermostConfig, NextcloudTalkConfig,
+    QQConfig, SignalConfig, StreamMode, WhatsAppChatPolicy, WhatsAppConfig, WhatsAppWebMode,
 };
+#[cfg(feature = "channel-nostr")]
+use crate::config::schema::{NostrConfig, default_nostr_relays};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -19,7 +19,7 @@ use crate::providers::{
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
     is_zai_cn_alias,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use console::style;
 use dialoguer::{Confirm, Select};
 use serde::{Deserialize, Serialize};
@@ -145,6 +145,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         extra_headers: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        trust: crate::trust::TrustConfig::default(),
         backup: crate::config::BackupConfig::default(),
         data_retention: crate::config::DataRetentionConfig::default(),
         cloud_ops: crate::config::CloudOpsConfig::default(),
@@ -253,7 +254,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            // SAFETY: called during single-threaded onboarding wizard before async runtime.
+            unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -305,7 +307,8 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            // SAFETY: called during single-threaded onboarding wizard before async runtime.
+            unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -367,7 +370,8 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
                 style("Starting channel server...").white().bold()
             );
             println!();
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            // SAFETY: called during single-threaded onboarding wizard before async runtime.
+            unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -588,6 +592,7 @@ async fn run_quick_setup_with_home(
         extra_headers: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        trust: crate::trust::TrustConfig::default(),
         backup: crate::config::BackupConfig::default(),
         data_retention: crate::config::DataRetentionConfig::default(),
         cloud_ops: crate::config::CloudOpsConfig::default(),
@@ -842,6 +847,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
+        "copilot" => "gpt-4o".into(),
         "venice" => "zai-org-glm-5".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "mistral" => "mistral-large-latest".into(),
@@ -943,6 +949,22 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
+        ],
+        "copilot" => vec![
+            ("gpt-4o".to_string(), "GPT-4o (recommended)".to_string()),
+            ("gpt-4.1".to_string(), "GPT-4.1 (latest)".to_string()),
+            (
+                "gpt-5-mini".to_string(),
+                "GPT-5 mini (fast, efficient)".to_string(),
+            ),
+            (
+                "claude-sonnet-4-6".to_string(),
+                "Claude Sonnet 4.6 (balanced)".to_string(),
+            ),
+            (
+                "claude-opus-4-6".to_string(),
+                "Claude Opus 4.6 (best quality)".to_string(),
+            ),
         ],
         "venice" => vec![
             (
@@ -2343,6 +2365,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "openai-codex",
                 "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
             ),
+            (
+                "copilot",
+                "GitHub Copilot (Copilot subscription OAuth, no API key)",
+            ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
             ("xai", "xAI — Grok 3 & 4"),
@@ -2640,6 +2666,25 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         }
 
         key
+    } else if canonical_provider_name(provider_name) == "copilot" {
+        // GitHub Copilot uses OAuth device flow — no API key needed during setup.
+        // Check if a GITHUB_TOKEN is already available in the environment.
+        if std::env::var("GITHUB_TOKEN").is_ok() {
+            print_bullet(&format!(
+                "{} GITHUB_TOKEN environment variable detected!",
+                style("✓").green().bold()
+            ));
+            print_bullet("ZeroClaw will use it for GitHub Copilot authentication.");
+        } else {
+            print_bullet("GitHub Copilot uses OAuth device-flow authentication.");
+            print_bullet("No API key is needed — you'll be prompted to authorize on first run.");
+            print_bullet(&format!(
+                "Or set {} to use a pre-existing GitHub personal access token.",
+                style("GITHUB_TOKEN").yellow()
+            ));
+        }
+        println!();
+        String::new()
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
@@ -3065,6 +3110,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai-codex" | "openai" => "OPENAI_API_KEY",
+        "copilot" => "GITHUB_TOKEN",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
         "sglang" => "SGLANG_API_KEY",
@@ -3544,6 +3590,7 @@ enum ChannelMenuChoice {
     Linq,
     Irc,
     Webhook,
+    Mattermost,
     NextcloudTalk,
     DingTalk,
     QqOfficial,
@@ -3565,6 +3612,7 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::Linq,
     ChannelMenuChoice::Irc,
     ChannelMenuChoice::Webhook,
+    ChannelMenuChoice::Mattermost,
     ChannelMenuChoice::NextcloudTalk,
     ChannelMenuChoice::DingTalk,
     ChannelMenuChoice::QqOfficial,
@@ -3670,6 +3718,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "✅ configured"
                     } else {
                         "— HTTP endpoint"
+                    }
+                ),
+                ChannelMenuChoice::Mattermost => format!(
+                    "Mattermost {}",
+                    if config.mattermost.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— Self-hosted team chat"
                     }
                 ),
                 ChannelMenuChoice::NextcloudTalk => format!(
@@ -3938,6 +3994,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     interrupt_on_new_message: false,
                     mention_only: false,
                     proxy_url: None,
+                    stream_mode: StreamMode::MultiMessage,
+                    draft_update_interval_ms: 1000,
+                    multi_message_delay_ms: 800,
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -4073,6 +4132,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     proxy_url: None,
                     stream_drafts: false,
                     draft_update_interval_ms: 1200,
+                    cancel_reaction: None,
                 });
             }
             ChannelMenuChoice::IMessage => {
@@ -4140,13 +4200,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let access_token: String =
-                    Input::new().with_prompt("  Access token").interact_text()?;
-
-                if access_token.trim().is_empty() {
-                    println!("  {} Skipped — token required", style("→").dim());
-                    continue;
-                }
+                let access_token: String = dialoguer::Password::new()
+                    .with_prompt("  Access token")
+                    .allow_empty_password(false)
+                    .interact()?;
 
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 let hs = homeserver.trim_end_matches('/');
@@ -4222,6 +4279,16 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     users_str.split(',').map(|s| s.trim().to_string()).collect()
                 };
 
+                let recovery_input: String = dialoguer::Password::new()
+                    .with_prompt("  E2EE recovery key (or Enter to skip — see docs/security/matrix-e2ee-guide.md section 4G)")
+                    .allow_empty_password(true)
+                    .interact()?;
+                let recovery_key = if recovery_input.trim().is_empty() {
+                    None
+                } else {
+                    Some(recovery_input.trim().to_string())
+                };
+
                 config.matrix = Some(MatrixConfig {
                     homeserver: homeserver.trim_end_matches('/').to_string(),
                     access_token,
@@ -4234,6 +4301,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     stream_mode: StreamMode::Partial,
                     draft_update_interval_ms: 1500,
                     multi_message_delay_ms: 800,
+                    recovery_key,
                 });
             }
             ChannelMenuChoice::Signal => {
@@ -4430,6 +4498,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         dm_policy: WhatsAppChatPolicy::default(),
                         group_policy: WhatsAppChatPolicy::default(),
                         self_chat_mode: false,
+                        dm_mention_patterns: vec![],
+                        group_mention_patterns: vec![],
                         proxy_url: None,
                     });
 
@@ -4536,6 +4606,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     dm_policy: WhatsAppChatPolicy::default(),
                     group_policy: WhatsAppChatPolicy::default(),
                     self_chat_mode: false,
+                    dm_mention_patterns: vec![],
+                    group_mention_patterns: vec![],
                     proxy_url: None,
                 });
             }
@@ -4807,6 +4879,95 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style(&port).cyan()
                 );
             }
+            ChannelMenuChoice::Mattermost => {
+                // ── Mattermost ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Mattermost Setup").white().bold(),
+                    style("— Self-hosted team chat via REST API / WebSocket").dim()
+                );
+                print_bullet(
+                    "1. Go to System Console → Integrations → Bot Accounts and create a bot.",
+                );
+                print_bullet("2. Copy the bot's Personal Access Token.");
+                print_bullet("3. Add the bot to the channel(s) you want it to monitor.");
+                println!();
+
+                let url: String = Input::new()
+                    .with_prompt("  Mattermost Server URL (e.g. https://mm.example.com)")
+                    .interact_text()?;
+
+                let auth_mode = Select::new()
+                    .with_prompt("  Authentication mode")
+                    .items([
+                        "Bot Token (Personal Access Token)",
+                        "Login credentials (bot_id + password)",
+                    ])
+                    .default(0)
+                    .interact()?;
+
+                let (bot_token, bot_id, bot_password) = if auth_mode == 0 {
+                    let token: String = Input::new().with_prompt("  Bot Token").interact_text()?;
+                    (Some(token), None, None)
+                } else {
+                    let id: String = Input::new()
+                        .with_prompt("  Bot ID (username or email)")
+                        .interact_text()?;
+                    let pw: String = Input::new().with_prompt("  Bot Password").interact_text()?;
+                    (None, Some(id), Some(pw))
+                };
+
+                let channel_id_input: String = Input::new()
+                    .with_prompt("  Channel ID (Enter to skip — will listen on all channels)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let (channel_id, channel_ids) = if channel_id_input.is_empty() {
+                    (None, vec!["*".to_string()])
+                } else if channel_id_input.contains(',') {
+                    let ids: Vec<String> = channel_id_input
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    (None, ids)
+                } else {
+                    (Some(channel_id_input), vec![])
+                };
+
+                let listen_mode = if bot_id.is_some() {
+                    let mode = Select::new()
+                        .with_prompt("  Listen mode")
+                        .items(["polling (REST API)", "websocket (real-time)"])
+                        .default(1)
+                        .interact()?;
+                    Some(if mode == 0 { "polling" } else { "websocket" }.to_string())
+                } else {
+                    None
+                };
+
+                config.mattermost = Some(MattermostConfig {
+                    url: url.trim().to_string(),
+                    bot_token,
+                    channel_id,
+                    channel_ids,
+                    allowed_users: vec!["*".to_string()],
+                    thread_replies: Some(true),
+                    mention_only: Some(false),
+                    interrupt_on_new_message: false,
+                    proxy_url: None,
+                    listen_mode,
+                    bot_id,
+                    bot_password,
+                });
+
+                println!(
+                    "  {} Mattermost connected to {}",
+                    style("✅").green().bold(),
+                    style(&url).cyan()
+                );
+            }
             ChannelMenuChoice::NextcloudTalk => {
                 // ── Nextcloud Talk ──
                 println!();
@@ -4871,6 +5032,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     },
                     allowed_users,
                     proxy_url: None,
+                    bot_name: None,
                 });
 
                 println!("  {} Nextcloud Talk configured", style("✅").green().bold());
@@ -5156,11 +5318,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .with_prompt("  Verification Token (optional, for Webhook mode)")
                         .allow_empty(true)
                         .interact_text()?;
-                    if token.is_empty() {
-                        None
-                    } else {
-                        Some(token)
-                    }
+                    if token.is_empty() { None } else { Some(token) }
                 } else {
                     None
                 };
@@ -5933,7 +6091,16 @@ fn print_summary(config: &Config) {
 
     let provider = config.default_provider.as_deref().unwrap_or("openrouter");
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
-        if provider == "openai-codex" {
+        if provider == "copilot" {
+            println!(
+                "    {} GitHub Copilot auth will prompt automatically on first run.",
+                style(format!("{step}.")).cyan().bold()
+            );
+            println!(
+                "       {}",
+                style("(OAuth device flow — no manual setup needed)").yellow()
+            );
+        } else if provider == "openai-codex" {
             println!(
                 "    {} Authenticate OpenAI Codex:",
                 style(format!("{step}.")).cyan().bold()
@@ -6040,13 +6207,15 @@ mod tests {
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
         fn unset(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
-            std::env::remove_var(key);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
     }
@@ -6054,9 +6223,11 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, previous) };
             } else {
-                std::env::remove_var(self.key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }
@@ -6307,12 +6478,14 @@ mod tests {
         let service_config = Path::new("/opt/homebrew/var/zeroclaw/config.toml");
         let service_workspace = Path::new("/opt/homebrew/var/zeroclaw/workspace");
 
-        assert!(quick_setup_homebrew_service_note(
-            service_config,
-            service_workspace,
-            Path::new("/opt/homebrew/bin/zeroclaw"),
-        )
-        .is_none());
+        assert!(
+            quick_setup_homebrew_service_note(
+                service_config,
+                service_workspace,
+                Path::new("/opt/homebrew/bin/zeroclaw"),
+            )
+            .is_none()
+        );
     }
 
     // ── scaffold_workspace: basic file creation ─────────────────
@@ -6845,6 +7018,8 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
+        assert_eq!(default_model_for_provider("copilot"), "gpt-4o");
+        assert_eq!(default_model_for_provider("github-copilot"), "gpt-4o");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
@@ -6913,6 +7088,8 @@ mod tests {
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
         assert_eq!(canonical_provider_name("llama.cpp"), "llamacpp");
+        assert_eq!(canonical_provider_name("github-copilot"), "copilot");
+        assert_eq!(canonical_provider_name("copilot"), "copilot");
     }
 
     #[test]
@@ -6949,6 +7126,20 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_include_expected_models() {
+        let ids: Vec<String> = curated_models_for_provider("copilot")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"gpt-4o".to_string()));
+        assert!(ids.contains(&"gpt-4.1".to_string()));
+        assert!(ids.contains(&"gpt-5-mini".to_string()));
+        assert!(ids.contains(&"claude-sonnet-4-6".to_string()));
+        assert!(ids.contains(&"claude-opus-4-6".to_string()));
     }
 
     #[test]
@@ -7425,9 +7616,10 @@ mod tests {
         };
 
         let err = run_models_refresh(&config, None, true).await.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("does not support live model discovery"));
+        assert!(
+            err.to_string()
+                .contains("does not support live model discovery")
+        );
     }
 
     // ── provider_env_var ────────────────────────────────────────
@@ -7438,6 +7630,8 @@ mod tests {
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
+        assert_eq!(provider_env_var("copilot"), "GITHUB_TOKEN");
+        assert_eq!(provider_env_var("github-copilot"), "GITHUB_TOKEN"); // alias
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
@@ -7582,13 +7776,17 @@ mod tests {
         channels.signal = None;
         channels.mattermost = Some(crate::config::schema::MattermostConfig {
             url: "https://mattermost.example.com".into(),
-            bot_token: "token".into(),
+            bot_token: Some("token".into()),
             channel_id: Some("channel".into()),
+            channel_ids: vec![],
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
             interrupt_on_new_message: false,
             proxy_url: None,
+            listen_mode: None,
+            bot_id: None,
+            bot_password: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7608,6 +7806,7 @@ mod tests {
             webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
             proxy_url: None,
+            bot_name: None,
         });
         assert!(has_launchable_channels(&channels));
 

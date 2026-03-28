@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::channels::traits::{Channel, SendMessage};
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;

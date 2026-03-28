@@ -1,6 +1,6 @@
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 
@@ -124,6 +124,8 @@ pub enum ConversationMessage {
 pub struct StreamChunk {
     /// Text delta for this chunk.
     pub delta: String,
+    /// Reasoning/thinking delta (chain-of-thought from thinking models).
+    pub reasoning: Option<String>,
     /// Whether this is the final chunk.
     pub is_final: bool,
     /// Approximate token count for this chunk (estimated).
@@ -135,6 +137,17 @@ impl StreamChunk {
     pub fn delta(text: impl Into<String>) -> Self {
         Self {
             delta: text.into(),
+            reasoning: None,
+            is_final: false,
+            token_count: 0,
+        }
+    }
+
+    /// Create a reasoning/thinking chunk.
+    pub fn reasoning(text: impl Into<String>) -> Self {
+        Self {
+            delta: String::new(),
+            reasoning: Some(text.into()),
             is_final: false,
             token_count: 0,
         }
@@ -144,6 +157,7 @@ impl StreamChunk {
     pub fn final_chunk() -> Self {
         Self {
             delta: String::new(),
+            reasoning: None,
             is_final: true,
             token_count: 0,
         }
@@ -153,6 +167,7 @@ impl StreamChunk {
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             delta: message.into(),
+            reasoning: None,
             is_final: true,
             token_count: 0,
         }
@@ -175,6 +190,11 @@ pub enum StreamEvent {
     TextDelta(StreamChunk),
     /// Structured tool call emitted during streaming.
     ToolCall(ToolCall),
+    /// A tool call that was already executed by the provider (e.g. Claude Code proxy).
+    /// Emitted for observability only — not re-executed by the agent's dispatcher.
+    PreExecutedToolCall { name: String, args: String },
+    /// The result of a pre-executed tool call.
+    PreExecutedToolResult { name: String, output: String },
     /// Stream has completed.
     Final,
 }

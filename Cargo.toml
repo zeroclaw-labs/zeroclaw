@@ -4,8 +4,8 @@ resolver = "2"
 
 [package]
 name = "zeroclawlabs"
-version = "0.6.2"
-edition = "2021"
+version = "0.6.5"
+edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
@@ -46,14 +46,16 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
+# Archive extraction (for self-update)
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
+
 # Matrix client + E2EE decryption
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
-serde_ignored = "0.1"
-serde_yaml = "0.9"
 
 # Config
 directories = "6.0"
@@ -77,6 +79,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 # URL encoding for web search
 urlencoding = "2.1"
 
+# CIDR-range matching for SSRF validator
+ipnetwork = "0.20"
+
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
 
@@ -89,8 +94,12 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
+# Tar/gzip extraction (update pipeline)
+flate2 = "1.1"
+tar = "0.4"
+
 # Zip extraction for ClawhHub / OpenClaw registry installers
-zip = { version = "8.1", default-features = false, features = ["deflate"] }
+zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 
 # Error handling
 anyhow = "1.0"
@@ -130,6 +139,9 @@ ring = "0.17"
 
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
+
+# LRU cache for bounded sender state
+lru = "0.16"
 
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
@@ -203,7 +215,7 @@ pdf-extract = { version = "0.10", optional = true }
 extism = { version = "1.20", optional = true }
 
 # Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.17", optional = true }
 
 # Terminal QR rendering for WhatsApp Web pairing flow.
 qrcode = { version = "0.14", optional = true }
@@ -280,6 +292,10 @@ ci-all = [
     "whatsapp-web",
     "plugins-wasm",
 ]
+
+[profile.dev]
+incremental = true
+opt-level = 1
 
 [profile.release]
 opt-level = "z"      # Optimize for size

@@ -27,7 +27,7 @@ impl Tool for KnowledgeTool {
     }
 
     fn description(&self) -> &str {
-        "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats."
+        "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, experts, and client relationships. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats, client_network, interaction_log."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -36,12 +36,12 @@ impl Tool for KnowledgeTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["capture", "search", "relate", "suggest", "expert_find", "lessons_extract", "graph_stats"],
+                    "enum": ["capture", "search", "relate", "suggest", "expert_find", "lessons_extract", "graph_stats", "client_network", "interaction_log"],
                     "description": "The action to perform"
                 },
                 "node_type": {
                     "type": "string",
-                    "enum": ["pattern", "decision", "lesson", "expert", "technology"],
+                    "enum": ["pattern", "decision", "lesson", "expert", "technology", "client", "contact", "interaction"],
                     "description": "Type of knowledge node (for capture)"
                 },
                 "title": {
@@ -75,8 +75,16 @@ impl Tool for KnowledgeTool {
                 },
                 "relation": {
                     "type": "string",
-                    "enum": ["uses", "replaces", "extends", "authored_by", "applies_to"],
+                    "enum": ["uses", "replaces", "extends", "authored_by", "applies_to", "manages_client", "contact_of", "interacted_with"],
                     "description": "Relationship type (for relate)"
+                },
+                "client_id": {
+                    "type": "string",
+                    "description": "Client node ID (for client_network, interaction_log)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of results (for interaction_log)"
                 },
                 "filters": {
                     "type": "object",
@@ -106,6 +114,8 @@ impl Tool for KnowledgeTool {
             "expert_find" => self.handle_expert_find(&args),
             "lessons_extract" => self.handle_lessons_extract(&args),
             "graph_stats" => self.handle_graph_stats(),
+            "client_network" => self.handle_client_network(&args),
+            "interaction_log" => self.handle_interaction_log(&args),
             other => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -409,6 +419,100 @@ impl KnowledgeTool {
                 error: Some(format!("failed to get stats: {e}")),
             }),
         }
+    }
+
+    fn handle_client_network(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let client_id = args
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'client_id' for client_network"))?;
+
+        let client = self
+            .graph
+            .get_node(client_id)?
+            .ok_or_else(|| anyhow::anyhow!("client node not found: {client_id}"))?;
+
+        if client.node_type != NodeType::Client {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "node {} is not a client (is {})",
+                    client_id,
+                    client.node_type.as_str()
+                )),
+            });
+        }
+
+        // Get contacts and interactions pointing to this client
+        let inbound = self.graph.find_inbound(client_id)?;
+        let contacts: Vec<_> = inbound
+            .iter()
+            .filter(|(n, r)| n.node_type == NodeType::Contact && *r == Relation::ContactOf)
+            .map(|(n, _)| json!({"id": &n.id, "name": &n.title, "tags": &n.tags}))
+            .collect();
+
+        let outbound = self.graph.find_related(client_id)?;
+        let interactions: Vec<_> = outbound.iter()
+            .filter(|(n, r)| n.node_type == NodeType::Interaction && *r == Relation::InteractedWith)
+            .map(|(n, _)| json!({"id": &n.id, "title": &n.title, "date": &n.created_at, "summary": truncate_str(&n.content, 200)}))
+            .collect();
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "client": {"id": &client.id, "name": &client.title, "tags": &client.tags},
+                "contacts": contacts,
+                "interactions": interactions,
+                "contact_count": contacts.len(),
+                "interaction_count": interactions.len(),
+            })
+            .to_string(),
+            error: None,
+        })
+    }
+
+    fn handle_interaction_log(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let client_id = args
+            .get("client_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("missing 'client_id' for interaction_log"))?;
+
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(20);
+
+        let outbound = self.graph.find_related(client_id)?;
+        let mut interactions: Vec<_> = outbound
+            .into_iter()
+            .filter(|(n, r)| n.node_type == NodeType::Interaction && *r == Relation::InteractedWith)
+            .map(|(n, _)| n)
+            .collect();
+
+        // Sort by created_at descending (most recent first)
+        interactions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        interactions.truncate(limit);
+
+        let entries: Vec<_> = interactions
+            .iter()
+            .map(|n| {
+                json!({
+                    "id": &n.id,
+                    "title": &n.title,
+                    "content": &n.content,
+                    "date": &n.created_at,
+                    "tags": &n.tags,
+                })
+            })
+            .collect();
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({"interactions": entries, "count": entries.len()}).to_string(),
+            error: None,
+        })
     }
 }
 

@@ -1,8 +1,8 @@
-use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::auth::AuthService;
+use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
-use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use crate::providers::ProviderRuntimeOptions;
+use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -26,7 +26,7 @@ pub struct OpenAiCodexProvider {
     client: Client,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesRequest {
     model: String,
     input: Vec<ResponsesInput>,
@@ -40,13 +40,13 @@ struct ResponsesRequest {
     parallel_tool_calls: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesInput {
     role: String,
     content: Vec<ResponsesInputContent>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesInputContent {
     #[serde(rename = "type")]
     kind: String,
@@ -56,12 +56,12 @@ struct ResponsesInputContent {
     image_url: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesTextOptions {
     verbosity: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponsesReasoningOptions {
     effort: String,
     summary: String,
@@ -711,7 +711,54 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        decode_responses_body(response).await
+        // Try to decode streaming response first
+        match decode_responses_body(response).await {
+            Ok(text) => Ok(text),
+            // If streaming fails, retry with non-streaming request
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "OpenAI Codex streaming failed, retrying with non-streaming request"
+                );
+                let mut non_streaming_request = request.clone();
+                non_streaming_request.stream = false;
+
+                let mut non_streaming_builder = self
+                    .client
+                    .post(&self.responses_url)
+                    .header("Authorization", format!("Bearer {bearer_token}"))
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("originator", "pi")
+                    .header("Content-Type", "application/json");
+
+                if let Some(account_id) = account_id.as_deref() {
+                    non_streaming_builder =
+                        non_streaming_builder.header("chatgpt-account-id", account_id);
+                }
+
+                if use_gateway_api_key_auth {
+                    if let Some(access_token) = access_token.as_deref() {
+                        non_streaming_builder =
+                            non_streaming_builder.header("x-openai-access-token", access_token);
+                    }
+                    if let Some(account_id) = account_id.as_deref() {
+                        non_streaming_builder =
+                            non_streaming_builder.header("x-openai-account-id", account_id);
+                    }
+                }
+
+                let non_streaming_response = non_streaming_builder
+                    .json(&non_streaming_request)
+                    .send()
+                    .await?;
+
+                if !non_streaming_response.status().is_success() {
+                    return Err(super::api_error("OpenAI Codex", non_streaming_response).await);
+                }
+
+                decode_responses_body(non_streaming_response).await
+            }
+        }
     }
 }
 
@@ -767,38 +814,7 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Mutex that serializes all tests which mutate process-global env vars
-    /// (`std::env::set_var` / `remove_var`).  Each such test must hold this
-    /// lock for its entire duration so that parallel test threads don't race.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var(key).ok();
-            match value {
-                Some(next) => std::env::set_var(key, next),
-                None => std::env::remove_var(key),
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(original) = self.original.as_deref() {
-                std::env::set_var(self.key, original);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
+    use crate::providers::test_util::{env_lock, EnvGuard};
 
     #[test]
     fn extracts_output_text_first() {
@@ -847,7 +863,7 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_prefers_explicit_endpoint_env() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let _endpoint_guard = EnvGuard::set(
             CODEX_RESPONSES_URL_ENV,
             Some("https://env.example.com/v1/responses"),
@@ -863,7 +879,7 @@ mod tests {
 
     #[test]
     fn resolve_responses_url_uses_provider_api_url_override() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let _endpoint_guard = EnvGuard::set(CODEX_RESPONSES_URL_ENV, None);
         let _base_guard = EnvGuard::set(CODEX_BASE_URL_ENV, None);
 
@@ -967,7 +983,7 @@ mod tests {
 
     #[test]
     fn resolve_reasoning_effort_prefers_configured_override() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("low"));
         assert_eq!(
             resolve_reasoning_effort("gpt-5-codex", Some("high")),
@@ -977,7 +993,7 @@ mod tests {
 
     #[test]
     fn resolve_reasoning_effort_uses_legacy_env_when_unconfigured() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = env_lock();
         let _guard = EnvGuard::set("ZEROCLAW_CODEX_REASONING_EFFORT", Some("minimal"));
         assert_eq!(
             resolve_reasoning_effort("gpt-5-codex", None),
@@ -1012,8 +1028,7 @@ data: [DONE]
 
     #[test]
     fn decode_utf8_stream_chunks_handles_multibyte_split_across_chunks() {
-        let payload =
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello 世\"}\n\ndata: [DONE]\n";
+        let payload = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello 世\"}\n\ndata: [DONE]\n";
         let bytes = payload.as_bytes();
         let split_at = payload.find('世').unwrap() + 1;
 

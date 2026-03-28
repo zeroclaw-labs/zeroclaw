@@ -28,8 +28,8 @@ mod battle_tests;
 pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
-    classify_memory_backend, default_memory_backend_key, memory_backend_profile,
-    selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
+    MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
+    memory_backend_profile, selectable_memory_backends,
 };
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
@@ -43,7 +43,7 @@ pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
 pub use traits::Memory;
 #[allow(unused_imports)]
-pub use traits::{MemoryCategory, MemoryEntry, ProceduralMessage};
+pub use traits::{ExportFilter, MemoryCategory, MemoryEntry, ProceduralMessage};
 
 use crate::config::{EmbeddingRouteConfig, MemoryConfig, StorageProviderConfig};
 use anyhow::Context;
@@ -630,7 +630,8 @@ mod tests {
     fn resolve_embedding_config_uses_embedding_provider_env_key_not_default_provider_key() {
         // COHERE_API_KEY is almost certainly unset in normal dev environments.
         let prev = std::env::var("COHERE_API_KEY").ok();
-        std::env::set_var("COHERE_API_KEY", "cohere-from-env");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("COHERE_API_KEY", "cohere-from-env") };
 
         let cfg = MemoryConfig {
             embedding_provider: "cohere".into(),
@@ -644,8 +645,10 @@ mod tests {
 
         // Restore env.
         match prev {
-            Some(v) => std::env::set_var("COHERE_API_KEY", v),
-            None => std::env::remove_var("COHERE_API_KEY"),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var("COHERE_API_KEY", v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var("COHERE_API_KEY") },
         }
 
         assert_eq!(

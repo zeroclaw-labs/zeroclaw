@@ -172,7 +172,18 @@ guild_id = "123456789012345678"   # optional
 allowed_users = ["*"]
 listen_to_bots = false
 mention_only = false
+stream_mode = "multi_message"     # optional: off | partial | multi_message (default: multi_message via wizard)
+draft_update_interval_ms = 1000   # optional: edit throttle for partial streaming
+multi_message_delay_ms = 800      # optional: delay between paragraph sends in multi_message mode
 ```
+
+Discord notes:
+
+- `stream_mode = "partial"` sends an editable draft message that updates token-by-token as the LLM streams its response, then finalizes with the complete text.
+- `stream_mode = "multi_message"` delivers the response incrementally as separate messages, splitting at paragraph boundaries (`\n\n`) as tokens arrive from the provider. Each paragraph appears in Discord as soon as it completes.
+- `draft_update_interval_ms` controls edit throttling in partial mode (default: 1000ms).
+- `multi_message_delay_ms` controls minimum delay between paragraph sends in multi_message mode to avoid Discord rate limits (default: 800ms).
+- Code fences are never split across messages in multi_message mode.
 
 ### 4.3 Slack
 
@@ -255,6 +266,7 @@ phone_number_id = "123456789012345"
 verify_token = "your-verify-token"
 app_secret = "your-app-secret"     # optional but recommended
 allowed_numbers = ["*"]
+interrupt_on_new_message = false   # optional: cancel in-flight same-sender same-chat request
 ```
 
 WhatsApp Web mode:
@@ -265,6 +277,7 @@ session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 pair_phone = "15551234567"         # optional; omit to use QR flow
 pair_code = ""                     # optional custom pair code
 allowed_numbers = ["*"]
+interrupt_on_new_message = false   # optional: cancel in-flight same-sender same-chat request
 ```
 
 Notes:
@@ -272,6 +285,7 @@ Notes:
 - Build with `cargo build --features whatsapp-web` (or equivalent run command).
 - Keep `session_path` on persistent storage to avoid relinking after restart.
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
+- `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 
 ### 4.8 Webhook Channel Config (Gateway)
 
@@ -409,6 +423,7 @@ base_url = "https://cloud.example.com"
 app_token = "nextcloud-talk-app-token"
 webhook_secret = "optional-webhook-secret"  # optional but recommended
 allowed_users = ["*"]
+# bot_name = "zeroclaw"  # display name of the bot; filters own messages to prevent feedback loops
 ```
 
 Notes:
