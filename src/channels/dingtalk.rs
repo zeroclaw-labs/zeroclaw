@@ -162,7 +162,12 @@ impl Channel for DingTalkChannel {
         let ws_url = format!("{}?ticket={}", gw.endpoint, gw.ticket);
 
         tracing::info!("DingTalk: connecting to stream WebSocket...");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&ws_url).await?;
+        let (ws_stream, _) = crate::config::ws_connect_with_proxy(
+            &ws_url,
+            "channel.dingtalk",
+            self.proxy_url.as_deref(),
+        )
+        .await?;
         let (mut write, mut read) = ws_stream.split();
 
         tracing::info!("DingTalk: connected and listening for messages...");
@@ -285,6 +290,8 @@ impl Channel for DingTalkChannel {
                             .as_secs(),
                         thread_ts: None,
                         interruption_scope_id: None,
+                        attachments: vec![],
+                        observe_group: false,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

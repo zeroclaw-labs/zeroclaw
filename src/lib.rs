@@ -41,12 +41,13 @@ use serde::{Deserialize, Serialize};
 pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
+pub mod calendar;
 pub mod channels;
 pub(crate) mod cli_input;
 pub mod commands;
 pub mod config;
 pub(crate) mod cost;
-pub(crate) mod cron;
+pub mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
 pub mod gateway;
@@ -67,14 +68,18 @@ pub(crate) mod onboard;
 pub mod peripherals;
 pub mod providers;
 pub mod rag;
+pub mod routines;
 pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
+pub mod sop;
 pub mod tools;
+pub(crate) mod trust;
 pub(crate) mod tunnel;
 pub(crate) mod util;
 pub mod verifiable_intent;
+pub mod voice;
 
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins;
@@ -162,6 +167,15 @@ pub enum ServiceCommands {
     Status,
     /// Uninstall daemon service unit
     Uninstall,
+    /// Tail daemon service logs
+    Logs {
+        /// Number of lines to show (default: 50)
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 /// Channel management subcommands
@@ -257,6 +271,14 @@ pub enum SkillCommands {
     Remove {
         /// Skill name to remove
         name: String,
+    },
+    /// Run TEST.sh validation for a skill (or all skills)
+    Test {
+        /// Skill name to test; omit for all skills
+        name: Option<String>,
+        /// Show verbose output
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -560,4 +582,21 @@ Examples:
     },
     /// Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)
     FlashNucleo,
+}
+
+/// SOP management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SopCommands {
+    /// List loaded SOPs
+    List,
+    /// Validate SOP definitions
+    Validate {
+        /// SOP name to validate (all if omitted)
+        name: Option<String>,
+    },
+    /// Show details of an SOP
+    Show {
+        /// Name of the SOP to show
+        name: String,
+    },
 }

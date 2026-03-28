@@ -1,12 +1,71 @@
-use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
-};
 use super::Provider;
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+};
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+// ── Provider Fallback Notification ──────────────────────────────────────
+// When ReliableProvider uses a fallback (different provider or model than
+// requested), it records the details here so channel code can notify the user.
+// Uses tokio::task_local to avoid cross-request leakage between concurrent
+// users (the old global static had a race window).
+
+/// Info about a provider fallback that occurred during a request.
+#[derive(Debug, Clone)]
+pub struct ProviderFallbackInfo {
+    /// Provider that was originally requested.
+    pub requested_provider: String,
+    /// Model that was originally requested.
+    pub requested_model: String,
+    /// Provider that actually served the request.
+    pub actual_provider: String,
+    /// Model that actually served the request.
+    pub actual_model: String,
+}
+
+tokio::task_local! {
+    static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
+}
+
+/// Take (consume) the last provider fallback info, if any.
+/// Must be called within a `scope_provider_fallback` scope.
+pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
+    PROVIDER_FALLBACK
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+/// Run the given future within a provider-fallback scope.
+/// Both `record_provider_fallback` (inside ReliableProvider) and
+/// `take_last_provider_fallback` (post-loop channel code) must execute
+/// within this scope for the data to be visible.
+pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Output {
+    PROVIDER_FALLBACK.scope(RefCell::new(None), future).await
+}
+
+/// Record a provider fallback event.
+fn record_provider_fallback(
+    requested_provider: &str,
+    requested_model: &str,
+    actual_provider: &str,
+    actual_model: &str,
+) {
+    let _ = PROVIDER_FALLBACK.try_with(|cell| {
+        *cell.borrow_mut() = Some(ProviderFallbackInfo {
+            requested_provider: requested_provider.to_string(),
+            requested_model: requested_model.to_string(),
+            actual_provider: actual_provider.to_string(),
+            actual_model: actual_model.to_string(),
+        });
+    });
+}
 
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
@@ -96,7 +155,7 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| lower.contains(hint))
 }
 
-fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+pub(crate) fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     let hints = [
         "exceeds the context window",
@@ -267,11 +326,44 @@ fn push_failure(
     ));
 }
 
+// ── Model–Provider Compatibility ─────────────────────────────────────────
+// Avoids wasting API calls on incompatible model–provider pairs (e.g.
+// sending `gemini-3-flash-preview` to an openai-codex provider).
+
+/// Returns model name prefixes accepted by a provider, based on its name.
+/// Returns None if unknown (accept any model).
+fn accepted_model_prefixes(provider_name: &str) -> Option<&[&str]> {
+    // Strip profile suffix: "gemini:gemini-api-1" → "gemini"
+    let base = provider_name.split(':').next().unwrap_or(provider_name);
+    match base {
+        "gemini" | "google" => Some(&["gemini-"]),
+        "openai-codex" => Some(&["gpt-", "o1-", "o3-", "o4-"]),
+        "openai" => Some(&["gpt-", "o1-", "o3-", "o4-", "chatgpt-"]),
+        "anthropic" => Some(&["claude-"]),
+        _ => None, // unknown provider — accept any model
+    }
+}
+
+fn is_model_compatible(provider_name: &str, model: &str) -> bool {
+    match accepted_model_prefixes(provider_name) {
+        None => true,
+        Some(prefixes) => prefixes.iter().any(|p| model.starts_with(p)),
+    }
+}
+
+/// Pick the first compatible model from the chain for a given provider.
+fn select_model_for_provider<'a>(provider_name: &str, models: &[&'a str]) -> Option<&'a str> {
+    models
+        .iter()
+        .copied()
+        .find(|m| is_model_compatible(provider_name, m))
+}
+
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
-// Three-level failover strategy: model chain → provider chain → retry loop.
-//   Outer loop:  iterate model fallback chain (original model first, then
-//                configured alternatives).
-//   Middle loop: iterate registered providers in priority order.
+// Two-level failover strategy: provider chain → (compatible models + retry).
+//   Outer loop:  iterate registered providers in priority order.
+//   Middle loop: iterate compatible models from the model fallback chain
+//                (incompatible models for this provider are skipped).
 //   Inner loop:  retry the same (provider, model) pair with exponential
 //                backoff, rotating API keys on rate-limit errors.
 // Loop invariant: `failures` accumulates every failed attempt so the final
@@ -287,6 +379,9 @@ pub struct ReliableProvider {
     key_index: AtomicUsize,
     /// Per-model fallback chains: model_name → [fallback_model_1, fallback_model_2, ...]
     model_fallbacks: HashMap<String, Vec<String>>,
+    /// Rate-limit cooldown: provider_index → earliest retry time.
+    /// Providers are skipped until their cooldown expires (default 10s).
+    rate_limit_cooldowns: Mutex<HashMap<usize, Instant>>,
 }
 
 impl ReliableProvider {
@@ -302,6 +397,7 @@ impl ReliableProvider {
             api_keys: Vec::new(),
             key_index: AtomicUsize::new(0),
             model_fallbacks: HashMap::new(),
+            rate_limit_cooldowns: Mutex::new(HashMap::new()),
         }
     }
 
@@ -344,6 +440,29 @@ impl ReliableProvider {
             base
         }
     }
+
+    /// Check if provider is in rate-limit cooldown. Returns true if should skip.
+    fn is_in_cooldown(&self, provider_idx: usize) -> bool {
+        let lock = self
+            .rate_limit_cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lock.get(&provider_idx)
+            .is_some_and(|&deadline| Instant::now() < deadline)
+    }
+
+    /// Mark provider as rate-limited for the given duration.
+    fn set_cooldown(&self, provider_idx: usize, cooldown: Duration) {
+        let mut lock = self
+            .rate_limit_cooldowns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        lock.insert(provider_idx, Instant::now() + cooldown);
+    }
+
+    /// Default rate-limit cooldown: 10s. Short enough to retry quickly
+    /// but long enough to skip wasted attempts within a single tool-loop iteration.
+    const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 }
 
 #[async_trait]
@@ -368,12 +487,22 @@ impl Provider for ReliableProvider {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
 
-        // Outer: model fallback chain. Middle: provider priority. Inner: retries.
-        // Each iteration: attempt one (provider, model) call. On success, return
-        // immediately. On non-retryable error, break to next provider. On
-        // retryable error, sleep with exponential backoff and retry.
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        // Outer: provider priority. Middle: compatible models. Inner: retries.
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    tracing::debug!(
+                        provider = provider_name,
+                        model = *current_model,
+                        "Skipping incompatible model for provider"
+                    );
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -382,13 +511,28 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model {
+                            if attempt > 0
+                                || *current_model != model
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -429,8 +573,6 @@ impl Provider for ReliableProvider {
                                 &error_detail,
                             );
 
-                            // Rate-limit with rotatable keys: cycle to the next API key
-                            // so the retry hits a different quota bucket.
                             if rate_limited && !non_retryable_rate_limit {
                                 if let Some(new_key) = self.rotate_key() {
                                     tracing::warn!(
@@ -451,6 +593,20 @@ impl Provider for ReliableProvider {
                                     error = %error_detail,
                                     "Non-retryable error, moving on"
                                 );
+                                break; // try next model on this provider
+                            }
+
+                            // Rate-limited — skip to next provider (not just next model)
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
                                 break;
                             }
 
@@ -471,20 +627,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
-            }
-
-            if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
-                );
             }
         }
 
@@ -505,8 +647,16 @@ impl Provider for ReliableProvider {
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -515,7 +665,12 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model || context_truncated {
+                            if attempt > 0
+                                || *current_model != model
+                                || context_truncated
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -523,6 +678,17 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     context_truncated,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -602,6 +768,19 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
+                                break;
+                            }
+
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
@@ -619,12 +798,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
             }
         }
 
@@ -659,8 +832,16 @@ impl Provider for ReliableProvider {
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
@@ -669,7 +850,12 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model || context_truncated {
+                            if attempt > 0
+                                || *current_model != model
+                                || context_truncated
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -677,6 +863,17 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     context_truncated,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -756,6 +953,19 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
+                                break;
+                            }
+
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
@@ -773,12 +983,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
             }
         }
 
@@ -799,18 +1003,43 @@ impl Provider for ReliableProvider {
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
 
-        for current_model in &models {
-            for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
+            for current_model in &models {
+                if !is_model_compatible(provider_name, current_model) {
+                    continue;
+                }
+
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
+                    // Log the full message payload on the first attempt of each
+                    // call (not on retries). Enabled by `--log-llm` / TRACE level.
+                    if attempt == 0 && tracing::enabled!(tracing::Level::TRACE) {
+                        let json = serde_json::to_string_pretty(&effective_messages)
+                            .unwrap_or_else(|e| format!("<serialization error: {e}>"));
+                        tracing::trace!(
+                            provider = %provider_name,
+                            model = %current_model,
+                            "\n{json}\n"
+                        );
+                    }
+
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
                     };
                     match provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model || context_truncated {
+                            if attempt > 0
+                                || *current_model != model
+                                || context_truncated
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -818,6 +1047,17 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     context_truncated,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -897,6 +1137,19 @@ impl Provider for ReliableProvider {
                                 break;
                             }
 
+                            if rate_limited && self.providers.len() > 1 {
+                                tracing::info!(
+                                    provider = provider_name,
+                                    model = *current_model,
+                                    "Rate limited, skipping to next provider"
+                                );
+                                let cd = parse_retry_after_ms(&e)
+                                    .map(|ms| Duration::from_millis(ms.min(60_000)))
+                                    .unwrap_or(Self::RATE_LIMIT_COOLDOWN);
+                                self.set_cooldown(provider_idx, cd);
+                                break;
+                            }
+
                             if attempt < self.max_retries {
                                 let wait = self.compute_backoff(backoff_ms, &e);
                                 tracing::warn!(
@@ -914,20 +1167,6 @@ impl Provider for ReliableProvider {
                         }
                     }
                 }
-
-                tracing::warn!(
-                    provider = provider_name,
-                    model = *current_model,
-                    "Exhausted retries, trying next provider/model"
-                );
-            }
-
-            if *current_model != model {
-                tracing::warn!(
-                    original_model = model,
-                    fallback_model = *current_model,
-                    "Model fallback exhausted all providers, trying next fallback model"
-                );
             }
         }
 
@@ -941,6 +1180,76 @@ impl Provider for ReliableProvider {
         self.providers.iter().any(|(_, p)| p.supports_streaming())
     }
 
+    fn supports_streaming_tool_events(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, p)| p.supports_streaming_tool_events())
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
+
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            if needs_tool_events && !provider.supports_streaming_tool_events() {
+                continue;
+            }
+
+            let provider_clone = provider_name.clone();
+
+            let current_model = self
+                .model_chain(model)
+                .first()
+                .copied()
+                .unwrap_or(model)
+                .to_string();
+
+            let req = ChatRequest {
+                messages: request.messages,
+                tools: request.tools,
+            };
+            let stream = provider.stream_chat(req, &current_model, temperature, options);
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(event) = stream.next().await {
+                    if let Err(ref e) = event {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed();
+        }
+
+        let message = if needs_tool_events {
+            "No provider supports streaming tool events".to_string()
+        } else {
+            "No provider supports streaming".to_string()
+        };
+        stream::once(async move { Err(super::traits::StreamError::Provider(message)) }).boxed()
+    }
+
     fn stream_chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -951,7 +1260,11 @@ impl Provider for ReliableProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // Try each provider/model combination for streaming
         // For streaming, we use the first provider that supports it and has streaming enabled
-        for (provider_name, provider) in &self.providers {
+        for (provider_idx, (provider_name, provider)) in self.providers.iter().enumerate() {
+            if self.is_in_cooldown(provider_idx) {
+                tracing::debug!(provider = %provider_name, "Skipping provider (rate-limit cooldown)");
+                continue;
+            }
             if !provider.supports_streaming() || !options.enabled {
                 continue;
             }
@@ -961,7 +1274,7 @@ impl Provider for ReliableProvider {
 
             // Try the first model in the chain for streaming
             let current_model = match self.model_chain(model).first() {
-                Some(m) => m.to_string(),
+                Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
 
@@ -1009,11 +1322,71 @@ impl Provider for ReliableProvider {
         })
         .boxed()
     }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Try each provider/model combination for streaming with history.
+        // Mirrors stream_chat_with_system but delegates to the underlying
+        // provider's stream_chat_with_history, preserving the full conversation.
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            let provider_clone = provider_name.clone();
+
+            let current_model = match self.model_chain(model).first() {
+                Some(m) => (*m).to_string(),
+                None => model.to_string(),
+            };
+
+            let stream =
+                provider.stream_chat_with_history(messages, &current_model, temperature, options);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    if let Err(ref e) = chunk {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(chunk).await.is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+            });
+
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            })
+            .boxed();
+        }
+
+        // No streaming support available
+        stream::once(async move {
+            Err(super::traits::StreamError::Provider(
+                "No provider supports streaming".to_string(),
+            ))
+        })
+        .boxed()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolSpec;
+    use futures_util::StreamExt;
     use std::sync::Arc;
 
     struct MockProvider {
@@ -2182,7 +2555,7 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         // Remaining messages should be the newer ones
         assert_eq!(messages.len(), 4); // system + 3 remaining non-system
-                                       // The last message should still be the most recent user message
+        // The last message should still be the most recent user message
         assert_eq!(messages.last().unwrap().content, "msg3");
     }
 
@@ -2358,5 +2731,562 @@ mod tests {
         // A regular 400 error (e.g. invalid API key) should still be non-retryable.
         let err = anyhow::anyhow!("400 Bad Request: invalid api key provided");
         assert!(is_non_retryable(&err));
+    }
+
+    struct StreamingToolEventMock {
+        stream_calls: Arc<AtomicUsize>,
+        supports_tool_events: bool,
+    }
+
+    impl StreamingToolEventMock {
+        fn new(supports_tool_events: bool) -> Self {
+            Self {
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                supports_tool_events,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StreamingToolEventMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.supports_tool_events
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![
+                Ok(StreamEvent::ToolCall(super::super::traits::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: r#"{"command":"date"}"#.to_string(),
+                })),
+                Ok(StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Arc<StreamingToolEventMock> {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.as_ref()
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.as_ref().supports_streaming()
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.as_ref().supports_streaming_tool_events()
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: f64,
+            options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.as_ref()
+                .stream_chat(request, model, temperature, options)
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_prefers_provider_with_tool_event_support() {
+        let primary = Arc::new(StreamingToolEventMock::new(false));
+        let fallback = Arc::new(StreamingToolEventMock::new(true));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(Arc::clone(&fallback)) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "run shell".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            }),
+        }];
+        let mut stream = provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+            },
+            "model",
+            0.0,
+            StreamOptions::new(true),
+        );
+
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        match first {
+            StreamEvent::ToolCall(call) => assert_eq!(call.name, "shell"),
+            other => panic!("expected tool-call event, got {other:?}"),
+        }
+        assert!(matches!(second, StreamEvent::Final));
+        assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.stream_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_errors_when_no_provider_supports_tool_events() {
+        let primary = Arc::new(StreamingToolEventMock::new(false));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "run shell".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let mut stream = provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+            },
+            "model",
+            0.0,
+            StreamOptions::new(true),
+        );
+
+        let first = stream.next().await.unwrap();
+        let err = first.expect_err("stream should fail without tool-event support");
+        assert!(
+            err.to_string()
+                .contains("No provider supports streaming tool events"),
+            "unexpected stream error: {err}"
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ── stream_chat_with_history failover tests ──────────────────────
+
+    /// Mock provider that supports streaming via stream_chat_with_history.
+    struct StreamingHistoryMock {
+        stream_calls: Arc<AtomicUsize>,
+        supports: bool,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingHistoryMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.supports
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            // Echo the number of messages as the delta to verify history was passed through
+            let msg_count = messages.len().to_string();
+            stream::iter(vec![
+                Ok(StreamChunk::delta(msg_count)),
+                Ok(StreamChunk::final_chunk()),
+            ])
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_delegates_to_streaming_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(StreamingHistoryMock {
+                    stream_calls: Arc::clone(&calls),
+                    supports: true,
+                }) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("msg1"),
+            ChatMessage::assistant("resp1"),
+            ChatMessage::user("msg2"),
+        ];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.delta, "4", "should pass all 4 messages to provider");
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(second.is_final);
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_skips_non_streaming_providers() {
+        let non_streaming_calls = Arc::new(AtomicUsize::new(0));
+        let streaming_calls = Arc::new(AtomicUsize::new(0));
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "non-streaming".into(),
+                    Box::new(StreamingHistoryMock {
+                        stream_calls: Arc::clone(&non_streaming_calls),
+                        supports: false,
+                    }) as Box<dyn Provider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(StreamingHistoryMock {
+                        stream_calls: Arc::clone(&streaming_calls),
+                        supports: true,
+                    }) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.delta, "1");
+        assert_eq!(
+            non_streaming_calls.load(Ordering::SeqCst),
+            0,
+            "non-streaming provider should be skipped"
+        );
+        assert_eq!(
+            streaming_calls.load(Ordering::SeqCst),
+            1,
+            "streaming provider should be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_errors_when_no_provider_supports_streaming() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "non-streaming".into(),
+                Box::new(StreamingHistoryMock {
+                    stream_calls: Arc::new(AtomicUsize::new(0)),
+                    supports: false,
+                }) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap();
+        let err = first.expect_err("should fail when no provider supports streaming");
+        assert!(
+            err.to_string().contains("No provider supports streaming"),
+            "unexpected error: {err}"
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_records_provider_fallback_info() {
+        scope_provider_fallback(async {
+            let provider = ReliableProvider::new(
+                vec![
+                    (
+                        "broken".into(),
+                        Box::new(MockProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 99, // always fail
+                            response: "unused",
+                            error: "401 Unauthorized",
+                        }),
+                    ),
+                    (
+                        "working".into(),
+                        Box::new(MockProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 0,
+                            response: "hello from working",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                2,
+                1,
+            );
+
+            let resp = provider.simple_chat("hi", "test-model", 0.0).await.unwrap();
+            assert_eq!(resp, "hello from working");
+
+            let fb = take_last_provider_fallback();
+            assert!(fb.is_some(), "fallback info should be recorded");
+            let fb = fb.unwrap();
+            assert_eq!(fb.requested_provider, "broken");
+            assert_eq!(fb.actual_provider, "working");
+            assert_eq!(fb.actual_model, "test-model");
+
+            // Second take should be None.
+            assert!(take_last_provider_fallback().is_none());
+        })
+        .await;
+    }
+
+    // ── Model–provider compatibility tests ──────────────────────
+
+    #[test]
+    fn model_compatibility_gemini_accepts_gemini_models() {
+        assert!(is_model_compatible("gemini", "gemini-3-flash-preview"));
+        assert!(is_model_compatible("gemini", "gemini-2.5-flash"));
+        assert!(is_model_compatible(
+            "gemini:gemini-api-1",
+            "gemini-3-flash-preview"
+        ));
+        assert!(!is_model_compatible("gemini", "gpt-5.1"));
+        assert!(!is_model_compatible("gemini", "claude-sonnet"));
+        // "google" is an alias used in config — should behave the same
+        assert!(is_model_compatible("google", "gemini-3-flash-preview"));
+        assert!(!is_model_compatible("google", "gpt-4o"));
+    }
+
+    #[test]
+    fn model_compatibility_codex_accepts_gpt_models() {
+        assert!(is_model_compatible("openai-codex", "gpt-5.1"));
+        assert!(is_model_compatible("openai-codex", "gpt-5.1-codex-mini"));
+        assert!(is_model_compatible("openai-codex:codex-1", "o4-mini"));
+        assert!(!is_model_compatible(
+            "openai-codex",
+            "gemini-3-flash-preview"
+        ));
+        assert!(!is_model_compatible("openai-codex", "claude-sonnet"));
+    }
+
+    #[test]
+    fn model_compatibility_unknown_accepts_any() {
+        assert!(is_model_compatible("custom-provider", "any-model"));
+        assert!(is_model_compatible("primary", "test"));
+        assert!(is_model_compatible("fallback", "gemini-3-flash-preview"));
+    }
+
+    #[test]
+    fn select_model_picks_first_compatible() {
+        let models = vec!["gemini-3-flash-preview", "gpt-5.1"];
+        assert_eq!(
+            select_model_for_provider("gemini", &models),
+            Some("gemini-3-flash-preview")
+        );
+        assert_eq!(
+            select_model_for_provider("openai-codex", &models),
+            Some("gpt-5.1")
+        );
+        assert_eq!(
+            select_model_for_provider("custom", &models),
+            Some("gemini-3-flash-preview")
+        );
+    }
+
+    #[test]
+    fn select_model_returns_none_for_incompatible() {
+        let models = vec!["gemini-3-flash-preview", "gemini-2.5-flash"];
+        assert_eq!(select_model_for_provider("openai-codex", &models), None);
+    }
+
+    #[tokio::test]
+    async fn provider_first_skips_incompatible_model() {
+        // Simulate gemini + openai-codex chain with gemini-3-flash-preview + gpt-5.1 models.
+        // Gemini provider should only see gemini-*, codex should only see gpt-*.
+        let gemini_mock = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec!["gemini-3-flash-preview"], // gemini fails
+            response: "never",
+        });
+
+        let codex_mock = Arc::new(ModelAwareMock {
+            calls: Arc::new(AtomicUsize::new(0)),
+            models_seen: parking_lot::Mutex::new(Vec::new()),
+            fail_models: vec![],
+            response: "codex ok",
+        });
+
+        let mut fallbacks = HashMap::new();
+        fallbacks.insert(
+            "gemini-3-flash-preview".to_string(),
+            vec!["gpt-5.1".to_string()],
+        );
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "gemini".into(),
+                    Box::new(gemini_mock.clone()) as Box<dyn Provider>,
+                ),
+                (
+                    "openai-codex".into(),
+                    Box::new(codex_mock.clone()) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        )
+        .with_model_fallbacks(fallbacks);
+
+        let result = provider
+            .simple_chat("hello", "gemini-3-flash-preview", 0.0)
+            .await
+            .unwrap();
+        assert_eq!(result, "codex ok");
+
+        // Gemini should have tried only gemini-3-flash-preview (not gpt-5.1)
+        let gemini_seen = gemini_mock.models_seen.lock();
+        assert_eq!(gemini_seen.as_slice(), &["gemini-3-flash-preview"]);
+
+        // Codex should have tried only gpt-5.1 (not gemini-3-flash-preview)
+        let codex_seen = codex_mock.models_seen.lock();
+        assert_eq!(codex_seen.as_slice(), &["gpt-5.1"]);
+    }
+
+    // ── Rate-limit cooldown tests ───────────────────────────────
+
+    #[test]
+    fn cooldown_initially_inactive() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "p".into(),
+                Box::new(MockProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "",
+                }),
+            )],
+            0,
+            1,
+        );
+        assert!(!provider.is_in_cooldown(0));
+        assert!(!provider.is_in_cooldown(1));
+    }
+
+    #[test]
+    fn cooldown_active_after_set() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "p".into(),
+                Box::new(MockProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "",
+                }),
+            )],
+            0,
+            1,
+        );
+        provider.set_cooldown(0, Duration::from_secs(60));
+        assert!(provider.is_in_cooldown(0));
+        assert!(!provider.is_in_cooldown(1)); // different index
+    }
+
+    #[test]
+    fn cooldown_expires_after_timeout() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "p".into(),
+                Box::new(MockProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "ok",
+                    error: "",
+                }),
+            )],
+            0,
+            1,
+        );
+        // Set cooldown with zero duration — should expire immediately
+        provider.set_cooldown(0, Duration::from_millis(0));
+        assert!(!provider.is_in_cooldown(0));
+    }
+
+    #[test]
+    fn parse_retry_after_used_for_cooldown() {
+        // Verify parse_retry_after_ms extracts values correctly for cooldown use
+        let err = anyhow::anyhow!("429 Too Many Requests, Retry-After: 5");
+        assert_eq!(parse_retry_after_ms(&err), Some(5000));
+
+        let err = anyhow::anyhow!("Rate limited. retry_after: 2.5 seconds");
+        assert_eq!(parse_retry_after_ms(&err), Some(2500));
+
+        let err = anyhow::anyhow!("500 Internal Server Error");
+        assert_eq!(parse_retry_after_ms(&err), None);
     }
 }

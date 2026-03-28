@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde_json::json;
@@ -365,7 +365,8 @@ mod tests {
     async fn missing_api_key_returns_error() {
         // Temporarily ensure the env var is unset.
         let original = std::env::var("FAL_API_KEY_TEST_IMAGE_GEN").ok();
-        std::env::remove_var("FAL_API_KEY_TEST_IMAGE_GEN");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FAL_API_KEY_TEST_IMAGE_GEN") };
 
         let tool = ImageGenTool::new(
             test_security(),
@@ -378,22 +379,26 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("FAL_API_KEY_TEST_IMAGE_GEN"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("FAL_API_KEY_TEST_IMAGE_GEN")
+        );
 
         // Restore if it was set.
         if let Some(val) = original {
-            std::env::set_var("FAL_API_KEY_TEST_IMAGE_GEN", val);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("FAL_API_KEY_TEST_IMAGE_GEN", val) };
         }
     }
 
     #[tokio::test]
     async fn invalid_size_returns_error() {
         // Set a dummy key so we get past the key check.
-        std::env::set_var("FAL_API_KEY_TEST_SIZE", "dummy_key");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("FAL_API_KEY_TEST_SIZE", "dummy_key") };
 
         let tool = ImageGenTool::new(
             test_security(),
@@ -408,7 +413,8 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap().contains("Invalid size"));
 
-        std::env::remove_var("FAL_API_KEY_TEST_SIZE");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FAL_API_KEY_TEST_SIZE") };
     }
 
     #[tokio::test]
@@ -435,7 +441,8 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_model_with_traversal_returns_error() {
-        std::env::set_var("FAL_API_KEY_TEST_MODEL", "dummy_key");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("FAL_API_KEY_TEST_MODEL", "dummy_key") };
 
         let tool = ImageGenTool::new(
             test_security(),
@@ -448,22 +455,27 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("Invalid model identifier"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Invalid model identifier")
+        );
 
-        std::env::remove_var("FAL_API_KEY_TEST_MODEL");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FAL_API_KEY_TEST_MODEL") };
     }
 
     #[test]
     fn read_api_key_missing() {
         let result = ImageGenTool::read_api_key("DEFINITELY_NOT_SET_ZC_TEST_12345");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("DEFINITELY_NOT_SET_ZC_TEST_12345"));
+        assert!(
+            result
+                .unwrap_err()
+                .contains("DEFINITELY_NOT_SET_ZC_TEST_12345")
+        );
     }
 
     #[test]
@@ -485,10 +497,12 @@ mod tests {
 
     #[test]
     fn read_api_key_present() {
-        std::env::set_var("ZC_IMAGE_GEN_TEST_KEY", "test_value_123");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZC_IMAGE_GEN_TEST_KEY", "test_value_123") };
         let result = ImageGenTool::read_api_key("ZC_IMAGE_GEN_TEST_KEY");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "test_value_123");
-        std::env::remove_var("ZC_IMAGE_GEN_TEST_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZC_IMAGE_GEN_TEST_KEY") };
     }
 }

@@ -1,9 +1,16 @@
 mod agent;
 mod agent_robustness;
+mod backup_cron_scheduling;
+mod calendar_triggers;
 mod channel_matrix;
 mod channel_routing;
+mod email_attachments;
+mod hook_execution_post_send;
 mod hooks;
+mod knowledge_client;
 mod memory_comparison;
+mod memory_loop_continuity;
 mod memory_restart;
+mod report_template_tool_test;
 mod telegram_attachment_fallback;
 mod telegram_finalize_draft;

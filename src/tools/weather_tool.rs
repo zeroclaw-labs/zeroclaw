@@ -8,7 +8,7 @@
 use super::traits::{Tool, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const WTTR_BASE_URL: &str = "https://wttr.in";
@@ -231,14 +231,13 @@ impl WeatherTool {
         let moon = astronomy.map(|a| a.moon_phase.as_str()).unwrap_or("N/A");
 
         let snow_note = if day.total_snow_cm != "0.0" && day.total_snow_cm != "0" {
-            let snow_str = if metric {
+            if metric {
                 format!(" | Snow: {} cm", day.total_snow_cm)
             } else {
                 // convert cm → inches for imperial display
                 let cm: f64 = day.total_snow_cm.parse().unwrap_or(0.0);
                 format!(" | Snow: {:.1} in", cm / 2.54)
-            };
-            snow_str
+            }
         } else {
             String::new()
         };

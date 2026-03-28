@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod host;
+pub mod signature;
 pub mod wasm_channel;
 pub mod wasm_tool;
 
@@ -29,6 +30,13 @@ pub struct PluginManifest {
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Ed25519 signature over the canonical manifest (base64url-encoded).
+    /// Set by the plugin publisher when signing the manifest.
+    #[serde(default)]
+    pub signature: Option<String>,
+    /// Hex-encoded Ed25519 public key of the publisher who signed this manifest.
+    #[serde(default)]
+    pub publisher_key: Option<String>,
 }
 
 /// What a plugin can do.
