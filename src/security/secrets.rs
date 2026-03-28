@@ -440,17 +440,21 @@ mod tests {
     fn op_invalid_reference_format() {
         let result = resolve_onepassword_ref("op://");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid 1Password reference"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid 1Password reference")
+        );
 
         let result = resolve_onepassword_ref("op://vault-only");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid 1Password reference"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid 1Password reference")
+        );
     }
 
     #[test]

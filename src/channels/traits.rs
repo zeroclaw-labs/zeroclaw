@@ -447,9 +447,11 @@ mod tests {
     async fn default_invite_user_returns_success() {
         let channel = DummyChannel;
 
-        assert!(channel
-            .invite_user("room_1", "@user:example.com")
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .invite_user("room_1", "@user:example.com")
+                .await
+                .is_ok()
+        );
     }
 }

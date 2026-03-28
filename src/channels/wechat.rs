@@ -1,6 +1,6 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use crate::security::pairing::PairingGuard;
-use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, BlockEncryptMut, KeyInit};
+use aes::cipher::{BlockDecryptMut, BlockEncryptMut, KeyInit, block_padding::Pkcs7};
 use anyhow::Context;
 use async_trait::async_trait;
 use base64::Engine;

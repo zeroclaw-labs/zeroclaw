@@ -33,10 +33,10 @@ pub mod lark;
 pub mod line;
 pub mod link_enricher;
 pub mod linq;
-pub mod media_markers;
 #[cfg(feature = "channel-matrix")]
 pub mod matrix;
 pub mod mattermost;
+pub mod media_markers;
 pub mod media_pipeline;
 pub mod mochat;
 pub mod mqtt;
@@ -114,9 +114,9 @@ pub use whatsapp::WhatsAppChannel;
 pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
-    build_tool_instructions, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_thread_id, scrub_credentials,
-    EMPTY_MODEL_REPLY_PLACEHOLDER,
+    EMPTY_MODEL_REPLY_PLACEHOLDER, build_tool_instructions, clear_model_switch_request,
+    get_model_switch_state, is_model_switch_requested, run_tool_call_loop, scope_thread_id,
+    scrub_credentials,
 };
 use crate::approval::ApprovalManager;
 use crate::config::Config;
@@ -761,7 +761,8 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], \
                [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
              - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
-             - Keep normal text outside markers and never wrap markers in code fences.\n"),
+             - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
         "lark" | "feishu" => Some(
             "When responding on Lark/Feishu:\n\
              - For media attachments use markers: [IMAGE:<local-absolute-path>], [DOCUMENT:<local-absolute-path>], [VIDEO:<local-absolute-path>], [AUDIO:<local-absolute-path>], or [VOICE:<local-absolute-path>]\n\

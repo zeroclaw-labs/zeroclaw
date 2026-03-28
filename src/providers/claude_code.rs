@@ -317,8 +317,8 @@ impl Provider for ClaudeCodeProvider {
 mod tests {
     use super::*;
     use crate::providers::test_util::env_lock;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Serialize tests that spawn the echo-provider script.
     ///

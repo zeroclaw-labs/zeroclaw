@@ -93,7 +93,7 @@ fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
 }
 
 fn base64url_no_pad(data: &[u8]) -> String {
-    use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
     URL_SAFE_NO_PAD.encode(data)
 }
 
@@ -626,11 +626,7 @@ fn openai_assistant_content_plaintext(content: Option<&serde_json::Value>) -> Op
                 }
                 out.push_str(text);
             }
-            if out.is_empty() {
-                None
-            } else {
-                Some(out)
-            }
+            if out.is_empty() { None } else { Some(out) }
         }
         _ => None,
     }
@@ -2478,8 +2474,8 @@ mod tests {
     use crate::providers::traits::ChatRequest;
     use crate::tools::ToolSpec;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
 
@@ -2487,8 +2483,8 @@ mod tests {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
     }
 
-    async fn spawn_transport_error_server(
-    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    async fn spawn_transport_error_server()
+    -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");
@@ -2660,7 +2656,7 @@ mod tests {
 
     #[test]
     fn zhipu_jwt_header_is_correct() {
-        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
         let result = zhipu_jwt_bearer("myid.mysecret").unwrap();
         let jwt = result.strip_prefix("Bearer ").unwrap();
         let header_b64 = jwt.split('.').next().unwrap();
@@ -2673,7 +2669,7 @@ mod tests {
 
     #[test]
     fn zhipu_jwt_payload_contains_api_key_and_timestamps() {
-        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
         let result = zhipu_jwt_bearer("myapiid.mysecretkey").unwrap();
         let jwt = result.strip_prefix("Bearer ").unwrap();
         let payload_b64 = jwt.split('.').nth(1).unwrap();
@@ -2699,7 +2695,7 @@ mod tests {
 
         // Verify HMAC-SHA256 signature
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
-        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
         let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
         ring::hmac::verify(&key, signing_input.as_bytes(), &sig_bytes)
             .expect("signature must verify");

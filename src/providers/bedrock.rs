@@ -1187,14 +1187,13 @@ impl Provider for BedrockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::test_util::{env_lock, EnvGuard};
+    use crate::providers::test_util::{EnvGuard, env_lock};
     use crate::providers::traits::ChatMessage;
     use std::sync::Mutex;
 
     /// Mutex to serialize tests that mutate process-wide environment variables,
     /// preventing race conditions during parallel `cargo test` execution.
     static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
 
     // ── SigV4 signing tests ─────────────────────────────────────
 

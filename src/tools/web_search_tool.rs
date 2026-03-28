@@ -973,9 +973,11 @@ mod tests {
         let json = serde_json::json!({"error": "bad request"});
         let result = tool.parse_tavily_results(&json, "test");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid Tavily API response"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid Tavily API response")
+        );
     }
 }

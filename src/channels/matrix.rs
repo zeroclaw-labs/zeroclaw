@@ -1999,9 +1999,9 @@ impl Channel for MatrixChannel {
         encryption: Option<bool>,
     ) -> anyhow::Result<String> {
         use matrix_sdk::ruma::{
-            api::client::room::{create_room::v3::Request as CreateRoomRequest, Visibility},
-            serde::Raw,
             OwnedUserId,
+            api::client::room::{Visibility, create_room::v3::Request as CreateRoomRequest},
+            serde::Raw,
         };
 
         let client = self

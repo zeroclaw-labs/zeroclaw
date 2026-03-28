@@ -1239,16 +1239,16 @@ pub(crate) fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-"kimi-code" | "kimi_coding" | "kimi_for_coding" => {
-            Ok(compat(OpenAiCompatibleProvider::new_with_user_agent_and_vision(
+        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(compat(
+            OpenAiCompatibleProvider::new_with_user_agent_and_vision(
                 "Kimi Code",
                 "https://api.kimi.com/coding/v1",
                 key,
                 AuthStyle::Bearer,
                 "KimiCLI/0.77",
                 true,
-            )))
-        }
+            ),
+        )),
         "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
             "Synthetic",
             "https://api.synthetic.new/openai/v1",
@@ -1267,12 +1267,14 @@ pub(crate) fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
-            "Z.AI",
-            zai_base_url(name).expect("checked in guard"),
-            key,
-            AuthStyle::ZhipuJwt,
-        ))),
+        name if zai_base_url(name).is_some() => {
+            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+                "Z.AI",
+                zai_base_url(name).expect("checked in guard"),
+                key,
+                AuthStyle::ZhipuJwt,
+            )))
+        }
         name if glm_base_url(name).is_some() => {
             Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",
@@ -2425,9 +2427,8 @@ pub(crate) mod test_util {
 
 #[cfg(test)]
 mod tests {
-    use super::test_util::{env_lock, EnvGuard};
+    use super::test_util::{EnvGuard, env_lock};
     use super::*;
-
 
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {

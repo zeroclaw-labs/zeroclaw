@@ -170,11 +170,7 @@ impl SsrfValidator {
         }
 
         let port: u16 = if port_str.is_empty() {
-            if scheme == "https" {
-                443
-            } else {
-                80
-            }
+            if scheme == "https" { 443 } else { 80 }
         } else {
             port_str
                 .parse()

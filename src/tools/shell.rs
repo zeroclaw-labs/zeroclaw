@@ -262,11 +262,12 @@ mod tests {
     /// Returns the fully-wrapped shell tool as it is composed in production:
     /// RateLimited(PathGuarded(ShellTool)).  Tests that verify path-blocking or
     /// rate-limiting behaviour must use this helper so they exercise the wrappers.
-    fn wrapped_shell(
-        security: Arc<SecurityPolicy>,
-    ) -> RateLimitedTool<PathGuardedTool<ShellTool>> {
+    fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<PathGuardedTool<ShellTool>> {
         RateLimitedTool::new(
-            PathGuardedTool::new(ShellTool::new(security.clone(), test_runtime()), security.clone()),
+            PathGuardedTool::new(
+                ShellTool::new(security.clone(), test_runtime()),
+                security.clone(),
+            ),
             security,
         )
     }

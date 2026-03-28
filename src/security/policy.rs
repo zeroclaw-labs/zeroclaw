@@ -3338,7 +3338,7 @@ mod tests {
         assert!(t.record_within("chat_a", 2)); // count=1 ≤ 2 → ok
         assert!(t.record_within("chat_a", 2)); // count=2 ≤ 2 → ok
         assert!(!t.record_within("chat_a", 2)); // count=3 > 2 → blocked
-                                                // sender B is unaffected — its bucket is empty
+        // sender B is unaffected — its bucket is empty
         assert!(t.record_within("chat_b", 2)); // count=1 ≤ 2 → ok
         assert!(t.record_within("chat_b", 2)); // count=2 ≤ 2 → ok
         assert!(!t.record_within("chat_b", 2)); // count=3 > 2 → blocked

@@ -1,18 +1,18 @@
+use super::media_markers::{OutgoingMediaKind, parse_outgoing_media_markers};
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use reqwest::multipart::{Form, Part};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
+use tokio::fs;
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
-use reqwest::multipart::{Form, Part};
-use std::path::Path;
-use tokio::fs;
-use super::media_markers::{parse_outgoing_media_markers, OutgoingMediaKind};
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -1836,13 +1836,19 @@ impl Channel for LarkChannel {
         // Upload & send local media parts (v1: local paths only).
         for part in parts {
             if part.target.starts_with("http://") || part.target.starts_with("https://") {
-                tracing::warn!("lark: unresolved remote media skipped (kind={:?})", part.kind);
+                tracing::warn!(
+                    "lark: unresolved remote media skipped (kind={:?})",
+                    part.kind
+                );
                 continue;
             }
 
             let path = Path::new(&part.target);
             if !path.exists() || !path.is_file() {
-                tracing::warn!("lark: unresolved local media skipped (kind={:?})", part.kind);
+                tracing::warn!(
+                    "lark: unresolved local media skipped (kind={:?})",
+                    part.kind
+                );
                 continue;
             }
 
@@ -1867,12 +1873,10 @@ impl Channel for LarkChannel {
                             .and_then(|n| n.to_str())
                             .unwrap_or("image.bin");
 
-                        let form = Form::new()
-                            .text("image_type", "message")
-                            .part(
-                                "image",
-                                Part::bytes(file_bytes.clone()).file_name(file_name.to_string()),
-                            );
+                        let form = Form::new().text("image_type", "message").part(
+                            "image",
+                            Part::bytes(file_bytes.clone()).file_name(file_name.to_string()),
+                        );
 
                         let resp = self
                             .http_client()
@@ -1903,11 +1907,7 @@ impl Channel for LarkChannel {
                         }
 
                         if status.is_success()
-                            && body_json
-                                .get("code")
-                                .and_then(|c| c.as_i64())
-                                .unwrap_or(0)
-                                == 0
+                            && body_json.get("code").and_then(|c| c.as_i64()).unwrap_or(0) == 0
                         {
                             let image_key = body_json
                                 .pointer("/image_key")
@@ -1934,25 +1934,24 @@ impl Channel for LarkChannel {
 
                     let mut retried = false;
                     loop {
-                        let (status, response) = match self.send_text_once(&url, &token, &body).await
-                        {
-                            Ok(v) => v,
-                            Err(_) => {
-                                tracing::warn!(
-                                    "lark: image message send request failed (kind={:?})",
-                                    part.kind
-                                );
-                                break;
-                            }
-                        };
+                        let (status, response) =
+                            match self.send_text_once(&url, &token, &body).await {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "lark: image message send request failed (kind={:?})",
+                                        part.kind
+                                    );
+                                    break;
+                                }
+                            };
                         if should_refresh_lark_tenant_token(status, &response) && !retried {
                             self.invalidate_token().await;
                             token = self.get_tenant_access_token().await?;
                             retried = true;
                             continue;
                         }
-                        if let Err(_) =
-                            ensure_lark_send_success(status, &response, "image message")
+                        if let Err(_) = ensure_lark_send_success(status, &response, "image message")
                         {
                             tracing::warn!(
                                 "lark: image message send failed (kind={:?})",
@@ -1995,7 +1994,10 @@ impl Channel for LarkChannel {
                         let resp = match resp {
                             Ok(r) => r,
                             Err(_) => {
-                                tracing::warn!("lark: file upload request failed (kind={:?})", part.kind);
+                                tracing::warn!(
+                                    "lark: file upload request failed (kind={:?})",
+                                    part.kind
+                                );
                                 break;
                             }
                         };
@@ -2013,11 +2015,7 @@ impl Channel for LarkChannel {
                         }
 
                         if status.is_success()
-                            && body_json
-                                .get("code")
-                                .and_then(|c| c.as_i64())
-                                .unwrap_or(0)
-                                == 0
+                            && body_json.get("code").and_then(|c| c.as_i64()).unwrap_or(0) == 0
                         {
                             let file_key = body_json
                                 .pointer("/file_key")
@@ -2043,30 +2041,26 @@ impl Channel for LarkChannel {
 
                     let mut retried = false;
                     loop {
-                        let (status, response) = match self.send_text_once(&url, &token, &body).await
-                        {
-                            Ok(v) => v,
-                            Err(_) => {
-                                tracing::warn!(
-                                    "lark: file message send request failed (kind={:?})",
-                                    part.kind
-                                );
-                                break;
-                            }
-                        };
+                        let (status, response) =
+                            match self.send_text_once(&url, &token, &body).await {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "lark: file message send request failed (kind={:?})",
+                                        part.kind
+                                    );
+                                    break;
+                                }
+                            };
                         if should_refresh_lark_tenant_token(status, &response) && !retried {
                             self.invalidate_token().await;
                             token = self.get_tenant_access_token().await?;
                             retried = true;
                             continue;
                         }
-                        if let Err(_) =
-                            ensure_lark_send_success(status, &response, "file message")
+                        if let Err(_) = ensure_lark_send_success(status, &response, "file message")
                         {
-                            tracing::warn!(
-                                "lark: file message send failed (kind={:?})",
-                                part.kind
-                            );
+                            tracing::warn!("lark: file message send failed (kind={:?})", part.kind);
                             break;
                         }
                         sent_any = true;

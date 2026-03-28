@@ -201,9 +201,10 @@ mod tests {
             deny_paths: vec![PathBuf::from("/home/user/.ssh")],
             allow_paths: vec![],
         };
-        assert!(s
-            .validate_path(Path::new("/home/user/.ssh/id_rsa"))
-            .is_err());
+        assert!(
+            s.validate_path(Path::new("/home/user/.ssh/id_rsa"))
+                .is_err()
+        );
     }
 
     #[test]

@@ -1336,8 +1336,8 @@ pub async fn run(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use futures_util::stream;
     use futures_util::StreamExt;
+    use futures_util::stream;
     use parking_lot::Mutex;
     use std::collections::HashMap;
 

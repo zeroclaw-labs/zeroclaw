@@ -1488,10 +1488,11 @@ async fn minimal_channel_all_defaults_succeed() {
         )
         .await
         .unwrap();
-    assert!(ch
-        .invite_user(&room_id, "@another:example.com")
-        .await
-        .is_ok());
+    assert!(
+        ch.invite_user(&room_id, "@another:example.com")
+            .await
+            .is_ok()
+    );
 }
 
 #[tokio::test]
