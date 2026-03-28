@@ -847,6 +847,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
+        "copilot" => "gpt-4o".into(),
         "venice" => "zai-org-glm-5".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "mistral" => "mistral-large-latest".into(),
@@ -948,6 +949,15 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
+        ],
+        "copilot" => vec![
+            ("gpt-4o".to_string(), "GPT-4o (recommended)".to_string()),
+            (
+                "claude-3.5-sonnet".to_string(),
+                "Claude 3.5 Sonnet".to_string(),
+            ),
+            ("o3-mini".to_string(), "o3-mini (reasoning)".to_string()),
+            ("gpt-4".to_string(), "GPT-4 (previous gen)".to_string()),
         ],
         "venice" => vec![
             (
@@ -2348,6 +2358,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "openai-codex",
                 "OpenAI Codex (ChatGPT subscription OAuth, no API key)",
             ),
+            (
+                "copilot",
+                "GitHub Copilot (Copilot subscription OAuth, no API key)",
+            ),
             ("deepseek", "DeepSeek — V3 & R1 (affordable)"),
             ("mistral", "Mistral — Large & Codestral"),
             ("xai", "xAI — Grok 3 & 4"),
@@ -2645,6 +2659,25 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         }
 
         key
+    } else if canonical_provider_name(provider_name) == "copilot" {
+        // GitHub Copilot uses OAuth device flow — no API key needed during setup.
+        // Check if a GITHUB_TOKEN is already available in the environment.
+        if std::env::var("GITHUB_TOKEN").is_ok() {
+            print_bullet(&format!(
+                "{} GITHUB_TOKEN environment variable detected!",
+                style("✓").green().bold()
+            ));
+            print_bullet("ZeroClaw will use it for GitHub Copilot authentication.");
+        } else {
+            print_bullet("GitHub Copilot uses OAuth device-flow authentication.");
+            print_bullet("No API key is needed — you'll be prompted to authorize on first run.");
+            print_bullet(&format!(
+                "Or set {} to use a pre-existing GitHub personal access token.",
+                style("GITHUB_TOKEN").yellow()
+            ));
+        }
+        println!();
+        String::new()
     } else if canonical_provider_name(provider_name) == "gemini" {
         // Special handling for Gemini: check for CLI auth first
         if crate::providers::gemini::GeminiProvider::has_cli_credentials() {
@@ -3070,6 +3103,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "openrouter" => "OPENROUTER_API_KEY",
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai-codex" | "openai" => "OPENAI_API_KEY",
+        "copilot" => "GITHUB_TOKEN",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
         "sglang" => "SGLANG_API_KEY",
@@ -5951,7 +5985,16 @@ fn print_summary(config: &Config) {
 
     let provider = config.default_provider.as_deref().unwrap_or("openrouter");
     if config.api_key.is_none() && !provider_supports_keyless_local_usage(provider) {
-        if provider == "openai-codex" {
+        if provider == "copilot" {
+            println!(
+                "    {} GitHub Copilot auth will prompt automatically on first run.",
+                style(format!("{step}.")).cyan().bold()
+            );
+            println!(
+                "       {}",
+                style("(OAuth device flow — no manual setup needed)").yellow()
+            );
+        } else if provider == "openai-codex" {
             println!(
                 "    {} Authenticate OpenAI Codex:",
                 style(format!("{step}.")).cyan().bold()
@@ -6869,6 +6912,8 @@ mod tests {
         );
         assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
         assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
+        assert_eq!(default_model_for_provider("copilot"), "gpt-4o");
+        assert_eq!(default_model_for_provider("github-copilot"), "gpt-4o");
         assert_eq!(
             default_model_for_provider("anthropic"),
             "claude-sonnet-4-5-20250929"
@@ -6937,6 +6982,8 @@ mod tests {
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
         assert_eq!(canonical_provider_name("llama.cpp"), "llamacpp");
+        assert_eq!(canonical_provider_name("github-copilot"), "copilot");
+        assert_eq!(canonical_provider_name("copilot"), "copilot");
     }
 
     #[test]
@@ -6973,6 +7020,18 @@ mod tests {
 
         assert!(ids.contains(&"gpt-5-codex".to_string()));
         assert!(ids.contains(&"gpt-5.2-codex".to_string()));
+    }
+
+    #[test]
+    fn curated_models_for_copilot_include_expected_models() {
+        let ids: Vec<String> = curated_models_for_provider("copilot")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"gpt-4o".to_string()));
+        assert!(ids.contains(&"claude-3.5-sonnet".to_string()));
+        assert!(ids.contains(&"o3-mini".to_string()));
     }
 
     #[test]
@@ -7463,6 +7522,8 @@ mod tests {
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
         assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
+        assert_eq!(provider_env_var("copilot"), "GITHUB_TOKEN");
+        assert_eq!(provider_env_var("github-copilot"), "GITHUB_TOKEN"); // alias
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
