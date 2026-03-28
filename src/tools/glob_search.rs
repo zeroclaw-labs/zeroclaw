@@ -48,15 +48,6 @@ impl Tool for GlobSearchTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'pattern' parameter"))?;
 
-        // Rate limit check (fast path)
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
         // Security: reject absolute paths unless under an explicit allowed root.
         if (pattern.starts_with('/') || pattern.starts_with('\\'))
             && !self.security.is_under_allowed_root(pattern)
@@ -74,15 +65,6 @@ impl Tool for GlobSearchTool {
                 success: false,
                 output: String::new(),
                 error: Some("Path traversal ('..') is not allowed in glob patterns.".into()),
-            });
-        }
-
-        // Record action to consume rate limit budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
             });
         }
 
@@ -181,6 +163,7 @@ impl Tool for GlobSearchTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::RateLimitedTool;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -203,6 +186,10 @@ mod tests {
             max_actions_per_hour,
             ..SecurityPolicy::default()
         })
+    }
+
+    fn wrapped_glob_search(security: Arc<SecurityPolicy>) -> RateLimitedTool<GlobSearchTool> {
+        RateLimitedTool::new(GlobSearchTool::new(security.clone()), security)
     }
 
     #[test]
@@ -364,7 +351,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("file.txt"), "").unwrap();
 
-        let tool = GlobSearchTool::new(test_security_with(
+        let tool = wrapped_glob_search(test_security_with(
             dir.path().to_path_buf(),
             AutonomyLevel::Supervised,
             0,
