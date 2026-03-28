@@ -330,6 +330,7 @@ pub struct TelegramChannel {
     /// Override for local Bot API servers or testing.
     api_base: String,
     transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
     voice_transcriptions: Mutex<std::collections::HashMap<String, String>>,
     workspace_dir: Option<std::path::PathBuf>,
     ack_reactions: bool,
@@ -375,6 +376,7 @@ impl TelegramChannel {
             bot_username: Mutex::new(None),
             api_base: "https://api.telegram.org".to_string(),
             transcription: None,
+            transcription_manager: None,
             voice_transcriptions: Mutex::new(std::collections::HashMap::new()),
             workspace_dir: None,
             ack_reactions: true,
@@ -423,8 +425,19 @@ impl TelegramChannel {
 
     /// Configure voice transcription.
     pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
-        if config.enabled {
-            self.transcription = Some(config);
+        if !config.enabled {
+            return self;
+        }
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+                self.transcription = Some(config);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, voice transcription disabled: {e}"
+                );
+            }
         }
         self
     }
@@ -1167,6 +1180,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
     /// or the message exceeds duration limits.
     async fn try_parse_voice_message(&self, update: &serde_json::Value) -> Option<ChannelMessage> {
         let config = self.transcription.as_ref()?;
+        let manager = self.transcription_manager.as_deref()?;
         let message = update.get("message")?;
 
         let (file_id, duration) = Self::parse_voice_metadata(message)?;
@@ -1235,14 +1249,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             }
         };
 
-        let text =
-            match super::transcription::transcribe_audio(audio_data, &file_name, config).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!("Voice transcription failed: {e}");
-                    return None;
-                }
-            };
+        let text = match manager.transcribe(&audio_data, &file_name).await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Voice transcription failed: {e}");
+                return None;
+            }
+        };
 
         if text.trim().is_empty() {
             tracing::info!("Voice transcription returned empty text, skipping");
@@ -4348,10 +4361,12 @@ mod tests {
     fn with_transcription_sets_config_when_enabled() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
 
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
         assert!(ch.transcription.is_some());
+        assert!(ch.transcription_manager.is_some());
     }
 
     #[test]
@@ -4360,6 +4375,7 @@ mod tests {
         let ch =
             TelegramChannel::new("token".into(), vec!["*".into()], false).with_transcription(tc);
         assert!(ch.transcription.is_none());
+        assert!(ch.transcription_manager.is_none());
     }
 
     #[tokio::test]
@@ -4382,6 +4398,7 @@ mod tests {
     async fn try_parse_voice_message_skips_when_duration_exceeds_limit() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
         tc.max_duration_secs = 5;
 
         let ch =
@@ -4403,6 +4420,7 @@ mod tests {
     async fn try_parse_voice_message_rejects_unauthorized_sender_before_download() {
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;
+        tc.api_key = Some("test_key".to_string());
         tc.max_duration_secs = 120;
 
         let ch = TelegramChannel::new("token".into(), vec!["alice".into()], false)
@@ -4453,15 +4471,17 @@ mod tests {
             audio_data.len()
         );
 
-        // 2. Call transcribe_audio() — real Groq Whisper API
+        // 2. Call TranscriptionManager.transcribe() — real Groq Whisper API
         let config = crate::config::TranscriptionConfig {
             enabled: true,
             ..Default::default()
         };
-        let transcript: String =
-            crate::channels::transcription::transcribe_audio(audio_data, "hello.mp3", &config)
-                .await
-                .expect("transcribe_audio should succeed with valid GROQ_API_KEY");
+        let manager = crate::channels::transcription::TranscriptionManager::new(&config)
+            .expect("TranscriptionManager::new should succeed with valid GROQ_API_KEY");
+        let transcript: String = manager
+            .transcribe(&audio_data, "hello.mp3")
+            .await
+            .expect("transcribe should succeed with valid GROQ_API_KEY");
 
         // 3. Verify Whisper actually recognized "hello"
         assert!(
@@ -4881,8 +4901,8 @@ mod tests {
     /// guard in `agent/loop_.rs` will reject photo messages.
     #[test]
     fn groq_provider_rejects_photo_with_vision_error() {
-        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
         use crate::providers::Provider;
+        use crate::providers::compatible::{AuthStyle, OpenAiCompatibleProvider};
 
         let groq = OpenAiCompatibleProvider::new(
             "Groq",

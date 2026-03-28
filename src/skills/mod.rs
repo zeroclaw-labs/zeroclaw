@@ -13,6 +13,9 @@ use zip::ZipArchive;
 mod audit;
 #[cfg(feature = "skill-creation")]
 pub mod creator;
+#[cfg(feature = "skill-creation")]
+pub mod improver;
+pub mod testing;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
@@ -79,13 +82,12 @@ struct SkillMeta {
     tags: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 struct SkillMarkdownMeta {
     name: Option<String>,
     description: Option<String>,
     version: Option<String>,
     author: Option<String>,
-    #[serde(default)]
     tags: Vec<String>,
 }
 
@@ -618,15 +620,64 @@ struct ParsedSkillMarkdown {
 
 fn parse_skill_markdown(content: &str) -> ParsedSkillMarkdown {
     if let Some((frontmatter, body)) = split_skill_frontmatter(content) {
-        if let Ok(meta) = serde_yaml::from_str::<SkillMarkdownMeta>(&frontmatter) {
-            return ParsedSkillMarkdown { meta, body };
-        }
+        let meta = parse_simple_frontmatter(&frontmatter);
+        return ParsedSkillMarkdown { meta, body };
     }
 
     ParsedSkillMarkdown {
         meta: SkillMarkdownMeta::default(),
         body: content.to_string(),
     }
+}
+
+/// Lightweight YAML-like frontmatter parser for simple `key: value` pairs.
+/// Replaces `serde_yaml` to avoid pulling in the full YAML parser (~30KB)
+/// for a struct with only 5 optional string fields.
+fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
+    let mut meta = SkillMarkdownMeta::default();
+    let mut collecting_tags = false;
+    for line in s.lines() {
+        // Handle YAML list items under `tags:` (e.g. "  - parser")
+        if collecting_tags {
+            let trimmed = line.trim();
+            if let Some(item) = trimmed.strip_prefix("- ") {
+                let tag = item.trim().trim_matches('"').trim_matches('\'');
+                if !tag.is_empty() {
+                    meta.tags.push(tag.to_string());
+                }
+                continue;
+            }
+            // Non-list-item line → stop collecting tags
+            collecting_tags = false;
+        }
+        let Some((key, val)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = val.trim().trim_matches('"').trim_matches('\'');
+        match key {
+            "name" => meta.name = Some(val.to_string()),
+            "description" => meta.description = Some(val.to_string()),
+            "version" => meta.version = Some(val.to_string()),
+            "author" => meta.author = Some(val.to_string()),
+            "tags" => {
+                if val.is_empty() {
+                    // YAML block list follows on subsequent lines
+                    collecting_tags = true;
+                } else {
+                    // Inline: [a, b, c] or comma-separated
+                    let val = val.trim_start_matches('[').trim_end_matches(']');
+                    meta.tags = val
+                        .split(',')
+                        .map(|t| t.trim().trim_matches('"').trim_matches('\'').to_string())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                }
+            }
+            _ => {}
+        }
+    }
+    meta
 }
 
 fn split_skill_frontmatter(content: &str) -> Option<(String, String)> {
@@ -774,7 +825,10 @@ pub fn skills_to_prompt_with_mode(
                 .collect();
 
             if !registered.is_empty() {
-                let _ = writeln!(prompt, "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">");
+                let _ = writeln!(
+                    prompt,
+                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">"
+                );
                 for tool in &registered {
                     let _ = writeln!(prompt, "      <tool>");
                     write_xml_text_element(
@@ -1310,7 +1364,9 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 println!("No skills installed.");
                 println!();
                 println!("  Create one: mkdir -p ~/.zeroclaw/workspace/skills/my-skill");
-                println!("              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md");
+                println!(
+                    "              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md"
+                );
                 println!();
                 println!("  Or install: zeroclaw skills install <source>");
             } else {
@@ -1436,6 +1492,44 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             );
             Ok(())
         }
+        crate::SkillCommands::Test { name, verbose } => {
+            let results = if let Some(ref skill_name) = name {
+                // Test a single skill
+                let source_path = PathBuf::from(skill_name);
+                let target = if source_path.exists() {
+                    source_path
+                } else {
+                    skills_dir(workspace_dir).join(skill_name)
+                };
+
+                if !target.exists() {
+                    anyhow::bail!("Skill not found: {}", skill_name);
+                }
+
+                let r = testing::test_skill(&target, skill_name, verbose)?;
+                if r.tests_run == 0 {
+                    println!(
+                        "  {} No TEST.sh found for skill '{}'.",
+                        console::style("-").dim(),
+                        skill_name,
+                    );
+                    return Ok(());
+                }
+                vec![r]
+            } else {
+                // Test all skills
+                let dirs = vec![skills_dir(workspace_dir)];
+                testing::test_all_skills(&dirs, verbose)?
+            };
+
+            testing::print_results(&results);
+
+            let any_failed = results.iter().any(|r| !r.failures.is_empty());
+            if any_failed {
+                anyhow::bail!("Some skill tests failed.");
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1459,7 +1553,8 @@ mod tests {
     impl EnvVarGuard {
         fn unset(key: &'static str) -> Self {
             let original = std::env::var(key).ok();
-            std::env::remove_var(key);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var(key) };
             Self { key, original }
         }
     }
@@ -1467,9 +1562,11 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = &self.original {
-                std::env::set_var(self.key, value);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, value) };
             } else {
-                std::env::remove_var(self.key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }

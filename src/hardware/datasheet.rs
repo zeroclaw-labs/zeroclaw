@@ -112,7 +112,9 @@ impl DatasheetManager {
     /// Returns a suggested search query string the LLM (or a search tool) can
     /// use to find the datasheet.
     pub fn search_query(device_name: &str) -> String {
-        format!("{device_name} datasheet filetype:pdf site:ti.com OR site:nxp.com OR site:st.com OR site:microchip.com OR site:infineon.com OR site:analog.com")
+        format!(
+            "{device_name} datasheet filetype:pdf site:ti.com OR site:nxp.com OR site:st.com OR site:microchip.com OR site:infineon.com OR site:analog.com"
+        )
     }
 }
 
@@ -190,7 +192,7 @@ impl Tool for DatasheetTool {
                     success: false,
                     output: String::new(),
                     error: Some("missing required parameter: action".to_string()),
-                })
+                });
             }
         };
 
@@ -208,7 +210,7 @@ impl Tool for DatasheetTool {
                                 "missing required parameter: device_name for action 'search'"
                                     .to_string(),
                             ),
-                        })
+                        });
                     }
                 };
 
@@ -248,7 +250,7 @@ impl Tool for DatasheetTool {
                                 "missing required parameter: device_name for action 'download'"
                                     .to_string(),
                             ),
-                        })
+                        });
                     }
                 };
                 let url = match args.get("url").and_then(|v| v.as_str()) {
@@ -260,7 +262,7 @@ impl Tool for DatasheetTool {
                             error: Some(
                                 "missing required parameter: url for action 'download'".to_string(),
                             ),
-                        })
+                        });
                     }
                 };
 
@@ -320,7 +322,7 @@ impl Tool for DatasheetTool {
                                 "missing required parameter: device_name for action 'read'"
                                     .to_string(),
                             ),
-                        })
+                        });
                     }
                 };
                 match mgr.find_local(&device) {

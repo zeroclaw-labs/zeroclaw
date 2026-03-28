@@ -1,7 +1,7 @@
 use super::traits::{Observer, ObserverEvent, ObserverMetric};
 use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opentelemetry::trace::{Span, SpanKind, Status, Tracer};
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{KeyValue, global};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -430,6 +430,12 @@ impl Observer for OtelObserver {
                 self.hand_duration
                     .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
             }
+            ObserverEvent::DeploymentStarted { .. }
+            | ObserverEvent::DeploymentCompleted { .. }
+            | ObserverEvent::DeploymentFailed { .. }
+            | ObserverEvent::RecoveryCompleted { .. } => {
+                // DORA deployment events: OTel pass-through not yet implemented.
+            }
         }
     }
 
@@ -469,6 +475,9 @@ impl Observer for OtelObserver {
                         KeyValue::new("success", success_str),
                     ],
                 );
+            }
+            ObserverMetric::DeploymentLeadTime(_) | ObserverMetric::RecoveryTime(_) => {
+                // DORA metrics: OTel pass-through not yet implemented.
             }
         }
     }

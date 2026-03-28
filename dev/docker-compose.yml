@@ -33,7 +33,7 @@ services:
           . /run/secrets/zeroclaw_env
           set +a
         fi
-        exec zeroclaw gateway --port "${ZEROCLAW_GATEWAY_PORT:-42617}" --host "[::]"
+        exec zeroclaw gateway start --port "${ZEROCLAW_GATEWAY_PORT:-42617}" --host "[::]"
     volumes:
       # Mount single config file (avoids shadowing other files in .zeroclaw)
       - ../target/.zeroclaw/config.toml:/zeroclaw-data/.zeroclaw/config.toml

@@ -286,14 +286,18 @@ async fn channel_draft_defaults() {
         "default send_draft should return None"
     );
 
-    assert!(channel
-        .update_draft("target", "msg_1", "updated")
-        .await
-        .is_ok());
-    assert!(channel
-        .finalize_draft("target", "msg_1", "final")
-        .await
-        .is_ok());
+    assert!(
+        channel
+            .update_draft("target", "msg_1", "updated")
+            .await
+            .is_ok()
+    );
+    assert!(
+        channel
+            .finalize_draft("target", "msg_1", "final")
+            .await
+            .is_ok()
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

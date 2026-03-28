@@ -143,10 +143,13 @@ mod tests {
                 body: "Do it".into(),
                 suggested_tools: vec![],
                 requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
             }],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
+            deterministic: false,
         }
     }
 
