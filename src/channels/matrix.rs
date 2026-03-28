@@ -792,6 +792,143 @@ impl MatrixChannel {
     }
 }
 
+// ── Outgoing media helpers ─────────────────────────────────────────────
+
+/// Parsed `[IMAGE:/path]`, `[FILE:/path]`, etc. marker from agent output.
+struct OutgoingMedia {
+    path: String,
+    msgtype: &'static str,
+}
+
+/// Extract media markers from message text, returning cleaned text and markers.
+fn extract_media_markers(message: &str) -> (String, Vec<OutgoingMedia>) {
+    let mut cleaned = String::with_capacity(message.len());
+    let mut markers = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = message[cursor..].find('[') {
+        let start = cursor + rel_start;
+        cleaned.push_str(&message[cursor..start]);
+        let Some(rel_end) = message[start..].find(']') else {
+            cleaned.push_str(&message[start..]);
+            cursor = message.len();
+            break;
+        };
+        let end = start + rel_end;
+        let inner = &message[start + 1..end];
+        let parsed = inner.split_once(':').and_then(|(kind, target)| {
+            let msgtype = match kind.trim().to_ascii_uppercase().as_str() {
+                "IMAGE" | "PHOTO" => "m.image",
+                "DOCUMENT" | "FILE" => "m.file",
+                "VIDEO" => "m.video",
+                "AUDIO" | "VOICE" => "m.audio",
+                _ => return None,
+            };
+            let target = target.trim();
+            (!target.is_empty()).then(|| OutgoingMedia {
+                path: target.to_string(),
+                msgtype,
+            })
+        });
+        if let Some(m) = parsed {
+            markers.push(m);
+        } else {
+            cleaned.push_str(&message[start..=end]);
+        }
+        cursor = end + 1;
+    }
+    if cursor < message.len() {
+        cleaned.push_str(&message[cursor..]);
+    }
+    (cleaned.trim().to_string(), markers)
+}
+
+impl MatrixChannel {
+    /// Upload a file and send it as a media message in the room.
+    async fn send_media(
+        &self,
+        room: &Room,
+        path: &str,
+        msgtype: &str,
+        thread_ts: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let file_path = std::path::Path::new(path);
+        anyhow::ensure!(file_path.exists(), "file not found: {path}");
+
+        let bytes = tokio::fs::read(file_path).await?;
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment");
+        let mime = mime_guess::from_path(path)
+            .first_or_octet_stream()
+            .to_string();
+
+        // Upload to Matrix media repo
+        let homeserver = self.homeserver.trim_end_matches('/');
+        let client = reqwest::Client::new();
+        let upload_resp = client
+            .post(format!(
+                "{homeserver}/_matrix/media/v3/upload?filename={}",
+                urlencoding::encode(filename)
+            ))
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .header("Content-Type", &mime)
+            .body(bytes)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            upload_resp.status().is_success(),
+            "media upload failed: {}",
+            upload_resp.status()
+        );
+
+        let content_uri: String = upload_resp
+            .json::<serde_json::Value>()
+            .await?
+            .get("content_uri")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| anyhow::anyhow!("missing content_uri in upload response"))?;
+
+        let mut event_content = serde_json::json!({
+            "msgtype": msgtype,
+            "body": filename,
+            "url": content_uri,
+            "info": { "mimetype": mime },
+        });
+        if let Some(thread_id) = thread_ts {
+            if let Ok(thread_root) = thread_id.parse::<OwnedEventId>() {
+                event_content["m.relates_to"] = serde_json::json!({
+                    "rel_type": "m.thread",
+                    "event_id": thread_root.to_string(),
+                    "is_falling_back": true,
+                    "m.in_reply_to": { "event_id": thread_root.to_string() },
+                });
+            }
+        }
+
+        let txn_id = uuid::Uuid::new_v4();
+        let room_id = room.room_id();
+        let send_resp = client
+            .put(format!(
+                "{homeserver}/_matrix/client/v3/rooms/{room_id}/send/m.room.message/{txn_id}"
+            ))
+            .header("Authorization", format!("Bearer {}", self.access_token))
+            .json(&event_content)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            send_resp.status().is_success(),
+            "media send failed: {}",
+            send_resp.status()
+        );
+
+        tracing::debug!(filename, msgtype, "Matrix: sent media attachment");
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Channel for MatrixChannel {
     fn name(&self) -> &str {
@@ -830,18 +967,49 @@ impl Channel for MatrixChannel {
             tracing::warn!("Matrix failed to stop typing notification: {error}");
         }
 
-        let mut content = RoomMessageEventContent::text_markdown(&message.content);
-
-        if let Some(ref thread_ts) = message.thread_ts {
-            if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
-                content.relates_to = Some(Relation::Thread(Thread::plain(
-                    thread_root.clone(),
-                    thread_root,
-                )));
+        // Parse and send any media attachment markers before the text message.
+        // Follows the same [IMAGE:/path], [DOCUMENT:/path], [VIDEO:/path], [AUDIO:/path]
+        // marker convention used by Discord and Telegram channels.
+        let (cleaned_content, media_markers) = extract_media_markers(&message.content);
+        for marker in &media_markers {
+            if let Err(err) = self
+                .send_media(
+                    &room,
+                    &marker.path,
+                    marker.msgtype,
+                    message.thread_ts.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    path = %marker.path,
+                    msgtype = marker.msgtype,
+                    "Matrix: failed to send media attachment: {err}"
+                );
             }
         }
 
-        room.send(content).await?;
+        let text_to_send = if media_markers.is_empty() {
+            &message.content
+        } else {
+            &cleaned_content
+        };
+
+        // Only send text if there's meaningful content after marker removal
+        if !text_to_send.trim().is_empty() {
+            let mut content = RoomMessageEventContent::text_markdown(text_to_send);
+
+            if let Some(ref thread_ts) = message.thread_ts {
+                if let Ok(thread_root) = thread_ts.parse::<OwnedEventId>() {
+                    content.relates_to = Some(Relation::Thread(Thread::plain(
+                        thread_root.clone(),
+                        thread_root,
+                    )));
+                }
+            }
+
+            room.send(content).await?;
+        }
 
         // Voice reply: generate TTS audio and send as m.audio when voice_mode is active
         if self.voice_mode.load(Ordering::Relaxed) {
@@ -1029,43 +1197,75 @@ impl Channel for MatrixChannel {
                     return;
                 }
 
-                // Helper: extract mxc:// download URL and filename for media types
-                let media_info = |source: &MediaSource, name: &str| -> Option<(String, String)> {
-                    match source {
-                        MediaSource::Plain(mxc) => {
-                            let rest = mxc.as_str().strip_prefix("mxc://")?;
-                            let url =
-                                format!("{}/_matrix/client/v1/media/download/{}", homeserver, rest);
-                            Some((url, name.to_string()))
+                // Helper: extract mxc:// download URL, filename, and MIME type for media.
+                // MediaSource::Encrypted appears only when SDK decryption failed (missing
+                // keys). When E2EE works (recovery key from #4674), encrypted media
+                // arrives as MediaSource::Plain after transparent SDK decryption.
+                let media_info =
+                    |source: &MediaSource,
+                     name: &str,
+                     mime: Option<&str>|
+                     -> Option<(String, String, Option<String>)> {
+                        match source {
+                            MediaSource::Plain(mxc) => {
+                                let rest = mxc.as_str().strip_prefix("mxc://")?;
+                                let url = format!(
+                                    "{}/_matrix/client/v1/media/download/{}",
+                                    homeserver, rest
+                                );
+                                Some((url, name.to_string(), mime.map(String::from)))
+                            }
+                            MediaSource::Encrypted(_) => {
+                                tracing::debug!(
+                                    "Matrix: encrypted media could not be decrypted (missing room keys?), skipping"
+                                );
+                                None
+                            }
                         }
-                        MediaSource::Encrypted(_) => None,
-                    }
-                };
+                    };
 
                 let (body, media_download) = match &event.content.msgtype {
                     MessageType::Text(content) => (content.body.clone(), None),
                     MessageType::Notice(content) => (content.body.clone(), None),
                     MessageType::Image(content) => {
-                        let dl = media_info(&content.source, &content.body);
+                        let mime = content
+                            .info
+                            .as_ref()
+                            .and_then(|i| i.mimetype.as_deref());
+                        let dl = media_info(&content.source, &content.body, mime);
                         (format!("[IMAGE:{}]", content.body), dl)
                     }
                     MessageType::File(content) => {
-                        let dl = media_info(&content.source, &content.body);
+                        let mime = content
+                            .info
+                            .as_ref()
+                            .and_then(|i| i.mimetype.as_deref());
+                        let dl = media_info(&content.source, &content.body, mime);
                         (format!("[file: {}]", content.body), dl)
                     }
                     MessageType::Audio(content) => {
-                        let dl = media_info(&content.source, &content.body);
+                        let mime = content
+                            .info
+                            .as_ref()
+                            .and_then(|i| i.mimetype.as_deref());
+                        let dl = media_info(&content.source, &content.body, mime);
                         (format!("[audio: {}]", content.body), dl)
                     }
                     MessageType::Video(content) => {
-                        let dl = media_info(&content.source, &content.body);
+                        let mime = content
+                            .info
+                            .as_ref()
+                            .and_then(|i| i.mimetype.as_deref());
+                        let dl = media_info(&content.source, &content.body, mime);
                         (format!("[video: {}]", content.body), dl)
                     }
                     _ => return,
                 };
 
-                // Download media to workspace if present
-                let body = if let Some((url, filename)) = media_download {
+                // Download media to workspace if present, and collect as
+                // MediaAttachment for the media pipeline (#4861).
+                let mut attachments: Vec<super::media_pipeline::MediaAttachment> = Vec::new();
+                let body = if let Some((url, filename, mime_type)) = media_download {
                     let workspace = std::path::PathBuf::from(
                         shellexpand::tilde(
                             &std::env::var("ZEROCLAW_WORKSPACE")
@@ -1085,6 +1285,11 @@ impl Channel for MatrixChannel {
                         Ok(resp) if resp.status().is_success() => match resp.bytes().await {
                             Ok(bytes) => match tokio::fs::write(&dest, &bytes).await {
                                 Ok(()) => {
+                                    attachments.push(super::media_pipeline::MediaAttachment {
+                                        file_name: filename.clone(),
+                                        data: bytes.to_vec(),
+                                        mime_type: mime_type.clone(),
+                                    });
                                     if body.starts_with("[IMAGE:") {
                                         format!("[IMAGE:{}]", dest.display())
                                     } else {
@@ -1187,7 +1392,7 @@ impl Channel for MatrixChannel {
                         .as_secs(),
                     thread_ts: thread_ts.clone(),
                     interruption_scope_id: thread_ts,
-                    attachments: vec![],
+                    attachments,
                 };
 
                 let _ = tx.send(msg).await;
