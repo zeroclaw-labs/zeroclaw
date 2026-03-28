@@ -1443,7 +1443,7 @@ mod tests {
 
     #[test]
     fn runtime_num_ctx_reads_env_variable() {
-        unsafe { std::env::set_var("ZEROCLAW_OLLAMA_NUM_CTX", "16384") };
+        std::env::set_var("ZEROCLAW_OLLAMA_NUM_CTX", "16384");
 
         let ctx = OllamaProvider::runtime_num_ctx();
 
@@ -1452,7 +1452,7 @@ mod tests {
 
     #[test]
     fn runtime_num_ctx_handles_invalid_value() {
-        unsafe { std::env::set_var("ZEROCLAW_OLLAMA_NUM_CTX", "invalid") };
+        std::env::set_var("ZEROCLAW_OLLAMA_NUM_CTX", "invalid");
 
         let ctx = OllamaProvider::runtime_num_ctx();
 

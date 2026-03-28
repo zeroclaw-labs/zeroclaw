@@ -2770,8 +2770,6 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
-            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
-            session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         };
 
         run_gateway_chat_simple(&state, "hello").await.unwrap();

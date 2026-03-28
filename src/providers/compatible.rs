@@ -2441,8 +2441,8 @@ mod tests {
     use crate::providers::traits::ChatRequest;
     use crate::tools::ToolSpec;
     use std::sync::{
-        Arc,
         atomic::{AtomicUsize, Ordering},
+        Arc,
     };
     use std::time::Duration;
 
@@ -2450,8 +2450,8 @@ mod tests {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
     }
 
-    async fn spawn_transport_error_server()
-    -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    async fn spawn_transport_error_server(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("listener should bind");

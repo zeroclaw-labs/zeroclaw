@@ -219,9 +219,6 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
-/// Maximum number of conversation history turns kept per channel session when
-/// no explicit `max_history_messages` is configured (config value is 0 or absent).
-const MAX_CHANNEL_HISTORY: usize = 50;
 /// Proactive context-window budget in estimated characters (~4 chars/token).
 /// When the total character count of conversation history exceeds this limit,
 /// older turns are dropped before the request is sent to the provider,
@@ -11063,6 +11060,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(debounce::MessageDebouncer::new(std::time::Duration::ZERO)),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
+            debouncer: Arc::new(debounce::MessageDebouncer::new(std::time::Duration::ZERO)),
         });
 
         process_channel_message(

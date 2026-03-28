@@ -1238,16 +1238,31 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        "kimi-code" | "kimi_coding" | "kimi_for_coding" => Ok(compat(
-            OpenAiCompatibleProvider::new_with_user_agent_and_vision(
+"kimi-code" | "kimi_coding" | "kimi_for_coding" => {
+            Ok(compat(OpenAiCompatibleProvider::new_with_user_agent_and_vision(
                 "Kimi Code",
                 "https://api.kimi.com/coding/v1",
                 key,
                 AuthStyle::Bearer,
                 "KimiCLI/0.77",
                 true,
-            ),
-        )),
+            )))
+        }
+                "Kimi Code",
+                "https://api.kimi.com/coding/v1",
+                key,
+                AuthStyle::Bearer,
+                "KimiCLI/0.77",
+"kimi-code" | "kimi_coding" | "kimi_for_coding" => {
+            Ok(compat(OpenAiCompatibleProvider::new_with_user_agent_and_vision(
+                "Kimi Code",
+                "https://api.kimi.com/coding/v1",
+                key,
+                AuthStyle::Bearer,
+                "KimiCLI/0.77",
+                true,
+            )))
+        }
         "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
             "Synthetic",
             "https://api.synthetic.new/openai/v1",
@@ -1266,14 +1281,12 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => {
-            Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
-                "Z.AI",
-                zai_base_url(name).expect("checked in guard"),
-                key,
-                AuthStyle::Bearer,
-            )))
-        }
+        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
+            "Z.AI",
+            zai_base_url(name).expect("checked in guard"),
+            key,
+            AuthStyle::Bearer,
+        ))),
         name if glm_base_url(name).is_some() => {
             Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
                 "GLM",

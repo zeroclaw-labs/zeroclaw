@@ -1,6 +1,6 @@
 use crate::config::ObservabilityConfig;
 use anyhow::Result;
-use chrono::Local;
+use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
