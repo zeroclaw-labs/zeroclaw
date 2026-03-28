@@ -1,6 +1,6 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
-use crate::cron::{self, deserialize_maybe_stringified, CronJobPatch};
+use crate::cron::{self, CronJobPatch, deserialize_maybe_stringified};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
@@ -361,10 +361,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
 
         let approved = tool
             .execute(json!({
@@ -501,11 +503,50 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
         assert!(cron::get_job(&cfg, &job.id).unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn empty_allowed_tools_patch_stored_as_none() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_agent_job(
+            &cfg,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "check status",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            Some(vec!["file_read".into()]),
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "allowed_tools": [] }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
+            None,
+            "empty allowed_tools patch should clear to None"
+        );
     }
 
     #[tokio::test]

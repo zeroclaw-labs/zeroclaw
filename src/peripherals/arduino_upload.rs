@@ -6,7 +6,7 @@
 
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::process::Command;
 
 /// Tool: upload Arduino sketch (agent-generated code) to the board.

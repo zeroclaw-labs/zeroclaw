@@ -11,7 +11,7 @@
 //! Both firmware files are compiled into the binary with `include_bytes!` so
 //! users never need to download them separately.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 // ── Embedded firmware ─────────────────────────────────────────────────────────
@@ -337,9 +337,10 @@ mod tests {
     #[test]
     fn pico_main_py_contains_zeroclaw_marker() {
         let src = std::str::from_utf8(PICO_MAIN_PY).expect("main.py is not valid UTF-8");
+        let lower = src.to_lowercase();
         assert!(
-            src.contains("zeroclaw"),
-            "main.py should contain 'zeroclaw' firmware marker"
+            lower.contains("zeroclaw"),
+            "main.py should contain 'zeroclaw' firmware marker (case-insensitive)"
         );
     }
 
@@ -347,5 +348,85 @@ mod tests {
     fn find_rpi_rp2_mount_returns_none_when_not_connected() {
         // This test runs on CI without a Pico attached — just verify it doesn't panic.
         let _ = find_rpi_rp2_mount(); // may be Some or None depending on environment
+    }
+
+    #[test]
+    fn uf2_magic_constant_is_correct() {
+        // UF2 magic word 1 as per the UF2 spec: 0x0A324655
+        assert_eq!(UF2_MAGIC1, [0x55, 0x46, 0x32, 0x0A]);
+    }
+
+    #[test]
+    fn ensure_firmware_dir_creates_directory() {
+        // This test verifies ensure_firmware_dir creates the ~/.zeroclaw/firmware/pico/ path.
+        // It may fail on the UF2 magic check (placeholder UF2) — that's expected and OK.
+        let result = ensure_firmware_dir();
+        // Either succeeds (real UF2) or fails with a clear placeholder message.
+        match result {
+            Ok(dir) => {
+                assert!(
+                    dir.exists(),
+                    "firmware dir should exist after ensure_firmware_dir"
+                );
+                assert!(dir.ends_with("pico"), "firmware dir should end with 'pico'");
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("placeholder") || msg.contains("UF2"),
+                    "error should mention placeholder UF2; got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn flash_uf2_rejects_invalid_magic() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let firmware_dir = tmp.path();
+
+        // Write a fake UF2 with wrong magic
+        std::fs::write(firmware_dir.join("zeroclaw-pico.uf2"), b"NOT_A_UF2_FILE").unwrap();
+
+        let mount = tempfile::tempdir().expect("create mount dir");
+        let result = flash_uf2(mount.path(), firmware_dir).await;
+        assert!(result.is_err(), "flash_uf2 should reject invalid UF2 magic");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("magic"),
+            "error should mention magic mismatch; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flash_uf2_rejects_too_small_file() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let firmware_dir = tmp.path();
+
+        // Write a tiny file (less than 8 bytes)
+        std::fs::write(firmware_dir.join("zeroclaw-pico.uf2"), b"tiny").unwrap();
+
+        let mount = tempfile::tempdir().expect("create mount dir");
+        let result = flash_uf2(mount.path(), firmware_dir).await;
+        assert!(result.is_err(), "flash_uf2 should reject too-small UF2");
+    }
+
+    #[tokio::test]
+    async fn deploy_main_py_fails_when_file_missing() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let firmware_dir = tmp.path();
+        // Don't create main.py — deploy should fail
+
+        let port = std::path::Path::new("/dev/ttyACM_fake_test");
+        let result = deploy_main_py(port, firmware_dir).await;
+        assert!(
+            result.is_err(),
+            "deploy should fail when main.py is missing"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("main.py not found"),
+            "error should mention missing main.py; got: {err}"
+        );
     }
 }

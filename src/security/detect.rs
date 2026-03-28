@@ -64,6 +64,18 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
             tracing::warn!("Docker requested but not available, falling back to application-layer");
             Arc::new(super::traits::NoopSandbox)
         }
+        SandboxBackend::SandboxExec => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::new() {
+                    return Arc::new(sandbox);
+                }
+            }
+            tracing::warn!(
+                "sandbox-exec requested but not available, falling back to application-layer"
+            );
+            Arc::new(super::traits::NoopSandbox)
+        }
         SandboxBackend::Auto | SandboxBackend::None => {
             // Auto-detect best available
             detect_best_sandbox()
@@ -100,6 +112,12 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
                 tracing::info!("Bubblewrap sandbox enabled");
                 return Arc::new(sandbox);
             }
+        }
+
+        // Try sandbox-exec (Seatbelt) — built into macOS
+        if let Ok(sandbox) = super::seatbelt::SeatbeltSandbox::probe() {
+            tracing::info!("macOS sandbox-exec (Seatbelt) enabled");
+            return Arc::new(sandbox);
         }
     }
 

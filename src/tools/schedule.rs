@@ -29,7 +29,7 @@ impl Tool for ScheduleTool {
     fn description(&self) -> &str {
         "Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. \
          WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. \
-         To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' \
+         To send a scheduled message to Discord/Telegram/Slack/Matrix/Feishu, use the cron_add tool with job_type='agent' \
          and a delivery config like {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}."
     }
 
@@ -617,11 +617,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!blocked.success);
-        assert!(blocked
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        assert!(
+            blocked
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
 
         let list = tool.execute(json!({"action": "list"})).await.unwrap();
         assert!(list.success);
@@ -666,11 +668,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!cancel.success);
-        assert!(cancel
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        assert!(
+            cancel
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
 
         let get = tool
             .execute(json!({"action": "get", "id": id}))
@@ -716,11 +720,13 @@ mod tests {
             .unwrap();
 
         assert!(!create.success);
-        assert!(create
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("cron is disabled"));
+        assert!(
+            create
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cron is disabled")
+        );
     }
 
     #[tokio::test]
@@ -750,11 +756,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("not allowed"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not allowed")
+        );
     }
 
     #[tokio::test]
@@ -783,11 +791,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
 
         let approved = tool
             .execute(json!({
