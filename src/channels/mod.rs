@@ -6547,6 +6547,11 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct TelegramDraftRecordingChannel {
+        finalized_drafts: tokio::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    #[derive(Default)]
     struct SlackRecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
@@ -6581,6 +6586,66 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Channel for TelegramDraftRecordingChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("draft-telegram-1".to_string()))
+        }
+
+        async fn update_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            _content: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            content: &str,
+        ) -> anyhow::Result<()> {
+            self.finalized_drafts.lock().await.push((
+                recipient.to_string(),
+                message_id.to_string(),
+                content.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
     #[async_trait::async_trait]
     impl Channel for SlackRecordingChannel {
         fn name(&self) -> &str {
@@ -7064,6 +7129,90 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(reply.contains("BTC is currently around"));
         assert!(!reply.contains("\"tool_calls\""));
         assert!(!reply.contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_telegram_streaming_completes_after_tool_loop() {
+        let channel_impl = Arc::new(TelegramDraftRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+        });
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            process_channel_message(
+                runtime_ctx,
+                traits::ChannelMessage {
+                    id: "msg-telegram-draft".to_string(),
+                    sender: "alice".to_string(),
+                    reply_target: "chat-telegram".to_string(),
+                    content: "hello".to_string(),
+                    channel: "telegram".to_string(),
+                    timestamp: 1,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                },
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("streaming telegram turn should not hang after the tool loop finishes");
+
+        let finalized_drafts = channel_impl.finalized_drafts.lock().await;
+        assert_eq!(finalized_drafts.len(), 1);
+        assert_eq!(finalized_drafts[0].0, "chat-telegram");
+        assert_eq!(finalized_drafts[0].1, "draft-telegram-1");
+        assert_eq!(finalized_drafts[0].2, "ok");
     }
 
     #[tokio::test]
