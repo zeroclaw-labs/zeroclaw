@@ -107,6 +107,7 @@ pub use whatsapp_web::WhatsAppWebChannel;
 use crate::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scrub_credentials,
+    EMPTY_MODEL_REPLY_PLACEHOLDER,
 };
 use crate::approval::ApprovalManager;
 use crate::config::Config;
@@ -3105,6 +3106,17 @@ async fn process_channel_message(
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
             } else {
                 sanitized_response
+            };
+
+            let mut delivered_response = if delivered_response.trim().is_empty() {
+                tracing::warn!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "outbound reply is empty after hooks/sanitization; substituting placeholder so the channel API accepts the message"
+                );
+                EMPTY_MODEL_REPLY_PLACEHOLDER.to_string()
+            } else {
+                delivered_response
             };
 
             // Append a footer when the response was served by a different provider family.
