@@ -121,11 +121,7 @@ impl DeferredMcpToolSet {
                     .iter()
                     .filter(|t| haystack.contains(t.as_str()))
                     .count();
-                if hits > 0 {
-                    Some((stub, hits))
-                } else {
-                    None
-                }
+                if hits > 0 { Some((stub, hits)) } else { None }
             })
             .collect();
 

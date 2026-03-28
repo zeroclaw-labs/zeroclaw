@@ -1,10 +1,10 @@
 use super::traits::{Memory, MemoryCategory};
 use super::{
-    classify_memory_backend, create_memory_for_migration, effective_memory_backend_name,
-    MemoryBackendKind,
+    MemoryBackendKind, classify_memory_backend, create_memory_for_migration,
+    effective_memory_backend_name,
 };
 use crate::config::Config;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use console::style;
 
 /// Handle `zeroclaw memory <subcommand>` CLI commands.

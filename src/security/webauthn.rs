@@ -15,7 +15,7 @@
 
 use crate::security::SecretStore;
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ring::rand::SecureRandom;
 use ring::signature;
 use serde::{Deserialize, Serialize};
@@ -871,10 +871,12 @@ mod tests {
 
         let result = mgr.finish_registration(&state, &response);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Expected type 'webauthn.create'"),);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Expected type 'webauthn.create'"),
+        );
     }
 
     #[test]
@@ -1044,10 +1046,12 @@ mod tests {
 
         let result = mgr.start_authentication("user1");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("No registered credentials"),);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("No registered credentials"),
+        );
     }
 
     #[test]
@@ -1240,10 +1244,12 @@ mod tests {
 
         let result = mgr.finish_authentication(&auth_state, &response);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("not in allowed list"),);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not in allowed list"),
+        );
     }
 
     #[test]

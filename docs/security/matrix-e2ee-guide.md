@@ -213,6 +213,55 @@ Delete this directory.
 
 **Prevention:** Do not delete the local state directory without also deregistering the device. If you need a fresh start, always deregister first.
 
+### I. Recovery key (recommended for E2EE)
+
+A recovery key lets ZeroClaw automatically restore room keys and cross-signing secrets from server-side backup. This means device resets, crypto store deletions, and fresh installs recover automatically — no emoji verification, no manual key sharing.
+
+#### Step 1: Get your recovery key from Element
+
+1. Log into the bot account in Element (web or desktop)
+2. Go to Settings → Security & Privacy → Encryption → Secure Backup
+3. If backup is already set up, your recovery key was shown when you first enabled it. If you saved it, use that.
+4. If backup is not set up, click "Set up Secure Backup" and choose "Generate a Security Key". Save the key — it looks like `EsTj 3yST y93F SLpB ...`
+5. Log out of Element when done
+
+#### Step 2: Add the recovery key to ZeroClaw
+
+Option A — during onboarding:
+
+```bash
+zeroclaw onboard
+# or
+zeroclaw onboard --channels-only
+```
+
+When configuring the Matrix channel, the wizard prompts:
+
+```
+E2EE recovery key (or Enter to skip): EsTj 3yST y93F SLpB jJsz ...
+```
+
+Paste the recovery key. It will be stored in `config.toml` as `channels_config.matrix.recovery_key`.
+
+Option B — edit `config.toml` directly:
+
+```toml
+[channels_config.matrix]
+recovery_key = "EsTj 3yST y93F SLpB jJsz ..."
+```
+
+If `secrets.encrypt = true` (the default), the value will be encrypted on next config save.
+
+#### Step 3: Restart ZeroClaw
+
+On startup you should see:
+
+```
+Matrix E2EE recovery successful — room keys and cross-signing secrets restored from server backup.
+```
+
+From now on, even if the local crypto store is deleted, ZeroClaw will recover automatically on next startup.
+
 ---
 
 ## 5. Debug Logging
@@ -243,6 +292,7 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 - Keep Matrix tokens out of logs and screenshots.
 - Start with permissive `allowed_users`, then tighten to explicit user IDs.
 - Prefer canonical room IDs in production to avoid alias drift.
+- **Threading behavior:** ZeroClaw always replies in a thread rooted at the user's original message. Each thread maintains its own isolated conversation context. The main room timeline is unaffected — threads do not share context with each other or with the room. In encrypted rooms, threading works identically — the SDK decrypts events transparently before thread context is evaluated.
 
 ---
 

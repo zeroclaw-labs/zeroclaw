@@ -1,7 +1,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::config::Config;
 use crate::cron::{
-    self, deserialize_maybe_stringified, DeliveryConfig, JobType, Schedule, SessionTarget,
+    self, DeliveryConfig, JobType, Schedule, SessionTarget, deserialize_maybe_stringified,
 };
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -146,7 +146,7 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq"],
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "lark", "feishu"],
                             "description": "Channel type to deliver output to"
                         },
                         "to": {
@@ -528,10 +528,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
         assert!(cron::list_jobs(&cfg).unwrap().is_empty());
     }
 
@@ -558,10 +560,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!denied.success);
-        assert!(denied
-            .error
-            .unwrap_or_default()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .error
+                .unwrap_or_default()
+                .contains("explicit approval")
+        );
 
         let approved = tool
             .execute(json!({
@@ -648,10 +652,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("every_ms must be > 0"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("every_ms must be > 0")
+        );
     }
 
     #[tokio::test]
@@ -668,10 +674,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Missing 'prompt'"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Missing 'prompt'")
+        );
     }
 
     #[tokio::test]
@@ -732,11 +740,11 @@ mod tests {
         let cfg = test_config(&tmp).await;
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg));
 
-        let values = tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]
-            ["enum"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let values =
+            tool.parameters_schema()["properties"]["delivery"]["properties"]["channel"]["enum"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
 
         assert!(values.iter().any(|value| value == "matrix"));
     }
