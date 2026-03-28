@@ -1,5 +1,6 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use reqwest::multipart::{Form, Part};
@@ -121,11 +122,38 @@ impl DiscordChannel {
     }
 }
 
+/// Maximum image attachment size (bytes) that will be downloaded and inlined.
+const DISCORD_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+
+/// MIME types accepted for inline image attachments.
+const DISCORD_IMAGE_MIME_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+    "image/bmp",
+];
+
+/// Check if a content type is a supported image MIME type.
+fn is_supported_image_mime(content_type: &str) -> bool {
+    let normalized = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    DISCORD_IMAGE_MIME_TYPES
+        .iter()
+        .any(|&m| m.eq_ignore_ascii_case(normalized))
+}
+
 /// Process Discord message attachments and return a string to append to the
 /// agent message context.
 ///
-/// Only `text/*` MIME types are fetched and inlined. All other types are
-/// silently skipped. Fetch errors are logged as warnings.
+/// - `text/*` MIME types are fetched and inlined as text.
+/// - `image/*` MIME types (png, jpeg, webp, gif, bmp) are fetched, base64-encoded,
+///   and emitted as `[IMAGE:data:<mime>;base64,<data>]` markers for the multimodal
+///   pipeline.
+/// - All other types are silently skipped. Fetch errors are logged as warnings.
 async fn process_attachments(
     attachments: &[serde_json::Value],
     client: &reqwest::Client,
@@ -156,6 +184,38 @@ async fn process_attachments(
                 }
                 Err(e) => {
                     tracing::warn!(name, error = %e, "discord attachment fetch error");
+                }
+            }
+        } else if is_supported_image_mime(ct) {
+            match client.get(url).send().await {
+                Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                    Ok(bytes) => {
+                        if bytes.len() > DISCORD_IMAGE_MAX_BYTES {
+                            tracing::warn!(
+                                name,
+                                size = bytes.len(),
+                                max = DISCORD_IMAGE_MAX_BYTES,
+                                "discord: image attachment too large, skipping"
+                            );
+                            continue;
+                        }
+                        let mime = ct.split(';').next().unwrap_or(ct).trim();
+                        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                        parts.push(format!("[IMAGE:data:{mime};base64,{encoded}]"));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            name,
+                            error = %e,
+                            "discord: failed to read image attachment bytes"
+                        );
+                    }
+                },
+                Ok(resp) => {
+                    tracing::warn!(name, status = %resp.status(), "discord image attachment fetch failed");
+                }
+                Err(e) => {
+                    tracing::warn!(name, error = %e, "discord image attachment fetch error");
                 }
             }
         } else {
@@ -2182,6 +2242,38 @@ mod tests {
         })];
         let result = process_attachments(&attachments, &client).await;
         assert!(result.is_empty());
+    }
+
+    // is_supported_image_mime tests
+
+    #[test]
+    fn is_supported_image_mime_accepts_known_types() {
+        assert!(is_supported_image_mime("image/png"));
+        assert!(is_supported_image_mime("image/jpeg"));
+        assert!(is_supported_image_mime("image/webp"));
+        assert!(is_supported_image_mime("image/gif"));
+        assert!(is_supported_image_mime("image/bmp"));
+    }
+
+    #[test]
+    fn is_supported_image_mime_strips_charset_params() {
+        assert!(is_supported_image_mime("image/png; charset=utf-8"));
+        assert!(is_supported_image_mime("image/jpeg; boundary=something"));
+    }
+
+    #[test]
+    fn is_supported_image_mime_rejects_unsupported() {
+        assert!(!is_supported_image_mime("image/svg+xml"));
+        assert!(!is_supported_image_mime("image/tiff"));
+        assert!(!is_supported_image_mime("application/pdf"));
+        assert!(!is_supported_image_mime("text/plain"));
+        assert!(!is_supported_image_mime(""));
+    }
+
+    #[test]
+    fn is_supported_image_mime_case_insensitive() {
+        assert!(is_supported_image_mime("Image/PNG"));
+        assert!(is_supported_image_mime("IMAGE/JPEG"));
     }
 
     #[test]
