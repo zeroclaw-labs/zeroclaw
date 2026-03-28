@@ -949,7 +949,8 @@ pub fn all_tools_with_runtime(
         .with_parent_tools(Arc::clone(&parent_tools))
         .with_multimodal_config(root_config.multimodal.clone())
         .with_delegate_config(root_config.delegate.clone())
-        .with_workspace_dir(workspace_dir.to_path_buf());
+        .with_workspace_dir(workspace_dir.to_path_buf())
+        .with_memory(memory.clone());
         tool_arcs.push(Arc::new(delegate_tool));
         Some(parent_tools)
     };

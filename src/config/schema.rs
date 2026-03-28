@@ -586,6 +586,11 @@ pub struct DelegateAgentConfig {
     /// When unset or empty, the sub-agent falls back to the default workspace `skills/` directory.
     #[serde(default)]
     pub skills_directory: Option<String>,
+    /// Optional memory namespace for isolation.
+    /// When set, the sub-agent's memory operations are isolated to this namespace,
+    /// preventing cross-contamination with memory from other agents.
+    #[serde(default)]
+    pub memory_namespace: Option<String>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
