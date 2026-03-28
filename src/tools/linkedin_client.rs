@@ -1070,9 +1070,10 @@ impl ImageGenerator {
 
     /// Generate a branded SVG text card with the post title on a gradient background.
     pub fn generate_fallback_card(title: &str, accent_color: &str) -> String {
-        // Truncate title to ~80 chars for clean display
+        // Truncate title to ~80 chars for clean display (UTF-8 safe)
         let display_title = if title.len() > 80 {
-            format!("{}...", &title[..77])
+            let end = title.floor_char_boundary(77);
+            format!("{}...", &title[..end])
         } else {
             title.to_string()
         };
