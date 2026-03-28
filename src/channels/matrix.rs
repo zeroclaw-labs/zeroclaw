@@ -1188,38 +1188,28 @@ impl Channel for MatrixChannel {
                         }
                     };
 
+                // Extract body text, media source, and MIME type from the message.
+                // Media types share the same source/info/body pattern.
                 let (body, media_download) = match &event.content.msgtype {
                     MessageType::Text(content) => (content.body.clone(), None),
                     MessageType::Notice(content) => (content.body.clone(), None),
                     MessageType::Image(content) => {
-                        let mime = content
-                            .info
-                            .as_ref()
-                            .and_then(|i| i.mimetype.as_deref());
+                        let mime = content.info.as_ref().and_then(|i| i.mimetype.as_deref());
                         let dl = media_info(&content.source, &content.body, mime);
                         (format!("[IMAGE:{}]", content.body), dl)
                     }
                     MessageType::File(content) => {
-                        let mime = content
-                            .info
-                            .as_ref()
-                            .and_then(|i| i.mimetype.as_deref());
+                        let mime = content.info.as_ref().and_then(|i| i.mimetype.as_deref());
                         let dl = media_info(&content.source, &content.body, mime);
                         (format!("[file: {}]", content.body), dl)
                     }
                     MessageType::Audio(content) => {
-                        let mime = content
-                            .info
-                            .as_ref()
-                            .and_then(|i| i.mimetype.as_deref());
+                        let mime = content.info.as_ref().and_then(|i| i.mimetype.as_deref());
                         let dl = media_info(&content.source, &content.body, mime);
                         (format!("[audio: {}]", content.body), dl)
                     }
                     MessageType::Video(content) => {
-                        let mime = content
-                            .info
-                            .as_ref()
-                            .and_then(|i| i.mimetype.as_deref());
+                        let mime = content.info.as_ref().and_then(|i| i.mimetype.as_deref());
                         let dl = media_info(&content.source, &content.body, mime);
                         (format!("[video: {}]", content.body), dl)
                     }
