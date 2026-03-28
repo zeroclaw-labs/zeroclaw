@@ -856,7 +856,7 @@ impl Tool for WebSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query. Be specific for better results."
+                    "description": "The search query. MUST be a resolved, specific query — not the user's raw message. Include: specific location (city/district), resolved dates (not '내일' but actual date), and relevant keywords. Example: '서울 강남구 2026-03-29 날씨 예보' instead of '내일 날씨'."
                 }
             },
             "required": ["query"]

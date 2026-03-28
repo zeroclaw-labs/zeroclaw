@@ -1202,6 +1202,23 @@ fn write_zeroclaw_config(
         }
     }
 
+    // Ensure web_search timeout is at least 30 seconds
+    let ws_table = table
+        .entry("web_search".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let toml::Value::Table(ref mut wst) = ws_table {
+        let current_timeout = wst
+            .get("timeout_secs")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(0);
+        if current_timeout < 30 {
+            wst.insert(
+                "timeout_secs".to_string(),
+                toml::Value::Integer(30),
+            );
+        }
+    }
+
     // Enable secrets encryption so the gateway auto-encrypts on first save
     let secrets_table = table
         .entry("secrets".to_string())

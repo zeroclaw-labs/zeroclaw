@@ -2596,7 +2596,7 @@ pub async fn run(
         ("memory_recall", "Search memory by query. Use for: retrieving prior decisions, preferences, historical context."),
         ("memory_forget", "Delete a memory entry. Use for: removing incorrect/stale information."),
         // ── Web tools (free, no API key required) ──
-        ("web_search", "Search the web (DuckDuckGo free, or Perplexity/Brave with API key). Use for: finding information, news, answers. Always try web_search FIRST for any information query."),
+        ("web_search", "Search the web (DuckDuckGo free, or Perplexity/Brave with API key). Use for: finding information, news, answers. Always try web_search FIRST for any information query. IMPORTANT: Never pass the user's raw message as the query. First resolve implicit context (location from memory, relative dates to actual dates) then construct a specific, optimized search query."),
         ("web_fetch", "Fetch and extract text from a web page URL. 5-minute timeout for slow pages. Use for: reading articles, documentation, getting full page content after web_search."),
         ("http_request", "Make HTTP requests (GET/POST/PUT/DELETE). Use for: calling APIs, checking URLs, downloading data."),
         // ── Document tools (free) ──
@@ -3332,7 +3332,7 @@ pub async fn process_message_with_session(
         ("memory_recall", "Search memory by query. Use for: retrieving prior decisions, preferences, historical context."),
         ("memory_forget", "Delete a memory entry. Use for: removing incorrect/stale information."),
         // ── Web tools (free, no API key required) ──
-        ("web_search", "Search the web (DuckDuckGo free, or Perplexity/Brave with API key). Use for: finding information, news, answers. Always try web_search FIRST for any information query."),
+        ("web_search", "Search the web (DuckDuckGo free, or Perplexity/Brave with API key). Use for: finding information, news, answers. Always try web_search FIRST for any information query. IMPORTANT: Never pass the user's raw message as the query. First resolve implicit context (location from memory, relative dates to actual dates) then construct a specific, optimized search query."),
         ("web_fetch", "Fetch and extract text from a web page URL. 5-minute timeout for slow pages. Use for: reading articles, documentation, getting full page content after web_search."),
         ("http_request", "Make HTTP requests (GET/POST/PUT/DELETE). Use for: calling APIs, checking URLs, downloading data."),
         // ── Document tools (free) ──
