@@ -952,12 +952,19 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "copilot" => vec![
             ("gpt-4o".to_string(), "GPT-4o (recommended)".to_string()),
+            ("gpt-4.1".to_string(), "GPT-4.1 (latest)".to_string()),
             (
-                "claude-3.5-sonnet".to_string(),
-                "Claude 3.5 Sonnet".to_string(),
+                "gpt-5-mini".to_string(),
+                "GPT-5 mini (fast, efficient)".to_string(),
             ),
-            ("o3-mini".to_string(), "o3-mini (reasoning)".to_string()),
-            ("gpt-4".to_string(), "GPT-4 (previous gen)".to_string()),
+            (
+                "claude-sonnet-4-6".to_string(),
+                "Claude Sonnet 4.6 (balanced)".to_string(),
+            ),
+            (
+                "claude-opus-4-6".to_string(),
+                "Claude Opus 4.6 (best quality)".to_string(),
+            ),
         ],
         "venice" => vec![
             (
@@ -7030,8 +7037,10 @@ mod tests {
             .collect();
 
         assert!(ids.contains(&"gpt-4o".to_string()));
-        assert!(ids.contains(&"claude-3.5-sonnet".to_string()));
-        assert!(ids.contains(&"o3-mini".to_string()));
+        assert!(ids.contains(&"gpt-4.1".to_string()));
+        assert!(ids.contains(&"gpt-5-mini".to_string()));
+        assert!(ids.contains(&"claude-sonnet-4-6".to_string()));
+        assert!(ids.contains(&"claude-opus-4-6".to_string()));
     }
 
     #[test]
