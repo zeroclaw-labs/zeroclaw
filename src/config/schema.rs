@@ -6872,6 +6872,15 @@ pub struct LineConfig {
     /// - `reply_only`  — Always Reply API; fails without a `replyToken`.
     #[serde(default)]
     pub reply_mode: LineReplyMode,
+    /// When `true`, the bot only responds in group chats when @mentioned by
+    /// `bot_display_name`.  1:1 messages are always processed regardless.
+    /// Defaults to `false`.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// Display name the bot uses inside LINE groups (e.g. `"ZeroClaw"`).
+    /// Required when `mention_only = true`; ignored otherwise.
+    #[serde(default)]
+    pub bot_display_name: Option<String>,
 }
 
 impl ChannelConfig for LineConfig {

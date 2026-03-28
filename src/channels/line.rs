@@ -123,6 +123,15 @@ pub struct LineChannel {
     workspace_dir: Option<std::path::PathBuf>,
     /// Outbound delivery mode (reply_first / push_only / reply_only).
     reply_mode: LineReplyMode,
+    /// When `true`, group messages are ignored unless they @mention the bot.
+    /// 1:1 messages are always processed.
+    mention_only: bool,
+    /// Resolved bot display name used to detect `@<name>` mentions.
+    ///
+    /// Populated either from config (manual override) or fetched once from
+    /// `GET /v2/bot/info` at startup via `resolve_bot_display_name()`.
+    /// Uses `OnceCell` so the field is written once and then read without locks.
+    bot_display_name: tokio::sync::OnceCell<String>,
     client: reqwest::Client,
 }
 
@@ -133,6 +142,8 @@ impl LineChannel {
             allowed_users,
             workspace_dir: None,
             reply_mode: LineReplyMode::default(),
+            mention_only: false,
+            bot_display_name: tokio::sync::OnceCell::new(),
             client: reqwest::Client::new(),
         }
     }
@@ -147,6 +158,79 @@ impl LineChannel {
     pub fn with_workspace_dir(mut self, dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(dir);
         self
+    }
+
+    /// Enable mention-only mode for group chats.
+    ///
+    /// When enabled the bot only responds in groups when `@<display_name>` appears
+    /// in the message text.  The `@<display_name>` prefix is stripped before the
+    /// content is forwarded to the agent.  1:1 messages are unaffected.
+    ///
+    /// `display_name_override` pre-seeds the bot name so no API call is needed.
+    /// If `None`, call `resolve_bot_display_name()` after construction to fetch
+    /// the name from LINE's Bot Info API.
+    pub fn with_mention_only(
+        mut self,
+        enabled: bool,
+        display_name_override: Option<String>,
+    ) -> Self {
+        self.mention_only = enabled;
+        if let Some(name) = display_name_override {
+            // Pre-seed — resolve_bot_display_name() will be a no-op.
+            let _ = self.bot_display_name.set(name);
+        }
+        self
+    }
+
+    /// Ensure `bot_display_name` is populated.
+    ///
+    /// Resolution order:
+    /// 1. Already set (config override) — returns immediately.
+    /// 2. Fetch `GET /v2/bot/info` and cache `displayName`.
+    /// 3. API failure — logs a warning; mention_only silently becomes a no-op
+    ///    until the next successful fetch (future webhook calls will retry via
+    ///    the `warn` path in `parse_webhook_payload`).
+    pub async fn resolve_bot_display_name(&self) {
+        if self.bot_display_name.initialized() {
+            return; // already set via config override
+        }
+
+        #[derive(serde::Deserialize)]
+        struct BotInfo {
+            #[serde(rename = "displayName")]
+            display_name: String,
+        }
+
+        let url = self.api_url("info");
+        match self
+            .client
+            .get(&url)
+            .bearer_auth(&self.channel_access_token)
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => match resp.json::<BotInfo>().await {
+                Ok(info) => {
+                    let name = info.display_name;
+                    tracing::info!("LINE: resolved bot display name = {name:?}");
+                    let _ = self.bot_display_name.set(name);
+                }
+                Err(e) => {
+                    tracing::warn!("LINE: failed to parse bot info response: {e}");
+                }
+            },
+            Ok(resp) => {
+                tracing::warn!(
+                    "LINE: GET /v2/bot/info returned {} — mention_only will be inactive",
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "LINE: failed to reach /v2/bot/info: {e} — mention_only will be inactive"
+                );
+            }
+        }
     }
 
     // ── Permissions ───────────────────────────────────────────────────────────
@@ -267,6 +351,25 @@ impl LineChannel {
         }
     }
 
+    // ── Mention helpers ───────────────────────────────────────────────────────
+
+    /// Returns `true` when the source is a group or room chat.
+    fn is_group_source(source: &LineSource) -> bool {
+        matches!(source.source_type.as_str(), "group" | "room")
+    }
+
+    /// If `text` contains `@<bot_name>`, strips the tag (and surrounding
+    /// whitespace) and returns the cleaned text.  Returns `None` if not found.
+    fn strip_mention(text: &str, bot_name: &str) -> Option<String> {
+        let tag = format!("@{bot_name}");
+        if text.contains(&tag) {
+            let cleaned = text.replace(&tag, "");
+            Some(cleaned.trim().to_string())
+        } else {
+            None
+        }
+    }
+
     // ── Parse webhook into channel messages ───────────────────────────────────
 
     /// Parse the raw JSON webhook payload into zero or more `ChannelMessage`s.
@@ -306,8 +409,50 @@ impl LineChannel {
 
             let timestamp = event.timestamp.unwrap_or(0) / 1000;
 
+            // mention_only: in group/room chats, require @BotName in text messages.
+            // Strip the tag before forwarding so the agent sees clean input.
+            let is_group = Self::is_group_source(&event.source);
+            let mut mention_stripped_text: Option<String> = None;
+            if self.mention_only && is_group {
+                // Resolve bot name lazily — handles the case where the startup
+                // API call failed.  OnceCell guarantees the fetch runs at most
+                // once even under concurrent webhook requests.
+                if !self.bot_display_name.initialized() {
+                    self.resolve_bot_display_name().await;
+                }
+                match self.bot_display_name.get() {
+                    Some(bot_name) => {
+                        if let Some(raw_text) = &msg.text {
+                            match Self::strip_mention(raw_text, bot_name) {
+                                Some(cleaned) => mention_stripped_text = Some(cleaned),
+                                None => {
+                                    tracing::debug!(
+                                        "LINE: mention_only — skipping group msg without @{bot_name}"
+                                    );
+                                    continue;
+                                }
+                            }
+                        } else {
+                            // Non-text message in a group while mention_only — skip silently.
+                            tracing::debug!(
+                                "LINE: mention_only — skipping non-text group msg (no @mention possible)"
+                            );
+                            continue;
+                        }
+                    }
+                    None => {
+                        // API still unreachable — passthrough this message and
+                        // let the next webhook trigger another resolve attempt.
+                        tracing::warn!(
+                            "LINE: mention_only is true but bot_display_name could not be resolved; \
+                             processing all group messages until LINE API is reachable"
+                        );
+                    }
+                }
+            }
+
             let content: Option<String> = match msg.msg_type.as_str() {
-                "text" => msg.text.clone(),
+                "text" => mention_stripped_text.or_else(|| msg.text.clone()),
 
                 "image" | "video" | "audio" => {
                     let ext = Self::content_ext(&msg.msg_type);
@@ -758,5 +903,133 @@ mod tests {
                 .to_string()
                 .contains("reply_only mode but no replyToken")
         );
+    }
+
+    // ── mention_only tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn strip_mention_found_returns_clean_text() {
+        let result = LineChannel::strip_mention("@ZeroClaw what is rust?", "ZeroClaw");
+        assert_eq!(result, Some("what is rust?".to_string()));
+    }
+
+    #[test]
+    fn strip_mention_not_found_returns_none() {
+        let result = LineChannel::strip_mention("just a normal message", "ZeroClaw");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn strip_mention_whitespace_trimmed() {
+        let result = LineChannel::strip_mention("  @ZeroClaw   hello  ", "ZeroClaw");
+        assert_eq!(result, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn with_mention_only_sets_flag_and_name() {
+        let ch = LineChannel::new("tok".to_string(), vec!["*".to_string()])
+            .with_mention_only(true, Some("ZeroClaw".to_string()));
+        assert!(ch.mention_only);
+        assert_eq!(ch.bot_display_name.get().map(|s| s.as_str()), Some("ZeroClaw"));
+    }
+
+    #[test]
+    fn with_mention_only_no_override_leaves_cell_empty() {
+        let ch = LineChannel::new("tok".to_string(), vec!["*".to_string()])
+            .with_mention_only(true, None);
+        assert!(ch.mention_only);
+        assert!(ch.bot_display_name.get().is_none());
+    }
+
+    #[test]
+    fn is_group_source_user_returns_false() {
+        let src = LineSource {
+            source_type: "user".to_string(),
+            user_id: Some("U1".to_string()),
+            group_id: None,
+            room_id: None,
+        };
+        assert!(!LineChannel::is_group_source(&src));
+    }
+
+    #[test]
+    fn is_group_source_group_returns_true() {
+        let src = LineSource {
+            source_type: "group".to_string(),
+            user_id: Some("U1".to_string()),
+            group_id: Some("C_GROUP".to_string()),
+            room_id: None,
+        };
+        assert!(LineChannel::is_group_source(&src));
+    }
+
+    #[tokio::test]
+    async fn mention_only_group_skips_message_without_tag() {
+        let ch = LineChannel::new("tok".to_string(), vec!["*".to_string()])
+            .with_mention_only(true, Some("ZeroClaw".to_string()));
+        let raw = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "tok",
+                "timestamp": 1_700_000_000_000u64,
+                "source": { "type": "group", "groupId": "C_GROUP", "userId": "U_MEMBER" },
+                "message": { "id": "m10", "type": "text", "text": "hello everyone" }
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&raw).await;
+        assert!(msgs.is_empty(), "no @mention — must be skipped");
+    }
+
+    #[tokio::test]
+    async fn mention_only_group_processes_message_with_tag() {
+        let ch = LineChannel::new("tok".to_string(), vec!["*".to_string()])
+            .with_mention_only(true, Some("ZeroClaw".to_string()));
+        let raw = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "tok",
+                "timestamp": 1_700_000_000_000u64,
+                "source": { "type": "group", "groupId": "C_GROUP", "userId": "U_MEMBER" },
+                "message": { "id": "m11", "type": "text", "text": "@ZeroClaw what is rust?" }
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&raw).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "what is rust?", "@mention must be stripped");
+        assert_eq!(msgs[0].reply_target, "C_GROUP");
+    }
+
+    #[tokio::test]
+    async fn mention_only_direct_message_always_processed() {
+        let ch = LineChannel::new("tok".to_string(), vec!["*".to_string()])
+            .with_mention_only(true, Some("ZeroClaw".to_string()));
+        let raw = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "tok",
+                "timestamp": 1_700_000_000_000u64,
+                "source": { "type": "user", "userId": "U_DM" },
+                "message": { "id": "m12", "type": "text", "text": "no tag needed in DM" }
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&raw).await;
+        assert_eq!(msgs.len(), 1, "1:1 DM must bypass mention_only filter");
+        assert_eq!(msgs[0].content, "no tag needed in DM");
+    }
+
+    #[tokio::test]
+    async fn mention_only_false_passes_group_messages_through() {
+        let ch = LineChannel::new("tok".to_string(), vec!["*".to_string()]);
+        let raw = serde_json::json!({
+            "events": [{
+                "type": "message",
+                "replyToken": "tok",
+                "timestamp": 1_700_000_000_000u64,
+                "source": { "type": "group", "groupId": "C_GROUP", "userId": "U_MEMBER" },
+                "message": { "id": "m13", "type": "text", "text": "no tag but mention_only off" }
+            }]
+        });
+        let msgs = ch.parse_webhook_payload(&raw).await;
+        assert_eq!(msgs.len(), 1, "mention_only=false must pass all messages");
     }
 }

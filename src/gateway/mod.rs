@@ -592,14 +592,25 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .map(Arc::from);
 
     // LINE channel (if configured)
-    let line_channel: Option<Arc<LineChannel>> = config.channels_config.line.as_ref().map(|ln| {
+    let line_channel: Option<Arc<LineChannel>> = if let Some(ln) =
+        config.channels_config.line.as_ref()
+    {
         let mut ch = LineChannel::new(ln.channel_access_token.clone(), ln.allowed_users.clone())
-            .with_reply_mode(ln.reply_mode);
+            .with_reply_mode(ln.reply_mode)
+            .with_mention_only(ln.mention_only, ln.bot_display_name.clone());
         if let Some(ws_dir) = config.workspace_dir.parent() {
             ch = ch.with_workspace_dir(ws_dir.join("workspace"));
         }
-        Arc::new(ch)
-    });
+        let ch = Arc::new(ch);
+        // Resolve bot display name (no-op if already set via config override).
+        // Only needed when mention_only is enabled, but cheap to call regardless.
+        if ln.mention_only {
+            ch.resolve_bot_display_name().await;
+        }
+        Some(ch)
+    } else {
+        None
+    };
 
     // LINE Channel Secret for webhook signature verification
     // Priority: environment variable > config file
