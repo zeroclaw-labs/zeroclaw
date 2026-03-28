@@ -36,6 +36,145 @@
       - any-glob-to-any-file:
           - "src/channels/**"
 
+"channel:bluesky":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/bluesky.rs"
+
+"channel:clawdtalk":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/clawdtalk.rs"
+
+"channel:cli":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/cli.rs"
+
+"channel:dingtalk":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/dingtalk.rs"
+
+"channel:discord":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/discord.rs"
+          - "src/channels/discord_history.rs"
+
+"channel:email":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/email_channel.rs"
+          - "src/channels/gmail_push.rs"
+
+"channel:imessage":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/imessage.rs"
+
+"channel:irc":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/irc.rs"
+
+"channel:lark":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/lark.rs"
+
+"channel:linq":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/linq.rs"
+
+"channel:matrix":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/matrix.rs"
+
+"channel:mattermost":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/mattermost.rs"
+
+"channel:mochat":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/mochat.rs"
+
+"channel:mqtt":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/mqtt.rs"
+
+"channel:nextcloud-talk":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/nextcloud_talk.rs"
+
+"channel:nostr":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/nostr.rs"
+
+"channel:notion":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/notion.rs"
+
+"channel:qq":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/qq.rs"
+
+"channel:reddit":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/reddit.rs"
+
+"channel:signal":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/signal.rs"
+
+"channel:slack":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/slack.rs"
+
+"channel:telegram":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/telegram.rs"
+
+"channel:twitter":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/twitter.rs"
+
+"channel:wati":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/wati.rs"
+
+"channel:webhook":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/webhook.rs"
+
+"channel:wecom":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/wecom.rs"
+
+"channel:whatsapp":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/channels/whatsapp.rs"
+          - "src/channels/whatsapp_storage.rs"
+          - "src/channels/whatsapp_web.rs"
+
 "gateway":
   - changed-files:
       - any-glob-to-any-file:
@@ -101,6 +240,73 @@
       - any-glob-to-any-file:
           - "src/providers/**"
 
+"provider:anthropic":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/anthropic.rs"
+
+"provider:azure-openai":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/azure_openai.rs"
+
+"provider:bedrock":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/bedrock.rs"
+
+"provider:claude-code":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/claude_code.rs"
+
+"provider:compatible":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/compatible.rs"
+
+"provider:copilot":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/copilot.rs"
+
+"provider:gemini":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/gemini.rs"
+          - "src/providers/gemini_cli.rs"
+
+"provider:glm":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/glm.rs"
+
+"provider:kilocli":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/kilocli.rs"
+
+"provider:ollama":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/ollama.rs"
+
+"provider:openai":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/openai.rs"
+          - "src/providers/openai_codex.rs"
+
+"provider:openrouter":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/openrouter.rs"
+
+"provider:telnyx":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/providers/telnyx.rs"
+
 "service":
   - changed-files:
       - any-glob-to-any-file:
@@ -120,6 +326,101 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/tools/**"
+
+"tool:browser":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/browser.rs"
+          - "src/tools/browser_delegate.rs"
+          - "src/tools/browser_open.rs"
+          - "src/tools/text_browser.rs"
+          - "src/tools/screenshot.rs"
+
+"tool:composio":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/composio.rs"
+
+"tool:cron":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/cron_add.rs"
+          - "src/tools/cron_list.rs"
+          - "src/tools/cron_remove.rs"
+          - "src/tools/cron_run.rs"
+          - "src/tools/cron_runs.rs"
+          - "src/tools/cron_update.rs"
+
+"tool:file":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/file_edit.rs"
+          - "src/tools/file_read.rs"
+          - "src/tools/file_write.rs"
+          - "src/tools/glob_search.rs"
+          - "src/tools/content_search.rs"
+
+"tool:google-workspace":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/google_workspace.rs"
+
+"tool:mcp":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/mcp_client.rs"
+          - "src/tools/mcp_deferred.rs"
+          - "src/tools/mcp_protocol.rs"
+          - "src/tools/mcp_tool.rs"
+          - "src/tools/mcp_transport.rs"
+
+"tool:memory":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/memory_forget.rs"
+          - "src/tools/memory_recall.rs"
+          - "src/tools/memory_store.rs"
+
+"tool:microsoft365":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/microsoft365/**"
+
+"tool:shell":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/shell.rs"
+          - "src/tools/node_tool.rs"
+          - "src/tools/cli_discovery.rs"
+
+"tool:sop":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/sop_advance.rs"
+          - "src/tools/sop_approve.rs"
+          - "src/tools/sop_execute.rs"
+          - "src/tools/sop_list.rs"
+          - "src/tools/sop_status.rs"
+
+"tool:web":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/web_fetch.rs"
+          - "src/tools/web_search_tool.rs"
+          - "src/tools/web_search_provider_routing.rs"
+          - "src/tools/http_request.rs"
+
+"tool:security":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/security_ops.rs"
+          - "src/tools/verifiable_intent.rs"
+
+"tool:cloud":
+  - changed-files:
+      - any-glob-to-any-file:
+          - "src/tools/cloud_ops.rs"
+          - "src/tools/cloud_patterns.rs"
 
 "tunnel":
   - changed-files:

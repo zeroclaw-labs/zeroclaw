@@ -280,6 +280,8 @@ impl SignalChannel {
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
+            observe_group: false,
         })
     }
 }

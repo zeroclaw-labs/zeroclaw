@@ -1,5 +1,5 @@
-use super::{kill_shared, new_shared_process, SharedProcess, Tunnel, TunnelProcess};
-use anyhow::{bail, Result};
+use super::{SharedProcess, Tunnel, TunnelProcess, kill_shared, new_shared_process};
+use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
 

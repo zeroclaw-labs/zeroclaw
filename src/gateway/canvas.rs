@@ -5,14 +5,14 @@
 //! - `GET  /api/canvas`     — list all active canvases
 //! - `WS   /ws/canvas/:id`  — real-time canvas updates via WebSocket
 
-use super::api::require_auth;
 use super::AppState;
+use super::api::require_auth;
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
         Path, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
 use futures_util::{SinkExt, StreamExt};

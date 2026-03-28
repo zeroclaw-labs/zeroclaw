@@ -1402,16 +1402,20 @@ mod tests {
         let psychology = identity.psychology.clone().unwrap();
         assert_eq!(psychology.mbti.as_deref(), Some("ISFJ"));
         assert_eq!(psychology.ocean.unwrap().openness, Some(0.4));
-        assert!(psychology
-            .moral_compass
-            .unwrap()
-            .contains(&"Alignment: Lawful Good".to_string()));
+        assert!(
+            psychology
+                .moral_compass
+                .unwrap()
+                .contains(&"Alignment: Lawful Good".to_string())
+        );
 
         let capabilities = identity.capabilities.clone().unwrap();
-        assert!(capabilities
-            .skills
-            .unwrap()
-            .contains(&"Gardening".to_string()));
+        assert!(
+            capabilities
+                .skills
+                .unwrap()
+                .contains(&"Gardening".to_string())
+        );
 
         let prompt = aieos_to_system_prompt(&identity);
         assert!(prompt.contains("## Identity"));

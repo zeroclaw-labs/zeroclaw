@@ -118,6 +118,18 @@ impl Tool for SopExecuteTool {
                     SopRunAction::Failed { run_id, reason, .. } => {
                         format!("SOP run {run_id} failed: {reason}")
                     }
+                    SopRunAction::DeterministicStep { run_id, step, .. } => {
+                        format!(
+                            "SOP run started (deterministic): {run_id}\nFirst step: {}",
+                            step.title
+                        )
+                    }
+                    SopRunAction::CheckpointWait { run_id, step, .. } => {
+                        format!(
+                            "SOP run started: {run_id} (paused at checkpoint: {})",
+                            step.title
+                        )
+                    }
                 };
                 Ok(ToolResult {
                     success: true,
@@ -140,7 +152,9 @@ fn action_run_id(action: &SopRunAction) -> Option<&str> {
         SopRunAction::ExecuteStep { run_id, .. }
         | SopRunAction::WaitApproval { run_id, .. }
         | SopRunAction::Completed { run_id, .. }
-        | SopRunAction::Failed { run_id, .. } => Some(run_id),
+        | SopRunAction::Failed { run_id, .. }
+        | SopRunAction::DeterministicStep { run_id, .. }
+        | SopRunAction::CheckpointWait { run_id, .. } => Some(run_id),
     }
 }
 
@@ -168,6 +182,8 @@ mod tests {
                     body: "Do step one".into(),
                     suggested_tools: vec!["shell".into()],
                     requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
                 },
                 SopStep {
                     number: 2,
@@ -175,11 +191,14 @@ mod tests {
                     body: "Do step two".into(),
                     suggested_tools: vec![],
                     requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
                 },
             ],
             cooldown_secs: 0,
             max_concurrent: 1,
             location: None,
+            deterministic: false,
         }
     }
 
