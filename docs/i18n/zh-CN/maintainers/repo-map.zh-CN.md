@@ -46,12 +46,11 @@ zeroclaw/
 ├── docs/contributing/extension-examples.md  # 扩展示例（自定义提供商/渠道/工具/内存）
 ├── firmware/             # Arduino、ESP32、Nucleo 开发板的嵌入式固件
 ├── web/                  # Web UI（Vite + TypeScript）
-├── python/               # Python SDK / 工具桥接
 ├── dev/                  # 本地开发工具（Docker、CI 脚本、沙箱）
 ├── scripts/              # CI 脚本、发布自动化、引导脚本
 ├── docs/                 # 文档系统（多语言、运行时参考）
 ├── .github/              # CI 工作流、PR 模板、自动化
-├── playground/           # （空，实验性临时空间）
+├── playground/           # （git 忽略）Docker 开发工作区，运行时自动填充
 ├── Cargo.toml            # 工作区清单
 ├── Dockerfile            # 容器构建文件
 ├── docker-compose.yml    # 服务编排
@@ -200,7 +199,6 @@ zeroclaw/
 | `docs/contributing/extension-examples.md` | 自定义提供商、渠道、工具和内存后端的扩展示例 |
 | `firmware/` | 嵌入式固件：`arduino/`、`esp32/`、`esp32-ui/`、`nucleo/`、`uno-q-bridge/` |
 | `web/` | Web UI 前端（Vite + TypeScript） |
-| `python/` | Python SDK / 工具桥接，包含自身测试 |
 | `dev/` | 本地开发：Docker Compose、CI 脚本（`ci.sh`）、配置模板、沙箱配置 |
 | `scripts/` | CI 辅助工具、发布自动化、引导脚本、贡献者层级计算 |
 | `docs/` | 文档系统：多语言（en/zh-CN/ja/ru/fr/vi）、运行时参考、运维操作手册、安全提案 |
@@ -233,7 +231,7 @@ main.rs ──▶ daemon/   ──▶ gateway/ + channels/ + cron/ + heartbeat/
 
 ```
 zeroclaw
-├── onboard [--interactive] [--force]     # 首次运行设置
+├── onboard [--force] [--reinit] [--channels-only]     # 首次运行设置
 ├── agent [-m "msg"] [-p provider]        # 启动代理循环
 ├── daemon [-p port]                      # 完整运行时（网关+渠道+cron+心跳）
 ├── gateway [-p port]                     # 仅 HTTP API 服务器

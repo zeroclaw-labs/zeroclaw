@@ -6,7 +6,6 @@
 > Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Vấn đề
-
 ZeroClaw ghi log các hành động nhưng thiếu audit trail chống giả mạo cho:
 - Ai đã thực thi lệnh nào
 - Khi nào và từ channel nào

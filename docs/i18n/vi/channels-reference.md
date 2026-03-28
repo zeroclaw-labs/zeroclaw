@@ -7,8 +7,8 @@ Với các phòng Matrix được mã hóa, xem hướng dẫn chuyên biệt:
 
 ## Truy cập nhanh
 
-- Cần tham khảo config đầy đủ theo từng channel: xem mục `## 4. Ví dụ cấu hình theo từng channel`.
-- Cần chẩn đoán khi không nhận được phản hồi: xem mục `## 6. Danh sách kiểm tra xử lý sự cố`.
+- Cần tham khảo config đầy đủ theo từng channel: xem [Ví dụ cấu hình theo từng Channel](#4-vi-d-cu-hnh-theo-tng-channel).
+- Cần chẩn đoán khi không nhận được phản hồi: xem [Danh sách kiểm tra xử lý sự cố](#6-danh-sch-kim-tra-x-l-s-c).
 - Cần hỗ trợ phòng Matrix được mã hóa: dùng [Hướng dẫn Matrix E2EE](matrix-e2ee-guide.md).
 - Cần thông tin triển khai/mạng (polling vs webhook): dùng [Network Deployment](network-deployment.md).
 
@@ -299,10 +299,10 @@ receive_mode = "websocket"          # hoặc "webhook"
 port = 8081                          # bắt buộc ở chế độ webhook
 ```
 
-Hỗ trợ onboarding tương tác:
+Hỗ trợ onboarding hướng dẫn:
 
 ```bash
-zeroclaw onboard --interactive
+zeroclaw onboard
 ```
 
 Trình hướng dẫn bao gồm bước **Lark/Feishu** chuyên biệt với:
@@ -355,9 +355,9 @@ zeroclaw onboard --channels-only
 zeroclaw daemon
 ```
 
-1. Gửi tin nhắn từ người gửi dự kiến.
-2. Xác nhận nhận được phản hồi.
-3. Siết chặt allowlist từ `"*"` thành các ID cụ thể.
+3. Gửi tin nhắn từ người gửi dự kiến.
+4. Xác nhận nhận được phản hồi.
+5. Siết chặt allowlist từ `"*"` thành các ID cụ thể.
 
 ---
 

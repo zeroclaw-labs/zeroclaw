@@ -1,0 +1,22 @@
+[Unit]
+Description=ZeroClaw AI Hardware Agent
+Documentation=https://github.com/zeroclaw/zeroclaw
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+SupplementaryGroups=gpio spi i2c
+WorkingDirectory=/home/pi/zeroclaw
+ExecStart=/home/pi/zeroclaw/zeroclaw gateway --host 0.0.0.0 --port 8080
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/home/pi/zeroclaw/.env
+Environment=RUST_LOG=info
+
+# Expand ~ in config path
+Environment=HOME=/home/pi
+
+[Install]
+WantedBy=multi-user.target

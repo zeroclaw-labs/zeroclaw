@@ -288,15 +288,6 @@ $ zeroclaw onboard
 # ↑ 仅多了一个词，静默自动检测！
 ```
 
-### 高级用户（显式控制）
-
-```bash
-$ zeroclaw onboard --security-level paranoid
-[1/9] Workspace Setup...
-...
-✓ Security: Paranoid | Landlock + Firejail | Audit signed
-```
-
 ---
 
 ## 向后兼容性

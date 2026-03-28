@@ -152,10 +152,12 @@ mod tests {
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Missing 'job_id'"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Missing 'job_id'")
+        );
     }
 
     #[tokio::test]
@@ -194,10 +196,12 @@ mod tests {
 
         let result = tool.execute(json!({"job_id": job.id})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
         assert_eq!(cron::list_jobs(&cfg).unwrap().len(), 1);
     }
 }

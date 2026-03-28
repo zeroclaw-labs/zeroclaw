@@ -6,7 +6,6 @@
 > Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
 ## Nguyên tắc cốt lõi
->
 > **"Các tính năng bảo mật nên như túi khí — luôn hiện diện, bảo vệ, và vô hình cho đến khi cần."**
 
 ## Thiết kế: tự động phát hiện âm thầm
@@ -266,7 +265,6 @@ impl Default for SandboxBackend {
 ## So sánh trải nghiệm người dùng
 
 ### Trước (hiện tại)
-
 ```bash
 $ zeroclaw onboard
 [1/9] Workspace Setup...
@@ -277,7 +275,6 @@ $ zeroclaw onboard
 ```
 
 ### Sau (với bảo mật không gây cản trở)
-
 ```bash
 $ zeroclaw onboard
 [1/9] Workspace Setup...
@@ -286,15 +283,6 @@ $ zeroclaw onboard
 [9/9] Workspace Files...
 ✓ Security: Supervised | workspace-scoped | Landlock sandbox ✓
 # ↑ Chỉ thêm một từ, tự phát hiện âm thầm!
-```
-
-### Người dùng nâng cao (kiểm soát tường minh)
-
-```bash
-$ zeroclaw onboard --security-level paranoid
-[1/9] Workspace Setup...
-...
-✓ Security: Paranoid | Landlock + Firejail | Audit signed
 ```
 
 ---

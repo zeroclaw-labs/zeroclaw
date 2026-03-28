@@ -12,6 +12,8 @@ pub enum CliCategory {
     Container,
     Build,
     Cloud,
+    AiAgent,
+    Productivity,
 }
 
 impl std::fmt::Display for CliCategory {
@@ -23,6 +25,8 @@ impl std::fmt::Display for CliCategory {
             Self::Container => write!(f, "Container"),
             Self::Build => write!(f, "Build"),
             Self::Cloud => write!(f, "Cloud"),
+            Self::AiAgent => write!(f, "AI Agent"),
+            Self::Productivity => write!(f, "Productivity"),
         }
     }
 }
@@ -103,6 +107,26 @@ const KNOWN_CLIS: &[KnownCli] = &[
         name: "rustc",
         version_args: &["--version"],
         category: CliCategory::Language,
+    },
+    KnownCli {
+        name: "claude",
+        version_args: &["--version"],
+        category: CliCategory::AiAgent,
+    },
+    KnownCli {
+        name: "gemini",
+        version_args: &["--version"],
+        category: CliCategory::AiAgent,
+    },
+    KnownCli {
+        name: "kilo",
+        version_args: &["--version"],
+        category: CliCategory::AiAgent,
+    },
+    KnownCli {
+        name: "gws",
+        version_args: &["--version"],
+        category: CliCategory::Productivity,
     },
 ];
 
@@ -235,5 +259,7 @@ mod tests {
         assert_eq!(CliCategory::Container.to_string(), "Container");
         assert_eq!(CliCategory::Build.to_string(), "Build");
         assert_eq!(CliCategory::Cloud.to_string(), "Cloud");
+        assert_eq!(CliCategory::AiAgent.to_string(), "AI Agent");
+        assert_eq!(CliCategory::Productivity.to_string(), "Productivity");
     }
 }

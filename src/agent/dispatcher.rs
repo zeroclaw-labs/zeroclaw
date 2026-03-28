@@ -128,7 +128,7 @@ impl ToolDispatcher for XmlToolDispatcher {
         ConversationMessage::Chat(ChatMessage::user(format!("[Tool results]\n{content}")))
     }
 
-    fn prompt_instructions(&self, tools: &[Box<dyn Tool>]) -> String {
+    fn prompt_instructions(&self, _tools: &[Box<dyn Tool>]) -> String {
         let mut instructions = String::new();
         instructions.push_str("## Tool Use Protocol\n\n");
         instructions
@@ -136,17 +136,6 @@ impl ToolDispatcher for XmlToolDispatcher {
         instructions.push_str(
             "```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n",
         );
-        instructions.push_str("### Available Tools\n\n");
-
-        for tool in tools {
-            let _ = writeln!(
-                instructions,
-                "- **{}**: {}\n  Parameters: `{}`",
-                tool.name(),
-                tool.description(),
-                tool.parameters_schema()
-            );
-        }
 
         instructions
     }

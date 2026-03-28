@@ -1,9 +1,10 @@
-#[cfg(feature = "channel-nostr")]
-use crate::config::schema::{default_nostr_relays, NostrConfig};
+use crate::cli_input::Input;
 use crate::config::schema::{
     DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NextcloudTalkConfig, QQConfig,
-    SignalConfig, StreamMode, WhatsAppConfig,
+    SignalConfig, StreamMode, WhatsAppChatPolicy, WhatsAppConfig, WhatsAppWebMode,
 };
+#[cfg(feature = "channel-nostr")]
+use crate::config::schema::{NostrConfig, default_nostr_relays};
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
     HeartbeatConfig, IMessageConfig, LarkConfig, MatrixConfig, MemoryConfig, ObservabilityConfig,
@@ -18,9 +19,9 @@ use crate::providers::{
     is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias,
     is_zai_cn_alias,
 };
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use console::style;
-use dialoguer::{Confirm, Input, Select};
+use dialoguer::{Confirm, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -95,7 +96,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     match resolve_interactive_onboarding_mode(&config_path, force)? {
         InteractiveOnboardingMode::FullOnboarding => {}
         InteractiveOnboardingMode::UpdateProviderOnly => {
-            return run_provider_update_wizard(&workspace_dir, &config_path).await;
+            return Box::pin(run_provider_update_wizard(&workspace_dir, &config_path)).await;
         }
     }
 
@@ -121,7 +122,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     let project_ctx = setup_project_context()?;
 
     print_step(9, 9, "Workspace Files");
-    scaffold_workspace(&workspace_dir, &project_ctx).await?;
+    scaffold_workspace(&workspace_dir, &project_ctx, &memory_config.backend).await?;
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
@@ -140,15 +141,25 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
         provider_timeout_secs: 120,
+        provider_max_tokens: None,
         extra_headers: std::collections::HashMap::new(),
+        provider_env: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        trust: crate::trust::TrustConfig::default(),
+        backup: crate::config::BackupConfig::default(),
+        data_retention: crate::config::DataRetentionConfig::default(),
+        cloud_ops: crate::config::CloudOpsConfig::default(),
+        conversational_ai: crate::config::ConversationalAiConfig::default(),
         security: crate::config::SecurityConfig::default(),
+        security_ops: crate::config::SecurityOpsConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
+        pacing: crate::config::PacingConfig::default(),
         skills: crate::config::SkillsConfig::default(),
+        pipeline: crate::config::PipelineConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
@@ -159,17 +170,26 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         tunnel: tunnel_config,
         gateway: crate::config::GatewayConfig::default(),
         composio: composio_config,
+        microsoft365: crate::config::Microsoft365Config::default(),
         secrets: secrets_config,
         browser: BrowserConfig::default(),
+        browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
+        media_pipeline: crate::config::MediaPipelineConfig::default(),
         web_fetch: crate::config::WebFetchConfig::default(),
+        link_enricher: crate::config::LinkEnricherConfig::default(),
+        text_browser: crate::config::TextBrowserConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
+        project_intel: crate::config::ProjectIntelConfig::default(),
+        google_workspace: crate::config::GoogleWorkspaceConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
+        delegate: crate::config::DelegateToolConfig::default(),
         agents: std::collections::HashMap::new(),
+        swarms: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
@@ -177,6 +197,23 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         tts: crate::config::TtsConfig::default(),
         mcp: crate::config::McpConfig::default(),
         nodes: crate::config::NodesConfig::default(),
+        workspace: crate::config::WorkspaceConfig::default(),
+        notion: crate::config::NotionConfig::default(),
+        jira: crate::config::JiraConfig::default(),
+        node_transport: crate::config::NodeTransportConfig::default(),
+        knowledge: crate::config::KnowledgeConfig::default(),
+        linkedin: crate::config::LinkedInConfig::default(),
+        image_gen: crate::config::ImageGenConfig::default(),
+        plugins: crate::config::PluginsConfig::default(),
+        locale: None,
+        verifiable_intent: crate::config::VerifiableIntentConfig::default(),
+        claude_code: crate::config::ClaudeCodeConfig::default(),
+        claude_code_runner: crate::config::ClaudeCodeRunnerConfig::default(),
+        codex_cli: crate::config::CodexCliConfig::default(),
+        gemini_cli: crate::config::GeminiCliConfig::default(),
+        opencode_cli: crate::config::OpenCodeCliConfig::default(),
+        sop: crate::config::SopConfig::default(),
+        shell_tool: crate::config::ShellToolConfig::default(),
     };
 
     println!(
@@ -218,7 +255,8 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            // SAFETY: called during single-threaded onboarding wizard before async runtime.
+            unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -236,7 +274,7 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     );
     println!();
 
-    let mut config = Config::load_or_init().await?;
+    let mut config = Box::pin(Config::load_or_init()).await?;
 
     print_step(1, 1, "Channels (How You Talk to ZeroClaw)");
     config.channels_config = setup_channels()?;
@@ -270,7 +308,8 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
             );
             println!();
             // Signal to main.rs to call start_channels after wizard returns
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            // SAFETY: called during single-threaded onboarding wizard before async runtime.
+            unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -332,7 +371,8 @@ async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) ->
                 style("Starting channel server...").white().bold()
             );
             println!();
-            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+            // SAFETY: called during single-threaded onboarding wizard before async runtime.
+            unsafe { std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1") };
         }
     }
 
@@ -360,7 +400,6 @@ fn apply_provider_update(
 
 /// Non-interactive setup: generates a sensible default config instantly.
 /// Use `zeroclaw onboard` or `zeroclaw onboard --api-key sk-... --provider openrouter --memory sqlite|lucid`.
-/// Use `zeroclaw onboard --interactive` for the full wizard.
 fn backend_key_from_choice(choice: usize) -> &'static str {
     selectable_memory_backends()
         .get(choice)
@@ -382,6 +421,7 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         embedding_dimensions: 1536,
         vector_weight: 0.7,
         keyword_weight: 0.3,
+        search_mode: crate::config::SearchMode::default(),
         min_relevance_score: 0.4,
         embedding_cache_size: if profile.uses_sqlite_hygiene {
             10000
@@ -392,9 +432,19 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         response_cache_enabled: false,
         response_cache_ttl_minutes: 60,
         response_cache_max_entries: 5_000,
+        response_cache_hot_entries: 256,
         snapshot_enabled: false,
         snapshot_on_hygiene: false,
         auto_hydrate: true,
+        retrieval_stages: vec!["cache".into(), "fts".into(), "vector".into()],
+        rerank_enabled: false,
+        rerank_threshold: 5,
+        fts_early_return_score: 0.85,
+        default_namespace: "default".into(),
+        conflict_threshold: 0.85,
+        audit_enabled: false,
+        audit_retention_days: 30,
+        policy: crate::config::MemoryPolicyConfig::default(),
         sqlite_open_timeout_secs: None,
         qdrant: crate::config::QdrantConfig::default(),
     }
@@ -412,14 +462,14 @@ pub async fn run_quick_setup(
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
 
-    run_quick_setup_with_home(
+    Box::pin(run_quick_setup_with_home(
         credential_override,
         provider,
         model_override,
         memory_backend,
         force,
         &home,
-    )
+    ))
     .await
 }
 
@@ -444,6 +494,47 @@ fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
 
     let config_dir = home.join(".zeroclaw");
     (config_dir.clone(), config_dir.join("workspace"))
+}
+
+fn homebrew_prefix_for_exe(exe: &Path) -> Option<&'static str> {
+    let exe = exe.to_string_lossy();
+    if exe == "/opt/homebrew/bin/zeroclaw"
+        || exe.starts_with("/opt/homebrew/Cellar/zeroclaw/")
+        || exe.starts_with("/opt/homebrew/opt/zeroclaw/")
+    {
+        return Some("/opt/homebrew");
+    }
+
+    if exe == "/usr/local/bin/zeroclaw"
+        || exe.starts_with("/usr/local/Cellar/zeroclaw/")
+        || exe.starts_with("/usr/local/opt/zeroclaw/")
+    {
+        return Some("/usr/local");
+    }
+
+    None
+}
+
+fn quick_setup_homebrew_service_note(
+    config_path: &Path,
+    workspace_dir: &Path,
+    exe: &Path,
+) -> Option<String> {
+    let prefix = homebrew_prefix_for_exe(exe)?;
+    let service_root = Path::new(prefix).join("var").join("zeroclaw");
+    let service_config = service_root.join("config.toml");
+    let service_workspace = service_root.join("workspace");
+
+    if config_path == service_config || workspace_dir == service_workspace {
+        return None;
+    }
+
+    Some(format!(
+        "Homebrew service note: `brew services` uses {} (config {}) by default. Your onboarding just wrote {}. If you plan to run ZeroClaw as a service, copy or link this workspace first.",
+        service_workspace.display(),
+        service_config.display(),
+        config_path.display(),
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -498,15 +589,25 @@ async fn run_quick_setup_with_home(
         model_providers: std::collections::HashMap::new(),
         default_temperature: 0.7,
         provider_timeout_secs: 120,
+        provider_max_tokens: None,
         extra_headers: std::collections::HashMap::new(),
+        provider_env: std::collections::HashMap::new(),
         observability: ObservabilityConfig::default(),
         autonomy: AutonomyConfig::default(),
+        trust: crate::trust::TrustConfig::default(),
+        backup: crate::config::BackupConfig::default(),
+        data_retention: crate::config::DataRetentionConfig::default(),
+        cloud_ops: crate::config::CloudOpsConfig::default(),
+        conversational_ai: crate::config::ConversationalAiConfig::default(),
         security: crate::config::SecurityConfig::default(),
+        security_ops: crate::config::SecurityOpsConfig::default(),
         runtime: RuntimeConfig::default(),
         reliability: crate::config::ReliabilityConfig::default(),
         scheduler: crate::config::schema::SchedulerConfig::default(),
         agent: crate::config::schema::AgentConfig::default(),
+        pacing: crate::config::PacingConfig::default(),
         skills: crate::config::SkillsConfig::default(),
+        pipeline: crate::config::PipelineConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
         heartbeat: HeartbeatConfig::default(),
@@ -517,17 +618,26 @@ async fn run_quick_setup_with_home(
         tunnel: crate::config::TunnelConfig::default(),
         gateway: crate::config::GatewayConfig::default(),
         composio: ComposioConfig::default(),
+        microsoft365: crate::config::Microsoft365Config::default(),
         secrets: SecretsConfig::default(),
         browser: BrowserConfig::default(),
+        browser_delegate: crate::tools::browser_delegate::BrowserDelegateConfig::default(),
         http_request: crate::config::HttpRequestConfig::default(),
         multimodal: crate::config::MultimodalConfig::default(),
+        media_pipeline: crate::config::MediaPipelineConfig::default(),
         web_fetch: crate::config::WebFetchConfig::default(),
+        link_enricher: crate::config::LinkEnricherConfig::default(),
+        text_browser: crate::config::TextBrowserConfig::default(),
         web_search: crate::config::WebSearchConfig::default(),
+        project_intel: crate::config::ProjectIntelConfig::default(),
+        google_workspace: crate::config::GoogleWorkspaceConfig::default(),
         proxy: crate::config::ProxyConfig::default(),
         identity: crate::config::IdentityConfig::default(),
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
+        delegate: crate::config::DelegateToolConfig::default(),
         agents: std::collections::HashMap::new(),
+        swarms: std::collections::HashMap::new(),
         hooks: crate::config::HooksConfig::default(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
@@ -535,6 +645,23 @@ async fn run_quick_setup_with_home(
         tts: crate::config::TtsConfig::default(),
         mcp: crate::config::McpConfig::default(),
         nodes: crate::config::NodesConfig::default(),
+        workspace: crate::config::WorkspaceConfig::default(),
+        notion: crate::config::NotionConfig::default(),
+        jira: crate::config::JiraConfig::default(),
+        node_transport: crate::config::NodeTransportConfig::default(),
+        knowledge: crate::config::KnowledgeConfig::default(),
+        linkedin: crate::config::LinkedInConfig::default(),
+        image_gen: crate::config::ImageGenConfig::default(),
+        plugins: crate::config::PluginsConfig::default(),
+        locale: None,
+        verifiable_intent: crate::config::VerifiableIntentConfig::default(),
+        claude_code: crate::config::ClaudeCodeConfig::default(),
+        claude_code_runner: crate::config::ClaudeCodeRunnerConfig::default(),
+        codex_cli: crate::config::CodexCliConfig::default(),
+        gemini_cli: crate::config::GeminiCliConfig::default(),
+        opencode_cli: crate::config::OpenCodeCliConfig::default(),
+        sop: crate::config::SopConfig::default(),
+        shell_tool: crate::config::ShellToolConfig::default(),
     };
 
     config.save().await?;
@@ -549,7 +676,7 @@ async fn run_quick_setup_with_home(
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
     };
-    scaffold_workspace(&workspace_dir, &default_ctx).await?;
+    scaffold_workspace(&workspace_dir, &default_ctx, &memory_backend_name).await?;
 
     println!(
         "  {} Workspace:  {}",
@@ -616,6 +743,16 @@ async fn run_quick_setup_with_home(
         style("Config saved:").white().bold(),
         style(config_path.display()).green()
     );
+    if cfg!(target_os = "macos") {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(note) =
+                quick_setup_homebrew_service_note(&config_path, &workspace_dir, &exe)
+            {
+                println!();
+                println!("  {}", style(note).yellow());
+            }
+        }
+    }
     println!();
     println!("  {}", style("Next steps:").white().bold());
     if credential_override.is_none() {
@@ -694,10 +831,15 @@ fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
 }
 
 /// Pick a sensible default model for the given provider.
-const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
-    ("MiniMax-M2.5", "MiniMax M2.5 (latest, recommended)"),
+const MINIMAX_ONBOARD_MODELS: [(&str, &str); 7] = [
+    (
+        "MiniMax-M2.7",
+        "MiniMax M2.7 (latest flagship, recommended)",
+    ),
+    ("MiniMax-M2.7-highspeed", "MiniMax M2.7 High-Speed (faster)"),
+    ("MiniMax-M2.5", "MiniMax M2.5 (stable)"),
     ("MiniMax-M2.5-highspeed", "MiniMax M2.5 High-Speed (faster)"),
-    ("MiniMax-M2.1", "MiniMax M2.1 (stable)"),
+    ("MiniMax-M2.1", "MiniMax M2.1 (previous gen)"),
     ("MiniMax-M2.1-highspeed", "MiniMax M2.1 High-Speed (faster)"),
     ("MiniMax-M2", "MiniMax M2 (legacy)"),
 ];
@@ -714,12 +856,12 @@ fn default_model_for_provider(provider: &str) -> String {
         "xai" => "grok-4-1-fast-reasoning".into(),
         "perplexity" => "sonar-pro".into(),
         "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct".into(),
-        "novita" => "minimax/minimax-m2.5".into(),
+        "novita" => "minimax/minimax-m2.7".into(),
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
         "cohere" => "command-a-03-2025".into(),
         "moonshot" => "kimi-k2.5".into(),
         "glm" | "zai" => "glm-5".into(),
-        "minimax" => "MiniMax-M2.5".into(),
+        "minimax" => "MiniMax-M2.7".into(),
         "qwen" => "qwen-plus".into(),
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
@@ -729,6 +871,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
+        "avian" => "deepseek/deepseek-v3.2".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -908,10 +1051,16 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Mixtral 8x22B".to_string(),
             ),
         ],
-        "novita" => vec![(
-            "minimax/minimax-m2.5".to_string(),
-            "MiniMax M2.5".to_string(),
-        )],
+        "novita" => vec![
+            (
+                "minimax/minimax-m2.7".to_string(),
+                "MiniMax M2.7 (latest flagship)".to_string(),
+            ),
+            (
+                "minimax/minimax-m2.5".to_string(),
+                "MiniMax M2.5".to_string(),
+            ),
+        ],
         "together-ai" => vec![
             (
                 "meta-llama/Llama-3.3-70B-Instruct-Turbo".to_string(),
@@ -977,8 +1126,16 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "minimax" => vec![
             (
+                "MiniMax-M2.7".to_string(),
+                "MiniMax M2.7 (latest flagship)".to_string(),
+            ),
+            (
+                "MiniMax-M2.7-highspeed".to_string(),
+                "MiniMax M2.7 High-Speed (fast)".to_string(),
+            ),
+            (
                 "MiniMax-M2.5".to_string(),
-                "MiniMax M2.5 (latest flagship)".to_string(),
+                "MiniMax M2.5 (stable)".to_string(),
             ),
             (
                 "MiniMax-M2.5-highspeed".to_string(),
@@ -986,7 +1143,7 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
             (
                 "MiniMax-M2.1".to_string(),
-                "MiniMax M2.1 (strong coding/reasoning)".to_string(),
+                "MiniMax M2.1 (previous gen)".to_string(),
             ),
         ],
         "qwen" => vec![
@@ -1051,6 +1208,21 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             (
                 "z-ai/glm-5".to_string(),
                 "GLM-5 (high reasoning)".to_string(),
+            ),
+        ],
+        "avian" => vec![
+            (
+                "deepseek/deepseek-v3.2".to_string(),
+                "DeepSeek V3.2 (164K context, recommended)".to_string(),
+            ),
+            (
+                "moonshotai/kimi-k2.5".to_string(),
+                "Kimi K2.5 (131K context)".to_string(),
+            ),
+            ("z-ai/glm-5".to_string(), "GLM-5 (131K context)".to_string()),
+            (
+                "minimax/minimax-m2.5".to_string(),
+                "MiniMax M2.5 (1M context)".to_string(),
             ),
         ],
         "ollama" => vec![
@@ -1167,6 +1339,7 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "vllm"
             | "osaurus"
             | "astrai"
+            | "avian"
             | "venice"
             | "fireworks"
             | "novita"
@@ -1204,6 +1377,7 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "qwen" => Some("https://dashscope.aliyuncs.com/compatible-mode/v1/models"),
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
+            "avian" => Some("https://api.avian.io/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
             "sglang" => Some("http://localhost:30000/v1/models"),
             "vllm" => Some("http://localhost:8000/v1/models"),
@@ -1214,8 +1388,8 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
     }
 }
 
-fn build_model_fetch_client() -> Result<reqwest::blocking::Client> {
-    reqwest::blocking::Client::builder()
+fn build_model_fetch_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
         .connect_timeout(Duration::from_secs(4))
         .build()
@@ -1298,7 +1472,7 @@ fn parse_ollama_model_ids(payload: &Value) -> Vec<String> {
     normalize_model_ids(ids)
 }
 
-fn fetch_openai_compatible_models(
+async fn fetch_openai_compatible_models(
     endpoint: &str,
     api_key: Option<&str>,
     allow_unauthenticated: bool,
@@ -1314,15 +1488,17 @@ fn fetch_openai_compatible_models(
 
     let payload: Value = request
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .with_context(|| format!("model fetch failed: GET {endpoint}"))?
         .json()
+        .await
         .context("failed to parse model list response")?;
 
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
-fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
+async fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
     let mut request = client.get("https://openrouter.ai/api/v1/models");
     if let Some(api_key) = api_key {
@@ -1331,15 +1507,17 @@ fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
 
     let payload: Value = request
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .context("model fetch failed: GET https://openrouter.ai/api/v1/models")?
         .json()
+        .await
         .context("failed to parse OpenRouter model list response")?;
 
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
-fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
+async fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
         bail!("Anthropic model fetch requires API key or OAuth token");
     };
@@ -1359,22 +1537,24 @@ fn fetch_anthropic_models(api_key: Option<&str>) -> Result<Vec<String>> {
 
     let response = request
         .send()
+        .await
         .context("model fetch failed: GET https://api.anthropic.com/v1/models")?;
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().unwrap_or_default();
+        let body = response.text().await.unwrap_or_default();
         bail!("Anthropic model list request failed (HTTP {status}): {body}");
     }
 
     let payload: Value = response
         .json()
+        .await
         .context("failed to parse Anthropic model list response")?;
 
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
-fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
+async fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
         bail!("Gemini model fetch requires API key");
     };
@@ -1384,22 +1564,26 @@ fn fetch_gemini_models(api_key: Option<&str>) -> Result<Vec<String>> {
         .get("https://generativelanguage.googleapis.com/v1beta/models")
         .query(&[("key", api_key), ("pageSize", "200")])
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .context("model fetch failed: GET Gemini models")?
         .json()
+        .await
         .context("failed to parse Gemini model list response")?;
 
     Ok(parse_gemini_model_ids(&payload))
 }
 
-fn fetch_ollama_models() -> Result<Vec<String>> {
+async fn fetch_ollama_models() -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
     let payload: Value = client
         .get("http://localhost:11434/api/tags")
         .send()
-        .and_then(reqwest::blocking::Response::error_for_status)
+        .await
+        .and_then(reqwest::Response::error_for_status)
         .context("model fetch failed: GET http://localhost:11434/api/tags")?
         .json()
+        .await
         .context("failed to parse Ollama model list response")?;
 
     Ok(parse_ollama_model_ids(&payload))
@@ -1484,7 +1668,7 @@ fn resolve_live_models_endpoint(
     models_endpoint_for_provider(provider_name).map(str::to_string)
 }
 
-fn fetch_live_models_for_provider(
+async fn fetch_live_models_for_provider(
     provider_name: &str,
     api_key: &str,
     provider_api_url: Option<&str>,
@@ -1516,9 +1700,9 @@ fn fetch_live_models_for_provider(
     };
 
     let models = match provider_name {
-        "openrouter" => fetch_openrouter_models(api_key.as_deref())?,
-        "anthropic" => fetch_anthropic_models(api_key.as_deref())?,
-        "gemini" => fetch_gemini_models(api_key.as_deref())?,
+        "openrouter" => fetch_openrouter_models(api_key.as_deref()).await?,
+        "anthropic" => fetch_anthropic_models(api_key.as_deref()).await?,
+        "gemini" => fetch_gemini_models(api_key.as_deref()).await?,
         "ollama" => {
             if ollama_remote {
                 // Remote Ollama endpoints can serve cloud-routed models.
@@ -1532,12 +1716,13 @@ fn fetch_live_models_for_provider(
                     "qwen3-coder-next:cloud".to_string(),
                     "qwen3-coder:480b:cloud".to_string(),
                     "kimi-k2.5:cloud".to_string(),
-                    "minimax-m2.5:cloud".to_string(),
+                    "minimax-m2.7:cloud".to_string(),
                     "deepseek-v3.1:671b:cloud".to_string(),
                 ]
             } else {
                 // Local endpoints should not surface cloud-only suffixes.
-                fetch_ollama_models()?
+                fetch_ollama_models()
+                    .await?
                     .into_iter()
                     .filter(|model_id| !model_id.ends_with(":cloud"))
                     .collect()
@@ -1549,11 +1734,8 @@ fn fetch_live_models_for_provider(
             {
                 let allow_unauthenticated =
                     allows_unauthenticated_model_fetch(requested_provider_name);
-                fetch_openai_compatible_models(
-                    &endpoint,
-                    api_key.as_deref(),
-                    allow_unauthenticated,
-                )?
+                fetch_openai_compatible_models(&endpoint, api_key.as_deref(), allow_unauthenticated)
+                    .await?
             } else {
                 Vec::new()
             }
@@ -1781,7 +1963,8 @@ pub async fn run_models_refresh(
 
     let api_key = config.api_key.clone().unwrap_or_default();
 
-    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
+    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()).await
+    {
         Ok(models) if !models.is_empty() => {
             cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
             println!(
@@ -2190,6 +2373,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "astrai",
                 "Astrai — compliant AI routing (PII stripping, cost optimization)",
             ),
+            (
+                "avian",
+                "Avian — OpenAI-compatible inference (DeepSeek, Kimi, GLM, MiniMax)",
+            ),
             ("bedrock", "Amazon Bedrock — AWS managed models"),
         ],
         3 => vec![
@@ -2256,7 +2443,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
 
         let model: String = Input::new()
             .with_prompt("  Model name (e.g. llama3, gpt-4o, mistral)")
-            .default("default".into())
+            .default("default")
             .interact_text()?;
 
         let provider_name = format!("custom:{base_url}");
@@ -2292,7 +2479,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         if use_remote_ollama {
             let raw_url: String = Input::new()
                 .with_prompt("  Remote Ollama endpoint URL")
-                .default("https://ollama.com".into())
+                .default("https://ollama.com")
                 .interact_text()?;
 
             let normalized_url = normalize_ollama_endpoint_url(&raw_url);
@@ -2339,7 +2526,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if matches!(provider_name, "llamacpp" | "llama.cpp") {
         let raw_url: String = Input::new()
             .with_prompt("  llama.cpp server endpoint URL")
-            .default("http://localhost:8080/v1".into())
+            .default("http://localhost:8080/v1")
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2370,7 +2557,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "sglang" {
         let raw_url: String = Input::new()
             .with_prompt("  SGLang server endpoint URL")
-            .default("http://localhost:30000/v1".into())
+            .default("http://localhost:30000/v1")
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2401,7 +2588,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "vllm" {
         let raw_url: String = Input::new()
             .with_prompt("  vLLM server endpoint URL")
-            .default("http://localhost:8000/v1".into())
+            .default("http://localhost:8000/v1")
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2432,7 +2619,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
     } else if provider_name == "osaurus" {
         let raw_url: String = Input::new()
             .with_prompt("  Osaurus server endpoint URL")
-            .default("http://localhost:1337/v1".into())
+            .default("http://localhost:1337/v1")
             .interact_text()?;
 
         let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
@@ -2614,6 +2801,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                 "bedrock" => "https://console.aws.amazon.com/iam",
                 "gemini" => "https://aistudio.google.com/app/apikey",
                 "astrai" => "https://as-trai.com",
+                "avian" => "https://avian.io",
                 _ => "",
             }
         };
@@ -2729,7 +2917,9 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
                     provider_name,
                     &api_key,
                     provider_api_url.as_deref(),
-                ) {
+                )
+                .await
+                {
                     Ok(live_model_ids) if !live_model_ids.is_empty() => {
                         cache_live_models_for_provider(
                             workspace_dir,
@@ -2913,6 +3103,7 @@ fn provider_env_var(name: &str) -> &'static str {
         "gemini" => "GEMINI_API_KEY",
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => "NVIDIA_API_KEY",
         "astrai" => "ASTRAI_API_KEY",
+        "avian" => "AVIAN_API_KEY",
         _ => "API_KEY",
     }
 }
@@ -3118,7 +3309,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
             // User chose serial but no device discovered — ask for manual path
             let manual_port: String = Input::new()
                 .with_prompt("  Serial port path (e.g. /dev/ttyUSB0)")
-                .default("/dev/ttyUSB0".into())
+                .default("/dev/ttyUSB0")
                 .interact_text()?;
             hw_config.serial_port = Some(manual_port);
         }
@@ -3144,7 +3335,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
             4 => {
                 let custom: String = Input::new()
                     .with_prompt("  Custom baud rate")
-                    .default("115200".into())
+                    .default("115200")
                     .interact_text()?;
                 custom.parse::<u32>().unwrap_or(115_200)
             }
@@ -3158,7 +3349,7 @@ fn setup_hardware() -> Result<HardwareConfig> {
     {
         let target: String = Input::new()
             .with_prompt("  Target MCU chip (e.g. STM32F411CEUx, nRF52840_xxAA)")
-            .default("STM32F411CEUx".into())
+            .default("STM32F411CEUx")
             .interact_text()?;
         hw_config.probe_target = Some(target);
     }
@@ -3218,7 +3409,7 @@ fn setup_project_context() -> Result<ProjectContext> {
 
     let user_name: String = Input::new()
         .with_prompt("  Your name")
-        .default("User".into())
+        .default("User")
         .interact_text()?;
 
     let tz_options = vec![
@@ -3242,7 +3433,7 @@ fn setup_project_context() -> Result<ProjectContext> {
     let timezone = if tz_idx == tz_options.len() - 1 {
         Input::new()
             .with_prompt("  Enter timezone (e.g. America/New_York)")
-            .default("UTC".into())
+            .default("UTC")
             .interact_text()?
     } else {
         // Extract the short label before the parenthetical
@@ -3256,7 +3447,7 @@ fn setup_project_context() -> Result<ProjectContext> {
 
     let agent_name: String = Input::new()
         .with_prompt("  Agent name")
-        .default("ZeroClaw".into())
+        .default("ZeroClaw")
         .interact_text()?;
 
     let style_options = vec![
@@ -3285,7 +3476,7 @@ fn setup_project_context() -> Result<ProjectContext> {
         _ => Input::new()
             .with_prompt("  Custom communication style")
             .default(
-                "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing.".into(),
+                "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing.",
             )
             .interact_text()?,
     };
@@ -3651,6 +3842,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    ack_reactions: None,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -3749,7 +3942,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     guild_id: if guild.is_empty() { None } else { Some(guild) },
                     allowed_users,
                     listen_to_bots: false,
+                    interrupt_on_new_message: false,
                     mention_only: false,
+                    proxy_url: None,
+                    stream_mode: StreamMode::MultiMessage,
+                    draft_update_interval_ms: 1000,
+                    multi_message_delay_ms: 800,
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -3876,7 +4074,16 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     } else {
                         Some(channel)
                     },
+                    channel_ids: Vec::new(),
                     allowed_users,
+                    interrupt_on_new_message: false,
+                    thread_replies: None,
+                    mention_only: false,
+                    use_markdown_blocks: false,
+                    proxy_url: None,
+                    stream_drafts: false,
+                    draft_update_interval_ms: 1200,
+                    cancel_reaction: None,
                 });
             }
             ChannelMenuChoice::IMessage => {
@@ -3904,7 +4111,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let contacts_str: String = Input::new()
                     .with_prompt("  Allowed contacts (comma-separated phone/email, or * for all)")
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_contacts = if contacts_str.trim() == "*" {
@@ -3944,13 +4151,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     continue;
                 }
 
-                let access_token: String =
-                    Input::new().with_prompt("  Access token").interact_text()?;
-
-                if access_token.trim().is_empty() {
-                    println!("  {} Skipped — token required", style("→").dim());
-                    continue;
-                }
+                let access_token: String = dialoguer::Password::new()
+                    .with_prompt("  Access token")
+                    .allow_empty_password(false)
+                    .interact()?;
 
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
                 let hs = homeserver.trim_end_matches('/');
@@ -4017,13 +4221,23 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let users_str: String = Input::new()
                     .with_prompt("  Allowed users (comma-separated @user:server, or * for all)")
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_users = if users_str.trim() == "*" {
                     vec!["*".into()]
                 } else {
                     users_str.split(',').map(|s| s.trim().to_string()).collect()
+                };
+
+                let recovery_input: String = dialoguer::Password::new()
+                    .with_prompt("  E2EE recovery key (or Enter to skip — see docs/security/matrix-e2ee-guide.md section 4G)")
+                    .allow_empty_password(true)
+                    .interact()?;
+                let recovery_key = if recovery_input.trim().is_empty() {
+                    None
+                } else {
+                    Some(recovery_input.trim().to_string())
                 };
 
                 config.matrix = Some(MatrixConfig {
@@ -4033,6 +4247,12 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     device_id: detected_device_id,
                     room_id,
                     allowed_users,
+                    allowed_rooms: vec![],
+                    interrupt_on_new_message: false,
+                    stream_mode: StreamMode::Partial,
+                    draft_update_interval_ms: 1500,
+                    multi_message_delay_ms: 800,
+                    recovery_key,
                 });
             }
             ChannelMenuChoice::Signal => {
@@ -4050,7 +4270,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let http_url: String = Input::new()
                     .with_prompt("  signal-cli HTTP URL")
-                    .default("http://127.0.0.1:8686".into())
+                    .default("http://127.0.0.1:8686")
                     .interact_text()?;
 
                 if http_url.trim().is_empty() {
@@ -4097,7 +4317,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .with_prompt(
                         "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
                     )
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_from = if allowed_from_raw.trim() == "*" {
@@ -4127,6 +4347,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_from,
                     ignore_attachments,
                     ignore_stories,
+                    proxy_url: None,
                 });
 
                 println!("  {} Signal configured", style("✅").green().bold());
@@ -4147,6 +4368,23 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .interact()?;
 
                 if mode_idx == 0 {
+                    // Compile-time check: warn early if the feature is not enabled.
+                    #[cfg(not(feature = "whatsapp-web"))]
+                    {
+                        println!();
+                        println!(
+                            "  {} {}",
+                            style("⚠").yellow().bold(),
+                            style("The 'whatsapp-web' feature is not compiled in. WhatsApp Web will not work at runtime.").yellow()
+                        );
+                        println!(
+                            "  {} Rebuild with: {}",
+                            style("→").dim(),
+                            style("cargo build --features whatsapp-web").white().bold()
+                        );
+                        println!();
+                    }
+
                     println!("  {}", style("Mode: WhatsApp Web").dim());
                     print_bullet("1. Build with --features whatsapp-web");
                     print_bullet(
@@ -4157,7 +4395,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                     let session_path: String = Input::new()
                         .with_prompt("  Session database path")
-                        .default("~/.zeroclaw/state/whatsapp-web/session.db".into())
+                        .default("~/.zeroclaw/state/whatsapp-web/session.db")
                         .interact_text()?;
 
                     if session_path.trim().is_empty() {
@@ -4187,7 +4425,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .with_prompt(
                             "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
                         )
-                        .default("*".into())
+                        .default("*")
                         .interact_text()?;
 
                     let allowed_numbers = if users_str.trim() == "*" {
@@ -4207,6 +4445,13 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         pair_code: (!pair_code.trim().is_empty())
                             .then(|| pair_code.trim().to_string()),
                         allowed_numbers,
+                        mode: WhatsAppWebMode::default(),
+                        dm_policy: WhatsAppChatPolicy::default(),
+                        group_policy: WhatsAppChatPolicy::default(),
+                        self_chat_mode: false,
+                        dm_mention_patterns: vec![],
+                        group_mention_patterns: vec![],
+                        proxy_url: None,
                     });
 
                     println!(
@@ -4247,7 +4492,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let verify_token: String = Input::new()
                     .with_prompt("  Webhook verify token (create your own)")
-                    .default("zeroclaw-whatsapp-verify".into())
+                    .default("zeroclaw-whatsapp-verify")
                     .interact_text()?;
 
                 // Test connection (run entirely in separate thread — Response must be used/dropped there)
@@ -4290,7 +4535,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .with_prompt(
                         "  Allowed phone numbers (comma-separated +1234567890, or * for all)",
                     )
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_numbers = if users_str.trim() == "*" {
@@ -4308,6 +4553,13 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     pair_phone: None,
                     pair_code: None,
                     allowed_numbers,
+                    mode: WhatsAppWebMode::default(),
+                    dm_policy: WhatsAppChatPolicy::default(),
+                    group_policy: WhatsAppChatPolicy::default(),
+                    self_chat_mode: false,
+                    dm_mention_patterns: vec![],
+                    group_mention_patterns: vec![],
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::Linq => {
@@ -4377,7 +4629,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .with_prompt(
                         "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
                     )
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_senders = if users_str.trim() == "*" {
@@ -4425,7 +4677,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let port_str: String = Input::new()
                     .with_prompt("  Port")
-                    .default("6697".into())
+                    .default("6697")
                     .interact_text()?;
 
                 let port: u16 = match port_str.trim().parse() {
@@ -4552,7 +4804,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let port: String = Input::new()
                     .with_prompt("  Port")
-                    .default("8080".into())
+                    .default("8080")
                     .interact_text()?;
 
                 let secret: String = Input::new()
@@ -4562,6 +4814,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 config.webhook = Some(WebhookConfig {
                     port: port.parse().unwrap_or(8080),
+                    listen_path: None,
+                    send_url: None,
+                    send_method: None,
+                    auth_header: None,
                     secret: if secret.is_empty() {
                         None
                     } else {
@@ -4615,7 +4871,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
 
                 let allowed_users_raw: String = Input::new()
                     .with_prompt("  Allowed Nextcloud actor IDs (comma-separated, or * for all)")
-                    .default("*".into())
+                    .default("*")
                     .interact_text()?;
 
                 let allowed_users = if allowed_users_raw.trim() == "*" {
@@ -4637,6 +4893,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         Some(webhook_secret.trim().to_string())
                     },
                     allowed_users,
+                    proxy_url: None,
+                    bot_name: None,
                 });
 
                 println!("  {} Nextcloud Talk configured", style("✅").green().bold());
@@ -4709,6 +4967,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     client_id,
                     client_secret,
                     allowed_users,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::QqOfficial => {
@@ -4785,6 +5044,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     app_id,
                     app_secret,
                     allowed_users,
+                    proxy_url: None,
                 });
             }
             ChannelMenuChoice::Lark | ChannelMenuChoice::Feishu => {
@@ -4920,11 +5180,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         .with_prompt("  Verification Token (optional, for Webhook mode)")
                         .allow_empty(true)
                         .interact_text()?;
-                    if token.is_empty() {
-                        None
-                    } else {
-                        Some(token)
-                    }
+                    if token.is_empty() { None } else { Some(token) }
                 } else {
                     None
                 };
@@ -4939,7 +5195,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                 let port = if receive_mode == LarkReceiveMode::Webhook {
                     let p: String = Input::new()
                         .with_prompt("  Webhook Port")
-                        .default("8080".into())
+                        .default("8080")
                         .interact_text()?;
                     Some(p.parse().unwrap_or(8080))
                 } else {
@@ -4974,6 +5230,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     use_feishu: is_feishu,
                     receive_mode,
                     port,
+                    proxy_url: None,
                 });
             }
             #[cfg(feature = "channel-nostr")]
@@ -5245,7 +5502,11 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 // ── Step 6: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
+async fn scaffold_workspace(
+    workspace_dir: &Path,
+    ctx: &ProjectContext,
+    memory_backend: &str,
+) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
         "ZeroClaw"
     } else {
@@ -5277,21 +5538,39 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          Update this file as you evolve. Your identity is yours to shape.\n"
     );
 
-    let agents = format!(
-        "# AGENTS.md — {agent} Personal Assistant\n\n\
-         ## Every Session (required)\n\n\
-         Before doing anything else:\n\n\
-         1. Read `SOUL.md` — this is who you are\n\
-         2. Read `USER.md` — this is who you're helping\n\
-         3. Use `memory_recall` for recent context (daily notes are on-demand)\n\
-         4. If in MAIN SESSION (direct chat): `MEMORY.md` is already injected\n\n\
-         Don't ask permission. Just do it.\n\n\
-         ## Memory System\n\n\
+    let memory_guidance = if memory_backend == "none" {
+        "## Memory System\n\n\
+         memory.backend = \"none\" — persistent memory is disabled.\n\
+         No daily notes or MEMORY.md will be created or injected.\n\
+         All context exists only within the current session.\n\n"
+            .to_string()
+    } else {
+        "## Memory System\n\n\
          You wake up fresh each session. These files ARE your continuity:\n\n\
          - **Daily notes:** `memory/YYYY-MM-DD.md` — raw logs (accessed via memory tools)\n\
          - **Long-term:** `MEMORY.md` — curated memories (auto-injected in main session)\n\n\
          Capture what matters. Decisions, context, things to remember.\n\
-         Skip secrets unless asked to keep them.\n\n\
+         Skip secrets unless asked to keep them.\n\n"
+            .to_string()
+    };
+
+    let session_steps = if memory_backend == "none" {
+        "1. Read `SOUL.md` — this is who you are\n\
+         2. Read `USER.md` — this is who you're helping\n\n"
+    } else {
+        "1. Read `SOUL.md` — this is who you are\n\
+         2. Read `USER.md` — this is who you're helping\n\
+         3. Use `memory_recall` for recent context (daily notes are on-demand)\n\
+         4. If in MAIN SESSION (direct chat): `MEMORY.md` is already injected\n\n"
+    };
+
+    let agents = format!(
+        "# AGENTS.md — {agent} Personal Assistant\n\n\
+         ## Every Session (required)\n\n\
+         Before doing anything else:\n\n\
+         {session_steps}\
+         Don't ask permission. Just do it.\n\n\
+         {memory_guidance}\
          ### Write It Down — No Mental Notes!\n\
          - Memory is limited — if you want to remember something, WRITE IT TO A FILE\n\
          - \"Mental notes\" don't survive session restarts. Files do.\n\
@@ -5309,7 +5588,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          Participate, don't dominate. Respond when mentioned or when you add genuine value.\n\
          Stay silent when it's casual banter or someone already answered.\n\n\
          ## Tools & Skills\n\n\
-         Skills are listed in the system prompt. Use `read` on a skill's SKILL.md for details.\n\
+         Skills are listed in the system prompt. Use `read_skill` when available, or `file_read` on a skill file, for full details.\n\
          Keep local notes (SSH hosts, device names, etc.) in `TOOLS.md`.\n\n\
          ## Crash Recovery\n\n\
          - If a run stops unexpectedly, recover context before acting.\n\
@@ -5460,7 +5739,7 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
          ## Open Loops\n\
          (Track unfinished tasks and follow-ups here)\n";
 
-    let files: Vec<(&str, String)> = vec![
+    let mut files: Vec<(&str, String)> = vec![
         ("IDENTITY.md", identity),
         ("AGENTS.md", agents),
         ("HEARTBEAT.md", heartbeat),
@@ -5468,8 +5747,10 @@ async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Resul
         ("USER.md", user_md),
         ("TOOLS.md", tools.to_string()),
         ("BOOTSTRAP.md", bootstrap),
-        ("MEMORY.md", memory.to_string()),
     ];
+    if memory_backend != "none" {
+        files.push(("MEMORY.md", memory.to_string()));
+    }
 
     // Create subdirectories
     let subdirs = ["sessions", "memory", "state", "cron", "skills"];
@@ -5779,13 +6060,15 @@ mod tests {
     impl EnvVarGuard {
         fn set(key: &'static str, value: &str) -> Self {
             let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var(key, value) };
             Self { key, previous }
         }
 
         fn unset(key: &'static str) -> Self {
             let previous = std::env::var(key).ok();
-            std::env::remove_var(key);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var(key) };
             Self { key, previous }
         }
     }
@@ -5793,9 +6076,11 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, previous) };
             } else {
-                std::env::remove_var(self.key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }
@@ -5869,14 +6154,14 @@ mod tests {
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-issue946"),
             Some("openrouter"),
             Some("custom-model-946"),
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -5896,14 +6181,14 @@ mod tests {
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
         let tmp = TempDir::new().unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-issue946"),
             Some("anthropic"),
             None,
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .unwrap();
 
@@ -5926,14 +6211,14 @@ mod tests {
             .await
             .unwrap();
 
-        let err = run_quick_setup_with_home(
+        let err = Box::pin(run_quick_setup_with_home(
             Some("sk-existing"),
             Some("openrouter"),
             Some("custom-model"),
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .expect_err("quick setup should refuse overwrite without --force");
 
@@ -5959,14 +6244,14 @@ mod tests {
         .await
         .unwrap();
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-force"),
             Some("openrouter"),
             Some("custom-model-fresh"),
             Some("sqlite"),
             true,
             tmp.path(),
-        )
+        ))
         .await
         .expect("quick setup should overwrite existing config with --force");
 
@@ -5993,19 +6278,67 @@ mod tests {
         );
         let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
 
-        let config = run_quick_setup_with_home(
+        let config = Box::pin(run_quick_setup_with_home(
             Some("sk-env"),
             Some("openrouter"),
             Some("model-env"),
             Some("sqlite"),
             false,
             tmp.path(),
-        )
+        ))
         .await
         .expect("quick setup should honor ZEROCLAW_WORKSPACE");
 
         assert_eq!(config.workspace_dir, workspace_dir);
         assert_eq!(config.config_path, expected_config_path);
+    }
+
+    #[test]
+    fn homebrew_prefix_for_exe_detects_supported_layouts() {
+        assert_eq!(
+            homebrew_prefix_for_exe(Path::new("/opt/homebrew/bin/zeroclaw")),
+            Some("/opt/homebrew")
+        );
+        assert_eq!(
+            homebrew_prefix_for_exe(Path::new(
+                "/opt/homebrew/Cellar/zeroclaw/0.5.0/bin/zeroclaw",
+            )),
+            Some("/opt/homebrew")
+        );
+        assert_eq!(
+            homebrew_prefix_for_exe(Path::new("/usr/local/bin/zeroclaw")),
+            Some("/usr/local")
+        );
+        assert_eq!(homebrew_prefix_for_exe(Path::new("/tmp/zeroclaw")), None);
+    }
+
+    #[test]
+    fn quick_setup_homebrew_service_note_mentions_service_workspace() {
+        let note = quick_setup_homebrew_service_note(
+            Path::new("/Users/alix/.zeroclaw/config.toml"),
+            Path::new("/Users/alix/.zeroclaw/workspace"),
+            Path::new("/opt/homebrew/bin/zeroclaw"),
+        )
+        .expect("homebrew installs should emit a service workspace note");
+
+        assert!(note.contains("/opt/homebrew/var/zeroclaw/workspace"));
+        assert!(note.contains("/opt/homebrew/var/zeroclaw/config.toml"));
+        assert!(note.contains("/Users/alix/.zeroclaw/config.toml"));
+    }
+
+    #[test]
+    fn quick_setup_homebrew_service_note_skips_matching_service_layout() {
+        let service_config = Path::new("/opt/homebrew/var/zeroclaw/config.toml");
+        let service_workspace = Path::new("/opt/homebrew/var/zeroclaw/workspace");
+
+        assert!(
+            quick_setup_homebrew_service_note(
+                service_config,
+                service_workspace,
+                Path::new("/opt/homebrew/bin/zeroclaw"),
+            )
+            .is_none()
+        );
     }
 
     // ── scaffold_workspace: basic file creation ─────────────────
@@ -6014,7 +6347,9 @@ mod tests {
     async fn scaffold_creates_all_md_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let expected = [
             "IDENTITY.md",
@@ -6035,7 +6370,9 @@ mod tests {
     async fn scaffold_creates_all_subdirectories() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         for dir in &["sessions", "memory", "state", "cron", "skills"] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
@@ -6051,7 +6388,9 @@ mod tests {
             user_name: "Alice".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6077,7 +6416,9 @@ mod tests {
             timezone: "US/Pacific".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6103,7 +6444,9 @@ mod tests {
             agent_name: "Crabby".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -6153,7 +6496,9 @@ mod tests {
             communication_style: "Be technical and detailed.".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -6186,7 +6531,9 @@ mod tests {
     async fn scaffold_uses_defaults_for_empty_context() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default(); // all empty
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -6233,7 +6580,9 @@ mod tests {
             .await
             .unwrap();
 
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         // SOUL.md should be untouched
         let soul = tokio::fs::read_to_string(&soul_path).await.unwrap();
@@ -6264,13 +6613,17 @@ mod tests {
             ..Default::default()
         };
 
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
         let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
 
         // Run again — should not change anything
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
         let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
@@ -6284,7 +6637,9 @@ mod tests {
     async fn scaffold_files_are_non_empty() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         for f in &[
             "IDENTITY.md",
@@ -6307,7 +6662,9 @@ mod tests {
     async fn agents_md_references_on_demand_memory() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
             .await
@@ -6328,7 +6685,9 @@ mod tests {
     async fn memory_md_warns_about_token_cost() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
             .await
@@ -6349,7 +6708,9 @@ mod tests {
     async fn tools_md_lists_all_builtin_tools() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
             .await
@@ -6381,7 +6742,9 @@ mod tests {
     async fn soul_md_includes_emoji_awareness_guidance() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -6407,7 +6770,9 @@ mod tests {
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -6433,7 +6798,9 @@ mod tests {
                 "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
                     .into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
+        scaffold_workspace(tmp.path(), &ctx, "sqlite")
+            .await
+            .unwrap();
 
         // Verify every file got personalized
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
@@ -6472,6 +6839,28 @@ mod tests {
         assert!(heartbeat.contains("Claw"));
     }
 
+    // ── scaffold_workspace: none backend skips MEMORY.md ────────
+
+    #[tokio::test]
+    async fn scaffold_none_backend_disables_memory_guidance_and_skips_memory_md() {
+        let tmp = TempDir::new().unwrap();
+        let ctx = ProjectContext::default();
+        scaffold_workspace(tmp.path(), &ctx, "none").await.unwrap();
+
+        assert!(
+            !tmp.path().join("MEMORY.md").exists(),
+            "MEMORY.md should not be created for none backend"
+        );
+
+        let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
+            .await
+            .unwrap();
+        assert!(
+            agents.contains("memory.backend = \"none\""),
+            "AGENTS.md should note that memory backend is none"
+        );
+    }
+
     // ── model helper coverage ───────────────────────────────────
 
     #[test]
@@ -6490,7 +6879,7 @@ mod tests {
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
         assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
-        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
+        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.7");
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
@@ -6522,6 +6911,10 @@ mod tests {
         assert_eq!(
             default_model_for_provider("astrai"),
             "anthropic/claude-sonnet-4.6"
+        );
+        assert_eq!(
+            default_model_for_provider("avian"),
+            "deepseek/deepseek-v3.2"
         );
     }
 
@@ -6661,6 +7054,19 @@ mod tests {
     }
 
     #[test]
+    fn curated_models_for_avian_include_expected_catalog() {
+        let ids: Vec<String> = curated_models_for_provider("avian")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+
+        assert!(ids.contains(&"deepseek/deepseek-v3.2".to_string()));
+        assert!(ids.contains(&"moonshotai/kimi-k2.5".to_string()));
+        assert!(ids.contains(&"z-ai/glm-5".to_string()));
+        assert!(ids.contains(&"minimax/minimax-m2.5".to_string()));
+    }
+
+    #[test]
     fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
         assert!(supports_live_model_fetch("openai"));
         assert!(supports_live_model_fetch("anthropic"));
@@ -6677,6 +7083,7 @@ mod tests {
         assert!(supports_live_model_fetch("sglang"));
         assert!(supports_live_model_fetch("vllm"));
         assert!(supports_live_model_fetch("astrai"));
+        assert!(supports_live_model_fetch("avian"));
         assert!(supports_live_model_fetch("venice"));
         assert!(supports_live_model_fetch("glm-cn"));
         assert!(supports_live_model_fetch("qwen-intl"));
@@ -6797,6 +7204,10 @@ mod tests {
         assert_eq!(
             models_endpoint_for_provider("vllm"),
             Some("http://localhost:8000/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("avian"),
+            Some("https://api.avian.io/v1/models")
         );
         assert_eq!(models_endpoint_for_provider("perplexity"), None);
         assert_eq!(models_endpoint_for_provider("unknown-provider"), None);
@@ -7040,9 +7451,10 @@ mod tests {
         };
 
         let err = run_models_refresh(&config, None, true).await.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("does not support live model discovery"));
+        assert!(
+            err.to_string()
+                .contains("does not support live model discovery")
+        );
     }
 
     // ── provider_env_var ────────────────────────────────────────
@@ -7084,6 +7496,7 @@ mod tests {
         assert_eq!(provider_env_var("build.nvidia.com"), "NVIDIA_API_KEY"); // alias
         assert_eq!(provider_env_var("astrai"), "ASTRAI_API_KEY");
         assert_eq!(provider_env_var("opencode-go"), "OPENCODE_GO_API_KEY");
+        assert_eq!(provider_env_var("avian"), "AVIAN_API_KEY");
     }
 
     #[test]
@@ -7189,6 +7602,7 @@ mod tests {
             allowed_from: vec!["*".into()],
             ignore_attachments: false,
             ignore_stories: true,
+            proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7200,6 +7614,8 @@ mod tests {
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
+            interrupt_on_new_message: false,
+            proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7208,6 +7624,7 @@ mod tests {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
+            proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7217,6 +7634,8 @@ mod tests {
             app_token: "token".into(),
             webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
+            proxy_url: None,
+            bot_name: None,
         });
         assert!(has_launchable_channels(&channels));
 
@@ -7229,6 +7648,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
+            proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
     }

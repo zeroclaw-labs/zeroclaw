@@ -30,7 +30,12 @@ impl Provider for MockProvider {
         _model: &str,
         _temperature: f64,
     ) -> Result<String> {
-        Ok("fallback".into())
+        let mut guard = self.responses.lock().unwrap();
+        if guard.is_empty() {
+            return Ok("fallback".into());
+        }
+        let resp = guard.remove(0);
+        Ok(resp.text.unwrap_or_else(|| "fallback".into()))
     }
 
     async fn chat(
@@ -166,6 +171,7 @@ impl Provider for TraceLlmProvider {
                 usage: Some(TokenUsage {
                     input_tokens: Some(input_tokens),
                     output_tokens: Some(output_tokens),
+                    cached_input_tokens: None,
                 }),
                 reasoning_content: None,
             }),
@@ -188,6 +194,7 @@ impl Provider for TraceLlmProvider {
                     usage: Some(TokenUsage {
                         input_tokens: Some(input_tokens),
                         output_tokens: Some(output_tokens),
+                        cached_input_tokens: None,
                     }),
                     reasoning_content: None,
                 })

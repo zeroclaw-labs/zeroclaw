@@ -70,11 +70,11 @@ zeroclaw onboard --channels-only
 zeroclaw daemon
 ```
 
-1. Gửi một tin nhắn văn bản thuần trong phòng Matrix đã cấu hình.
+2. Gửi một tin nhắn văn bản thuần trong phòng Matrix đã cấu hình.
 
-2. Xác nhận log ZeroClaw có thông tin khởi động Matrix listener và không có lỗi sync/auth lặp lại.
+3. Xác nhận log ZeroClaw có thông tin khởi động Matrix listener và không có lỗi sync/auth lặp lại.
 
-3. Trong phòng mã hóa, xác minh bot có thể đọc và phản hồi tin nhắn mã hóa từ các người dùng được phép.
+4. Trong phòng mã hóa, xác minh bot có thể đọc và phản hồi tin nhắn mã hóa từ các người dùng được phép.
 
 ---
 

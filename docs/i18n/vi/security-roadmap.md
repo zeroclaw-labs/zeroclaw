@@ -49,7 +49,6 @@ ZeroClaw đã có **application-layer security xuất sắc**:
 ## Lộ trình triển khai
 
 ### Giai đoạn 1: kết quả nhanh (1-2 tuần)
-
 **Mục tiêu**: giải quyết các thiếu sót nghiêm trọng với độ phức tạp tối thiểu
 
 | Nhiệm vụ | File | Công sức | Tác động |
@@ -68,7 +67,6 @@ ZeroClaw đã có **application-layer security xuất sắc**:
 ---
 
 ### Giai đoạn 2: tích hợp nền tảng (2-3 tuần)
-
 **Mục tiêu**: tích hợp sâu với OS để cách ly cấp production
 
 | Nhiệm vụ | Công sức | Tác động |
@@ -88,7 +86,6 @@ ZeroClaw đã có **application-layer security xuất sắc**:
 ---
 
 ### Giai đoạn 3: hardening production (1-2 tuần)
-
 **Mục tiêu**: các tính năng bảo mật doanh nghiệp
 
 | Nhiệm vụ | Công sức | Tác động |
