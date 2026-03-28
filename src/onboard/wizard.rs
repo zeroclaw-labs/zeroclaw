@@ -494,6 +494,8 @@ fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
 
     // If the binary was installed via Homebrew, use the Homebrew var path
     // instead of ~/.zeroclaw so the Homebrew service finds the same config.
+    if let Some(brew_var) = detect_homebrew_var_dir() {
+        let config_dir = brew_var.join("zeroclaw");
     if let Some(prefix) = std::env::current_exe()
         .ok()
         .as_deref()
@@ -507,6 +509,27 @@ fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
     (config_dir.clone(), config_dir.join("workspace"))
 }
 
+/// Detects whether the running binary was installed via Homebrew by checking
+/// if `std::env::current_exe()` lives under a Cellar directory.  When it does,
+/// returns the corresponding Homebrew `var` directory (e.g.
+/// `/opt/homebrew/var` or `/usr/local/var`).
+fn detect_homebrew_var_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    homebrew_var_dir_from_exe(&exe)
+}
+
+/// Pure helper: given an executable path, returns the Homebrew `var` directory
+/// if the path lives under a Homebrew Cellar.
+fn homebrew_var_dir_from_exe(exe: &Path) -> Option<PathBuf> {
+    let exe_str = exe.to_str()?;
+
+    // Typical Homebrew paths:
+    //   /opt/homebrew/Cellar/zeroclaw/1.2.3/bin/zeroclaw   (Apple Silicon)
+    //   /usr/local/Cellar/zeroclaw/1.2.3/bin/zeroclaw      (Intel)
+    if let Some(idx) = exe_str.find("/Cellar/") {
+        let prefix = PathBuf::from(&exe_str[..idx]);
+        let var_dir = prefix.join("var");
+        return Some(var_dir);
 fn homebrew_prefix_for_exe(exe: &Path) -> Option<&'static str> {
     let exe = exe.to_string_lossy();
     if exe == "/opt/homebrew/bin/zeroclaw"
@@ -7665,5 +7688,50 @@ mod tests {
             proxy_url: None,
         });
         assert!(has_launchable_channels(&channels));
+    }
+
+    #[test]
+    fn homebrew_var_dir_detected_for_apple_silicon_cellar() {
+        let exe = PathBuf::from("/opt/homebrew/Cellar/zeroclaw/1.2.3/bin/zeroclaw");
+        let var_dir = homebrew_var_dir_from_exe(&exe);
+        assert_eq!(var_dir, Some(PathBuf::from("/opt/homebrew/var")));
+    }
+
+    #[test]
+    fn homebrew_var_dir_detected_for_intel_cellar() {
+        let exe = PathBuf::from("/usr/local/Cellar/zeroclaw/0.9.0/bin/zeroclaw");
+        let var_dir = homebrew_var_dir_from_exe(&exe);
+        assert_eq!(var_dir, Some(PathBuf::from("/usr/local/var")));
+    }
+
+    #[test]
+    fn homebrew_var_dir_none_for_non_homebrew_path() {
+        let exe = PathBuf::from("/usr/bin/zeroclaw");
+        assert_eq!(homebrew_var_dir_from_exe(&exe), None);
+    }
+
+    #[test]
+    fn homebrew_var_dir_none_for_cargo_target_path() {
+        let exe = PathBuf::from("/home/user/Projects/zeroclaw/target/debug/zeroclaw");
+        assert_eq!(homebrew_var_dir_from_exe(&exe), None);
+    }
+
+    #[tokio::test]
+    async fn quick_setup_dirs_uses_homebrew_var_when_exe_in_cellar() {
+        let _env_guard = env_lock().lock().await;
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+
+        // The live resolve_quick_setup_dirs_with_home function reads
+        // current_exe() which we cannot override. Instead, verify that
+        // the extracted helper correctly produces the expected paths.
+        let exe = PathBuf::from("/opt/homebrew/Cellar/zeroclaw/2.0.0/bin/zeroclaw");
+        let var_dir = homebrew_var_dir_from_exe(&exe).expect("should detect Homebrew");
+        let config_dir = var_dir.join("zeroclaw");
+        assert_eq!(config_dir, PathBuf::from("/opt/homebrew/var/zeroclaw"));
+        assert_eq!(
+            config_dir.join("workspace"),
+            PathBuf::from("/opt/homebrew/var/zeroclaw/workspace")
+        );
     }
 }
