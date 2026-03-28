@@ -5,14 +5,14 @@
 use crate::multimodal;
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, StreamChunk, StreamError, StreamOptions, StreamResult, TokenUsage,
+    Provider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult, TokenUsage,
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use reqwest::{
-    header::{HeaderMap, HeaderValue, USER_AGENT},
     Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +46,8 @@ pub struct OpenAiCompatibleProvider {
     /// Custom API path suffix (e.g. "/v2/generate").
     /// When set, overrides the default `/chat/completions` path detection.
     api_path: Option<String>,
+    /// Maximum output tokens to include in API requests.
+    max_tokens: Option<u32>,
 }
 
 /// How the provider expects the API key to be sent.
@@ -103,16 +105,24 @@ impl OpenAiCompatibleProvider {
         )
     }
 
-    /// Vision-enabled OpenAI-compatible provider without `/v1/responses` fallback.
-    /// Use for gateways that only expose tool calls via chat completions (no `/v1/responses`).
+    /// Same as `new_with_vision` but skips the /v1/responses fallback on 404.
+    /// Use for custom OpenAI-compatible providers that only support chat completions.
     pub fn new_with_vision_no_responses_fallback(
         name: &str,
         base_url: &str,
         credential: Option<&str>,
         auth_style: AuthStyle,
+        supports_vision: bool,
     ) -> Self {
         Self::new_with_options(
-            name, base_url, credential, auth_style, true, false, None, false,
+            name,
+            base_url,
+            credential,
+            auth_style,
+            supports_vision,
+            false,
+            None,
+            false,
         )
     }
 
@@ -196,6 +206,7 @@ impl OpenAiCompatibleProvider {
             extra_headers: std::collections::HashMap::new(),
             reasoning_effort: None,
             api_path: None,
+            max_tokens: None,
         }
     }
 
@@ -230,6 +241,12 @@ impl OpenAiCompatibleProvider {
     /// When set, replaces the default `/chat/completions` path.
     pub fn with_api_path(mut self, api_path: Option<String>) -> Self {
         self.api_path = api_path;
+        self
+    }
+
+    /// Set the maximum output tokens for API requests.
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
         self
     }
 
@@ -410,11 +427,27 @@ impl OpenAiCompatibleProvider {
     }
 
     fn reasoning_effort_for_model(&self, model: &str) -> Option<String> {
-        let id = model.rsplit('/').next().unwrap_or(model);
-        let supports_reasoning_effort = id.starts_with("gpt-5") || id.contains("codex");
-        supports_reasoning_effort
-            .then(|| self.reasoning_effort.clone())
-            .flatten()
+        let id = model.rsplit('/').next().unwrap_or(model).to_lowercase();
+        // Only apply reasoning_effort to known OpenAI o1/o3/gpt-5 models
+        // and only if the provider seems to intend to support it.
+        let is_openai_reasoning_model = id.starts_with("o1-")
+            || id == "o1"
+            || id.starts_with("o3-")
+            || id == "o3"
+            || id.starts_with("gpt-5");
+
+        // Stricter check for 'codex' models: only if it looks like an official OpenAI model
+        // or if the provider name explicitly contains "openai" or "codex".
+        let is_likely_codex_supported = id.contains("codex")
+            && (id.starts_with("gpt-")
+                || self.name.to_lowercase().contains("openai")
+                || self.name.to_lowercase().contains("codex"));
+
+        if is_openai_reasoning_model || is_likely_codex_supported {
+            self.reasoning_effort.clone()
+        } else {
+            None
+        }
     }
 }
 
@@ -433,6 +466,8 @@ struct ApiChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -677,6 +712,8 @@ struct NativeChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -775,56 +812,209 @@ struct ResponsesContent {
 /// Server-Sent Event stream chunk for OpenAI-compatible streaming.
 #[derive(Debug, Deserialize)]
 struct StreamChunkResponse {
+    #[serde(default)]
     choices: Vec<StreamChoice>,
 }
 
 #[derive(Debug, Deserialize)]
 struct StreamChoice {
+    #[serde(default)]
     delta: StreamDelta,
+    #[serde(default)]
     finish_reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
     /// Reasoning/thinking models may stream output via `reasoning_content`.
     #[serde(default)]
     reasoning_content: Option<String>,
+    /// Native tool-calling deltas in OpenAI chat-completions streaming format.
+    #[serde(default)]
+    tool_calls: Option<Vec<StreamToolCallDelta>>,
 }
 
-/// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
-/// Handles the `data: {...}` format and `[DONE]` sentinel.
-fn parse_sse_line(line: &str) -> StreamResult<Option<String>> {
+#[derive(Debug, Deserialize)]
+struct StreamToolCallDelta {
+    #[serde(default)]
+    index: Option<usize>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamFunctionDelta>,
+    // Compatibility: some providers stream name/arguments at top-level.
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamFunctionDelta {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct StreamToolCallAccumulator {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl StreamToolCallAccumulator {
+    fn apply_delta(&mut self, delta: &StreamToolCallDelta) {
+        if let Some(id) = delta.id.as_ref().filter(|value| !value.is_empty()) {
+            self.id = Some(id.clone());
+        }
+
+        let delta_name = delta
+            .function
+            .as_ref()
+            .and_then(|function| function.name.as_ref())
+            .or(delta.name.as_ref())
+            .filter(|value| !value.is_empty());
+        if let Some(name) = delta_name {
+            self.name = Some(name.clone());
+        }
+
+        if let Some(arguments_delta) = delta
+            .function
+            .as_ref()
+            .and_then(|function| function.arguments.as_ref())
+            .or(delta.arguments.as_ref())
+            .filter(|value| !value.is_empty())
+        {
+            self.arguments.push_str(arguments_delta);
+        }
+    }
+
+    fn into_provider_tool_call(self) -> Option<ProviderToolCall> {
+        let name = self.name?;
+        let arguments = if self.arguments.trim().is_empty() {
+            "{}".to_string()
+        } else {
+            self.arguments
+        };
+        let normalized_arguments = if serde_json::from_str::<serde_json::Value>(&arguments).is_ok()
+        {
+            arguments
+        } else {
+            tracing::warn!(
+                function = %name,
+                arguments = %arguments,
+                "Invalid JSON in streamed native tool-call arguments, using empty object"
+            );
+            "{}".to_string()
+        };
+
+        Some(ProviderToolCall {
+            id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            name,
+            arguments: normalized_arguments,
+        })
+    }
+}
+
+fn parse_sse_chunk(line: &str) -> StreamResult<Option<StreamChunkResponse>> {
     let line = line.trim();
 
-    // Skip empty lines and comments
     if line.is_empty() || line.starts_with(':') {
         return Ok(None);
     }
 
-    // SSE format: "data: {...}"
-    if let Some(data) = line.strip_prefix("data:") {
-        let data = data.trim();
+    let Some(data) = line.strip_prefix("data:") else {
+        return Ok(None);
+    };
+    let data = data.trim();
 
-        // Check for [DONE] sentinel
-        if data == "[DONE]" {
-            return Ok(None);
+    if data == "[DONE]" {
+        return Ok(None);
+    }
+
+    serde_json::from_str(data)
+        .map(Some)
+        .map_err(StreamError::Json)
+}
+
+/// Parse custom proxy tool events from SSE lines.
+/// These are emitted by proxies like claude-max-api-proxy that execute tools
+/// internally and forward observability events via custom SSE fields.
+fn parse_proxy_tool_event(line: &str) -> Option<StreamEvent> {
+    let data = line.trim().strip_prefix("data:")?.trim();
+    let obj: serde_json::Value = serde_json::from_str(data).ok()?;
+
+    if let Some(ts) = obj.get("x_tool_start") {
+        let Some(name) = ts.get("name").and_then(|v| v.as_str()) else {
+            tracing::debug!("proxy x_tool_start event missing required 'name' field");
+            return None;
+        };
+        let name = name.to_string();
+        let args = ts
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("{}")
+            .to_string();
+        return Some(StreamEvent::PreExecutedToolCall { name, args });
+    }
+
+    if let Some(tr) = obj.get("x_tool_result") {
+        let name = tr
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let output = tr
+            .get("output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Some(StreamEvent::PreExecutedToolResult { name, output });
+    }
+
+    None
+}
+
+fn extract_sse_text_delta(choice: &StreamChoice) -> Option<String> {
+    if let Some(content) = &choice.delta.content {
+        if !content.is_empty() {
+            return Some(content.clone());
         }
+    }
 
-        // Parse JSON delta
-        let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+    choice
+        .delta
+        .reasoning_content
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
 
-        // Extract content from delta
-        if let Some(choice) = chunk.choices.first() {
-            if let Some(content) = &choice.delta.content {
-                if !content.is_empty() {
-                    return Ok(Some(content.clone()));
-                }
+/// Parse SSE (Server-Sent Events) stream from OpenAI-compatible providers.
+/// Handles the `data: {...}` format and `[DONE]` sentinel.
+///
+/// Returns a `StreamChunk` that distinguishes content from reasoning:
+/// - Content deltas → `StreamChunk::delta`
+/// - Reasoning deltas → `StreamChunk::reasoning`
+fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
+    let chunk = match parse_sse_chunk(line)? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+
+    if let Some(choice) = chunk.choices.first() {
+        if let Some(content) = &choice.delta.content {
+            if !content.is_empty() {
+                return Ok(Some(StreamChunk::delta(content.clone())));
             }
-            // Fallback to reasoning_content for thinking models
-            if let Some(reasoning) = &choice.delta.reasoning_content {
-                return Ok(Some(reasoning.clone()));
+        }
+        if let Some(reasoning) = &choice.delta.reasoning_content {
+            if !reasoning.is_empty() {
+                return Ok(Some(StreamChunk::reasoning(reasoning.clone())));
             }
         }
     }
@@ -837,14 +1027,11 @@ fn sse_bytes_to_chunks(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-    // Create a channel to send chunks
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
     tokio::spawn(async move {
-        // Buffer for incomplete lines
         let mut buffer = String::new();
 
-        // Get response body as bytes stream
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
@@ -854,37 +1041,49 @@ fn sse_bytes_to_chunks(
         }
 
         let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences that may be split across
+        // HTTP/1.1 chunked transfer boundaries (e.g. 3-byte CJK chars).
+        let mut utf8_buf: Vec<u8> = Vec::new();
 
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    // Convert bytes to string and process line by line
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            break;
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                // Could still be an incomplete multi-byte char; wait for more data
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
                         }
                     };
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     buffer.push_str(&text);
 
-                    // Process complete lines
                     while let Some(pos) = buffer.find('\n') {
-                        let line = buffer.drain(..=pos).collect::<String>();
-                        buffer = buffer[pos + 1..].to_string();
+                        let line = buffer[..pos].to_string();
+                        buffer.drain(..=pos);
 
                         match parse_sse_line(&line) {
-                            Ok(Some(content)) => {
-                                let mut chunk = StreamChunk::delta(content);
-                                if count_tokens {
-                                    chunk = chunk.with_token_estimate();
-                                }
+                            Ok(Some(chunk)) => {
+                                let chunk = if count_tokens {
+                                    chunk.with_token_estimate()
+                                } else {
+                                    chunk
+                                };
                                 if tx.send(Ok(chunk)).await.is_err() {
                                     return; // Receiver dropped
                                 }
@@ -899,18 +1098,161 @@ fn sse_bytes_to_chunks(
                 }
                 Err(e) => {
                     let _ = tx.send(Err(StreamError::Http(e))).await;
-                    break;
+                    return;
                 }
             }
         }
 
-        // Send final chunk
         let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
     });
 
-    // Convert channel receiver to stream
     stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|chunk| (chunk, rx))
+    })
+    .boxed()
+}
+
+/// Convert SSE byte stream to structured streaming events.
+fn sse_bytes_to_events(
+    response: reqwest::Response,
+    count_tokens: bool,
+) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+    tokio::spawn(async move {
+        let mut buffer = String::new();
+        let mut tool_calls: Vec<StreamToolCallAccumulator> = Vec::new();
+        let mut emitted_tool_calls = false;
+
+        match response.error_for_status_ref() {
+            Ok(_) => {}
+            Err(e) => {
+                let _ = tx.send(Err(StreamError::Http(e))).await;
+                return;
+            }
+        }
+
+        let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences split across chunk boundaries.
+        let mut utf8_buf: Vec<u8> = Vec::new();
+        while let Some(item) = bytes_stream.next().await {
+            match item {
+                Ok(bytes) => {
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
+                        Err(e) => {
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
+                        }
+                    };
+                    if text.is_empty() {
+                        continue;
+                    }
+
+                    buffer.push_str(&text);
+
+                    while let Some(pos) = buffer.find('\n') {
+                        let line = buffer[..pos].to_string();
+                        buffer.drain(..=pos);
+
+                        // Custom proxy events for pre-executed tool calls
+                        // (e.g. claude-max-api-proxy streaming x_tool_start/x_tool_result)
+                        if let Some(event) = parse_proxy_tool_event(&line) {
+                            if tx.send(Ok(event)).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+
+                        let chunk = match parse_sse_chunk(&line) {
+                            Ok(Some(chunk)) => chunk,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                let _ = tx.send(Err(e)).await;
+                                return;
+                            }
+                        };
+
+                        let mut should_emit_tool_calls = false;
+                        for choice in &chunk.choices {
+                            if let Some(text_delta) = extract_sse_text_delta(choice) {
+                                let mut text_chunk = StreamChunk::delta(text_delta);
+                                if count_tokens {
+                                    text_chunk = text_chunk.with_token_estimate();
+                                }
+                                if tx
+                                    .send(Ok(StreamEvent::TextDelta(text_chunk)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+
+                            if let Some(deltas) = choice.delta.tool_calls.as_ref() {
+                                for delta in deltas {
+                                    let index = delta.index.unwrap_or(tool_calls.len());
+                                    if index >= tool_calls.len() {
+                                        tool_calls.resize_with(index + 1, Default::default);
+                                    }
+                                    if let Some(acc) = tool_calls.get_mut(index) {
+                                        acc.apply_delta(delta);
+                                    }
+                                }
+                            }
+
+                            if choice.finish_reason.as_deref() == Some("tool_calls") {
+                                should_emit_tool_calls = true;
+                            }
+                        }
+
+                        if should_emit_tool_calls && !emitted_tool_calls {
+                            emitted_tool_calls = true;
+                            for tool_call in tool_calls
+                                .drain(..)
+                                .filter_map(StreamToolCallAccumulator::into_provider_tool_call)
+                            {
+                                if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            }
+        }
+
+        if !emitted_tool_calls {
+            for tool_call in tool_calls
+                .drain(..)
+                .filter_map(StreamToolCallAccumulator::into_provider_tool_call)
+            {
+                if tx.send(Ok(StreamEvent::ToolCall(tool_call))).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        let _ = tx.send(Ok(StreamEvent::Final)).await;
+    });
+
+    stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|event| (event, rx))
     })
     .boxed()
 }
@@ -1281,16 +1623,18 @@ impl OpenAiCompatibleProvider {
         let lower = error.to_lowercase();
         [
             "unknown parameter: tools",
+            "unknown parameter: tool_choice",
             "unsupported parameter: tools",
+            "invalid parameter: tools",
+            "unexpected parameter 'tools'",
+            "extra fields not allowed",
             "unrecognized field `tools`",
             "does not support tools",
             "function calling is not supported",
-            "tool_choice",
             "tool call validation failed",
-            "was not in request",
         ]
         .iter()
-        .any(|hint| lower.contains(hint))
+        .any(|pattern| lower.contains(pattern))
     }
 }
 
@@ -1351,6 +1695,7 @@ impl Provider for OpenAiCompatibleProvider {
             tool_stream: None,
             tools: None,
             tool_choice: None,
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -1372,22 +1717,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &fallback_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1475,6 +1805,7 @@ impl Provider for OpenAiCompatibleProvider {
             tool_stream: None,
             tools: None,
             tool_choice: None,
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -1484,22 +1815,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} chat completions transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1595,6 +1911,7 @@ impl Provider for OpenAiCompatibleProvider {
             } else {
                 Some("auto".to_string())
             },
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -1673,6 +1990,7 @@ impl Provider for OpenAiCompatibleProvider {
                 .tool_stream_for_tools(tools.as_ref().is_some_and(|tools| !tools.is_empty())),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -1685,28 +2003,7 @@ impl Provider for OpenAiCompatibleProvider {
             .await
         {
             Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            usage: None,
-                            reasoning_content: None,
-                        })
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
-
-                return Err(chat_error.into());
-            }
+            Err(chat_error) => return Err(chat_error.into()),
         };
 
         if !response.status().is_success() {
@@ -1775,6 +2072,144 @@ impl Provider for OpenAiCompatibleProvider {
         true
     }
 
+    fn supports_streaming_tool_events(&self) -> bool {
+        self.native_tool_calling
+    }
+
+    fn stream_chat(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+        }
+
+        let credential = match self.credential.as_ref() {
+            Some(value) => value.clone(),
+            None => {
+                let provider_name = self.name.clone();
+                return stream::once(async move {
+                    Err(StreamError::Provider(format!(
+                        "{} API key not set",
+                        provider_name
+                    )))
+                })
+                .boxed();
+            }
+        };
+
+        let has_tools = request.tools.is_some_and(|tools| !tools.is_empty());
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(request.messages)
+        } else {
+            request.messages.to_vec()
+        };
+
+        let tools = Self::convert_tool_specs(request.tools);
+        let payload = if has_tools {
+            serde_json::to_value(NativeChatRequest {
+                model: model.to_string(),
+                messages: Self::convert_messages_for_native(
+                    &effective_messages,
+                    !self.merge_system_into_user,
+                ),
+                temperature,
+                reasoning_effort: self.reasoning_effort.clone(),
+                tool_stream: if options.enabled { Some(true) } else { None },
+                stream: Some(options.enabled),
+                tools: tools.clone(),
+                tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+                max_tokens: self.max_tokens,
+            })
+        } else {
+            let messages = effective_messages
+                .iter()
+                .map(|message| Message {
+                    role: message.role.clone(),
+                    content: Self::to_message_content(
+                        &message.role,
+                        &message.content,
+                        !self.merge_system_into_user,
+                    ),
+                })
+                .collect();
+
+            serde_json::to_value(ApiChatRequest {
+                model: model.to_string(),
+                messages,
+                temperature,
+                reasoning_effort: self.reasoning_effort.clone(),
+                tool_stream: if options.enabled { Some(true) } else { None },
+                stream: Some(options.enabled),
+                tools: None,
+                tool_choice: None,
+                max_tokens: self.max_tokens,
+            })
+        };
+
+        let payload = match payload {
+            Ok(payload) => payload,
+            Err(error) => {
+                return stream::once(async move { Err(StreamError::Json(error)) }).boxed();
+            }
+        };
+
+        let url = self.chat_completions_url();
+        let client = self.http_client();
+        let auth_header = self.auth_header.clone();
+        let count_tokens = options.count_tokens;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+        tokio::spawn(async move {
+            let mut req_builder = client.post(&url).json(&payload);
+
+            req_builder = match &auth_header {
+                AuthStyle::Bearer => {
+                    req_builder.header("Authorization", format!("Bearer {}", credential))
+                }
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
+            };
+            req_builder = req_builder.header("Accept", "text/event-stream");
+
+            let response = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = match response.text().await {
+                    Ok(text) => text,
+                    Err(_) => format!("HTTP error: {}", status),
+                };
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
+                return;
+            }
+
+            let mut event_stream = sse_bytes_to_events(response, count_tokens);
+            while let Some(event) = event_stream.next().await {
+                if tx.send(event).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed()
+    }
+
     fn stream_chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -1818,6 +2253,7 @@ impl Provider for OpenAiCompatibleProvider {
             tool_stream: None,
             tools: None,
             tool_choice: None,
+            max_tokens: self.max_tokens,
         };
 
         let url = self.chat_completions_url();
@@ -1881,6 +2317,109 @@ impl Provider for OpenAiCompatibleProvider {
         .boxed()
     }
 
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        let credential = match self.credential.as_ref() {
+            Some(value) => value.clone(),
+            None => {
+                let provider_name = self.name.clone();
+                return stream::once(async move {
+                    Err(StreamError::Provider(format!(
+                        "{} API key not set",
+                        provider_name
+                    )))
+                })
+                .boxed();
+            }
+        };
+
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(messages)
+        } else {
+            messages.to_vec()
+        };
+        let api_messages: Vec<Message> = effective_messages
+            .iter()
+            .map(|m| Message {
+                role: m.role.clone(),
+                content: Self::to_message_content(
+                    &m.role,
+                    &m.content,
+                    !self.merge_system_into_user,
+                ),
+            })
+            .collect();
+
+        let request = ApiChatRequest {
+            model: model.to_string(),
+            messages: api_messages,
+            temperature,
+            stream: Some(options.enabled),
+            reasoning_effort: self.reasoning_effort_for_model(model),
+            tool_stream: None,
+            tools: None,
+            tool_choice: None,
+            max_tokens: self.max_tokens,
+        };
+
+        let url = self.chat_completions_url();
+        let client = self.http_client();
+        let auth_header = self.auth_header.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        tokio::spawn(async move {
+            let mut req_builder = client.post(&url).json(&request);
+
+            req_builder = match &auth_header {
+                AuthStyle::Bearer => {
+                    req_builder.header("Authorization", format!("Bearer {}", credential))
+                }
+                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
+                AuthStyle::Custom(header) => req_builder.header(header, &credential),
+            };
+
+            req_builder = req_builder.header("Accept", "text/event-stream");
+
+            let response = match req_builder.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(Err(StreamError::Http(e))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let error = match response.text().await {
+                    Ok(e) => e,
+                    Err(_) => format!("HTTP error: {}", status),
+                };
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .await;
+                return;
+            }
+
+            let mut chunk_stream = sse_bytes_to_chunks(response, options.count_tokens);
+            while let Some(chunk) = chunk_stream.next().await {
+                if tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         if let Some(credential) = self.credential.as_ref() {
             // Hit the chat completions URL with a GET to establish the connection pool.
@@ -1899,9 +2438,37 @@ impl Provider for OpenAiCompatibleProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::traits::ChatRequest;
+    use crate::tools::ToolSpec;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
 
     fn make_provider(name: &str, url: &str, key: Option<&str>) -> OpenAiCompatibleProvider {
         OpenAiCompatibleProvider::new(name, url, key, AuthStyle::Bearer)
+    }
+
+    async fn spawn_transport_error_server(
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let addr = listener.local_addr().expect("listener addr");
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connection_count);
+
+        let handle = tokio::spawn(async move {
+            while let Ok(Ok((stream, _))) =
+                tokio::time::timeout(Duration::from_millis(200), listener.accept()).await
+            {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        (format!("http://{addr}/v1"), connection_count, handle)
     }
 
     #[test]
@@ -1935,10 +2502,12 @@ mod tests {
             .chat_with_system(None, "hello", "llama-3.3-70b", 0.7)
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Venice API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Venice API key not set")
+        );
     }
 
     #[test]
@@ -1961,6 +2530,7 @@ mod tests {
             tool_stream: None,
             tools: None,
             tool_choice: None,
+            max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
@@ -2162,9 +2732,101 @@ mod tests {
             .await
             .expect_err("system-only fallback payload should fail");
 
-        assert!(err
-            .to_string()
-            .contains("requires at least one non-system message"));
+        assert!(
+            err.to_string()
+                .contains("requires at least one non-system message")
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_system_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+
+        let err = provider
+            .chat_with_system(Some("policy"), "hello", "gpt-test", 0.0)
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_with_history_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+
+        let err = provider
+            .chat_with_history(
+                &[ChatMessage::system("policy"), ChatMessage::user("hello")],
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_chat_transport_error_does_not_attempt_responses_fallback() {
+        let (base_url, connection_count, server) = spawn_transport_error_server().await;
+        let provider = make_provider("custom", &base_url, Some("test-key"));
+        let messages = [ChatMessage::user("hello")];
+        let tools = [ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell commands".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"}
+                }
+            }),
+        }];
+
+        let err = provider
+            .chat(
+                ChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                },
+                "gpt-test",
+                0.0,
+            )
+            .await
+            .expect_err("transport error should bubble up");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        server.abort();
+
+        assert!(
+            connection_count.load(Ordering::SeqCst) <= 1,
+            "transport errors should not trigger a second /responses attempt"
+        );
+        assert!(
+            !err.to_string().contains("responses fallback failed"),
+            "transport error should be reported directly"
+        );
     }
 
     #[test]
@@ -2556,18 +3218,46 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_effort_only_applies_to_gpt5_and_codex_models() {
+    fn reasoning_effort_only_applies_to_openai_and_selected_codex_models() {
         let provider = make_provider("test", "https://example.com", None)
             .with_reasoning_effort(Some("high".to_string()));
 
+        // OpenAI reasoning models
         assert_eq!(
-            provider.reasoning_effort_for_model("gpt-5.3-codex"),
+            provider.reasoning_effort_for_model("o1-preview"),
             Some("high".to_string())
         );
         assert_eq!(
-            provider.reasoning_effort_for_model("openai/gpt-5"),
+            provider.reasoning_effort_for_model("openai/o3-mini"),
             Some("high".to_string())
         );
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-5"),
+            Some("high".to_string())
+        );
+
+        // Codex models with gpt- prefix (likely OpenAI)
+        assert_eq!(
+            provider.reasoning_effort_for_model("gpt-4-codex"),
+            Some("high".to_string())
+        );
+
+        // Non-OpenAI codex models with generic provider name should be REJECTED
+        assert_eq!(
+            provider.reasoning_effort_for_model("llama-3-codex"),
+            None,
+            "Generic codex model should not get reasoning_effort on unknown provider"
+        );
+
+        // But if provider name contains "openai", it should be ACCEPTED
+        let openai_provider = make_provider("openai-proxy", "https://example.com", None)
+            .with_reasoning_effort(Some("high".to_string()));
+        assert_eq!(
+            openai_provider.reasoning_effort_for_model("llama-3-codex"),
+            Some("high".to_string()),
+            "Codex model should get reasoning_effort if provider name contains 'openai'"
+        );
+
         assert_eq!(provider.reasoning_effort_for_model("llama-3.3-70b"), None);
     }
 
@@ -2751,6 +3441,7 @@ mod tests {
             tool_stream: None,
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
+            max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -2785,6 +3476,7 @@ mod tests {
                 }
             })]),
             tool_choice: Some("auto".to_string()),
+            max_tokens: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -2818,6 +3510,7 @@ mod tests {
                 }
             })]),
             tool_choice: Some("auto".to_string()),
+            max_tokens: None,
         };
 
         let json = serde_json::to_string(&req).unwrap();
@@ -2929,10 +3622,12 @@ mod tests {
 
         let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TestProvider API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TestProvider API key not set")
+        );
     }
 
     #[test]
@@ -3076,37 +3771,97 @@ mod tests {
     #[test]
     fn parse_sse_line_with_content() {
         let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("hello".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(result.delta, "hello");
+        assert!(result.reasoning.is_none());
     }
 
     #[test]
     fn parse_sse_line_with_reasoning_content() {
         let line = r#"data: {"choices":[{"delta":{"reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
     fn parse_sse_line_with_both_prefers_content() {
         let line = r#"data: {"choices":[{"delta":{"content":"real answer","reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("real answer".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(result.delta, "real answer");
+        assert!(result.reasoning.is_none());
     }
 
     #[test]
-    fn parse_sse_line_with_empty_content_falls_back_to_reasoning_content() {
+    fn parse_sse_line_with_empty_content_falls_back_to_reasoning() {
         let line =
             r#"data: {"choices":[{"delta":{"content":"","reasoning_content":"thinking..."}}]}"#;
-        let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, Some("thinking...".to_string()));
+        let result = parse_sse_line(line).unwrap().unwrap();
+        assert!(result.delta.is_empty());
+        assert_eq!(result.reasoning.as_deref(), Some("thinking..."));
     }
 
     #[test]
     fn parse_sse_line_done_sentinel() {
         let line = "data: [DONE]";
         let result = parse_sse_line(line).unwrap();
-        assert_eq!(result, None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_sse_chunk_with_tool_call_delta() {
+        let line = r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{\"command\":\"date\"}"}}]}}]}"#;
+        let chunk = parse_sse_chunk(line)
+            .unwrap()
+            .expect("chunk should be parsed");
+        let choice = chunk.choices.first().expect("choice should exist");
+        let tool_calls = choice
+            .delta
+            .tool_calls
+            .as_ref()
+            .expect("tool call deltas should exist");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].index, Some(0));
+        assert_eq!(tool_calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(
+            tool_calls[0]
+                .function
+                .as_ref()
+                .and_then(|function| function.name.as_deref()),
+            Some("shell")
+        );
+    }
+
+    #[test]
+    fn stream_tool_call_accumulator_combines_deltas() {
+        let mut acc = StreamToolCallAccumulator::default();
+        acc.apply_delta(&StreamToolCallDelta {
+            index: Some(0),
+            id: Some("call_1".to_string()),
+            function: Some(StreamFunctionDelta {
+                name: Some("shell".to_string()),
+                arguments: Some("{\"command\":\"".to_string()),
+            }),
+            name: None,
+            arguments: None,
+        });
+        acc.apply_delta(&StreamToolCallDelta {
+            index: Some(0),
+            id: None,
+            function: Some(StreamFunctionDelta {
+                name: None,
+                arguments: Some("date\"}".to_string()),
+            }),
+            name: None,
+            arguments: None,
+        });
+
+        let tool_call = acc
+            .into_provider_tool_call()
+            .expect("accumulator should emit tool call");
+        assert_eq!(tool_call.id, "call_1");
+        assert_eq!(tool_call.name, "shell");
+        assert_eq!(tool_call.arguments, r#"{"command":"date"}"#);
     }
 
     #[test]
@@ -3356,5 +4111,79 @@ mod tests {
         assert!(!json.as_object().unwrap().contains_key("type"));
         assert!(!json.as_object().unwrap().contains_key("function"));
         assert!(!json.as_object().unwrap().contains_key("parameters"));
+    }
+
+    // ── parse_proxy_tool_event tests ──
+
+    #[test]
+    fn proxy_tool_start_valid() {
+        let line = r#"data: {"x_tool_start":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolCall { ref name, ref args })
+            if name == "bash" && args == r#"{"cmd":"ls"}"#
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_start_missing_name_returns_none() {
+        let line = r#"data: {"x_tool_start":{"arguments":"{}"}}"#;
+        assert!(parse_proxy_tool_event(line).is_none());
+    }
+
+    #[test]
+    fn proxy_tool_start_missing_arguments_defaults() {
+        let line = r#"data: {"x_tool_start":{"name":"read"}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolCall { ref name, ref args })
+            if name == "read" && args == "{}"
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_result_valid() {
+        let line = r#"data: {"x_tool_result":{"name":"bash","output":"hello world"}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolResult { ref name, ref output })
+            if name == "bash" && output == "hello world"
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_result_missing_fields_uses_defaults() {
+        let line = r#"data: {"x_tool_result":{}}"#;
+        let event = parse_proxy_tool_event(line);
+        assert!(matches!(
+            event,
+            Some(StreamEvent::PreExecutedToolResult { ref name, ref output })
+            if name == "unknown" && output.is_empty()
+        ));
+    }
+
+    #[test]
+    fn proxy_tool_event_non_json_returns_none() {
+        assert!(parse_proxy_tool_event("data: not json").is_none());
+    }
+
+    #[test]
+    fn proxy_tool_event_no_data_prefix_returns_none() {
+        let line = r#"{"x_tool_start":{"name":"bash"}}"#;
+        assert!(parse_proxy_tool_event(line).is_none());
+    }
+
+    #[test]
+    fn proxy_tool_event_standard_openai_chunk_returns_none() {
+        let line = r#"data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"hi"}}]}"#;
+        assert!(parse_proxy_tool_event(line).is_none());
+    }
+
+    #[test]
+    fn proxy_tool_event_done_sentinel_returns_none() {
+        assert!(parse_proxy_tool_event("data: [DONE]").is_none());
     }
 }
