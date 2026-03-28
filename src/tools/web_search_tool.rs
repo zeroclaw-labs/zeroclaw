@@ -817,6 +817,172 @@ impl WebSearchTool {
         ))
     }
 
+    /// Search via Playwright browser daemon — opens a real Chromium browser
+    /// to a search engine and scrapes results. Free, no API key, no bot detection.
+    async fn search_via_browser(&self, query: &str, engine: &str) -> anyhow::Result<String> {
+        let encoded_query = urlencoding::encode(query).to_string().replace("%20", "+");
+        let search_url = match engine {
+            "naver" => format!(
+                "https://search.naver.com/search.naver?where=nexearch&query={}",
+                encoded_query
+            ),
+            "google" => format!(
+                "https://www.google.com/search?q={}&hl=ko",
+                encoded_query
+            ),
+            _ => format!(
+                "https://duckduckgo.com/?q={}",
+                encoded_query
+            ),
+        };
+
+        let daemon_port = self.ensure_browser_daemon().await?;
+        let daemon_url = format!("http://127.0.0.1:{}/command", daemon_port);
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .build()?;
+
+        // Step 1: Navigate to search URL
+        let open_resp = client
+            .post(&daemon_url)
+            .json(&json!({
+                "command": "open",
+                "url": search_url,
+                "timeout_ms": 15000
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Browser daemon unreachable: {e}"))?;
+
+        if !open_resp.status().is_success() {
+            let text = open_resp.text().await.unwrap_or_default();
+            anyhow::bail!("Browser navigate failed: {text}");
+        }
+
+        // Step 2: Wait for page to load, then get text content
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let text_resp = client
+            .post(&daemon_url)
+            .json(&json!({
+                "command": "text",
+                "timeout_ms": 10000
+            }))
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("Browser text extraction failed: {e}"))?;
+
+        let resp_text = text_resp.text().await?;
+        let resp_json: serde_json::Value = serde_json::from_str(&resp_text)
+            .unwrap_or_else(|_| json!({"data": resp_text}));
+
+        let page_text = resp_json
+            .get("data")
+            .and_then(|d| d.as_str())
+            .or_else(|| resp_json.get("output").and_then(|o| o.as_str()))
+            .unwrap_or("");
+
+        if page_text.trim().is_empty() {
+            return Ok(format!("No results found for: {} (via {} browser)", query, engine));
+        }
+
+        // Truncate to reasonable size for LLM context (UTF-8 safe)
+        let max_chars = 4000;
+        let truncated: String = if page_text.chars().count() > max_chars {
+            let mut s: String = page_text.chars().take(max_chars).collect();
+            s.push('…');
+            s
+        } else {
+            page_text.to_string()
+        };
+
+        Ok(format!(
+            "Search results for: {} (via {} browser)\n\n{}",
+            query, engine, truncated
+        ))
+    }
+
+    /// Ensure the Playwright browser daemon is running and return its port.
+    /// Reuses the same daemon lifecycle as the browser tool.
+    async fn ensure_browser_daemon(&self) -> anyhow::Result<u16> {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        let state_path = std::path::PathBuf::from(&home)
+            .join(".zeroclaw")
+            .join("browser-daemon.json");
+
+        // Check if daemon is already running
+        if state_path.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&state_path).await {
+                if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(port) = state.get("port").and_then(|v| v.as_u64()) {
+                        let port = port as u16;
+                        let client = reqwest::Client::builder()
+                            .timeout(Duration::from_secs(2))
+                            .build()?;
+                        if client
+                            .get(format!("http://127.0.0.1:{}/health", port))
+                            .send()
+                            .await
+                            .is_ok()
+                        {
+                            return Ok(port);
+                        }
+                    }
+                }
+            }
+            let _ = tokio::fs::remove_file(&state_path).await;
+        }
+
+        // Start the daemon — find the script in standard locations
+        let script_candidates = [
+            "scripts/playwright-daemon.js",
+            "../scripts/playwright-daemon.js",
+            "../../scripts/playwright-daemon.js",
+        ];
+        let script = script_candidates
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .ok_or_else(|| anyhow::anyhow!("playwright-daemon.js not found"))?;
+
+        let port = 9500u16;
+        tracing::info!("Starting Playwright browser daemon for web search on port {port}");
+
+        let _child = std::process::Command::new("node")
+            .arg(script)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg("--headless")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to start browser daemon: {e}"))?;
+
+        // Wait for daemon to be ready (up to 15 seconds for first cold start)
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()?;
+        for i in 0..30 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if client
+                .get(format!("http://127.0.0.1:{}/health", port))
+                .send()
+                .await
+                .is_ok()
+            {
+                tracing::info!("Browser daemon ready for search after {}ms", (i + 1) * 500);
+                return Ok(port);
+            }
+        }
+
+        anyhow::bail!(
+            "Browser daemon failed to start within 15s. \
+             Ensure Node.js and Playwright are installed."
+        )
+    }
+
     async fn search_with_provider(&self, provider: &str, query: &str) -> anyhow::Result<String> {
         match provider {
             "duckduckgo" => self.search_duckduckgo(query).await,
@@ -826,6 +992,9 @@ impl WebSearchTool {
             "perplexity" => self.search_perplexity(query).await,
             "exa" => self.search_exa(query).await,
             "jina" => self.search_jina(query).await,
+            "naver" => self.search_via_browser(query, "naver").await,
+            "google" => self.search_via_browser(query, "google").await,
+            "browser" => self.search_via_browser(query, "naver").await,
             _ => anyhow::bail!("Unknown search provider: {provider}"),
         }
     }
