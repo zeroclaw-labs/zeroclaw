@@ -1,0 +1,310 @@
+use async_trait::async_trait;
+
+/// A message received from or sent to a channel
+#[derive(Debug, Clone)]
+pub struct ChannelMessage {
+    pub id: String,
+    pub sender: String,
+    pub reply_target: String,
+    pub content: String,
+    pub channel: String,
+    pub timestamp: u64,
+    /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
+    /// When set, replies should be posted as threaded responses.
+    pub thread_ts: Option<String>,
+}
+
+/// Message to send through a channel
+#[derive(Debug, Clone)]
+pub struct SendMessage {
+    pub content: String,
+    pub recipient: String,
+    pub subject: Option<String>,
+    /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
+    pub thread_ts: Option<String>,
+}
+
+impl SendMessage {
+    /// Create a new message with content and recipient
+    pub fn new(content: impl Into<String>, recipient: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            recipient: recipient.into(),
+            subject: None,
+            thread_ts: None,
+        }
+    }
+
+    /// Create a new message with content, recipient, and subject
+    pub fn with_subject(
+        content: impl Into<String>,
+        recipient: impl Into<String>,
+        subject: impl Into<String>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            recipient: recipient.into(),
+            subject: Some(subject.into()),
+            thread_ts: None,
+        }
+    }
+
+    /// Set the thread identifier for threaded replies.
+    pub fn in_thread(mut self, thread_ts: Option<String>) -> Self {
+        self.thread_ts = thread_ts;
+        self
+    }
+}
+
+/// Core channel trait — implement for any messaging platform
+#[async_trait]
+pub trait Channel: Send + Sync {
+    /// Human-readable channel name
+    fn name(&self) -> &str;
+
+    /// Send a message through this channel
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
+
+    /// Start listening for incoming messages (long-running)
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
+
+    /// Check if channel is healthy
+    async fn health_check(&self) -> bool {
+        true
+    }
+
+    /// Signal that the bot is processing a response (e.g. "typing" indicator).
+    /// Implementations should repeat the indicator as needed for their platform.
+    async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Stop any active typing indicator.
+    async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Whether this channel supports progressive message updates via draft edits.
+    fn supports_draft_updates(&self) -> bool {
+        false
+    }
+
+    /// Send an initial draft message. Returns a platform-specific message ID for later edits.
+    async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Update a previously sent draft message with new accumulated content.
+    ///
+    /// Returns `Ok(None)` to keep the current draft message ID, or
+    /// `Ok(Some(new_id))` when a continuation message was created
+    /// (e.g. after hitting a platform edit-count cap).
+    async fn update_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Finalize a draft with the complete response (e.g. apply Markdown formatting).
+    async fn finalize_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Cancel and remove a previously sent draft message if the channel supports it.
+    async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Send an interactive approval prompt, if supported by the channel.
+    ///
+    /// Default behavior sends a plain-text fallback with slash-command actions.
+    async fn send_approval_prompt(
+        &self,
+        recipient: &str,
+        request_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        thread_ts: Option<String>,
+    ) -> anyhow::Result<()> {
+        let raw_args = arguments.to_string();
+        let args_preview = if raw_args.len() > 220 {
+            let end = crate::util::floor_utf8_char_boundary(&raw_args, 220);
+            format!("{}...", &raw_args[..end])
+        } else {
+            raw_args
+        };
+        let message = format!(
+            "Approval required for tool `{tool_name}`.\nRequest ID: `{request_id}`\nArgs: `{args_preview}`\nApprove: `/approve-allow {request_id}`\nDeny: `/approve-deny {request_id}`"
+        );
+        self.send(&SendMessage::new(message, recipient).in_thread(thread_ts))
+            .await
+    }
+
+    /// Add a reaction (emoji) to a message.
+    ///
+    /// `channel_id` is the platform channel/conversation identifier (e.g. Discord channel ID).
+    /// `message_id` is the platform-scoped message identifier (e.g. `discord_<snowflake>`).
+    /// `emoji` is the Unicode emoji to react with (e.g. "👀", "✅").
+    async fn add_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Remove a reaction (emoji) from a message previously added by this bot.
+    async fn remove_reaction(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyChannel;
+
+    #[async_trait]
+    impl Channel for DummyChannel {
+        fn name(&self) -> &str {
+            "dummy"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            tx.send(ChannelMessage {
+                id: "1".into(),
+                sender: "tester".into(),
+                reply_target: "tester".into(),
+                content: "hello".into(),
+                channel: "dummy".into(),
+                timestamp: 123,
+                thread_ts: None,
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
+    }
+
+    #[test]
+    fn channel_message_clone_preserves_fields() {
+        let message = ChannelMessage {
+            id: "42".into(),
+            sender: "alice".into(),
+            reply_target: "alice".into(),
+            content: "ping".into(),
+            channel: "dummy".into(),
+            timestamp: 999,
+            thread_ts: None,
+        };
+
+        let cloned = message.clone();
+        assert_eq!(cloned.id, "42");
+        assert_eq!(cloned.sender, "alice");
+        assert_eq!(cloned.reply_target, "alice");
+        assert_eq!(cloned.content, "ping");
+        assert_eq!(cloned.channel, "dummy");
+        assert_eq!(cloned.timestamp, 999);
+    }
+
+    #[tokio::test]
+    async fn default_trait_methods_return_success() {
+        let channel = DummyChannel;
+
+        assert!(channel.health_check().await);
+        assert!(channel.start_typing("bob").await.is_ok());
+        assert!(channel.stop_typing("bob").await.is_ok());
+        assert!(channel
+            .send(&SendMessage::new("hello", "bob"))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_reaction_methods_return_success() {
+        let channel = DummyChannel;
+
+        assert!(channel
+            .add_reaction("chan_1", "msg_1", "\u{1F440}")
+            .await
+            .is_ok());
+        assert!(channel
+            .remove_reaction("chan_1", "msg_1", "\u{1F440}")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn default_draft_methods_return_success() {
+        let channel = DummyChannel;
+
+        assert!(!channel.supports_draft_updates());
+        assert!(channel
+            .send_draft(&SendMessage::new("draft", "bob"))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(channel.update_draft("bob", "msg_1", "text").await.is_ok());
+        assert!(channel
+            .finalize_draft("bob", "msg_1", "final text")
+            .await
+            .is_ok());
+        assert!(channel.cancel_draft("bob", "msg_1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn listen_sends_message_to_channel() {
+        let channel = DummyChannel;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        channel.listen(tx).await.unwrap();
+
+        let received = rx.recv().await.expect("message should be sent");
+        assert_eq!(received.sender, "tester");
+        assert_eq!(received.content, "hello");
+        assert_eq!(received.channel, "dummy");
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_truncates_safely_for_multibyte_utf8() {
+        let channel = DummyChannel;
+        let long_chinese = "測".repeat(100); // 300 bytes, over 220
+        let args = serde_json::json!({"cmd": long_chinese});
+        let result = channel
+            .send_approval_prompt("tester", "req-1", "shell", &args, None)
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn approval_prompt_short_args_not_truncated() {
+        let channel = DummyChannel;
+        let short_chinese = "測".repeat(10);
+        let args = serde_json::json!({"cmd": short_chinese});
+        let result = channel
+            .send_approval_prompt("tester", "req-1", "shell", &args, None)
+            .await;
+        assert!(result.is_ok());
+    }
+}

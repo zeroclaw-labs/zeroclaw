@@ -1,3 +1,4 @@
+use crate::agent::personality;
 use crate::config::IdentityConfig;
 use crate::i18n::ToolDescriptions;
 use crate::identity;
@@ -5,11 +6,9 @@ use crate::security::AutonomyLevel;
 use crate::skills::Skill;
 use crate::tools::Tool;
 use anyhow::Result;
-use chrono::Local;
+use chrono::{Datelike, Local, Timelike};
 use std::fmt::Write;
 use std::path::Path;
-
-const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
@@ -47,13 +46,13 @@ impl SystemPromptBuilder {
     pub fn with_defaults() -> Self {
         Self {
             sections: vec![
+                Box::new(DateTimeSection),
                 Box::new(IdentitySection),
                 Box::new(ToolHonestySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
-                Box::new(DateTimeSection),
                 Box::new(RuntimeSection),
                 Box::new(ChannelMediaSection),
             ],
@@ -115,18 +114,10 @@ impl PromptSection for IdentitySection {
                 "The following workspace files define your identity, behavior, and context.\n\n",
             );
         }
-        for file in [
-            "AGENTS.md",
-            "SOUL.md",
-            "TOOLS.md",
-            "IDENTITY.md",
-            "USER.md",
-            "HEARTBEAT.md",
-            "BOOTSTRAP.md",
-            "MEMORY.md",
-        ] {
-            inject_workspace_file(&mut prompt, ctx.workspace_dir, file);
-        }
+
+        // Use the personality module for structured file loading.
+        let profile = personality::load_personality(ctx.workspace_dir);
+        prompt.push_str(&profile.render());
 
         Ok(prompt)
     }
@@ -196,23 +187,18 @@ impl PromptSection for SafetySection {
         out.push_str("- Prefer `trash` over `rm`.\n");
         out.push_str(match ctx.autonomy_level {
             AutonomyLevel::Full => {
-                "- Respect the runtime autonomy policy: if a tool or action is allowed, \
-                 execute it directly instead of asking the user for extra approval.\n\
-                 - If a tool or action is blocked by policy or unavailable, explain that \
-                 concrete restriction instead of simulating an approval dialog."
+                "- Execute tools and actions directly — no extra approval needed.\n\
+                 - You have full access to all configured tools. Use them confidently to accomplish tasks.\n\
+                 - Only refuse an action if the runtime explicitly rejects it — do not preemptively decline."
             }
             AutonomyLevel::ReadOnly => {
-                "- This runtime is read-only for side effects unless a tool explicitly \
-                 reports otherwise.\n\
-                 - If a requested action is blocked by policy, explain the restriction \
-                 directly instead of simulating an approval dialog."
+                "- This runtime is read-only. Write operations will be rejected by the runtime if attempted.\n\
+                 - Use read-only tools freely and confidently."
             }
             AutonomyLevel::Supervised => {
-                "- When in doubt, ask before acting externally.\n\
-                 - Respect the runtime autonomy policy: ask for approval only when the \
-                 current runtime policy actually requires it.\n\
-                 - If a tool or action is blocked by policy or unavailable, explain that \
-                 concrete restriction instead of simulating an approval dialog."
+                "- Ask for approval when the runtime policy requires it for the specific action.\n\
+                 - Do not preemptively refuse actions — attempt them and let the runtime enforce restrictions.\n\
+                 - Use available tools confidently; the security policy will enforce boundaries."
             }
         });
 
@@ -278,10 +264,15 @@ impl PromptSection for DateTimeSection {
 
     fn build(&self, _ctx: &PromptContext<'_>) -> Result<String> {
         let now = Local::now();
+        // Force Gregorian year to avoid confusion with local calendars (e.g. Buddhist calendar).
+        let (year, month, day) = (now.year(), now.month(), now.day());
+        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
+        let tz = now.format("%Z");
+
         Ok(format!(
-            "## Current Date & Time\n\n{} ({})",
-            now.format("%Y-%m-%d %H:%M:%S"),
-            now.format("%Z")
+            "## Current Date\n\n{} ({})",
+            now.format("%Y-%m-%d"),
+            now.format("%:z")
         ))
     }
 }
@@ -298,40 +289,6 @@ impl PromptSection for ChannelMediaSection {
             - `[IMAGE:<path>]` — An image attachment, processed by the vision pipeline.\n\
             - `[Document: <name>] <path>` — A file attachment saved to the workspace."
             .into())
-    }
-}
-
-fn inject_workspace_file(prompt: &mut String, workspace_dir: &Path, filename: &str) {
-    let path = workspace_dir.join(filename);
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let trimmed = content.trim();
-            if trimmed.is_empty() {
-                return;
-            }
-            let _ = writeln!(prompt, "### {filename}\n");
-            let truncated = if trimmed.chars().count() > BOOTSTRAP_MAX_CHARS {
-                trimmed
-                    .char_indices()
-                    .nth(BOOTSTRAP_MAX_CHARS)
-                    .map(|(idx, _)| &trimmed[..idx])
-                    .unwrap_or(trimmed)
-            } else {
-                trimmed
-            };
-            prompt.push_str(truncated);
-            if truncated.len() < trimmed.len() {
-                let _ = writeln!(
-                    prompt,
-                    "\n\n[... truncated at {BOOTSTRAP_MAX_CHARS} chars — use `read` for full file]\n"
-                );
-            } else {
-                prompt.push_str("\n\n");
-            }
-        }
-        Err(_) => {
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
-        }
     }
 }
 
@@ -473,8 +430,9 @@ mod tests {
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
         assert!(output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        assert!(output.contains("<name>release_checklist</name>"));
-        assert!(output.contains("<kind>shell</kind>"));
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed names
+        assert!(output.contains("<callable_tools"));
+        assert!(output.contains("<name>deploy.release_checklist</name>"));
     }
 
     #[test]
@@ -516,14 +474,14 @@ mod tests {
         assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
         assert!(output.contains("read_skill(name)"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
-        // Compact mode should still include tools so the LLM knows about them
-        assert!(output.contains("<tools>"));
-        assert!(output.contains("<name>release_checklist</name>"));
-        assert!(output.contains("<kind>shell</kind>"));
+        // Compact mode should still include tools so the LLM knows about them.
+        // Registered tools (shell kind) appear under <callable_tools> with prefixed names.
+        assert!(output.contains("<callable_tools"));
+        assert!(output.contains("<name>deploy.release_checklist</name>"));
     }
 
     #[test]
-    fn datetime_section_includes_timestamp_and_timezone() {
+    fn date_section_includes_date_and_offset() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
@@ -539,12 +497,18 @@ mod tests {
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
-        assert!(rendered.starts_with("## Current Date & Time\n\n"));
+        assert!(rendered.starts_with("## Current Date\n\n"));
 
-        let payload = rendered.trim_start_matches("## Current Date & Time\n\n");
-        assert!(payload.chars().any(|c| c.is_ascii_digit()));
-        assert!(payload.contains(" ("));
-        assert!(payload.ends_with(')'));
+        let payload = rendered.trim_start_matches("## Current Date\n\n");
+        let (date, offset) = payload
+            .split_once(" (")
+            .expect("date payload should include offset");
+        assert_eq!(date.len(), 10);
+        assert!(date.chars().all(|c| c.is_ascii_digit() || c == '-'));
+        assert!(offset.ends_with(')'));
+        let offset = offset.trim_end_matches(')');
+        assert!(offset.starts_with('+') || offset.starts_with('-'));
+        assert!(offset.contains(':'));
     }
 
     #[test]
@@ -685,7 +649,7 @@ mod tests {
             "full autonomy should NOT include 'bypass oversight' instructions"
         );
         assert!(
-            output.contains("execute it directly"),
+            output.contains("Execute tools and actions directly"),
             "full autonomy should instruct to execute directly"
         );
         assert!(

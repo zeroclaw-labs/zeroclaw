@@ -5,7 +5,7 @@
 use super::AppState;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
@@ -787,6 +787,37 @@ pub async fn handle_api_health(
     Json(serde_json::json!({"health": snapshot})).into_response()
 }
 
+/// GET /api/channels — list all configured channels with status details
+pub async fn handle_api_channels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+
+    let channels: Vec<serde_json::Value> = config
+        .channels_config
+        .channels()
+        .into_iter()
+        .map(|(channel, enabled)| {
+            let status = if enabled { "active" } else { "inactive" };
+            let health = if enabled { "healthy" } else { "down" };
+            serde_json::json!({
+                "name": channel.name(),
+                "type": channel.name(),
+                "enabled": enabled,
+                "status": status,
+                "health": health,
+            })
+        })
+        .collect();
+
+    Json(channels).into_response()
+}
+
 // ── Helpers ─────────────────────────────────────────────────────
 
 fn is_masked_secret(value: &str) -> bool {
@@ -1000,7 +1031,8 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_optional_secret(&mut slack.app_token);
     }
     if let Some(mattermost) = masked.channels_config.mattermost.as_mut() {
-        mask_required_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_token);
+        mask_optional_secret(&mut mattermost.bot_password);
     }
     if let Some(webhook) = masked.channels_config.webhook.as_mut() {
         mask_optional_secret(&mut webhook.secret);
@@ -1056,6 +1088,25 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(email) = masked.channels_config.email.as_mut() {
         mask_required_secret(&mut email.password);
     }
+
+    // Transcription provider API keys (Groq top-level + sub-providers).
+    mask_optional_secret(&mut masked.transcription.api_key);
+    if let Some(openai_stt) = masked.transcription.openai.as_mut() {
+        mask_optional_secret(&mut openai_stt.api_key);
+    }
+    if let Some(deepgram) = masked.transcription.deepgram.as_mut() {
+        mask_optional_secret(&mut deepgram.api_key);
+    }
+    if let Some(assemblyai) = masked.transcription.assemblyai.as_mut() {
+        mask_optional_secret(&mut assemblyai.api_key);
+    }
+    if let Some(google_stt) = masked.transcription.google.as_mut() {
+        mask_optional_secret(&mut google_stt.api_key);
+    }
+    if let Some(local_whisper) = masked.transcription.local_whisper.as_mut() {
+        mask_optional_secret(&mut local_whisper.bearer_token);
+    }
+
     masked
 }
 
@@ -1133,7 +1184,7 @@ fn restore_masked_sensitive_fields(
         incoming.channels_config.mattermost.as_mut(),
         current.channels_config.mattermost.as_ref(),
     ) {
-        restore_required_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
+        restore_optional_secret(&mut incoming_ch.bot_token, &current_ch.bot_token);
     }
     if let (Some(incoming_ch), Some(current_ch)) = (
         incoming.channels_config.webhook.as_mut(),
@@ -1243,6 +1294,42 @@ fn restore_masked_sensitive_fields(
     ) {
         restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
+
+    // Transcription provider API keys (Groq top-level + sub-providers).
+    restore_optional_secret(
+        &mut incoming.transcription.api_key,
+        &current.transcription.api_key,
+    );
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.openai.as_mut(),
+        current.transcription.openai.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.deepgram.as_mut(),
+        current.transcription.deepgram.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.assemblyai.as_mut(),
+        current.transcription.assemblyai.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.google.as_mut(),
+        current.transcription.google.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.api_key, &current_stt.api_key);
+    }
+    if let (Some(incoming_stt), Some(current_stt)) = (
+        incoming.transcription.local_whisper.as_mut(),
+        current.transcription.local_whisper.as_ref(),
+    ) {
+        restore_optional_secret(&mut incoming_stt.bearer_token, &current_stt.bearer_token);
+    }
 }
 
 fn hydrate_config_for_save(
@@ -1280,16 +1367,55 @@ pub async fn handle_api_sessions_list(
         .into_iter()
         .filter_map(|meta| {
             let session_id = meta.key.strip_prefix("gw_")?;
-            Some(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "session_id": session_id,
                 "created_at": meta.created_at.to_rfc3339(),
                 "last_activity": meta.last_activity.to_rfc3339(),
                 "message_count": meta.message_count,
-            }))
+                "name": meta.name
+            });
+            if let Some(name) = meta.name {
+                entry["name"] = serde_json::Value::String(name);
+            }
+            Some(entry)
         })
         .collect();
 
     Json(serde_json::json!({ "sessions": gw_sessions })).into_response()
+}
+
+/// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
+pub async fn handle_api_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "session_id": id,
+            "messages": [],
+            "session_persistence": false,
+        }))
+        .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    let msgs = backend.load(&session_key);
+    let messages: Vec<serde_json::Value> = msgs
+        .into_iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+
+    Json(serde_json::json!({
+        "session_id": id,
+        "messages": messages,
+        "session_persistence": true,
+    }))
+    .into_response()
 }
 
 /// DELETE /api/sessions/{id} — delete a gateway session
@@ -1326,10 +1452,193 @@ pub async fn handle_api_session_delete(
     }
 }
 
+/// PUT /api/sessions/{id} — rename a gateway session
+pub async fn handle_api_session_rename(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let name = body["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "name is required"})),
+        )
+            .into_response();
+    }
+
+    let session_key = format!("gw_{id}");
+
+    // Verify the session exists before renaming
+    let sessions = backend.list_sessions();
+    if !sessions.contains(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
+    match backend.set_session_name(&session_key, name) {
+        Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /api/sessions/{id}/history — get message history for a gateway session
+pub async fn handle_api_session_history(
+/// GET /api/sessions/running — list sessions currently in "running" state
+pub async fn handle_api_sessions_running(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "sessions": [],
+            "message": "Session persistence is disabled"
+        }))
+        .into_response();
+    };
+
+    let running = backend.list_running_sessions();
+    let sessions: Vec<serde_json::Value> = running
+        .into_iter()
+        .filter_map(|meta| {
+            let session_id = meta.key.strip_prefix("gw_")?;
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "created_at": meta.created_at.to_rfc3339(),
+                "last_activity": meta.last_activity.to_rfc3339(),
+                "message_count": meta.message_count,
+            }))
+        })
+        .collect();
+
+    Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// GET /api/sessions/{id}/state — get session state
+pub async fn handle_api_session_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+
+    // Verify the session exists
+    let sessions = backend.list_sessions();
+    if !sessions.contains(&session_key) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response();
+    }
+
+    let messages = backend.load(&session_key);
+    let history: Vec<serde_json::Value> = messages
+        .into_iter()
+        .map(|msg| {
+            serde_json::json!({
+                "role": msg.role,
+                "content": msg.content,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "session_id": id, "history": history })).into_response()
+    match backend.get_session_state(&session_key) {
+        Ok(Some(ss)) => {
+            let mut resp = serde_json::json!({
+                "session_id": id,
+                "state": ss.state,
+            });
+            if let Some(turn_id) = ss.turn_id {
+                resp["turn_id"] = serde_json::Value::String(turn_id);
+            }
+            if let Some(started) = ss.turn_started_at {
+                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
+            }
+            Json(resp).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+// ── Claude Code hook endpoint ────────────────────────────────────
+
+/// POST /hooks/claude-code — receives HTTP hook events from Claude Code
+/// sessions spawned by [`ClaudeCodeRunnerTool`].
+///
+/// Claude Code posts structured JSON describing tool executions, completions,
+/// and errors. This handler logs the event and (when a Slack channel is
+/// configured) could be wired to update a Slack message in-place.
+pub async fn handle_claude_code_hook(
+    State(state): State<AppState>,
+    Json(payload): Json<crate::tools::claude_code_runner::ClaudeCodeHookEvent>,
+) -> impl IntoResponse {
+    // Do not require bearer-token auth: Claude Code subprocesses cannot easily
+    // obtain a pairing token, and the hook carries a session_id that ties it
+    // back to a session we spawned.
+    let _ = &state; // retained for future Slack update wiring
+
+    tracing::info!(
+        session_id = %payload.session_id,
+        event_type = %payload.event_type,
+        tool_name = ?payload.tool_name,
+        summary = ?payload.summary,
+        "Claude Code hook event received"
+    );
+
+    Json(serde_json::json!({ "ok": true }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::{nodes, AppState, GatewayRateLimiter, IdempotencyStore};
+    use crate::gateway::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
     use crate::security::pairing::PairingGuard;
@@ -1421,9 +1730,12 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(crate::gateway::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            line: None,
+            line_channel_secret: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -1437,10 +1749,15 @@ mod tests {
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            session_queue: Arc::new(crate::gateway::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
             device_registry: None,
             pending_pairings: None,
             path_prefix: String::new(),
             canvas_store: crate::tools::canvas::CanvasStore::new(),
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
         }
     }
 
@@ -1855,14 +2172,18 @@ mod tests {
             Some("route-embed-key-1")
         );
         assert_eq!(hydrated.embedding_routes[2].api_key, None);
-        assert!(hydrated
-            .model_routes
-            .iter()
-            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
-        assert!(hydrated
-            .embedding_routes
-            .iter()
-            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
+        assert!(
+            hydrated
+                .model_routes
+                .iter()
+                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
+        );
+        assert!(
+            hydrated
+                .embedding_routes
+                .iter()
+                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
+        );
     }
 
     #[tokio::test]
@@ -1984,10 +2305,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("delivery.to is required"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("delivery.to is required")
+        );
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
@@ -2026,10 +2349,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("unsupported delivery channel"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported delivery channel")
+        );
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());

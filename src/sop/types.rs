@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -42,6 +43,10 @@ pub enum SopExecutionMode {
     StepByStep,
     /// Critical/High → Auto, Normal/Low → Supervised.
     PriorityBased,
+    /// Execute steps sequentially without LLM round-trips.
+    /// Step outputs are piped as inputs to the next step.
+    /// Checkpoint steps pause for human approval.
+    Deterministic,
 }
 
 impl fmt::Display for SopExecutionMode {
@@ -51,6 +56,7 @@ impl fmt::Display for SopExecutionMode {
             Self::Supervised => write!(f, "supervised"),
             Self::StepByStep => write!(f, "step_by_step"),
             Self::PriorityBased => write!(f, "priority_based"),
+            Self::Deterministic => write!(f, "deterministic"),
         }
     }
 }
@@ -79,6 +85,11 @@ pub enum SopTrigger {
         condition: Option<String>,
     },
     Manual,
+    Calendar {
+        calendar_source: String,
+        #[serde(default)]
+        calendar_ids: Vec<String>,
+    },
 }
 
 impl fmt::Display for SopTrigger {
@@ -89,8 +100,49 @@ impl fmt::Display for SopTrigger {
             Self::Cron { expression } => write!(f, "cron:{expression}"),
             Self::Peripheral { board, signal, .. } => write!(f, "peripheral:{board}/{signal}"),
             Self::Manual => write!(f, "manual"),
+            Self::Calendar {
+                calendar_source, ..
+            } => write!(f, "calendar:{calendar_source}"),
         }
     }
+}
+
+// ── Step kind ────────────────────────────────────────────────────
+
+/// The kind of a workflow step.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SopStepKind {
+    /// Normal step — executed by the agent (or deterministic handler).
+    #[default]
+    Execute,
+    /// Checkpoint step — pauses execution and waits for human approval.
+    Checkpoint,
+}
+
+impl fmt::Display for SopStepKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Execute => write!(f, "execute"),
+            Self::Checkpoint => write!(f, "checkpoint"),
+        }
+    }
+}
+
+// ── Typed step parameters ────────────────────────────────────────
+
+/// JSON Schema fragment for validating step input/output data.
+///
+/// Stored as a raw `serde_json::Value` so callers can validate without
+/// pulling in a full JSON Schema library.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepSchema {
+    /// JSON Schema object describing expected input shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    /// JSON Schema object describing expected output shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
 }
 
 // ── Step ────────────────────────────────────────────────────────
@@ -105,6 +157,12 @@ pub struct SopStep {
     pub suggested_tools: Vec<String>,
     #[serde(default)]
     pub requires_confirmation: bool,
+    /// Step kind: `execute` (default) or `checkpoint`.
+    #[serde(default)]
+    pub kind: SopStepKind,
+    /// Typed input/output schemas for deterministic data flow validation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<StepSchema>,
 }
 
 // ── SOP ─────────────────────────────────────────────────────────
@@ -125,6 +183,10 @@ pub struct Sop {
     pub max_concurrent: u32,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    /// When true, sets execution_mode to Deterministic.
+    /// Steps execute sequentially without LLM round-trips.
+    #[serde(default)]
+    pub deterministic: bool,
 }
 
 fn default_cooldown_secs() -> u64 {
@@ -160,6 +222,9 @@ pub(crate) struct SopMeta {
     pub cooldown_secs: u64,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
+    /// Opt-in deterministic execution (no LLM round-trips between steps).
+    #[serde(default)]
+    pub deterministic: bool,
 }
 
 fn default_sop_version() -> String {
@@ -177,6 +242,7 @@ pub enum SopTriggerSource {
     Cron,
     Peripheral,
     Manual,
+    Calendar,
 }
 
 impl fmt::Display for SopTriggerSource {
@@ -187,6 +253,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Cron => write!(f, "cron"),
             Self::Peripheral => write!(f, "peripheral"),
             Self::Manual => write!(f, "manual"),
+            Self::Calendar => write!(f, "calendar"),
         }
     }
 }
@@ -214,6 +281,8 @@ pub enum SopRunStatus {
     Pending,
     Running,
     WaitingApproval,
+    /// Paused at a checkpoint in a deterministic workflow.
+    PausedCheckpoint,
     Completed,
     Failed,
     Cancelled,
@@ -225,6 +294,7 @@ impl fmt::Display for SopRunStatus {
             Self::Pending => write!(f, "pending"),
             Self::Running => write!(f, "running"),
             Self::WaitingApproval => write!(f, "waiting_approval"),
+            Self::PausedCheckpoint => write!(f, "paused_checkpoint"),
             Self::Completed => write!(f, "completed"),
             Self::Failed => write!(f, "failed"),
             Self::Cancelled => write!(f, "cancelled"),
@@ -276,6 +346,44 @@ pub struct SopRun {
     /// ISO-8601 timestamp when the run entered WaitingApproval (for timeout tracking).
     #[serde(default)]
     pub waiting_since: Option<String>,
+    /// Number of LLM calls saved by deterministic execution in this run.
+    #[serde(default)]
+    pub llm_calls_saved: u64,
+}
+
+// ── Deterministic workflow state (persistence + resume) ──────────
+
+/// Persisted state for a deterministic workflow run, enabling resume
+/// after interruption. Serialized to a JSON file alongside the SOP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeterministicRunState {
+    /// Identifier of this run.
+    pub run_id: String,
+    /// SOP name this state belongs to.
+    pub sop_name: String,
+    /// Last successfully completed step number (0 = none completed).
+    pub last_completed_step: u32,
+    /// Total steps in the workflow.
+    pub total_steps: u32,
+    /// Output of each completed step, keyed by step number.
+    pub step_outputs: HashMap<u32, serde_json::Value>,
+    /// ISO-8601 timestamp when this state was last persisted.
+    pub persisted_at: String,
+    /// Number of LLM calls that were saved by deterministic execution.
+    pub llm_calls_saved: u64,
+    /// Whether the run is paused at a checkpoint awaiting approval.
+    pub paused_at_checkpoint: bool,
+}
+
+// ── Cost savings metric ──────────────────────────────────────────
+
+/// Tracks how many LLM round-trips were saved by deterministic execution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeterministicSavings {
+    /// Total LLM calls saved across all deterministic runs.
+    pub total_llm_calls_saved: u64,
+    /// Total deterministic runs completed.
+    pub total_runs: u64,
 }
 
 /// What the engine instructs the caller to do next after a state transition.
@@ -292,6 +400,20 @@ pub enum SopRunAction {
         run_id: String,
         step: SopStep,
         context: String,
+    },
+    /// Execute a step deterministically (no LLM). The `input` is the piped
+    /// output from the previous step (or trigger payload for step 1).
+    DeterministicStep {
+        run_id: String,
+        step: SopStep,
+        input: serde_json::Value,
+    },
+    /// Deterministic workflow hit a checkpoint — pause for human approval.
+    /// Workflow state has been persisted so it can resume after approval.
+    CheckpointWait {
+        run_id: String,
+        step: SopStep,
+        state_file: PathBuf,
     },
     /// The SOP run completed successfully.
     Completed { run_id: String, sop_name: String },
@@ -379,6 +501,62 @@ condition = "$.value > 85"
     }
 
     #[test]
+    fn step_kind_display() {
+        assert_eq!(SopStepKind::Execute.to_string(), "execute");
+        assert_eq!(SopStepKind::Checkpoint.to_string(), "checkpoint");
+    }
+
+    #[test]
+    fn step_kind_serde_roundtrip() {
+        let json = serde_json::to_string(&SopStepKind::Checkpoint).unwrap();
+        assert_eq!(json, "\"checkpoint\"");
+        let parsed: SopStepKind = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, SopStepKind::Checkpoint);
+    }
+
+    #[test]
+    fn execution_mode_deterministic_roundtrip() {
+        let json = serde_json::to_string(&SopExecutionMode::Deterministic).unwrap();
+        assert_eq!(json, "\"deterministic\"");
+        let parsed: SopExecutionMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, SopExecutionMode::Deterministic);
+    }
+
+    #[test]
+    fn deterministic_run_state_serde() {
+        let state = DeterministicRunState {
+            run_id: "det-001".into(),
+            sop_name: "test-sop".into(),
+            last_completed_step: 2,
+            total_steps: 5,
+            step_outputs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(1, serde_json::json!({"result": "ok"}));
+                m.insert(2, serde_json::json!("step2_done"));
+                m
+            },
+            persisted_at: "2026-03-01T00:00:00Z".into(),
+            llm_calls_saved: 2,
+            paused_at_checkpoint: true,
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: DeterministicRunState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.run_id, "det-001");
+        assert_eq!(parsed.last_completed_step, 2);
+        assert_eq!(parsed.llm_calls_saved, 2);
+        assert!(parsed.paused_at_checkpoint);
+        assert_eq!(parsed.step_outputs.len(), 2);
+    }
+
+    #[test]
+    fn run_status_paused_checkpoint_display() {
+        assert_eq!(
+            SopRunStatus::PausedCheckpoint.to_string(),
+            "paused_checkpoint"
+        );
+    }
+
+    #[test]
     fn step_defaults() {
         let step: SopStep =
             serde_json::from_str(r#"{"number": 1, "title": "Check", "body": "Verify readings"}"#)
@@ -459,6 +637,7 @@ path = "/sop/test"
                 completed_at: Some("2026-02-19T12:00:05Z".into()),
             }],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         let json = serde_json::to_string(&run).unwrap();
         let parsed: SopRun = serde_json::from_str(&json).unwrap();

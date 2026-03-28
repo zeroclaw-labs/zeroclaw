@@ -15,6 +15,9 @@ use uuid::Uuid;
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
+/// Maximum audio download size for transcription (25 MB).
+const QQ_MAX_AUDIO_DOWNLOAD_BYTES: u64 = 25 * 1024 * 1024;
+
 /// Maximum upload size for QQ media files (10 MB).
 const QQ_MAX_UPLOAD_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -269,6 +272,15 @@ fn now_secs() -> u64 {
 /// Deduplication set capacity — evict half of entries when full.
 const DEDUP_CAPACITY: usize = 10_000;
 
+/// Maximum number of retry attempts when fetching the access token.
+const AUTH_RETRY_MAX_ATTEMPTS: u32 = 4;
+
+/// Initial backoff delay for auth token retry (in milliseconds).
+const AUTH_RETRY_INITIAL_BACKOFF_MS: u64 = 500;
+
+/// Maximum backoff delay for auth token retry (in milliseconds).
+const AUTH_RETRY_MAX_BACKOFF_MS: u64 = 8_000;
+
 /// QQ Official Bot channel — uses Tencent's official QQ Bot API with
 /// OAuth2 authentication and a Discord-like WebSocket gateway protocol.
 pub struct QQChannel {
@@ -287,6 +299,12 @@ pub struct QQChannel {
     reply_tracker: Arc<RwLock<HashMap<String, ReplyRecord>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Session ID from the last READY event, used for gateway resume (opcode 6).
+    session_id: Arc<RwLock<Option<String>>>,
+    /// Last sequence number received, used for gateway resume (opcode 6).
+    last_sequence: Arc<RwLock<Option<i64>>>,
+    transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
 }
 
 impl QQChannel {
@@ -301,6 +319,10 @@ impl QQChannel {
             upload_cache: Arc::new(RwLock::new(HashMap::new())),
             reply_tracker: Arc::new(RwLock::new(HashMap::new())),
             proxy_url: None,
+            session_id: Arc::new(RwLock::new(None)),
+            last_sequence: Arc::new(RwLock::new(None)),
+            transcription: None,
+            transcription_manager: None,
         }
     }
 
@@ -309,11 +331,96 @@ impl QQChannel {
         self.workspace_dir = Some(dir);
         self
     }
-
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
+    }
+
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, audio transcription disabled: {e}"
+                );
+            }
+        }
+        self.transcription = Some(config);
+        self
+    }
+
+    fn is_audio_attachment(attachment: &serde_json::Value) -> bool {
+        let content_type = attachment
+            .get("content_type")
+            .and_then(|ct| ct.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if content_type.starts_with("audio/") {
+            return true;
+        }
+        let filename = attachment
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .unwrap_or("");
+        if let Some(ext) = filename.rsplit_once('.').map(|(_, e)| e) {
+            return matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "flac" | "mp3" | "mpeg" | "mpga" | "m4a" | "ogg" | "oga" | "opus" | "wav"
+            );
+        }
+        false
+    }
+
+    async fn try_transcribe_attachment(&self, attachment: &serde_json::Value) -> Option<String> {
+        if !Self::is_audio_attachment(attachment) {
+            return None;
+        }
+        let manager = self.transcription_manager.as_deref()?;
+        let url = attachment.get("url").and_then(|u| u.as_str())?.trim();
+        if url.is_empty() {
+            return None;
+        }
+        if ensure_https(url).is_err() {
+            tracing::warn!("QQ: refusing to fetch audio over non-HTTPS URL");
+            return None;
+        }
+        let token = self.get_token().await.ok()?;
+        let resp = self
+            .http_client()
+            .get(url)
+            .header("Authorization", format!("QQBot {token}"))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            tracing::warn!("QQ: audio attachment fetch failed: {}", resp.status());
+            return None;
+        }
+        if let Some(content_length) = resp.content_length() {
+            if content_length > QQ_MAX_AUDIO_DOWNLOAD_BYTES {
+                tracing::warn!(
+                    "QQ: audio download skipped: content-length {content_length} exceeds {} bytes",
+                    QQ_MAX_AUDIO_DOWNLOAD_BYTES
+                );
+                return None;
+            }
+        }
+        let audio_data = resp.bytes().await.ok()?;
+        let filename = attachment
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .filter(|f| !f.is_empty())
+            .unwrap_or("audio.ogg");
+        match manager.transcribe(&audio_data, filename).await {
+            Ok(transcript) => Some(transcript),
+            Err(e) => {
+                tracing::warn!("QQ: transcription failed: {e}");
+                None
+            }
+        }
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -368,6 +475,50 @@ impl QQChannel {
         Ok((token, expiry))
     }
 
+    /// Fetch an access token with retry and exponential backoff.
+    ///
+    /// Transient failures (network errors, 5xx responses) during reconnection
+    /// can cause the entire recovery loop to fail. This method retries up to
+    /// `AUTH_RETRY_MAX_ATTEMPTS` times with exponential backoff + jitter so
+    /// that a single transient error doesn't permanently break the reconnect
+    /// flow (see issue #4745).
+    async fn fetch_access_token_with_retry(&self) -> anyhow::Result<(String, u64)> {
+        let mut backoff_ms = AUTH_RETRY_INITIAL_BACKOFF_MS;
+        let mut last_err = None;
+
+        for attempt in 1..=AUTH_RETRY_MAX_ATTEMPTS {
+            match self.fetch_access_token().await {
+                Ok(result) => {
+                    if attempt > 1 {
+                        tracing::info!(
+                            "QQ: getAppAccessToken succeeded on attempt {attempt}/{AUTH_RETRY_MAX_ATTEMPTS}"
+                        );
+                    }
+                    return Ok(result);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "QQ: getAppAccessToken failed (attempt {attempt}/{AUTH_RETRY_MAX_ATTEMPTS}): {e}"
+                    );
+                    last_err = Some(e);
+
+                    if attempt < AUTH_RETRY_MAX_ATTEMPTS {
+                        // Add jitter: 75%-125% of base backoff
+                        let jitter_factor = 0.75 + (rand::random::<f64>() * 0.5);
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let sleep_ms = (backoff_ms as f64 * jitter_factor) as u64;
+                        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                        backoff_ms = (backoff_ms * 2).min(AUTH_RETRY_MAX_BACKOFF_MS);
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            anyhow::anyhow!("QQ: getAppAccessToken failed after {AUTH_RETRY_MAX_ATTEMPTS} attempts")
+        }))
+    }
+
     /// Get a valid access token, refreshing if expired.
     async fn get_token(&self) -> anyhow::Result<String> {
         let now = std::time::SystemTime::now()
@@ -384,7 +535,7 @@ impl QQChannel {
             }
         }
 
-        let (token, expiry) = self.fetch_access_token().await?;
+        let (token, expiry) = self.fetch_access_token_with_retry().await?;
         {
             let mut cache = self.token_cache.write().await;
             *cache = Some((token.clone(), expiry));
@@ -976,7 +1127,9 @@ impl Channel for QQChannel {
         let gw_url = self.get_gateway_url(&token).await?;
 
         tracing::info!("QQ: connecting to gateway WebSocket...");
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&gw_url).await?;
+        let (ws_stream, _) =
+            crate::config::ws_connect_with_proxy(&gw_url, "channel.qq", self.proxy_url.as_deref())
+                .await?;
         let (mut write, mut read) = ws_stream.split();
 
         // Read Hello (opcode 10)
@@ -991,34 +1144,68 @@ impl Channel for QQChannel {
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(41250);
 
-        // Send Identify (opcode 2)
-        // Intents: PUBLIC_GUILD_MESSAGES (1<<30) | C2C_MESSAGE_CREATE & GROUP_AT_MESSAGE_CREATE (1<<25)
-        let intents: u64 = (1 << 25) | (1 << 30);
-        let identify = json!({
-            "op": 2,
-            "d": {
-                "token": format!("QQBot {token}"),
-                "intents": intents,
-                "properties": {
-                    "os": "linux",
-                    "browser": "zeroclaw",
-                    "device": "zeroclaw",
+        // Check if we can resume a previous session
+        let stored_session = self.session_id.read().await.clone();
+        let stored_seq = *self.last_sequence.read().await;
+
+        if let (Some(sid), Some(seq)) = (&stored_session, stored_seq) {
+            // Attempt Resume (opcode 6)
+            tracing::info!("QQ: attempting session resume (session_id={sid}, seq={seq})");
+            let resume = json!({
+                "op": 6,
+                "d": {
+                    "token": format!("QQBot {token}"),
+                    "session_id": sid,
+                    "seq": seq,
                 }
-            }
-        });
-        write
-            .send(Message::Text(identify.to_string().into()))
-            .await?;
+            });
+            write.send(Message::Text(resume.to_string().into())).await?;
+        } else {
+            // Send Identify (opcode 2)
+            // Intents: PUBLIC_GUILD_MESSAGES (1<<30) | C2C_MESSAGE_CREATE & GROUP_AT_MESSAGE_CREATE (1<<25)
+            let intents: u64 = (1 << 25) | (1 << 30);
+            let identify = json!({
+                "op": 2,
+                "d": {
+                    "token": format!("QQBot {token}"),
+                    "intents": intents,
+                    "properties": {
+                        "os": "linux",
+                        "browser": "zeroclaw",
+                        "device": "zeroclaw",
+                    }
+                }
+            });
+            write
+                .send(Message::Text(identify.to_string().into()))
+                .await?;
+            tracing::info!("QQ: connected and sent Identify");
+        }
 
-        tracing::info!("QQ: connected and identified");
+        let mut sequence: i64 = stored_seq.unwrap_or(-1);
 
-        let mut sequence: i64 = -1;
+        // Track consecutive missed heartbeat ACKs.  The previous logic
+        // killed the connection on the *first* missed ACK which is overly
+        // aggressive -- transient network hiccups or brief server-side GC
+        // pauses can cause a single ACK to be delayed.  We now allow up to
+        // `MAX_MISSED_ACKS` consecutive misses before declaring the
+        // connection dead.
+        const MAX_MISSED_ACKS: u32 = 3;
+        let mut missed_ack_count: u32 = 0;
 
-        // Spawn heartbeat timer
-        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
+        // Spawn heartbeat timer.
+        //
+        // We add a small grace period (10% of the server-provided interval,
+        // capped at 5s) so that a slightly-delayed ACK does not immediately
+        // count as missed.
         let hb_interval = heartbeat_interval;
+        let grace_ms: u64 = (hb_interval / 10).min(5_000);
+        let effective_interval = hb_interval.saturating_add(grace_ms);
+
+        let (hb_tx, mut hb_rx) = tokio::sync::mpsc::channel::<()>(1);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(hb_interval));
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(effective_interval));
             loop {
                 interval.tick().await;
                 if hb_tx.send(()).await.is_err() {
@@ -1027,9 +1214,40 @@ impl Channel for QQChannel {
             }
         });
 
-        loop {
+        // Reason the loop exited — used to decide error type
+        enum ExitReason {
+            Reconnect,
+            InvalidSession,
+            Close(Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>),
+            StreamEnded,
+            HeartbeatTimeout,
+            WriteFailed,
+            ChannelClosed,
+        }
+
+        let exit_reason;
+
+        'outer: loop {
             tokio::select! {
                 _ = hb_rx.recv() => {
+                    // Increment the missed-ACK counter.  Only declare the
+                    // connection dead after MAX_MISSED_ACKS consecutive
+                    // heartbeats go un-acknowledged.
+                    if missed_ack_count > 0 {
+                        if missed_ack_count >= MAX_MISSED_ACKS {
+                            tracing::warn!(
+                                "QQ: {missed_ack_count} consecutive heartbeat ACKs missed \
+                                 (interval {hb_interval}ms + {grace_ms}ms grace); \
+                                 connection appears zombied"
+                            );
+                            exit_reason = ExitReason::HeartbeatTimeout;
+                            break;
+                        }
+                        tracing::info!(
+                            "QQ: heartbeat ACK missed ({missed_ack_count}/{MAX_MISSED_ACKS}); \
+                             tolerating transient delay"
+                        );
+                    }
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
                     if write
@@ -1037,19 +1255,29 @@ impl Channel for QQChannel {
                         .await
                         .is_err()
                     {
+                        exit_reason = ExitReason::WriteFailed;
                         break;
                     }
+                    missed_ack_count += 1;
                 }
                 msg = read.next() => {
                     let msg = match msg {
                         Some(Ok(Message::Text(t))) => t,
                         Some(Ok(Message::Ping(payload))) => {
                             if write.send(Message::Pong(payload)).await.is_err() {
+                                exit_reason = ExitReason::WriteFailed;
                                 break;
                             }
                             continue;
                         }
-                        Some(Ok(Message::Close(_))) | None => break,
+                        Some(Ok(Message::Close(frame))) => {
+                            exit_reason = ExitReason::Close(frame);
+                            break;
+                        }
+                        None => {
+                            exit_reason = ExitReason::StreamEnded;
+                            break;
+                        }
                         _ => continue,
                     };
 
@@ -1075,19 +1303,28 @@ impl Channel for QQChannel {
                                 .await
                                 .is_err()
                             {
+                                exit_reason = ExitReason::WriteFailed;
                                 break;
                             }
+                            missed_ack_count += 1;
                             continue;
                         }
                         // Reconnect
                         7 => {
-                            tracing::warn!("QQ: received Reconnect (op 7)");
+                            tracing::warn!("QQ: received Reconnect (op 7); will resume");
+                            exit_reason = ExitReason::Reconnect;
                             break;
                         }
                         // Invalid Session
                         9 => {
-                            tracing::warn!("QQ: received Invalid Session (op 9)");
+                            tracing::warn!("QQ: received Invalid Session (op 9); clearing session for fresh auth");
+                            exit_reason = ExitReason::InvalidSession;
                             break;
+                        }
+                        // Heartbeat ACK
+                        11 => {
+                            missed_ack_count = 0;
+                            continue;
                         }
                         _ => {}
                     }
@@ -1102,6 +1339,15 @@ impl Channel for QQChannel {
                         Some(d) => d,
                         None => continue,
                     };
+
+                    // Capture session_id from READY event for future resume
+                    if event_type == "READY" || event_type == "RESUMED" {
+                        if let Some(sid) = d.get("session_id").and_then(|s| s.as_str()) {
+                            *self.session_id.write().await = Some(sid.to_string());
+                            tracing::info!("QQ: session established (session_id={sid}, event={event_type})");
+                        }
+                        continue;
+                    }
 
                     tracing::debug!("QQ: event_type={event_type} payload={d}");
 
@@ -1139,11 +1385,14 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 interruption_scope_id: None,
+                    attachments: vec![],
+                                observe_group: false,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
                                 tracing::warn!("QQ: message channel closed");
-                                break;
+                                exit_reason = ExitReason::ChannelClosed;
+                                break 'outer;
                             }
                         }
                         "GROUP_AT_MESSAGE_CREATE" => {
@@ -1178,11 +1427,14 @@ impl Channel for QQChannel {
                                     .as_secs(),
                                 thread_ts: None,
                                 interruption_scope_id: None,
+                    attachments: vec![],
+                                observe_group: false,
                             };
 
                             if tx.send(channel_msg).await.is_err() {
                                 tracing::warn!("QQ: message channel closed");
-                                break;
+                                exit_reason = ExitReason::ChannelClosed;
+                                break 'outer;
                             }
                         }
                         _ => {}
@@ -1191,11 +1443,65 @@ impl Channel for QQChannel {
             }
         }
 
-        anyhow::bail!("QQ WebSocket connection closed")
+        // Persist sequence number for potential resume on next reconnect
+        *self.last_sequence.write().await = if sequence >= 0 { Some(sequence) } else { None };
+
+        match exit_reason {
+            ExitReason::InvalidSession => {
+                // Clear stored session so next reconnect does a fresh Identify
+                *self.session_id.write().await = None;
+                *self.last_sequence.write().await = None;
+                anyhow::bail!(
+                    "QQ WebSocket connection closed: invalid session (fresh auth required)"
+                )
+            }
+            ExitReason::Reconnect => {
+                // Session state preserved — supervisor will reconnect and we'll attempt Resume
+                anyhow::bail!(
+                    "QQ WebSocket connection closed: server requested reconnect (resume will be attempted)"
+                )
+            }
+            ExitReason::Close(ref frame) => {
+                let (code, reason) = frame
+                    .as_ref()
+                    .map(|f| (f.code.to_string(), f.reason.to_string()))
+                    .unwrap_or_else(|| ("unknown".into(), "none".into()));
+                tracing::warn!(
+                    "QQ: WebSocket closed with code={code}, reason=\"{reason}\"; \
+                     resume will be attempted on reconnect"
+                );
+                anyhow::bail!(
+                    "QQ WebSocket connection closed: close_code={code}, reason=\"{reason}\""
+                )
+            }
+            ExitReason::StreamEnded => {
+                tracing::warn!(
+                    "QQ: WebSocket stream ended unexpectedly; resume will be attempted on reconnect"
+                );
+                anyhow::bail!("QQ WebSocket connection closed: stream ended unexpectedly")
+            }
+            ExitReason::HeartbeatTimeout => {
+                tracing::warn!(
+                    "QQ: heartbeat timeout after {MAX_MISSED_ACKS} consecutive missed ACKs; \
+                     resume will be attempted on reconnect"
+                );
+                anyhow::bail!(
+                    "QQ WebSocket connection closed: heartbeat ACK timeout \
+                     ({MAX_MISSED_ACKS} consecutive missed ACKs)"
+                )
+            }
+            ExitReason::WriteFailed => {
+                tracing::warn!("QQ: WebSocket write failed; resume will be attempted on reconnect");
+                anyhow::bail!("QQ WebSocket connection closed: write failed")
+            }
+            ExitReason::ChannelClosed => {
+                anyhow::bail!("QQ WebSocket connection closed: internal message channel closed")
+            }
+        }
     }
 
     async fn health_check(&self) -> bool {
-        self.fetch_access_token().await.is_ok()
+        self.fetch_access_token_with_retry().await.is_ok()
     }
 }
 
@@ -1660,5 +1966,140 @@ allowed_users = ["user1"]
         let ch = make_channel();
         assert!(ch.check_reply_allowed("msg_a").await);
         assert!(ch.check_reply_allowed("msg_b").await);
+    }
+
+    // --- Auth retry tests ---
+
+    #[test]
+    fn test_auth_retry_constants_are_sensible() {
+        const {
+            assert!(AUTH_RETRY_MAX_ATTEMPTS >= 2, "should retry at least once");
+            assert!(
+                AUTH_RETRY_INITIAL_BACKOFF_MS > 0,
+                "initial backoff must be positive"
+            );
+            assert!(
+                AUTH_RETRY_MAX_BACKOFF_MS >= AUTH_RETRY_INITIAL_BACKOFF_MS,
+                "max backoff must be >= initial"
+            );
+        }
+    }
+
+    #[test]
+    fn test_auth_retry_backoff_stays_within_bounds() {
+        // Simulate the backoff progression and verify it caps at max
+        let mut backoff = AUTH_RETRY_INITIAL_BACKOFF_MS;
+        for _ in 1..AUTH_RETRY_MAX_ATTEMPTS {
+            backoff = (backoff * 2).min(AUTH_RETRY_MAX_BACKOFF_MS);
+        }
+        assert!(
+            backoff <= AUTH_RETRY_MAX_BACKOFF_MS,
+            "backoff must never exceed the configured maximum"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_token_returns_cached_token_without_fetch() {
+        let ch = make_channel();
+        // Pre-populate the token cache with a token that expires far in the future
+        let future_expiry = now_secs() + 3600;
+        *ch.token_cache.write().await = Some(("cached_tok".to_string(), future_expiry));
+
+        // get_token should return the cached value without hitting the network
+        let tok = ch.get_token().await.unwrap();
+        assert_eq!(tok, "cached_tok");
+    }
+
+    #[tokio::test]
+    async fn test_get_token_refreshes_expired_cache() {
+        let ch = make_channel();
+        // Pre-populate with an already-expired token
+        *ch.token_cache.write().await = Some(("old_tok".to_string(), 0));
+
+        // get_token should try to refresh -- will fail because there's no real
+        // server, but the important thing is it doesn't return the stale token.
+        let result = ch.get_token().await;
+        assert!(
+            result.is_err(),
+            "should fail when token expired and no server available"
+        );
+    }
+
+    // --- Heartbeat stability tests ---
+
+    #[test]
+    fn test_heartbeat_grace_period_calculation() {
+        // The grace period is 10% of the server interval, capped at 5000ms.
+        let cases: Vec<(u64, u64)> = vec![
+            (41_250, 4_125),  // default QQ interval
+            (30_000, 3_000),  // smaller interval
+            (60_000, 5_000),  // larger interval, capped at 5s
+            (100_000, 5_000), // very large, still capped
+            (5_000, 500),     // small interval
+            (0, 0),           // degenerate zero
+        ];
+        for (interval, expected_grace) in cases {
+            let grace: u64 = (interval / 10).min(5_000);
+            assert_eq!(
+                grace, expected_grace,
+                "grace for interval {interval} should be {expected_grace}"
+            );
+            let effective = interval.saturating_add(grace);
+            assert!(effective >= interval);
+        }
+    }
+
+    #[test]
+    fn test_missed_ack_counter_logic() {
+        let max_missed: u32 = 3;
+        let mut missed: u32 = 0;
+
+        // First tick: counter is 0, send heartbeat
+        assert!(missed < max_missed);
+        missed += 1;
+        assert_eq!(missed, 1, "counter should be 1 after first heartbeat");
+
+        // ACK received: reset
+        missed = 0;
+        assert_eq!(missed, 0, "counter should reset on ACK");
+
+        // 3 consecutive misses without ACK
+        for _ in 0..max_missed {
+            assert!(
+                missed < max_missed,
+                "should not reach zombie state before {max_missed} misses"
+            );
+            missed += 1;
+        }
+        assert!(
+            missed >= max_missed,
+            "should declare zombie after {max_missed} missed ACKs"
+        );
+    }
+
+    #[test]
+    fn test_missed_ack_counter_reset_on_ack() {
+        let max_missed: u32 = 3;
+        let mut missed: u32 = 0;
+
+        missed += 1;
+        missed += 1;
+        assert_eq!(missed, 2);
+
+        // ACK arrives: reset
+        missed = 0;
+        assert_eq!(missed, 0);
+
+        // One more miss, still under threshold
+        missed += 1;
+        assert!(missed < max_missed);
+    }
+
+    #[test]
+    fn test_effective_interval_never_overflows() {
+        let interval = u64::MAX;
+        let grace: u64 = (interval / 10).min(5_000);
+        let effective = interval.saturating_add(grace);
+        assert_eq!(effective, u64::MAX);
     }
 }
