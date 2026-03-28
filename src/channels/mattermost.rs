@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -76,7 +76,15 @@ impl MattermostChannel {
     }
 
     fn http_client(&self) -> reqwest::Client {
-        crate::config::build_channel_proxy_client("channel.mattermost", self.proxy_url.as_deref())
+        // Use timeout-enabled client to prevent connection pool exhaustion
+        // when custom OpenAI providers (like sub2api) respond slowly or hang.
+        // Fixes issue #4299: 502 Gateway Error after Mattermost integration.
+        crate::config::build_channel_proxy_client_with_timeouts(
+            "channel.mattermost",
+            self.proxy_url.as_deref(),
+            30, // 30 second request timeout
+            10, // 10 second connect timeout
+        )
     }
 
     /// Check if a user ID is in the allowlist.
@@ -465,6 +473,7 @@ impl MattermostChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
     }
 }
@@ -1206,6 +1215,7 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,
@@ -1229,6 +1239,7 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,
@@ -1372,6 +1383,7 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 3600,
                 openai: None,
                 deepgram: None,
@@ -1440,6 +1452,7 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,
@@ -1490,6 +1503,7 @@ mod tests {
                 model: "whisper-large-v3".to_string(),
                 language: None,
                 initial_prompt: None,
+                max_audio_bytes: None,
                 max_duration_secs: 600,
                 openai: None,
                 deepgram: None,

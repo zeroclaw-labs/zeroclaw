@@ -4,8 +4,8 @@ use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::{DelegateAgentConfig, DelegateToolConfig};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
@@ -1143,6 +1143,10 @@ impl DelegateTool {
                 None,
                 None,
                 &crate::config::PacingConfig::default(),
+                0,    // max_tool_result_chars: inherit from parent config in future
+                0,    // context_token_budget: 0 = disabled for subagents
+                None, // shared_budget: TODO thread from parent in future
+                false, // native_tool_calls_only: use text fallback for subagents
             ),
         )
         .await;
@@ -1610,11 +1614,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("read-only mode"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("read-only mode")
+        );
     }
 
     #[tokio::test]
@@ -1629,11 +1635,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Rate limit exceeded")
+        );
     }
 
     #[tokio::test]
@@ -1667,11 +1675,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Failed to create provider"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to create provider")
+        );
     }
 
     #[tokio::test]
@@ -1705,11 +1715,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Failed to create provider"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to create provider")
+        );
     }
 
     #[test]
@@ -1741,11 +1753,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("allowed_tools is empty"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("allowed_tools is empty")
+        );
     }
 
     #[tokio::test]
@@ -1764,11 +1778,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("no executable tools"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no executable tools")
+        );
     }
 
     #[tokio::test]
@@ -1810,11 +1826,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("no executable tools"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no executable tools")
+        );
     }
 
     #[tokio::test]
@@ -1830,11 +1848,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("maximum tool iterations (2)"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("maximum tool iterations (2)")
+        );
     }
 
     #[tokio::test]
@@ -1850,11 +1870,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("provider boom"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("provider boom")
+        );
     }
 
     /// MCP tools pushed into the shared parent_tools handle after DelegateTool

@@ -1,6 +1,6 @@
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write;
 

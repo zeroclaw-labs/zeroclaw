@@ -189,7 +189,7 @@ impl WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("HTTP request failed: {e}")),
-                }
+                };
             }
         };
 
@@ -239,7 +239,7 @@ impl WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read response body: {e}")),
-                }
+                };
             }
         };
 
@@ -316,7 +316,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
-                })
+                });
             }
         };
 
@@ -365,7 +365,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build HTTP client: {e}")),
-                })
+                });
             }
         };
 
@@ -877,14 +877,16 @@ mod tests {
     fn redirect_target_validation_allows_permitted_host() {
         let allowed = vec!["example.com".to_string()];
         let blocked = vec![];
-        assert!(validate_target_url(
-            "https://docs.example.com/page",
-            &allowed,
-            &blocked,
-            &[],
-            "web_fetch"
-        )
-        .is_ok());
+        assert!(
+            validate_target_url(
+                "https://docs.example.com/page",
+                &allowed,
+                &blocked,
+                &[],
+                "web_fetch"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1291,7 +1293,8 @@ mod tests {
     #[tokio::test]
     async fn firecrawl_missing_api_key_returns_error() {
         // Ensure the env var is unset for this test
-        std::env::remove_var("FIRECRAWL_TEST_MISSING_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FIRECRAWL_TEST_MISSING_KEY") };
 
         let tool = test_tool_with_firecrawl(FirecrawlConfig {
             enabled: true,
@@ -1328,7 +1331,8 @@ mod tests {
             .await;
 
         // Ensure Firecrawl API key env is missing so fallback also fails
-        std::env::remove_var("FIRECRAWL_DOUBLE_FAIL_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FIRECRAWL_DOUBLE_FAIL_KEY") };
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1414,7 +1418,8 @@ mod tests {
             .await;
 
         // Set up API key env var for this test
-        std::env::set_var("FIRECRAWL_E2E_TEST_KEY", "test-key-12345");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("FIRECRAWL_E2E_TEST_KEY", "test-key-12345") };
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1461,7 +1466,8 @@ mod tests {
         );
 
         // Clean up env var
-        std::env::remove_var("FIRECRAWL_E2E_TEST_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FIRECRAWL_E2E_TEST_KEY") };
     }
 
     // ── Allowed private hosts ─────────────────────────────────────

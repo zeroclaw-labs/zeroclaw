@@ -7,8 +7,8 @@
 #   binary_path  Path to the binary to check (required)
 #   label        Optional label for step summary (e.g. target triple)
 #
-# Thresholds:
-#   >20MB  — hard error (safeguard)
+# Thresholds (overridable via environment):
+#   BINARY_SIZE_HARD_LIMIT  — hard error (default: 20MB for CI, override for release)
 #   >15MB  — warning (advisory)
 #   >5MB   — warning (target)
 #
@@ -18,6 +18,7 @@ set -euo pipefail
 
 BIN="${1:?Usage: check_binary_size.sh <binary_path> [label]}"
 LABEL="${2:-}"
+HARD_LIMIT="${BINARY_SIZE_HARD_LIMIT:-20971520}"  # default 20MB
 
 if [ ! -f "$BIN" ]; then
   echo "::error::Binary not found at $BIN"
@@ -34,8 +35,9 @@ if [ -n "$LABEL" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   echo "- Size: ${SIZE_MB}MB ($SIZE bytes)" >> "$GITHUB_STEP_SUMMARY"
 fi
 
-if [ "$SIZE" -gt 20971520 ]; then
-  echo "::error::Binary exceeds 20MB safeguard (${SIZE_MB}MB)"
+HARD_LIMIT_MB=$((HARD_LIMIT / 1024 / 1024))
+if [ "$SIZE" -gt "$HARD_LIMIT" ]; then
+  echo "::error::Binary exceeds ${HARD_LIMIT_MB}MB safeguard (${SIZE_MB}MB)"
   exit 1
 elif [ "$SIZE" -gt 15728640 ]; then
   echo "::warning::Binary exceeds 15MB advisory target (${SIZE_MB}MB)"

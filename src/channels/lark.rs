@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
+use reqwest::multipart::{Form, Part};
+use std::path::Path;
+use tokio::fs;
+use super::media_markers::{parse_outgoing_media_markers, OutgoingMediaKind};
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -981,6 +985,10 @@ impl LarkChannel {
                             let Some(text) = transcript else { continue; };
                             (text, Vec::new())
                         }
+                        "list" => match parse_list_content(&lark_msg.content) {
+                            Some(t) => (t, Vec::new()),
+                            None => { tracing::debug!("Lark WS: list message with no extractable text"); continue; }
+                        },
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
 
@@ -1023,6 +1031,7 @@ impl LarkChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                        observe_group: false,
                         interruption_scope_id: None,
                     attachments: vec![],
                     };
@@ -1552,6 +1561,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         }]
     }
 
@@ -1715,6 +1725,13 @@ impl LarkChannel {
                     }
                 }
             }
+            "list" => match parse_list_content(content_str) {
+                Some(t) => (t, Vec::new()),
+                None => {
+                    tracing::debug!("Lark: list message with no extractable text");
+                    return messages;
+                }
+            },
             _ => {
                 tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
                 return messages;
@@ -1759,11 +1776,22 @@ impl LarkChannel {
             channel: self.channel_name().to_string(),
             timestamp,
             thread_ts: None,
+            observe_group: false,
             interruption_scope_id: None,
             attachments: vec![],
         });
 
         messages
+    }
+}
+
+/// Lark/Feishu file_type for non-image uploads.
+fn lark_file_type(kind: OutgoingMediaKind) -> &'static str {
+    match kind {
+        OutgoingMediaKind::Image => "image",
+        OutgoingMediaKind::Document => "stream",
+        OutgoingMediaKind::Video => "mp4",
+        OutgoingMediaKind::Audio | OutgoingMediaKind::Voice => "opus",
     }
 }
 
@@ -1774,34 +1802,302 @@ impl Channel for LarkChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let token = self.get_tenant_access_token().await?;
+        let mut token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
-        let chunks = split_markdown_chunks(&message.content, LARK_CARD_MARKDOWN_MAX_BYTES);
-        for chunk in &chunks {
-            let body = build_interactive_card_body(&message.recipient, chunk);
+        let (cleaned_text, parts) = parse_outgoing_media_markers(&message.content);
 
-            let (status, response) = self.send_text_once(&url, &token, &body).await?;
+        // Send text first (caption-like content) when present.
+        let mut sent_any = false;
+        if !cleaned_text.is_empty() {
+            let content = serde_json::json!({ "text": cleaned_text }).to_string();
+            let body = serde_json::json!({
+                "receive_id": message.recipient,
+                "msg_type": "text",
+                "content": content,
+            });
 
-            if should_refresh_lark_tenant_token(status, &response) {
-                // Token expired/invalid, invalidate and retry once.
-                self.invalidate_token().await;
-                let new_token = self.get_tenant_access_token().await?;
-                let (retry_status, retry_response) =
-                    self.send_text_once(&url, &new_token, &body).await?;
-
-                if should_refresh_lark_tenant_token(retry_status, &retry_response) {
-                    anyhow::bail!(
-                        "Lark send failed after token refresh: status={retry_status}, body={retry_response}"
-                    );
+            let mut retried = false;
+            loop {
+                let (status, response) = self.send_text_once(&url, &token, &body).await?;
+                if should_refresh_lark_tenant_token(status, &response) && !retried {
+                    // Token expired/invalid, invalidate and retry once.
+                    self.invalidate_token().await;
+                    token = self.get_tenant_access_token().await?;
+                    retried = true;
+                    continue;
                 }
-
-                ensure_lark_send_success(retry_status, &retry_response, "after token refresh")?;
-            } else {
-                ensure_lark_send_success(status, &response, "without token refresh")?;
+                ensure_lark_send_success(status, &response, "text message")?;
+                sent_any = true;
+                break;
             }
         }
 
+        // Upload & send local media parts (v1: local paths only).
+        for part in parts {
+            if part.target.starts_with("http://") || part.target.starts_with("https://") {
+                tracing::warn!("lark: unresolved remote media skipped (kind={:?})", part.kind);
+                continue;
+            }
+
+            let path = Path::new(&part.target);
+            if !path.exists() || !path.is_file() {
+                tracing::warn!("lark: unresolved local media skipped (kind={:?})", part.kind);
+                continue;
+            }
+
+            // Read once so retries do not re-read from disk.
+            let file_bytes = match fs::read(path).await {
+                Ok(b) => b,
+                Err(_) => {
+                    tracing::warn!("lark: media read failed (kind={:?})", part.kind);
+                    continue;
+                }
+            };
+
+            match part.kind {
+                OutgoingMediaKind::Image => {
+                    let upload_url = format!("{}/im/v1/images", self.api_base());
+
+                    let mut uploaded_image_key: Option<String> = None;
+                    let mut retried = false;
+                    loop {
+                        let file_name = path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("image.bin");
+
+                        let form = Form::new()
+                            .text("image_type", "message")
+                            .part(
+                                "image",
+                                Part::bytes(file_bytes.clone()).file_name(file_name.to_string()),
+                            );
+
+                        let resp = self
+                            .http_client()
+                            .post(&upload_url)
+                            .header("Authorization", format!("Bearer {token}"))
+                            .multipart(form)
+                            .send()
+                            .await;
+
+                        let resp = match resp {
+                            Ok(r) => r,
+                            Err(_) => {
+                                tracing::warn!("lark: image upload request failed");
+                                break;
+                            }
+                        };
+
+                        let status = resp.status();
+                        let raw = resp.text().await.unwrap_or_default();
+                        let body_json = serde_json::from_str::<serde_json::Value>(&raw)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+
+                        if should_refresh_lark_tenant_token(status, &body_json) && !retried {
+                            self.invalidate_token().await;
+                            token = self.get_tenant_access_token().await?;
+                            retried = true;
+                            continue;
+                        }
+
+                        if status.is_success()
+                            && body_json
+                                .get("code")
+                                .and_then(|c| c.as_i64())
+                                .unwrap_or(0)
+                                == 0
+                        {
+                            let image_key = body_json
+                                .pointer("/image_key")
+                                .or_else(|| body_json.pointer("/data/image_key"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
+                            uploaded_image_key = image_key;
+                        }
+                        break;
+                    }
+
+                    let Some(image_key) = uploaded_image_key else {
+                        tracing::warn!("lark: image upload failed");
+                        continue;
+                    };
+
+                    // Send image message.
+                    let content = serde_json::json!({ "image_key": image_key }).to_string();
+                    let body = serde_json::json!({
+                        "receive_id": message.recipient,
+                        "msg_type": "image",
+                        "content": content,
+                    });
+
+                    let mut retried = false;
+                    loop {
+                        let (status, response) = match self.send_text_once(&url, &token, &body).await
+                        {
+                            Ok(v) => v,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "lark: image message send request failed (kind={:?})",
+                                    part.kind
+                                );
+                                break;
+                            }
+                        };
+                        if should_refresh_lark_tenant_token(status, &response) && !retried {
+                            self.invalidate_token().await;
+                            token = self.get_tenant_access_token().await?;
+                            retried = true;
+                            continue;
+                        }
+                        if let Err(_) =
+                            ensure_lark_send_success(status, &response, "image message")
+                        {
+                            tracing::warn!(
+                                "lark: image message send failed (kind={:?})",
+                                part.kind
+                            );
+                            break;
+                        }
+                        sent_any = true;
+                        break;
+                    }
+                }
+                _ => {
+                    let upload_url = format!("{}/im/v1/files", self.api_base());
+                    let file_type = lark_file_type(part.kind);
+                    let filename = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("attachment.bin")
+                        .to_string();
+
+                    let mut uploaded_file_key: Option<String> = None;
+                    let mut retried = false;
+                    loop {
+                        let form = Form::new()
+                            .text("file_type", file_type)
+                            .text("file_name", filename.clone())
+                            .part(
+                                "file",
+                                Part::bytes(file_bytes.clone()).file_name(filename.clone()),
+                            );
+
+                        let resp = self
+                            .http_client()
+                            .post(&upload_url)
+                            .header("Authorization", format!("Bearer {token}"))
+                            .multipart(form)
+                            .send()
+                            .await;
+
+                        let resp = match resp {
+                            Ok(r) => r,
+                            Err(_) => {
+                                tracing::warn!("lark: file upload request failed (kind={:?})", part.kind);
+                                break;
+                            }
+                        };
+
+                        let status = resp.status();
+                        let raw = resp.text().await.unwrap_or_default();
+                        let body_json = serde_json::from_str::<serde_json::Value>(&raw)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+
+                        if should_refresh_lark_tenant_token(status, &body_json) && !retried {
+                            self.invalidate_token().await;
+                            token = self.get_tenant_access_token().await?;
+                            retried = true;
+                            continue;
+                        }
+
+                        if status.is_success()
+                            && body_json
+                                .get("code")
+                                .and_then(|c| c.as_i64())
+                                .unwrap_or(0)
+                                == 0
+                        {
+                            let file_key = body_json
+                                .pointer("/file_key")
+                                .or_else(|| body_json.pointer("/data/file_key"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string);
+                            uploaded_file_key = file_key;
+                        }
+                        break;
+                    }
+
+                    let Some(file_key) = uploaded_file_key else {
+                        tracing::warn!("lark: file upload failed (kind={:?})", part.kind);
+                        continue;
+                    };
+
+                    let content = serde_json::json!({ "file_key": file_key }).to_string();
+                    let body = serde_json::json!({
+                        "receive_id": message.recipient,
+                        "msg_type": "file",
+                        "content": content,
+                    });
+
+                    let mut retried = false;
+                    loop {
+                        let (status, response) = match self.send_text_once(&url, &token, &body).await
+                        {
+                            Ok(v) => v,
+                            Err(_) => {
+                                tracing::warn!(
+                                    "lark: file message send request failed (kind={:?})",
+                                    part.kind
+                                );
+                                break;
+                            }
+                        };
+                        if should_refresh_lark_tenant_token(status, &response) && !retried {
+                            self.invalidate_token().await;
+                            token = self.get_tenant_access_token().await?;
+                            retried = true;
+                            continue;
+                        }
+                        if let Err(_) =
+                            ensure_lark_send_success(status, &response, "file message")
+                        {
+                            tracing::warn!(
+                                "lark: file message send failed (kind={:?})",
+                                part.kind
+                            );
+                            break;
+                        }
+                        sent_any = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // v1 compatibility: if everything was unresolved/failed and we didn't send
+        // any text, send a fixed placeholder to avoid empty deliveries.
+        if !sent_any {
+            let content = serde_json::json!({ "text": "[empty message]" }).to_string();
+            let body = serde_json::json!({
+                "receive_id": message.recipient,
+                "msg_type": "text",
+                "content": content,
+            });
+            let mut retried = false;
+            loop {
+                let (status, response) = self.send_text_once(&url, &token, &body).await?;
+                if should_refresh_lark_tenant_token(status, &response) && !retried {
+                    self.invalidate_token().await;
+                    token = self.get_tenant_access_token().await?;
+                    retried = true;
+                    continue;
+                }
+                ensure_lark_send_success(status, &response, "empty message")?;
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -1826,7 +2122,7 @@ impl LarkChannel {
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
-        use axum::{extract::State, routing::post, Json, Router};
+        use axum::{Json, Router, extract::State, routing::post};
 
         #[derive(Clone)]
         struct AppState {
@@ -2267,7 +2563,14 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
                                 mentioned_open_ids.push(open_id.to_string());
                             }
                         }
-                        _ => {}
+                        _ => {
+                            // Some Feishu rich-text tags (for example `md`) still carry useful
+                            // human text in a `text` field. Keep that text instead of dropping
+                            // the whole message as empty.
+                            if let Some(t) = el.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
+                        }
                     }
                 }
                 text.push('\n');
@@ -2288,6 +2591,106 @@ fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
 
 fn parse_post_content(content: &str) -> Option<String> {
     parse_post_content_details(content).map(|details| details.text)
+}
+
+/// Parse Feishu `list` message content into plain-text bullet lines.
+///
+/// Feishu sends list/bullet content as a JSON structure with nested items,
+/// each containing inline elements (text, links, etc.).  We flatten them
+/// into `"- item"` lines separated by newlines.
+fn parse_list_content(content: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(content).ok()?;
+
+    // The top-level structure may contain an "items" array directly, or the
+    // items might be under a "content" key.  Walk both shapes.
+    let items = parsed
+        .get("items")
+        .and_then(|v| v.as_array())
+        .or_else(|| parsed.get("content").and_then(|v| v.as_array()))?;
+
+    let mut lines = Vec::new();
+    collect_list_items(items, &mut lines, 0);
+
+    let result = lines.join("\n").trim().to_string();
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// Recursively collect list item text.  Each item may itself contain nested
+/// sub-lists via a `"children"` field.
+fn collect_list_items(items: &[serde_json::Value], lines: &mut Vec<String>, depth: usize) {
+    let indent = "  ".repeat(depth);
+    for item in items {
+        // Each item can be an array of inline elements, or an object with
+        // "content" (inline elements array) and optional "children" (sub-items).
+        let (inline_elements, children) = if let Some(arr) = item.as_array() {
+            (arr.as_slice(), None)
+        } else if let Some(obj) = item.as_object() {
+            let inlines = obj
+                .get("content")
+                .and_then(|v| v.as_array())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[]);
+            let kids = obj.get("children").and_then(|v| v.as_array());
+            (inlines, kids)
+        } else {
+            continue;
+        };
+
+        let mut text = String::new();
+        for el in inline_elements {
+            // Handle flat inline elements or nested arrays of inline elements
+            if let Some(inner_arr) = el.as_array() {
+                for inner_el in inner_arr {
+                    extract_inline_text(inner_el, &mut text);
+                }
+            } else {
+                extract_inline_text(el, &mut text);
+            }
+        }
+
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            lines.push(format!("{indent}- {trimmed}"));
+        }
+
+        if let Some(kids) = children {
+            collect_list_items(kids, lines, depth + 1);
+        }
+    }
+}
+
+/// Extract text from a single Feishu inline element (text, link, at-mention).
+fn extract_inline_text(el: &serde_json::Value, out: &mut String) {
+    match el.get("tag").and_then(|t| t.as_str()).unwrap_or("") {
+        "text" => {
+            if let Some(t) = el.get("text").and_then(|t| t.as_str()) {
+                out.push_str(t);
+            }
+        }
+        "a" => {
+            out.push_str(
+                el.get("text")
+                    .and_then(|t| t.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| el.get("href").and_then(|h| h.as_str()))
+                    .unwrap_or(""),
+            );
+        }
+        "at" => {
+            let n = el
+                .get("user_name")
+                .and_then(|n| n.as_str())
+                .or_else(|| el.get("user_id").and_then(|i| i.as_str()))
+                .unwrap_or("user");
+            out.push('@');
+            out.push_str(n);
+        }
+        _ => {}
+    }
 }
 
 /// Remove `@_user_N` placeholder tokens injected by Feishu in group chats.
@@ -2613,6 +3016,69 @@ mod tests {
 
         let msgs = ch.parse_event_payload(&payload).await;
         assert!(msgs.is_empty());
+    }
+
+    #[test]
+    fn parse_list_content_flat_items() {
+        // Flat structure: items is an array of arrays of inline elements
+        let content = r#"{"items":[[{"tag":"text","text":"first item"}],[{"tag":"text","text":"second item"}]]}"#;
+        let result = parse_list_content(content).unwrap();
+        assert_eq!(result, "- first item\n- second item");
+    }
+
+    #[test]
+    fn parse_list_content_nested_children() {
+        // Nested structure: items are objects with content + children
+        let content = r#"{"items":[{"content":[[{"tag":"text","text":"parent"}]],"children":[{"content":[[{"tag":"text","text":"child"}]]}]}]}"#;
+        let result = parse_list_content(content).unwrap();
+        assert_eq!(result, "- parent\n  - child");
+    }
+
+    #[test]
+    fn parse_list_content_with_links() {
+        let content = r#"{"items":[[{"tag":"text","text":"see "},{"tag":"a","text":"docs","href":"https://example.com"}]]}"#;
+        let result = parse_list_content(content).unwrap();
+        assert_eq!(result, "- see docs");
+    }
+
+    #[test]
+    fn parse_list_content_empty_returns_none() {
+        let content = r#"{"items":[]}"#;
+        assert!(parse_list_content(content).is_none());
+    }
+
+    #[test]
+    fn parse_list_content_invalid_json_returns_none() {
+        assert!(parse_list_content("not json").is_none());
+    }
+
+    #[tokio::test]
+    async fn lark_parse_list_message_type() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "list",
+                    "content": "{\"items\":[[{\"tag\":\"text\",\"text\":\"buy milk\"}],[{\"tag\":\"text\",\"text\":\"buy eggs\"}]]}",
+                    "chat_id": "oc_chat",
+                    "create_time": "1000"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].content.contains("buy milk"));
+        assert!(msgs[0].content.contains("buy eggs"));
     }
 
     #[tokio::test]
@@ -2993,10 +3459,11 @@ mod tests {
                 }
             }
         });
-        assert!(ch
-            .parse_event_payload(&wrong_mention_payload)
-            .await
-            .is_empty());
+        assert!(
+            ch.parse_event_payload(&wrong_mention_payload)
+                .await
+                .is_empty()
+        );
 
         let bot_mention_payload = serde_json::json!({
             "header": { "event_type": "im.message.receive_v1" },
@@ -3043,6 +3510,28 @@ mod tests {
         });
 
         assert_eq!(ch.parse_event_payload(&payload).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn lark_parse_post_message_accepts_md_tag_text_content() {
+        let ch = make_channel();
+        let payload = serde_json::json!({
+            "header": { "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_testuser123" } },
+                "message": {
+                    "message_type": "post",
+                    "chat_type": "p2p",
+                    "chat_id": "oc_chat",
+                    "mentions": [],
+                    "content": "{\"zh_cn\":{\"title\":\"\",\"content\":[[{\"tag\":\"md\",\"text\":\"* 1\\n* 2\"}]]}}"
+                }
+            }
+        });
+
+        let msgs = ch.parse_event_payload(&payload).await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "* 1\n* 2");
     }
 
     #[tokio::test]
@@ -3466,6 +3955,18 @@ mod tests {
 
     #[tokio::test]
     async fn lark_audio_file_key_missing_returns_none() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let whisper_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "test"})),
+            )
+            .mount(&whisper_server)
+            .await;
+
         let ch = make_channel();
         let mut tc = crate::config::TranscriptionConfig::default();
         tc.enabled = true;

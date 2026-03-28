@@ -50,6 +50,7 @@ pub struct Agent {
     model_name: String,
     temperature: f64,
     workspace_dir: std::path::PathBuf,
+    autonomy_config: crate::config::AutonomyConfig,
     identity_config: crate::config::IdentityConfig,
     skills: Vec<crate::skills::Skill>,
     skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
@@ -67,6 +68,10 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// Activated MCP tools for deferred loading mode.
+    /// When MCP deferred loading is enabled, tools are activated via `tool_search`
+    /// and stored here for lookup during tool execution.
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 }
 
 pub struct AgentBuilder {
@@ -81,6 +86,7 @@ pub struct AgentBuilder {
     model_name: Option<String>,
     temperature: Option<f64>,
     workspace_dir: Option<std::path::PathBuf>,
+    autonomy_config: Option<crate::config::AutonomyConfig>,
     identity_config: Option<crate::config::IdentityConfig>,
     skills: Option<Vec<crate::skills::Skill>>,
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
@@ -94,6 +100,7 @@ pub struct AgentBuilder {
     tool_descriptions: Option<ToolDescriptions>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
 }
 
 impl AgentBuilder {
@@ -110,6 +117,7 @@ impl AgentBuilder {
             model_name: None,
             temperature: None,
             workspace_dir: None,
+            autonomy_config: None,
             identity_config: None,
             skills: None,
             skills_prompt_mode: None,
@@ -123,6 +131,7 @@ impl AgentBuilder {
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: None,
+            activated_tools: None,
         }
     }
 
@@ -178,6 +187,11 @@ impl AgentBuilder {
 
     pub fn workspace_dir(mut self, workspace_dir: std::path::PathBuf) -> Self {
         self.workspace_dir = Some(workspace_dir);
+        self
+    }
+
+    pub fn autonomy_config(mut self, autonomy_config: crate::config::AutonomyConfig) -> Self {
+        self.autonomy_config = Some(autonomy_config);
         self
     }
 
@@ -255,6 +269,14 @@ impl AgentBuilder {
         self
     }
 
+    pub fn activated_tools(
+        mut self,
+        activated: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>>,
+    ) -> Self {
+        self.activated_tools = activated;
+        self
+    }
+
     pub fn build(self) -> Result<Agent> {
         let mut tools = self
             .tools
@@ -294,6 +316,7 @@ impl AgentBuilder {
             workspace_dir: self
                 .workspace_dir
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
+            autonomy_config: self.autonomy_config.unwrap_or_default(),
             identity_config: self.identity_config.unwrap_or_default(),
             skills: self.skills.unwrap_or_default(),
             skills_prompt_mode: self.skills_prompt_mode.unwrap_or_default(),
@@ -310,6 +333,7 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            activated_tools: self.activated_tools,
         })
     }
 }
@@ -407,6 +431,7 @@ impl Agent {
         // Replicates the same MCP initialization logic used in the CLI
         // and webhook paths (loop_.rs) so that the WebSocket/daemon UI
         // path also has access to MCP tools.
+        let mut activated_tools: Option<Arc<std::sync::Mutex<tools::ActivatedToolSet>>> = None;
         if config.mcp.enabled && !config.mcp.servers.is_empty() {
             tracing::info!(
                 "Initializing MCP client — {} server(s) configured",
@@ -425,9 +450,9 @@ impl Agent {
                             deferred_set.len(),
                             registry.server_count()
                         );
-                        let activated = std::sync::Arc::new(std::sync::Mutex::new(
-                            tools::ActivatedToolSet::new(),
-                        ));
+                        let activated =
+                            Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
+                        activated_tools = Some(Arc::clone(&activated));
                         tools.push(Box::new(tools::ToolSearchTool::new(
                             deferred_set,
                             activated,
@@ -527,6 +552,7 @@ impl Agent {
             .model_name(model_name)
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
+            .autonomy_config(config.autonomy.clone())
             .classification_config(config.query_classification.clone())
             .available_hints(available_hints)
             .route_model_by_hint(route_model_by_hint)
@@ -539,6 +565,7 @@ impl Agent {
             .auto_save(config.memory.auto_save)
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(config.autonomy.level)
+            .activated_tools(activated_tools)
             .build()
     }
 
@@ -583,12 +610,19 @@ impl Agent {
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
         };
-        self.prompt_builder.build(&ctx)
+        let mut prompt = self.prompt_builder.build(&ctx)?;
+        crate::channels::append_autonomy_constraints_once(
+            &mut prompt,
+            &self.autonomy_config,
+            &self.workspace_dir,
+        );
+        Ok(prompt)
     }
 
     async fn execute_tool_call(&self, call: &ParsedToolCall) -> ToolExecutionResult {
         let start = Instant::now();
 
+        // First try to find tool in static registry, then in activated MCP tools.
         let result = if let Some(tool) = self.tools.iter().find(|t| t.name() == call.name) {
             match tool.execute(call.arguments.clone()).await {
                 Ok(r) => {
@@ -611,6 +645,35 @@ impl Agent {
                     });
                     format!("Error executing {}: {e}", call.name)
                 }
+            }
+        } else if let Some(activated_arc) = self.activated_tools.as_ref() {
+            // Try to find in activated MCP tools.
+            let activated_opt = activated_arc.lock().unwrap().get_resolved(&call.name);
+            if let Some(tool) = activated_opt {
+                match tool.execute(call.arguments.clone()).await {
+                    Ok(r) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: r.success,
+                        });
+                        if r.success {
+                            r.output
+                        } else {
+                            format!("Error: {}", r.error.unwrap_or(r.output))
+                        }
+                    }
+                    Err(e) => {
+                        self.observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call.name.clone(),
+                            duration: start.elapsed(),
+                            success: false,
+                        });
+                        format!("Error executing {}: {e}", call.name)
+                    }
+                }
+            } else {
+                format!("Unknown tool: {}", call.name)
             }
         } else {
             format!("Unknown tool: {}", call.name)
@@ -756,7 +819,7 @@ impl Agent {
                 None
             };
 
-            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
                     self.observer.record_event(&ObserverEvent::CacheHit {
                         cache_type: "response".into(),
@@ -803,7 +866,7 @@ impl Agent {
                 };
 
                 // Store in response cache (text-only, no tool calls)
-                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
                         .usage
                         .as_ref()
@@ -931,7 +994,7 @@ impl Agent {
                 None
             };
 
-            if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                 if let Ok(Some(cached)) = cache.get(key) {
                     self.observer.record_event(&ObserverEvent::CacheHit {
                         cache_type: "response".into(),
@@ -958,11 +1021,11 @@ impl Agent {
             let mut stream = self.provider.stream_chat(
                 crate::providers::ChatRequest {
                     messages: &messages,
-                    // tools: None — turn_streamed is used by the gateway WS handler
-                    // for dashboard chat. Tool dispatch is handled by the main agent
-                    // loop (run_tool_call_loop) for channel messages. Passing tools
-                    // here would change behavior for all providers, not just proxies.
-                    tools: None,
+                    tools: if self.tool_dispatcher.should_send_tool_specs() {
+                        Some(&self.tool_specs)
+                    } else {
+                        None
+                    },
                 },
                 &effective_model,
                 self.temperature,
@@ -972,6 +1035,7 @@ impl Agent {
             let mut streamed_text = String::new();
             let mut streamed_tool_calls: Vec<crate::providers::traits::ToolCall> = Vec::new();
             let mut got_stream = false;
+            let mut stream_error: Option<String> = None;
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -1021,15 +1085,24 @@ impl Agent {
                         }
                         crate::providers::traits::StreamEvent::Final => break,
                     },
-                    Err(_) => break,
+                    Err(err) => {
+                        stream_error = Some(err.to_string());
+                        break;
+                    }
                 }
             }
             // Drop the stream so we release the borrow on provider.
             drop(stream);
 
-            // If streaming produced text, use it as the response and
-            // check for tool calls via the dispatcher.
-            let response = if got_stream {
+            // If streaming completed without error and produced text, use it
+            // directly. Otherwise, fall back to non-streaming chat.
+            //
+            // Why: some providers can emit partial/error text over stream on
+            // failures (for example model capability mismatches). Returning
+            // that partial stream as the final assistant response causes
+            // user-visible false answers. Fallback chat gives us a clean
+            // authoritative result path.
+            let response = if got_stream && stream_error.is_none() {
                 // Build a synthetic ChatResponse from streamed text
                 crate::providers::ChatResponse {
                     text: Some(streamed_text),
@@ -1038,6 +1111,13 @@ impl Agent {
                     reasoning_content: None,
                 }
             } else {
+                if let Some(ref err) = stream_error {
+                    tracing::warn!(
+                        error = err.as_str(),
+                        model = effective_model.as_str(),
+                        "Streaming turn had an error; attempting non-streaming fallback"
+                    );
+                }
                 // Fall back to non-streaming chat
                 match self
                     .provider
@@ -1056,7 +1136,25 @@ impl Agent {
                     .await
                 {
                     Ok(resp) => resp,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        // If streaming produced partial text but fallback failed,
+                        // preserve the partial answer rather than failing hard.
+                        if got_stream {
+                            tracing::warn!(
+                                error = %err,
+                                model = effective_model.as_str(),
+                                "Fallback chat failed after partial stream; returning partial streamed text"
+                            );
+                            crate::providers::ChatResponse {
+                                text: Some(streamed_text),
+                                tool_calls: streamed_tool_calls,
+                                usage: None,
+                                reasoning_content: None,
+                            }
+                        } else {
+                            return Err(err);
+                        }
+                    }
                 }
             };
 
@@ -1069,7 +1167,7 @@ impl Agent {
                 };
 
                 // Store in response cache
-                if let (Some(ref cache), Some(ref key)) = (&self.response_cache, &cache_key) {
+                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
                     let token_count = response
                         .usage
                         .as_ref()
@@ -1233,6 +1331,8 @@ pub async fn run(
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use futures_util::stream;
+    use futures_util::StreamExt;
     use parking_lot::Mutex;
     use std::collections::HashMap;
 
@@ -1368,6 +1468,97 @@ mod tests {
         assert_eq!(response, "hello");
     }
 
+    /// Mock provider that emits error text via stream then fails,
+    /// but succeeds on non-streaming fallback. Reproduces #4670.
+    struct StreamingErrorThenFallbackProvider;
+
+    #[async_trait]
+    impl Provider for StreamingErrorThenFallbackProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            Ok(crate::providers::ChatResponse {
+                text: Some("fallback answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: crate::providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>,
+        > {
+            stream::iter(vec![
+                Ok(crate::providers::traits::StreamEvent::TextDelta(
+                    crate::providers::traits::StreamChunk::delta(
+                        "unknown does not support streaming".to_string(),
+                    ),
+                )),
+                Err(crate::providers::traits::StreamError::Provider(
+                    "unknown does not support streaming".to_string(),
+                )),
+            ])
+            .boxed()
+        }
+    }
+
+    /// Regression test for #4670: streaming error text should not become the
+    /// final response. The agent should fall back to non-streaming chat.
+    #[tokio::test]
+    async fn turn_streamed_falls_back_to_chat_when_stream_errors_after_partial_text() {
+        let provider = Box::new(StreamingErrorThenFallbackProvider);
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(XmlToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+        let response = agent.turn_streamed("hi", event_tx).await.unwrap();
+        while event_rx.try_recv().is_ok() {}
+
+        assert_eq!(response, "fallback answer");
+    }
+
     #[tokio::test]
     async fn turn_with_native_dispatcher_handles_tool_results_variant() {
         let provider = Box::new(MockProvider {
@@ -1413,10 +1604,12 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");
-        assert!(agent
-            .history()
-            .iter()
-            .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
+        assert!(
+            agent
+                .history()
+                .iter()
+                .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
+        );
     }
 
     #[tokio::test]
@@ -1475,7 +1668,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_config_passes_extra_headers_to_custom_provider() {
-        use axum::{http::HeaderMap, routing::post, Json, Router};
+        use axum::{Json, Router, http::HeaderMap, routing::post};
         use tempfile::TempDir;
         use tokio::net::TcpListener;
 
@@ -1669,5 +1862,174 @@ mod tests {
             matches!(&history[2], ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi there")
         );
         assert_eq!(history.len(), 3);
+    }
+
+    /// Mock provider that captures whether tool specs were passed to `stream_chat`
+    /// and returns a tool call followed by a text response through the stream.
+    struct StreamToolCaptureProvider {
+        tools_received: Arc<Mutex<Vec<bool>>>,
+        call_count: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait]
+    impl Provider for StreamToolCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<String> {
+            Ok("ok".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> Result<crate::providers::ChatResponse> {
+            self.tools_received.lock().push(request.tools.is_some());
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                Ok(crate::providers::ChatResponse {
+                    text: Some(String::new()),
+                    tool_calls: vec![crate::providers::ToolCall {
+                        id: "tc_stream_1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            } else {
+                Ok(crate::providers::ChatResponse {
+                    text: Some("stream-done".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: crate::providers::traits::StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            crate::providers::traits::StreamResult<crate::providers::traits::StreamEvent>,
+        > {
+            use futures_util::stream::{self, StreamExt};
+            self.tools_received.lock().push(request.tools.is_some());
+            let mut count = self.call_count.lock();
+            *count += 1;
+            if *count == 1 {
+                let tc =
+                    crate::providers::traits::StreamEvent::ToolCall(crate::providers::ToolCall {
+                        id: "tc_stream_1".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                    });
+                stream::iter(vec![
+                    Ok(tc),
+                    Ok(crate::providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            } else {
+                let chunk = crate::providers::traits::StreamEvent::TextDelta(
+                    crate::providers::traits::StreamChunk {
+                        delta: "stream-done".into(),
+                        is_final: false,
+                        reasoning: None,
+                        token_count: 0,
+                    },
+                );
+                stream::iter(vec![
+                    Ok(chunk),
+                    Ok(crate::providers::traits::StreamEvent::Final),
+                ])
+                .boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn turn_streamed_passes_tool_specs_to_provider() {
+        let tools_received = Arc::new(Mutex::new(Vec::new()));
+        let provider = Box::new(StreamToolCaptureProvider {
+            tools_received: tools_received.clone(),
+            call_count: Arc::new(Mutex::new(0)),
+        });
+
+        let memory_cfg = crate::config::MemoryConfig {
+            backend: "none".into(),
+            ..crate::config::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .provider(provider)
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
+        let response = agent
+            .turn_streamed("use the echo tool", event_tx)
+            .await
+            .unwrap();
+        assert_eq!(response, "stream-done");
+
+        // Verify tools were passed in both stream_chat calls
+        let received = tools_received.lock();
+        assert!(
+            received.len() >= 2,
+            "Expected at least 2 stream_chat calls, got {}",
+            received.len()
+        );
+        assert!(
+            received[0],
+            "First stream_chat call should have received tool specs"
+        );
+        assert!(
+            received[1],
+            "Second stream_chat call should have received tool specs"
+        );
+
+        // Collect events and verify tool call + tool result were emitted
+        let mut events = Vec::new();
+        while let Ok(ev) = event_rx.try_recv() {
+            events.push(ev);
+        }
+        let has_tool_call = events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ToolCall { name, .. } if name == "echo"));
+        let has_tool_result = events
+            .iter()
+            .any(|e| matches!(e, TurnEvent::ToolResult { name, .. } if name == "echo"));
+        assert!(
+            has_tool_call,
+            "Should have emitted a ToolCall event for 'echo'"
+        );
+        assert!(
+            has_tool_result,
+            "Should have emitted a ToolResult event for 'echo'"
+        );
     }
 }

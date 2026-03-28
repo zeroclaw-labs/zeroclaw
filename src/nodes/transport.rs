@@ -4,7 +4,7 @@
 //! no custom binary framing, no UDP tunneling.  This makes the transport
 //! compatible with corporate proxies, firewalls, and IT audit expectations.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
