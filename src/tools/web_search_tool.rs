@@ -244,8 +244,9 @@ impl WebSearchTool {
     fn build_http_client(&self, service_key: &str) -> anyhow::Result<reqwest::Client> {
         let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(self.timeout_secs))
-            .connect_timeout(Duration::from_secs(10))
-            .user_agent(self.user_agent.as_str());
+            .connect_timeout(Duration::from_secs(15))
+            .user_agent(self.user_agent.as_str())
+            .redirect(reqwest::redirect::Policy::limited(10));
         let builder =
             crate::config::apply_runtime_proxy_to_builder(builder, service_key);
         Ok(builder.build()?)
@@ -260,11 +261,18 @@ impl WebSearchTool {
 
         let client = self.build_http_client("tool.web_search")?;
 
-        let response = client.get(&search_url).send().await.map_err(|e| {
-            anyhow::anyhow!(
-                "DuckDuckGo search request failed: {e}. Check outbound network/proxy settings, or switch [web_search].provider to \"brave\"/\"firecrawl\"."
-            )
-        })?;
+        let response = client
+            .get(&search_url)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7")
+            .header("Referer", "https://duckduckgo.com/")
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "DuckDuckGo search request failed: {e}. Check outbound network/proxy settings, or switch [web_search].provider to \"brave\"/\"firecrawl\"."
+                )
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -856,7 +864,7 @@ impl Tool for WebSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query. Be specific for better results."
+                    "description": "The search query. MUST be a resolved, specific query — not the user's raw message. Include: specific location (city/district), resolved dates (not '내일' but actual date), and relevant keywords. Example: '서울 강남구 2026-03-29 날씨 예보' instead of '내일 날씨'."
                 }
             },
             "required": ["query"]
