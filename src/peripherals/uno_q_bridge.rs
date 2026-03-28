@@ -149,3 +149,146 @@ impl Tool for UnoQGpioWriteTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::traits::Tool;
+
+    // ── UnoQGpioReadTool ────────────────────────────────────────────────
+
+    #[test]
+    fn gpio_read_tool_name() {
+        let tool = UnoQGpioReadTool;
+        assert_eq!(tool.name(), "gpio_read");
+    }
+
+    #[test]
+    fn gpio_read_tool_description_mentions_uno_q() {
+        let tool = UnoQGpioReadTool;
+        assert!(
+            tool.description().contains("Uno Q"),
+            "description should mention Uno Q"
+        );
+    }
+
+    #[test]
+    fn gpio_read_tool_schema_requires_pin() {
+        let tool = UnoQGpioReadTool;
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["pin"].is_object());
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("pin")),
+            "pin should be required"
+        );
+    }
+
+    #[test]
+    fn gpio_read_tool_spec_valid() {
+        let tool = UnoQGpioReadTool;
+        let spec = tool.spec();
+        assert_eq!(spec.name, "gpio_read");
+        assert!(!spec.description.is_empty());
+        assert_eq!(spec.parameters["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn gpio_read_missing_pin_returns_error() {
+        let tool = UnoQGpioReadTool;
+        // execute returns Err when pin is missing (anyhow bail)
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err(), "missing pin should return Err");
+    }
+
+    #[tokio::test]
+    async fn gpio_read_no_bridge_returns_error() {
+        // No bridge server running — connection should fail with a timeout or connection error.
+        let tool = UnoQGpioReadTool;
+        let result = tool.execute(json!({"pin": 13})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.is_some(), "should report bridge connection error");
+    }
+
+    // ── UnoQGpioWriteTool ───────────────────────────────────────────────
+
+    #[test]
+    fn gpio_write_tool_name() {
+        let tool = UnoQGpioWriteTool;
+        assert_eq!(tool.name(), "gpio_write");
+    }
+
+    #[test]
+    fn gpio_write_tool_description_mentions_uno_q() {
+        let tool = UnoQGpioWriteTool;
+        assert!(
+            tool.description().contains("Uno Q"),
+            "description should mention Uno Q"
+        );
+    }
+
+    #[test]
+    fn gpio_write_tool_schema_requires_pin_and_value() {
+        let tool = UnoQGpioWriteTool;
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["type"], "object");
+        assert!(schema["properties"]["pin"].is_object());
+        assert!(schema["properties"]["value"].is_object());
+        let required = schema["required"].as_array().expect("required array");
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("pin")),
+            "pin should be required"
+        );
+        assert!(
+            required.iter().any(|v| v.as_str() == Some("value")),
+            "value should be required"
+        );
+    }
+
+    #[test]
+    fn gpio_write_tool_spec_valid() {
+        let tool = UnoQGpioWriteTool;
+        let spec = tool.spec();
+        assert_eq!(spec.name, "gpio_write");
+        assert!(!spec.description.is_empty());
+        assert_eq!(spec.parameters["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn gpio_write_missing_pin_returns_error() {
+        let tool = UnoQGpioWriteTool;
+        // execute returns Err when pin is missing (anyhow bail)
+        let result = tool.execute(json!({"value": 1})).await;
+        assert!(result.is_err(), "missing pin should return Err");
+    }
+
+    #[tokio::test]
+    async fn gpio_write_missing_value_returns_error() {
+        let tool = UnoQGpioWriteTool;
+        // execute returns Err when value is missing (anyhow bail)
+        let result = tool.execute(json!({"pin": 13})).await;
+        assert!(result.is_err(), "missing value should return Err");
+    }
+
+    #[tokio::test]
+    async fn gpio_write_no_bridge_returns_error() {
+        // No bridge server running — connection should fail.
+        let tool = UnoQGpioWriteTool;
+        let result = tool.execute(json!({"pin": 13, "value": 1})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.is_some(), "should report bridge connection error");
+    }
+
+    // ── Constants ───────────────────────────────────────────────────────
+
+    #[test]
+    fn bridge_host_is_localhost() {
+        assert_eq!(BRIDGE_HOST, "127.0.0.1");
+    }
+
+    #[test]
+    fn bridge_port_is_9999() {
+        assert_eq!(BRIDGE_PORT, 9999);
+    }
+}
