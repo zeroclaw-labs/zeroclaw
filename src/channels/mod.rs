@@ -402,6 +402,8 @@ struct ChannelRuntimeContext {
     max_tool_result_chars: usize,
     context_token_budget: usize,
     debouncer: Arc<debounce::MessageDebouncer>,
+    receipt_generator: Option<crate::agent::tool_receipts::ReceiptGenerator>,
+    show_receipts_in_response: bool,
 }
 
 #[derive(Clone)]
@@ -2876,6 +2878,7 @@ async fn process_channel_message(
     let cost_tracking_context = ctx.cost_tracking.clone().map(|state| {
         crate::agent::loop_::ToolLoopCostTrackingContext::new(state.tracker, state.prices)
     });
+    let tool_receipts_collector: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
     let llm_call_start = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
@@ -2923,6 +2926,8 @@ async fn process_channel_message(
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
+                        ctx.receipt_generator.as_ref(),
+                        Some(&tool_receipts_collector),
                     ),
                     ),
                     ),
@@ -3133,6 +3138,19 @@ async fn process_channel_message(
                         fb.requested_provider, fb.actual_provider, fb.actual_model,
                     )
                     .ok();
+                }
+            }
+
+            if ctx.show_receipts_in_response {
+                let receipts = tool_receipts_collector
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if !receipts.is_empty() {
+                    use std::fmt::Write as _;
+                    write!(delivered_response, "\n\n---\nTool receipts:").ok();
+                    for r in receipts.iter() {
+                        write!(delivered_response, "\n  {r}").ok();
+                    }
                 }
             }
 
@@ -5268,6 +5286,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         system_prompt.push_str(&deferred_section);
     }
 
+    if config.agent.tool_receipts.enabled {
+        system_prompt.push_str(
+            "\n## Tool Execution Receipts\n\n\
+             Every tool result includes a `[receipt: ...]` field. This is a cryptographic \
+             signature proving the tool actually executed. You must include the receipt \
+             verbatim when referencing tool results. Do not modify, omit, or fabricate receipts. \
+             A missing or invalid receipt indicates a fabricated tool call.\n\n",
+        );
+    }
+
     if !skills.is_empty() {
         println!(
             "  🧩 Skills:   {}",
@@ -5499,6 +5527,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
         debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::from_millis(
             config.channels_config.debounce_ms,
         ))),
+        receipt_generator: if config.agent.tool_receipts.enabled {
+            Some(crate::agent::tool_receipts::ReceiptGenerator::new())
+        } else {
+            None
+        },
+        show_receipts_in_response: config.agent.tool_receipts.show_in_response,
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -5933,6 +5967,8 @@ mod tests {
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6057,6 +6093,8 @@ mod tests {
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6138,6 +6176,8 @@ mod tests {
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6236,6 +6276,8 @@ mod tests {
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -6835,6 +6877,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -6925,6 +6969,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7029,6 +7075,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7118,6 +7166,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7217,6 +7267,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7337,6 +7389,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7438,6 +7492,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7554,6 +7610,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7658,6 +7716,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7752,6 +7812,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -7969,6 +8031,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -8081,6 +8145,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8212,6 +8278,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8340,6 +8408,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8446,6 +8516,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8511,6 +8583,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 discord: false,
                 mattermost: false,
                 matrix: false,
+                whatsapp: false,
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8523,6 +8596,7 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: crate::config::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            native_tool_calls_only: false,
             session_store: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &crate::config::AutonomyConfig::default(),
@@ -8533,6 +8607,11 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -8620,6 +8699,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -9412,6 +9493,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -9553,6 +9636,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -9737,6 +9822,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -9853,6 +9940,8 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10440,6 +10529,8 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -10536,6 +10627,8 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10840,6 +10933,8 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -10960,6 +11055,8 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11072,6 +11169,8 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11204,6 +11303,8 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         process_channel_message(
@@ -11477,6 +11578,8 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            receipt_generator: None,
+            show_receipts_in_response: false,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);

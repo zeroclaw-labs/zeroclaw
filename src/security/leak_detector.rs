@@ -319,8 +319,15 @@ impl LeakDetector {
         let media_re = MEDIA_MARKER_PATTERN.get_or_init(|| {
             Regex::new(r"\[(IMAGE|VIDEO|VOICE|AUDIO|DOCUMENT|FILE):[^\]]*\]").unwrap()
         });
+        // Tool receipts (zc-receipt-...) are runtime-generated HMAC tokens that
+        // intentionally appear in output. Strip them before entropy scanning so
+        // they are not redacted as leaked credentials. See #4830.
+        static RECEIPT_PATTERN: OnceLock<Regex> = OnceLock::new();
+        let receipt_re =
+            RECEIPT_PATTERN.get_or_init(|| Regex::new(r"zc-receipt-\d+-[A-Za-z0-9_-]+").unwrap());
         let content_stripped = url_re.replace_all(content, "");
         let content_without_urls = media_re.replace_all(&content_stripped, "");
+        let content_without_urls = receipt_re.replace_all(&content_without_urls, "");
 
         let tokens = extract_candidate_tokens(&content_without_urls);
 
@@ -590,5 +597,16 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         // "ab" repeated: entropy = 1.0 bit
         let e = shannon_entropy("abab");
         assert!((e - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn tool_receipts_not_redacted_as_high_entropy() {
+        let detector = LeakDetector::new();
+        let content = "The date is Fri Mar 27.\n\n[receipt: zc-receipt-1774608496-gzpEBuUIRYX1vd4fQl4oYkqhq4-GnoJDStmlYzvQiWA]";
+        let result = detector.scan(content);
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "Tool receipts (zc-receipt-...) should not be redacted"
+        );
     }
 }
