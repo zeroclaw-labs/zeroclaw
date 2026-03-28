@@ -23,28 +23,28 @@ pub mod tls;
 pub mod ws;
 
 use crate::channels::{
-    session_backend::SessionBackend, session_sqlite::SqliteSessionBackend, Channel,
-    GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
+    Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
+    WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
+use crate::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use crate::tools;
 use crate::tools::canvas::CanvasStore;
 use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
+    Router,
     body::Bytes,
     extract::{ConnectInfo, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{delete, get, post, put},
-    Router,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -381,11 +381,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
-        tracing::warn!(
-            "⚠️  Binding to {host} — gateway will be exposed to all network interfaces.\n\
-             Suggestion: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
-             [gateway] allow_public_bind = true in config.toml to silence this warning.\n\n\
-             Docker/VM: if you are running inside a container or VM, this is expected."
+        anyhow::bail!(
+            "🛑 Refusing to bind to {host} — gateway would be exposed on all network interfaces.\n\
+             Fix: use --host 127.0.0.1 (default), configure a tunnel, or set\n\
+             [gateway] allow_public_bind = true in config.toml.\n\n\
+             Docker / VM / container: if you need to reach the gateway from another\n\
+             container or host, set [gateway] host = \"0.0.0.0\" and allow_public_bind = true\n\
+             in config.toml, then connect via ws://host.docker.internal:{port}."
         );
     }
     let config_state = Arc::new(Mutex::new(config.clone()));
@@ -1132,7 +1134,9 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 fn prometheus_disabled_hint() -> String {
-    String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+    String::from(
+        "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
+    )
 }
 
 #[cfg(feature = "observability-prometheus")]
@@ -2271,7 +2275,8 @@ mod tests {
     #[test]
     fn gateway_timeout_falls_back_to_default() {
         // When env var is not set, should return the default constant
-        std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS") };
         assert_eq!(gateway_request_timeout_secs(), 30);
     }
 

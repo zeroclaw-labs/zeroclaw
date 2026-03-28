@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::collections::BTreeSet;
 
 const BANKING_DOMAINS: &[&str] = &[

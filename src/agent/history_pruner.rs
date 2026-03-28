@@ -133,7 +133,7 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
         if let Some(idx) = protected
             .iter()
             .enumerate()
-            .find(|(_, &p)| !p)
+            .find(|&(_, &p)| !p)
             .map(|(i, _)| i)
         {
             messages.remove(idx);

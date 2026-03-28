@@ -1,30 +1,30 @@
 use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use matrix_sdk::{
+    Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     ruma::{
+        OwnedEventId, OwnedRoomId, OwnedUserId,
         api::client::receipt::create_receipt,
         events::reaction::ReactionEventContent,
         events::receipt::ReceiptThread,
         events::relation::{Annotation, Thread},
+        events::room::MediaSource,
         events::room::member::StrippedRoomMemberEvent,
         events::room::message::{
             MessageType, OriginalSyncRoomMessageEvent, Relation, ReplacementMetadata,
             RoomMessageEventContent,
         },
-        events::room::MediaSource,
-        OwnedEventId, OwnedRoomId, OwnedUserId,
     },
-    Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
 };
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, OnceCell, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::{Mutex, OnceCell, RwLock, mpsc};
 
 /// Matrix channel for Matrix Client-Server API.
 /// Uses matrix-sdk for reliable sync and encrypted-room decryption.
@@ -1103,7 +1103,7 @@ impl Channel for MatrixChannel {
 
                 // Voice transcription: if this was an audio message, transcribe it
                 let body = if body.starts_with("[audio:") {
-                    if let (Some(path_start), Some(ref manager)) = (body.find("saved to "), &transcription_mgr) {
+                    if let (Some(path_start), Some(manager)) = (body.find("saved to "), &transcription_mgr) {
                         let audio_path = body[path_start + 9..].to_string();
                         let file_name = audio_path
                             .rsplit('/')
@@ -1171,10 +1171,22 @@ impl Channel for MatrixChannel {
                     tracing::warn!("Matrix failed to start typing notification: {error}");
                 }
 
+                // Always root a thread at the incoming message. Without this,
+                // the first exchange uses thread_ts=None (room-level session key)
+                // but Matrix implicitly creates a thread, so the follow-up arrives
+                // with a different thread_ts (the bot's response event ID), causing
+                // a session key mismatch and loss of context. See #4804.
                 let thread_ts = match &event.content.relates_to {
                     Some(Relation::Thread(thread)) => Some(thread.event_id.to_string()),
-                    _ => None,
+                    _ => Some(event_id.clone()),
                 };
+
+                tracing::debug!(
+                    thread_ts = ?thread_ts,
+                    event_id = %event_id,
+                    "Matrix message thread context"
+                );
+
                 let msg = ChannelMessage {
                     id: event_id,
                     sender: sender.clone(),
@@ -1926,10 +1938,12 @@ mod tests {
         assert_eq!(value["msgtype"], "m.text");
         assert_eq!(value["body"], "**hello**");
         assert_eq!(value["format"], "org.matrix.custom.html");
-        assert!(value["formatted_body"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("<strong>hello</strong>"));
+        assert!(
+            value["formatted_body"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("<strong>hello</strong>")
+        );
     }
 
     #[test]
@@ -2174,9 +2188,10 @@ mod tests {
         );
 
         let err = ch.resolve_room_id().await.unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("must start with '!' (room ID) or '#' (room alias)"));
+        assert!(
+            err.to_string()
+                .contains("must start with '!' (room ID) or '#' (room alias)")
+        );
     }
 
     #[tokio::test]

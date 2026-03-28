@@ -1797,9 +1797,11 @@ mod tests {
         let chunks = split_message_for_discord(&msg);
         // Should split into 5 chunks of <= 2000 chars
         assert_eq!(chunks.len(), 5);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH)
+        );
         // Verify total content is preserved
         let reconstructed = chunks.concat();
         assert_eq!(reconstructed, msg);
@@ -1894,9 +1896,11 @@ mod tests {
     fn split_chunks_always_within_discord_limit() {
         let msg = "x".repeat(12_345);
         let chunks = split_message_for_discord(&msg);
-        assert!(chunks
-            .iter()
-            .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.chars().count() <= DISCORD_MAX_MESSAGE_LENGTH)
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ resolver = "2"
 [package]
 name = "zeroclawlabs"
 version = "0.6.5"
-edition = "2021"
+edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."

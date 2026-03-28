@@ -91,6 +91,7 @@ pub struct SecurityPolicy {
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
+    pub shell_timeout_secs: u64,
     pub tracker: ActionTracker,
 }
 
@@ -223,6 +224,7 @@ impl Default for SecurityPolicy {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
+            shell_timeout_secs: 60,
             tracker: ActionTracker::new(),
         }
     }
@@ -616,11 +618,7 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
         return None;
     }
     let value = body[1..].trim_start_matches('=').trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn redirection_target(token: &str) -> Option<&str> {
@@ -677,17 +675,18 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
         return executable_path == allowed_path;
     }
 
-    // Command-name entries continue to match by basename.
-    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
-    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
-    if allowed == executable_base {
+    // Command-name entries continue to match by basename (case-insensitive).
+    // `executable_base` is already lowercased by the caller, so we lowercase
+    // the allowlist entry to match. On Windows, also match when the executable
+    // has a .exe/.cmd/.bat suffix that the allowlist entry omits.
+    let allowed_lower = allowed.to_ascii_lowercase();
+    if allowed_lower == executable_base {
         return true;
     }
 
     #[cfg(target_os = "windows")]
     {
         let base_lower = executable_base.to_ascii_lowercase();
-        let allowed_lower = allowed.to_ascii_lowercase();
         for ext in &[".exe", ".cmd", ".bat"] {
             if base_lower == format!("{allowed_lower}{ext}") {
                 return true;
@@ -848,10 +847,6 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
-        if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
-        }
-
         let risk = self.command_risk_level(command);
 
         // When the operator has set `allowed_commands = ["*"]` AND explicitly
@@ -861,6 +856,10 @@ impl SecurityPolicy {
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         if has_wildcard && !self.block_high_risk_commands {
             return Ok(risk);
+        }
+
+        if !self.is_command_allowed(command) {
+            return Err(format!("Command not allowed by security policy: {command}"));
         }
 
         if risk == CommandRiskLevel::High {
@@ -1015,12 +1014,10 @@ impl SecurityPolicy {
         }
 
         // At least one command must be present
-        let has_cmd = segments.iter().any(|s| {
+        segments.iter().any(|s| {
             let s = skip_env_assignments(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        });
-
-        has_cmd
+        })
     }
 
     /// Check for dangerous arguments that allow sub-command execution.
@@ -1393,6 +1390,7 @@ impl SecurityPolicy {
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
+            shell_timeout_secs: autonomy_config.shell_timeout_secs,
             tracker: ActionTracker::new(),
         }
     }
@@ -1542,9 +1540,10 @@ mod tests {
     #[test]
     fn enforce_tool_operation_read_allowed_in_readonly_mode() {
         let p = readonly_policy();
-        assert!(p
-            .enforce_tool_operation(ToolOperation::Read, "memory_recall")
-            .is_ok());
+        assert!(
+            p.enforce_tool_operation(ToolOperation::Read, "memory_recall")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2280,6 +2279,18 @@ mod tests {
         assert!(p.is_command_allowed("LANG=C grep pattern file"));
         // env assignment + disallowed command — blocked
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
+    }
+
+    #[test]
+    fn mixed_case_allowlist_entry_matches_command() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["icalBuddy".into()],
+            ..SecurityPolicy::default()
+        };
+        // Mixed-case allowlist entry should match the same command
+        assert!(p.is_command_allowed("icalBuddy"));
+        // Also match lowercase invocation (case-insensitive)
+        assert!(p.is_command_allowed("icalbuddy"));
     }
 
     #[test]
@@ -3101,13 +3112,15 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        assert!(p
-            .validate_command_execution("rm -rf /tmp/test", true)
-            .is_ok());
+        assert!(
+            p.validate_command_execution("rm -rf /tmp/test", true)
+                .is_ok()
+        );
         assert!(p.validate_command_execution("nohup firefox", true).is_ok());
-        assert!(p
-            .validate_command_execution("ls /usr/bin/firefox", true)
-            .is_ok());
+        assert!(
+            p.validate_command_execution("ls /usr/bin/firefox", true)
+                .is_ok()
+        );
     }
 
     #[test]
