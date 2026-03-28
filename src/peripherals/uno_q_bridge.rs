@@ -208,7 +208,10 @@ mod tests {
         let tool = UnoQGpioReadTool;
         let result = tool.execute(json!({"pin": 13})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.is_some(), "should report bridge connection error");
+        assert!(
+            result.error.is_some(),
+            "should report bridge connection error"
+        );
     }
 
     // ── UnoQGpioWriteTool ───────────────────────────────────────────────
@@ -277,7 +280,10 @@ mod tests {
         let tool = UnoQGpioWriteTool;
         let result = tool.execute(json!({"pin": 13, "value": 1})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.is_some(), "should report bridge connection error");
+        assert!(
+            result.error.is_some(),
+            "should report bridge connection error"
+        );
     }
 
     // ── Constants ───────────────────────────────────────────────────────
