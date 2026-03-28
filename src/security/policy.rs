@@ -735,6 +735,25 @@ fn redirection_target(token: &str) -> Option<&str> {
     }
 }
 
+/// Check if a redirection target is safe (standard /dev/* targets or file descriptors).
+///
+/// Safe targets include:
+/// - `/dev/null` — discards output
+/// - `/dev/stdout` — redirects to standard output
+/// - `/dev/stderr` — redirects to standard error
+/// - `/dev/zero` — infinite zero bytes source
+///
+/// File descriptor forms like `2>&1` are handled separately via `redirection_target()`,
+/// which strips the ampersand prefix before calling this function. This function
+/// validates the actual target path/name.
+fn safe_redirect_target(target: &str) -> bool {
+    let target = target.trim();
+    matches!(
+        target,
+        "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/zero"
+    )
+}
+
 /// Extract the basename from a command path, handling both Unix (`/`) and
 /// Windows (`\`) separators so that `C:\Git\bin\git.exe` resolves to `git.exe`.
 fn command_basename(raw: &str) -> &str {
@@ -1070,11 +1089,33 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
-        // arbitrary paths and bypass path checks.
+        // Allow safe shell redirections (`<`, `>`, `>>`) to /dev/* targets.
+        // Block unsafe redirections to arbitrary paths that could bypass path checks.
         // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
         if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
-            return false;
+            // Check if all redirections target safe destinations
+            for segment in split_unquoted_segments(command) {
+                let cmd_part = skip_env_assignments(&segment);
+                let mut words = cmd_part.split_whitespace();
+
+                // Check inline redirections on executable itself, e.g., `cat</dev/null`
+                if let Some(executable) = words.next() {
+                    if let Some(target) = redirection_target(strip_wrapping_quotes(executable)) {
+                        if !safe_redirect_target(target) {
+                            return false;
+                        }
+                    }
+                }
+
+                // Check redirections in remaining arguments
+                for token in words {
+                    if let Some(target) = redirection_target(token) {
+                        if !safe_redirect_target(target) {
+                            return false;
+                        }
+                    }
+                }
+            }
         }
 
         // Block `tee` — it can write to arbitrary files, bypassing the
@@ -2326,6 +2367,50 @@ mod tests {
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
         assert!(!p.is_command_allowed("cat </etc/passwd"));
         assert!(!p.is_command_allowed("cat</etc/passwd"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_null_allowed() {
+        let p = default_policy();
+        // stdout to /dev/null
+        assert!(p.is_command_allowed("echo secret > /dev/null"));
+        // stderr to /dev/null
+        assert!(p.is_command_allowed("ls 2> /dev/null"));
+        // both stdout and stderr to /dev/null
+        assert!(p.is_command_allowed("find . 2>&1 > /dev/null"));
+        // inline redirection form
+        assert!(p.is_command_allowed("cat</dev/null"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_stdout_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo hello > /dev/stdout"));
+        assert!(p.is_command_allowed("cat /dev/zero > /dev/stdout"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_stderr_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo error > /dev/stderr"));
+        assert!(p.is_command_allowed("ls 1> /dev/stderr"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_zero_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("dd if=/dev/zero of=/dev/null"));
+    }
+
+    #[test]
+    fn safe_file_descriptor_redirect_allowed() {
+        let p = default_policy();
+        // stderr to stdout
+        assert!(p.is_command_allowed("find . 2>&1"));
+        // stdout to stderr
+        assert!(p.is_command_allowed("echo hello 1>&2"));
+        // combined with safe target
+        assert!(p.is_command_allowed("ls 2>&1 > /dev/null"));
     }
 
     #[test]
