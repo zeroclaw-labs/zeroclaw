@@ -4543,7 +4543,8 @@ fn collect_configured_channels(
                     sig.ignore_attachments,
                     sig.ignore_stories,
                 )
-                .with_proxy_url(sig.proxy_url.clone()),
+                .with_proxy_url(sig.proxy_url.clone())
+                .with_transcription(config.transcription.clone()),
             ),
         });
     }
