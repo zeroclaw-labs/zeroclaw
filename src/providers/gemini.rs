@@ -1378,7 +1378,7 @@ impl Provider for GeminiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use reqwest::{header::AUTHORIZATION, StatusCode};
+    use reqwest::{StatusCode, header::AUTHORIZATION};
 
     /// Helper to create a test OAuth auth variant.
     fn test_oauth_auth(token: &str) -> GeminiAuth {
@@ -2160,10 +2160,12 @@ mod tests {
 
         let result = provider.warmup().await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("ManagedOAuth requires auth_service"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("ManagedOAuth requires auth_service")
+        );
     }
 
     /// Validates that warmup() for CLI OAuth skips validation (existing behavior).
@@ -2273,11 +2275,10 @@ mod tests {
 
     #[test]
     fn build_parts_multiple_images() {
-        let content =
-            "Image A: [IMAGE:data:image/png;base64,AAAA] Image B: [IMAGE:data:image/jpeg;base64,BBBB]";
+        let content = "Image A: [IMAGE:data:image/png;base64,AAAA] Image B: [IMAGE:data:image/jpeg;base64,BBBB]";
         let parts = build_parts(content);
         assert_eq!(parts.len(), 3); // text + 2 images
-                                    // Verify both inline parts
+        // Verify both inline parts
         let inline_parts: Vec<_> = parts
             .iter()
             .filter(|p| matches!(p, Part::Inline { .. }))

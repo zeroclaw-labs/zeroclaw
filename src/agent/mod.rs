@@ -10,11 +10,11 @@ pub mod history;
 pub mod history_pruner;
 pub mod loop_;
 pub mod loop_detector;
-pub mod tool_execution;
 pub mod memory_loader;
 pub mod personality;
 pub mod prompt;
 pub mod thinking;
+pub mod tool_execution;
 
 #[cfg(test)]
 mod tests;

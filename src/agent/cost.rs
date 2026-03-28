@@ -1,6 +1,6 @@
 use crate::config::schema::ModelPricing;
-use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
 use crate::cost::CostTracker;
+use crate::cost::types::{BudgetCheck, TokenUsage as CostTokenUsage};
 use std::sync::Arc;
 
 // ── Cost tracking via task-local ──

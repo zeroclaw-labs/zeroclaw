@@ -14,7 +14,7 @@ use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 
 // Items that still live in `loop_` — import via the parent module.
-use super::loop_::{scrub_credentials, ParsedToolCall, ToolLoopCancelled};
+use super::loop_::{ParsedToolCall, ToolLoopCancelled, scrub_credentials};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 

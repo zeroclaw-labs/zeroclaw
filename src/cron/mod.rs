@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::security::SecurityPolicy;
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 mod schedule;
 mod store;
@@ -18,8 +18,8 @@ pub use store::{
     record_run, remove_job, reschedule_after_run, sync_declarative_jobs, update_job,
 };
 pub use types::{
-    deserialize_maybe_stringified, CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType,
-    Schedule, SessionTarget,
+    CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    deserialize_maybe_stringified,
 };
 
 /// Validate a shell command against the full security policy (allowlist + risk gate).
@@ -702,10 +702,12 @@ mod tests {
             "touch cron-medium-risk",
         );
         assert!(denied.is_err());
-        assert!(denied
-            .unwrap_err()
-            .to_string()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("explicit approval")
+        );
 
         let approved = add_shell_job_with_approval(
             &config,
@@ -738,10 +740,12 @@ mod tests {
             false,
         );
         assert!(denied.is_err());
-        assert!(denied
-            .unwrap_err()
-            .to_string()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("explicit approval")
+        );
 
         let approved = update_shell_job_with_approval(
             &config,
@@ -772,10 +776,12 @@ mod tests {
             None,
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("explicit approval"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("explicit approval")
+        );
     }
 
     #[test]
@@ -797,10 +803,12 @@ mod tests {
 
         let result = add_once_validated(&config, "1h", "curl https://example.com", false);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("blocked by security policy"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blocked by security policy")
+        );
     }
 
     #[test]
@@ -823,10 +831,12 @@ mod tests {
 
         let denied = add_once_at_validated(&config, at, "touch at-medium", false);
         assert!(denied.is_err());
-        assert!(denied
-            .unwrap_err()
-            .to_string()
-            .contains("explicit approval"));
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("explicit approval")
+        );
 
         let approved = add_once_at_validated(&config, at, "touch at-medium", true);
         assert!(approved.is_ok(), "{approved:?}");
@@ -852,10 +862,12 @@ mod tests {
             false,
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("blocked by security policy"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blocked by security policy")
+        );
     }
 
     #[test]
@@ -870,10 +882,12 @@ mod tests {
         let result =
             validate_shell_command_with_security(&security, "curl https://example.com", false);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("blocked by security policy"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blocked by security policy")
+        );
     }
 
     #[test]
