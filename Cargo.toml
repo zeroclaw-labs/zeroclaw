@@ -256,6 +256,14 @@ inherits = "release"
 codegen-units = 8    # Parallel codegen for faster builds on powerful machines (16GB+ RAM recommended)
                      # Use: cargo build --profile release-fast
 
+[profile.railway]
+inherits = "release"
+opt-level = "s"      # Good size optimization without extreme compile time of "z"
+lto = "thin"         # ~3x faster than "fat" LTO, similar binary size
+codegen-units = 16   # Parallel codegen — builds ~5x faster than codegen-units=1
+strip = true
+panic = "abort"
+
 [profile.dist]
 inherits = "release"
 opt-level = "z"
