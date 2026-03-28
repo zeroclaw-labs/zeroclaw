@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# ZeroClaw Railway Deployment Dockerfile
+# MoA (ZeroClaw) Railway Deployment Dockerfile
 # Multi-stage build optimized for Railway hosting.
 #
 # Stage 1 (builder): Compiles the ZeroClaw binary from source.
