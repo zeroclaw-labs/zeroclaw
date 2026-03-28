@@ -2508,19 +2508,28 @@ mod tests {
     fn multi_message_remaining_leading_newlines_trimmed_by_sanitize() {
         // accumulated was "\n\nHello world", sent_so_far=2 from empty paragraph.
         // Sanitized text has leading \n\n stripped.
-        assert_eq!(super::multi_message_remaining_text("Hello world", 2), "Hello world");
+        assert_eq!(
+            super::multi_message_remaining_text("Hello world", 2),
+            "Hello world"
+        );
     }
 
     #[test]
     fn multi_message_remaining_after_sent_paragraph() {
         // "Para 1\n\nPara 2" — Para 1 was sent, tail is Para 2.
-        assert_eq!(super::multi_message_remaining_text("Para 1\n\nPara 2", 15), "Para 2");
+        assert_eq!(
+            super::multi_message_remaining_text("Para 1\n\nPara 2", 15),
+            "Para 2"
+        );
     }
 
     #[test]
     fn multi_message_remaining_nothing_sent() {
         // No paragraphs sent, flush everything.
-        assert_eq!(super::multi_message_remaining_text("Hello world", 0), "Hello world");
+        assert_eq!(
+            super::multi_message_remaining_text("Hello world", 0),
+            "Hello world"
+        );
     }
 
     #[test]
@@ -2528,7 +2537,10 @@ mod tests {
         // All paragraphs sent (sent_so_far exceeds sanitized text length).
         // Guard in finalize_draft prevents entering this path, but the
         // helper still returns the tail safely.
-        assert_eq!(super::multi_message_remaining_text("Para 1\n\nPara 2", 28), "Para 2");
+        assert_eq!(
+            super::multi_message_remaining_text("Para 1\n\nPara 2", 28),
+            "Para 2"
+        );
     }
 
     #[test]
