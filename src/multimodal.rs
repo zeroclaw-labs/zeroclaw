@@ -1,6 +1,6 @@
-use crate::config::{build_runtime_proxy_client_with_timeouts, MultimodalConfig};
+use crate::config::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 use crate::providers::ChatMessage;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use std::path::Path;
 
@@ -24,7 +24,9 @@ pub enum MultimodalError {
     #[error("multimodal image limit exceeded: max_images={max_images}, found={found}")]
     TooManyImages { max_images: usize, found: usize },
 
-    #[error("multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes")]
+    #[error(
+        "multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes"
+    )]
     ImageTooLarge {
         input: String,
         size_bytes: usize,
@@ -401,11 +403,7 @@ fn detect_mime(
 
 fn normalize_content_type(content_type: &str) -> Option<String> {
     let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
-    if mime.is_empty() {
-        None
-    } else {
-        Some(mime)
-    }
+    if mime.is_empty() { None } else { Some(mime) }
 }
 
 fn mime_from_extension(ext: &str) -> Option<&'static str> {
@@ -507,15 +505,18 @@ mod tests {
             max_images: 1,
             max_image_size_mb: 5,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
             .await
             .expect_err("should reject image count overflow");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal image limit exceeded"));
+        assert!(
+            error
+                .to_string()
+                .contains("multimodal image limit exceeded")
+        );
     }
 
     #[tokio::test]
@@ -528,9 +529,11 @@ mod tests {
             .await
             .expect_err("should reject remote image URL when fetch is disabled");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal remote image fetch is disabled"));
+        assert!(
+            error
+                .to_string()
+                .contains("multimodal remote image fetch is disabled")
+        );
     }
 
     #[tokio::test]
@@ -549,15 +552,18 @@ mod tests {
             max_images: 4,
             max_image_size_mb: 1,
             allow_remote_fetch: false,
+            ..Default::default()
         };
 
         let error = prepare_messages_for_provider(&messages, &config)
             .await
             .expect_err("should reject oversized local image");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
+        assert!(
+            error
+                .to_string()
+                .contains("multimodal image size limit exceeded")
+        );
     }
 
     #[test]

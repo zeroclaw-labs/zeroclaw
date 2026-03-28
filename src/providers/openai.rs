@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct OpenAiProvider {
     base_url: String,
     credential: Option<String>,
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -17,6 +18,8 @@ struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +65,8 @@ struct NativeChatRequest {
     tools: Option<Vec<NativeToolSpec>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,7 +188,14 @@ impl OpenAiProvider {
                 .map(|u| u.trim_end_matches('/').to_string())
                 .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             credential: credential.map(ToString::to_string),
+            max_tokens: None,
         }
+    }
+
+    /// Set the maximum output tokens for API requests.
+    pub fn with_max_tokens(mut self, max_tokens: Option<u32>) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 
     /// Adjust temperature for models that have specific requirements.
@@ -368,6 +380,7 @@ impl Provider for OpenAiProvider {
             model: model.to_string(),
             messages,
             temperature: adjusted_temperature,
+            max_tokens: self.max_tokens,
         };
 
         let response = self
@@ -411,6 +424,7 @@ impl Provider for OpenAiProvider {
             temperature: adjusted_temperature,
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
+            max_tokens: self.max_tokens,
         };
 
         let response = self
@@ -477,6 +491,7 @@ impl Provider for OpenAiProvider {
             temperature: adjusted_temperature,
             tool_choice: native_tools.as_ref().map(|_| "auto".to_string()),
             tools: native_tools,
+            max_tokens: self.max_tokens,
         };
 
         let response = self
@@ -575,6 +590,7 @@ mod tests {
                 },
             ],
             temperature: 0.7,
+            max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"role\":\"system\""));
@@ -591,6 +607,7 @@ mod tests {
                 content: "hello".to_string(),
             }],
             temperature: 0.0,
+            max_tokens: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(!json.contains("system"));
@@ -735,10 +752,12 @@ mod tests {
 
         let result = p.chat_with_tools(&messages, &tools, "gpt-4o", 0.7).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid OpenAI tool specification"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid OpenAI tool specification")
+        );
     }
 
     #[test]

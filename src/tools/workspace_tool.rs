@@ -4,8 +4,8 @@
 
 use super::traits::{Tool, ToolResult};
 use crate::config::workspace::WorkspaceManager;
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use serde_json::json;
 use std::fmt::Write;
