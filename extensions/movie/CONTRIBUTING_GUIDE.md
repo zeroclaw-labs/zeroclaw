@@ -449,7 +449,7 @@ git push origin v0.1.0
 
 如果在贡献过程中遇到问题：
 
-1. 查看 ZeroClaw 的 [CONTRIBUTING.md](https://github.com/zeroclaw-labs/zeroclaw/blob/main/CONTRIBUTING.md)
+1. 查看 ZeroClaw 的 [CONTRIBUTING.md](https://github.com/zeroclaw-labs/zeroclaw/blob/master/CONTRIBUTING.md)
 2. 在 Discussions 中提问
 3. 联系维护者
 
