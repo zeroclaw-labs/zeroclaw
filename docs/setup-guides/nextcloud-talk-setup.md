@@ -18,6 +18,9 @@ base_url = "https://cloud.example.com"
 app_token = "nextcloud-talk-app-token"
 webhook_secret = "optional-webhook-secret"
 allowed_users = ["*"]
+# bot_name is the Nextcloud Talk display name of the bot (e.g. "zeroclaw").
+# Used to ignore the bot's own messages and prevent feedback loops.
+# bot_name = "zeroclaw"
 ```
 
 Field reference:
@@ -26,6 +29,7 @@ Field reference:
 - `app_token`: Bot app token used as `Authorization: Bearer <token>` for OCS send API.
 - `webhook_secret`: Shared secret for verifying `X-Nextcloud-Talk-Signature`.
 - `allowed_users`: Allowed Nextcloud actor IDs (`[]` denies all, `"*"` allows all).
+- `bot_name`: Display name of the bot in Nextcloud Talk. When set, messages from this actor name are silently ignored to prevent feedback loops.
 
 Environment override:
 

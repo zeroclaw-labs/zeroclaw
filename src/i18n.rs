@@ -262,21 +262,28 @@ shell = "Execute a shell command"
         let saved = std::env::var("ZEROCLAW_LOCALE").ok();
         let saved_lang = std::env::var("LANG").ok();
 
-        std::env::set_var("ZEROCLAW_LOCALE", "ja-JP");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_LOCALE", "ja-JP") };
         assert_eq!(detect_locale(), "ja-JP");
 
-        std::env::remove_var("ZEROCLAW_LOCALE");
-        std::env::set_var("LANG", "zh_CN.UTF-8");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_LOCALE") };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("LANG", "zh_CN.UTF-8") };
         assert_eq!(detect_locale(), "zh-CN");
 
         // Restore.
         match saved {
-            Some(v) => std::env::set_var("ZEROCLAW_LOCALE", v),
-            None => std::env::remove_var("ZEROCLAW_LOCALE"),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var("ZEROCLAW_LOCALE", v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var("ZEROCLAW_LOCALE") },
         }
         match saved_lang {
-            Some(v) => std::env::set_var("LANG", v),
-            None => std::env::remove_var("LANG"),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var("LANG", v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var("LANG") },
         }
     }
 
