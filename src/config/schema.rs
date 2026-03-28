@@ -8695,7 +8695,7 @@ fn encrypt_secret(
     value: &mut String,
     field_name: &str,
 ) -> Result<()> {
-    if !crate::security::SecretStore::is_encrypted(value) {
+    if !crate::security::SecretStore::is_encrypted(value) && !value.starts_with("op://") {
         *value = store
             .encrypt(value)
             .with_context(|| format!("Failed to encrypt {field_name}"))?;
