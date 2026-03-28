@@ -58,9 +58,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          semver_pattern='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
+          semver_pattern='^v[0-9]+\.[0-9]+\.[0-9]+$'
           if [[ ! "$RELEASE_TAG" =~ $semver_pattern ]]; then
-            echo "::error::release_tag must match semver-like format (vX.Y.Z[-suffix])."
+            echo "::error::release_tag must match stable semver format (vX.Y.Z)."
             exit 1
           fi
 
@@ -80,7 +80,7 @@ jobs:
             exit 1
           fi
 
-          tarball_url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${RELEASE_TAG}.tar.gz"
+          tarball_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/zeroclaw-source-${tag_version}.tar.gz"
           tarball_sha="$(curl -fsSL "$tarball_url" | sha256sum | awk '{print $1}')"
 
           {
@@ -93,7 +93,8 @@ jobs:
             echo "### Release Metadata"
             echo "- release_tag: \`${RELEASE_TAG}\`"
             echo "- cargo_version: \`${cargo_version}\`"
-            echo "- tarball_sha256: \`${tarball_sha}\`"
+            echo "- homebrew_source_url: \`${tarball_url}\`"
+            echo "- homebrew_source_sha256: \`${tarball_sha}\`"
             echo "- dry_run: ${DRY_RUN}"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -221,8 +222,8 @@ jobs:
           pr_body="Automated formula bump from ZeroClaw release workflow.
 
           - Release tag: ${RELEASE_TAG}
-          - Source tarball: ${TARBALL_URL}
-          - Source sha256: ${TARBALL_SHA}"
+          - Homebrew source archive: ${TARBALL_URL}
+          - Homebrew source sha256: ${TARBALL_SHA}"
 
           gh pr create \
             --repo "$UPSTREAM_REPO" \
