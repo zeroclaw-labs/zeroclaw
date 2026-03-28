@@ -213,6 +213,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         opencode_cli: crate::config::OpenCodeCliConfig::default(),
         sop: crate::config::SopConfig::default(),
         shell_tool: crate::config::ShellToolConfig::default(),
+        provider_env: std::collections::HashMap::new(),
     };
 
     println!(
@@ -660,6 +661,7 @@ async fn run_quick_setup_with_home(
         opencode_cli: crate::config::OpenCodeCliConfig::default(),
         sop: crate::config::SopConfig::default(),
         shell_tool: crate::config::ShellToolConfig::default(),
+        provider_env: std::collections::HashMap::new(),
     };
 
     config.save().await?;
@@ -4403,6 +4405,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         .map(|m| m.multi_message_delay_ms)
                         .unwrap_or(800),
                     recovery_key,
+                    mention_only: existing_mx
+                        .map(|m| m.mention_only)
+                        .unwrap_or(false),
                 });
             }
             ChannelMenuChoice::Signal => {
@@ -4610,6 +4615,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                             .map(|w| w.group_mention_patterns.clone())
                             .unwrap_or_default(),
                         proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
+                        interrupt_on_new_message: existing_wa
+                            .map(|w| w.interrupt_on_new_message)
+                            .unwrap_or(false),
                     });
 
                     println!(
@@ -4726,6 +4734,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         .map(|w| w.group_mention_patterns.clone())
                         .unwrap_or_default(),
                     proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
+                    interrupt_on_new_message: existing_wa
+                        .map(|w| w.interrupt_on_new_message)
+                        .unwrap_or(false),
                 });
             }
             ChannelMenuChoice::Linq => {

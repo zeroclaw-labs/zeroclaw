@@ -2740,6 +2740,7 @@ impl SlackChannel {
                                         thread_ts,
                                         interruption_scope_id: scope_id,
                                         attachments: vec![],
+                                        observe_group: false,
                                     };
                                     tracing::info!(
                                         "Slack: :{cancel_emoji}: reaction from {user} \

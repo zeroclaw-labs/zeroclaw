@@ -512,6 +512,7 @@ impl LineChannel {
                 thread_ts: reply_token,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             });
         }
 

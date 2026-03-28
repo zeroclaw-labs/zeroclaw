@@ -113,11 +113,6 @@ impl DiscordHistoryChannel {
             guard.insert(channel_id.to_string());
         }
 
-        // Ensure we remove from pending list when done
-        let _pending_cleanup = scopeguard::guard(channel_id.to_string(), |id| {
-            self.pending_channel_resolutions.lock().remove(&id);
-        });
-
         // 3. Fetch from API (either not in DB or stale)
         let url = format!("https://discord.com/api/v10/channels/{channel_id}");
         let resp = self
@@ -149,6 +144,9 @@ impl DiscordHistoryChannel {
         };
 
         let resolved = name.unwrap_or_else(|| channel_id.to_string());
+
+        // Remove from pending list now that resolution is done
+        self.pending_channel_resolutions.lock().remove(channel_id);
 
         // 4. Store in persistent database
         let _ = self

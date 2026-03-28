@@ -6506,6 +6506,10 @@ pub struct DiscordConfig {
     /// Only used when `stream_mode = "multi_message"`.
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
+    /// Seconds of inactivity before the bot considers a streaming response stalled.
+    /// 0 means no timeout (default).
+    #[serde(default)]
+    pub stall_timeout_secs: u64,
 }
 
 impl ChannelConfig for DiscordConfig {
@@ -9447,7 +9451,9 @@ impl Config {
             // so that provider credential resolution picks them up automatically.
             for (key, value) in &config.provider_env {
                 if std::env::var(key).is_err() {
-                    std::env::set_var(key, value);
+                    // SAFETY: called during single-threaded config load before
+                    // any concurrent access to the environment.
+                    unsafe { std::env::set_var(key, value); }
                     tracing::debug!(key = %key, "Injected provider_env into process environment");
                 }
             }

@@ -2880,14 +2880,14 @@ async fn process_channel_message(
         if turns.is_empty() {
             let legacy_key = legacy_sanitized_key(&history_key);
             if legacy_key != history_key {
-                if let Some(legacy_turns) = histories.remove(&legacy_key) {
+                if let Some(legacy_turns) = histories.pop(&legacy_key) {
                     if !legacy_turns.is_empty() {
                         tracing::info!(
                             old_key = %legacy_key,
                             new_key = %history_key,
                             "Migrated legacy session to percent-encoded key"
                         );
-                        histories.insert(history_key.clone(), legacy_turns.clone());
+                        histories.put(history_key.clone(), legacy_turns.clone());
                         // Re-persist under new key and remove legacy file
                         if let Some(ref store) = ctx.session_store {
                             for turn in &legacy_turns {

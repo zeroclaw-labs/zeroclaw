@@ -269,7 +269,7 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: f64,
         options: StreamOptions,
-    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
         provider.stream_chat_with_system(
@@ -287,7 +287,7 @@ impl Provider for RouterProvider {
         model: &str,
         temperature: f64,
         options: StreamOptions,
-    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         let (provider_idx, resolved_model) = self.resolve(model);
         let (_, provider) = &self.providers[provider_idx];
         provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
@@ -300,28 +300,10 @@ impl Provider for RouterProvider {
             .unwrap_or(false)
     }
 
-    fn supports_streaming(&self) -> bool {
-        self.providers
-            .iter()
-            .any(|(_, provider)| provider.supports_streaming())
-    }
-
     fn supports_streaming_tool_events(&self) -> bool {
         self.providers
             .iter()
             .any(|(_, provider)| provider.supports_streaming_tool_events())
-    }
-
-    fn stream_chat_with_history(
-        &self,
-        messages: &[ChatMessage],
-        model: &str,
-        temperature: f64,
-        options: StreamOptions,
-    ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-        let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, provider) = &self.providers[provider_idx];
-        provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
     }
 
     fn stream_chat(

@@ -1249,21 +1249,6 @@ pub(crate) fn create_provider_with_url_and_options(
                 true,
             )))
         }
-                "Kimi Code",
-                "https://api.kimi.com/coding/v1",
-                key,
-                AuthStyle::Bearer,
-                "KimiCLI/0.77",
-"kimi-code" | "kimi_coding" | "kimi_for_coding" => {
-            Ok(compat(OpenAiCompatibleProvider::new_with_user_agent_and_vision(
-                "Kimi Code",
-                "https://api.kimi.com/coding/v1",
-                key,
-                AuthStyle::Bearer,
-                "KimiCLI/0.77",
-                true,
-            )))
-        }
         "synthetic" => Ok(compat(OpenAiCompatibleProvider::new(
             "Synthetic",
             "https://api.synthetic.new/openai/v1",

@@ -190,7 +190,8 @@ pub struct SecurityPolicy {
 /// Default allowed commands for Unix platforms.
 #[cfg(not(target_os = "windows"))]
 fn default_allowed_commands() -> Vec<String> {
-    vec![
+    #[allow(unused_mut)]
+    let mut cmds = vec![
         "git".into(),
         "npm".into(),
         "cargo".into(),
