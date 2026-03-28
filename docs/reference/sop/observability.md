@@ -12,8 +12,6 @@ Common key patterns:
 - `sop_step_{run_id}_{step_number}`: per-step result
 - `sop_approval_{run_id}_{step_number}`: operator approval record
 - `sop_timeout_approve_{run_id}_{step_number}`: timeout auto-approval record
-- `sop_gate_decision_{gate_id}_{timestamp_ms}`: gate evaluator decision record (when `ampersona-gates` is enabled)
-- `sop_phase_state`: persisted trust-phase state snapshot (when `ampersona-gates` is enabled)
 
 ## 2. Inspection Paths
 

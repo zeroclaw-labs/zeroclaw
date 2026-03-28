@@ -1,12 +1,70 @@
-use super::traits::{
-    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult,
-};
 use super::Provider;
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
+};
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+
+// ── Provider Fallback Notification ──────────────────────────────────────
+// When ReliableProvider uses a fallback (different provider or model than
+// requested), it records the details here so channel code can notify the user.
+// Uses tokio::task_local to avoid cross-request leakage between concurrent
+// users (the old global static had a race window).
+
+/// Info about a provider fallback that occurred during a request.
+#[derive(Debug, Clone)]
+pub struct ProviderFallbackInfo {
+    /// Provider that was originally requested.
+    pub requested_provider: String,
+    /// Model that was originally requested.
+    pub requested_model: String,
+    /// Provider that actually served the request.
+    pub actual_provider: String,
+    /// Model that actually served the request.
+    pub actual_model: String,
+}
+
+tokio::task_local! {
+    static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
+}
+
+/// Take (consume) the last provider fallback info, if any.
+/// Must be called within a `scope_provider_fallback` scope.
+pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
+    PROVIDER_FALLBACK
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+/// Run the given future within a provider-fallback scope.
+/// Both `record_provider_fallback` (inside ReliableProvider) and
+/// `take_last_provider_fallback` (post-loop channel code) must execute
+/// within this scope for the data to be visible.
+pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Output {
+    PROVIDER_FALLBACK.scope(RefCell::new(None), future).await
+}
+
+/// Record a provider fallback event.
+fn record_provider_fallback(
+    requested_provider: &str,
+    requested_model: &str,
+    actual_provider: &str,
+    actual_model: &str,
+) {
+    let _ = PROVIDER_FALLBACK.try_with(|cell| {
+        *cell.borrow_mut() = Some(ProviderFallbackInfo {
+            requested_provider: requested_provider.to_string(),
+            requested_model: requested_model.to_string(),
+            actual_provider: actual_provider.to_string(),
+            actual_model: actual_model.to_string(),
+        });
+    });
+}
 
 // ── Error Classification ─────────────────────────────────────────────────
 // Errors are split into retryable (transient server/network failures) and
@@ -96,7 +154,7 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
     hints.iter().any(|hint| lower.contains(hint))
 }
 
-fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+pub(crate) fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     let hints = [
         "exceeds the context window",
@@ -382,13 +440,28 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model {
+                            if attempt > 0
+                                || *current_model != model
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
                                     attempt,
                                     original_model = model,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -515,7 +588,12 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model || context_truncated {
+                            if attempt > 0
+                                || *current_model != model
+                                || context_truncated
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -523,6 +601,17 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     context_truncated,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -669,7 +758,12 @@ impl Provider for ReliableProvider {
                         .await
                     {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model || context_truncated {
+                            if attempt > 0
+                                || *current_model != model
+                                || context_truncated
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -677,6 +771,17 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     context_truncated,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -804,13 +909,30 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
+                    // Log the full message payload on the first attempt of each
+                    // call (not on retries). Enabled by `--log-llm` / TRACE level.
+                    if attempt == 0 && tracing::enabled!(tracing::Level::TRACE) {
+                        let json = serde_json::to_string_pretty(&effective_messages)
+                            .unwrap_or_else(|e| format!("<serialization error: {e}>"));
+                        tracing::trace!(
+                            provider = %provider_name,
+                            model = %current_model,
+                            "\n{json}\n"
+                        );
+                    }
+
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
                     };
                     match provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
-                            if attempt > 0 || *current_model != model || context_truncated {
+                            if attempt > 0
+                                || *current_model != model
+                                || context_truncated
+                                || self.providers.first().map(|(n, _)| n.as_str())
+                                    != Some(provider_name)
+                            {
                                 tracing::info!(
                                     provider = provider_name,
                                     model = *current_model,
@@ -818,6 +940,17 @@ impl Provider for ReliableProvider {
                                     original_model = model,
                                     context_truncated,
                                     "Provider recovered (failover/retry)"
+                                );
+                                let primary = self
+                                    .providers
+                                    .first()
+                                    .map(|(n, _)| n.as_str())
+                                    .unwrap_or("");
+                                record_provider_fallback(
+                                    primary,
+                                    model,
+                                    provider_name,
+                                    current_model,
                                 );
                             }
                             return Ok(resp);
@@ -941,6 +1074,76 @@ impl Provider for ReliableProvider {
         self.providers.iter().any(|(_, p)| p.supports_streaming())
     }
 
+    fn supports_streaming_tool_events(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|(_, p)| p.supports_streaming_tool_events())
+    }
+
+    fn stream_chat(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
+
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            if needs_tool_events && !provider.supports_streaming_tool_events() {
+                continue;
+            }
+
+            let provider_clone = provider_name.clone();
+
+            let current_model = self
+                .model_chain(model)
+                .first()
+                .copied()
+                .unwrap_or(model)
+                .to_string();
+
+            let req = ChatRequest {
+                messages: request.messages,
+                tools: request.tools,
+            };
+            let stream = provider.stream_chat(req, &current_model, temperature, options);
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(event) = stream.next().await {
+                    if let Err(ref e) = event {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            });
+
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed();
+        }
+
+        let message = if needs_tool_events {
+            "No provider supports streaming tool events".to_string()
+        } else {
+            "No provider supports streaming".to_string()
+        };
+        stream::once(async move { Err(super::traits::StreamError::Provider(message)) }).boxed()
+    }
+
     fn stream_chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -961,7 +1164,7 @@ impl Provider for ReliableProvider {
 
             // Try the first model in the chain for streaming
             let current_model = match self.model_chain(model).first() {
-                Some(m) => m.to_string(),
+                Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
 
@@ -1009,11 +1212,71 @@ impl Provider for ReliableProvider {
         })
         .boxed()
     }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        // Try each provider/model combination for streaming with history.
+        // Mirrors stream_chat_with_system but delegates to the underlying
+        // provider's stream_chat_with_history, preserving the full conversation.
+        for (provider_name, provider) in &self.providers {
+            if !provider.supports_streaming() || !options.enabled {
+                continue;
+            }
+
+            let provider_clone = provider_name.clone();
+
+            let current_model = match self.model_chain(model).first() {
+                Some(m) => (*m).to_string(),
+                None => model.to_string(),
+            };
+
+            let stream =
+                provider.stream_chat_with_history(messages, &current_model, temperature, options);
+
+            let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+            tokio::spawn(async move {
+                let mut stream = stream;
+                while let Some(chunk) = stream.next().await {
+                    if let Err(ref e) = chunk {
+                        tracing::warn!(
+                            provider = provider_clone,
+                            model = current_model,
+                            "Streaming error: {e}"
+                        );
+                    }
+                    if tx.send(chunk).await.is_err() {
+                        break; // Receiver dropped
+                    }
+                }
+            });
+
+            return stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|chunk| (chunk, rx))
+            })
+            .boxed();
+        }
+
+        // No streaming support available
+        stream::once(async move {
+            Err(super::traits::StreamError::Provider(
+                "No provider supports streaming".to_string(),
+            ))
+        })
+        .boxed()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolSpec;
+    use futures_util::StreamExt;
     use std::sync::Arc;
 
     struct MockProvider {
@@ -2182,7 +2445,7 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         // Remaining messages should be the newer ones
         assert_eq!(messages.len(), 4); // system + 3 remaining non-system
-                                       // The last message should still be the most recent user message
+        // The last message should still be the most recent user message
         assert_eq!(messages.last().unwrap().content, "msg3");
     }
 
@@ -2358,5 +2621,374 @@ mod tests {
         // A regular 400 error (e.g. invalid API key) should still be non-retryable.
         let err = anyhow::anyhow!("400 Bad Request: invalid api key provided");
         assert!(is_non_retryable(&err));
+    }
+
+    struct StreamingToolEventMock {
+        stream_calls: Arc<AtomicUsize>,
+        supports_tool_events: bool,
+    }
+
+    impl StreamingToolEventMock {
+        fn new(supports_tool_events: bool) -> Self {
+            Self {
+                stream_calls: Arc::new(AtomicUsize::new(0)),
+                supports_tool_events,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for StreamingToolEventMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.supports_tool_events
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            stream::iter(vec![
+                Ok(StreamEvent::ToolCall(super::super::traits::ToolCall {
+                    id: "call_1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: r#"{"command":"date"}"#.to_string(),
+                })),
+                Ok(StreamEvent::Final),
+            ])
+            .boxed()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for Arc<StreamingToolEventMock> {
+        async fn chat_with_system(
+            &self,
+            system_prompt: Option<&str>,
+            message: &str,
+            model: &str,
+            temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.as_ref()
+                .chat_with_system(system_prompt, message, model, temperature)
+                .await
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.as_ref().supports_streaming()
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            self.as_ref().supports_streaming_tool_events()
+        }
+
+        fn stream_chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            temperature: f64,
+            options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+            self.as_ref()
+                .stream_chat(request, model, temperature, options)
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_prefers_provider_with_tool_event_support() {
+        let primary = Arc::new(StreamingToolEventMock::new(false));
+        let fallback = Arc::new(StreamingToolEventMock::new(true));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(Arc::clone(&fallback)) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "run shell".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                }
+            }),
+        }];
+        let mut stream = provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+            },
+            "model",
+            0.0,
+            StreamOptions::new(true),
+        );
+
+        let first = stream.next().await.unwrap().unwrap();
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(stream.next().await.is_none());
+
+        match first {
+            StreamEvent::ToolCall(call) => assert_eq!(call.name, "shell"),
+            other => panic!("expected tool-call event, got {other:?}"),
+        }
+        assert!(matches!(second, StreamEvent::Final));
+        assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback.stream_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_errors_when_no_provider_supports_tool_events() {
+        let primary = Arc::new(StreamingToolEventMock::new(false));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(Arc::clone(&primary)) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_string(),
+            description: "run shell".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        let mut stream = provider.stream_chat(
+            ChatRequest {
+                messages: &messages,
+                tools: Some(&tools),
+            },
+            "model",
+            0.0,
+            StreamOptions::new(true),
+        );
+
+        let first = stream.next().await.unwrap();
+        let err = first.expect_err("stream should fail without tool-event support");
+        assert!(
+            err.to_string()
+                .contains("No provider supports streaming tool events"),
+            "unexpected stream error: {err}"
+        );
+        assert!(stream.next().await.is_none());
+        assert_eq!(primary.stream_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // ── stream_chat_with_history failover tests ──────────────────────
+
+    /// Mock provider that supports streaming via stream_chat_with_history.
+    struct StreamingHistoryMock {
+        stream_calls: Arc<AtomicUsize>,
+        supports: bool,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingHistoryMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            self.supports
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            // Echo the number of messages as the delta to verify history was passed through
+            let msg_count = messages.len().to_string();
+            stream::iter(vec![
+                Ok(StreamChunk::delta(msg_count)),
+                Ok(StreamChunk::final_chunk()),
+            ])
+            .boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_delegates_to_streaming_provider() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(StreamingHistoryMock {
+                    stream_calls: Arc::clone(&calls),
+                    supports: true,
+                }) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("msg1"),
+            ChatMessage::assistant("resp1"),
+            ChatMessage::user("msg2"),
+        ];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.delta, "4", "should pass all 4 messages to provider");
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(second.is_final);
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_skips_non_streaming_providers() {
+        let non_streaming_calls = Arc::new(AtomicUsize::new(0));
+        let streaming_calls = Arc::new(AtomicUsize::new(0));
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "non-streaming".into(),
+                    Box::new(StreamingHistoryMock {
+                        stream_calls: Arc::clone(&non_streaming_calls),
+                        supports: false,
+                    }) as Box<dyn Provider>,
+                ),
+                (
+                    "streaming".into(),
+                    Box::new(StreamingHistoryMock {
+                        stream_calls: Arc::clone(&streaming_calls),
+                        supports: true,
+                    }) as Box<dyn Provider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.delta, "1");
+        assert_eq!(
+            non_streaming_calls.load(Ordering::SeqCst),
+            0,
+            "non-streaming provider should be skipped"
+        );
+        assert_eq!(
+            streaming_calls.load(Ordering::SeqCst),
+            1,
+            "streaming provider should be used"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_with_history_errors_when_no_provider_supports_streaming() {
+        let provider = ReliableProvider::new(
+            vec![(
+                "non-streaming".into(),
+                Box::new(StreamingHistoryMock {
+                    stream_calls: Arc::new(AtomicUsize::new(0)),
+                    supports: false,
+                }) as Box<dyn Provider>,
+            )],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let mut stream =
+            provider.stream_chat_with_history(&messages, "model", 0.0, StreamOptions::new(true));
+
+        let first = stream.next().await.unwrap();
+        let err = first.expect_err("should fail when no provider supports streaming");
+        assert!(
+            err.to_string().contains("No provider supports streaming"),
+            "unexpected error: {err}"
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_records_provider_fallback_info() {
+        scope_provider_fallback(async {
+            let provider = ReliableProvider::new(
+                vec![
+                    (
+                        "broken".into(),
+                        Box::new(MockProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 99, // always fail
+                            response: "unused",
+                            error: "401 Unauthorized",
+                        }),
+                    ),
+                    (
+                        "working".into(),
+                        Box::new(MockProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 0,
+                            response: "hello from working",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                2,
+                1,
+            );
+
+            let resp = provider.simple_chat("hi", "test-model", 0.0).await.unwrap();
+            assert_eq!(resp, "hello from working");
+
+            let fb = take_last_provider_fallback();
+            assert!(fb.is_some(), "fallback info should be recorded");
+            let fb = fb.unwrap();
+            assert_eq!(fb.requested_provider, "broken");
+            assert_eq!(fb.actual_provider, "working");
+            assert_eq!(fb.actual_model, "test-model");
+
+            // Second take should be None.
+            assert!(take_last_provider_fallback().is_none());
+        })
+        .await;
     }
 }

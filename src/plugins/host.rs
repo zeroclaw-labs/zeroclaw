@@ -1,6 +1,7 @@
 //! Plugin host: discovery, loading, lifecycle management.
 
 use super::error::PluginError;
+use super::signature::{self, SignatureMode, VerificationResult};
 use super::{PluginCapability, PluginInfo, PluginManifest};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,16 +10,29 @@ use std::path::{Path, PathBuf};
 pub struct PluginHost {
     plugins_dir: PathBuf,
     loaded: HashMap<String, LoadedPlugin>,
+    signature_mode: SignatureMode,
+    trusted_publisher_keys: Vec<String>,
 }
 
 struct LoadedPlugin {
     manifest: PluginManifest,
     wasm_path: PathBuf,
+    #[allow(dead_code)]
+    verification: VerificationResult,
 }
 
 impl PluginHost {
     /// Create a new plugin host with the given plugins directory.
     pub fn new(workspace_dir: &Path) -> Result<Self, PluginError> {
+        Self::with_security(workspace_dir, SignatureMode::Disabled, Vec::new())
+    }
+
+    /// Create a new plugin host with signature verification settings.
+    pub fn with_security(
+        workspace_dir: &Path,
+        signature_mode: SignatureMode,
+        trusted_publisher_keys: Vec<String>,
+    ) -> Result<Self, PluginError> {
         let plugins_dir = workspace_dir.join("plugins");
         if !plugins_dir.exists() {
             std::fs::create_dir_all(&plugins_dir)?;
@@ -27,10 +41,21 @@ impl PluginHost {
         let mut host = Self {
             plugins_dir,
             loaded: HashMap::new(),
+            signature_mode,
+            trusted_publisher_keys,
         };
 
         host.discover()?;
         Ok(host)
+    }
+
+    /// Parse the signature mode string from config into a `SignatureMode`.
+    pub fn parse_signature_mode(mode: &str) -> SignatureMode {
+        match mode.to_lowercase().as_str() {
+            "strict" => SignatureMode::Strict,
+            "permissive" => SignatureMode::Permissive,
+            _ => SignatureMode::Disabled,
+        }
     }
 
     /// Discover plugins in the plugins directory.
@@ -46,14 +71,33 @@ impl PluginHost {
                 let manifest_path = path.join("manifest.toml");
                 if manifest_path.exists() {
                     if let Ok(manifest) = self.load_manifest(&manifest_path) {
-                        let wasm_path = path.join(&manifest.wasm_path);
-                        self.loaded.insert(
-                            manifest.name.clone(),
-                            LoadedPlugin {
-                                manifest,
-                                wasm_path,
-                            },
-                        );
+                        // Verify plugin signature
+                        let manifest_toml =
+                            std::fs::read_to_string(&manifest_path).unwrap_or_default();
+                        match self.verify_plugin_signature(
+                            &manifest.name,
+                            &manifest_toml,
+                            &manifest,
+                        ) {
+                            Ok(verification) => {
+                                let wasm_path = path.join(&manifest.wasm_path);
+                                self.loaded.insert(
+                                    manifest.name.clone(),
+                                    LoadedPlugin {
+                                        manifest,
+                                        wasm_path,
+                                        verification,
+                                    },
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = path.display().to_string(),
+                                    error = %e,
+                                    "skipping plugin due to signature verification failure"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -66,6 +110,23 @@ impl PluginHost {
         let content = std::fs::read_to_string(path)?;
         let manifest: PluginManifest = toml::from_str(&content)?;
         Ok(manifest)
+    }
+
+    /// Verify a plugin's signature against configured policy.
+    fn verify_plugin_signature(
+        &self,
+        name: &str,
+        manifest_toml: &str,
+        manifest: &PluginManifest,
+    ) -> Result<VerificationResult, PluginError> {
+        signature::enforce_signature_policy(
+            name,
+            manifest_toml,
+            manifest.signature.as_deref(),
+            manifest.publisher_key.as_deref(),
+            &self.trusted_publisher_keys,
+            self.signature_mode,
+        )
     }
 
     /// List all discovered plugins.
@@ -130,6 +191,11 @@ impl PluginHost {
             return Err(PluginError::AlreadyLoaded(manifest.name));
         }
 
+        // Verify plugin signature before installing
+        let manifest_toml = std::fs::read_to_string(&manifest_path)?;
+        let verification =
+            self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
+
         // Copy plugin to plugins directory
         let dest_dir = self.plugins_dir.join(&manifest.name);
         std::fs::create_dir_all(&dest_dir)?;
@@ -149,6 +215,7 @@ impl PluginHost {
             LoadedPlugin {
                 manifest,
                 wasm_path: wasm_dest,
+                verification,
             },
         );
 

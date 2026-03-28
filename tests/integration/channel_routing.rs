@@ -26,6 +26,7 @@ fn channel_message_sender_field_holds_platform_user_id() {
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
+        attachments: vec![],
     };
 
     assert_eq!(msg.sender, "123456789");
@@ -49,6 +50,7 @@ fn channel_message_reply_target_distinct_from_sender() {
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
+        attachments: vec![],
     };
 
     assert_ne!(
@@ -70,6 +72,7 @@ fn channel_message_fields_not_swapped() {
         timestamp: 1700000000,
         thread_ts: None,
         interruption_scope_id: None,
+        attachments: vec![],
     };
 
     assert_eq!(
@@ -97,6 +100,7 @@ fn channel_message_preserves_all_fields_on_clone() {
         timestamp: 1700000001,
         thread_ts: None,
         interruption_scope_id: None,
+        attachments: vec![],
     };
 
     let cloned = original.clone();
@@ -191,6 +195,7 @@ impl Channel for CapturingChannel {
             timestamp: 1700000000,
             thread_ts: None,
             interruption_scope_id: None,
+            attachments: vec![],
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -281,14 +286,18 @@ async fn channel_draft_defaults() {
         "default send_draft should return None"
     );
 
-    assert!(channel
-        .update_draft("target", "msg_1", "updated")
-        .await
-        .is_ok());
-    assert!(channel
-        .finalize_draft("target", "msg_1", "final")
-        .await
-        .is_ok());
+    assert!(
+        channel
+            .update_draft("target", "msg_1", "updated")
+            .await
+            .is_ok()
+    );
+    assert!(
+        channel
+            .finalize_draft("target", "msg_1", "final")
+            .await
+            .is_ok()
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
