@@ -518,6 +518,9 @@ fn resolve_qwen_oauth_context(credential_override: Option<&str>) -> QwenOauthPro
     if credential.is_none() && !placeholder_requested {
         credential = read_non_empty_env("DASHSCOPE_API_KEY");
     }
+    if credential.is_none() && !placeholder_requested {
+        credential = read_non_empty_env("BAILIAN_API_KEY");
+    }
 
     let base_url = env_resource_url
         .as_deref()
@@ -920,7 +923,7 @@ fn resolve_provider_credential(name: &str, credential_override: Option<&str>) ->
         name if is_doubao_alias(name) => {
             vec!["ARK_API_KEY", "VOLCENGINE_API_KEY", "DOUBAO_API_KEY"]
         }
-        name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY"],
+        name if is_qwen_alias(name) => vec!["DASHSCOPE_API_KEY", "BAILIAN_API_KEY"],
         name if is_bailian_alias(name) => vec!["BAILIAN_API_KEY", "DASHSCOPE_API_KEY"],
         name if is_zai_alias(name) => vec!["ZAI_API_KEY"],
         "nvidia" | "nvidia-nim" | "build.nvidia.com" => vec!["NVIDIA_API_KEY"],
@@ -1253,7 +1256,7 @@ fn create_provider_with_url_and_options(
             key,
             AuthStyle::Bearer,
         ))),
-        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new(
+        name if zai_base_url(name).is_some() => Ok(compat(OpenAiCompatibleProvider::new_no_responses_fallback(
             "Z.AI",
             zai_base_url(name).expect("checked in guard"),
             key,
@@ -2058,9 +2061,10 @@ pub fn list_providers() -> Vec<ProviderInfo> {
         },
         ProviderInfo {
             name: "qwen",
-            display_name: "Qwen (DashScope / Qwen Code OAuth)",
+            display_name: "Qwen (DashScope / Bailian / Qwen Code OAuth)",
             aliases: &[
                 "dashscope",
+                "bailian",
                 "qwen-intl",
                 "dashscope-intl",
                 "qwen-us",
