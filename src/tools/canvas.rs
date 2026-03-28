@@ -612,9 +612,11 @@ mod tests {
         let store = CanvasStore::new();
         // Create MAX_CANVAS_COUNT canvases
         for i in 0..MAX_CANVAS_COUNT {
-            assert!(store
-                .render(&format!("canvas_{i}"), "html", "content")
-                .is_some());
+            assert!(
+                store
+                    .render(&format!("canvas_{i}"), "html", "content")
+                    .is_some()
+            );
         }
         // The next new canvas should be rejected
         assert!(store.render("one_too_many", "html", "content").is_none());

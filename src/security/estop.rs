@@ -301,8 +301,8 @@ fn now_rfc3339() -> String {
 mod tests {
     use super::*;
     use crate::config::OtpConfig;
-    use crate::security::otp::OtpValidator;
     use crate::security::SecretStore;
+    use crate::security::otp::OtpValidator;
     use tempfile::tempdir;
 
     fn estop_config(path: &Path) -> EstopConfig {

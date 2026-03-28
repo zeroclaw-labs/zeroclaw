@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
-import { X, Settings, Sun, Moon, Monitor, Laptop, Check, Type, CaseSensitive } from 'lucide-react';
+import { X, Settings, Sun, Moon, Monitor, Laptop, Check, Type, CaseSensitive, Palette } from 'lucide-react';
 import { useTheme } from '@/hooks/useTheme';
 import { t } from '@/lib/i18n';
-import type { ThemeName, AccentColor, UiFont, MonoFont } from '@/contexts/ThemeContextDef';
+import type { AccentColor, UiFont, MonoFont, ThemeMode } from '@/contexts/ThemeContextDef';
 import { uiFontStacks, monoFontStacks } from '@/contexts/ThemeContextDef';
+import { colorThemes } from '@/contexts/colorThemes';
 
-const themeOptions: { value: ThemeName; icon: typeof Sun; labelKey: string }[] = [
+const themeOptions: { value: ThemeMode; icon: typeof Sun; labelKey: string }[] = [
   { value: 'system', icon: Laptop, labelKey: 'theme.system' },
   { value: 'dark', icon: Moon, labelKey: 'theme.dark' },
   { value: 'light', icon: Sun, labelKey: 'theme.light' },
@@ -49,6 +50,71 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** Mini terminal preview card for a color theme. */
+function ThemePreviewCard({
+  theme,
+  active,
+  onClick,
+}: {
+  theme: typeof colorThemes[number];
+  active: boolean;
+  onClick: () => void;
+}) {
+  const [bg, c1, c2, c3, text] = theme.preview;
+  return (
+    <button
+      onClick={onClick}
+      className="flex flex-col gap-1.5 p-2 rounded-xl border transition-all text-left group"
+      style={{
+        borderColor: active ? 'var(--pc-accent)' : 'var(--pc-border)',
+        background: active ? 'var(--pc-accent-glow)' : 'transparent',
+        boxShadow: active ? '0 0 12px var(--pc-accent-glow)' : 'none',
+        minWidth: '110px',
+      }}
+      aria-pressed={active}
+    >
+      {/* Mini terminal */}
+      <div
+        className="w-full rounded-lg overflow-hidden"
+        style={{ background: bg, border: `1px solid ${theme.scheme === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)'}` }}
+      >
+        {/* Title bar dots */}
+        <div className="flex gap-1 px-2 py-1.5">
+          <span className="w-[6px] h-[6px] rounded-full" style={{ background: '#ff5f57' }} />
+          <span className="w-[6px] h-[6px] rounded-full" style={{ background: '#febc2e' }} />
+          <span className="w-[6px] h-[6px] rounded-full" style={{ background: '#28c840' }} />
+        </div>
+        {/* Fake code lines */}
+        <div className="px-2 pb-2 flex flex-col gap-[3px]">
+          <div className="flex gap-1 items-center">
+            <span className="h-[3px] rounded-full" style={{ background: c1, width: '30%' }} />
+            <span className="h-[3px] rounded-full" style={{ background: text, width: '20%', opacity: 0.4 }} />
+          </div>
+          <div className="flex gap-1 items-center">
+            <span className="h-[3px] rounded-full" style={{ background: text, width: '15%', opacity: 0.3 }} />
+            <span className="h-[3px] rounded-full" style={{ background: c2, width: '25%' }} />
+            <span className="h-[3px] rounded-full" style={{ background: c3, width: '18%' }} />
+          </div>
+          <div className="flex gap-1 items-center">
+            <span className="h-[3px] rounded-full" style={{ background: c3, width: '22%' }} />
+            <span className="h-[3px] rounded-full" style={{ background: text, width: '28%', opacity: 0.3 }} />
+          </div>
+        </div>
+      </div>
+      {/* Label */}
+      <div className="flex items-center gap-1 px-0.5">
+        {active && <Check size={10} style={{ color: 'var(--pc-accent)' }} />}
+        <span
+          className="text-[10px] font-medium truncate"
+          style={{ color: active ? 'var(--pc-accent-light)' : 'var(--pc-text-muted)' }}
+        >
+          {theme.name}
+        </span>
+      </div>
+    </button>
+  );
+}
+
 interface Props {
   open: boolean;
   onClose: () => void;
@@ -56,17 +122,22 @@ interface Props {
 
 export function SettingsModal({ open, onClose }: Props) {
   const {
-    theme, accent, uiFont, monoFont, uiFontSize, monoFontSize,
-    setTheme, setAccent, setUiFont, setMonoFont, setUiFontSize, setMonoFontSize,
+    theme, accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize,
+    setTheme, setAccent, setColorTheme, setUiFont, setMonoFont, setUiFontSize, setMonoFontSize,
   } = useTheme();
 
-  type TabId = 'appearance' | 'typography';
+  type TabId = 'appearance' | 'themes' | 'typography';
   const [tab, setTab] = useState<TabId>('appearance');
 
-  const tabs: { id: TabId; label: string }[] = useMemo(() => [
-    { id: 'appearance', label: t('settings.tab.appearance') },
-    { id: 'typography', label: t('settings.tab.typography') },
+  const tabs: { id: TabId; label: string; icon: typeof Palette }[] = useMemo(() => [
+    { id: 'appearance', label: t('settings.tab.appearance'), icon: Settings },
+    { id: 'themes', label: 'Themes', icon: Palette },
+    { id: 'typography', label: t('settings.tab.typography'), icon: Type },
   ], []);
+
+  // Group themes by scheme for the themes tab
+  const darkThemes = useMemo(() => colorThemes.filter(ct => ct.scheme === 'dark'), []);
+  const lightThemes = useMemo(() => colorThemes.filter(ct => ct.scheme === 'light'), []);
 
   useEffect(() => {
     if (!open) return;
@@ -89,7 +160,7 @@ export function SettingsModal({ open, onClose }: Props) {
     >
       <div className="absolute inset-0" style={{ background: 'rgba(0,0,0,0.6)', backdropFilter: 'blur(8px)' }} />
       <div
-        className="relative w-full max-w-xl mx-4 rounded-3xl border shadow-2xl animate-fade-in"
+        className="relative w-full max-w-2xl mx-4 rounded-3xl border shadow-2xl animate-fade-in"
         style={{ background: 'var(--pc-bg-base)', borderColor: 'var(--pc-border)' }}
         onClick={(e) => e.stopPropagation()}
       >
@@ -115,14 +186,14 @@ export function SettingsModal({ open, onClose }: Props) {
         </div>
 
         {/* Body */}
-        <div className="px-6 py-4 max-h-[60vh] overflow-y-auto">
+        <div className="px-6 py-4 max-h-[65vh] overflow-y-auto">
           {/* Tabs */}
           <div className="flex gap-2 mb-4">
             {tabs.map(tTab => (
               <button
                 key={tTab.id}
                 onClick={() => setTab(tTab.id)}
-                className="flex-1 rounded-xl border px-3 py-2 text-xs font-medium transition-colors"
+                className="flex-1 rounded-xl border px-3 py-2 text-xs font-medium transition-colors flex items-center justify-center gap-1.5"
                 style={tab === tTab.id
                   ? { borderColor: 'var(--pc-accent-dim)', background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }
                   : { borderColor: 'var(--pc-border)', color: 'var(--pc-text-muted)', background: 'transparent' }
@@ -130,6 +201,7 @@ export function SettingsModal({ open, onClose }: Props) {
                 onMouseEnter={(e) => { if (tab !== tTab.id) e.currentTarget.style.background = 'var(--pc-hover)'; }}
                 onMouseLeave={(e) => { if (tab !== tTab.id) e.currentTarget.style.background = 'transparent'; }}
               >
+                <tTab.icon size={13} />
                 {tTab.label}
               </button>
             ))}
@@ -188,6 +260,54 @@ export function SettingsModal({ open, onClose }: Props) {
                       {accent === opt.value && <Check size={14} style={{ color: 'white' }} />}
                     </button>
                   ))}
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* Themes Tab */}
+          {tab === 'themes' && (
+            <>
+              <SectionTitle>Dark Themes</SectionTitle>
+              <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 mb-4">
+                {darkThemes.map(ct => (
+                  <ThemePreviewCard
+                    key={ct.id}
+                    theme={ct}
+                    active={colorTheme === ct.id}
+                    onClick={() => setColorTheme(ct.id)}
+                  />
+                ))}
+              </div>
+
+              <SectionTitle>Light Themes</SectionTitle>
+              <div className="grid grid-cols-3 sm:grid-cols-4 gap-2 mb-4">
+                {lightThemes.map(ct => (
+                  <ThemePreviewCard
+                    key={ct.id}
+                    theme={ct}
+                    active={colorTheme === ct.id}
+                    onClick={() => setColorTheme(ct.id)}
+                  />
+                ))}
+              </div>
+
+              {/* Active theme info */}
+              <div
+                className="rounded-2xl border p-3 mt-2"
+                style={{ background: 'var(--pc-bg-surface)', borderColor: 'var(--pc-border)' }}
+              >
+                <div className="flex items-center gap-2">
+                  <Palette size={14} style={{ color: 'var(--pc-accent)' }} />
+                  <span className="text-xs font-medium" style={{ color: 'var(--pc-text-primary)' }}>
+                    {colorThemes.find(ct => ct.id === colorTheme)?.name ?? 'Default Dark'}
+                  </span>
+                  <span
+                    className="text-[10px] px-1.5 py-0.5 rounded-full"
+                    style={{ background: 'var(--pc-accent-glow)', color: 'var(--pc-accent-light)' }}
+                  >
+                    Active
+                  </span>
                 </div>
               </div>
             </>
