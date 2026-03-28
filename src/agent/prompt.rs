@@ -793,15 +793,36 @@ impl PromptSection for ToolUsageStrategySection {
                  - ONLY after ALL attempts fail, briefly inform the user.\n\n",
             );
 
-            // ── Tier 2 — Browser ──
+            // ── Tier 2 — Browser (gstack-inspired daemon + @ref system) ──
             out.push_str(
-                "### Tier 2 — Browser Automation (active interaction only)\n\n\
-                 Use `browser` tool ONLY when the request requires click/scroll/login/multi-page:\n\
-                 - \"쿠팡에서 아이패드 검색해서 가격 비교\" → browser\n\
-                 - \"네이버 로그인해서 메일 확인\" → browser\n\n\
-                 Do NOT use browser for simple searches:\n\
-                 - \"서울 날씨\" → `web_search` or `perplexity_search`\n\
-                 - \"애플 주가\" → `web_search` or `perplexity_search`\n\n",
+                "### Tier 2 — Browser Automation (persistent daemon)\n\n\
+                 The browser uses a **persistent Chromium daemon** that maintains cookies, \
+                 login sessions, and tabs across all commands. First call ~3s, subsequent ~100ms.\n\n\
+                 **Use browser when the request requires active interaction:**\n\
+                 - Clicking, scrolling, filling forms, multi-page navigation\n\
+                 - JavaScript-rendered content that `web_fetch` can't get\n\
+                 - Screenshots, visual verification\n\n\
+                 **@Ref System for element selection:**\n\
+                 1. Call `browser(action=\"snapshot\")` to get an accessibility tree with @refs\n\
+                 2. The snapshot returns elements like: `[button] \"Submit\" @e3`\n\
+                 3. Use @refs in subsequent commands: `browser(action=\"click\", selector=\"@e3\")`\n\
+                 4. @refs are cleared on page navigation — re-run `snapshot` after navigating\n\
+                 5. If @ref is stale, you'll get a clear error telling you to re-run `snapshot`\n\n\
+                 **Browser workflow pattern:**\n\
+                 ```\n\
+                 1. browser(action=\"open\", url=\"https://...\")    → navigate\n\
+                 2. browser(action=\"snapshot\")                     → get @refs\n\
+                 3. browser(action=\"click\", selector=\"@e5\")      → interact\n\
+                 4. browser(action=\"snapshot\")                     → refresh @refs\n\
+                 5. browser(action=\"fill\", selector=\"@e2\", value=\"...\") → type text\n\
+                 6. browser(action=\"screenshot\")                   → verify result\n\
+                 ```\n\n\
+                 **Tab management:**\n\
+                 - `browser(action=\"tabs\")` — list open tabs\n\
+                 - `browser(action=\"newtab\", url=\"...\")` — open new tab\n\
+                 - `browser(action=\"tab\", tab_id=2)` — switch tab\n\
+                 - `browser(action=\"closetab\", tab_id=1)` — close tab\n\n\
+                 **DO NOT use browser for simple searches** — use `web_search` or `perplexity_search`.\n\n",
             );
         }
 

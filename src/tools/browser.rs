@@ -873,19 +873,23 @@ impl BrowserTool {
     }
 
     /// Execute a browser action via the Playwright bridge script.
+    /// Execute a browser action via the persistent Playwright daemon (HTTP server).
+    ///
+    /// The daemon (`scripts/playwright-daemon.js`) runs a long-lived Chromium
+    /// instance with persistent cookies, tabs, and login sessions.
+    /// First call auto-starts the daemon (~3s), subsequent calls ~100-200ms.
+    ///
+    /// Inspired by gstack's browser architecture:
+    /// - Persistent browser state across commands
+    /// - @ref system for stable element addressing
+    /// - AI-agent-friendly error messages
     async fn execute_playwright_action(
         &self,
         action: BrowserAction,
         raw_args: &Value,
     ) -> anyhow::Result<ToolResult> {
-        let bridge_script = Self::playwright_bridge_script();
-
-        // Build the command payload from raw args, injecting headless config
+        // Build the command payload from raw args
         let mut payload = raw_args.as_object().cloned().unwrap_or_default();
-        payload.insert(
-            "headless".to_string(),
-            Value::Bool(self.playwright_headless),
-        );
         if !payload.contains_key("timeout_ms") {
             payload.insert(
                 "timeout_ms".to_string(),
@@ -907,65 +911,141 @@ impl BrowserTool {
             self.validate_output_path("path", path)?;
         }
 
-        let payload_json = serde_json::to_string(&payload)?;
-        let encoded = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            payload_json.as_bytes(),
-        );
+        // ── Daemon connection ──
+        // Read daemon state file to get port, or start daemon if not running
+        let daemon_port = self.ensure_playwright_daemon().await?;
+        let daemon_url = format!("http://127.0.0.1:{}/command", daemon_port);
 
-        debug!(
-            "Running playwright-bridge: {} {} <base64-payload>",
-            self.playwright_command, bridge_script
-        );
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(self.playwright_timeout_ms))
+            .build()?;
 
-        let output = tokio::time::timeout(
-            Duration::from_millis(self.playwright_timeout_ms),
-            Command::new(&self.playwright_command)
-                .arg(&bridge_script)
-                .arg(&encoded)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .output(),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "Playwright action timed out after {} ms",
-                self.playwright_timeout_ms
-            )
-        })??;
+        let response = client
+            .post(&daemon_url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Browser daemon unreachable: {e}. The daemon may have shut down. \
+                     Try the command again (it will auto-restart)."
+                )
+            })?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let resp_text = response.text().await?;
 
-        if !stderr.is_empty() {
-            debug!("playwright-bridge stderr: {}", stderr);
-        }
-
-        if let Ok(resp) = serde_json::from_str::<AgentBrowserResponse>(&stdout) {
+        if let Ok(resp) = serde_json::from_str::<AgentBrowserResponse>(&resp_text) {
             return self.to_result(resp);
         }
 
-        if output.status.success() {
-            Ok(ToolResult {
-                success: true,
-                output: stdout.trim().to_string(),
-                error: None,
-            })
-        } else {
-            Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Playwright bridge failed: {}",
-                    if stderr.is_empty() {
-                        stdout.trim().to_string()
-                    } else {
-                        stderr.trim().to_string()
-                    }
-                )),
-            })
+        // Fallback: try to parse as generic JSON
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&resp_text) {
+            let success = json.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+            let data = json.get("data").cloned().unwrap_or(Value::Null);
+            let error = json.get("error").and_then(|v| v.as_str()).map(String::from);
+
+            return Ok(ToolResult {
+                success,
+                output: serde_json::to_string_pretty(&data).unwrap_or_default(),
+                error,
+            });
         }
+
+        Ok(ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!("Invalid daemon response: {resp_text}")),
+        })
+    }
+
+    /// Ensure the Playwright daemon is running and return its port.
+    /// If not running, start it and wait for health check.
+    async fn ensure_playwright_daemon(&self) -> anyhow::Result<u16> {
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        let state_path = std::path::PathBuf::from(&home)
+            .join(".zeroclaw")
+            .join("browser-daemon.json");
+
+        // Check if daemon is already running
+        if state_path.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&state_path).await {
+                if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(port) = state.get("port").and_then(|v| v.as_u64()) {
+                        let port = port as u16;
+                        // Health check
+                        let client = reqwest::Client::builder()
+                            .timeout(Duration::from_secs(2))
+                            .build()?;
+                        if client
+                            .get(format!("http://127.0.0.1:{}/health", port))
+                            .send()
+                            .await
+                            .is_ok()
+                        {
+                            return Ok(port);
+                        }
+                    }
+                }
+            }
+            // State file exists but daemon is dead — remove stale file
+            let _ = tokio::fs::remove_file(&state_path).await;
+        }
+
+        // Start the daemon
+        let daemon_script = Self::find_script("playwright-daemon.js");
+        let port = 9500u16; // Fixed port for simplicity
+
+        tracing::info!("Starting Playwright browser daemon on port {port}");
+
+        let headless_flag = if self.playwright_headless { "--headless" } else { "--headed" };
+        let _child = std::process::Command::new(&self.playwright_command)
+            .arg(&daemon_script)
+            .arg("--port")
+            .arg(port.to_string())
+            .arg(headless_flag)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to start browser daemon: {e}"))?;
+
+        // Wait for daemon to be ready (up to 10 seconds)
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()?;
+        for i in 0..20 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if client
+                .get(format!("http://127.0.0.1:{}/health", port))
+                .send()
+                .await
+                .is_ok()
+            {
+                tracing::info!("Browser daemon ready after {}ms", (i + 1) * 500);
+                return Ok(port);
+            }
+        }
+
+        anyhow::bail!(
+            "Browser daemon failed to start within 10s. \
+             Ensure Node.js and Playwright are installed: npm install playwright"
+        )
+    }
+
+    /// Find a script in standard locations.
+    fn find_script(name: &str) -> String {
+        let candidates = [
+            format!("scripts/{name}"),
+            format!("../scripts/{name}"),
+            format!("../../scripts/{name}"),
+        ];
+        for c in &candidates {
+            if std::path::Path::new(c).exists() {
+                return c.to_string();
+            }
+        }
+        format!("scripts/{name}")
     }
 
     fn validate_coordinate(&self, key: &str, value: i64, max: Option<i64>) -> anyhow::Result<()> {
