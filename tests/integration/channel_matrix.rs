@@ -1109,10 +1109,11 @@ async fn send_empty_content() {
 async fn send_very_long_content() {
     let ch = MatrixTestChannel::new("test");
     let long_content = "a".repeat(100_000);
-    assert!(ch
-        .send(&SendMessage::new(&long_content, "user_1"))
-        .await
-        .is_ok());
+    assert!(
+        ch.send(&SendMessage::new(&long_content, "user_1"))
+            .await
+            .is_ok()
+    );
 
     let events = ch.events();
     match &events[0] {
@@ -1333,11 +1334,12 @@ async fn minimal_channel_all_defaults_succeed() {
     assert!(ch.start_typing("user").await.is_ok());
     assert!(ch.stop_typing("user").await.is_ok());
     assert!(!ch.supports_draft_updates());
-    assert!(ch
-        .send_draft(&SendMessage::new("d", "u"))
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        ch.send_draft(&SendMessage::new("d", "u"))
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(ch.update_draft("u", "m", "t").await.is_ok());
     assert!(ch.finalize_draft("u", "m", "t").await.is_ok());
     assert!(ch.cancel_draft("u", "m").await.is_ok());
@@ -1345,10 +1347,11 @@ async fn minimal_channel_all_defaults_succeed() {
     assert!(ch.remove_reaction("c", "m", "\u{1F440}").await.is_ok());
     assert!(ch.pin_message("c", "m").await.is_ok());
     assert!(ch.unpin_message("c", "m").await.is_ok());
-    assert!(ch
-        .redact_message("c", "m", Some("test".to_string()))
-        .await
-        .is_ok());
+    assert!(
+        ch.redact_message("c", "m", Some("test".to_string()))
+            .await
+            .is_ok()
+    );
     assert!(ch.redact_message("c", "m", None).await.is_ok());
 }
 

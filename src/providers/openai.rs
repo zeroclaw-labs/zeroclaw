@@ -752,10 +752,12 @@ mod tests {
 
         let result = p.chat_with_tools(&messages, &tools, "gpt-4o", 0.7).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid OpenAI tool specification"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid OpenAI tool specification")
+        );
     }
 
     #[test]

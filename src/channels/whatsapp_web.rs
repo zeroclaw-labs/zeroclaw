@@ -28,11 +28,12 @@
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::select;
+use wa_rs_proto::whatsapp::device_props::PlatformType;
 
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
@@ -702,6 +703,11 @@ impl Channel for WhatsAppWebChannel {
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
+                .with_device_props(
+                    Some("ZeroClaw".to_string()),
+                    None,
+                    Some(PlatformType::Desktop),
+                )
                 .on_event(move |event, client| {
                     let tx_inner = tx_clone.clone();
                     let allowed_numbers = allowed_numbers.clone();

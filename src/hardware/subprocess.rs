@@ -23,7 +23,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// Subprocess timeout — kill the child process after this many seconds.
 const SUBPROCESS_TIMEOUT_SECS: u64 = 10;
