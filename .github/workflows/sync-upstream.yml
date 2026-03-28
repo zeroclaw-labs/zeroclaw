@@ -60,7 +60,7 @@ jobs:
           BEHIND=${{ steps.check.outputs.behind }}
           gh pr comment ${{ steps.existing.outputs.pr }} \
             --body "Weekly sync check: upstream is now **$BEHIND commits ahead** of master. Resolve this PR to catch up."
-          echo "Commented on existing PR #${{ steps.existing.outputs.pr }} — skipping new branch."
+          echo "Commented on existing PR #${{ steps.existing.outputs.pr }} -- skipping new branch."
 
       - name: Create sync branch and merge
         if: steps.check.outputs.behind != '0' && steps.existing.outputs.pr == ''
@@ -91,27 +91,26 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           BEHIND=${{ steps.check.outputs.behind }}
+          cat > /tmp/pr-body.md << 'BODY'
+          Automated weekly sync from [zeroclaw-labs/zeroclaw](https://github.com/zeroclaw-labs/zeroclaw).
+
+          **Before merging, verify fork-owned files still apply cleanly:**
+          - [ ] `src/channels/discord.rs` - image marker emission in `process_attachments()`
+          - [ ] `src/channels/mod.rs` - approval wiring (largest file, highest conflict risk)
+          - [ ] `src/approval/mod.rs` - net-new file, verify it still compiles
+          - [ ] `src/agent/history.rs` - `trim_tool_message_content` tool_call_id preservation
+          - [ ] `src/providers/openrouter.rs` - `clean_for_gemini` schema cleaning
+
+          **Also check:**
+          - [ ] Breaking changes in `Cargo.toml` / config schema
+          - [ ] Run `cargo check` in WSL after merge before triggering a CI build
+          BODY
           gh pr create \
             --title "chore: sync $BEHIND upstream commit(s) $(date +%Y-%m-%d)" \
             --label sync \
             --head "${{ steps.merge.outputs.branch }}" \
             --base master \
-            --body "$(cat <<'EOF'
-Automated weekly sync from [zeroclaw-labs/zeroclaw](https://github.com/zeroclaw-labs/zeroclaw).
-
-**Before merging, verify fork-owned files still apply cleanly:**
-- [ ] `src/channels/discord.rs` — image marker emission in `process_attachments()`
-- [ ] `src/channels/mod.rs` — approval wiring (largest file, highest conflict risk)
-- [ ] `src/approval/mod.rs` — net-new file, verify it still compiles
-- [ ] `src/agent/history.rs` — `trim_tool_message_content` tool_call_id preservation
-- [ ] `src/providers/openrouter.rs` — `clean_for_gemini` schema cleaning
-
-**Also check:**
-- [ ] Breaking changes in `Cargo.toml` / config schema
-- [ ] Run `cargo check` in WSL after merge before triggering a CI build
-
-EOF
-          )"
+            --body-file /tmp/pr-body.md
 
       - name: Open draft conflict PR
         if: steps.merge.outputs.status == 'conflict'
@@ -120,33 +119,33 @@ EOF
         run: |
           BEHIND=${{ steps.check.outputs.behind }}
           CONFLICTS="${{ steps.merge.outputs.conflicts }}"
+          BRANCH="${{ steps.merge.outputs.branch }}"
+          {
+            echo "Automated weekly sync from [zeroclaw-labs/zeroclaw](https://github.com/zeroclaw-labs/zeroclaw)."
+            echo ""
+            echo "> **Merge conflict detected.** This is a draft PR. Resolve conflicts on the \`$BRANCH\` branch, then mark ready for review."
+            echo ""
+            echo "**Conflicted files:**"
+            echo "$CONFLICTS" | tr ' ' '\n' | grep -v '^$' | sed 's/^/- /'
+            echo ""
+            echo "**Fork-owned files to verify after resolution:**"
+            echo "- [ ] \`src/channels/discord.rs\` - image marker emission in \`process_attachments()\`"
+            echo "- [ ] \`src/channels/mod.rs\` - approval wiring (largest file, highest conflict risk)"
+            echo "- [ ] \`src/approval/mod.rs\` - net-new file, verify it still compiles"
+            echo "- [ ] \`src/agent/history.rs\` - \`trim_tool_message_content\` tool_call_id preservation"
+            echo "- [ ] \`src/providers/openrouter.rs\` - \`clean_for_gemini\` schema cleaning"
+            echo ""
+            echo "**Also check:**"
+            echo "- [ ] Breaking changes in \`Cargo.toml\` / config schema"
+            echo "- [ ] Run \`cargo check\` in WSL after merge before triggering a CI build"
+          } > /tmp/pr-body.md
           gh pr create \
             --title "chore: sync $BEHIND upstream commit(s) $(date +%Y-%m-%d) [CONFLICT]" \
             --label sync \
             --draft \
-            --head "${{ steps.merge.outputs.branch }}" \
+            --head "$BRANCH" \
             --base master \
-            --body "$(cat <<EOF
-Automated weekly sync from [zeroclaw-labs/zeroclaw](https://github.com/zeroclaw-labs/zeroclaw).
-
-> **Merge conflict detected.** This is a draft PR. Resolve conflicts on the \`${{ steps.merge.outputs.branch }}\` branch, then mark ready for review.
-
-**Conflicted files:**
-$(echo "$CONFLICTS" | tr ' ' '\n' | grep -v '^$' | sed 's/^/- /')
-
-**Fork-owned files to verify after resolution:**
-- [ ] \`src/channels/discord.rs\` — image marker emission in \`process_attachments()\`
-- [ ] \`src/channels/mod.rs\` — approval wiring (largest file, highest conflict risk)
-- [ ] \`src/approval/mod.rs\` — net-new file, verify it still compiles
-- [ ] \`src/agent/history.rs\` — \`trim_tool_message_content\` tool_call_id preservation
-- [ ] \`src/providers/openrouter.rs\` — \`clean_for_gemini\` schema cleaning
-
-**Also check:**
-- [ ] Breaking changes in \`Cargo.toml\` / config schema
-- [ ] Run \`cargo check\` in WSL after merge before triggering a CI build
-
-EOF
-          )"
+            --body-file /tmp/pr-body.md
 
       - name: No changes
         if: steps.check.outputs.behind == '0'
