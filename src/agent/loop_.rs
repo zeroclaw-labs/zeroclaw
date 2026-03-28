@@ -2870,6 +2870,17 @@ pub(crate) async fn run_tool_call_loop(
                 let should_emit_post_hoc_chunks =
                     !response_streamed_live || display_text != response_text;
                 if !should_emit_post_hoc_chunks {
+                    // Capture any pending model switch into callback before returning.
+                    if let Some((sw_provider, sw_model)) = get_model_switch_state()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take()
+                    {
+                        if let Some(ref cb) = model_switch_callback {
+                            *cb.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some((sw_provider, sw_model));
+                        }
+                    }
                     history.push(ChatMessage::assistant(response_text.clone()));
                     return Ok(display_text);
                 }
@@ -2897,6 +2908,16 @@ pub(crate) async fn run_tool_call_loop(
                 }
                 if !chunk.is_empty() {
                     let _ = tx.send(DraftEvent::Content(chunk)).await;
+                }
+            }
+            // Capture any pending model switch into callback before returning.
+            if let Some((sw_provider, sw_model)) = get_model_switch_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                if let Some(ref cb) = model_switch_callback {
+                    *cb.lock().unwrap_or_else(|e| e.into_inner()) = Some((sw_provider, sw_model));
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));

@@ -123,7 +123,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use portable_atomic::{AtomicU64, Ordering};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -231,6 +231,66 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
+/// Process-wide shared per-chat route overrides. Persisted to `routes.json` in the workspace.
+static GLOBAL_ROUTE_OVERRIDES: std::sync::LazyLock<RouteSelectionMap> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// Path to the routes.json file; set once at startup when the workspace is known.
+static GLOBAL_ROUTES_FILE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Return a clone of the global route-overrides Arc.
+fn global_route_overrides() -> RouteSelectionMap {
+    Arc::clone(&GLOBAL_ROUTE_OVERRIDES)
+}
+
+/// Set the routes.json path and load any persisted overrides from disk.
+fn init_route_overrides(workspace_dir: &std::path::Path) {
+    let routes_file = workspace_dir.join("routes.json");
+    *GLOBAL_ROUTES_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(routes_file.clone());
+
+    if let Ok(text) = std::fs::read_to_string(&routes_file) {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, ChannelRouteSelection>>(&text) {
+            let mut overrides = GLOBAL_ROUTE_OVERRIDES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *overrides = map;
+            tracing::info!(
+                path = %routes_file.display(),
+                count = overrides.len(),
+                "Loaded per-chat route overrides from disk"
+            );
+        }
+    }
+}
+
+/// Persist current route overrides to routes.json (best-effort; logs on failure).
+fn save_route_overrides(overrides: &HashMap<String, ChannelRouteSelection>) {
+    let path_guard = GLOBAL_ROUTES_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ref path) = *path_guard else { return };
+    match serde_json::to_string_pretty(overrides) {
+        Ok(json) => {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(
+                        path = %parent.display(),
+                        error = %e,
+                        "Failed to create parent directory for route overrides"
+                    );
+                    return;
+                }
+            }
+            if let Err(e) = std::fs::write(path, json) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to save route overrides"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to serialize route overrides"),
+    }
+}
+
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
@@ -256,7 +316,7 @@ fn channel_message_timeout_budget_secs_with_cap(
     message_timeout_secs.saturating_mul(scale)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ChannelRouteSelection {
     provider: String,
     model: String,
@@ -1030,6 +1090,16 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
 }
 
 fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> ChannelRouteSelection {
+    // Check global (persisted) overrides first, then fall back to ctx-local overrides.
+    let global = global_route_overrides();
+    if let Some(entry) = global
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+    {
+        return entry;
+    }
     ctx.route_overrides
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1040,14 +1110,35 @@ fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> Channel
 
 fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
     let default_route = default_route_selection(ctx);
-    let mut routes = ctx
-        .route_overrides
+
+    // Update ctx-local overrides.
+    {
+        let mut local = ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if next == default_route {
+            local.remove(sender_key);
+        } else {
+            local.insert(sender_key.to_string(), next.clone());
+        }
+    }
+
+    // Persist to global overrides + disk only when routes file is configured
+    // (i.e., init_route_overrides was called at startup). Skipped in tests.
+    let has_routes_file = GLOBAL_ROUTES_FILE
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if next == default_route {
-        routes.remove(sender_key);
-    } else {
-        routes.insert(sender_key.to_string(), next);
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    if has_routes_file {
+        let global = global_route_overrides();
+        let mut routes = global.lock().unwrap_or_else(|e| e.into_inner());
+        if next == default_route {
+            routes.remove(sender_key);
+        } else {
+            routes.insert(sender_key.to_string(), next);
+        }
+        save_route_overrides(&routes);
     }
 }
 
@@ -2844,7 +2935,11 @@ async fn process_channel_message(
         Cancelled,
     }
 
-    let model_switch_callback = get_model_switch_state();
+    // Per-request model switch slot: isolates model_switch tool results per user,
+    // preventing cross-user leakage from the global MODEL_SWITCH_REQUEST.
+    let model_switch_slot: crate::agent::loop_::ModelSwitchCallback = Arc::new(Mutex::new(None));
+    // Clear any stale global state before entering the loop.
+    clear_model_switch_request();
     let scale_cap = ctx
         .pacing
         .message_timeout_scale_max
@@ -2895,7 +2990,7 @@ async fn process_channel_message(
                         },
                         ctx.tool_call_dedup_exempt.as_ref(),
                         ctx.activated_tools.as_ref(),
-                        Some(model_switch_callback.clone()),
+                        Some(model_switch_slot.clone()),
                         &ctx.pacing,
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
@@ -2953,6 +3048,37 @@ async fn process_channel_message(
         (llm_result, fb)
     })
     .await;
+
+    // After the agent loop, check the per-request model_switch_slot first,
+    // then fall back to the global MODEL_SWITCH_REQUEST, and persist the
+    // route override for this sender.
+    let pending_switch = model_switch_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .or_else(|| {
+            get_model_switch_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        });
+    if let Some((sw_provider, sw_model)) = pending_switch {
+        tracing::info!(
+            provider = %sw_provider,
+            model = %sw_model,
+            sender = %history_key,
+            "Persisting model switch from agent loop"
+        );
+        set_route_selection(
+            ctx.as_ref(),
+            &history_key,
+            ChannelRouteSelection {
+                provider: sw_provider,
+                model: sw_model,
+                api_key: None,
+            },
+        );
+    }
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
     tracing::debug!("Post-loop: dropping delta_tx and awaiting draft updater");
@@ -5471,6 +5597,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .as_ref()
         .is_some_and(|wa| wa.interrupt_on_new_message);
 
+    // Load persisted per-chat route overrides from routes.json in workspace.
+    init_route_overrides(&config.workspace_dir);
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -7251,6 +7380,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
         let route_key = "telegram_chat-1_alice";
+        // Check ctx-local overrides (set_route_selection writes to both local and global).
         let route = runtime_ctx
             .route_overrides
             .lock()
@@ -7285,7 +7415,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let route_key = "telegram_chat-1_alice".to_string();
         let mut route_overrides = HashMap::new();
         route_overrides.insert(
-            route_key,
+            route_key.clone(),
             ChannelRouteSelection {
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
