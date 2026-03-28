@@ -8,6 +8,55 @@ use std::sync::Arc;
 const PUSHOVER_API_URL: &str = "https://api.pushover.net/1/messages.json";
 const PUSHOVER_REQUEST_TIMEOUT_SECS: u64 = 15;
 
+/// Pushover Tool: Send notifications via Pushover API
+///
+/// # Overview
+/// This tool sends Pushover notifications to your devices. It requires two environment variables:
+/// - `PUSHOVER_TOKEN`: Your application token (from Pushover dashboard)
+/// - `PUSHOVER_USER_KEY`: Your user key (from Pushover dashboard)
+///
+/// # Configuration
+/// Place a `.env` file in your workspace directory with:
+/// ```
+/// PUSHOVER_TOKEN=your_app_token
+/// PUSHOVER_USER_KEY=your_user_key
+/// ```
+///
+/// You can also use `export` prefixes: `export PUSHOVER_TOKEN=...`.
+///
+/// # Features
+/// - Priority levels: -2 (silent/lowest), -1 (low), 0 (normal), 1 (high), 2 (emergency/repeating)
+/// - Custom notification sounds (if supported by device)
+/// - Optional title override
+///
+/// # Rate Limits
+/// Pushover enforces rate limits (approximately 100 messages per user per day for free tier). The tool will return API errors if limits are exceeded.
+///
+/// # Errors
+/// - Missing credentials: Returns error if `.env` absent or required keys missing
+/// - Network errors: Propagated as failures
+/// - API errors: Non-200 HTTP status or JSON response status != 1
+///
+/// # Example
+/// ```
+/// use zeroclaw::tools::PushoverTool;
+/// use zeroclaw::security::SecurityPolicy;
+/// use std::path::PathBuf;
+/// use std::sync::Arc;
+///
+/// let security = Arc::new(SecurityPolicy::default());
+/// let workspace = PathBuf::from("/path/to/workspace");
+/// let tool = PushoverTool::new(security, workspace);
+///
+/// // Send a high-priority message with custom sound
+/// let args = serde_json::json!({
+///     "message": "Server down!",
+///     "title": "ALERT",
+///     "priority": 1,
+///     "sound": "bugle"
+/// });
+/// // Call tool.execute(args).await
+/// ```
 pub struct PushoverTool {
     security: Arc<SecurityPolicy>,
     workspace_dir: PathBuf,
@@ -21,6 +70,10 @@ impl PushoverTool {
         }
     }
 
+    /// Parse environment values with support for quoting and inline comments.
+    /// Examples:
+    ///   KEY=value # comment
+    ///   export KEY="quoted value"
     fn parse_env_value(raw: &str) -> String {
         let raw = raw.trim();
 
@@ -430,4 +483,24 @@ mod tests {
         assert!(!result.success);
         assert!(result.error.unwrap().contains("-2..=2"));
     }
+
+    #[tokio::test]
+    async fn execute_requires_message() {
+        let tmp = TempDir::new().unwrap();
+        let env_path = tmp.path().join(".env");
+        fs::write(&env_path, "PUSHOVER_TOKEN=t\nPUSHOVER_USER_KEY=u\n").unwrap();
+
+        let tool = PushoverTool::new(
+            test_security(AutonomyLevel::Full, 100),
+            tmp.path().to_path_buf(),
+        );
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("Missing 'message'"));
+    }
+
+    // Additional tests for HTTP success/failure scenarios would require mocking
+    // the HTTP client. Those are left as integration tests or require additional
+    // zeroclaw test utilities.
 }

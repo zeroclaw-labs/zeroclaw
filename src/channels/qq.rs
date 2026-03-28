@@ -15,6 +15,9 @@ use uuid::Uuid;
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_AUTH_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 
+/// Maximum audio download size for transcription (25 MB).
+const QQ_MAX_AUDIO_DOWNLOAD_BYTES: u64 = 25 * 1024 * 1024;
+
 /// Maximum upload size for QQ media files (10 MB).
 const QQ_MAX_UPLOAD_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -300,6 +303,8 @@ pub struct QQChannel {
     session_id: Arc<RwLock<Option<String>>>,
     /// Last sequence number received, used for gateway resume (opcode 6).
     last_sequence: Arc<RwLock<Option<i64>>>,
+    transcription: Option<crate::config::TranscriptionConfig>,
+    transcription_manager: Option<std::sync::Arc<super::transcription::TranscriptionManager>>,
 }
 
 impl QQChannel {
@@ -316,6 +321,8 @@ impl QQChannel {
             proxy_url: None,
             session_id: Arc::new(RwLock::new(None)),
             last_sequence: Arc::new(RwLock::new(None)),
+            transcription: None,
+            transcription_manager: None,
         }
     }
 
@@ -324,11 +331,96 @@ impl QQChannel {
         self.workspace_dir = Some(dir);
         self
     }
-
     /// Set a per-channel proxy URL that overrides the global proxy config.
     pub fn with_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.proxy_url = proxy_url;
         self
+    }
+
+    pub fn with_transcription(mut self, config: crate::config::TranscriptionConfig) -> Self {
+        match super::transcription::TranscriptionManager::new(&config) {
+            Ok(m) => {
+                self.transcription_manager = Some(std::sync::Arc::new(m));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "transcription manager init failed, audio transcription disabled: {e}"
+                );
+            }
+        }
+        self.transcription = Some(config);
+        self
+    }
+
+    fn is_audio_attachment(attachment: &serde_json::Value) -> bool {
+        let content_type = attachment
+            .get("content_type")
+            .and_then(|ct| ct.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if content_type.starts_with("audio/") {
+            return true;
+        }
+        let filename = attachment
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .unwrap_or("");
+        if let Some(ext) = filename.rsplit_once('.').map(|(_, e)| e) {
+            return matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "flac" | "mp3" | "mpeg" | "mpga" | "m4a" | "ogg" | "oga" | "opus" | "wav"
+            );
+        }
+        false
+    }
+
+    async fn try_transcribe_attachment(&self, attachment: &serde_json::Value) -> Option<String> {
+        if !Self::is_audio_attachment(attachment) {
+            return None;
+        }
+        let manager = self.transcription_manager.as_deref()?;
+        let url = attachment.get("url").and_then(|u| u.as_str())?.trim();
+        if url.is_empty() {
+            return None;
+        }
+        if ensure_https(url).is_err() {
+            tracing::warn!("QQ: refusing to fetch audio over non-HTTPS URL");
+            return None;
+        }
+        let token = self.get_token().await.ok()?;
+        let resp = self
+            .http_client()
+            .get(url)
+            .header("Authorization", format!("QQBot {token}"))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            tracing::warn!("QQ: audio attachment fetch failed: {}", resp.status());
+            return None;
+        }
+        if let Some(content_length) = resp.content_length() {
+            if content_length > QQ_MAX_AUDIO_DOWNLOAD_BYTES {
+                tracing::warn!(
+                    "QQ: audio download skipped: content-length {content_length} exceeds {} bytes",
+                    QQ_MAX_AUDIO_DOWNLOAD_BYTES
+                );
+                return None;
+            }
+        }
+        let audio_data = resp.bytes().await.ok()?;
+        let filename = attachment
+            .get("filename")
+            .and_then(|f| f.as_str())
+            .filter(|f| !f.is_empty())
+            .unwrap_or("audio.ogg");
+        match manager.transcribe(&audio_data, filename).await {
+            Ok(transcript) => Some(transcript),
+            Err(e) => {
+                tracing::warn!("QQ: transcription failed: {e}");
+                None
+            }
+        }
     }
 
     fn http_client(&self) -> reqwest::Client {

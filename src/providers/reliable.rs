@@ -909,6 +909,18 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
+                    // Log the full message payload on the first attempt of each
+                    // call (not on retries). Enabled by `--log-llm` / TRACE level.
+                    if attempt == 0 && tracing::enabled!(tracing::Level::TRACE) {
+                        let json = serde_json::to_string_pretty(&effective_messages)
+                            .unwrap_or_else(|e| format!("<serialization error: {e}>"));
+                        tracing::trace!(
+                            provider = %provider_name,
+                            model = %current_model,
+                            "\n{json}\n"
+                        );
+                    }
+
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,

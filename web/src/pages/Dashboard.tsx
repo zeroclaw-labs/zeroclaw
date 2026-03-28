@@ -11,7 +11,6 @@ import {
   Users,
   MessageSquare,
   ChevronRight,
-  Hash,
   Wifi,
 } from 'lucide-react';
 import type { StatusResponse, CostSummary, Session, ChannelDetail } from '@/types/api';
@@ -97,17 +96,6 @@ function healthBg(status: string): string {
       return 'rgba(255, 170, 0, 0.05)';
     default:
       return 'rgba(255, 68, 102, 0.05)';
-  }
-}
-
-function sessionStatusColor(status: string): string {
-  switch (status) {
-    case 'active':
-      return 'var(--color-status-success)';
-    case 'idle':
-      return 'var(--color-status-warning)';
-    default:
-      return 'var(--pc-text-faint)';
   }
 }
 
@@ -515,24 +503,24 @@ function SessionsTab() {
           <div className="space-y-2 overflow-y-auto max-h-96">
             {sessions.map((session) => (
               <button
-                key={session.id}
+                key={session.session_id}
                 onClick={() => setSelectedSession(session)}
                 className="w-full text-left flex items-center justify-between py-3 px-4 rounded-xl transition-all"
                 style={{
-                  background: selectedSession?.id === session.id
+                  background: selectedSession?.session_id === session.session_id
                     ? "rgba(var(--pc-accent-rgb), 0.08)"
                     : "var(--pc-bg-elevated)",
-                  border: selectedSession?.id === session.id
+                  border: selectedSession?.session_id === session.session_id
                     ? "1px solid rgba(var(--pc-accent-rgb), 0.2)"
                     : "1px solid transparent",
                 }}
                 onMouseEnter={(e) => {
-                  if (selectedSession?.id !== session.id) {
+                  if (selectedSession?.session_id !== session.session_id) {
                     e.currentTarget.style.background = "var(--pc-hover)";
                   }
                 }}
                 onMouseLeave={(e) => {
-                  if (selectedSession?.id !== session.id) {
+                  if (selectedSession?.session_id !== session.session_id) {
                     e.currentTarget.style.background = "var(--pc-bg-elevated)";
                   }
                 }}
@@ -543,23 +531,10 @@ function SessionsTab() {
                       className="text-sm font-medium font-mono truncate"
                       style={{ color: "var(--pc-text-primary)" }}
                     >
-                      {session.id.slice(0, 8)}...
-                    </span>
-                    <span
-                      className="text-[10px] uppercase font-medium px-2 py-0.5 rounded-full"
-                      style={{
-                        background: `${sessionStatusColor(session.status)}15`,
-                        color: sessionStatusColor(session.status),
-                      }}
-                    >
-                      {session.status}
+                      {session.session_id.slice(0, 8)}...
                     </span>
                   </div>
                   <div className="flex items-center gap-3 text-xs" style={{ color: "var(--pc-text-muted)" }}>
-                    <span className="flex items-center gap-1">
-                      <Hash className="h-3 w-3" />
-                      {session.channel}
-                    </span>
                     <span className="flex items-center gap-1">
                       <MessageSquare className="h-3 w-3" />
                       {session.message_count}
@@ -592,11 +567,9 @@ function SessionsTab() {
         {selectedSession ? (
           <div className="space-y-4">
             {[
-              { label: t("dashboard.session_id"), value: selectedSession.id },
-              { label: t("dashboard.session_channel"), value: selectedSession.channel },
-              { label: t("dashboard.session_started"), value: formatTime(selectedSession.started_at) },
+              { label: t("dashboard.session_id"), value: selectedSession.session_id },
+              { label: t("dashboard.session_started"), value: formatTime(selectedSession.created_at) },
               { label: t("dashboard.session_last_activity"), value: formatRelative(selectedSession.last_activity) },
-              { label: t("dashboard.session_status"), value: selectedSession.status },
               { label: t("dashboard.session_messages"), value: String(selectedSession.message_count) },
             ].map(({ label, value }) => (
               <div key={label}>
@@ -611,26 +584,6 @@ function SessionsTab() {
                 </p>
               </div>
             ))}
-
-            <div
-              className="pt-3 mt-3 border-t"
-              style={{ borderColor: "var(--pc-border)" }}
-            >
-              <div
-                className="flex items-center gap-2"
-              >
-                <span
-                  className="status-dot"
-                  style={{
-                    background: sessionStatusColor(selectedSession.status),
-                    boxShadow: `0 0 6px ${sessionStatusColor(selectedSession.status)}`,
-                  }}
-                />
-                <span className="text-xs capitalize" style={{ color: "var(--pc-text-muted)" }}>
-                  {selectedSession.status}
-                </span>
-              </div>
-            </div>
           </div>
         ) : (
           <p className="text-sm py-8 text-center" style={{ color: "var(--pc-text-faint)" }}>
