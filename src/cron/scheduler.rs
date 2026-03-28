@@ -1,3 +1,5 @@
+#[cfg(feature = "channel-lark")]
+use crate::channels::LarkChannel;
 #[cfg(feature = "channel-matrix")]
 use crate::channels::MatrixChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -638,6 +640,22 @@ pub(crate) async fn deliver_announcement(
             channel
                 .send(&SendMessage::new(safe_output.as_str(), target))
                 .await?;
+        }
+        "lark" | "feishu" => {
+            #[cfg(feature = "channel-lark")]
+            {
+                let lark = config
+                    .channels_config
+                    .lark
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("lark channel not configured"))?;
+                let channel = LarkChannel::from_config(lark);
+                channel.send(&SendMessage::new(output, target)).await?;
+            }
+            #[cfg(not(feature = "channel-lark"))]
+            {
+                anyhow::bail!("lark delivery channel requires `channel-lark` feature");
+            }
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
