@@ -475,6 +475,26 @@ pub fn milestone_report_template(lang: &str) -> ReportTemplate {
     }
 }
 
+/// High-level template rendering function.
+///
+/// Returns the rendered template as a string or an error if the template
+/// or language is not supported.
+#[allow(clippy::implicit_hasher)]
+pub fn render_template(
+    template_name: &str,
+    language: &str,
+    vars: &HashMap<String, String>,
+) -> anyhow::Result<String> {
+    let tpl = match template_name {
+        "weekly_status" => weekly_status_template(language),
+        "sprint_review" => sprint_review_template(language),
+        "risk_register" => risk_register_template(language),
+        "milestone_report" => milestone_report_template(language),
+        _ => anyhow::bail!("unsupported template: {}", template_name),
+    };
+    Ok(tpl.render(vars))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

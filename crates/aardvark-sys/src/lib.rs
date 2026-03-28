@@ -457,19 +457,27 @@ mod tests {
 
     #[test]
     fn error_display_messages_are_human_readable() {
-        assert!(AardvarkError::NotFound
-            .to_string()
-            .to_lowercase()
-            .contains("not found"));
+        assert!(
+            AardvarkError::NotFound
+                .to_string()
+                .to_lowercase()
+                .contains("not found")
+        );
         assert!(AardvarkError::OpenFailed(-1).to_string().contains("-1"));
-        assert!(AardvarkError::I2cWriteFailed(-3)
-            .to_string()
-            .contains("I2C write"));
-        assert!(AardvarkError::SpiTransferFailed(-2)
-            .to_string()
-            .contains("SPI"));
-        assert!(AardvarkError::LibraryNotFound
-            .to_string()
-            .contains("aardvark.so"));
+        assert!(
+            AardvarkError::I2cWriteFailed(-3)
+                .to_string()
+                .contains("I2C write")
+        );
+        assert!(
+            AardvarkError::SpiTransferFailed(-2)
+                .to_string()
+                .contains("SPI")
+        );
+        assert!(
+            AardvarkError::LibraryNotFound
+                .to_string()
+                .contains("aardvark.so")
+        );
     }
 }
