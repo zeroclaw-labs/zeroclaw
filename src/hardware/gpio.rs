@@ -81,7 +81,7 @@ impl Tool for GpioWriteTool {
                     success: false,
                     output: String::new(),
                     error: Some("missing required parameter: pin".to_string()),
-                })
+                });
             }
         };
         let value = match args.get("value").and_then(|v| v.as_u64()) {
@@ -91,7 +91,7 @@ impl Tool for GpioWriteTool {
                     success: false,
                     output: String::new(),
                     error: Some("missing required parameter: value".to_string()),
-                })
+                });
             }
         };
 
@@ -203,7 +203,7 @@ impl Tool for GpioReadTool {
                     success: false,
                     output: String::new(),
                     error: Some("missing required parameter: pin".to_string()),
-                })
+                });
             }
         };
 
@@ -467,11 +467,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("missing required parameter: pin"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("missing required parameter: pin")
+        );
 
         // Missing device with empty registry — auto-select finds no GPIO device → Ok(failure)
         let empty_reg = Arc::new(RwLock::new(DeviceRegistry::new()));
@@ -489,11 +491,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("missing required parameter: value"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("missing required parameter: value")
+        );
     }
 
     // ── GpioReadTool tests ───────────────────────────────────────────────
@@ -576,11 +580,13 @@ mod tests {
         // Missing pin
         let result = tool.execute(json!({"device": "pico0"})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("missing required parameter: pin"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("missing required parameter: pin")
+        );
 
         // Missing device with empty registry — auto-select finds no GPIO device → Ok(failure)
         let empty_reg = Arc::new(RwLock::new(DeviceRegistry::new()));

@@ -723,6 +723,7 @@ mod tests {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -752,6 +753,7 @@ mod tests {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -794,6 +796,7 @@ mod tests {
             assemblyai: None,
             google: None,
             local_whisper: None,
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -936,10 +939,11 @@ mod tests {
             google: None,
             local_whisper: Some(crate::config::LocalWhisperConfig {
                 url: format!("{}/v1/transcribe", whisper_server.uri()),
-                bearer_token: "test-token".to_string(),
+                bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 25 * 1024 * 1024,
                 timeout_secs: 300,
             }),
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -988,10 +992,11 @@ mod tests {
             google: None,
             local_whisper: Some(crate::config::LocalWhisperConfig {
                 url: "http://localhost:8000/v1/transcribe".to_string(),
-                bearer_token: "test-token".to_string(),
+                bearer_token: Some("test-token".to_string()),
                 max_audio_bytes: 25 * 1024 * 1024,
                 timeout_secs: 300,
             }),
+            transcribe_non_ptt_audio: false,
         };
 
         let ch = WatiChannel::new(
@@ -1033,7 +1038,7 @@ mod tests {
             default_provider: "local_whisper".into(),
             local_whisper: Some(crate::config::LocalWhisperConfig {
                 url: "http://localhost:8001/v1/transcribe".into(),
-                bearer_token: "test-token".into(),
+                bearer_token: Some("test-token".into()),
                 max_audio_bytes: 25 * 1024 * 1024,
                 timeout_secs: 120,
             }),

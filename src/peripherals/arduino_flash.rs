@@ -35,7 +35,9 @@ pub fn ensure_arduino_cli() -> Result<()> {
             .status()
             .context("Failed to run brew install")?;
         if !status.success() {
-            anyhow::bail!("brew install arduino-cli failed. Install manually: https://arduino.github.io/arduino-cli/");
+            anyhow::bail!(
+                "brew install arduino-cli failed. Install manually: https://arduino.github.io/arduino-cli/"
+            );
         }
         println!("arduino-cli installed.");
         if !arduino_cli_available() {
@@ -46,7 +48,9 @@ pub fn ensure_arduino_cli() -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         println!("arduino-cli not found. Run the install script:");
-        println!("  curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh");
+        println!(
+            "  curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh"
+        );
         println!();
         println!("Or install via package manager (e.g. apt install arduino-cli on Debian/Ubuntu).");
         anyhow::bail!("arduino-cli not installed. Install it and try again.");
@@ -123,7 +127,10 @@ pub fn flash_arduino_firmware(port: &str) -> Result<()> {
 
     if !upload.status.success() {
         let stderr = String::from_utf8_lossy(&upload.stderr);
-        anyhow::bail!("Upload failed:\n{}\n\nEnsure the board is connected and the port is correct (e.g. /dev/cu.usbmodem* on macOS).", stderr);
+        anyhow::bail!(
+            "Upload failed:\n{}\n\nEnsure the board is connected and the port is correct (e.g. /dev/cu.usbmodem* on macOS).",
+            stderr
+        );
     }
 
     println!("ZeroClaw firmware flashed successfully.");

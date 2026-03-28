@@ -1,6 +1,6 @@
 use super::types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod};
 use crate::config::schema::CostConfig;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use chrono::{Datelike, NaiveDate, Utc};
 use parking_lot::{Mutex, MutexGuard};
 use std::collections::HashMap;
@@ -558,8 +558,9 @@ mod tests {
         let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
 
         let err = tracker.check_budget(f64::NAN).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("Estimated cost must be a finite, non-negative value"));
+        assert!(
+            err.to_string()
+                .contains("Estimated cost must be a finite, non-negative value")
+        );
     }
 }
