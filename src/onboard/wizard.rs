@@ -4004,6 +4004,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     multi_message_delay_ms: existing_dc
                         .map(|d| d.multi_message_delay_ms)
                         .unwrap_or(800),
+                    stall_timeout_secs: existing_dc
+                        .map(|d| d.stall_timeout_secs)
+                        .unwrap_or(0),
                 });
             }
             ChannelMenuChoice::Slack => {

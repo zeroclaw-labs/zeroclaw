@@ -50,6 +50,7 @@ pub mod session_sqlite;
 pub mod session_store;
 pub mod signal;
 pub mod slack;
+pub mod stall_watchdog;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
@@ -4800,7 +4801,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.draft_update_interval_ms,
                     dc.multi_message_delay_ms,
                 )
-                .with_transcription(config.transcription.clone()),
+                .with_transcription(config.transcription.clone())
+                .with_stall_timeout(dc.stall_timeout_secs),
             ))
         }
         "slack" => {
@@ -5012,7 +5014,8 @@ fn collect_configured_channels(
                     dc.multi_message_delay_ms,
                 )
                 .with_proxy_url(dc.proxy_url.clone())
-                .with_transcription(config.transcription.clone()),
+                .with_transcription(config.transcription.clone())
+                .with_stall_timeout(dc.stall_timeout_secs),
             ),
         });
     }

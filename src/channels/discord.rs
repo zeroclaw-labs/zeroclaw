@@ -43,6 +43,8 @@ pub struct DiscordChannel {
     multi_message_sent_len: Mutex<HashMap<String, usize>>,
     /// Thread context captured from `send_draft()` for MultiMessage paragraph delivery.
     multi_message_thread_ts: Mutex<HashMap<String, Option<String>>>,
+    /// Stall-watchdog timeout in seconds (0 = disabled).
+    stall_timeout_secs: u64,
 }
 
 impl DiscordChannel {
@@ -70,6 +72,7 @@ impl DiscordChannel {
             last_draft_edit: Mutex::new(HashMap::new()),
             multi_message_sent_len: Mutex::new(HashMap::new()),
             multi_message_thread_ts: Mutex::new(HashMap::new()),
+            stall_timeout_secs: 0,
         }
     }
 
@@ -118,6 +121,12 @@ impl DiscordChannel {
         self.stream_mode = stream_mode;
         self.draft_update_interval_ms = draft_update_interval_ms;
         self.multi_message_delay_ms = multi_message_delay_ms;
+        self
+    }
+
+    /// Set the stall-watchdog timeout (0 = disabled).
+    pub fn with_stall_timeout(mut self, secs: u64) -> Self {
+        self.stall_timeout_secs = secs;
         self
     }
 
@@ -1075,8 +1084,34 @@ impl Channel for DiscordChannel {
 
         let guild_filter = self.guild_id.clone();
 
+        // --- Stall watchdog --------------------------------------------------
+        let watchdog = if self.stall_timeout_secs > 0 {
+            Some(super::stall_watchdog::StallWatchdog::new(
+                self.stall_timeout_secs,
+            ))
+        } else {
+            None
+        };
+
+        let (stall_tx, mut stall_rx) = tokio::sync::mpsc::channel::<()>(1);
+        if let Some(ref wd) = watchdog {
+            let stall_signal = stall_tx.clone();
+            wd.start(move || {
+                tracing::warn!("Discord: stall watchdog fired — no events for configured timeout, triggering reconnect");
+                let _ = stall_signal.try_send(());
+            })
+            .await;
+        }
+        // Keep stall_tx alive so the receiver doesn't close prematurely when
+        // the watchdog is disabled (recv will just pend forever).
+        let _stall_tx_guard = stall_tx;
+
         loop {
             tokio::select! {
+                _ = stall_rx.recv() => {
+                    tracing::info!("Discord: breaking listen loop due to stall watchdog");
+                    break;
+                }
                 _ = hb_rx.recv() => {
                     let d = if sequence >= 0 { json!(sequence) } else { json!(null) };
                     let hb = json!({"op": 1, "d": d});
@@ -1106,6 +1141,12 @@ impl Channel for DiscordChannel {
                         Ok(e) => e,
                         Err(_) => continue,
                     };
+
+                    // Mark activity for the stall watchdog on every
+                    // successfully parsed gateway event.
+                    if let Some(ref wd) = watchdog {
+                        wd.touch();
+                    }
 
                     // Track sequence number from all dispatch events
                     if let Some(s) = event.get("s").and_then(serde_json::Value::as_i64) {
@@ -1290,6 +1331,12 @@ impl Channel for DiscordChannel {
                     }
                 }
             }
+        }
+
+        // Clean up the watchdog task before returning so the outer
+        // reconnection loop can start fresh.
+        if let Some(ref wd) = watchdog {
+            wd.stop().await;
         }
 
         Ok(())
