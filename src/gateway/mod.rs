@@ -1761,33 +1761,52 @@ async fn handle_line_webhook(
         );
     };
 
-    let body_str = String::from_utf8_lossy(&body);
+    // ── Security: Body size limit ─────────────────────────────────────────────
+    if body.len() > MAX_BODY_SIZE {
+        tracing::warn!("LINE webhook body too large: {} bytes", body.len());
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({"error": "Payload too large"})),
+        );
+    }
 
-    // ── Security: Verify X-Line-Signature ────────────────────────────────────
-    if let Some(ref channel_secret) = state.line_channel_secret {
-        let signature = headers
-            .get("X-Line-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !crate::channels::line::verify_line_signature(channel_secret, &body_str, signature) {
-            tracing::warn!(
-                "LINE webhook signature verification failed ({})",
-                if signature.is_empty() {
-                    "missing"
-                } else {
-                    "invalid"
-                }
-            );
+    // ── Security: Require valid UTF-8 before signature check ─────────────────
+    let body_str = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!("LINE webhook body is not valid UTF-8");
             return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid UTF-8 body"})),
             );
         }
+    };
+
+    // ── Security: Verify X-Line-Signature (mandatory) ────────────────────────
+    let Some(ref channel_secret) = state.line_channel_secret else {
+        tracing::error!("LINE channel_secret not configured — rejecting webhook");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "LINE channel_secret not configured"})),
+        );
+    };
+    let signature = headers
+        .get("X-Line-Signature")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !crate::channels::line::verify_line_signature(channel_secret, body_str, signature) {
+        tracing::warn!(
+            "LINE webhook signature verification failed ({})",
+            if signature.is_empty() { "missing" } else { "invalid" }
+        );
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Invalid signature"})),
+        );
     }
 
     // ── Parse JSON body ───────────────────────────────────────────────────────
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
+    let Ok(payload) = serde_json::from_str::<serde_json::Value>(body_str) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "Invalid JSON payload"})),
