@@ -2305,7 +2305,10 @@ mod tests {
         })];
         // No workspace_dir — should fall back to using the CDN URL directly.
         let result = process_attachments(&attachments, &client, None).await;
-        assert_eq!(result, "[IMAGE:https://cdn.discordapp.com/attachments/1/2/photo.jpg]");
+        assert_eq!(
+            result,
+            "[IMAGE:https://cdn.discordapp.com/attachments/1/2/photo.jpg]"
+        );
     }
 
     #[tokio::test]
@@ -2317,7 +2320,10 @@ mod tests {
             "content_type": "video/mp4"
         })];
         let result = process_attachments(&attachments, &client, None).await;
-        assert_eq!(result, "[VIDEO:https://cdn.discordapp.com/attachments/1/2/clip.mp4]");
+        assert_eq!(
+            result,
+            "[VIDEO:https://cdn.discordapp.com/attachments/1/2/clip.mp4]"
+        );
     }
 
     #[tokio::test]
@@ -2338,7 +2344,10 @@ mod tests {
         let result = process_attachments(&attachments, &client, None).await;
         assert!(result.contains("[IMAGE:https://cdn.discordapp.com/attachments/1/2/a.png]"));
         assert!(result.contains("[IMAGE:https://cdn.discordapp.com/attachments/1/2/b.jpg]"));
-        assert!(result.contains("\n---\n"), "multiple images must be separated by ---");
+        assert!(
+            result.contains("\n---\n"),
+            "multiple images must be separated by ---"
+        );
     }
 
     #[tokio::test]
@@ -2355,7 +2364,10 @@ mod tests {
         })];
         let result = process_attachments(&attachments, &client, Some(tmp.path())).await;
         // Download will fail (no real CDN), fallback to URL
-        assert_eq!(result, "[IMAGE:https://cdn.discordapp.com/attachments/1/2/fallback.png]");
+        assert_eq!(
+            result,
+            "[IMAGE:https://cdn.discordapp.com/attachments/1/2/fallback.png]"
+        );
     }
 
     #[test]
