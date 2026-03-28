@@ -40,7 +40,7 @@ impl Peripheral for RpiGpioPeripheral {
 
     async fn connect(&mut self) -> anyhow::Result<()> {
         // Verify GPIO is accessible by doing a no-op init
-        let result = tokio::task::spawn_blocking(|| rppal::gpio::Gpio::new()).await??;
+        let result = tokio::task::spawn_blocking(rppal::gpio::Gpio::new).await??;
         drop(result);
         Ok(())
     }
@@ -91,7 +91,8 @@ impl Tool for RpiGpioReadTool {
             .get("pin")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
-        let pin_u8 = pin as u8;
+        let pin_u8 = u8::try_from(pin)
+            .map_err(|_| anyhow::anyhow!("pin value {pin} out of range for u8"))?;
 
         let value = tokio::task::spawn_blocking(move || {
             let gpio = rppal::gpio::Gpio::new()?;
@@ -150,7 +151,8 @@ impl Tool for RpiGpioWriteTool {
             .get("value")
             .and_then(|v| v.as_u64())
             .ok_or_else(|| anyhow::anyhow!("Missing 'value' parameter"))?;
-        let pin_u8 = pin as u8;
+        let pin_u8 = u8::try_from(pin)
+            .map_err(|_| anyhow::anyhow!("pin value {pin} out of range for u8"))?;
         let level = match value {
             0 => rppal::gpio::Level::Low,
             _ => rppal::gpio::Level::High,

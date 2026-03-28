@@ -962,14 +962,15 @@ pub fn all_tools_with_runtime(
 
     // Workspace management tool (conditionally registered when workspace isolation is enabled)
     if root_config.workspace.enabled {
-        let workspaces_dir = if root_config.workspace.workspaces_dir.starts_with("~/") {
-            let home = directories::UserDirs::new()
-                .map(|u| u.home_dir().to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            home.join(&root_config.workspace.workspaces_dir[2..])
-        } else {
-            std::path::PathBuf::from(&root_config.workspace.workspaces_dir)
-        };
+        let workspaces_dir =
+            if let Some(stripped) = root_config.workspace.workspaces_dir.strip_prefix("~/") {
+                let home = directories::UserDirs::new()
+                    .map(|u| u.home_dir().to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                home.join(stripped)
+            } else {
+                std::path::PathBuf::from(&root_config.workspace.workspaces_dir)
+            };
         let ws_manager = crate::config::workspace::WorkspaceManager::new(workspaces_dir);
         tool_arcs.push(Arc::new(WorkspaceTool::new(
             Arc::new(tokio::sync::RwLock::new(ws_manager)),
@@ -993,11 +994,11 @@ pub fn all_tools_with_runtime(
     #[cfg(feature = "plugins-wasm")]
     {
         let plugin_dir = config.plugins.plugins_dir.clone();
-        let plugin_path = if plugin_dir.starts_with("~/") {
+        let plugin_path = if let Some(stripped) = plugin_dir.strip_prefix("~/") {
             let home = directories::UserDirs::new()
                 .map(|u| u.home_dir().to_path_buf())
                 .unwrap_or_else(|| std::path::PathBuf::from("."));
-            home.join(&plugin_dir[2..])
+            home.join(stripped)
         } else {
             std::path::PathBuf::from(&plugin_dir)
         };

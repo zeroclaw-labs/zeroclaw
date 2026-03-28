@@ -177,7 +177,8 @@ fn probe_read_memory(chip: &str, address: u64, length: usize) -> anyhow::Result<
                 }
             })
             .collect();
-        out.push_str(&format!("0x{:08X}  {:48}  {}\n", addr, hex, ascii));
+        use std::fmt::Write;
+        let _ = write!(out, "0x{addr:08X}  {hex:48}  {ascii}\n");
     }
     Ok(out)
 }

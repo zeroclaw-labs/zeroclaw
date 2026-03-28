@@ -124,10 +124,8 @@ fn collect_pdf_paths(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             collect_pdf_paths(&path, out);
-        } else if path.is_file() {
-            if path.extension().and_then(|e| e.to_str()) == Some("pdf") {
-                out.push(path);
-            }
+        } else if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("pdf") {
+            out.push(path);
         }
     }
 }

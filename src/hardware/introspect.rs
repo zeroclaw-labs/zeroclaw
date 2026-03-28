@@ -91,27 +91,31 @@ fn probe_memory_map(chip: &str) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("{}", e))?;
     let target = session.target();
     let mut out = String::new();
-    for region in target.memory_map.iter() {
+    for region in &target.memory_map {
         match region {
             MemoryRegion::Ram(ram) => {
+                use std::fmt::Write;
                 let (start, end) = (ram.range.start, ram.range.end);
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "RAM: 0x{:08X} - 0x{:08X} ({} KB)\n",
                     start,
                     end,
                     (end - start) / 1024
-                ));
+                );
             }
             MemoryRegion::Nvm(flash) => {
+                use std::fmt::Write;
                 let (start, end) = (flash.range.start, flash.range.end);
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "Flash: 0x{:08X} - 0x{:08X} ({} KB)\n",
                     start,
                     end,
                     (end - start) / 1024
-                ));
+                );
             }
-            _ => {}
+            MemoryRegion::Generic(_) => {}
         }
     }
     if out.is_empty() {

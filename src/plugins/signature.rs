@@ -12,20 +12,15 @@ use ring::signature::{self, Ed25519KeyPair, KeyPair};
 use super::error::PluginError;
 
 /// Signature mode controls how unsigned/unverified plugins are handled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SignatureMode {
     /// Reject plugins that are unsigned or fail verification.
     Strict,
     /// Warn but allow plugins that are unsigned or fail verification.
     Permissive,
     /// Do not check signatures at all.
+    #[default]
     Disabled,
-}
-
-impl Default for SignatureMode {
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 /// Result of verifying a plugin's signature.
@@ -65,7 +60,7 @@ fn b64u_decode(s: &str) -> Result<Vec<u8>, PluginError> {
 fn hex_decode(s: &str) -> Result<Vec<u8>, PluginError> {
     // Simple hex decoder
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(PluginError::SignatureInvalid(
             "hex string must have even length".into(),
         ));
@@ -80,7 +75,11 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, PluginError> {
 }
 
 fn hex_encode(data: &[u8]) -> String {
-    data.iter().map(|b| format!("{b:02x}")).collect()
+    use std::fmt::Write;
+    data.iter().fold(String::new(), |mut acc, b| {
+        let _ = write!(acc, "{b:02x}");
+        acc
+    })
 }
 
 // ── Canonical manifest bytes ──

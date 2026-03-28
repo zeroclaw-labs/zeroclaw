@@ -500,7 +500,9 @@ impl DeviceRegistry {
             // For unknown VIDs, run the ping handshake before registering.
             // This avoids registering random USB-serial adapters.
             // If the probe succeeds we reuse the same transport instance below.
-            let probe_transport = if !is_known_vid {
+            let probe_transport = if is_known_vid {
+                None
+            } else {
                 let probe = HardwareSerialTransport::new(&info.port_path, DEFAULT_BAUD);
                 if !probe.ping_handshake().await {
                     tracing::debug!(
@@ -510,8 +512,6 @@ impl DeviceRegistry {
                     continue;
                 }
                 Some(probe)
-            } else {
-                None
             };
 
             let board_name = info.board_name.as_deref().unwrap_or("unknown").to_string();

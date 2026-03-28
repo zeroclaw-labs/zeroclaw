@@ -144,7 +144,7 @@ async fn do_send(path: &str, baud: u32, json: &str) -> Result<ZcResponse, Transp
             // Match on the error kind for robust cross-platform disconnect detection.
             match e.kind {
                 tokio_serial::ErrorKind::NoDevice => TransportError::Disconnected,
-                tokio_serial::ErrorKind::Io(io_kind) if io_kind == std::io::ErrorKind::NotFound => {
+                tokio_serial::ErrorKind::Io(std::io::ErrorKind::NotFound) => {
                     TransportError::Disconnected
                 }
                 _ => TransportError::Other(format!("failed to open {path}: {e}")),

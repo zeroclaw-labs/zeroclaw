@@ -376,10 +376,12 @@ impl Tool for GpioRpiWriteTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
+        let pin_raw = args
             .get("pin")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))? as u8;
+            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
+        let pin = u8::try_from(pin_raw)
+            .map_err(|_| anyhow::anyhow!("pin value {pin_raw} out of range for u8"))?;
         let value = args
             .get("value")
             .and_then(|v| v.as_u64())
@@ -453,10 +455,12 @@ impl Tool for GpioRpiReadTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
+        let pin_raw = args
             .get("pin")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))? as u8;
+            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
+        let pin = u8::try_from(pin_raw)
+            .map_err(|_| anyhow::anyhow!("pin value {pin_raw} out of range for u8"))?;
 
         // Onboard ACT LED → read from sysfs
         if is_onboard_led(pin) {
@@ -534,10 +538,12 @@ impl Tool for GpioRpiBlinkTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let pin = args
+        let pin_raw = args
             .get("pin")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))? as u8;
+            .ok_or_else(|| anyhow::anyhow!("Missing 'pin' parameter"))?;
+        let pin = u8::try_from(pin_raw)
+            .map_err(|_| anyhow::anyhow!("pin value {pin_raw} out of range for u8"))?;
         let times = args
             .get("times")
             .and_then(|v| v.as_u64())

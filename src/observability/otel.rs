@@ -212,7 +212,12 @@ impl Observer for OtelObserver {
             | ObserverEvent::ToolCallStart { .. }
             | ObserverEvent::TurnComplete
             | ObserverEvent::CacheHit { .. }
-            | ObserverEvent::CacheMiss { .. } => {}
+            | ObserverEvent::CacheMiss { .. }
+            | ObserverEvent::HandStarted { .. }
+            | ObserverEvent::DeploymentStarted { .. }
+            | ObserverEvent::DeploymentCompleted { .. }
+            | ObserverEvent::DeploymentFailed { .. }
+            | ObserverEvent::RecoveryCompleted { .. } => {}
             ObserverEvent::LlmResponse {
                 provider,
                 model,
@@ -359,7 +364,6 @@ impl Observer for OtelObserver {
                 self.errors
                     .add(1, &[KeyValue::new("component", component.clone())]);
             }
-            ObserverEvent::HandStarted { .. } => {}
             ObserverEvent::HandCompleted {
                 hand_name,
                 duration_ms,
@@ -429,12 +433,6 @@ impl Observer for OtelObserver {
                 self.hand_runs.add(1, &attrs);
                 self.hand_duration
                     .record(secs, &[KeyValue::new("hand", hand_name.clone())]);
-            }
-            ObserverEvent::DeploymentStarted { .. }
-            | ObserverEvent::DeploymentCompleted { .. }
-            | ObserverEvent::DeploymentFailed { .. }
-            | ObserverEvent::RecoveryCompleted { .. } => {
-                // DORA deployment events: OTel pass-through not yet implemented.
             }
         }
     }

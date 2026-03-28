@@ -90,7 +90,7 @@ async fn resolve_device_port(
 }
 
 /// Return an unsupported-runtime error `ToolResult` for a given tool name.
-fn unsupported_runtime(runtime: &DeviceRuntime, tool: &str) -> ToolResult {
+fn unsupported_runtime(runtime: DeviceRuntime, tool: &str) -> ToolResult {
     ToolResult {
         success: false,
         output: String::new(),
@@ -186,7 +186,7 @@ impl Tool for DeviceReadCodeTool {
         // Runtime dispatch.
         match runtime {
             DeviceRuntime::MicroPython | DeviceRuntime::CircuitPython => {}
-            other => return Ok(unsupported_runtime(&other, "device_read_code")),
+            other => return Ok(unsupported_runtime(other, "device_read_code")),
         }
 
         tracing::info!(alias = %alias, port = %port, runtime = %runtime, "reading main.py from device");
@@ -306,7 +306,7 @@ impl Tool for DeviceWriteCodeTool {
         // Runtime dispatch.
         match runtime {
             DeviceRuntime::MicroPython | DeviceRuntime::CircuitPython => {}
-            other => return Ok(unsupported_runtime(&other, "device_write_code")),
+            other => return Ok(unsupported_runtime(other, "device_write_code")),
         }
 
         tracing::info!(alias = %alias, port = %port, runtime = %runtime, code_len = code.len(), "writing main.py to device");
@@ -479,7 +479,7 @@ impl Tool for DeviceExecTool {
         // Runtime dispatch.
         match runtime {
             DeviceRuntime::MicroPython | DeviceRuntime::CircuitPython => {}
-            other => return Ok(unsupported_runtime(&other, "device_exec")),
+            other => return Ok(unsupported_runtime(other, "device_exec")),
         }
 
         tracing::info!(alias = %alias, port = %port, runtime = %runtime, code_len = code.len(), "executing snippet on device");

@@ -169,27 +169,31 @@ fn probe_board_info(chip: &str) -> anyhow::Result<String> {
         "**Board:** {}\n**Chip:** {}\n**Architecture:** {:?}\n\n**Memory map:**\n",
         chip, target.name, arch
     );
-    for region in target.memory_map.iter() {
+    for region in &target.memory_map {
         match region {
             MemoryRegion::Ram(ram) => {
+                use std::fmt::Write;
                 let (start, end) = (ram.range.start, ram.range.end);
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "RAM: 0x{:08X} - 0x{:08X} ({} KB)\n",
                     start,
                     end,
                     (end - start) / 1024
-                ));
+                );
             }
             MemoryRegion::Nvm(flash) => {
+                use std::fmt::Write;
                 let (start, end) = (flash.range.start, flash.range.end);
-                out.push_str(&format!(
+                let _ = write!(
+                    out,
                     "Flash: 0x{:08X} - 0x{:08X} ({} KB)\n",
                     start,
                     end,
                     (end - start) / 1024
-                ));
+                );
             }
-            _ => {}
+            MemoryRegion::Generic(_) => {}
         }
     }
     out.push_str("\n(Info read via USB/SWD — no firmware on target needed.)");

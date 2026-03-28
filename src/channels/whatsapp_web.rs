@@ -617,7 +617,7 @@ impl Channel for WhatsAppWebChannel {
             ..Default::default()
         };
 
-        let message_id = client.send_message(to, outgoing).await?;
+        let message_id = Box::pin(client.send_message(to, outgoing)).await?;
         tracing::debug!(
             "WhatsApp Web: sent text to {} (id: {})",
             message.recipient,
@@ -666,7 +666,7 @@ impl Channel for WhatsAppWebChannel {
                 tracing::info!(
                     "WhatsApp Web: no existing session, new device will be created during pairing"
                 );
-            };
+            }
 
             // Create transport factory
             let mut transport_factory = TokioWebSocketTransportFactory::new();
@@ -910,7 +910,7 @@ impl Channel for WhatsAppWebChannel {
                                         // Reply to the originating chat JID (DM or group).
                                         reply_target: chat,
                                         content,
-                                        timestamp: chrono::Utc::now().timestamp() as u64,
+                                        timestamp: chrono::Utc::now().timestamp().unsigned_abs(),
                                         thread_ts: None,
                                         interruption_scope_id: None,
                     attachments: vec![],
