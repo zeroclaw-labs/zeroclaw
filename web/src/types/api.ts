@@ -130,6 +130,11 @@ export interface SSEEvent {
   [key: string]: any;
 }
 
+export interface SessionMessage {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
 export interface WsMessage {
   type: 'session_start' | 'message' | 'chunk' | 'chunk_reset' | 'thinking' | 'tool_call' | 'tool_result' | 'done' | 'error';
   type:

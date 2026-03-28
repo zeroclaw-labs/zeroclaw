@@ -56,6 +56,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.unknown_error': '未知错误',
     'agent.send_error': '发送消息失败，请重试。',
     'agent.copy_message': '复制消息',
+    'agent.load_more': '加载更多历史消息',
+    'agent.loading_more': '加载中...',
     'agent.connected_status': '已连接',
     'agent.disconnected_status': '已断开',
 
@@ -409,6 +411,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.unknown_error': 'Unknown error',
     'agent.send_error': 'Failed to send message. Please try again.',
     'agent.copy_message': 'Copy message',
+    'agent.load_more': 'Load earlier messages',
+    'agent.loading_more': 'Loading...',
     'agent.connected_status': 'Connected',
     'agent.disconnected_status': 'Disconnected',
 
@@ -808,6 +812,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.unknown_error': 'Bilinmeyen hata',
     'agent.send_error': 'Mesaj gönderilemedi. Lütfen tekrar deneyin.',
     'agent.copy_message': 'Mesajı kopyala',
+    'agent.load_more': 'Daha eski mesajları yükle',
+    'agent.loading_more': 'Yükleniyor...',
     'agent.connected_status': 'Bağlandı',
     'agent.disconnected_status': 'Bağlantı kesildi',
 
