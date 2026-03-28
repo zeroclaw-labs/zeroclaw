@@ -30,12 +30,12 @@ pub fn verify_line_signature(channel_secret: &str, body: &str, signature: &str) 
         return false;
     };
     mac.update(body.as_bytes());
-    let result = mac.finalize().into_bytes();
-    let expected = general_purpose::STANDARD.encode(result);
-    // Constant-time compare is not strictly required here because LINE sends
-    // the expected value to us (not the other way around), but we keep it
-    // simple and secure.
-    expected == signature
+    // Decode the incoming signature and verify with constant-time comparison
+    // (prevents timing-based side-channel attacks on the HMAC).
+    let Ok(sig_bytes) = general_purpose::STANDARD.decode(signature) else {
+        return false;
+    };
+    mac.verify_slice(&sig_bytes).is_ok()
 }
 
 // ── Incoming event structs ────────────────────────────────────────────────────
@@ -318,8 +318,27 @@ impl LineChannel {
             }
         };
 
+        // Guard against servers that omit Content-Length (checked above only when present).
+        if bytes.len() as u64 > LINE_MAX_IMAGE_BYTES {
+            tracing::warn!(
+                "LINE: skipping content {message_id}: body {} bytes > {} MB limit",
+                bytes.len(),
+                LINE_MAX_IMAGE_BYTES / (1024 * 1024)
+            );
+            return None;
+        }
+
+        // Sanitize IDs before using them as filename components to block path traversal.
         let safe_chat_id = chat_id.replace(['-', ':'], "_");
-        let filename = format!("line_{safe_chat_id}_{message_id}.{ext}");
+        let safe_msg_id: String = message_id
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+            .collect();
+        if safe_msg_id.is_empty() {
+            tracing::warn!("LINE: invalid message_id {message_id:?}, skipping download");
+            return None;
+        }
+        let filename = format!("line_{safe_chat_id}_{safe_msg_id}.{ext}");
         let local_path = save_dir.join(&filename);
 
         if let Err(e) = tokio::fs::write(&local_path, &bytes).await {
@@ -441,12 +460,13 @@ impl LineChannel {
                         }
                     }
                     None => {
-                        // API still unreachable — passthrough this message and
-                        // let the next webhook trigger another resolve attempt.
+                        // API still unreachable — fail-closed: drop the group message
+                        // rather than bypassing the mention filter.
                         tracing::warn!(
                             "LINE: mention_only is true but bot_display_name could not be resolved; \
-                             processing all group messages until LINE API is reachable"
+                             dropping group message (fail-closed)"
                         );
+                        continue;
                     }
                 }
             }
