@@ -114,9 +114,11 @@ mod tests {
     fn default_policy_allows_everything() {
         let enforcer = PolicyEnforcer::new(&empty_policy());
         assert!(!enforcer.is_read_only("default"));
-        assert!(enforcer
-            .validate_store("default", &MemoryCategory::Core)
-            .is_ok());
+        assert!(
+            enforcer
+                .validate_store("default", &MemoryCategory::Core)
+                .is_ok()
+        );
         assert!(enforcer.check_namespace_limit(100).is_ok());
         assert!(enforcer.check_category_limit(100).is_ok());
     }
@@ -131,12 +133,16 @@ mod tests {
 
         assert!(enforcer.is_read_only("archive"));
         assert!(!enforcer.is_read_only("default"));
-        assert!(enforcer
-            .validate_store("archive", &MemoryCategory::Core)
-            .is_err());
-        assert!(enforcer
-            .validate_store("default", &MemoryCategory::Core)
-            .is_ok());
+        assert!(
+            enforcer
+                .validate_store("archive", &MemoryCategory::Core)
+                .is_err()
+        );
+        assert!(
+            enforcer
+                .validate_store("default", &MemoryCategory::Core)
+                .is_ok()
+        );
     }
 
     #[test]

@@ -413,34 +413,6 @@ impl Default for SopMetricsCollector {
     }
 }
 
-// ── Conditional MetricsProvider impl ───────────────────────────
-
-#[cfg(feature = "ampersona-gates")]
-impl ampersona_core::traits::MetricsProvider for SopMetricsCollector {
-    fn get_metric(
-        &self,
-        query: &ampersona_core::traits::MetricQuery,
-    ) -> Result<ampersona_core::traits::MetricSample, ampersona_core::errors::MetricError> {
-        if self.inner.is_poisoned() {
-            return Err(ampersona_core::errors::MetricError::ProviderUnavailable);
-        }
-        let value = if let Some(ref window) = query.window {
-            // Window specified by evaluator (from Criterion.window_seconds)
-            self.get_metric_value_windowed(&query.name, window)
-        } else {
-            // No window — use name as-is (may include _7d/_30d suffix or be all-time)
-            self.get_metric_value(&query.name)
-        };
-        value
-            .map(|v| ampersona_core::traits::MetricSample {
-                name: query.name.clone(),
-                value: v,
-                sampled_at: Utc::now(),
-            })
-            .ok_or_else(|| ampersona_core::errors::MetricError::NotFound(query.name.clone()))
-    }
-}
-
 // ── Helpers ────────────────────────────────────────────────────
 
 fn build_snapshot(run: &SopRun, human_count: u64, timeout_count: u64) -> RunSnapshot {
@@ -637,6 +609,9 @@ mod tests {
         total_steps: u32,
         step_results: Vec<SopStepResult>,
     ) -> SopRun {
+        let now = Utc::now();
+        let started = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let completed = now.to_rfc3339();
         SopRun {
             run_id: run_id.into(),
             sop_name: sop_name.into(),
@@ -644,10 +619,11 @@ mod tests {
             status,
             current_step: total_steps,
             total_steps,
-            started_at: "2026-02-19T12:00:00Z".into(),
-            completed_at: Some("2026-02-19T12:05:00Z".into()),
+            started_at: started,
+            completed_at: Some(completed),
             step_results,
             waiting_since: None,
+            llm_calls_saved: 0,
         }
     }
 
@@ -1141,43 +1117,6 @@ mod tests {
         );
     }
 
-    // ── MetricsProvider impl (ampersona-gates feature) ───────
-
-    #[cfg(feature = "ampersona-gates")]
-    #[test]
-    fn metrics_provider_get_metric() {
-        use ampersona_core::traits::{MetricQuery, MetricsProvider};
-
-        let c = SopMetricsCollector::new();
-        let run = make_run(
-            "r1",
-            "test-sop",
-            SopRunStatus::Completed,
-            1,
-            vec![make_step(1, SopStepStatus::Completed)],
-        );
-        c.record_run_complete(&run);
-
-        let query = MetricQuery {
-            name: "sop.runs_completed".into(),
-            window: None,
-        };
-        let sample = c.get_metric(&query).unwrap();
-        assert_eq!(sample.value, json!(1u64));
-        assert_eq!(sample.name, "sop.runs_completed");
-
-        // NotFound for unknown metric
-        let bad_query = MetricQuery {
-            name: "sop.nonexistent".into(),
-            window: None,
-        };
-        let err = c.get_metric(&bad_query).unwrap_err();
-        assert!(matches!(
-            err,
-            ampersona_core::errors::MetricError::NotFound(_)
-        ));
-    }
-
     // ── Warm-start tests ─────────────────────────────────────
 
     #[tokio::test]
@@ -1245,6 +1184,7 @@ mod tests {
             completed_at: None,
             step_results: vec![],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         audit.log_run_start(&run).await.unwrap();
 
@@ -1342,6 +1282,7 @@ mod tests {
             completed_at: None,
             step_results: vec![],
             waiting_since: None,
+            llm_calls_saved: 0,
         };
         audit.log_run_start(&running_run).await.unwrap();
         audit.log_approval(&running_run, 1).await.unwrap();
@@ -1385,7 +1326,7 @@ mod tests {
         assert_eq!(hic_7d, 1);
     }
 
-    // ── Windowed MetricsProvider tests (ampersona-gates feature) ──
+    // ── Windowed MetricsProvider tests ──
 
     #[test]
     fn get_metric_windowed_7d_matches_suffix() {
@@ -1460,33 +1401,5 @@ mod tests {
             .as_u64()
             .unwrap();
         assert_eq!(val, 2);
-    }
-
-    #[cfg(feature = "ampersona-gates")]
-    #[test]
-    fn get_metric_provider_window_propagation() {
-        use ampersona_core::traits::{MetricQuery, MetricsProvider};
-
-        let c = SopMetricsCollector::new();
-        let run = make_run(
-            "r1",
-            "test-sop",
-            SopRunStatus::Completed,
-            1,
-            vec![make_step(1, SopStepStatus::Completed)],
-        );
-        c.record_run_complete(&run);
-
-        // Query with window via MetricsProvider trait
-        let query = MetricQuery {
-            name: "sop.runs_completed".into(),
-            window: Some(std::time::Duration::from_secs(7 * 86400)),
-        };
-        let sample = c.get_metric(&query).unwrap();
-        assert_eq!(sample.value, json!(1u64));
-
-        // Same result as suffix-based query
-        let suffix_val = c.get_metric_value("sop.runs_completed_7d");
-        assert_eq!(Some(sample.value), suffix_val);
     }
 }

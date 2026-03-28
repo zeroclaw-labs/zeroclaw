@@ -147,7 +147,7 @@ impl Tool for PushoverTool {
                     error: Some(format!(
                         "Invalid 'priority': {value}. Expected integer in range -2..=2"
                     )),
-                })
+                });
             }
             None => None,
         };

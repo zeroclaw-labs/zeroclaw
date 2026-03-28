@@ -1,15 +1,16 @@
 use super::embeddings::EmbeddingProvider;
-use super::traits::{Memory, MemoryCategory, MemoryEntry};
+use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry};
 use super::vector;
+use crate::config::schema::SearchMode;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -32,6 +33,7 @@ pub struct SqliteMemory {
     vector_weight: f32,
     keyword_weight: f32,
     cache_max: usize,
+    search_mode: SearchMode,
 }
 
 impl SqliteMemory {
@@ -43,6 +45,7 @@ impl SqliteMemory {
             0.3,
             10_000,
             None,
+            SearchMode::default(),
         )
     }
 
@@ -68,6 +71,7 @@ impl SqliteMemory {
             vector_weight: 0.7,
             keyword_weight: 0.3,
             cache_max: 10_000,
+            search_mode: SearchMode::default(),
         })
     }
 
@@ -83,6 +87,7 @@ impl SqliteMemory {
         keyword_weight: f32,
         cache_max: usize,
         open_timeout_secs: Option<u64>,
+        search_mode: SearchMode,
     ) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("brain.db");
 
@@ -115,6 +120,7 @@ impl SqliteMemory {
             vector_weight,
             keyword_weight,
             cache_max,
+            search_mode,
         })
     }
 
@@ -610,8 +616,12 @@ impl Memory for SqliteMemory {
                 .await;
         }
 
-        // Compute query embedding (async, before blocking work)
-        let query_embedding = self.get_or_compute_embedding(query).await?;
+        // Compute query embedding only when needed (skip for BM25-only mode)
+        let query_embedding = if self.search_mode == SearchMode::Bm25 {
+            None
+        } else {
+            self.get_or_compute_embedding(query).await?
+        };
 
         let conn = self.conn.clone();
         let query = query.to_string();
@@ -620,6 +630,7 @@ impl Memory for SqliteMemory {
         let until_owned = until.map(String::from);
         let vector_weight = self.vector_weight;
         let keyword_weight = self.keyword_weight;
+        let search_mode = self.search_mode.clone();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
             let conn = conn.lock();
@@ -627,17 +638,23 @@ impl Memory for SqliteMemory {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            // FTS5 BM25 keyword search
-            let keyword_results = Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default();
+            // FTS5 BM25 keyword search (skip for embedding-only mode)
+            let keyword_results = if search_mode == SearchMode::Embedding {
+                Vec::new()
+            } else {
+                Self::fts5_search(&conn, &query, limit * 2).unwrap_or_default()
+            };
 
-            // Vector similarity search (if embeddings available)
-            let vector_results = if let Some(ref qe) = query_embedding {
+            // Vector similarity search (skip for BM25-only mode)
+            let vector_results = if search_mode == SearchMode::Bm25 {
+                Vec::new()
+            } else if let Some(ref qe) = query_embedding {
                 Self::vector_search(&conn, qe, limit * 2, None, session_ref).unwrap_or_default()
             } else {
                 Vec::new()
             };
 
-            // Hybrid merge
+            // Merge results based on search mode
             let merged = if vector_results.is_empty() {
                 keyword_results
                     .iter()
@@ -645,6 +662,16 @@ impl Memory for SqliteMemory {
                         id: id.clone(),
                         vector_score: None,
                         keyword_score: Some(*score),
+                        final_score: *score,
+                    })
+                    .collect::<Vec<_>>()
+            } else if keyword_results.is_empty() {
+                vector_results
+                    .iter()
+                    .map(|(id, score)| vector::ScoredResult {
+                        id: id.clone(),
+                        vector_score: Some(*score),
+                        keyword_score: None,
                         final_score: *score,
                     })
                     .collect::<Vec<_>>()
@@ -926,6 +953,38 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn purge_namespace(&self, namespace: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let namespace = namespace.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE category = ?1",
+                params![namespace],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected as usize)
+        })
+        .await?
+    }
+
+    async fn purge_session(&self, session_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let session_id = session_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let conn = conn.lock();
+            let affected = conn.execute(
+                "DELETE FROM memories WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            Ok(affected as usize)
+        })
+        .await?
+    }
+
     async fn count(&self) -> anyhow::Result<usize> {
         let conn = self.conn.clone();
 
@@ -944,6 +1003,73 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
             .await
             .unwrap_or(false)
+    }
+
+    async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
+        let conn = self.conn.clone();
+        let filter = filter.clone();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemoryEntry>> {
+            let conn = conn.lock();
+            let mut sql =
+                "SELECT id, key, content, category, created_at, session_id, namespace, importance, superseded_by \
+                 FROM memories WHERE 1=1"
+                    .to_string();
+            let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            let mut idx = 1;
+
+            if let Some(ref ns) = filter.namespace {
+                let _ = write!(sql, " AND namespace = ?{idx}");
+                param_values.push(Box::new(ns.clone()));
+                idx += 1;
+            }
+            if let Some(ref sid) = filter.session_id {
+                let _ = write!(sql, " AND session_id = ?{idx}");
+                param_values.push(Box::new(sid.clone()));
+                idx += 1;
+            }
+            if let Some(ref cat) = filter.category {
+                let _ = write!(sql, " AND category = ?{idx}");
+                param_values.push(Box::new(Self::category_to_str(cat)));
+                idx += 1;
+            }
+            if let Some(ref since) = filter.since {
+                let _ = write!(sql, " AND created_at >= ?{idx}");
+                param_values.push(Box::new(since.clone()));
+                idx += 1;
+            }
+            if let Some(ref until) = filter.until {
+                let _ = write!(sql, " AND created_at <= ?{idx}");
+                param_values.push(Box::new(until.clone()));
+                let _ = idx;
+            }
+            sql.push_str(" ORDER BY created_at ASC");
+
+            let mut stmt = conn.prepare(&sql)?;
+            let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                param_values.iter().map(AsRef::as_ref).collect();
+            let rows = stmt.query_map(params_ref.as_slice(), |row| {
+                Ok(MemoryEntry {
+                    id: row.get(0)?,
+                    key: row.get(1)?,
+                    content: row.get(2)?,
+                    category: Self::str_to_category(&row.get::<_, String>(3)?),
+                    timestamp: row.get(4)?,
+                    session_id: row.get(5)?,
+                    score: None,
+                    namespace: row.get::<_, Option<String>>(6)?.unwrap_or_else(|| "default".into()),
+                    importance: row.get(7)?,
+                    superseded_by: row.get(8)?,
+                })
+            })?;
+
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            Ok(results)
+        })
+        .await?
     }
 
     async fn recall_namespaced(
@@ -1085,9 +1211,11 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|r| r.content.to_lowercase().contains("rust")));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.content.to_lowercase().contains("rust"))
+        );
     }
 
     #[tokio::test]
@@ -1461,7 +1589,15 @@ mod tests {
     fn open_with_timeout_succeeds_when_fast() {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
-        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, Some(5));
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            embedder,
+            0.7,
+            0.3,
+            1000,
+            Some(5),
+            SearchMode::default(),
+        );
         assert!(
             mem.is_ok(),
             "open with 5s timeout should succeed on fast path"
@@ -1479,6 +1615,7 @@ mod tests {
             0.3,
             1000,
             Some(2),
+            SearchMode::default(),
         )
         .unwrap();
         mem.store(
@@ -1499,7 +1636,15 @@ mod tests {
     fn with_embedder_noop() {
         let tmp = TempDir::new().unwrap();
         let embedder = Arc::new(super::super::embeddings::NoopEmbedding);
-        let mem = SqliteMemory::with_embedder(tmp.path(), embedder, 0.7, 0.3, 1000, None);
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            embedder,
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::default(),
+        );
         assert!(mem.is_ok());
         assert_eq!(mem.unwrap().name(), "sqlite");
     }
@@ -1831,7 +1976,7 @@ mod tests {
         mem.reindex().await.unwrap();
         let count = mem.reindex().await.unwrap();
         assert_eq!(count, 0); // Noop embedder → nothing to re-embed
-                              // Data should still be intact
+        // Data should still be intact
         let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -1918,6 +2063,157 @@ mod tests {
         let (_tmp, mem) = temp_sqlite();
         let all = mem.list(None, None).await.unwrap();
         assert!(all.is_empty());
+    }
+
+    // ── Bulk deletion tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn sqlite_purge_namespace_removes_all_matching_entries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a1", "data1", MemoryCategory::Custom("ns1".into()), None)
+            .await
+            .unwrap();
+        mem.store("a2", "data2", MemoryCategory::Custom("ns1".into()), None)
+            .await
+            .unwrap();
+        mem.store("b1", "data3", MemoryCategory::Custom("ns2".into()), None)
+            .await
+            .unwrap();
+
+        let count = mem.purge_namespace("ns1").await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_namespace_preserves_other_namespaces() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a1", "data1", MemoryCategory::Custom("ns1".into()), None)
+            .await
+            .unwrap();
+        mem.store("b1", "data2", MemoryCategory::Custom("ns2".into()), None)
+            .await
+            .unwrap();
+        mem.store("c1", "data3", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("d1", "data4", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let count = mem.purge_namespace("ns1").await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(mem.count().await.unwrap(), 3);
+
+        let remaining = mem.list(None, None).await.unwrap();
+        assert!(
+            remaining
+                .iter()
+                .all(|e| e.category != MemoryCategory::Custom("ns1".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_namespace_returns_count() {
+        let (_tmp, mem) = temp_sqlite();
+        for i in 0..5 {
+            mem.store(
+                &format!("k{i}"),
+                "data",
+                MemoryCategory::Custom("target".into()),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+
+        let count = mem.purge_namespace("target").await.unwrap();
+        assert_eq!(count, 5);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_session_removes_all_matching_entries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a1", "data1", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("a2", "data2", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("b1", "data3", MemoryCategory::Core, Some("sess-b"))
+            .await
+            .unwrap();
+
+        let count = mem.purge_session("sess-a").await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_session_preserves_other_sessions() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a1", "data1", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("b1", "data2", MemoryCategory::Core, Some("sess-b"))
+            .await
+            .unwrap();
+        mem.store("c1", "data3", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let count = mem.purge_session("sess-a").await.unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(mem.count().await.unwrap(), 2);
+
+        let remaining = mem.list(None, None).await.unwrap();
+        assert!(
+            remaining
+                .iter()
+                .all(|e| e.session_id.as_deref() != Some("sess-a"))
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_session_returns_count() {
+        let (_tmp, mem) = temp_sqlite();
+        for i in 0..3 {
+            mem.store(
+                &format!("k{i}"),
+                "data",
+                MemoryCategory::Core,
+                Some("target-sess"),
+            )
+            .await
+            .unwrap();
+        }
+
+        let count = mem.purge_session("target-sess").await.unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_namespace_empty_namespace_is_noop() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let count = mem.purge_namespace("").await.unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn sqlite_purge_session_empty_session_is_noop() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "data", MemoryCategory::Core, Some("sess"))
+            .await
+            .unwrap();
+
+        let count = mem.purge_session("").await.unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(mem.count().await.unwrap(), 1);
     }
 
     // ── Session isolation ─────────────────────────────────────────
@@ -2009,9 +2305,11 @@ mod tests {
         // List with session-a filter
         let results = mem.list(None, Some("sess-a")).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|e| e.session_id.as_deref() == Some("sess-a")));
+        assert!(
+            results
+                .iter()
+                .all(|e| e.session_id.as_deref() == Some("sess-a"))
+        );
 
         // List with session-a + category filter
         let results = mem
@@ -2123,6 +2421,227 @@ mod tests {
         assert_eq!(mem.count().await.unwrap(), 6);
     }
 
+    // ── Export (GDPR Art. 20) tests ─────────────────────────
+
+    #[tokio::test]
+    async fn export_no_filter_returns_all_entries() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "one", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "two", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+        mem.store("c", "three", MemoryCategory::Conversation, None)
+            .await
+            .unwrap();
+
+        let filter = ExportFilter::default();
+        let results = mem.export(&filter).await.unwrap();
+        assert_eq!(results.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn export_with_namespace_filter() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store_with_metadata(
+            "a",
+            "ns1 data",
+            MemoryCategory::Core,
+            None,
+            Some("ns1"),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store_with_metadata(
+            "b",
+            "ns2 data",
+            MemoryCategory::Core,
+            None,
+            Some("ns2"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let filter = ExportFilter {
+            namespace: Some("ns1".into()),
+            ..Default::default()
+        };
+        let results = mem.export(&filter).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].namespace, "ns1");
+    }
+
+    #[tokio::test]
+    async fn export_with_session_id_filter() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "sess-a data", MemoryCategory::Core, Some("sess-a"))
+            .await
+            .unwrap();
+        mem.store("b", "sess-b data", MemoryCategory::Core, Some("sess-b"))
+            .await
+            .unwrap();
+
+        let filter = ExportFilter {
+            session_id: Some("sess-a".into()),
+            ..Default::default()
+        };
+        let results = mem.export(&filter).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "a");
+    }
+
+    #[tokio::test]
+    async fn export_with_category_filter() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("a", "core data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "daily data", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let filter = ExportFilter {
+            category: Some(MemoryCategory::Core),
+            ..Default::default()
+        };
+        let results = mem.export(&filter).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].category, MemoryCategory::Core);
+    }
+
+    #[tokio::test]
+    async fn export_with_time_range() {
+        let (_tmp, mem) = temp_sqlite();
+        // Store entries — created_at is set to Local::now() by store()
+        mem.store("a", "old data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("b", "new data", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Export with a time range that covers everything
+        let filter = ExportFilter {
+            since: Some("2000-01-01T00:00:00Z".into()),
+            until: Some("2099-12-31T23:59:59Z".into()),
+            ..Default::default()
+        };
+        let results = mem.export(&filter).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Export with a time range in the far future (no results)
+        let filter = ExportFilter {
+            since: Some("2099-01-01T00:00:00Z".into()),
+            ..Default::default()
+        };
+        let results = mem.export(&filter).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_with_combined_filters() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store_with_metadata(
+            "a",
+            "match",
+            MemoryCategory::Core,
+            Some("sess-a"),
+            Some("ns1"),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store_with_metadata(
+            "b",
+            "no match ns",
+            MemoryCategory::Core,
+            Some("sess-a"),
+            Some("ns2"),
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store_with_metadata(
+            "c",
+            "no match sess",
+            MemoryCategory::Core,
+            None,
+            Some("ns1"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let filter = ExportFilter {
+            namespace: Some("ns1".into()),
+            session_id: Some("sess-a".into()),
+            category: Some(MemoryCategory::Core),
+            since: Some("2000-01-01T00:00:00Z".into()),
+            until: Some("2099-12-31T23:59:59Z".into()),
+        };
+        let results = mem.export(&filter).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "a");
+    }
+
+    #[tokio::test]
+    async fn export_empty_database_returns_empty_vec() {
+        let (_tmp, mem) = temp_sqlite();
+        let filter = ExportFilter::default();
+        let results = mem.export(&filter).await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn export_ordering_is_chronological() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store("first", "data1", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        // Small delay to ensure different timestamps
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        mem.store("second", "data2", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let filter = ExportFilter::default();
+        let results = mem.export(&filter).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results[0].timestamp <= results[1].timestamp,
+            "Export must be ordered by created_at ASC"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_preserves_field_integrity() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store_with_metadata(
+            "roundtrip_key",
+            "roundtrip content",
+            MemoryCategory::Custom("custom_cat".into()),
+            Some("sess-rt"),
+            Some("ns-rt"),
+            Some(0.9),
+        )
+        .await
+        .unwrap();
+
+        let filter = ExportFilter::default();
+        let results = mem.export(&filter).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let e = &results[0];
+        assert_eq!(e.key, "roundtrip_key");
+        assert_eq!(e.content, "roundtrip content");
+        assert_eq!(e.category, MemoryCategory::Custom("custom_cat".into()));
+        assert_eq!(e.session_id.as_deref(), Some("sess-rt"));
+        assert_eq!(e.namespace, "ns-rt");
+        assert_eq!(e.importance, Some(0.9));
+    }
+
     // ── §4.2 Reindex / corruption recovery tests ────────────
 
     #[tokio::test]
@@ -2158,5 +2677,93 @@ mod tests {
         mem.reindex().await.unwrap();
 
         assert_eq!(mem.count().await.unwrap(), 1);
+    }
+
+    // ── SearchMode tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn search_mode_bm25_only() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Bm25,
+        )
+        .unwrap();
+        mem.store(
+            "lang",
+            "User prefers Rust programming",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.store("food", "User likes pizza", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        assert!(!results.is_empty(), "BM25 mode should find keyword matches");
+        assert!(
+            results.iter().any(|e| e.content.contains("Rust")),
+            "BM25 should match on keyword 'Rust'"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_mode_embedding_only() {
+        let tmp = TempDir::new().unwrap();
+        // NoopEmbedding returns None, so embedding-only mode will fall back to LIKE
+        let mem = SqliteMemory::with_embedder(
+            tmp.path(),
+            Arc::new(super::super::embeddings::NoopEmbedding),
+            0.7,
+            0.3,
+            1000,
+            None,
+            SearchMode::Embedding,
+        )
+        .unwrap();
+        mem.store(
+            "lang",
+            "User prefers Rust programming",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // With NoopEmbedding, vector search returns empty, and FTS is skipped.
+        // The recall method falls back to LIKE search.
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        // LIKE fallback should still find it
+        assert!(
+            results.iter().any(|e| e.content.contains("Rust")),
+            "Embedding mode with noop should fall back to LIKE and still find results"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_mode_hybrid_default() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        // Default search mode should be Hybrid
+        assert_eq!(mem.search_mode, SearchMode::Hybrid);
+
+        mem.store(
+            "lang",
+            "User prefers Rust programming",
+            MemoryCategory::Core,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
+        assert!(!results.is_empty(), "Hybrid mode should find results");
     }
 }

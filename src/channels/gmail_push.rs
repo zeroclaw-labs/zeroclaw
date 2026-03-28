@@ -17,16 +17,16 @@
 //! The channel automatically calls `users.watch` to register the subscription
 //! and renews it before the 7-day expiry.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use reqwest::Client;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
@@ -494,6 +494,7 @@ impl GmailPushChannel {
                         timestamp,
                         thread_ts: Some(gmail_msg.thread_id),
                         interruption_scope_id: None,
+                        attachments: Vec::new(),
                     };
 
                     if tx.send(channel_msg).await.is_err() {

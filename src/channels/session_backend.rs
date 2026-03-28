@@ -94,6 +94,43 @@ pub trait SessionBackend: Send + Sync {
     fn get_session_name(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Ok(None)
     }
+
+    /// Set the session state (e.g. "idle", "running", "error").
+    /// `turn_id` identifies the current turn (set when running, cleared on idle).
+    fn set_session_state(
+        &self,
+        _session_key: &str,
+        _state: &str,
+        _turn_id: Option<&str>,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the current session state. Returns `None` if the backend doesn't track state.
+    fn get_session_state(&self, _session_key: &str) -> std::io::Result<Option<SessionState>> {
+        Ok(None)
+    }
+
+    /// List sessions currently in "running" state.
+    fn list_running_sessions(&self) -> Vec<SessionMetadata> {
+        Vec::new()
+    }
+
+    /// List sessions stuck in "running" state longer than `threshold_secs`.
+    fn list_stuck_sessions(&self, _threshold_secs: u64) -> Vec<SessionMetadata> {
+        Vec::new()
+    }
+}
+
+/// Session state information.
+#[derive(Debug, Clone)]
+pub struct SessionState {
+    /// Current state: "idle", "running", or "error".
+    pub state: String,
+    /// Turn ID of the active or last turn.
+    pub turn_id: Option<String>,
+    /// When the current state was entered.
+    pub turn_started_at: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
