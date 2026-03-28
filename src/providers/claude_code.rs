@@ -293,15 +293,9 @@ impl Provider for ClaudeCodeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::test_util::env_lock;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
-    }
+    use std::sync::OnceLock;
 
     /// Serialize tests that spawn the echo-provider script.
     ///
@@ -419,28 +413,38 @@ mod tests {
     /// Helper: create a provider that uses a shell script echoing stdin back.
     /// The script ignores CLI flags (`--print`, `--model`, `-`) and just cats stdin.
     ///
-    /// Each invocation places the script in its own unique directory and writes
-    /// the file atomically via `std::fs::write` to avoid `ETXTBSY` ("Text file
-    /// busy") races that occur when parallel test threads create and exec
-    /// scripts concurrently on the same filesystem.
+    /// Uses write-to-temp-then-rename to avoid ETXTBSY ("Text file busy")
+    /// races: the final path is never open for writing when `execve()` runs.
     fn echo_provider() -> ClaudeCodeProvider {
         static SCRIPT_ID: AtomicUsize = AtomicUsize::new(0);
         let script_id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "zeroclaw_test_claude_code_{}_{}",
+        let final_path = dir.join(format!(
+            "fake_claude_{}_{}.sh",
             std::process::id(),
             script_id
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-
-        let path = dir.join("fake_claude.sh");
-        std::fs::write(&path, "#!/bin/sh\ncat /dev/stdin\n").unwrap();
+        // Write to a temporary file, then rename. This ensures the final
+        // path was never opened for writing in this process, preventing
+        // ETXTBSY when the kernel still holds an inode write reference.
+        let tmp_path = dir.join(format!(
+            ".tmp_fake_claude_{}_{}.sh",
+            std::process::id(),
+            script_id
+        ));
+        {
+            let mut f = std::fs::File::create(&tmp_path).unwrap();
+            writeln!(f, "#!/bin/sh\ncat /dev/stdin").unwrap();
+            f.sync_all().unwrap();
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        ClaudeCodeProvider { binary_path: path }
+        std::fs::rename(&tmp_path, &final_path).unwrap();
+        ClaudeCodeProvider {
+            binary_path: final_path,
+        }
     }
 
     #[test]

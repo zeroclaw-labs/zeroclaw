@@ -767,44 +767,7 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned")
-    }
-
-    struct EnvGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: Option<&str>) -> Self {
-            let original = std::env::var(key).ok();
-            match value {
-                // SAFETY: test-only, single-threaded test runner.
-                Some(next) => unsafe { std::env::set_var(key, next) },
-                // SAFETY: test-only, single-threaded test runner.
-                None => unsafe { std::env::remove_var(key) },
-            }
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            if let Some(original) = self.original.as_deref() {
-                // SAFETY: test-only, single-threaded test runner.
-                unsafe { std::env::set_var(self.key, original) };
-            } else {
-                // SAFETY: test-only, single-threaded test runner.
-                unsafe { std::env::remove_var(self.key) };
-            }
-        }
-    }
+    use crate::providers::test_util::{env_lock, EnvGuard};
 
     #[test]
     fn extracts_output_text_first() {
