@@ -3,6 +3,7 @@ pub enum WebSearchProviderRoute {
     DuckDuckGo,
     Brave,
     SearXNG,
+    Tavily,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +16,7 @@ pub struct WebSearchProviderResolution {
 pub const DEFAULT_WEB_SEARCH_PROVIDER: &str = "duckduckgo";
 const BRAVE_PROVIDER: &str = "brave";
 const SEARXNG_PROVIDER: &str = "searxng";
+const TAVILY_PROVIDER: &str = "tavily";
 
 pub fn resolve_web_search_provider(raw_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_provider.trim().to_ascii_lowercase();
@@ -34,6 +36,11 @@ pub fn resolve_web_search_provider(raw_provider: &str) -> WebSearchProviderResol
         "searxng" | "searx" | "searx-ng" | "searx_ng" => WebSearchProviderResolution {
             route: WebSearchProviderRoute::SearXNG,
             canonical_provider: SEARXNG_PROVIDER,
+            used_fallback: false,
+        },
+        "tavily" | "tavily-search" | "tavily_search" => WebSearchProviderResolution {
+            route: WebSearchProviderRoute::Tavily,
+            canonical_provider: TAVILY_PROVIDER,
             used_fallback: false,
         },
         _ => WebSearchProviderResolution {
@@ -77,6 +84,17 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::SearXNG);
             assert_eq!(resolved.canonical_provider, SEARXNG_PROVIDER);
+            assert!(!resolved.used_fallback);
+        }
+    }
+
+    #[test]
+    fn resolve_aliases_to_tavily() {
+        let tavily_aliases = ["tavily", "tavily-search", "tavily_search"];
+        for alias in tavily_aliases {
+            let resolved = resolve_web_search_provider(alias);
+            assert_eq!(resolved.route, WebSearchProviderRoute::Tavily);
+            assert_eq!(resolved.canonical_provider, TAVILY_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }

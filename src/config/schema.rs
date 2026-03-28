@@ -2796,12 +2796,15 @@ pub struct WebSearchConfig {
     /// Enable `web_search_tool` for web searches
     #[serde(default)]
     pub enabled: bool,
-    /// Search provider: "duckduckgo" (free), "brave" (requires API key), or "searxng" (self-hosted)
+    /// Search provider: "duckduckgo" (free), "brave" (requires API key), "searxng" (self-hosted), or "tavily" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// Tavily API key (required if provider is "tavily")
+    #[serde(default)]
+    pub tavily_api_key: Option<String>,
     /// SearXNG instance URL (required if provider is "searxng"), e.g. "https://searx.example.com"
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -2831,6 +2834,7 @@ impl Default for WebSearchConfig {
             enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            tavily_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
@@ -9065,6 +9069,12 @@ impl Config {
 
             decrypt_optional_secret(
                 &store,
+                &mut config.web_search.tavily_api_key,
+                "config.web_search.tavily_api_key",
+            )?;
+
+            decrypt_optional_secret(
+                &store,
                 &mut config.storage.provider.config.db_url,
                 "config.storage.provider.config.db_url",
             )?;
@@ -10361,6 +10371,16 @@ impl Config {
             }
         }
 
+        // Tavily API key: ZEROCLAW_TAVILY_API_KEY or TAVILY_API_KEY
+        if let Ok(api_key) =
+            std::env::var("ZEROCLAW_TAVILY_API_KEY").or_else(|_| std::env::var("TAVILY_API_KEY"))
+        {
+            let api_key = api_key.trim();
+            if !api_key.is_empty() {
+                self.web_search.tavily_api_key = Some(api_key.to_string());
+            }
+        }
+
         // SearXNG instance URL: ZEROCLAW_SEARXNG_INSTANCE_URL or SEARXNG_INSTANCE_URL
         if let Ok(instance_url) = std::env::var("ZEROCLAW_SEARXNG_INSTANCE_URL")
             .or_else(|_| std::env::var("SEARXNG_INSTANCE_URL"))
@@ -10555,6 +10575,12 @@ impl Config {
             &store,
             &mut config_to_save.web_search.brave_api_key,
             "config.web_search.brave_api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.web_search.tavily_api_key,
+            "config.web_search.tavily_api_key",
         )?;
 
         encrypt_optional_secret(
