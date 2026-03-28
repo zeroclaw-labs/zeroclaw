@@ -97,9 +97,6 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
-# Tar/gzip extraction (update pipeline)
-flate2 = "1.1"
-tar = "0.4"
 
 # Zip extraction for ClawhHub / OpenClaw registry installers
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
