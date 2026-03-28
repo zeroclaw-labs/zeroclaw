@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -17,6 +18,7 @@ pub struct MattermostChannel {
     /// Static bot token from config. `None` when using credential-based auth.
     bot_token: Option<String>,
     channel_id: Option<String>,
+    channel_ids: Vec<String>,
     allowed_users: Vec<String>,
     /// When true (default), replies thread on the original post's root_id.
     /// When false, replies go to the channel root.
@@ -63,6 +65,7 @@ impl MattermostChannel {
         base_url: String,
         bot_token: Option<String>,
         channel_id: Option<String>,
+        channel_ids: Vec<String>,
         allowed_users: Vec<String>,
         thread_replies: bool,
         mention_only: bool,
@@ -73,6 +76,7 @@ impl MattermostChannel {
             base_url,
             bot_token,
             channel_id,
+            channel_ids,
             allowed_users,
             thread_replies,
             mention_only,
@@ -190,17 +194,22 @@ impl MattermostChannel {
     /// real-time event streaming. Automatically reconnects with exponential backoff.
     async fn listen_ws(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         // WebSocket mode receives events from all channels the bot can see.
-        // When channel_id is set, only events for that channel are processed.
-        let filter_channel_id = self.channel_id.clone();
+        // When scoped channels are configured, only events for those channels are processed.
+        let scoped_channels = self.scoped_channel_ids();
 
         let (bot_user_id, bot_username) = self.get_bot_identity().await;
 
-        tracing::info!(
-            "Mattermost channel listening (websocket){}...",
-            filter_channel_id
-                .as_deref()
-                .map_or(String::new(), |id| format!(" on {id}"))
-        );
+        if let Some(ref channel_ids) = scoped_channels {
+            tracing::info!(
+                "Mattermost channel listening (websocket) on {} configured channel(s): {}",
+                channel_ids.len(),
+                channel_ids.join(", ")
+            );
+        } else {
+            tracing::info!(
+                "Mattermost channel listening (websocket) on all accessible channels"
+            );
+        }
 
         let mut reconnect_attempt: u32 = 0;
         const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -336,7 +345,7 @@ impl MattermostChannel {
                                     text.as_ref(),
                                     &bot_user_id,
                                     &bot_username,
-                                    filter_channel_id.as_deref(),
+                                    scoped_channels.as_deref(),
                                 ).await {
                                     if tx.send(msg).await.is_err() {
                                         return Ok(());
@@ -386,7 +395,7 @@ impl MattermostChannel {
         raw: &str,
         bot_user_id: &str,
         bot_username: &str,
-        filter_channel_id: Option<&str>,
+        scoped_channels: Option<&[String]>,
     ) -> Option<ChannelMessage> {
         let event: serde_json::Value = serde_json::from_str(raw).ok()?;
 
@@ -403,20 +412,20 @@ impl MattermostChannel {
             .and_then(|p| p.as_str())?;
         let post: serde_json::Value = serde_json::from_str(post_str).ok()?;
 
-        // Filter by channel_id when configured; otherwise accept all channels.
+        // Filter by configured channel scope; otherwise accept all channels.
         let post_channel = post
             .get("channel_id")
             .and_then(|c| c.as_str())
             .unwrap_or("");
-        if let Some(filter) = filter_channel_id {
-            if post_channel != filter {
+        if let Some(configured_channels) = scoped_channels {
+            if !configured_channels.iter().any(|id| id == post_channel) {
                 return None;
             }
         }
 
         // Use the post's own channel_id for reply routing.
         let effective_channel_id = if post_channel.is_empty() {
-            filter_channel_id.unwrap_or("")
+            ""
         } else {
             post_channel
         };
@@ -445,6 +454,104 @@ impl MattermostChannel {
             effective_channel_id,
             effective_text.as_deref(),
         )
+    }
+
+    fn normalized_channel_id(input: Option<&str>) -> Option<String> {
+        input
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && *v != "*")
+            .map(ToOwned::to_owned)
+    }
+
+    fn configured_channel_id(&self) -> Option<String> {
+        Self::normalized_channel_id(self.channel_id.as_deref())
+    }
+
+    /// Resolve the effective channel scope:
+    /// explicit `channel_ids` list first, then single `channel_id`, otherwise wildcard discovery.
+    fn scoped_channel_ids(&self) -> Option<Vec<String>> {
+        let mut seen = HashSet::new();
+        let ids: Vec<String> = self
+            .channel_ids
+            .iter()
+            .filter_map(|entry| Self::normalized_channel_id(Some(entry)))
+            .filter(|id| seen.insert(id.clone()))
+            .collect();
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+        self.configured_channel_id().map(|id| vec![id])
+    }
+
+    /// List all channels the bot is a member of across all teams.
+    async fn list_accessible_channels(&self) -> Result<Vec<String>> {
+        let token = self.effective_token().await?;
+        let client = self.http_client();
+
+        // 1. Get teams the bot belongs to
+        let teams_resp = client
+            .get(format!("{}/api/v4/users/me/teams", self.base_url))
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        if !teams_resp.status().is_success() {
+            bail!(
+                "Mattermost: failed to list teams ({})",
+                teams_resp.status()
+            );
+        }
+        let teams: Vec<serde_json::Value> = teams_resp.json().await?;
+
+        // 2. For each team, get the bot's channels
+        let mut channels = Vec::new();
+        let bot_user_id = {
+            let (id, _) = self.get_bot_identity().await;
+            id
+        };
+
+        for team in &teams {
+            let team_id = team.get("id").and_then(|i| i.as_str()).unwrap_or("");
+            if team_id.is_empty() {
+                continue;
+            }
+            let ch_resp = client
+                .get(format!(
+                    "{}/api/v4/users/{}/teams/{}/channels",
+                    self.base_url, bot_user_id, team_id
+                ))
+                .bearer_auth(&token)
+                .send()
+                .await;
+            let ch_resp = match ch_resp {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "Mattermost: failed to list channels for team {team_id}: {e}"
+                    );
+                    continue;
+                }
+            };
+            if !ch_resp.status().is_success() {
+                continue;
+            }
+            let ch_list: Vec<serde_json::Value> = match ch_resp.json().await {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for ch in &ch_list {
+                let delete_at = ch.get("delete_at").and_then(|d| d.as_i64()).unwrap_or(0);
+                if delete_at != 0 {
+                    continue; // archived
+                }
+                if let Some(id) = ch.get("id").and_then(|i| i.as_str()) {
+                    channels.push(id.to_string());
+                }
+            }
+        }
+
+        channels.sort();
+        channels.dedup();
+        Ok(channels)
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -719,10 +826,7 @@ impl Channel for MattermostChannel {
 impl MattermostChannel {
     /// Polling-based listener — polls the REST API every 3 seconds.
     async fn listen_polling(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_id = self
-            .channel_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Mattermost channel_id required for listening"))?;
+        let scoped_channels = self.scoped_channel_ids();
 
         let (bot_user_id, bot_username) = self.get_bot_identity().await;
         #[allow(clippy::cast_possible_truncation)]
@@ -731,7 +835,22 @@ impl MattermostChannel {
             .unwrap_or_default()
             .as_millis()) as i64;
 
-        tracing::info!("Mattermost channel listening (polling) on {}...", channel_id);
+        // Auto-discovery state for wildcard mode.
+        let mut discovered_channels: Vec<String> = Vec::new();
+        let mut last_discovery = tokio::time::Instant::now() - Duration::from_secs(120);
+
+        if let Some(ref channel_ids) = scoped_channels {
+            tracing::info!(
+                "Mattermost channel listening (polling) on {} configured channel(s): {}",
+                channel_ids.len(),
+                channel_ids.join(", ")
+            );
+        } else {
+            tracing::info!(
+                "Mattermost channel_id/channel_ids not set (or wildcard only); \
+                 listening across all accessible channels."
+            );
+        }
 
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -744,69 +863,98 @@ impl MattermostChannel {
                 }
             };
 
-            let resp = match self
-                .http_client()
-                .get(format!(
-                    "{}/api/v4/channels/{}/posts",
-                    self.base_url, channel_id
-                ))
-                .bearer_auth(&token)
-                .query(&[("since", last_create_at.to_string())])
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("Mattermost poll error: {e}");
-                    continue;
+            // Resolve target channels for this poll cycle.
+            let target_channels = if let Some(ref channel_ids) = scoped_channels {
+                channel_ids.clone()
+            } else {
+                // Auto-discover channels every 60 seconds in wildcard mode.
+                if discovered_channels.is_empty()
+                    || last_discovery.elapsed() >= Duration::from_secs(60)
+                {
+                    match self.list_accessible_channels().await {
+                        Ok(channels) => {
+                            if channels != discovered_channels {
+                                tracing::info!(
+                                    "Mattermost auto-discovery refreshed: listening on {} channel(s).",
+                                    channels.len()
+                                );
+                            }
+                            discovered_channels = channels;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Mattermost channel discovery failed: {e}");
+                        }
+                    }
+                    last_discovery = tokio::time::Instant::now();
                 }
+                discovered_channels.clone()
             };
 
-            let data: serde_json::Value = match resp.json().await {
-                Ok(d) => d,
-                Err(e) => {
-                    tracing::warn!("Mattermost parse error: {e}");
-                    continue;
-                }
-            };
+            for channel_id in &target_channels {
+                let resp = match self
+                    .http_client()
+                    .get(format!(
+                        "{}/api/v4/channels/{}/posts",
+                        self.base_url, channel_id
+                    ))
+                    .bearer_auth(&token)
+                    .query(&[("since", last_create_at.to_string())])
+                    .send()
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("Mattermost poll error on {channel_id}: {e}");
+                        continue;
+                    }
+                };
 
-            if let Some(posts) = data.get("posts").and_then(|p| p.as_object()) {
-                // Process in chronological order
-                let mut post_list: Vec<_> = posts.values().collect();
-                post_list
-                    .sort_by_key(|p| p.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0));
+                let data: serde_json::Value = match resp.json().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::warn!("Mattermost parse error on {channel_id}: {e}");
+                        continue;
+                    }
+                };
 
-                let last_create_at_before_this_batch = last_create_at;
-                for post in post_list {
-                    let create_at = post
-                        .get("create_at")
-                        .and_then(|c| c.as_i64())
-                        .unwrap_or(last_create_at);
-                    last_create_at = last_create_at.max(create_at);
+                if let Some(posts) = data.get("posts").and_then(|p| p.as_object()) {
+                    // Process in chronological order
+                    let mut post_list: Vec<_> = posts.values().collect();
+                    post_list
+                        .sort_by_key(|p| p.get("create_at").and_then(|c| c.as_i64()).unwrap_or(0));
 
-                    let effective_text = if post
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("")
-                        .trim()
-                        .is_empty()
-                        && post_has_audio_attachment(post)
-                    {
-                        self.try_transcribe_audio_attachment(post).await
-                    } else {
-                        None
-                    };
+                    let last_create_at_before_this_batch = last_create_at;
+                    for post in post_list {
+                        let create_at = post
+                            .get("create_at")
+                            .and_then(|c| c.as_i64())
+                            .unwrap_or(last_create_at);
+                        last_create_at = last_create_at.max(create_at);
 
-                    if let Some(channel_msg) = self.parse_mattermost_post(
-                        post,
-                        &bot_user_id,
-                        &bot_username,
-                        last_create_at_before_this_batch,
-                        &channel_id,
-                        effective_text.as_deref(),
-                    ) {
-                        if tx.send(channel_msg).await.is_err() {
-                            return Ok(());
+                        let effective_text = if post
+                            .get("message")
+                            .and_then(|m| m.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .is_empty()
+                            && post_has_audio_attachment(post)
+                        {
+                            self.try_transcribe_audio_attachment(post).await
+                        } else {
+                            None
+                        };
+
+                        if let Some(channel_msg) = self.parse_mattermost_post(
+                            post,
+                            &bot_user_id,
+                            &bot_username,
+                            last_create_at_before_this_batch,
+                            channel_id,
+                            effective_text.as_deref(),
+                        ) {
+                            if tx.send(channel_msg).await.is_err() {
+                                return Ok(());
+                            }
                         }
                     }
                 }
@@ -1058,6 +1206,7 @@ mod tests {
             "url".into(),
             Some("token".into()),
             None,
+            vec![],
             allowed,
             thread_replies,
             false,
@@ -1070,6 +1219,7 @@ mod tests {
             "url".into(),
             Some("token".into()),
             None,
+            vec![],
             vec!["*".into()],
             true,
             true,
@@ -1082,6 +1232,7 @@ mod tests {
             "https://mm.example.com/".into(),
             Some("token".into()),
             None,
+            vec![],
             vec![],
             false,
             false,
@@ -1863,6 +2014,7 @@ mod tests {
                 mock_server.uri(),
                 Some("test_token".to_string()),
                 None,
+                vec![],
                 vec!["*".into()],
                 false,
                 false,
@@ -1913,6 +2065,7 @@ mod tests {
                 mock_server.uri(),
                 Some("test_token".to_string()),
                 None,
+                vec![],
                 vec!["*".into()],
                 false,
                 false,
@@ -1954,5 +2107,98 @@ mod tests {
             let result = ch.try_transcribe_audio_attachment(&post).await;
             assert!(result.is_none());
         }
+    }
+
+    #[test]
+    fn normalized_channel_id_respects_wildcard_and_blank() {
+        assert_eq!(MattermostChannel::normalized_channel_id(None), None);
+        assert_eq!(MattermostChannel::normalized_channel_id(Some("")), None);
+        assert_eq!(MattermostChannel::normalized_channel_id(Some("   ")), None);
+        assert_eq!(MattermostChannel::normalized_channel_id(Some("*")), None);
+        assert_eq!(MattermostChannel::normalized_channel_id(Some(" * ")), None);
+        assert_eq!(
+            MattermostChannel::normalized_channel_id(Some(" abc123 ")),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn scoped_channel_ids_prefers_explicit_list() {
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            Some("C_SINGLE".into()),
+            vec!["C_LIST1".into(), "C_LIST2".into()],
+            vec![],
+            false,
+            false,
+        );
+        assert_eq!(
+            ch.scoped_channel_ids(),
+            Some(vec!["C_LIST1".to_string(), "C_LIST2".to_string()])
+        );
+    }
+
+    #[test]
+    fn scoped_channel_ids_falls_back_to_single_channel_id() {
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            Some("C_SINGLE".into()),
+            vec![],
+            vec![],
+            false,
+            false,
+        );
+        assert_eq!(
+            ch.scoped_channel_ids(),
+            Some(vec!["C_SINGLE".to_string()])
+        );
+    }
+
+    #[test]
+    fn scoped_channel_ids_returns_none_for_wildcard() {
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            vec![],
+            vec![],
+            false,
+            false,
+        );
+        assert_eq!(ch.scoped_channel_ids(), None);
+    }
+
+    #[test]
+    fn scoped_channel_ids_wildcard_in_list_is_ignored() {
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            vec!["*".into()],
+            vec![],
+            false,
+            false,
+        );
+        // "*" normalizes to None, so the list is empty → falls back to channel_id (also None) → wildcard
+        assert_eq!(ch.scoped_channel_ids(), None);
+    }
+
+    #[test]
+    fn scoped_channel_ids_deduplicates() {
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            vec!["C1".into(), "C2".into(), "C1".into()],
+            vec![],
+            false,
+            false,
+        );
+        assert_eq!(
+            ch.scoped_channel_ids(),
+            Some(vec!["C1".to_string(), "C2".to_string()])
+        );
     }
 }

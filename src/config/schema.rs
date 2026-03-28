@@ -6558,6 +6558,11 @@ pub struct MattermostConfig {
     pub bot_token: Option<String>,
     /// Optional channel ID to restrict the bot to a single channel.
     pub channel_id: Option<String>,
+    /// Optional list of channel IDs to monitor. Takes precedence over
+    /// `channel_id`. Use `["*"]` or omit both to listen on all accessible
+    /// channels (wildcard / auto-discovery mode).
+    #[serde(default)]
+    pub channel_ids: Vec<String>,
     /// Allowed Mattermost user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
