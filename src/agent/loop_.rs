@@ -1093,6 +1093,8 @@ fn map_tool_name_alias(tool_name: &str) -> &str {
         "memoryforget" | "memory_forget" | "forget" | "memforget" => "memory_forget",
         // HTTP variations
         "http_request" | "http" | "fetch" | "curl" | "wget" => "http_request",
+        // Skill invocation variations
+        "useskill" | "use_skill" | "skill" | "invoke_skill" => "use_skill",
         _ => tool_name,
     }
 }
@@ -3725,15 +3727,10 @@ pub async fn run(
             "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain.",
         ),
     ];
-    if matches!(
-        config.skills.prompt_injection_mode,
-        crate::config::SkillsPromptInjectionMode::Compact
-    ) {
-        tool_descs.push((
-            "read_skill",
-            "Load the full source for an available skill by name. Use when: compact mode only shows a summary and you need the complete skill instructions.",
-        ));
-    }
+    tool_descs.push((
+        "use_skill",
+        "Invoke a skill by name. BLOCKING REQUIREMENT: when the user's request matches a skill description in <available_skills> or the user mentions a skill by name, invoke use_skill BEFORE generating any other response. Don't use when: no available skill matches the user's intent.",
+    ));
     tool_descs.push((
         "cron_add",
         "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
@@ -4627,15 +4624,7 @@ pub async fn process_message(
         ("screenshot", "Capture a screenshot."),
         ("image_info", "Read image metadata."),
     ];
-    if matches!(
-        config.skills.prompt_injection_mode,
-        crate::config::SkillsPromptInjectionMode::Compact
-    ) {
-        tool_descs.push((
-            "read_skill",
-            "Load the full source for an available skill by name.",
-        ));
-    }
+    tool_descs.push(("use_skill", "Invoke a skill by name."));
     if config.browser.enabled {
         tool_descs.push(("browser_open", "Open approved URLs in browser."));
     }

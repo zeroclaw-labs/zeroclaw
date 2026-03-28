@@ -9,6 +9,7 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,9 @@ pub struct SkillShellTool {
     tool_description: String,
     command_template: String,
     args: HashMap<String, String>,
+    /// The skill's root directory. Commands execute with this as the working
+    /// directory so that relative paths in skill scripts resolve correctly.
+    skill_dir: PathBuf,
     security: Arc<SecurityPolicy>,
 }
 
@@ -30,10 +34,13 @@ impl SkillShellTool {
     /// Create a new skill shell tool.
     ///
     /// The tool name is prefixed with the skill name (`skill_name.tool_name`)
-    /// to prevent collisions with built-in tools.
+    /// to prevent collisions with built-in tools. The `skill_dir` is used as
+    /// the working directory so relative paths in skill commands resolve
+    /// correctly.
     pub fn new(
         skill_name: &str,
         tool: &crate::skills::SkillTool,
+        skill_dir: PathBuf,
         security: Arc<SecurityPolicy>,
     ) -> Self {
         Self {
@@ -41,6 +48,7 @@ impl SkillShellTool {
             tool_description: tool.description.clone(),
             command_template: tool.command.clone(),
             args: tool.args.clone(),
+            skill_dir,
             security,
         }
     }
@@ -137,20 +145,17 @@ impl Tool for SkillShellTool {
             });
         }
 
-        // Build and execute the command
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(&command);
-        cmd.current_dir(&self.security.workspace_dir);
+        cmd.current_dir(&self.skill_dir);
         cmd.env_clear();
 
-        // Only pass safe environment variables
-        for var in &[
-            "PATH", "HOME", "TERM", "LANG", "LC_ALL", "USER", "SHELL", "TMPDIR",
-        ] {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
+        for var in super::shell::collect_allowed_shell_env_vars(&self.security) {
+            if let Ok(val) = std::env::var(&var) {
+                cmd.env(&var, val);
             }
         }
+        cmd.env("SKILL_DIR", &self.skill_dir);
 
         let result =
             tokio::time::timeout(Duration::from_secs(SKILL_SHELL_TIMEOUT_SECS), cmd.output()).await;
@@ -236,19 +241,19 @@ mod tests {
 
     #[test]
     fn skill_shell_tool_name_is_prefixed() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), std::env::temp_dir(), test_security());
         assert_eq!(tool.name(), "my_skill.run_lint");
     }
 
     #[test]
     fn skill_shell_tool_description() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), std::env::temp_dir(), test_security());
         assert_eq!(tool.description(), "Run the linter on a file");
     }
 
     #[test]
     fn skill_shell_tool_parameters_schema() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), std::env::temp_dir(), test_security());
         let schema = tool.parameters_schema();
 
         assert_eq!(schema["type"], "object");
@@ -264,7 +269,7 @@ mod tests {
 
     #[test]
     fn skill_shell_tool_substitute_args() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), std::env::temp_dir(), test_security());
         let result = tool.substitute_args(&serde_json::json!({
             "file": "src/main.rs",
             "format": "json"
@@ -274,7 +279,7 @@ mod tests {
 
     #[test]
     fn skill_shell_tool_substitute_missing_arg() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), std::env::temp_dir(), test_security());
         let result = tool.substitute_args(&serde_json::json!({"file": "test.rs"}));
         // Missing {{format}} placeholder stays in the command
         assert!(result.contains("{{format}}"));
@@ -290,7 +295,7 @@ mod tests {
             command: "echo hello".to_string(),
             args: HashMap::new(),
         };
-        let tool = SkillShellTool::new("s", &st, test_security());
+        let tool = SkillShellTool::new("s", &st, std::env::temp_dir(), test_security());
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"].as_object().unwrap().is_empty());
@@ -306,7 +311,7 @@ mod tests {
             command: "echo hello-skill".to_string(),
             args: HashMap::new(),
         };
-        let tool = SkillShellTool::new("test", &st, test_security());
+        let tool = SkillShellTool::new("test", &st, std::env::temp_dir(), test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("hello-skill"));
@@ -314,7 +319,7 @@ mod tests {
 
     #[test]
     fn skill_shell_tool_spec_roundtrip() {
-        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), test_security());
+        let tool = SkillShellTool::new("my_skill", &sample_skill_tool(), std::env::temp_dir(), test_security());
         let spec = tool.spec();
         assert_eq!(spec.name, "my_skill.run_lint");
         assert_eq!(spec.description, "Run the linter on a file");

@@ -680,7 +680,7 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
     meta
 }
 
-fn split_skill_frontmatter(content: &str) -> Option<(String, String)> {
+pub(crate) fn split_skill_frontmatter(content: &str) -> Option<(String, String)> {
     let normalized = content.replace("\r\n", "\n");
     let rest = normalized.strip_prefix("---\n")?;
     if let Some(idx) = rest.find("\n---\n") {
@@ -729,23 +729,102 @@ fn write_xml_text_element(out: &mut String, indent: usize, tag: &str, value: &st
     out.push_str(">\n");
 }
 
-fn resolve_skill_location(skill: &Skill, workspace_dir: &Path) -> PathBuf {
-    skill.location.clone().unwrap_or_else(|| {
-        workspace_dir
-            .join("skills")
-            .join(&skill.name)
-            .join("SKILL.md")
-    })
+/// Resolve the skill's root directory (not the file).
+pub(crate) fn resolve_skill_dir(skill: &Skill, workspace_dir: &Path) -> PathBuf {
+    skill
+        .location
+        .as_ref()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| workspace_dir.join("skills").join(&skill.name))
+}
+
+/// Resolve relative paths in skill content to absolute paths.
+///
+/// Scans the text for tokens that look like relative file paths (e.g.
+/// `scripts/cli.py`, `./references/guide.md`) and, when the referenced file
+/// actually exists under `skill_dir`, replaces the occurrence with its
+/// absolute path.  This lets the LLM invoke scripts without needing to know
+/// or remember the skill directory — the harness resolves it upfront.
+pub(crate) fn resolve_relative_paths(content: &str, skill_dir: &Path) -> String {
+    // Match tokens that look like relative paths: optionally preceded by a
+    // boundary character (whitespace, backtick, quote, paren) or start of
+    // string; optionally prefixed with ./; must contain at least one `/`
+    // (to distinguish from bare filenames or version strings); and end with
+    // a filename-like extension followed by a boundary or end of string.
+    //
+    // NOTE: The `regex` crate does not support look-around, so boundary
+    // characters are captured and preserved during replacement instead.
+    // Group 1: optional boundary before path (preserved in output)
+    // Group 2: optional ./ prefix
+    // Group 3: the relative path itself
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(?:^|([\s`"'(]))(\./)?([a-zA-Z0-9_][a-zA-Z0-9_./-]*/[a-zA-Z0-9_][a-zA-Z0-9_./-]*\.[a-zA-Z0-9]+)(?:[\s`"'),:;]|$)"#,
+        )
+        .expect("valid regex")
+    });
+    let re = &*RE;
+
+    let mut result = String::with_capacity(content.len());
+    let mut last_end = 0;
+
+    for caps in re.captures_iter(content) {
+        let full_match = caps.get(0).unwrap();
+        let rel_path = caps.get(3).unwrap().as_str();
+        let candidate = skill_dir.join(rel_path);
+
+        if candidate.exists() {
+            let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let path_end = caps.get(3).unwrap().end();
+            let suffix = &content[path_end..full_match.end()];
+
+            result.push_str(&content[last_end..full_match.start()]);
+            result.push_str(prefix);
+            result.push_str(&candidate.display().to_string());
+            result.push_str(suffix);
+            last_end = full_match.end();
+        }
+    }
+    result.push_str(&content[last_end..]);
+    result
+}
+
+/// List bundled resources (scripts, references, assets) in a skill directory.
+///
+/// Returns a list of relative paths suitable for inclusion in the activation
+/// output so the LLM knows what files are available without reading them.
+pub(crate) fn list_skill_resources(skill_dir: &Path) -> Vec<String> {
+    let mut resources = Vec::new();
+    let interesting_dirs = ["scripts", "references", "assets"];
+
+    for dir_name in &interesting_dirs {
+        let dir = skill_dir.join(dir_name);
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Ok(rel) = path.strip_prefix(skill_dir) {
+                        resources.push(rel.display().to_string());
+                    }
+                }
+            }
+        }
+    }
+    resources.sort();
+    resources
 }
 
 fn render_skill_location(skill: &Skill, workspace_dir: &Path, prefer_relative: bool) -> String {
-    let location = resolve_skill_location(skill, workspace_dir);
+    let dir = resolve_skill_dir(skill, workspace_dir);
     if prefer_relative {
-        if let Ok(relative) = location.strip_prefix(workspace_dir) {
+        if let Ok(relative) = dir.strip_prefix(workspace_dir) {
             return relative.display().to_string();
         }
     }
-    location.display().to_string()
+    dir.display().to_string()
 }
 
 /// Build the "Available Skills" system prompt section with full skill instructions.
@@ -775,16 +854,20 @@ pub fn skills_to_prompt_with_mode(
              Skill instructions and tool metadata are preloaded below.\n\
              Follow these instructions directly; do not read skill files at runtime unless the user asks. \
              Never make up a script name; you must always follow the instructions and tool definitions provided within the skill file.\n\
-             CRITICAL RULE: Relative skill script paths in the SKILL.md are relative to the skill root. The shell command MUST always first `cd` into the skill's `location` before executing any shell commands from the skill instructions.\n\n\
+             Each skill's <description> defines when to use it. \
+             When the user's request matches a skill description — including when they mention a skill by name or use a slash command — \
+             you MUST call `use_skill` with that skill's name BEFORE generating any other response.\n\n\
              <available_skills>\n",
         ),
         crate::config::SkillsPromptInjectionMode::Compact => String::from(
             "## Available Skills\n\n\
              Skill summaries are preloaded below to keep context compact.\n\
-             Skill instructions are loaded on demand: call `read_skill(name)` with the skill's `<name>` when you need the full skill file.\n\
-             The `location` field is included for reference. \
+             Skill instructions are loaded on demand via `use_skill(name)`.\n\
+             The `location` field is the skill's root directory. \
              Never make up a script name; you must always follow the instructions and tool definitions provided within the skill file.\n\
-             CRITICAL RULE: Relative skill script paths in the SKILL.md are relative to the skill root. The shell command MUST always first `cd` into the skill's `location` before executing any shell commands from the skill instructions.\n\n\
+             Each skill's <description> defines when to use it. \
+             When the user's request matches a skill description — including when they mention a skill by name or use a slash command — \
+             you MUST call `use_skill` with that skill's name BEFORE generating any other response.\n\n\
              <available_skills>\n",
         ),
     };
@@ -806,9 +889,11 @@ pub fn skills_to_prompt_with_mode(
         if matches!(mode, crate::config::SkillsPromptInjectionMode::Full)
             && !skill.prompts.is_empty()
         {
+            let skill_dir = resolve_skill_dir(skill, workspace_dir);
             let _ = writeln!(prompt, "    <instructions>");
             for instruction in &skill.prompts {
-                write_xml_text_element(&mut prompt, 6, "instruction", instruction);
+                let resolved = resolve_relative_paths(instruction, &skill_dir);
+                write_xml_text_element(&mut prompt, 6, "instruction", &resolved);
             }
             let _ = writeln!(prompt, "    </instructions>");
         }
@@ -879,12 +964,14 @@ pub fn skills_to_tools(
 ) -> Vec<Box<dyn crate::tools::traits::Tool>> {
     let mut tools: Vec<Box<dyn crate::tools::traits::Tool>> = Vec::new();
     for skill in skills {
+        let skill_dir = resolve_skill_dir(skill, &security.workspace_dir);
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
                     tools.push(Box::new(crate::tools::skill_tool::SkillShellTool::new(
                         &skill.name,
                         tool,
+                        skill_dir.clone(),
                         security.clone(),
                     )));
                 }
@@ -1707,9 +1794,10 @@ command = "echo hello"
 
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>test</name>"));
-        assert!(prompt.contains("<location>skills/test/SKILL.md</location>"));
+        assert!(prompt.contains("<location>skills/test</location>"));
         assert!(prompt.contains("loaded on demand"));
-        assert!(prompt.contains("read_skill(name)"));
+        assert!(prompt.contains("use_skill(name)"));
+        assert!(!prompt.contains("read_skill"));
         assert!(!prompt.contains("<instructions>"));
         assert!(!prompt.contains("<instruction>Do the thing.</instruction>"));
         // Compact mode should still include tools so the LLM knows about them.
@@ -2239,6 +2327,101 @@ command = "obsidian search {{query}}"
         let skills = load_skills_from_directory(&skills_dir, true);
         assert_eq!(skills.len(), 1, "skill should load when allow_scripts=true");
         assert_eq!(skills[0].name, "obsidian");
+    }
+
+    #[test]
+    fn resolve_relative_paths_replaces_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts_dir = dir.path().join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::write(scripts_dir.join("cli.py"), "# script").unwrap();
+
+        let content = "Run `uv run scripts/cli.py search` to search.";
+        let resolved = resolve_relative_paths(content, dir.path());
+        let expected_path = scripts_dir.join("cli.py").display().to_string();
+        assert!(
+            resolved.contains(&expected_path),
+            "Expected resolved path in output, got: {resolved}"
+        );
+        // The relative path token should be gone — only the absolute one remains.
+        assert_eq!(
+            resolved.matches("scripts/cli.py").count(),
+            1,
+            "relative path should appear exactly once (inside the absolute path), got: {resolved}"
+        );
+    }
+
+    #[test]
+    fn resolve_relative_paths_leaves_nonexistent_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "Run `uv run scripts/missing.py` to do stuff.";
+        let resolved = resolve_relative_paths(content, dir.path());
+        assert_eq!(resolved, content);
+    }
+
+    #[test]
+    fn resolve_relative_paths_handles_dot_slash_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts_dir = dir.path().join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::write(scripts_dir.join("run.sh"), "#!/bin/bash").unwrap();
+
+        let content = "Execute ./scripts/run.sh to deploy.";
+        let resolved = resolve_relative_paths(content, dir.path());
+        let expected_path = scripts_dir.join("run.sh").display().to_string();
+        assert!(
+            resolved.contains(&expected_path),
+            "Expected resolved path in output, got: {resolved}"
+        );
+    }
+
+    #[test]
+    fn list_skill_resources_finds_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let scripts_dir = dir.path().join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::write(scripts_dir.join("cli.py"), "# script").unwrap();
+        fs::write(scripts_dir.join("__init__.py"), "").unwrap();
+        // SKILL.md should not appear in resources
+        fs::write(dir.path().join("SKILL.md"), "# Skill").unwrap();
+
+        let resources = list_skill_resources(dir.path());
+        assert!(resources.contains(&"scripts/__init__.py".to_string()));
+        assert!(resources.contains(&"scripts/cli.py".to_string()));
+        assert!(!resources.iter().any(|r| r.contains("SKILL.md")));
+    }
+
+    #[test]
+    fn list_skill_resources_empty_when_no_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let resources = list_skill_resources(dir.path());
+        assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn skills_to_prompt_full_mode_resolves_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("skills").join("myskill");
+        let scripts_dir = skill_dir.join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::write(scripts_dir.join("run.py"), "# script").unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: myskill\ndescription: test\n---\n\nRun `uv run scripts/run.py`\n",
+        )
+        .unwrap();
+
+        let skills = load_skills_from_directory(&dir.path().join("skills"), true);
+        assert_eq!(skills.len(), 1);
+
+        let prompt = skills_to_prompt(&skills, dir.path());
+        let abs_path = scripts_dir.join("run.py").display().to_string();
+        assert!(
+            prompt.contains(&abs_path),
+            "Full mode prompt should contain resolved absolute path, got: {}",
+            &prompt[prompt.find("<instructions>").unwrap_or(0)
+                ..prompt.find("</instructions>").unwrap_or(prompt.len())]
+        );
     }
 }
 

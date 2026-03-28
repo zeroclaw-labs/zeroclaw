@@ -488,7 +488,8 @@ mod tests {
         assert!(output.contains("<available_skills>"));
         assert!(output.contains("<name>deploy</name>"));
         assert!(output.contains("<location>skills/deploy/SKILL.md</location>"));
-        assert!(output.contains("read_skill(name)"));
+        assert!(output.contains("use_skill(name)"));
+        assert!(!output.contains("read_skill"));
         assert!(!output.contains("<instruction>Run smoke tests before deploy.</instruction>"));
         // Compact mode should still include tools so the LLM knows about them.
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names.

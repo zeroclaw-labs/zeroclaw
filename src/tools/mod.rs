@@ -85,7 +85,6 @@ pub mod project_intel;
 pub mod proxy_config;
 pub mod pushover;
 pub mod reaction;
-pub mod read_skill;
 pub mod report_template_tool;
 pub mod report_templates;
 pub mod schedule;
@@ -105,6 +104,7 @@ pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
 pub mod traits;
+pub mod use_skill;
 pub mod verifiable_intent;
 pub mod weather_tool;
 pub mod web_fetch;
@@ -181,7 +181,6 @@ pub use project_intel::ProjectIntelTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
 pub use reaction::ReactionTool;
-pub use read_skill::ReadSkillTool;
 pub use report_template_tool::ReportTemplateTool;
 pub use schedule::ScheduleTool;
 #[allow(unused_imports)]
@@ -205,6 +204,7 @@ pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
 pub use traits::{ToolResult, ToolSpec};
+pub use use_skill::UseSkillTool;
 pub use verifiable_intent::VerifiableIntentTool;
 pub use weather_tool::WeatherTool;
 pub use web_fetch::WebFetchTool;
@@ -492,16 +492,13 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    if matches!(
+    // use_skill works in both Full and Compact modes.
+    tool_arcs.push(Arc::new(UseSkillTool::new(
+        workspace_dir.to_path_buf(),
+        root_config.skills.open_skills_enabled,
+        root_config.skills.open_skills_dir.clone(),
         root_config.skills.prompt_injection_mode,
-        crate::config::SkillsPromptInjectionMode::Compact
-    ) {
-        tool_arcs.push(Arc::new(ReadSkillTool::new(
-            workspace_dir.to_path_buf(),
-            root_config.skills.open_skills_enabled,
-            root_config.skills.open_skills_dir.clone(),
-        )));
-    }
+    )));
 
     if browser_config.enabled {
         // Add legacy browser_open tool for simple URL opening
@@ -1346,73 +1343,4 @@ mod tests {
         assert!(!names.contains(&"delegate"));
     }
 
-    #[test]
-    fn all_tools_includes_read_skill_in_compact_mode() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let mut cfg = test_config(&tmp);
-        cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
-
-        let (tools, _, _, _, _, _) = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"read_skill"));
-    }
-
-    #[test]
-    fn all_tools_excludes_read_skill_in_full_mode() {
-        let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
-        let mem_cfg = MemoryConfig {
-            backend: "markdown".into(),
-            ..MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> =
-            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
-
-        let browser = BrowserConfig::default();
-        let http = crate::config::HttpRequestConfig::default();
-        let mut cfg = test_config(&tmp);
-        cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
-
-        let (tools, _, _, _, _, _) = all_tools(
-            Arc::new(cfg.clone()),
-            &security,
-            mem,
-            None,
-            None,
-            &browser,
-            &http,
-            &crate::config::WebFetchConfig::default(),
-            tmp.path(),
-            &HashMap::new(),
-            None,
-            &cfg,
-            None,
-        );
-        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(!names.contains(&"read_skill"));
-    }
 }
