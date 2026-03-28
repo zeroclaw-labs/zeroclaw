@@ -6,10 +6,10 @@
 //! Uses `ring` for ECDSA P-256 (already a dependency) and `sha2`/`base64`
 //! for hashing and encoding (also existing dependencies).
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use ring::rand::SystemRandom;
-use ring::signature::{self, EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+use ring::signature::{self, ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
 use sha2::{Digest, Sha256};
 
 use crate::verifiable_intent::error::{ViError, ViErrorKind};

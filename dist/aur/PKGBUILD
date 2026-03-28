@@ -1,6 +1,6 @@
 # Maintainer: zeroclaw-labs <bot@zeroclaw.dev>
 pkgname=zeroclaw
-pkgver=0.5.6
+pkgver=0.5.9
 pkgrel=1
 pkgdesc="Zero overhead. Zero compromise. 100% Rust. The fastest, smallest AI assistant."
 arch=('x86_64')

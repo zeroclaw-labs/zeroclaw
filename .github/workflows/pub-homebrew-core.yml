@@ -1,6 +1,22 @@
 name: Pub Homebrew Core
 
 on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Existing release tag to publish (vX.Y.Z)"
+        required: true
+        type: string
+      dry_run:
+        description: "Patch formula only (no push/PR)"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      HOMEBREW_UPSTREAM_PR_TOKEN:
+        required: false
+      HOMEBREW_CORE_BOT_TOKEN:
+        required: false
   workflow_dispatch:
     inputs:
       release_tag:
@@ -88,6 +104,8 @@ jobs:
         env:
           HOMEBREW_CORE_BOT_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
           GH_TOKEN: ${{ secrets.HOMEBREW_UPSTREAM_PR_TOKEN || secrets.HOMEBREW_CORE_BOT_TOKEN }}
+          TARBALL_URL: ${{ steps.release_meta.outputs.tarball_url }}
+          TARBALL_SHA: ${{ steps.release_meta.outputs.tarball_sha }}
         run: |
           set -euo pipefail
 
@@ -140,8 +158,13 @@ jobs:
             echo "branch_name=$branch_name" >> "$GITHUB_OUTPUT"
           fi
 
-          tarball_url="$(grep 'tarball_url=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2-)"
-          tarball_sha="$(grep 'tarball_sha=' "$GITHUB_OUTPUT" | head -1 | cut -d= -f2-)"
+          tarball_url="${TARBALL_URL}"
+          tarball_sha="${TARBALL_SHA}"
+
+          if [[ -z "$tarball_url" || -z "$tarball_sha" ]]; then
+            echo "::error::tarball_url or tarball_sha is empty — release_meta step output not propagated."
+            exit 1
+          fi
 
           perl -0pi -e "s|^  url \".*\"|  url \"${tarball_url}\"|m" "$formula_file"
           perl -0pi -e "s|^  sha256 \".*\"|  sha256 \"${tarball_sha}\"|m" "$formula_file"
@@ -150,7 +173,14 @@ jobs:
           # Ensure Node.js build dependency is declared so that build.rs can
           # run `npm ci && npm run build` to produce the web frontend assets.
           if ! grep -q 'depends_on "node" => :build' "$formula_file"; then
-            perl -0pi -e 's|(  depends_on "rust" => :build\n)|\1  depends_on "node" => :build\n|m' "$formula_file"
+            # Try inserting after the rust build dependency first; if that
+            # pattern is absent, fall back to inserting before the first
+            # `depends_on` line so the node dep is always present.
+            if grep -q 'depends_on "rust" => :build' "$formula_file"; then
+              perl -0pi -e 's|(  depends_on "rust" => :build\n)|\1  depends_on "node" => :build\n|m' "$formula_file"
+            else
+              perl -0pi -e 's|(  depends_on )|  depends_on "node" => :build\n\1|m' "$formula_file"
+            fi
           fi
 
           git -C "$repo_dir" diff -- "$FORMULA_PATH" > "$tmp_repo/formula.diff"
@@ -182,6 +212,12 @@ jobs:
           repo_dir="${TMP_REPO}/homebrew-core"
           fork_owner="${BOT_FORK_REPO%%/*}"
           bot_email="${BOT_EMAIL:-${fork_owner}@users.noreply.github.com}"
+
+          # Pre-flight: verify token has push access to the fork
+          if ! gh api "repos/${BOT_FORK_REPO}" --jq '.permissions.push' 2>/dev/null | grep -q true; then
+            echo "::error::Token lacks push access to ${BOT_FORK_REPO}. Ensure HOMEBREW_CORE_BOT_TOKEN (or HOMEBREW_UPSTREAM_PR_TOKEN) is a PAT with 'Contents: write' scope for ${BOT_FORK_REPO}."
+            exit 1
+          fi
 
           git -C "$repo_dir" config user.name "$fork_owner"
           git -C "$repo_dir" config user.email "$bot_email"

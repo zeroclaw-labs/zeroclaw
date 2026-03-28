@@ -4,7 +4,7 @@
 //! This makes the trail tamper-evident — modifying any entry invalidates all subsequent hashes.
 
 use crate::config::AuditConfig;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -84,6 +84,10 @@ pub struct AuditEvent {
     /// SHA-256 hash of (`prev_hash` || canonical JSON of this entry's content fields).
     #[serde(default)]
     pub entry_hash: String,
+
+    /// Optional HMAC-SHA256 signature over entry_hash (present only when sign_events enabled)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub signature: Option<String>,
 }
 
 impl AuditEvent {
@@ -104,6 +108,7 @@ impl AuditEvent {
             sequence: 0,
             prev_hash: String::new(),
             entry_hash: String::new(),
+            signature: None,
         }
     }
 
@@ -199,6 +204,8 @@ pub struct AuditLogger {
     config: AuditConfig,
     buffer: Mutex<Vec<AuditEvent>>,
     chain: Mutex<ChainState>,
+    /// Signing key (loaded once at construction time if sign_events enabled)
+    signing_key: Option<Vec<u8>>,
 }
 
 /// Structured command execution details for audit logging.
@@ -218,7 +225,31 @@ impl AuditLogger {
     ///
     /// If the log file already exists, the chain state is recovered from the last
     /// entry so that new writes continue the existing hash chain.
+    ///
+    /// If `config.sign_events` is true, requires `ZEROCLAW_AUDIT_SIGNING_KEY` env var
+    /// to be set with a hex-encoded 32-byte key. Fails if key is missing or invalid.
     pub fn new(config: AuditConfig, zeroclaw_dir: PathBuf) -> Result<Self> {
+        // Load and validate signing key if sign_events enabled
+        let signing_key = if config.sign_events {
+            let key_hex = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").map_err(|_| {
+                anyhow::anyhow!("sign_events enabled but ZEROCLAW_AUDIT_SIGNING_KEY not set")
+            })?;
+
+            let key_bytes = hex::decode(&key_hex)
+                .map_err(|_| anyhow::anyhow!("ZEROCLAW_AUDIT_SIGNING_KEY must be hex-encoded"))?;
+
+            if key_bytes.len() != 32 {
+                bail!(
+                    "ZEROCLAW_AUDIT_SIGNING_KEY must be 32 bytes (64 hex chars), got {}",
+                    key_bytes.len()
+                );
+            }
+
+            Some(key_bytes)
+        } else {
+            None
+        };
+
         let log_path = zeroclaw_dir.join(&config.log_path);
         let chain_state = recover_chain_state(&log_path);
         Ok(Self {
@@ -226,7 +257,24 @@ impl AuditLogger {
             config,
             buffer: Mutex::new(Vec::new()),
             chain: Mutex::new(chain_state),
+            signing_key,
         })
+    }
+
+    /// Compute HMAC-SHA256 signature over entry_hash when sign_events enabled.
+    fn compute_signature(&self, entry_hash: &str) -> Result<Option<String>> {
+        if let Some(ref key_bytes) = self.signing_key {
+            use hmac::{Hmac, Mac};
+            use sha2::Sha256;
+
+            let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes)
+                .map_err(|_| anyhow::anyhow!("Invalid HMAC key length"))?;
+            mac.update(entry_hash.as_bytes());
+
+            Ok(Some(hex::encode(mac.finalize().into_bytes())))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Log an event
@@ -245,6 +293,10 @@ impl AuditLogger {
             chained.sequence = state.sequence;
             chained.prev_hash = state.prev_hash.clone();
             chained.entry_hash = compute_entry_hash(&state.prev_hash, &chained);
+
+            // Compute signature if sign_events enabled
+            chained.signature = self.compute_signature(&chained.entry_hash)?;
+
             state.prev_hash = chained.entry_hash.clone();
             state.sequence += 1;
         }
@@ -365,6 +417,8 @@ fn recover_chain_state(log_path: &Path) -> ChainState {
 /// - Each `entry_hash` matches the recomputed `SHA-256(prev_hash || content)`.
 /// - `prev_hash` links to the preceding entry (or the genesis seed for the first).
 /// - Sequence numbers are contiguous starting from 0.
+/// - If a record has a `signature` field and `ZEROCLAW_AUDIT_SIGNING_KEY` is available,
+///   verifies the HMAC-SHA256 signature over `entry_hash`.
 ///
 /// Returns `Ok(entry_count)` on success, or an error describing the first violation.
 pub fn verify_chain(log_path: &Path) -> Result<u64> {
@@ -373,6 +427,12 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
 
     let mut expected_prev_hash = GENESIS_PREV_HASH.to_string();
     let mut expected_sequence: u64 = 0;
+
+    // Attempt to load signing key from environment (optional)
+    let signing_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY")
+        .ok()
+        .and_then(|key_hex| hex::decode(&key_hex).ok())
+        .filter(|key_bytes| key_bytes.len() == 32);
 
     for (line_idx, line) in reader.lines().enumerate() {
         let line = line?;
@@ -414,6 +474,28 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
             );
         }
 
+        // Verify signature if present and key is available
+        if let Some(ref signature) = entry.signature {
+            if let Some(ref key_bytes) = signing_key {
+                use hmac::{Hmac, Mac};
+                use sha2::Sha256;
+
+                let mut mac = Hmac::<Sha256>::new_from_slice(key_bytes)
+                    .map_err(|_| anyhow::anyhow!("Invalid HMAC key length during verification"))?;
+                mac.update(entry.entry_hash.as_bytes());
+                let expected_sig = hex::encode(mac.finalize().into_bytes());
+
+                if signature != &expected_sig {
+                    bail!(
+                        "signature verification failed at line {} (sequence {}): signature mismatch",
+                        line_idx + 1,
+                        entry.sequence
+                    );
+                }
+            }
+            // If signature present but key not available, skip verification (backward compat)
+        }
+
         expected_prev_hash = entry.entry_hash.clone();
         expected_sequence += 1;
     }
@@ -424,7 +506,12 @@ pub fn verify_chain(log_path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scopeguard::defer;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Mutex to serialize tests that read/write ZEROCLAW_AUDIT_SIGNING_KEY env var.
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn audit_event_new_creates_unique_id() {
@@ -765,6 +852,426 @@ mod tests {
         // Full chain should verify (4 entries, sequences 0..3)
         let count = verify_chain(&log_path)?;
         assert_eq!(count, 4);
+        Ok(())
+    }
+
+    // ── HMAC signing tests ──────────────────────────────────
+
+    #[test]
+    fn signature_present_when_sign_events_enabled() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
+        defer! {
+            if let Some(key) = old_key {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        let tmp = TempDir::new()?;
+        let test_key = "a".repeat(64); // 64 hex chars = 32 bytes
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
+
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: true,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let event = AuditEvent::new(AuditEventType::CommandExecution);
+
+        logger.log(&event)?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+
+        assert!(
+            parsed.signature.is_some(),
+            "signature must be present when sign_events=true"
+        );
+        let sig = parsed.signature.unwrap();
+        assert_eq!(sig.len(), 64, "HMAC-SHA256 signature must be 64 hex chars");
+
+        Ok(())
+    }
+
+    #[test]
+    fn signature_absent_when_sign_events_disabled() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: false,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let event = AuditEvent::new(AuditEventType::CommandExecution);
+
+        logger.log(&event)?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+
+        assert!(
+            parsed.signature.is_none(),
+            "signature must be absent when sign_events=false"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn signature_computed_over_entry_hash() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
+        defer! {
+            if let Some(key) = old_key {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        let tmp = TempDir::new()?;
+        let test_key = "b".repeat(64);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
+
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: true,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let event = AuditEvent::new(AuditEventType::CommandExecution);
+
+        logger.log(&event)?;
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let parsed: AuditEvent = serde_json::from_str(content.trim())?;
+
+        // Manually recompute HMAC to verify correctness
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let key_bytes = hex::decode(&test_key)?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key_bytes).unwrap();
+        mac.update(parsed.entry_hash.as_bytes());
+        let expected_sig = hex::encode(mac.finalize().into_bytes());
+
+        assert_eq!(parsed.signature, Some(expected_sig));
+
+        Ok(())
+    }
+
+    #[test]
+    fn constructor_fails_if_sign_events_but_no_key() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
+        defer! {
+            // Only restore if it was a valid 64-char key
+            if let Some(key) = old_key.as_ref().filter(|k| k.len() == 64) {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: true,
+            ..Default::default()
+        };
+
+        let result = AuditLogger::new(config, tmp.path().to_path_buf());
+        assert!(result.is_err());
+        if let Err(e) = result {
+            let err_msg = e.to_string();
+            assert!(
+                err_msg.contains("ZEROCLAW_AUDIT_SIGNING_KEY not set"),
+                "error: {}",
+                err_msg
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn constructor_fails_if_signing_key_invalid_hex() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
+        defer! {
+            // Only restore if it was a valid 64-char key
+            if let Some(key) = old_key.as_ref().filter(|k| k.len() == 64) {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", "not-valid-hex") };
+
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: true,
+            ..Default::default()
+        };
+
+        let result = AuditLogger::new(config, tmp.path().to_path_buf());
+        assert!(result.is_err());
+        if let Err(e) = result {
+            let err_msg = e.to_string();
+            assert!(
+                err_msg.contains("must be hex-encoded"),
+                "error: {}",
+                err_msg
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn constructor_fails_if_signing_key_wrong_length() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
+        defer! {
+            // Only restore if it was a valid 64-char key
+            if let Some(key) = old_key.as_ref().filter(|k| k.len() == 64) {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        // 30 bytes = 60 hex chars (not 32 bytes)
+        let short_key = "c".repeat(60);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &short_key) };
+        let tmp = TempDir::new()?;
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: true,
+            ..Default::default()
+        };
+
+        let result = AuditLogger::new(config, tmp.path().to_path_buf());
+        assert!(result.is_err());
+        if let Err(e) = result {
+            let err_msg = e.to_string();
+            assert!(err_msg.contains("must be 32 bytes"), "error: {}", err_msg);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn different_keys_produce_different_signatures() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
+        defer! {
+            if let Some(key) = old_key {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        let _tmp = TempDir::new()?;
+
+        // Compute HMAC manually with key1
+        let key1 = "d".repeat(64);
+        let key1_bytes = hex::decode(&key1)?;
+
+        // Compute HMAC manually with key2
+        let key2 = "e".repeat(64);
+        let key2_bytes = hex::decode(&key2)?;
+
+        // Use a fixed entry_hash for testing
+        let test_entry_hash = "test_hash_value";
+
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut mac1 = Hmac::<Sha256>::new_from_slice(&key1_bytes).unwrap();
+        mac1.update(test_entry_hash.as_bytes());
+        let sig1 = hex::encode(mac1.finalize().into_bytes());
+
+        let mut mac2 = Hmac::<Sha256>::new_from_slice(&key2_bytes).unwrap();
+        mac2.update(test_entry_hash.as_bytes());
+        let sig2 = hex::encode(mac2.finalize().into_bytes());
+
+        assert_ne!(
+            sig1, sig2,
+            "different keys must produce different signatures"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn signature_deterministic_for_same_entry_hash() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
+        defer! {
+            if let Some(key) = old_key {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        let tmp = TempDir::new()?;
+        let test_key = "f".repeat(64);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
+
+        let config = AuditConfig {
+            enabled: true,
+            sign_events: true,
+            ..Default::default()
+        };
+        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+
+        // Log two events
+        for _ in 0..2 {
+            let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
+                "cmd".to_string(),
+                "low".to_string(),
+                false,
+                true,
+            );
+            logger.log(&event)?;
+        }
+
+        let log_path = tmp.path().join("audit.log");
+        let content = std::fs::read_to_string(&log_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        let event1: AuditEvent = serde_json::from_str(lines[0])?;
+        let event2: AuditEvent = serde_json::from_str(lines[1])?;
+
+        // Different entry_hashes due to chaining, so signatures should differ
+        assert_ne!(event1.entry_hash, event2.entry_hash);
+        assert_ne!(event1.signature, event2.signature);
+
+        // Manually verify determinism by recomputing signature for event1
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let key_bytes = hex::decode(&test_key)?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key_bytes).unwrap();
+        mac.update(event1.entry_hash.as_bytes());
+        let expected_sig1 = hex::encode(mac.finalize().into_bytes());
+        assert_eq!(event1.signature, Some(expected_sig1));
+
+        Ok(())
+    }
+
+    #[test]
+    fn verify_chain_accepts_mixed_signed_and_unsigned_records() -> Result<()> {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
+        defer! {
+            if let Some(key) = old_key.as_ref().filter(|k| k.len() == 64) {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            }
+        }
+
+        let tmp = TempDir::new()?;
+        let log_path = tmp.path().join("audit.log");
+        let test_key = "a1".repeat(32); // 64 hex chars = 32 bytes
+
+        // First logger with sign_events=false (unsigned records)
+        {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
+            let config = AuditConfig {
+                enabled: true,
+                sign_events: false,
+                ..Default::default()
+            };
+            let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+            for i in 0..2 {
+                let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
+                    format!("unsigned-{}", i),
+                    "low".to_string(),
+                    false,
+                    true,
+                );
+                logger.log(&event)?;
+            }
+        }
+
+        // Second logger with sign_events=true (signed records)
+        {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
+            let config = AuditConfig {
+                enabled: true,
+                sign_events: true,
+                ..Default::default()
+            };
+            let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+            for i in 0..2 {
+                let event = AuditEvent::new(AuditEventType::CommandExecution).with_action(
+                    format!("signed-{}", i),
+                    "low".to_string(),
+                    false,
+                    true,
+                );
+                logger.log(&event)?;
+            }
+        }
+
+        // Verify the full chain (4 records: 2 unsigned + 2 signed)
+        // Set the key in env so verify_chain can check signatures
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
+        let count = verify_chain(&log_path)?;
+        assert_eq!(count, 4, "should verify all 4 records");
+
+        // Verify that first 2 records have no signature, last 2 have signatures
+        let content = std::fs::read_to_string(&log_path)?;
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 4);
+
+        let rec0: AuditEvent = serde_json::from_str(lines[0])?;
+        let rec1: AuditEvent = serde_json::from_str(lines[1])?;
+        let rec2: AuditEvent = serde_json::from_str(lines[2])?;
+        let rec3: AuditEvent = serde_json::from_str(lines[3])?;
+
+        assert!(rec0.signature.is_none(), "first unsigned record");
+        assert!(rec1.signature.is_none(), "second unsigned record");
+        assert!(rec2.signature.is_some(), "first signed record");
+        assert!(rec3.signature.is_some(), "second signed record");
+
         Ok(())
     }
 }

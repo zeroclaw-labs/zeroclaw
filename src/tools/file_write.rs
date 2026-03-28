@@ -393,11 +393,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("escapes workspace"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("escapes workspace")
+        );
         assert!(!outside.join("hijack.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&root).await;
@@ -439,11 +441,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Rate limit exceeded")
+        );
         assert!(!dir.join("out.txt").exists());
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -567,10 +571,12 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("runtime config/state file"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("runtime config/state file")
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
