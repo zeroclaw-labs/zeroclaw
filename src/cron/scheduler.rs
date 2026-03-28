@@ -16,7 +16,7 @@ use crate::cron::{
     sync_declarative_jobs, update_job,
 };
 use crate::security::SecurityPolicy;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, stream};
 use std::process::Stdio;
@@ -416,7 +416,14 @@ fn resolve_matrix_delivery_room(configured_room_id: &str, target: &str) -> Strin
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
     let delivery: &DeliveryConfig = &job.delivery;
-    if !delivery.mode.eq_ignore_ascii_case("announce") {
+
+    // Determine if delivery is requested:
+    // - Explicit "announce" mode (legacy format)
+    // - Channel set with no mode / empty mode (simplified format)
+    // - "none" mode → skip delivery
+    let has_channel = delivery.channel.as_deref().is_some_and(|c| !c.is_empty());
+    let mode = delivery.mode.trim().to_ascii_lowercase();
+    if mode == "none" || (!has_channel && mode != "announce") {
         return Ok(());
     }
 
@@ -433,11 +440,9 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
     let channel = delivery
         .channel
         .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for announce mode"))?;
-    let target = delivery
-        .to
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("delivery.to is required for announce mode"))?;
+        .ok_or_else(|| anyhow::anyhow!("delivery.channel is required for delivery"))?;
+    // `to` is optional for live-channel delivery (channel knows its target)
+    let target = delivery.to.as_deref().unwrap_or("");
 
     deliver_announcement(config, channel, target, output).await
 }
@@ -483,6 +488,19 @@ pub(crate) async fn deliver_announcement(
     // Scan for credential leaks before delivering cron job output to channel.
     let safe_output = scan_and_redact_output(channel, target, output);
 
+    // Try the live channel registry first -- this reuses the daemon's
+    // connected channel instances, which is required for stateful
+    // channels like WhatsApp Web that need an active browser session.
+    if let Some(live_ch) = crate::channels::get_live_channel(channel) {
+        live_ch
+            .send(&SendMessage::new(safe_output.as_str(), target))
+            .await
+            .with_context(|| format!("live channel '{channel}' delivery failed"))?;
+        return Ok(());
+    }
+
+    // Fall back to constructing a new channel instance (works for
+    // stateless HTTP-based channels like Telegram, Discord, Slack).
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
             let tg = config

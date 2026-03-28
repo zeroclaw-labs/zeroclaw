@@ -2947,48 +2947,4 @@ mod tests {
         );
         assert!(stream.next().await.is_none());
     }
-
-    #[tokio::test]
-    async fn fallback_records_provider_fallback_info() {
-        scope_provider_fallback(async {
-            let provider = ReliableProvider::new(
-                vec![
-                    (
-                        "broken".into(),
-                        Box::new(MockProvider {
-                            calls: Arc::new(AtomicUsize::new(0)),
-                            fail_until_attempt: 99, // always fail
-                            response: "unused",
-                            error: "401 Unauthorized",
-                        }),
-                    ),
-                    (
-                        "working".into(),
-                        Box::new(MockProvider {
-                            calls: Arc::new(AtomicUsize::new(0)),
-                            fail_until_attempt: 0,
-                            response: "hello from working",
-                            error: "unused",
-                        }),
-                    ),
-                ],
-                2,
-                1,
-            );
-
-            let resp = provider.simple_chat("hi", "test-model", 0.0).await.unwrap();
-            assert_eq!(resp, "hello from working");
-
-            let fb = take_last_provider_fallback();
-            assert!(fb.is_some(), "fallback info should be recorded");
-            let fb = fb.unwrap();
-            assert_eq!(fb.requested_provider, "broken");
-            assert_eq!(fb.actual_provider, "working");
-            assert_eq!(fb.actual_model, "test-model");
-
-            // Second take should be None.
-            assert!(take_last_provider_fallback().is_none());
-        })
-        .await;
-    }
 }

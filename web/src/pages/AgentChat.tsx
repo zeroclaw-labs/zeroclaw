@@ -26,11 +26,52 @@ interface ChatMessage {
 }
 
 const DRAFT_KEY = 'agent-chat';
+const CHAT_STORAGE_PREFIX = 'zeroclaw_agent_chat_';
+const MAX_VISIBLE_MESSAGES = 100;
+
+function chatStorageKey(): string {
+  return `${CHAT_STORAGE_PREFIX}${getOrCreateSessionId()}`;
+}
+
+function capMessages(messages: ChatMessage[]): ChatMessage[] {
+  if (messages.length <= MAX_VISIBLE_MESSAGES) {
+    return messages;
+  }
+  return messages.slice(messages.length - MAX_VISIBLE_MESSAGES);
+}
+
+function loadPersistedMessages(): ChatMessage[] {
+  try {
+    const raw = sessionStorage.getItem(chatStorageKey());
+    if (!raw) {
+      return [];
+    }
+    const parsed = JSON.parse(raw) as Array<
+      Omit<ChatMessage, 'timestamp'> & { timestamp: string }
+    >;
+    return capMessages(
+      parsed.map((message) => ({
+        ...message,
+        timestamp: new Date(message.timestamp),
+      })),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function persistMessages(messages: ChatMessage[]): void {
+  try {
+    sessionStorage.setItem(chatStorageKey(), JSON.stringify(capMessages(messages)));
+  } catch {
+    // Ignore storage failures and keep the in-memory chat usable.
+  }
+}
 
 export default function AgentChat() {
   const sessionIdRef = useRef(getOrCreateSessionId());
   const { draft, saveDraft, clearDraft } = useDraft(DRAFT_KEY);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<ChatMessage[]>(() => loadPersistedMessages());
   const [historyReady, setHistoryReady] = useState(false);
   const [input, setInput] = useState(draft);
   const [typing, setTyping] = useState(false);
@@ -47,6 +88,20 @@ export default function AgentChat() {
   const capturedThinkingRef = useRef('');
   const [streamingContent, setStreamingContent] = useState('');
   const [streamingThinking, setStreamingThinking] = useState('');
+
+  const updateMessages = useCallback(
+    (
+      updater:
+        | ChatMessage[]
+        | ((prev: ChatMessage[]) => ChatMessage[]),
+    ) => {
+      setMessages((prev) => {
+        const next = typeof updater === 'function' ? updater(prev) : updater;
+        return capMessages(next);
+      });
+    },
+    [],
+  );
 
   // Persist draft to in-memory store so it survives route changes
   useEffect(() => {
@@ -167,7 +222,7 @@ export default function AgentChat() {
           const content = msg.full_response ?? msg.content ?? pendingContentRef.current;
           const thinking = capturedThinkingRef.current || pendingThinkingRef.current || undefined;
           if (content) {
-            setMessages((prev) => [
+            updateMessages((prev) => [
               ...prev,
               {
                 id: generateUUID(),
@@ -199,7 +254,7 @@ export default function AgentChat() {
           break;
 
         case 'error':
-          setMessages((prev) => [
+          updateMessages((prev) => [
             ...prev,
             {
               id: generateUUID(),
@@ -228,7 +283,11 @@ export default function AgentChat() {
     return () => {
       ws.disconnect();
     };
-  }, []);
+  }, [updateMessages]);
+
+  useEffect(() => {
+    persistMessages(messages);
+  }, [messages]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -238,7 +297,7 @@ export default function AgentChat() {
     const trimmed = input.trim();
     if (!trimmed || !wsRef.current?.connected) return;
 
-    setMessages((prev) => [
+    updateMessages((prev) => [
       ...prev,
       {
         id: generateUUID(),

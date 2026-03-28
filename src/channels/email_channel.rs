@@ -480,6 +480,7 @@ impl EmailChannel {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             };
 
             if tx.send(msg).await.is_err() {

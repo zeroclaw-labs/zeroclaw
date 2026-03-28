@@ -16,6 +16,7 @@
 
 pub mod acp_server;
 pub mod bluesky;
+pub mod chunker;
 pub mod clawdtalk;
 pub mod cli;
 pub mod debounce;
@@ -107,6 +108,7 @@ pub use whatsapp_web::WhatsAppWebChannel;
 use crate::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scrub_credentials,
+    EMPTY_MODEL_REPLY_PLACEHOLDER,
 };
 use crate::approval::ApprovalManager;
 use crate::config::Config;
@@ -122,7 +124,7 @@ use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use portable_atomic::{AtomicU64, Ordering};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
@@ -233,6 +235,66 @@ const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
 
+/// Process-wide shared per-chat route overrides. Persisted to `routes.json` in the workspace.
+static GLOBAL_ROUTE_OVERRIDES: std::sync::LazyLock<RouteSelectionMap> =
+    std::sync::LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// Path to the routes.json file; set once at startup when the workspace is known.
+static GLOBAL_ROUTES_FILE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Return a clone of the global route-overrides Arc.
+fn global_route_overrides() -> RouteSelectionMap {
+    Arc::clone(&GLOBAL_ROUTE_OVERRIDES)
+}
+
+/// Set the routes.json path and load any persisted overrides from disk.
+fn init_route_overrides(workspace_dir: &std::path::Path) {
+    let routes_file = workspace_dir.join("routes.json");
+    *GLOBAL_ROUTES_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(routes_file.clone());
+
+    if let Ok(text) = std::fs::read_to_string(&routes_file) {
+        if let Ok(map) = serde_json::from_str::<HashMap<String, ChannelRouteSelection>>(&text) {
+            let mut overrides = GLOBAL_ROUTE_OVERRIDES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *overrides = map;
+            tracing::info!(
+                path = %routes_file.display(),
+                count = overrides.len(),
+                "Loaded per-chat route overrides from disk"
+            );
+        }
+    }
+}
+
+/// Persist current route overrides to routes.json (best-effort; logs on failure).
+fn save_route_overrides(overrides: &HashMap<String, ChannelRouteSelection>) {
+    let path_guard = GLOBAL_ROUTES_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ref path) = *path_guard else { return };
+    match serde_json::to_string_pretty(overrides) {
+        Ok(json) => {
+            if let Some(parent) = path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(
+                        path = %parent.display(),
+                        error = %e,
+                        "Failed to create parent directory for route overrides"
+                    );
+                    return;
+                }
+            }
+            if let Err(e) = std::fs::write(path, json) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to save route overrides"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "Failed to serialize route overrides"),
+    }
+}
+
 fn effective_channel_message_timeout_secs(configured: u64) -> u64 {
     configured.max(MIN_CHANNEL_MESSAGE_TIMEOUT_SECS)
 }
@@ -258,7 +320,7 @@ fn channel_message_timeout_budget_secs_with_cap(
     message_timeout_secs.saturating_mul(scale)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ChannelRouteSelection {
     provider: String,
     model: String,
@@ -314,6 +376,43 @@ struct RuntimeConfigState {
 fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
     static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Process-global registry of live (connected) channel instances.
+///
+/// Populated by `start_channels()` after building `channels_by_name`.
+/// Used by `deliver_announcement()` to reuse the daemon's connected
+/// channel rather than creating a new disconnected instance (which
+/// fails for stateful channels like WhatsApp Web).
+fn live_channel_registry() -> &'static Mutex<HashMap<String, Arc<dyn Channel>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<dyn Channel>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register live channel instances from the daemon for use by the scheduler.
+pub fn register_live_channels<S: ::std::hash::BuildHasher>(
+    channels: &HashMap<String, Arc<dyn Channel>, S>,
+) {
+    let mut registry = live_channel_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    registry.clear();
+    for (name, ch) in channels {
+        registry.insert(name.clone(), Arc::clone(ch));
+    }
+    tracing::debug!(
+        "Registered {} live channel(s) for cron delivery",
+        registry.len()
+    );
+}
+
+/// Retrieve a live channel instance by name (e.g. "whatsapp", "telegram").
+pub fn get_live_channel(name: &str) -> Option<Arc<dyn Channel>> {
+    live_channel_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .cloned()
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "zeroclaw.service"];
@@ -445,15 +544,30 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 }
 
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
-    // channels) and thread_ts for per-topic isolation in forum groups.
+    // Key by reply_target (chat JID / channel ID) so each group and DM
+    // gets an independent session.  Include thread_ts for per-topic
+    // isolation in forum groups.
     match &msg.thread_ts {
         Some(tid) => format!(
             "{}_{}_{}_{}",
             msg.channel, msg.reply_target, tid, msg.sender
         ),
-        None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
+        None => format!("{}_{}", msg.channel, msg.reply_target),
     }
+}
+
+/// Generate the legacy session key as it would appear after lossy filename sanitization.
+/// Used to find sessions persisted before the percent-encoding fix (#4806).
+fn legacy_sanitized_key(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
@@ -1032,6 +1146,16 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
 }
 
 fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> ChannelRouteSelection {
+    // Check global (persisted) overrides first, then fall back to ctx-local overrides.
+    let global = global_route_overrides();
+    if let Some(entry) = global
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sender_key)
+        .cloned()
+    {
+        return entry;
+    }
     ctx.route_overrides
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1042,14 +1166,35 @@ fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> Channel
 
 fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
     let default_route = default_route_selection(ctx);
-    let mut routes = ctx
-        .route_overrides
+
+    // Update ctx-local overrides.
+    {
+        let mut local = ctx
+            .route_overrides
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if next == default_route {
+            local.remove(sender_key);
+        } else {
+            local.insert(sender_key.to_string(), next.clone());
+        }
+    }
+
+    // Persist to global overrides + disk only when routes file is configured
+    // (i.e., init_route_overrides was called at startup). Skipped in tests.
+    let has_routes_file = GLOBAL_ROUTES_FILE
         .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    if next == default_route {
-        routes.remove(sender_key);
-    } else {
-        routes.insert(sender_key.to_string(), next);
+        .unwrap_or_else(|e| e.into_inner())
+        .is_some();
+    if has_routes_file {
+        let global = global_route_overrides();
+        let mut routes = global.lock().unwrap_or_else(|e| e.into_inner());
+        if next == default_route {
+            routes.remove(sender_key);
+        } else {
+            routes.insert(sender_key.to_string(), next);
+        }
+        save_route_overrides(&routes);
     }
 }
 
@@ -2527,6 +2672,18 @@ async fn process_channel_message(
             .await;
     }
 
+    // observe_group: store in session for context but do not invoke the LLM.
+    // Used by channels with mention_only to passively track group conversation.
+    if msg.observe_group {
+        append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
+        tracing::debug!(
+            "Stored observe-only message in session (key={}, len={})",
+            history_key,
+            msg.content.len()
+        );
+        return;
+    }
+
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
@@ -2554,12 +2711,40 @@ async fn process_channel_message(
     let prior_turns_raw = if force_fresh_session {
         vec![ChatMessage::user(&msg.content)]
     } else {
-        ctx.conversation_histories
+        let mut histories = ctx
+            .conversation_histories
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&history_key)
-            .cloned()
-            .unwrap_or_default()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut turns = histories.get(&history_key).cloned().unwrap_or_default();
+
+        // Fallback: check for sessions persisted under the legacy lossy-sanitized
+        // key (pre-#4806). If found, migrate to the correct key. See #4806.
+        if turns.is_empty() {
+            let legacy_key = legacy_sanitized_key(&history_key);
+            if legacy_key != history_key {
+                if let Some(legacy_turns) = histories.remove(&legacy_key) {
+                    if !legacy_turns.is_empty() {
+                        tracing::info!(
+                            old_key = %legacy_key,
+                            new_key = %history_key,
+                            "Migrated legacy session to percent-encoded key"
+                        );
+                        histories.insert(history_key.clone(), legacy_turns.clone());
+                        // Re-persist under new key and remove legacy file
+                        if let Some(ref store) = ctx.session_store {
+                            for turn in &legacy_turns {
+                                let _ = store.append(&history_key, turn);
+                            }
+                            let _ = store.delete_session(&legacy_key);
+                        }
+                        turns = legacy_turns;
+                    }
+                }
+            }
+        }
+
+        drop(histories);
+        turns
     };
     let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
@@ -2846,7 +3031,11 @@ async fn process_channel_message(
         Cancelled,
     }
 
-    let model_switch_callback = get_model_switch_state();
+    // Per-request model switch slot: isolates model_switch tool results per user,
+    // preventing cross-user leakage from the global MODEL_SWITCH_REQUEST.
+    let model_switch_slot: crate::agent::loop_::ModelSwitchCallback = Arc::new(Mutex::new(None));
+    // Clear any stale global state before entering the loop.
+    clear_model_switch_request();
     let scale_cap = ctx
         .pacing
         .message_timeout_scale_max
@@ -2897,7 +3086,7 @@ async fn process_channel_message(
                         },
                         ctx.tool_call_dedup_exempt.as_ref(),
                         ctx.activated_tools.as_ref(),
-                        Some(model_switch_callback.clone()),
+                        Some(model_switch_slot.clone()),
                         &ctx.pacing,
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
@@ -2955,6 +3144,37 @@ async fn process_channel_message(
         (llm_result, fb)
     })
     .await;
+
+    // After the agent loop, check the per-request model_switch_slot first,
+    // then fall back to the global MODEL_SWITCH_REQUEST, and persist the
+    // route override for this sender.
+    let pending_switch = model_switch_slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .or_else(|| {
+            get_model_switch_state()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+        });
+    if let Some((sw_provider, sw_model)) = pending_switch {
+        tracing::info!(
+            provider = %sw_provider,
+            model = %sw_model,
+            sender = %history_key,
+            "Persisting model switch from agent loop"
+        );
+        set_route_selection(
+            ctx.as_ref(),
+            &history_key,
+            ChannelRouteSelection {
+                provider: sw_provider,
+                model: sw_model,
+                api_key: None,
+            },
+        );
+    }
 
     // Drop all senders so updater tasks can exit (rx.recv() returns None).
     tracing::debug!("Post-loop: dropping delta_tx and awaiting draft updater");
@@ -3093,6 +3313,17 @@ async fn process_channel_message(
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
             } else {
                 sanitized_response
+            };
+
+            let mut delivered_response = if delivered_response.trim().is_empty() {
+                tracing::warn!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "outbound reply is empty after hooks/sanitization; substituting placeholder so the channel API accepts the message"
+                );
+                EMPTY_MODEL_REPLY_PLACEHOLDER.to_string()
+            } else {
+                delivered_response
             };
 
             // Append a footer when the response was served by a different provider family.
@@ -4291,6 +4522,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_workspace_dir(config.workspace_dir.as_path().to_path_buf())
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -4496,6 +4728,7 @@ fn collect_configured_channels(
                     dc.listen_to_bots,
                     dc.mention_only,
                 )
+                .with_workspace_dir(config.workspace_dir.as_path().to_path_buf())
                 .with_streaming(
                     dc.stream_mode,
                     dc.draft_update_interval_ms,
@@ -5408,6 +5641,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .collect::<HashMap<_, _>>(),
     );
 
+    // Populate the live channel registry so the cron scheduler can reuse
+    // the daemon's connected channel instances (required for stateful
+    // channels like WhatsApp Web that need an active browser session).
+    register_live_channels(&channels_by_name);
+
     // Populate the reaction tool's channel map now that channels are initialized.
     if let Some(ref handle) = reaction_handle_ch {
         let mut map = handle.write();
@@ -5470,6 +5708,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .whatsapp
         .as_ref()
         .is_some_and(|wa| wa.interrupt_on_new_message);
+
+    // Load persisted per-chat route overrides from routes.json in workspace.
+    init_route_overrides(&config.workspace_dir);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -5895,6 +6136,24 @@ mod tests {
         assert_eq!(normalized[1].role, "assistant");
         assert!(normalized[1].content.contains("Task timed out"));
         assert_eq!(normalized[2].content, "next question");
+    }
+
+    #[test]
+    fn legacy_sanitized_key_matches_old_encoding() {
+        let key = "matrix_@user:m.org||!room:m.org_$evt123:m.org_@user:m.org";
+        let legacy = legacy_sanitized_key(key);
+        assert_eq!(
+            legacy,
+            "matrix__user_m_org___room_m_org__evt123_m_org__user_m_org"
+        );
+        assert_ne!(legacy, key, "legacy key should differ from original");
+    }
+
+    #[test]
+    fn legacy_sanitized_key_noop_for_simple_keys() {
+        let key = "discord_12345_67890";
+        let legacy = legacy_sanitized_key(key);
+        assert_eq!(legacy, key, "simple keys should be unchanged");
     }
 
     #[test]
@@ -6358,6 +6617,11 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct TelegramDraftRecordingChannel {
+        finalized_drafts: tokio::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    #[derive(Default)]
     struct SlackRecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
@@ -6392,6 +6656,66 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl Channel for TelegramDraftRecordingChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn supports_draft_updates(&self) -> bool {
+            true
+        }
+
+        async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
+            Ok(Some("draft-telegram-1".to_string()))
+        }
+
+        async fn update_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            _content: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn finalize_draft(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            content: &str,
+        ) -> anyhow::Result<()> {
+            self.finalized_drafts.lock().await.push((
+                recipient.to_string(),
+                message_id.to_string(),
+                content.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn cancel_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
     #[async_trait::async_trait]
     impl Channel for SlackRecordingChannel {
         fn name(&self) -> &str {
@@ -6863,6 +7187,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -6875,6 +7200,90 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(reply.contains("BTC is currently around"));
         assert!(!reply.contains("\"tool_calls\""));
         assert!(!reply.contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_telegram_streaming_completes_after_tool_loop() {
+        let channel_impl = Arc::new(TelegramDraftRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+        });
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            process_channel_message(
+                runtime_ctx,
+                traits::ChannelMessage {
+                    id: "msg-telegram-draft".to_string(),
+                    sender: "alice".to_string(),
+                    reply_target: "chat-telegram".to_string(),
+                    content: "hello".to_string(),
+                    channel: "telegram".to_string(),
+                    timestamp: 1,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                },
+                CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("streaming telegram turn should not hang after the tool loop finishes");
+
+        let finalized_drafts = channel_impl.finalized_drafts.lock().await;
+        assert_eq!(finalized_drafts.len(), 1);
+        assert_eq!(finalized_drafts[0].0, "chat-telegram");
+        assert_eq!(finalized_drafts[0].1, "draft-telegram-1");
+        assert_eq!(finalized_drafts[0].2, "ok");
     }
 
     #[tokio::test]
@@ -6952,6 +7361,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -6967,7 +7377,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("telegram_chat-telegram_alice")
+            .get("telegram_chat-telegram")
             .expect("telegram history should be stored");
         let assistant_turn = turns
             .iter()
@@ -7055,6 +7465,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7143,6 +7554,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7241,6 +7653,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7250,7 +7663,8 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
-        let route_key = "telegram_chat-1_alice";
+        let route_key = "telegram_chat-1";
+        // Check ctx-local overrides (set_route_selection writes to both local and global).
         let route = runtime_ctx
             .route_overrides
             .lock()
@@ -7282,10 +7696,10 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&default_provider));
         provider_cache_seed.insert("openrouter".to_string(), routed_provider);
 
-        let route_key = "telegram_chat-1_alice".to_string();
+        let route_key = "telegram_chat-1".to_string();
         let mut route_overrides = HashMap::new();
         route_overrides.insert(
-            route_key,
+            route_key.clone(),
             ChannelRouteSelection {
                 provider: "openrouter".to_string(),
                 model: "route-model".to_string(),
@@ -7360,6 +7774,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7460,6 +7875,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7575,6 +7991,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7678,6 +8095,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7771,6 +8189,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -7986,6 +8405,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
         .await
         .unwrap();
@@ -7999,6 +8419,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         })
         .await
         .unwrap();
@@ -8098,6 +8519,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -8112,6 +8534,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -8228,6 +8651,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -8242,6 +8666,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -8355,6 +8780,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -8369,6 +8795,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -8460,6 +8887,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -8548,6 +8976,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -9127,6 +9556,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -9144,6 +9574,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: Some("1741234567.123456".into()),
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         assert_eq!(
@@ -9164,6 +9595,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
@@ -9181,6 +9613,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -9192,6 +9625,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         assert_ne!(
@@ -9215,6 +9649,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -9226,6 +9661,7 @@ BTC is currently around $65,000 based on latest tool output."#
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
 
         mem.store(
@@ -9382,6 +9818,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -9399,6 +9836,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -9522,6 +9960,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -9555,6 +9994,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -9566,7 +10006,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                !histories.contains_key("telegram_chat-refresh_alice"),
+                !histories.contains_key("telegram_chat-refresh"),
                 "/new should clear the cached sender history before the next message"
             );
         }
@@ -9577,7 +10017,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                pending_new_sessions.contains("telegram_chat-refresh_alice"),
+                pending_new_sessions.contains("telegram_chat-refresh"),
                 "/new should mark the sender for a fresh next-message prompt rebuild"
             );
         }
@@ -9594,6 +10034,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -9705,6 +10146,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -9728,7 +10170,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_chat-ctx_alice")
+            .get("test-channel_chat-ctx")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
@@ -9746,7 +10188,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let mut histories = HashMap::new();
         histories.insert(
-            "telegram_chat-telegram_alice".to_string(),
+            "telegram_chat-telegram".to_string(),
             vec![
                 ChatMessage::assistant("stale assistant"),
                 ChatMessage::user("earlier user question"),
@@ -9821,6 +10263,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -10408,6 +10851,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -10502,6 +10946,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -10519,6 +10964,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -10543,7 +10989,7 @@ This is an example JSON object for profile settings."#;
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_chat-photo_zeroclaw_user")
+            .get("test-channel_chat-photo")
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
@@ -10804,6 +11250,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -10923,6 +11370,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -11034,6 +11482,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -11165,6 +11614,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                observe_group: false,
             },
             CancellationToken::new(),
         )
@@ -11327,6 +11777,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            observe_group: false,
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice");
     }
@@ -11343,6 +11794,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: Some("$thread1".into()),
             interruption_scope_id: Some("$thread1".into()),
             attachments: vec![],
+            observe_group: false,
         };
         assert_eq!(interruption_scope_key(&msg), "matrix_room_alice_$thread1");
     }
@@ -11360,6 +11812,7 @@ This is an example JSON object for profile settings."#;
             thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
             interruption_scope_id: None,                 // but NOT a thread reply
             attachments: vec![],
+            observe_group: false,
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
     }
@@ -11443,6 +11896,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: Some("1741234567.100001".to_string()),
                 interruption_scope_id: Some("1741234567.100001".to_string()),
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();
@@ -11457,6 +11911,7 @@ This is an example JSON object for profile settings."#;
                 thread_ts: Some("1741234567.200002".to_string()),
                 interruption_scope_id: Some("1741234567.200002".to_string()),
                 attachments: vec![],
+                observe_group: false,
             })
             .await
             .unwrap();
