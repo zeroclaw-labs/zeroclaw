@@ -7252,6 +7252,16 @@ pub struct SecurityConfig {
     /// WebAuthn / FIDO2 hardware key authentication configuration.
     #[serde(default)]
     pub webauthn: WebAuthnConfig,
+
+    /// Disable the high-entropy token redaction heuristic in the leak detector.
+    ///
+    /// When `true`, the `LeakDetector` skips Shannon-entropy-based token
+    /// flagging while all pattern-based checks (API keys, AWS credentials,
+    /// private keys, JWTs, database URLs, generic secrets) remain active.
+    /// Useful when outbound content regularly contains legitimate high-entropy
+    /// strings such as base64-encoded payloads or API usage examples.
+    #[serde(default)]
+    pub disable_high_entropy_redaction: bool,
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).

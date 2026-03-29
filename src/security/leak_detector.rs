@@ -32,6 +32,8 @@ pub enum LeakResult {
 pub struct LeakDetector {
     /// Sensitivity threshold (0.0-1.0, higher = more aggressive detection).
     sensitivity: f64,
+    /// When `true`, skip the high-entropy token heuristic entirely.
+    skip_high_entropy: bool,
 }
 
 impl Default for LeakDetector {
@@ -43,14 +45,27 @@ impl Default for LeakDetector {
 impl LeakDetector {
     /// Create a new leak detector with default sensitivity.
     pub fn new() -> Self {
-        Self { sensitivity: 0.7 }
+        Self {
+            sensitivity: 0.7,
+            skip_high_entropy: false,
+        }
     }
 
     /// Create a detector with custom sensitivity.
     pub fn with_sensitivity(sensitivity: f64) -> Self {
         Self {
             sensitivity: sensitivity.clamp(0.0, 1.0),
+            skip_high_entropy: false,
         }
+    }
+
+    /// Disable the high-entropy token heuristic.
+    ///
+    /// When set, [`scan`](Self::scan) skips Shannon-entropy-based detection
+    /// while all pattern-based checks remain active.
+    pub fn with_high_entropy_disabled(mut self, disabled: bool) -> Self {
+        self.skip_high_entropy = disabled;
+        self
     }
 
     /// Scan content for potential credential leaks.
@@ -65,7 +80,9 @@ impl LeakDetector {
         self.check_private_keys(content, &mut patterns, &mut redacted);
         self.check_jwt_tokens(content, &mut patterns, &mut redacted);
         self.check_database_urls(content, &mut patterns, &mut redacted);
-        self.check_high_entropy_tokens(content, &mut patterns, &mut redacted);
+        if !self.skip_high_entropy {
+            self.check_high_entropy_tokens(content, &mut patterns, &mut redacted);
+        }
 
         if patterns.is_empty() {
             LeakResult::Clean
@@ -571,6 +588,33 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
             LeakResult::Clean => {
                 panic!("Should still detect high-entropy tokens outside media markers")
             }
+        }
+    }
+
+    #[test]
+    fn high_entropy_disabled_skips_entropy_check() {
+        let detector = LeakDetector::new().with_high_entropy_disabled(true);
+        // This token would normally be flagged as high-entropy.
+        let content = "Found credential: aB3xK9mW2pQ7vL4nR8sT1yU6hD0jF5cG";
+        let result = detector.scan(content);
+        assert!(
+            matches!(result, LeakResult::Clean),
+            "High-entropy detection should be skipped when disabled"
+        );
+    }
+
+    #[test]
+    fn high_entropy_disabled_still_detects_pattern_based_leaks() {
+        let detector = LeakDetector::new().with_high_entropy_disabled(true);
+        // Pattern-based detection (Stripe key) must still work.
+        let content = "My Stripe key is sk_test_1234567890abcdefghijklmnop";
+        let result = detector.scan(content);
+        match result {
+            LeakResult::Detected { patterns, redacted } => {
+                assert!(patterns.iter().any(|p| p.contains("Stripe")));
+                assert!(redacted.contains("[REDACTED"));
+            }
+            LeakResult::Clean => panic!("Pattern-based leaks should still be detected"),
         }
     }
 

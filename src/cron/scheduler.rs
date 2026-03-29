@@ -451,8 +451,14 @@ impl RedactedOutput {
 
 /// Scan cron job output for credential leaks and return redacted output if leaks are detected.
 /// Logs a warning with channel, target, and detected patterns when credentials are found.
-fn scan_and_redact_output(channel: &str, target: &str, output: &str) -> RedactedOutput {
-    let leak_detector = crate::security::LeakDetector::new();
+fn scan_and_redact_output(
+    channel: &str,
+    target: &str,
+    output: &str,
+    disable_high_entropy_redaction: bool,
+) -> RedactedOutput {
+    let leak_detector = crate::security::LeakDetector::new()
+        .with_high_entropy_disabled(disable_high_entropy_redaction);
     let leak_check = leak_detector.scan(output);
 
     match leak_check {
@@ -476,7 +482,12 @@ pub(crate) async fn deliver_announcement(
     output: &str,
 ) -> Result<()> {
     // Scan for credential leaks before delivering cron job output to channel.
-    let safe_output = scan_and_redact_output(channel, target, output);
+    let safe_output = scan_and_redact_output(
+        channel,
+        target,
+        output,
+        config.security.disable_high_entropy_redaction,
+    );
 
     match channel.to_ascii_lowercase().as_str() {
         "telegram" => {
@@ -1432,7 +1443,7 @@ mod tests {
     fn scan_and_redact_output_redacts_credentials() {
         let leaked_output = "Deployment key: sk_test_FAKE1234567890abcdefgh"; // gitleaks:allow
 
-        let redacted = scan_and_redact_output("telegram", "123456", leaked_output);
+        let redacted = scan_and_redact_output("telegram", "123456", leaked_output, false);
 
         assert!(
             !redacted.as_str().contains("sk_test_FAKE1234567890abcdefgh"), // gitleaks:allow
@@ -1445,7 +1456,7 @@ mod tests {
     fn scan_and_redact_output_preserves_clean_output() {
         let clean_output = "Deployment completed successfully at 2024-03-15 10:00:00";
 
-        let redacted = scan_and_redact_output("telegram", "123456", clean_output);
+        let redacted = scan_and_redact_output("telegram", "123456", clean_output, false);
 
         assert_eq!(redacted.as_str(), clean_output);
     }

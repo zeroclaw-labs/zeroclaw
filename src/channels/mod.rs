@@ -2009,7 +2009,11 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
-fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+fn sanitize_channel_response(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    disable_high_entropy_redaction: bool,
+) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
@@ -2026,7 +2030,10 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     let sanitized = strip_tool_narration(&stripped_json);
 
     // Scan for credential leaks before returning to caller
-    match crate::security::LeakDetector::new().scan(&sanitized) {
+    match crate::security::LeakDetector::new()
+        .with_high_entropy_disabled(disable_high_entropy_redaction)
+        .scan(&sanitized)
+    {
         crate::security::LeakResult::Clean => sanitized,
         crate::security::LeakResult::Detected { patterns, redacted } => {
             tracing::warn!(
@@ -3107,8 +3114,11 @@ async fn process_channel_message(
                 }
             }
 
-            let sanitized_response =
-                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+            let sanitized_response = sanitize_channel_response(
+                &outbound_response,
+                ctx.tools_registry.as_ref(),
+                ctx.prompt_config.security.disable_high_entropy_redaction,
+            );
             let mut delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {
@@ -5788,7 +5798,7 @@ mod tests {
         // Issue #4478: response with leading whitespace before [Used tools: ...]
         let input = "  [Used tools: web_search_tool]\nHere is the search result.";
 
-        let result = sanitize_channel_response(input, &tools);
+        let result = sanitize_channel_response(input, &tools, false);
 
         assert!(!result.contains("[Used tools:"));
         assert!(result.contains("Here is the search result."));
@@ -11529,7 +11539,7 @@ This is an example JSON object for profile settings."#;
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
 
-        let result = sanitize_channel_response(leaked, &tools);
+        let result = sanitize_channel_response(leaked, &tools, false);
 
         assert!(!result.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
         assert!(result.contains("[REDACTED"));
@@ -11540,7 +11550,7 @@ This is an example JSON object for profile settings."#;
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let clean_text = "This is a normal message with no credentials.";
 
-        let result = sanitize_channel_response(clean_text, &tools);
+        let result = sanitize_channel_response(clean_text, &tools, false);
 
         assert_eq!(result, clean_text);
     }
