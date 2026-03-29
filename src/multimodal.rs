@@ -143,7 +143,7 @@ pub async fn prepare_messages_for_provider(
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
 
     let mut normalized_messages = Vec::with_capacity(trimmed.len());
-    let mut has_successful_images = false;
+    // has_successful_images removed — declared but never used
     for message in &trimmed {
         if message.role != "user" {
             normalized_messages.push(message.clone());

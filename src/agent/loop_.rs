@@ -5830,6 +5830,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("provider without vision support should fail");
@@ -5885,6 +5887,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("oversized payload must fail");
@@ -5934,6 +5938,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect("valid multimodal payload should pass");
@@ -5981,6 +5987,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -6037,6 +6045,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("should fail when vision provider cannot be created");
@@ -6091,6 +6101,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -6148,6 +6160,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect_err("should fail due to nonexistent vision provider");
@@ -6202,6 +6216,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect("empty image markers should not trigger vision routing");
@@ -6255,6 +6271,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -6393,6 +6411,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect("parallel execution should complete");
@@ -6467,6 +6487,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect("cron_add delivery defaults should be injected");
@@ -6533,6 +6555,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect("explicit delivery mode should be preserved");
@@ -6593,6 +6617,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -6667,6 +6693,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
@@ -6730,6 +6758,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -6815,6 +6845,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect("loop should complete");
@@ -6875,6 +6907,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -6961,6 +6995,8 @@ mod tests {
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect("native tool-call text should be relayed through on_delta");
@@ -7029,6 +7065,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -7100,6 +7138,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -7175,6 +7215,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -7259,6 +7301,8 @@ mod tests {
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await
@@ -9273,6 +9317,8 @@ Let me check the result."#;
             0,
             0,
             None,
+            None,
+            None,
         )
         .await
         .expect("tool loop should complete");
@@ -9430,7 +9476,6 @@ Let me check the result."#;
                     0,
                     0,
                     None,
-                    false,
                     None,
                     None,
                 ),
@@ -9515,7 +9560,6 @@ Let me check the result."#;
                     0,
                     0,
                     None,
-                    false,
                     None,
                     None,
                 ),
@@ -9575,6 +9619,8 @@ Let me check the result."#;
             &crate::config::PacingConfig::default(),
             0,
             0,
+            None,
+            None,
             None,
         )
         .await

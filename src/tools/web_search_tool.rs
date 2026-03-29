@@ -418,6 +418,7 @@ impl Tool for WebSearchTool {
             );
         }
 
+        #[allow(clippy::match_same_arms)]
         let result = match resolution.route {
             WebSearchProviderRoute::DuckDuckGo => self.search_duckduckgo(query).await?,
             WebSearchProviderRoute::Brave => self.search_brave(query).await?,
