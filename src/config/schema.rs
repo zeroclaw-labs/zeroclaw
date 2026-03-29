@@ -2521,10 +2521,12 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
-    /// Allow requests to private/LAN hosts (RFC 1918, loopback, link-local, .local).
-    /// Default: false (deny private hosts for SSRF protection).
-    #[serde(default)]
-    pub allow_private_hosts: bool,
+    /// Per-host allowlist for private/LAN destinations (RFC 1918, loopback, link-local, .local).
+    /// Accepts either a list of hostnames/IPs (e.g. `["localhost", "192.168.1.5"]`) or a boolean
+    /// for backward compatibility (`true` = `["*"]`, `false` = `[]`).
+    /// Default: [] (deny all private hosts for SSRF protection).
+    #[serde(default, deserialize_with = "deserialize_allow_private_hosts")]
+    pub allow_private_hosts: Vec<String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -2534,9 +2536,42 @@ impl Default for HttpRequestConfig {
             allowed_domains: vec!["*".into()],
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
-            allow_private_hosts: false,
+            allow_private_hosts: vec![],
         }
     }
+}
+
+/// Deserialize `allow_private_hosts` from either a boolean or a list of strings.
+/// `true` → `["*"]` (allow all), `false` → `[]` (deny all), list → list.
+fn deserialize_allow_private_hosts<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct BoolOrVec;
+
+    impl<'de> Visitor<'de> for BoolOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a boolean or a list of hostnames")
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<Vec<String>, E> {
+            Ok(if v { vec!["*".into()] } else { vec![] })
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<String>, A::Error> {
+            let mut hosts = Vec::new();
+            while let Some(s) = seq.next_element::<String>()? {
+                hosts.push(s);
+            }
+            Ok(hosts)
+        }
+    }
+
+    deserializer.deserialize_any(BoolOrVec)
 }
 
 fn default_http_max_response_size() -> usize {
