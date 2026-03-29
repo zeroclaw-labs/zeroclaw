@@ -54,7 +54,7 @@ pub mod transcription;
 pub mod tts;
 pub mod twitter;
 pub mod voice_call;
-#[cfg(feature = "voice-wake")]
+#[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
 pub mod voice_wake;
 pub mod wati;
 pub mod webhook;
@@ -97,7 +97,7 @@ pub use tts::{TtsManager, TtsProvider};
 pub use twitter::TwitterChannel;
 #[allow(unused_imports)]
 pub use voice_call::{VoiceCallChannel, VoiceCallConfig};
-#[cfg(feature = "voice-wake")]
+#[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
 pub use voice_wake::VoiceWakeChannel;
 pub use wati::WatiChannel;
 pub use webhook::WebhookChannel;
@@ -4895,7 +4895,7 @@ fn collect_configured_channels(
         });
     }
 
-    #[cfg(feature = "voice-wake")]
+    #[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
     if let Some(ref vw) = config.channels_config.voice_wake {
         channels.push(ConfiguredChannel {
             display_name: "VoiceWake",

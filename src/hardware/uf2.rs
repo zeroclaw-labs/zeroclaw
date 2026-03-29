@@ -17,10 +17,16 @@ use std::path::{Path, PathBuf};
 // ── Embedded firmware ─────────────────────────────────────────────────────────
 
 /// MicroPython UF2 binary — copied to RPI-RP2 to install the base runtime.
+#[cfg(all(feature = "hardware", not(feature = "ci-skip-firmware")))]
 const PICO_UF2: &[u8] = include_bytes!("../../firmware/pico/zeroclaw-pico.uf2");
+#[cfg(all(feature = "hardware", feature = "ci-skip-firmware"))]
+const PICO_UF2: &[u8] = &[];
 
 /// ZeroClaw serial protocol handler — written to the Pico after MicroPython boots.
+#[cfg(all(feature = "hardware", not(feature = "ci-skip-firmware")))]
 pub const PICO_MAIN_PY: &[u8] = include_bytes!("../../firmware/pico/main.py");
+#[cfg(all(feature = "hardware", feature = "ci-skip-firmware"))]
+pub const PICO_MAIN_PY: &[u8] = &[];
 
 /// UF2 magic word 1 (little-endian bytes at offset 0 of every UF2 block).
 const UF2_MAGIC1: [u8; 4] = [0x55, 0x46, 0x32, 0x0A];
