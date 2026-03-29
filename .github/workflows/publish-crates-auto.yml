@@ -12,7 +12,6 @@ concurrency:
 
 permissions:
   contents: read
-  deployments: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -91,9 +90,6 @@ jobs:
     if: needs.check-registry.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment:
-      name: crates-io
-      url: https://crates.io/crates/zeroclawlabs
     steps:
       - uses: actions/checkout@v4
 

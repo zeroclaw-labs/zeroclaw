@@ -30,15 +30,6 @@ impl BubblewrapSandbox {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
-
-    /// Check if seccomp is available for syscall filtering
-    fn seccomp_available() -> bool {
-        Command::new("bwrap")
-            .arg("--help")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).contains("--seccomp"))
-            .unwrap_or(false)
-    }
 }
 
 impl Sandbox for BubblewrapSandbox {
@@ -54,15 +45,6 @@ impl Sandbox for BubblewrapSandbox {
             "--ro-bind",
             "/usr",
             "/usr",
-            "--ro-bind",
-            "/usr/local",
-            "/usr/local",
-            "--ro-bind",
-            "/bin",
-            "/bin",
-            "--ro-bind",
-            "/sbin",
-            "/sbin",
             "--dev",
             "/dev",
             "--proc",
@@ -73,23 +55,6 @@ impl Sandbox for BubblewrapSandbox {
             "--unshare-all",
             "--die-with-parent",
         ]);
-
-        // Try to use seccomp for syscall filtering
-        if Self::seccomp_available() {
-            tracing::info!("Enabling seccomp BPF filter for bubblewrap sandbox");
-            // Use basic seccomp profile that blocks dangerous syscalls
-            // This profile blocks ptrace, mount, kexec_load, and other dangerous syscalls
-            bwrap_cmd.arg("--seccomp");
-            bwrap_cmd.arg("--seccomp-drop-capability");
-            bwrap_cmd.arg("CAP_SYS_ADMIN");
-            bwrap_cmd.arg("--seccomp-drop-capability");
-            bwrap_cmd.arg("CAP_SYS_PTRACE");
-        } else {
-            tracing::warn!(
-                "seccomp not available in bubblewrap. Install seccomp-bpf package for enhanced syscall filtering."
-            );
-        }
-
         bwrap_cmd.arg(&program);
         bwrap_cmd.args(&args);
 
@@ -205,19 +170,6 @@ mod tests {
         assert!(
             args.contains(&"--ro-bind".to_string()),
             "must include read-only bind for /usr"
-        );
-        assert!(args.contains(&"/usr".to_string()), "must include /usr bind");
-        assert!(
-            args.contains(&"/usr/local".to_string()),
-            "must include /usr/local bind for tools like python3"
-        );
-        assert!(
-            args.contains(&"/bin".to_string()),
-            "must include /bin bind for core system tools"
-        );
-        assert!(
-            args.contains(&"/sbin".to_string()),
-            "must include /sbin bind for system administration tools"
         );
         assert!(
             args.contains(&"--dev".to_string()),

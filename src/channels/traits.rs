@@ -22,29 +22,6 @@ pub struct ChannelMessage {
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
     pub attachments: Vec<super::media_pipeline::MediaAttachment>,
-    /// When true, the message is stored in session history for context
-    /// but the agent does not generate a response.  Used by channels with
-    /// `mention_only` to passively observe group conversation.
-    #[cfg_attr(test, allow(dead_code))]
-    pub observe_group: bool,
-}
-
-#[allow(clippy::derivable_impls)]
-impl Default for ChannelMessage {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            sender: String::new(),
-            reply_target: String::new(),
-            content: String::new(),
-            channel: String::new(),
-            timestamp: 0,
-            thread_ts: None,
-            interruption_scope_id: None,
-            attachments: vec![],
-            observe_group: false,
-        }
-    }
 }
 
 /// Message to send through a channel
@@ -248,34 +225,6 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-
-    /// Create a room/channel/conversation on the platform.
-    ///
-    /// `name` is the human-readable room name.
-    /// `topic` is an optional room description or purpose.
-    /// `invites` is a list of user IDs to invite to the room.
-    /// `visibility` is an optional visibility setting ("public" or "private").
-    /// `encryption` is an optional flag to enable end-to-end encryption.
-    ///
-    /// Returns the platform-scoped room identifier.
-    async fn create_room(
-        &self,
-        _name: Option<&str>,
-        _topic: Option<&str>,
-        _invites: Vec<String>,
-        _visibility: Option<&str>,
-        _encryption: Option<bool>,
-    ) -> anyhow::Result<String> {
-        Ok(String::new())
-    }
-
-    /// Invite a user to a room/channel/conversation.
-    ///
-    /// `room_id` is the platform-scoped room identifier.
-    /// `user_id` is the platform-scoped user identifier.
-    async fn invite_user(&self, _room_id: &str, _user_id: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -308,7 +257,6 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
-                observe_group: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -327,7 +275,6 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
-            observe_group: false,
         };
 
         let cloned = message.clone();
@@ -423,33 +370,5 @@ mod tests {
                 .await
                 .is_ok()
         );
-    }
-
-    #[tokio::test]
-    async fn default_create_room_returns_success() {
-        let channel = DummyChannel;
-
-        let room_id = channel
-            .create_room(
-                Some("Test Room"),
-                Some("Test Topic"),
-                vec!["@user:example.com".to_string()],
-                Some("private"),
-                Some(true),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(room_id, "");
-    }
-
-    #[tokio::test]
-    async fn default_invite_user_returns_success() {
-        let channel = DummyChannel;
-
-        assert!(channel
-            .invite_user("room_1", "@user:example.com")
-            .await
-            .is_ok());
     }
 }

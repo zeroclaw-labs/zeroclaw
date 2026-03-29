@@ -197,18 +197,8 @@
 ### `config`
 
 - `zeroclaw config schema`
-- `zeroclaw config reload [--port <PORT>] [--host <HOST>]`
 
 `config schema` 将完整 `config.toml` 契约的 JSON Schema（草案 2020-12）打印到 stdout。
-
-`config reload` 将 `config.toml` 热重载到运行中的网关，无需重启守护进程。它调用本地网关的 `POST /admin/reload-config`。会话历史和子代理状态会被保留。
-
-注意：
-
-- 需要运行中的守护进程或网关（`zeroclaw daemon` / `zeroclaw gateway`）。
-- 仅允许回环地址（`127.0.0.0/8`、`::1`、`localhost`）作为目标。
-- 如果 `config.toml` 格式错误，重载会失败并返回描述性错误，运行中的配置不变。
-- 部分字段（如 `default_provider`、`default_model`）需要完全重启守护进程才能生效。检测到此类更改时，命令会打印警告。
 
 ### `completions`
 

@@ -300,21 +300,6 @@ methods = ["list", "get", "create", "update"]
 | `require_pairing` | `true` | Yêu cầu ghép nối trước khi xác thực bearer |
 | `allow_public_bind` | `false` | Chặn lộ public do vô ý |
 
-### Endpoint quản trị
-
-| Phương thức | Đường dẫn | Truy cập | Mục đích |
-|---|---|---|---|
-| `POST` | `/admin/reload-config` | chỉ localhost | Tải lại `config.toml` từ đĩa |
-| `POST` | `/admin/shutdown` | chỉ localhost | Tắt daemon một cách an toàn |
-| `GET` | `/admin/paircode` | chỉ localhost | Hiển thị mã ghép nối hiện tại |
-| `POST` | `/admin/paircode/new` | chỉ localhost | Tạo mã ghép nối mới |
-
-`/admin/reload-config` đọc lại, giải mã, xác thực và thay thế cấu hình trong bộ nhớ. Yêu cầu không phải loopback trả về `403`. Nếu đường dẫn cấu hình đã giải quyết khác với instance đang chạy (ví dụ `ZEROCLAW_WORKSPACE` đã thay đổi), endpoint trả về `409 Conflict`.
-
-Hạn chế đã biết: chỉ `state.config` được thay thế. Các trường được tạo khi khởi động (`default_provider`, `default_model`, `webhook_secret_hash`, trạng thái ghép nối) **không** được cập nhật qua reload. Phản hồi bao gồm `restart_required: true` và `restart_warnings` khi phát hiện các thay đổi đó.
-
-Lệnh CLI tắt: `zeroclaw config reload`
-
 ## `[autonomy]`
 
 | Khóa | Mặc định | Mục đích |

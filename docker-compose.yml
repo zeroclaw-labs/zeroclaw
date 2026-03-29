@@ -18,7 +18,7 @@ services:
     # Or build the Debian variant (includes bash, git, curl):
     # build:
     #   context: .
-    #   target: debian
+    #   dockerfile: Dockerfile.debian
     container_name: zeroclaw
     restart: unless-stopped
     

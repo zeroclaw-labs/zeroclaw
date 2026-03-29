@@ -898,28 +898,6 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
             ));
         }
     }
-
-    // Linger check for systemd user services
-    if cfg!(target_os = "linux") {
-        match crate::service::is_linger_enabled() {
-            Some(true) => {
-                items.push(DiagItem::ok(cat, "loginctl linger enabled"));
-            }
-            Some(false) => {
-                let user = std::env::var("USER")
-                    .or_else(|_| std::env::var("LOGNAME"))
-                    .unwrap_or_else(|_| "$USER".to_string());
-                items.push(DiagItem::warn(
-                    cat,
-                    format!(
-                        "linger not enabled — daemon will stop on logout. \
-                         Fix: sudo loginctl enable-linger {user}"
-                    ),
-                ));
-            }
-            None => {} // loginctl not available or not Linux; skip
-        }
-    }
 }
 
 // ── Environment checks ───────────────────────────────────────────
@@ -950,62 +928,6 @@ fn check_environment(items: &mut Vec<DiagItem>) {
 
     // Optional tools
     check_command_available("curl", &["--version"], cat, items);
-
-    // On Linux with systemd, verify that loginctl linger is enabled so that
-    // user-level services survive SSH disconnects / session ends.
-    #[cfg(target_os = "linux")]
-    check_linger(items);
-}
-
-#[cfg(target_os = "linux")]
-fn check_linger(items: &mut Vec<DiagItem>) {
-    let cat = "environment";
-
-    // Only relevant when running under systemd (i.e. /run/systemd/system exists).
-    if !std::path::Path::new("/run/systemd/system").exists() {
-        return;
-    }
-
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_default();
-
-    if user.is_empty() {
-        return; // can't determine user â skip silently
-    }
-
-    let output = std::process::Command::new("loginctl")
-        .args(["show-user", &user, "--property=Linger"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let linger_enabled = stdout
-                .lines()
-                .any(|line| line.trim().eq_ignore_ascii_case("linger=yes"));
-
-            if linger_enabled {
-                items.push(DiagItem::ok(
-                    cat,
-                    format!("linger enabled for user \"{user}\""),
-                ));
-            } else {
-                items.push(DiagItem::warn(
-                    cat,
-                    format!(
-                        "linger not enabled for user \"{user}\": daemon will stop on logout. \
-                         Fix: sudo loginctl enable-linger {user}"
-                    ),
-                ));
-            }
-        }
-        _ => {
-            // loginctl unavailable or returned an error â skip silently
-        }
-    }
 }
 
 fn check_cli_tools(items: &mut Vec<DiagItem>) {
@@ -1364,6 +1286,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         config.agents.insert(
@@ -1381,6 +1304,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
 

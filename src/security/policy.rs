@@ -507,19 +507,12 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 
 /// Detect a single unquoted `&` operator (background/chain). `&&` is allowed.
 ///
-fn truncate_command_for_log(command: &str, max: usize) -> String {
-    if command.len() <= max {
-        command.to_string()
-    } else {
-        format!("{}...", &command[..max])
-    }
-}
-
 /// We treat any standalone `&` as unsafe in policy validation because it can
 /// chain hidden sub-commands and escape foreground timeout expectations.
 fn contains_unquoted_single_ampersand(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let mut prev = ' ';
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -532,10 +525,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::Double => {
                 if escaped {
                     escaped = false;
+                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    prev = ch;
                     continue;
                 }
                 if ch == '"' {
@@ -545,24 +540,37 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::None => {
                 if escaped {
                     escaped = false;
+                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    prev = ch;
                     continue;
                 }
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     '&' => {
-                        if chars.next_if_eq(&'&').is_none() {
-                            return true;
+                        // `&&` is a logical-AND separator, not a background op.
+                        if chars.next_if_eq(&'&').is_some() {
+                            prev = '&';
+                            continue;
                         }
+                        // `>&N` and `<&N` are fd redirects, not background ops.
+                        if (prev == '>' || prev == '<')
+                            || chars.peek().is_some_and(|c| c.is_ascii_digit())
+                        {
+                            prev = ch;
+                            continue;
+                        }
+                        return true;
                     }
                     _ => {}
                 }
             }
         }
+        prev = ch;
     }
 
     false
@@ -721,18 +729,69 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+/// Extract the file target from a redirection token, returning `None` for
+/// fd-only redirects (e.g. `2>&1`) and standalone operators (e.g. `>`).
 fn redirection_target(token: &str) -> Option<&str> {
-    let marker_idx = token.find(['<', '>'])?;
+    match parse_redirection(token) {
+        RedirectionParse::Target(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// Result of parsing a redirection token.
+enum RedirectionParse<'a> {
+    /// Token contains a redirect operator with an inline target, e.g. `>/dev/null`.
+    Target(&'a str),
+    /// Token is a pure file-descriptor redirect like `2>&1` — always safe.
+    FdOnly,
+    /// Token is a bare redirect operator (e.g. `>`, `>>`, `<`) — the target is the next token.
+    NeedsNextToken,
+    /// Token contains no redirection.
+    None,
+}
+
+fn parse_redirection(token: &str) -> RedirectionParse<'_> {
+    let Some(marker_idx) = token.find(['<', '>']) else {
+        return RedirectionParse::None;
+    };
     let mut rest = &token[marker_idx + 1..];
     rest = rest.trim_start_matches(['<', '>']);
-    rest = rest.trim_start_matches('&');
+
+    // Check for fd redirect: `&` followed by only digits (e.g. `2>&1`, `>&2`).
+    if let Some(after_amp) = rest.strip_prefix('&') {
+        let after_digits = after_amp.trim_start_matches(|c: char| c.is_ascii_digit());
+        if after_digits.is_empty() {
+            return RedirectionParse::FdOnly;
+        }
+    }
+
+    // Strip leading digits (fd number before operator, e.g. the `2` in `2>/dev/null`).
     rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        None
+        RedirectionParse::NeedsNextToken
     } else {
-        Some(trimmed)
+        RedirectionParse::Target(trimmed)
     }
+}
+
+/// Check if a redirection target is safe (standard /dev/* targets or file descriptors).
+///
+/// Safe targets include:
+/// - `/dev/null` — discards output
+/// - `/dev/stdout` — redirects to standard output
+/// - `/dev/stderr` — redirects to standard error
+/// - `/dev/zero` — infinite zero bytes source
+///
+/// File descriptor forms like `2>&1` are handled separately via `redirection_target()`,
+/// which strips the ampersand prefix before calling this function. This function
+/// validates the actual target path/name.
+fn safe_redirect_target(target: &str) -> bool {
+    let target = target.trim();
+    matches!(
+        target,
+        "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/zero"
+    )
 }
 
 /// Extract the basename from a command path, handling both Unix (`/`) and
@@ -775,18 +834,17 @@ fn is_allowlist_entry_match(allowed: &str, executable: &str, executable_base: &s
         return executable_path == allowed_path;
     }
 
-    // Command-name entries continue to match by basename (case-insensitive).
-    // `executable_base` is already lowercased by the caller, so we lowercase
-    // the allowlist entry to match. On Windows, also match when the executable
-    // has a .exe/.cmd/.bat suffix that the allowlist entry omits.
-    let allowed_lower = allowed.to_ascii_lowercase();
-    if allowed_lower == executable_base {
+    // Command-name entries continue to match by basename.
+    // On Windows, also match when the executable has a .exe/.cmd/.bat suffix
+    // that the allowlist entry omits (e.g., allowlist "git" matches "git.exe").
+    if allowed == executable_base {
         return true;
     }
 
     #[cfg(target_os = "windows")]
     {
         let base_lower = executable_base.to_ascii_lowercase();
+        let allowed_lower = allowed.to_ascii_lowercase();
         for ext in &[".exe", ".cmd", ".bat"] {
             if base_lower == format!("{allowed_lower}{ext}") {
                 return true;
@@ -947,6 +1005,10 @@ impl SecurityPolicy {
         command: &str,
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
+        if !self.is_command_allowed(command) {
+            return Err(format!("Command not allowed by security policy: {command}"));
+        }
+
         let risk = self.command_risk_level(command);
 
         // When the operator has set `allowed_commands = ["*"]` AND explicitly
@@ -956,10 +1018,6 @@ impl SecurityPolicy {
         let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
         if has_wildcard && !self.block_high_risk_commands {
             return Ok(risk);
-        }
-
-        if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
         }
 
         if risk == CommandRiskLevel::High {
@@ -1048,15 +1106,6 @@ impl SecurityPolicy {
             return false;
         }
 
-        // When the operator has set `allowed_commands = ["*"]` AND explicitly
-        // disabled `block_high_risk_commands`, they have opted out of all
-        // command-level restrictions including subshell/redirect guards.
-        let full_wildcard =
-            self.allowed_commands.iter().any(|c| c.trim() == "*") && !self.block_high_risk_commands;
-        if full_wildcard {
-            return true;
-        }
-
         // Block subshell/expansion operators — these allow hiding arbitrary
         // commands inside an allowed command (e.g. `echo $(rm -rf /)`) and
         // bypassing path checks through variable indirection. The helper below
@@ -1070,11 +1119,55 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
-        // arbitrary paths and bypass path checks.
+        // Allow safe shell redirections (`<`, `>`, `>>`) to /dev/* targets.
+        // Block unsafe redirections to arbitrary paths that could bypass path checks.
         // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
         if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
-            return false;
+            // Check if all redirections target safe destinations
+            for segment in split_unquoted_segments(command) {
+                let cmd_part = skip_env_assignments(&segment);
+                let words: Vec<&str> = cmd_part.split_whitespace().collect();
+
+                let mut i = 0;
+                // Skip the executable (first word)
+                if !words.is_empty() {
+                    // Check inline redirections on executable itself, e.g., `cat</dev/null`
+                    match parse_redirection(strip_wrapping_quotes(words[0])) {
+                        RedirectionParse::Target(target) => {
+                            if !safe_redirect_target(target) {
+                                return false;
+                            }
+                        }
+                        RedirectionParse::NeedsNextToken => {
+                            // Bare redirect as executable is invalid, block it
+                            return false;
+                        }
+                        RedirectionParse::FdOnly | RedirectionParse::None => {}
+                    }
+                    i = 1;
+                }
+
+                // Check redirections in remaining arguments
+                while i < words.len() {
+                    match parse_redirection(words[i]) {
+                        RedirectionParse::Target(target) => {
+                            if !safe_redirect_target(target) {
+                                return false;
+                            }
+                        }
+                        RedirectionParse::NeedsNextToken => {
+                            // Standalone redirect operator — next token is the target
+                            i += 1;
+                            let target = words.get(i).map(|w| w.trim()).unwrap_or("");
+                            if !safe_redirect_target(target) {
+                                return false;
+                            }
+                        }
+                        RedirectionParse::FdOnly | RedirectionParse::None => {}
+                    }
+                    i += 1;
+                }
+            }
         }
 
         // Block `tee` — it can write to arbitrary files, bypassing the
@@ -2329,6 +2422,50 @@ mod tests {
     }
 
     #[test]
+    fn safe_redirect_to_dev_null_allowed() {
+        let p = default_policy();
+        // stdout to /dev/null
+        assert!(p.is_command_allowed("echo secret > /dev/null"));
+        // stderr to /dev/null
+        assert!(p.is_command_allowed("ls 2> /dev/null"));
+        // both stdout and stderr to /dev/null
+        assert!(p.is_command_allowed("find . 2>&1 > /dev/null"));
+        // inline redirection form
+        assert!(p.is_command_allowed("cat</dev/null"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_stdout_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo hello > /dev/stdout"));
+        assert!(p.is_command_allowed("cat /dev/zero > /dev/stdout"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_stderr_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo error > /dev/stderr"));
+        assert!(p.is_command_allowed("ls 1> /dev/stderr"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_zero_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("cat /dev/zero > /dev/null"));
+    }
+
+    #[test]
+    fn safe_file_descriptor_redirect_allowed() {
+        let p = default_policy();
+        // stderr to stdout
+        assert!(p.is_command_allowed("find . 2>&1"));
+        // stdout to stderr
+        assert!(p.is_command_allowed("echo hello 1>&2"));
+        // combined with safe target
+        assert!(p.is_command_allowed("ls 2>&1 > /dev/null"));
+    }
+
+    #[test]
     fn quoted_ampersand_and_redirect_literals_are_not_treated_as_operators() {
         let p = default_policy();
         assert!(p.is_command_allowed("echo \"A&B\""));
@@ -2388,18 +2525,6 @@ mod tests {
         assert!(p.is_command_allowed("LANG=C grep pattern file"));
         // env assignment + disallowed command — blocked
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
-    }
-
-    #[test]
-    fn mixed_case_allowlist_entry_matches_command() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["icalBuddy".into()],
-            ..SecurityPolicy::default()
-        };
-        // Mixed-case allowlist entry should match the same command
-        assert!(p.is_command_allowed("icalBuddy"));
-        // Also match lowercase invocation (case-insensitive)
-        assert!(p.is_command_allowed("icalbuddy"));
     }
 
     #[test]
@@ -3253,7 +3378,7 @@ mod tests {
         assert!(t.record_within("chat_a", 2)); // count=1 ≤ 2 → ok
         assert!(t.record_within("chat_a", 2)); // count=2 ≤ 2 → ok
         assert!(!t.record_within("chat_a", 2)); // count=3 > 2 → blocked
-                                                // sender B is unaffected — its bucket is empty
+        // sender B is unaffected — its bucket is empty
         assert!(t.record_within("chat_b", 2)); // count=1 ≤ 2 → ok
         assert!(t.record_within("chat_b", 2)); // count=2 ≤ 2 → ok
         assert!(!t.record_within("chat_b", 2)); // count=3 > 2 → blocked

@@ -299,7 +299,11 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("Path blocked"));
-        assert_eq!(counter.load(Ordering::SeqCst), 0, "inner must not be called");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "inner must not be called"
+        );
     }
 
     #[tokio::test]
@@ -318,8 +322,12 @@ mod tests {
     #[tokio::test]
     async fn path_guard_custom_extractor() {
         let (inner, counter) = CountingTool::new();
-        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full))
-            .with_extractor(|args| args.get("target").and_then(|v| v.as_str()).map(String::from));
+        let tool =
+            PathGuardedTool::new(inner, policy(AutonomyLevel::Full)).with_extractor(|args| {
+                args.get("target")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            });
         let result = tool
             .execute(serde_json::json!({"target": "/etc/shadow"}))
             .await

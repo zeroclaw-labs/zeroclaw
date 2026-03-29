@@ -11,7 +11,6 @@ concurrency:
 permissions:
   contents: write
   packages: write
-  deployments: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -334,8 +333,8 @@ jobs:
     needs: [version, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
     environment:
-      name: beta-release
-      url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.version.outputs.tag }}
+      name: github-releases
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ needs.version.outputs.tag }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -408,9 +407,6 @@ jobs:
     name: Trigger Website Redeploy
     needs: [publish]
     runs-on: ubuntu-latest
-    environment:
-      name: website
-      url: https://www.zeroclawlabs.ai
     steps:
       - name: Trigger website redeploy
         env:
@@ -429,7 +425,7 @@ jobs:
     timeout-minutes: 15
     environment:
       name: docker
-      url: https://ghcr.io/zeroclaw-labs/zeroclaw
+      url: https://github.com/${{ github.repository }}/pkgs/container/zeroclaw
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -465,6 +461,7 @@ jobs:
             > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
 
           cp Dockerfile.ci docker-ctx/Dockerfile
+          cp Dockerfile.debian.ci docker-ctx/Dockerfile.debian
 
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -488,7 +485,7 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: docker-ctx
-          build-args: VARIANT=debian
+          file: docker-ctx/Dockerfile.debian
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.version.outputs.tag }}-debian

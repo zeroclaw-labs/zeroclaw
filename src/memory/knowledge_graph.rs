@@ -25,10 +25,6 @@ pub enum NodeType {
     Lesson,
     Expert,
     Technology,
-    // Client relationship types
-    Client,
-    Contact,
-    Interaction,
 }
 
 impl NodeType {
@@ -39,9 +35,6 @@ impl NodeType {
             Self::Lesson => "lesson",
             Self::Expert => "expert",
             Self::Technology => "technology",
-            Self::Client => "client",
-            Self::Contact => "contact",
-            Self::Interaction => "interaction",
         }
     }
 
@@ -52,9 +45,6 @@ impl NodeType {
             "lesson" => Ok(Self::Lesson),
             "expert" => Ok(Self::Expert),
             "technology" => Ok(Self::Technology),
-            "client" => Ok(Self::Client),
-            "contact" => Ok(Self::Contact),
-            "interaction" => Ok(Self::Interaction),
             other => anyhow::bail!("unknown node type: {other}"),
         }
     }
@@ -69,10 +59,6 @@ pub enum Relation {
     Extends,
     AuthoredBy,
     AppliesTo,
-    // Client relationship types
-    ManagesClient,
-    ContactOf,
-    InteractedWith,
 }
 
 impl Relation {
@@ -83,9 +69,6 @@ impl Relation {
             Self::Extends => "extends",
             Self::AuthoredBy => "authored_by",
             Self::AppliesTo => "applies_to",
-            Self::ManagesClient => "manages_client",
-            Self::ContactOf => "contact_of",
-            Self::InteractedWith => "interacted_with",
         }
     }
 
@@ -96,9 +79,6 @@ impl Relation {
             "extends" => Ok(Self::Extends),
             "authored_by" => Ok(Self::AuthoredBy),
             "applies_to" => Ok(Self::AppliesTo),
-            "manages_client" => Ok(Self::ManagesClient),
-            "contact_of" => Ok(Self::ContactOf),
-            "interacted_with" => Ok(Self::InteractedWith),
             other => anyhow::bail!("unknown relation: {other}"),
         }
     }
@@ -406,47 +386,6 @@ impl KnowledgeGraph {
             let relation_str: String = row.get(8)?;
             let relation = Relation::parse(&relation_str)?;
             results.push((node, relation));
-        }
-        Ok(results)
-    }
-
-    /// Find nodes with edges pointing to the given node (inbound edges).
-    pub fn find_inbound(&self, node_id: &str) -> anyhow::Result<Vec<(KnowledgeNode, Relation)>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT n.id, n.node_type, n.title, n.content, n.tags,
-                    n.created_at, n.updated_at, n.source_project,
-                    e.relation
-             FROM edges e
-             JOIN nodes n ON n.id = e.from_id
-             WHERE e.to_id = ?1",
-        )?;
-        let mut results = Vec::new();
-        let mut rows = stmt.query(params![node_id])?;
-        while let Some(row) = rows.next()? {
-            let node = row_to_node(row)?;
-            let relation_str: String = row.get(8)?;
-            let relation = Relation::parse(&relation_str)?;
-            results.push((node, relation));
-        }
-        Ok(results)
-    }
-
-    /// Query nodes by type, ordered by most recently updated.
-    pub fn query_by_type(
-        &self,
-        node_type: &NodeType,
-        limit: usize,
-    ) -> anyhow::Result<Vec<KnowledgeNode>> {
-        let conn = self.conn.lock();
-        let mut stmt = conn.prepare(
-            "SELECT id, node_type, title, content, tags, created_at, updated_at, source_project
-             FROM nodes WHERE node_type = ?1 ORDER BY updated_at DESC LIMIT ?2",
-        )?;
-        let mut results = Vec::new();
-        let mut rows = stmt.query(params![node_type.as_str(), limit as i64])?;
-        while let Some(row) = rows.next()? {
-            results.push(row_to_node(row)?);
         }
         Ok(results)
     }
@@ -904,9 +843,6 @@ mod tests {
             NodeType::Lesson,
             NodeType::Expert,
             NodeType::Technology,
-            NodeType::Client,
-            NodeType::Contact,
-            NodeType::Interaction,
         ] {
             assert_eq!(&NodeType::parse(nt.as_str()).unwrap(), nt);
         }
@@ -920,9 +856,6 @@ mod tests {
             Relation::Extends,
             Relation::AuthoredBy,
             Relation::AppliesTo,
-            Relation::ManagesClient,
-            Relation::ContactOf,
-            Relation::InteractedWith,
         ] {
             assert_eq!(&Relation::parse(r.as_str()).unwrap(), r);
         }

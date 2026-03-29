@@ -227,7 +227,6 @@ impl RedditChannel {
             thread_ts: item.parent_id.clone(),
             interruption_scope_id: None,
             attachments: vec![],
-            observe_group: false,
         })
     }
 }

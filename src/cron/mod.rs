@@ -62,8 +62,7 @@ pub(crate) fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Res
         bail!("delivery.channel is required for announce mode");
     };
     match channel.to_ascii_lowercase().as_str() {
-        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq" | "lark"
-        | "feishu" => {}
+        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq" => {}
         other => bail!("unsupported delivery channel: {other}"),
     }
 

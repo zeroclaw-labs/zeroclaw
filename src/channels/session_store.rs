@@ -23,26 +23,8 @@ impl SessionStore {
         Ok(Self { sessions_dir })
     }
 
-    /// Compute the file path for a session key using reversible percent-encoding.
-    /// Characters that are not alphanumeric, `_`, or `-` are encoded as `%XX`.
-    /// This ensures the key can be recovered exactly from the filename.
+    /// Compute the file path for a session key, sanitizing for filesystem safety.
     fn session_path(&self, session_key: &str) -> PathBuf {
-        let safe_key: String = session_key
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' || c == '-' {
-                    format!("{c}")
-                } else {
-                    format!("%{:02X}", c as u32)
-                }
-            })
-            .collect();
-        self.sessions_dir.join(format!("{safe_key}.jsonl"))
-    }
-
-    /// Legacy file path using the old lossy sanitization (pre-#4806).
-    /// Used as a fallback when loading sessions persisted before the encoding fix.
-    fn legacy_session_path(&self, session_key: &str) -> PathBuf {
         let safe_key: String = session_key
             .chars()
             .map(|c| {
@@ -58,19 +40,11 @@ impl SessionStore {
 
     /// Load all messages for a session from its JSONL file.
     /// Returns an empty vec if the file does not exist or is unreadable.
-    /// Falls back to legacy (lossy-sanitized) filename if the encoded path doesn't exist.
     pub fn load(&self, session_key: &str) -> Vec<ChatMessage> {
         let path = self.session_path(session_key);
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
-            Err(_) => {
-                // Fallback: try legacy path for sessions persisted before #4806
-                let legacy_path = self.legacy_session_path(session_key);
-                match std::fs::File::open(&legacy_path) {
-                    Ok(f) => f,
-                    Err(_) => return Vec::new(),
-                }
-            }
+            Err(_) => return Vec::new(),
         };
 
         let reader = std::io::BufReader::new(file);
@@ -90,22 +64,8 @@ impl SessionStore {
         messages
     }
 
-    /// Migrate a legacy-encoded session file to the new percent-encoded path.
-    fn maybe_migrate_legacy_file(&self, session_key: &str) {
-        let new_path = self.session_path(session_key);
-        if new_path.exists() {
-            return;
-        }
-        let legacy_path = self.legacy_session_path(session_key);
-        if legacy_path.exists() {
-            let _ = std::fs::rename(&legacy_path, &new_path);
-        }
-    }
-
     /// Append a single message to the session JSONL file.
-    /// Migrates legacy-encoded files to the new encoding on first append.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        self.maybe_migrate_legacy_file(session_key);
         let path = self.session_path(session_key);
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -151,20 +111,13 @@ impl SessionStore {
     }
 
     /// Delete a session's JSONL file. Returns `true` if the file existed.
-    /// Also removes legacy-encoded file if present.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let path = self.session_path(session_key);
-        if path.exists() {
-            std::fs::remove_file(&path)?;
-            return Ok(true);
+        if !path.exists() {
+            return Ok(false);
         }
-        // Try legacy path
-        let legacy_path = self.legacy_session_path(session_key);
-        if legacy_path.exists() {
-            std::fs::remove_file(&legacy_path)?;
-            return Ok(true);
-        }
-        Ok(false)
+        std::fs::remove_file(&path)?;
+        Ok(true)
     }
 
     /// Return the modification time of a session's JSONL file.
@@ -175,7 +128,6 @@ impl SessionStore {
     }
 
     /// List all session keys that have files on disk.
-    /// Decodes percent-encoded filenames back to original keys.
     pub fn list_sessions(&self) -> Vec<String> {
         let entries = match std::fs::read_dir(&self.sessions_dir) {
             Ok(e) => e,
@@ -186,37 +138,10 @@ impl SessionStore {
             .filter_map(|entry| {
                 let entry = entry.ok()?;
                 let name = entry.file_name().into_string().ok()?;
-                let encoded_key = name.strip_suffix(".jsonl")?;
-                Some(decode_session_key(encoded_key))
+                name.strip_suffix(".jsonl").map(String::from)
             })
             .collect()
     }
-}
-
-/// Decode a percent-encoded session key back to the original string.
-/// `%XX` sequences are decoded to the corresponding character.
-fn decode_session_key(encoded: &str) -> String {
-    let mut result = String::new();
-    let mut chars = encoded.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            let hex: String = chars.by_ref().take(2).collect();
-            if hex.len() == 2 {
-                if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                    if let Some(decoded) = char::from_u32(code) {
-                        result.push(decoded);
-                        continue;
-                    }
-                }
-            }
-            // Malformed escape — pass through as-is
-            result.push('%');
-            result.push_str(&hex);
-        } else {
-            result.push(c);
-        }
-    }
-    result
 }
 
 impl SessionBackend for SessionStore {
@@ -280,107 +205,21 @@ mod tests {
     }
 
     #[test]
-    fn key_encoding_roundtrip() {
+    fn key_sanitization() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
 
-        // Keys with special chars should survive encode → decode roundtrip
-        let key = "matrix_@user:m.org||!room:m.org_$evt123:m.org_@user:m.org";
-        store.append(key, &ChatMessage::user("test")).unwrap();
-
-        let messages = store.load(key);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "test");
-
-        // list_sessions should return the original key
-        let sessions = store.list_sessions();
-        assert!(sessions.contains(&key.to_string()));
-    }
-
-    #[test]
-    fn key_encoding_special_chars() {
-        let tmp = TempDir::new().unwrap();
-        let store = SessionStore::new(tmp.path()).unwrap();
-
-        // All special chars in Matrix keys should survive
-        let key = "slack/thread:123/user";
-        store.append(key, &ChatMessage::user("test")).unwrap();
-
-        let messages = store.load(key);
-        assert_eq!(messages.len(), 1);
-
-        let sessions = store.list_sessions();
-        assert!(sessions.contains(&key.to_string()));
-    }
-
-    #[test]
-    fn legacy_file_fallback() {
-        let tmp = TempDir::new().unwrap();
-        let store = SessionStore::new(tmp.path()).unwrap();
-
-        // Simulate a legacy file written with lossy sanitization
-        let key = "matrix_@user:m.org||!room:m.org";
-        let legacy_path = store.legacy_session_path(key);
-        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        let mut file = std::fs::File::create(&legacy_path).unwrap();
-        writeln!(file, r#"{{"role":"user","content":"legacy msg"}}"#).unwrap();
-
-        // load() should find it via legacy fallback
-        let messages = store.load(key);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].content, "legacy msg");
-    }
-
-    #[test]
-    fn legacy_file_migration_on_append() {
-        let tmp = TempDir::new().unwrap();
-        let store = SessionStore::new(tmp.path()).unwrap();
-
-        // Create a legacy file
-        let key = "matrix_@user:m.org||!room:m.org";
-        let legacy_path = store.legacy_session_path(key);
-        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        let mut file = std::fs::File::create(&legacy_path).unwrap();
-        writeln!(file, r#"{{"role":"user","content":"old msg"}}"#).unwrap();
-
-        // Append should migrate the file
+        // Keys with special chars should be sanitized
         store
-            .append(key, &ChatMessage::assistant("new msg"))
+            .append("slack/thread:123/user", &ChatMessage::user("test"))
             .unwrap();
 
-        // Legacy file should be gone, new-encoded file should exist
-        assert!(!legacy_path.exists());
-        assert!(store.session_path(key).exists());
-
-        // All messages should be present
-        let messages = store.load(key);
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].content, "old msg");
-        assert_eq!(messages[1].content, "new msg");
+        let messages = store.load("slack/thread:123/user");
+        assert_eq!(messages.len(), 1);
     }
 
     #[test]
-    fn decode_session_key_roundtrip() {
-        let keys = vec![
-            "matrix_@user:m.org||!room:m.org_$evt:m.org_@user:m.org",
-            "simple_key_no_specials",
-            "slack/thread:123/user",
-            "discord_12345_67890",
-            "email_user@example.com",
-        ];
-        for key in keys {
-            let store = SessionStore {
-                sessions_dir: PathBuf::from("/tmp"),
-            };
-            let path = store.session_path(key);
-            let filename = path.file_stem().unwrap().to_str().unwrap();
-            let decoded = super::decode_session_key(filename);
-            assert_eq!(decoded, key, "roundtrip failed for key: {key}");
-        }
-    }
-
-    #[test]
-    fn list_sessions_returns_decoded_keys() {
+    fn list_sessions_returns_keys() {
         let tmp = TempDir::new().unwrap();
         let store = SessionStore::new(tmp.path()).unwrap();
 

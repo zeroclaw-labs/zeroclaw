@@ -213,7 +213,6 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         opencode_cli: crate::config::OpenCodeCliConfig::default(),
         sop: crate::config::SopConfig::default(),
         shell_tool: crate::config::ShellToolConfig::default(),
-        provider_env: std::collections::HashMap::new(),
     };
 
     println!(
@@ -492,6 +491,17 @@ fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
         }
     }
 
+    // If the binary was installed via Homebrew, use the Homebrew var path
+    // instead of ~/.zeroclaw so the Homebrew service finds the same config.
+    if let Some(prefix) = std::env::current_exe()
+        .ok()
+        .as_deref()
+        .and_then(homebrew_prefix_for_exe)
+    {
+        let config_dir = PathBuf::from(prefix).join("var").join("zeroclaw");
+        return (config_dir.clone(), config_dir.join("workspace"));
+    }
+
     let config_dir = home.join(".zeroclaw");
     (config_dir.clone(), config_dir.join("workspace"))
 }
@@ -661,7 +671,6 @@ async fn run_quick_setup_with_home(
         opencode_cli: crate::config::OpenCodeCliConfig::default(),
         sop: crate::config::SopConfig::default(),
         shell_tool: crate::config::ShellToolConfig::default(),
-        provider_env: std::collections::HashMap::new(),
     };
 
     config.save().await?;
@@ -4006,9 +4015,7 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     multi_message_delay_ms: existing_dc
                         .map(|d| d.multi_message_delay_ms)
                         .unwrap_or(800),
-                    stall_timeout_secs: existing_dc
-                        .map(|d| d.stall_timeout_secs)
-                        .unwrap_or(0),
+                    stall_timeout_secs: existing_dc.map(|d| d.stall_timeout_secs).unwrap_or(0),
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -4405,9 +4412,6 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         .map(|m| m.multi_message_delay_ms)
                         .unwrap_or(800),
                     recovery_key,
-                    mention_only: existing_mx
-                        .map(|m| m.mention_only)
-                        .unwrap_or(false),
                 });
             }
             ChannelMenuChoice::Signal => {
@@ -4615,9 +4619,6 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                             .map(|w| w.group_mention_patterns.clone())
                             .unwrap_or_default(),
                         proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
-                        interrupt_on_new_message: existing_wa
-                            .map(|w| w.interrupt_on_new_message)
-                            .unwrap_or(false),
                     });
 
                     println!(
@@ -4734,9 +4735,6 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         .map(|w| w.group_mention_patterns.clone())
                         .unwrap_or_default(),
                     proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
-                    interrupt_on_new_message: existing_wa
-                        .map(|w| w.interrupt_on_new_message)
-                        .unwrap_or(false),
                 });
             }
             ChannelMenuChoice::Linq => {
@@ -7849,6 +7847,7 @@ mod tests {
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stall_timeout_secs: 0,
         });
         existing.matrix = Some(MatrixConfig {
             homeserver: "https://m.org".into(),

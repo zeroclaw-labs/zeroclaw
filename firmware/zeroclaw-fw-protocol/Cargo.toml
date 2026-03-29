@@ -1,0 +1,20 @@
+[workspace]
+
+[package]
+name = "zeroclaw-fw-protocol"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "ZeroClaw firmware protocol — no_std JSON-over-serial command parsing and response formatting"
+
+[dependencies]
+heapless = { version = "0.9", default-features = false }
+serde = { version = "1.0", default-features = false, features = ["derive"], optional = true }
+serde_json = { version = "1.0", default-features = false, optional = true, features = ["alloc"] }
+
+[features]
+default = []
+serde = ["dep:serde", "dep:serde_json"]
+
+[dev-dependencies]
+serde_json = "1.0"

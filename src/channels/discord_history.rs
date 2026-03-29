@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
@@ -21,8 +21,6 @@ pub struct DiscordHistoryChannel {
     /// Dedicated discord.db memory backend.
     discord_memory: Arc<dyn Memory>,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
-    /// Tracks which channels are currently being resolved to avoid redundant API calls.
-    pending_channel_resolutions: Mutex<HashSet<String>>,
     proxy_url: Option<String>,
     /// When false, DM messages are not stored in discord.db.
     store_dms: bool,
@@ -47,7 +45,6 @@ impl DiscordHistoryChannel {
             channel_ids,
             discord_memory,
             typing_handles: Mutex::new(HashMap::new()),
-            pending_channel_resolutions: Mutex::new(HashSet::new()),
             proxy_url: None,
             store_dms,
             respond_to_dms,
@@ -79,7 +76,7 @@ impl DiscordHistoryChannel {
 
     fn bot_user_id_from_token(token: &str) -> Option<String> {
         let part = token.split('.').next()?;
-        super::discord_utils::base64_decode(part)
+        base64_decode(part)
     }
 
     async fn resolve_channel_name(&self, channel_id: &str) -> String {
@@ -102,18 +99,7 @@ impl DiscordHistoryChannel {
             }
         }
 
-        // 2. Race condition protection: check if already resolving
-        {
-            let mut guard = self.pending_channel_resolutions.lock();
-            if guard.contains(channel_id) {
-                // If already pending, wait briefly and return the ID as fallback
-                // or the caller will retry on the next message anyway.
-                return channel_id.to_string();
-            }
-            guard.insert(channel_id.to_string());
-        }
-
-        // 3. Fetch from API (either not in DB or stale)
+        // 2. Fetch from API (either not in DB or stale)
         let url = format!("https://discord.com/api/v10/channels/{channel_id}");
         let resp = self
             .http_client()
@@ -145,10 +131,7 @@ impl DiscordHistoryChannel {
 
         let resolved = name.unwrap_or_else(|| channel_id.to_string());
 
-        // Remove from pending list now that resolution is done
-        self.pending_channel_resolutions.lock().remove(channel_id);
-
-        // 4. Store in persistent database
+        // 3. Store in persistent database
         let _ = self
             .discord_memory
             .store(
@@ -161,6 +144,40 @@ impl DiscordHistoryChannel {
 
         resolved
     }
+}
+
+const BASE64_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+#[allow(clippy::cast_possible_truncation)]
+fn base64_decode(input: &str) -> Option<String> {
+    let padded = match input.len() % 4 {
+        2 => format!("{input}=="),
+        3 => format!("{input}="),
+        _ => input.to_string(),
+    };
+    let mut bytes = Vec::new();
+    let chars: Vec<u8> = padded.bytes().collect();
+    for chunk in chars.chunks(4) {
+        if chunk.len() < 4 {
+            break;
+        }
+        let mut v = [0usize; 4];
+        for (i, &b) in chunk.iter().enumerate() {
+            if b == b'=' {
+                v[i] = 0;
+            } else {
+                v[i] = BASE64_ALPHABET.iter().position(|&a| a == b)?;
+            }
+        }
+        bytes.push(((v[0] << 2) | (v[1] >> 4)) as u8);
+        if chunk[2] != b'=' {
+            bytes.push((((v[1] & 0xF) << 4) | (v[2] >> 2)) as u8);
+        }
+        if chunk[3] != b'=' {
+            bytes.push((((v[2] & 0x3) << 6) | v[3]) as u8);
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 fn contains_bot_mention(content: &str, bot_user_id: &str) -> bool {
@@ -241,7 +258,6 @@ impl Channel for DiscordHistoryChannel {
             .unwrap_or(41250);
 
         // Identify with intents for guild + DM messages + message content
-        // Intents: GUILDS (1<<0) | GUILD_MESSAGES (1<<9) | DIRECT_MESSAGES (1<<12) | MESSAGE_CONTENT (1<<15)
         let identify = json!({
             "op": 2,
             "d": {
@@ -367,7 +383,7 @@ impl Channel for DiscordHistoryChannel {
                         .unwrap_or("")
                         .to_string();
 
-                    // DM detection: DMs have guild_id set to null (which as_str() returns None).
+                    // DM detection: DMs have no guild_id
                     let is_dm_event = d.get("guild_id").and_then(serde_json::Value::as_str).is_none();
 
                     // Resolve channel name (with cache)
@@ -484,7 +500,6 @@ impl Channel for DiscordHistoryChannel {
                             thread_ts: None,
                             interruption_scope_id: None,
                             attachments: Vec::new(),
-                            observe_group: false,
                         };
                         if tx.send(channel_msg).await.is_err() {
                             break;
@@ -536,38 +551,5 @@ impl Channel for DiscordHistoryChannel {
             handle.abort();
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bot_user_id_extraction() {
-        // Token format is header.payload.signature, header is base64(user_id)
-        // ID 899856331077468210 is "ODk5ODU2MzMxMDc3NDY4MjEw" in base64
-        let token = "ODk5ODU2MzMxMDc3NDY4MjEw.GOgTlz.something";
-        let id = DiscordHistoryChannel::bot_user_id_from_token(token);
-        assert_eq!(id, Some("899856331077468210".to_string()));
-    }
-
-    #[test]
-    fn mention_detection() {
-        let bot_id = "12345";
-        assert!(contains_bot_mention("hello <@12345> world", bot_id));
-        assert!(contains_bot_mention("hello <@!12345> world", bot_id));
-        assert!(!contains_bot_mention("hello <@54321> world", bot_id));
-        assert!(!contains_bot_mention("hello world", bot_id));
-    }
-
-    #[test]
-    fn mention_stripping() {
-        let bot_id = "12345";
-        assert_eq!(
-            strip_bot_mention("  hello <@12345> world  ", bot_id),
-            "hello   world"
-        );
-        assert_eq!(strip_bot_mention("<@!12345> help", bot_id), "help");
     }
 }

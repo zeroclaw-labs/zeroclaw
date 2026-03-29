@@ -113,8 +113,6 @@ impl Tool for DiscordSearchTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| v as usize);
 
-        // Note: we pass channel_id as session_id to recall() because Discord messages
-        // are stored with channel_id in the session_id field of the memory entry.
         match self
             .discord_memory
             .recall(query, limit, channel_id, since, until)

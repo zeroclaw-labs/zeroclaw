@@ -363,21 +363,6 @@ methods = ["list", "get", "create", "update"]
 | `require_pairing` | `true` | bearer 认证前需要配对 |
 | `allow_public_bind` | `false` | 阻止意外公共暴露 |
 
-### 管理端点
-
-| 方法 | 路径 | 访问 | 用途 |
-|---|---|---|---|
-| `POST` | `/admin/reload-config` | 仅限本地 | 从磁盘热重载 `config.toml` |
-| `POST` | `/admin/shutdown` | 仅限本地 | 优雅关闭守护进程 |
-| `GET` | `/admin/paircode` | 仅限本地 | 显示当前配对码 |
-| `POST` | `/admin/paircode/new` | 仅限本地 | 生成新配对码 |
-
-`/admin/reload-config` 重新读取、解密、验证并替换内存中的配置。非回环请求返回 `403`。如果解析的配置路径与运行实例不同（例如 `ZEROCLAW_WORKSPACE` 已更改），端点返回 `409 Conflict`。
-
-已知限制：仅替换 `state.config`。启动时派生的字段（`default_provider`、`default_model`、`webhook_secret_hash`、配对状态）**不会**通过重载更新。当检测到此类更改时，响应包含 `restart_required: true` 和 `restart_warnings`。
-
-CLI 快捷方式：`zeroclaw config reload`
-
 ## `[autonomy]`
 
 | 键 | 默认值 | 用途 |

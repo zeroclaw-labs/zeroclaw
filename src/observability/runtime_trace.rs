@@ -126,7 +126,7 @@ impl RuntimeTraceLogger {
         let tmp = self.path.with_extension(format!(
             "tmp.{}.{}",
             std::process::id(),
-            Local::now().timestamp_nanos_opt().unwrap_or_default()
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         fs::write(&tmp, rewritten)?;
 
@@ -367,7 +367,7 @@ mod tests {
         for i in 0..5 {
             let event = RuntimeTraceEvent {
                 id: format!("id-{i}"),
-                timestamp: Local::now().to_rfc3339(),
+                timestamp: Utc::now().to_rfc3339(),
                 event_type: "test".into(),
                 channel: None,
                 provider: None,
@@ -395,7 +395,7 @@ mod tests {
         let target_id = "target-event";
         let event = RuntimeTraceEvent {
             id: target_id.into(),
-            timestamp: Local::now().to_rfc3339(),
+            timestamp: Utc::now().to_rfc3339(),
             event_type: "tool_call_result".into(),
             channel: Some("telegram".into()),
             provider: Some("openrouter".into()),

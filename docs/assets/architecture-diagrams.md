@@ -299,7 +299,6 @@ flowchart TB
     Gateway --> WebhookPOST[POST /webhook<br/>Main agent endpoint]
     Gateway --> WAVerify[GET /whatsapp<br/>Meta verification]
     Gateway --> WAMessage[POST /whatsapp<br/>WhatsApp webhook]
-    Gateway --> ReloadPOST[POST /admin/reload-config<br/>Hot-reload config<br/>localhost only]
 
     PairPOST --> PairLimiter[Rate Limiter<br/>pair req/min]
     PairLimiter --> PairGuard[PairingGuard<br/>Code validation]

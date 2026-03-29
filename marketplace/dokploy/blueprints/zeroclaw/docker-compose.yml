@@ -1,7 +1,7 @@
 version: "3.8"
 services:
   zeroclaw:
-    image: ghcr.io/zeroclaw-labs/zeroclaw:0.6.6
+    image: ghcr.io/zeroclaw-labs/zeroclaw:0.6.4
     restart: unless-stopped
     environment:
       - API_KEY=${API_KEY}

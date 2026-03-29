@@ -22,10 +22,9 @@ pub mod audit;
 #[cfg(feature = "sandbox-bubblewrap")]
 pub mod bubblewrap;
 pub mod detect;
-pub mod dm_pairing;
 pub mod docker;
 
-// SSRF protection and prompt injection defense (contributed from RustyClaw, MIT licensed)
+// Prompt injection defense (contributed from RustyClaw, MIT licensed)
 pub mod domain_matcher;
 pub mod estop;
 #[cfg(target_os = "linux")]
@@ -37,14 +36,12 @@ pub mod leak_detector;
 pub mod nevis;
 pub mod otp;
 pub mod pairing;
-pub mod path_validation;
 pub mod playbook;
 pub mod policy;
 pub mod prompt_guard;
 #[cfg(target_os = "macos")]
 pub mod seatbelt;
 pub mod secrets;
-pub mod ssrf;
 pub mod traits;
 pub mod vulnerability;
 #[cfg(feature = "webauthn")]
@@ -62,13 +59,9 @@ pub use estop::{EstopLevel, EstopManager, EstopState, ResumeSelector};
 pub use otp::OtpValidator;
 #[allow(unused_imports)]
 pub use pairing::PairingGuard;
-#[allow(unused_imports)]
-pub use path_validation::PathValidationSandbox;
 pub use policy::{AutonomyLevel, SecurityPolicy};
 #[allow(unused_imports)]
 pub use secrets::SecretStore;
-#[allow(unused_imports)]
-pub use ssrf::SsrfValidator;
 #[allow(unused_imports)]
 pub use traits::{NoopSandbox, Sandbox};
 // Nevis IAM integration

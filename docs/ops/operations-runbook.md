@@ -166,12 +166,8 @@ Before applying config changes:
 1. backup `~/.zeroclaw/config.toml`
 2. apply one logical change at a time
 3. run `zeroclaw doctor`
-4. apply the change:
-   - **Hot-reload** (no downtime): `zeroclaw config reload`
-   - **Full restart** (required for provider/model/pairing changes): restart daemon/service
+4. restart daemon/service
 5. verify with `status` + `channel doctor`
-
-`config reload` preserves conversation history and sub-agent state. If the change requires a restart, the command prints warnings listing the affected fields.
 
 ## Rollback Procedure
 

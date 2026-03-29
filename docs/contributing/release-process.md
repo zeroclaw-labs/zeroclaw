@@ -112,9 +112,8 @@ Required repository settings for non-dry-run:
 
 Workflow guardrails:
 
-- release tag must be stable `vX.Y.Z` and match `Cargo.toml` version
-- formula source URL and SHA256 are updated from the stable release asset `zeroclaw-source-X.Y.Z.tar.gz`
-- the Homebrew source archive includes prebuilt `web/dist`, so dashboard assets stay available in formula builds without requiring npm during the Homebrew build
+- release tag must match `Cargo.toml` version
+- formula source URL and SHA256 are updated from the tagged tarball
 - formula license is normalized to `Apache-2.0 OR MIT`
 - PR is opened from the bot fork into `Homebrew/homebrew-core:master`
 

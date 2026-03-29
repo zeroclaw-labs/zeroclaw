@@ -679,92 +679,10 @@ MSG
   esac
 }
 
-# Get minimum Rust version from Cargo.toml rust-version field
-get_minimum_rust_version() {
-  local cargo_toml="${ROOT_DIR}/Cargo.toml"
-  if [[ -f "$cargo_toml" ]]; then
-    grep -E '^rust-version\s*=' "$cargo_toml" | head -1 | sed 's/.*=\s*"\?\([^"]*\)"\?.*/\1/'
-  fi
-}
-
-# Compare two version strings (e.g., "1.87" vs "1.63")
-# Returns 0 if $1 >= $2, 1 otherwise
-version_ge() {
-  local v1="$1"
-  local v2="$2"
-  # Use sort -V for version comparison
-  if [[ "$(printf '%s\n%s' "$v2" "$v1" | sort -V | head -1)" == "$v2" ]]; then
-    return 0
-  else
-    return 1
-  fi
-}
-
-# Check if installed Rust version meets minimum requirement
-check_rust_version() {
-  local min_version
-  min_version="$(get_minimum_rust_version)"
-  if [[ -z "$min_version" ]]; then
-    return 0  # No minimum version specified
-  fi
-
-  if ! have_cmd rustc; then
-    return 1  # Rust not installed
-  fi
-
-  local current_version
-  current_version="$(rustc --version | awk '{print $2}')"
-
-  if version_ge "$current_version" "$min_version"; then
-    return 0  # Version OK
-  else
-    return 1  # Version too old
-  fi
-}
-
 install_rust_toolchain() {
-  # Check if Rust is installed and meets minimum version
   if have_cmd cargo && have_cmd rustc; then
-    local min_version current_version
-    min_version="$(get_minimum_rust_version)"
-    current_version="$(rustc --version | awk '{print $2}')"
-
-    if [[ -n "$min_version" ]]; then
-      if version_ge "$current_version" "$min_version"; then
-        step_ok "Rust already installed: $(rustc --version)"
-        return
-      else
-        warn "Rust version $current_version is too old (minimum required: $min_version)"
-        # Check if rustup is available for upgrade
-        if have_cmd rustup; then
-          step_dot "Updating Rust to latest stable via rustup"
-          rustup update stable
-          # Re-source cargo env to ensure new version is in PATH
-          if [[ -f "$HOME/.cargo/env" ]]; then
-            # shellcheck disable=SC1090
-            source "$HOME/.cargo/env"
-          fi
-          # Verify the update worked
-          current_version="$(rustc --version | awk '{print $2}')"
-          if version_ge "$current_version" "$min_version"; then
-            step_ok "Rust updated to $current_version"
-            return
-          else
-            error "Failed to update Rust to required version $min_version"
-            error "Please manually update Rust: rustup update stable"
-            exit 1
-          fi
-        else
-          error "Rust $current_version is too old and rustup is not available"
-          error "Please install rustup or update your Rust installation manually"
-          error "Minimum required version: $min_version"
-          exit 1
-        fi
-      fi
-    else
-      step_ok "Rust already installed: $(rustc --version)"
-      return
-    fi
+    step_ok "Rust already installed: $(rustc --version)"
+    return
   fi
 
   if ! have_cmd curl; then

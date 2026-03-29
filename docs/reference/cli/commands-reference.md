@@ -197,18 +197,8 @@ Skill manifests (`SKILL.toml`) support `prompts` and `[[tools]]`; both are injec
 ### `config`
 
 - `zeroclaw config schema`
-- `zeroclaw config reload [--port <PORT>] [--host <HOST>]`
 
 `config schema` prints a JSON Schema (draft 2020-12) for the full `config.toml` contract to stdout.
-
-`config reload` hot-reloads `config.toml` into the running gateway without restarting the daemon. It calls `POST /admin/reload-config` on the local gateway. Conversation history and sub-agent state are preserved.
-
-Notes:
-
-- Requires a running daemon or gateway (`zeroclaw daemon` / `zeroclaw gateway`).
-- Only loopback addresses (`127.0.0.0/8`, `::1`, `localhost`) are allowed as targets.
-- If `config.toml` is malformed, the reload fails with a descriptive error and the running config is unchanged.
-- Some fields (e.g. `default_provider`, `default_model`) require a full daemon restart to take effect. The command prints warnings when such changes are detected.
 
 ### `completions`
 

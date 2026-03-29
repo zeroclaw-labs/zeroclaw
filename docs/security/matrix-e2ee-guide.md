@@ -292,7 +292,6 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 - Keep Matrix tokens out of logs and screenshots.
 - Start with permissive `allowed_users`, then tighten to explicit user IDs.
 - Prefer canonical room IDs in production to avoid alias drift.
-- **Threading behavior:** ZeroClaw always replies in a thread rooted at the user's original message. Each thread maintains its own isolated conversation context. The main room timeline is unaffected — threads do not share context with each other or with the room. In encrypted rooms, threading works identically — the SDK decrypts events transparently before thread context is evaluated.
 
 ---
 

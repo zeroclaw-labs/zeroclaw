@@ -262,11 +262,12 @@ mod tests {
     /// Returns the fully-wrapped shell tool as it is composed in production:
     /// RateLimited(PathGuarded(ShellTool)).  Tests that verify path-blocking or
     /// rate-limiting behaviour must use this helper so they exercise the wrappers.
-    fn wrapped_shell(
-        security: Arc<SecurityPolicy>,
-    ) -> RateLimitedTool<PathGuardedTool<ShellTool>> {
+    fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<PathGuardedTool<ShellTool>> {
         RateLimitedTool::new(
-            PathGuardedTool::new(ShellTool::new(security.clone(), test_runtime()), security.clone()),
+            PathGuardedTool::new(
+                ShellTool::new(security.clone(), test_runtime()),
+                security.clone(),
+            ),
             security,
         )
     }
@@ -632,12 +633,6 @@ mod tests {
         assert_eq!(
             DEFAULT_SHELL_TIMEOUT_SECS, 60,
             "default shell timeout must be 60 seconds"
-        );
-        // SecurityPolicy::default() should carry the same value.
-        let policy = SecurityPolicy::default();
-        assert_eq!(
-            policy.shell_timeout_secs, DEFAULT_SHELL_TIMEOUT_SECS,
-            "SecurityPolicy default must match DEFAULT_SHELL_TIMEOUT_SECS"
         );
     }
 

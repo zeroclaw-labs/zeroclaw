@@ -95,6 +95,22 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         }
     }
 
+    // Wire up MQTT SOP listener if configured
+    if let Some(ref mqtt_config) = config.channels_config.mqtt {
+        let mqtt_cfg = mqtt_config.clone();
+        handles.push(spawn_component_supervisor(
+            "mqtt",
+            initial_backoff,
+            max_backoff,
+            move || {
+                let cfg = mqtt_cfg.clone();
+                async move { Box::pin(run_mqtt_sop_listener(&cfg)).await }
+            },
+        ));
+    } else {
+        crate::health::mark_component_ok("mqtt");
+    }
+
     if config.heartbeat.enabled {
         let heartbeat_cfg = config.clone();
         handles.push(spawn_component_supervisor(
@@ -813,6 +829,23 @@ fn has_supervised_channels(config: &Config) -> bool {
         .any(|(_, ok)| *ok)
 }
 
+async fn run_mqtt_sop_listener(config: &crate::config::MqttConfig) -> Result<()> {
+    use crate::config::SopConfig;
+    use crate::memory::NoneMemory;
+    use crate::sop::{SopAuditLogger, SopEngine};
+    use std::sync::{Arc, Mutex};
+
+    // Initialize SOP engine
+    let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+
+    // Initialize SOP audit logger with NoneMemory (MQTT listener is headless)
+    let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
+
+    // Validate MQTT config and run the listener
+    config.validate()?;
+    crate::channels::mqtt::run_mqtt_sop_listener(config, engine, audit).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -918,17 +951,13 @@ mod tests {
         let mut config = Config::default();
         config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
             url: "https://mattermost.example.com".into(),
-            bot_token: Some("token".into()),
+            bot_token: "token".into(),
             channel_id: Some("channel-id".into()),
-            channel_ids: vec![],
             allowed_users: vec!["*".into()],
             thread_replies: Some(true),
             mention_only: Some(false),
             interrupt_on_new_message: false,
             proxy_url: None,
-            listen_mode: None,
-            bot_id: None,
-            bot_password: None,
         });
         assert!(has_supervised_channels(&config));
     }

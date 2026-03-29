@@ -1,6 +1,6 @@
 # CLAUDE.md — ZeroClaw (Claude Code)
 
-> **Shared instructions live in `@AGENTS.md`.**
+> **Shared instructions live in [`AGENTS.md`](./AGENTS.md).**
 > This file contains only Claude Code-specific directives.
 
 ## Claude Code Settings
@@ -14,10 +14,3 @@ _No custom hooks defined yet._
 ## Slash Commands
 
 _No custom slash commands defined yet._
-
-## Linked References
-
-- `@AGENTS.md` — primary agent instruction file (cross-tool)
-- `@docs/contributing/change-playbooks.md` — adding providers, channels, tools, peripherals; security/gateway changes; architecture boundaries
-- `@docs/contributing/pr-discipline.md` — privacy rules, superseded-PR attribution/templates, handoff template
-- `@docs/contributing/docs-contract.md` — docs system contract, i18n rules, locale parity

@@ -317,8 +317,8 @@ impl Provider for ClaudeCodeProvider {
 mod tests {
     use super::*;
     use crate::providers::test_util::env_lock;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Serialize tests that spawn the echo-provider script.
     ///
@@ -432,8 +432,10 @@ mod tests {
     /// Uses write-to-temp-then-rename to avoid ETXTBSY ("Text file busy")
     /// races: the final path is never open for writing when `execve()` runs.
     fn echo_provider() -> ClaudeCodeProvider {
+        use std::io::Write;
         static SCRIPT_ID: AtomicUsize = AtomicUsize::new(0);
         let script_id = SCRIPT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir();
         let final_path = dir.join(format!(
             "fake_claude_{}_{}.sh",
             std::process::id(),

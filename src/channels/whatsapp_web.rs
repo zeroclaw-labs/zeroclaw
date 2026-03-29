@@ -31,7 +31,6 @@ use super::whatsapp_storage::RusqliteStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::select;
 use wa_rs_proto::whatsapp::device_props::PlatformType;
@@ -1002,43 +1001,18 @@ impl Channel for WhatsAppWebChannel {
             // Fall through to send text normally (voice chat gets BOTH)
         }
 
-        // Parse media attachment markers ([IMAGE:path], [VOICE:path], etc.)
-        let (cleaned_text, attachments) = parse_attachment_markers(&message.content);
+        // Send text message
+        let outgoing = wa_rs_proto::whatsapp::Message {
+            conversation: Some(message.content.clone()),
+            ..Default::default()
+        };
 
-        // Send each media attachment
-        for attachment in &attachments {
-            if let Err(e) = Self::send_wa_attachment(&client, &to, attachment).await {
-                tracing::warn!(
-                    kind = ?attachment.kind,
-                    target = %attachment.target,
-                    error = %e,
-                    "WhatsApp Web: failed to send media attachment; skipping"
-                );
-            }
-        }
-
-        // Send remaining text (if any after stripping markers)
-        if !cleaned_text.is_empty() {
-            let outgoing = wa_rs_proto::whatsapp::Message {
-                conversation: Some(cleaned_text),
-                ..Default::default()
-            };
-
-            let message_id = Box::pin(client.send_message(to, outgoing)).await?;
-            tracing::debug!(
-                "WhatsApp Web: sent text to {} (id: {})",
-                message.recipient,
-                message_id
-            );
-        } else if attachments.is_empty() {
-            // Original message was empty — send as-is to preserve existing behaviour
-            let outgoing = wa_rs_proto::whatsapp::Message {
-                conversation: Some(message.content.clone()),
-                ..Default::default()
-            };
-            Box::pin(client.send_message(to, outgoing)).await?;
-        }
-
+        let message_id = client.send_message(to, outgoing).await?;
+        tracing::debug!(
+            "WhatsApp Web: sent text to {} (id: {})",
+            message.recipient,
+            message_id
+        );
         Ok(())
     }
 
@@ -1371,7 +1345,6 @@ impl Channel for WhatsAppWebChannel {
                                         thread_ts: None,
                                         interruption_scope_id: None,
                     attachments: vec![],
-                                        observe_group: false,
                                     })
                                     .await
                                 {

@@ -1,26 +1,9 @@
 # Dockerfile.ci — CI/release image using pre-built binaries.
 # Used by release workflows to skip the ~60 min Rust compilation.
-#
-# Variants (via --build-arg):
-#   Distroless (default):  docker build -f Dockerfile.ci .
-#   Debian (with shell):   docker build -f Dockerfile.ci --build-arg VARIANT=debian .
+# The main Dockerfile is still used for local dev builds.
 
-ARG VARIANT=distroless
-
-# ── Distroless base ────────────────────────────────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:9c4fe2381c2e6d53c4cfdefeff6edbd2a67ec7713e2c3ca6653806cbdbf27a1e AS base-distroless
-
-# ── Debian base (with shell tools) ─────────────────────────────
-FROM debian:bookworm-slim AS base-debian
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash \
-        ca-certificates \
-        curl \
-        git \
-    && rm -rf /var/lib/apt/lists/*
-
-# ── Runtime ────────────────────────────────────────────────────
-FROM base-${VARIANT} AS runtime
+# ── Runtime (Distroless) ─────────────────────────────────────
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7
 
 ARG TARGETARCH
 

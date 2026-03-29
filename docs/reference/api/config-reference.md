@@ -150,6 +150,69 @@ loop_ignore_tools = ["browser_screenshot", "browser_navigate"]
 message_timeout_scale_max = 8
 ```
 
+## `[reliability]`
+
+Resilience configuration for multi-model fallback chains, API key rotation, and retry policies.
+
+| Key | Type | Default | Purpose |
+|---|---|---|---|
+| `fallback_providers` | `[string]` | `[]` | Ordered list of fallback provider IDs when primary fails |
+| `model_fallbacks` | `{string: [string]}` | `{}` | Per-model fallback chains (map of model → list of alternatives) |
+| `api_keys` | `[string]` | `[]` | Additional API keys for rate-limit (429) rotation |
+| `provider_retries` | `u32` | `2` | Retry attempts per provider before moving to next fallback |
+| `provider_backoff_ms` | `u64` | `500` | Initial exponential backoff delay in milliseconds |
+| `channel_initial_backoff_secs` | `u64` | `1` | Initial backoff for channel/daemon restart attempts |
+| `channel_max_backoff_secs` | `u64` | `60` | Maximum backoff for channel/daemon restart attempts |
+| `scheduler_poll_secs` | `u64` | `5` | Scheduler polling cadence in seconds |
+| `scheduler_retries` | `u32` | `3` | Maximum retry attempts for cron job execution |
+
+Notes:
+
+- `fallback_providers` is a list of provider IDs to try in order when the primary provider fails (timeout, connection error, 503, rate limit after key rotation).
+- Each fallback provider resolves credentials independently using the standard resolution order: explicit config → provider-specific env var → `ZEROCLAW_API_KEY` → `API_KEY`.
+- `model_fallbacks` allows semantic fallbacks when a specific model is unavailable. Example: `{ "claude-opus-4-20250514" = ["claude-sonnet-4-20250514"] }`.
+- `api_keys` supplies additional API keys that ZeroClaw rotates through on `429` (rate limit) responses. The primary `api_key` (set globally or per-channel) is tried first.
+- `provider_retries` applies before each fallback attempt. With `provider_retries = 2` and `provider_backoff_ms = 500`, the runtime retries with delays of 500ms, then 1000ms.
+- `channel_initial_backoff_secs` and `channel_max_backoff_secs` control exponential backoff for channel reconnection after transient failures.
+- `scheduler_poll_secs` controls how often the built-in scheduler checks for cron-triggered tasks.
+- `scheduler_retries` limits retry attempts for failed scheduled task executions.
+- Hot-reload enabled: updates to this section take effect on the next channel message or provider request without restart.
+
+Example:
+
+```toml
+[reliability]
+fallback_providers = ["anthropic", "groq", "openrouter"]
+api_keys = ["sk-backup-1", "sk-backup-2"]
+
+[reliability.model_fallbacks]
+"claude-opus-4-20250514" = ["claude-sonnet-4-20250514"]
+"gpt-4o" = ["gpt-4-turbo", "gpt-3.5-turbo"]
+
+provider_retries = 3
+provider_backoff_ms = 1000
+channel_initial_backoff_secs = 2
+channel_max_backoff_secs = 120
+scheduler_poll_secs = 10
+scheduler_retries = 5
+```
+
+Fallback triggers:
+
+- **Timeout**: No response within the provider timeout window.
+- **Connection error**: Network/DNS failure.
+- **Service unavailable (503)**: Provider temporary outage.
+- **Rate limit (429)**: First, rotates through `api_keys` on the same provider/model; then falls back to next provider.
+- **Model not found**: If `model_fallbacks` is configured for that model, tries alternatives in order.
+
+Fallback does **not** trigger on:
+
+- **Client error (400)**: Malformed request; retrying won't help.
+- **Invalid credentials (401/403)**: Permanent auth failure.
+- **Model output errors**: The provider responded but the model returned an error in its response.
+
+For detailed configuration guidance, see [Multi-Model Setup and Fallback Chains](/docs/getting-started/multi-model-setup.md).
+
 ## `[security.otp]`
 
 | Key | Default | Purpose |
@@ -459,21 +522,6 @@ When deploying behind a reverse proxy that maps ZeroClaw to a sub-path,
 set `path_prefix` to that sub-path (e.g. `"/zeroclaw"`). All gateway
 routes will be served under this prefix. The value must start with `/`
 and must not end with `/`.
-
-### Admin endpoints
-
-| Method | Path | Access | Purpose |
-|---|---|---|---|
-| `POST` | `/admin/reload-config` | localhost only | Hot-reload `config.toml` from disk |
-| `POST` | `/admin/shutdown` | localhost only | Graceful daemon shutdown |
-| `GET` | `/admin/paircode` | localhost only | Show current pairing code |
-| `POST` | `/admin/paircode/new` | localhost only | Generate new pairing code |
-
-`/admin/reload-config` re-reads, decrypts, validates, and swaps the in-memory config. Non-loopback requests return `403`. If the resolved config path differs from the running instance (e.g. `ZEROCLAW_WORKSPACE` changed), the endpoint returns `409 Conflict`.
-
-Known limitation: only `state.config` is swapped. Fields derived at startup (`default_provider`, `default_model`, `webhook_secret_hash`, pairing state) are **not** updated by reload. The response includes `restart_required: true` and `restart_warnings` when such changes are detected.
-
-CLI shorthand: `zeroclaw config reload`
 
 ## `[autonomy]`
 

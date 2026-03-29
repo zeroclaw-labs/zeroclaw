@@ -897,7 +897,6 @@ mod tests {
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
-            mention_only: false,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();

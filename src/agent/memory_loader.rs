@@ -216,7 +216,6 @@ mod tests {
             .await
             .unwrap();
         assert!(context.contains("[Memory context]"));
-        assert!(context.contains("[/Memory context]"));
         assert!(context.contains("- k: v"));
     }
 

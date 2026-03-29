@@ -270,8 +270,12 @@ impl PromptSection for DateTimeSection {
         let tz = now.format("%Z");
 
         Ok(format!(
-            "## Current Date\n\n{} ({})",
-            now.format("%Y-%m-%d"),
+            "## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n\
+             The following is the ABSOLUTE TRUTH regarding the current date and time. \
+             Use this for all relative time calculations (e.g. \"last 7 days\").\n\n\
+             Date: {year:04}-{month:02}-{day:02}\n\
+             Time: {hour:02}:{minute:02}:{second:02} ({tz})\n\
+             ISO 8601: {year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{}",
             now.format("%:z")
         ))
     }
@@ -481,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn date_section_includes_date_and_offset() {
+    fn datetime_section_includes_timestamp_and_timezone() {
         let tools: Vec<Box<dyn Tool>> = vec![];
         let ctx = PromptContext {
             workspace_dir: Path::new("/tmp"),
@@ -497,18 +501,12 @@ mod tests {
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
-        assert!(rendered.starts_with("## Current Date\n\n"));
+        assert!(rendered.starts_with("## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n"));
 
-        let payload = rendered.trim_start_matches("## Current Date\n\n");
-        let (date, offset) = payload
-            .split_once(" (")
-            .expect("date payload should include offset");
-        assert_eq!(date.len(), 10);
-        assert!(date.chars().all(|c| c.is_ascii_digit() || c == '-'));
-        assert!(offset.ends_with(')'));
-        let offset = offset.trim_end_matches(')');
-        assert!(offset.starts_with('+') || offset.starts_with('-'));
-        assert!(offset.contains(':'));
+        let payload = rendered.trim_start_matches("## CRITICAL CONTEXT: CURRENT DATE & TIME\n\n");
+        assert!(payload.chars().any(|c| c.is_ascii_digit()));
+        assert!(payload.contains("Date:"));
+        assert!(payload.contains("Time:"));
     }
 
     #[test]

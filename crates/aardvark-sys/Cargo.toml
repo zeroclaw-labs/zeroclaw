@@ -21,5 +21,5 @@ repository = "https://github.com/zeroclaw-labs/zeroclaw"
 #   4. Replace stub method bodies with FFI calls via mod bindings
 
 [dependencies]
-libloading = "0.9"
+libloading = "0.8"
 thiserror = "2.0"
