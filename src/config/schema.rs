@@ -3205,6 +3205,10 @@ pub struct PluginsConfig {
     /// Plugin signature verification security settings
     #[serde(default)]
     pub security: PluginSecurityConfig,
+    /// Per-plugin configuration: `[plugins.<name>]` sections map key-value pairs
+    /// that are passed to the plugin as Extism config.
+    #[serde(default, flatten)]
+    pub per_plugin: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 }
 
 /// Plugin signature verification configuration (`[plugins.security]`).
@@ -3221,10 +3225,24 @@ pub struct PluginSecurityConfig {
     /// Hex-encoded Ed25519 public keys of trusted plugin publishers.
     #[serde(default)]
     pub trusted_publisher_keys: Vec<String>,
+    /// Network security level for plugin host validation: "default", "strict", or "paranoid".
+    #[serde(default = "default_network_security_level")]
+    pub network_security_level: String,
+    /// Plugins individually allowed to load in paranoid mode.
+    ///
+    /// When `network_security_level` is `"paranoid"`, **only** plugins whose name
+    /// appears in this list are loaded; all others are rejected with
+    /// [`PluginError::PluginNotAllowlisted`].  Ignored at other security levels.
+    #[serde(default)]
+    pub allowed_plugins: Vec<String>,
 }
 
 fn default_signature_mode() -> String {
     "disabled".to_string()
+}
+
+fn default_network_security_level() -> String {
+    "default".to_string()
 }
 
 impl Default for PluginSecurityConfig {
@@ -3232,6 +3250,8 @@ impl Default for PluginSecurityConfig {
         Self {
             signature_mode: default_signature_mode(),
             trusted_publisher_keys: Vec::new(),
+            network_security_level: default_network_security_level(),
+            allowed_plugins: Vec::new(),
         }
     }
 }
@@ -3252,6 +3272,7 @@ impl Default for PluginsConfig {
             auto_discover: false,
             max_plugins: default_max_plugins(),
             security: PluginSecurityConfig::default(),
+            per_plugin: std::collections::HashMap::new(),
         }
     }
 }
