@@ -1259,6 +1259,22 @@ pub struct ToolFilterGroup {
     pub filter_builtins: bool,
 }
 
+/// HMAC tool execution receipt configuration.
+///
+/// When enabled, every tool execution produces a cryptographic HMAC-SHA256
+/// receipt appended to the tool result. Receipts prove the tool actually ran
+/// and cannot be forged by the LLM. See arXiv:2603.10060.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ToolReceiptsConfig {
+    /// Enable HMAC receipt generation for tool executions. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// When true, append tool receipts to the user-visible response message.
+    /// When false (default), receipts are only in internal history and debug logs.
+    #[serde(default)]
+    pub show_in_response: bool,
+}
+
 /// OpenAI Whisper STT provider configuration (`[transcription.openai]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OpenAiSttConfig {
@@ -1415,6 +1431,13 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// HMAC tool execution receipts for hallucination detection.
+    /// When enabled, every tool execution produces a cryptographic receipt
+    /// that proves the tool actually ran. The LLM cannot forge valid receipts.
+    /// Based on: Basu (2026), arXiv:2603.10060.
+    #[serde(default)]
+    pub tool_receipts: ToolReceiptsConfig,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1467,6 +1490,7 @@ impl Default for AgentConfig {
                 crate::agent::context_compressor::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            tool_receipts: ToolReceiptsConfig::default(),
         }
     }
 }

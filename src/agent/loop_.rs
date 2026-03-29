@@ -2173,6 +2173,8 @@ pub(crate) async fn agent_turn(
         0,    // max_tool_result_chars: 0 = disabled (legacy callers)
         0,    // context_token_budget: 0 = disabled (legacy callers)
         None, // shared_budget: no shared budget for legacy callers
+        None, // receipt_generator
+        None, // collected_receipts
         native_tool_calls_only,
     )
     .await
@@ -2312,6 +2314,8 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
+    collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
     native_tool_calls_only: bool,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
@@ -3035,6 +3039,7 @@ pub(crate) async fn run_tool_call_loop(
                                 success: false,
                                 error_reason: Some(scrub_credentials(&reason)),
                                 duration: Duration::ZERO,
+                                receipt: None,
                             },
                         ));
                         continue;
@@ -3104,6 +3109,7 @@ pub(crate) async fn run_tool_call_loop(
                                 success: false,
                                 error_reason: Some(denied),
                                 duration: Duration::ZERO,
+                                receipt: None,
                             },
                         ));
                         continue;
@@ -3153,6 +3159,7 @@ pub(crate) async fn run_tool_call_loop(
                         success: false,
                         error_reason: Some(duplicate),
                         duration: Duration::ZERO,
+                        receipt: None,
                     },
                 ));
                 continue;
@@ -3215,6 +3222,7 @@ pub(crate) async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                receipt_generator,
             )
             .await?
         } else {
@@ -3224,6 +3232,7 @@ pub(crate) async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                receipt_generator,
             )
             .await?
         };
@@ -3334,7 +3343,17 @@ pub(crate) async fn run_tool_call_loop(
                     }
                 }
             }
-            let result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            let mut result_output = truncate_tool_result(&outcome.output, max_tool_result_chars);
+            // Append HMAC receipt to tool result when receipts are enabled (#4830)
+            if let Some(ref receipt) = outcome.receipt {
+                tracing::debug!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
+                result_output = format!("{result_output}\n\n[receipt: {receipt}]");
+                if let Some(store) = collected_receipts {
+                    if let Ok(mut v) = store.lock() {
+                        v.push(format!("{tool_name}: {receipt}"));
+                    }
+                }
+            }
             individual_results.push((tool_call_id, result_output.clone()));
             let _ = writeln!(
                 tool_results,
@@ -4031,6 +4050,8 @@ pub async fn run(
                 config.agent.max_tool_result_chars,
                 config.agent.max_context_tokens,
                 None, // shared_budget
+                None, // receipt_generator
+                None, // collected_receipts
                 config.agent.native_tool_calls_only,
             )
             .await
@@ -4338,6 +4359,8 @@ pub async fn run(
                     config.agent.max_tool_result_chars,
                     config.agent.max_context_tokens,
                     None, // shared_budget
+                    None, // receipt_generator
+                    None, // collected_receipts
                     config.agent.native_tool_calls_only,
                 )
                 .await
@@ -5179,8 +5202,16 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let result =
-            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
+        let result = execute_one_tool(
+            "unknown_tool",
+            call_arguments,
+            &[],
+            None,
+            &observer,
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
@@ -5209,6 +5240,7 @@ mod tests {
             Some(&activated),
             &observer,
             None,
+            None, // receipt_generator
         )
         .await
         .expect("suffix alias should execute the unique activated tool");
@@ -5853,6 +5885,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -5912,6 +5946,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -5959,6 +5995,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6008,6 +6046,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6064,6 +6104,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6120,6 +6162,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6177,6 +6221,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6232,6 +6278,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6287,6 +6335,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6425,6 +6475,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6500,6 +6552,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6567,6 +6621,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6629,6 +6685,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6703,6 +6761,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6768,6 +6828,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6853,6 +6915,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -6915,6 +6979,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -7001,6 +7067,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -7071,6 +7139,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -7143,6 +7213,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -7219,6 +7291,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -7304,6 +7378,8 @@ mod tests {
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -9337,6 +9413,8 @@ Let me check the result."#;
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await
@@ -9495,6 +9573,8 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // receipt_generator
+                    None, // collected_receipts
                 ),
             )
             .await
@@ -9577,6 +9657,8 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    None, // receipt_generator
+                    None, // collected_receipts
                 ),
             )
             .await
@@ -9635,6 +9717,8 @@ Let me check the result."#;
             0,
             0,
             None,
+            None, // receipt_generator
+            None, // collected_receipts
             false,
         )
         .await

@@ -19,4 +19,5 @@ The following docs are explicitly proposal-oriented and may include hypothetical
 - [sandboxing.md](sandboxing.md)
 - [../ops/resource-limits.md](../ops/resource-limits.md)
 - [audit-logging.md](audit-logging.md)
+- [tool-receipts.md](tool-receipts.md)
 - [security-roadmap.md](security-roadmap.md)
