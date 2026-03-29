@@ -14,6 +14,7 @@ docker-compose.override.yml
 
 # Environment files (may contain secrets)
 .env
+.envrc
 
 # Python virtual environments
 
@@ -50,6 +51,7 @@ lcov.info
 # IDE's stuff
 .idea
 .vscode/
+.editorconfig
 
 # Wrangler cache
 .wrangler/
