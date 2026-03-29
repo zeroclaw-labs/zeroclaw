@@ -4,11 +4,9 @@
 //! 1. User holds BOOTSEL while plugging in Pico → RPI-RP2 drive appears.
 //! 2. User asks "flash my pico".
 //! 3. LLM calls `pico_flash(confirm=true)`.
-//! 4. Tool copies UF2 to RPI-RP2 drive; Pico reboots into MicroPython.
-//! 5. Tool waits up to 20 s for `/dev/cu.usbmodem*` to appear.
-//! 6. Tool deploys `main.py` via `mpremote` and resets the Pico.
-//! 7. Tool waits for the serial port to reappear after reset.
-//! 8. Tool returns success; user restarts ZeroClaw to get `pico0`.
+//! 4. Tool copies UF2 to RPI-RP2 drive; Pico reboots into ZeroClaw firmware.
+//! 5. Tool waits up to 20 s for serial port to appear.
+//! 6. Tool returns success; user restarts ZeroClaw to get `pico0`.
 
 use super::device::DeviceRegistry;
 use super::uf2;
@@ -26,12 +24,11 @@ const PORT_POLL_MS: u64 = 500;
 
 // ── PicoFlashTool ─────────────────────────────────────────────────────────────
 
-/// Tool: flash ZeroClaw MicroPython firmware to a Pico in BOOTSEL mode.
+/// Tool: flash ZeroClaw firmware to a Pico in BOOTSEL mode.
 ///
 /// The Pico must be connected with BOOTSEL held so it mounts as `RPI-RP2`.
-/// After flashing, the tool deploys `main.py` via `mpremote`, then reconnects
-/// the serial transport in the [`DeviceRegistry`] so subsequent `gpio_write`
-/// calls work immediately without restarting ZeroClaw.
+/// After flashing, the tool reconnects the serial transport in the [`DeviceRegistry`]
+/// so subsequent `gpio_write` calls work immediately without restarting ZeroClaw.
 pub struct PicoFlashTool {
     registry: Arc<RwLock<DeviceRegistry>>,
 }
@@ -51,8 +48,8 @@ impl Tool for PicoFlashTool {
     fn description(&self) -> &str {
         "Flash ZeroClaw firmware to a Raspberry Pi Pico in BOOTSEL mode. \
          The Pico must be connected with the BOOTSEL button held (shows as RPI-RP2 drive in Finder). \
-         After flashing the Pico reboots, main.py is deployed, and the serial \
-         connection is refreshed automatically — no restart needed."
+         After flashing the Pico reboots and the serial connection is refreshed automatically — \
+         no restart needed."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -134,7 +131,7 @@ impl Tool for PicoFlashTool {
         )
         .await;
 
-        let port = match port {
+        let final_port = match port {
             Some(p) => p,
             None => {
                 // Flash likely succeeded even if port didn't appear in time —
@@ -144,94 +141,56 @@ impl Tool for PicoFlashTool {
                     output: String::new(),
                     error: Some(format!(
                         "UF2 copied to {} but serial port did not appear within {PORT_WAIT_SECS}s. \
-                         Unplug and replug the Pico, then run:\n  \
-                         mpremote connect <port> cp ~/.zeroclaw/firmware/pico/main.py :main.py + reset",
+                         Unplug and replug the Pico, then restart ZeroClaw.",
                         mount.display()
                     )),
                 });
             }
         };
 
-        tracing::info!(port = %port.display(), "Pico serial port online after UF2 flash");
+        tracing::info!(port = %final_port.display(), "Pico serial port online after UF2 flash");
 
-        // ── 6. Deploy main.py via mpremote ────────────────────────────────
-        if let Err(e) = uf2::deploy_main_py(&port, &firmware_dir).await {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("main.py deploy failed: {e}")),
-            });
-        }
-
-        // ── 7. Wait for serial port after mpremote reset ──────────────────
-        //
-        // mpremote resets the Pico so the serial port disappears briefly.
-        // Give the OS a moment to drop the old entry before polling.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-        let final_port = uf2::wait_for_serial_port(
-            std::time::Duration::from_secs(PORT_WAIT_SECS),
-            std::time::Duration::from_millis(PORT_POLL_MS),
-        )
-        .await;
-
-        // ── 8. Reconnect serial transport in DeviceRegistry ──────────────
+        // ── 6. Reconnect serial transport in DeviceRegistry ──────────────
         //
         // The old transport still points at a stale port handle from before
         // the flash. Reconnect so gpio_write works immediately.
-        let reconnect_result = match &final_port {
-            Some(p) => {
-                let port_str = p.to_string_lossy();
-                let mut reg = self.registry.write().await;
-                // Try to find a pico alias in the registry.
-                match reg.aliases().into_iter().find(|a| a.starts_with("pico")) {
-                    Some(a) => {
-                        let alias = a.to_string();
-                        reg.reconnect(&alias, Some(&port_str)).await
-                    }
-                    None => Err(anyhow::anyhow!(
-                        "no pico alias found in registry; cannot reconnect transport"
-                    )),
-                }
+        let port_str = final_port.to_string_lossy();
+        let mut reg = self.registry.write().await;
+        
+        let reconnect_result = match reg.aliases().into_iter().find(|a| a.starts_with("pico")) {
+            Some(a) => {
+                let alias = a.to_string();
+                reg.reconnect(&alias, Some(&port_str)).await
             }
-            None => Err(anyhow::anyhow!("no serial port to reconnect")),
+            None => Err(anyhow::anyhow!(
+                "no pico alias found in registry; cannot reconnect transport"
+            )),
         };
 
-        // ── 9. Return result ──────────────────────────────────────────────
-        match final_port {
-            Some(p) => {
-                let port_str = p.display().to_string();
-                let reconnected = reconnect_result.is_ok();
-                if reconnected {
-                    tracing::info!(port = %port_str, "Pico online with main.py — transport reconnected");
-                } else {
-                    let err = reconnect_result.unwrap_err();
-                    tracing::warn!(port = %port_str, err = %err, "Pico online but reconnect failed");
-                }
-                let suffix = if reconnected {
-                    "pico0 is ready — you can use gpio_write immediately."
-                } else {
-                    "Restart ZeroClaw to reconnect as pico0."
-                };
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "Pico flashed and main.py deployed successfully. \
-                         Firmware is online at {port_str}. {suffix}"
-                    ),
-                    error: None,
-                })
-            }
-            None => Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "Pico flashed and main.py deployed. \
-                         Serial port did not reappear within {PORT_WAIT_SECS}s after reset — \
-                         unplug and replug the Pico, then restart ZeroClaw to connect as pico0."
-                ),
-                error: None,
-            }),
+        // ── 7. Return result ──────────────────────────────────────────────
+        let port_display = final_port.display().to_string();
+        let reconnected = reconnect_result.is_ok();
+        
+        if reconnected {
+            tracing::info!(port = %port_display, "Pico online — transport reconnected");
+        } else {
+            let err = reconnect_result.unwrap_err();
+            tracing::warn!(port = %port_display, err = %err, "Pico online but reconnect failed");
         }
+        
+        let suffix = if reconnected {
+            "pico0 is ready — you can use gpio_write immediately."
+        } else {
+            "Restart ZeroClaw to reconnect as pico0."
+        };
+        
+        Ok(ToolResult {
+            success: true,
+            output: format!(
+                "Pico flashed successfully. Firmware is online at {port_display}. {suffix}"
+            ),
+            error: None,
+        })
     }
 }
 
@@ -290,7 +249,6 @@ mod tests {
             .await
             .unwrap();
         // Either success (if a Pico happens to be connected) or the BOOTSEL error.
-        // What must NOT happen: panic or anyhow error propagation.
         let _ = result; // just verify it didn't panic
     }
 }

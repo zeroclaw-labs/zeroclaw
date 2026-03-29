@@ -31,6 +31,7 @@ use super::whatsapp_storage::RusqliteStore;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use std::path::Path;
 use std::sync::Arc;
 use tokio::select;
 use wa_rs_proto::whatsapp::device_props::PlatformType;
@@ -647,7 +648,7 @@ impl WhatsAppWebChannel {
             anyhow::bail!("attachment path not found: {target}");
         }
 
-        let file_bytes = tokio::fs::read(path)
+        let file_bytes: Vec<u8> = tokio::fs::read(path)
             .await
             .map_err(|e| anyhow!("failed to read attachment file {target}: {e}"))?;
         if file_bytes.is_empty() {
@@ -663,7 +664,7 @@ impl WhatsAppWebChannel {
         let mimetype = mime_from_path(path).to_string();
         let file_name = path
             .file_name()
-            .and_then(|n| n.to_str())
+            .and_then(|n: &std::ffi::OsStr| n.to_str())
             .unwrap_or("file")
             .to_string();
 
