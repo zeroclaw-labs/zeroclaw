@@ -260,10 +260,33 @@ pub enum SkillCommands {
         /// Skill path or installed skill name
         source: String,
     },
-    /// Install a new skill from a URL or local path
+    /// Install a new skill from a URL, local path, or .well-known discovery
+    #[command(long_about = "\
+Install a new skill from a URL, local path, or .well-known agent-skills discovery.
+
+Sources can be:
+  - A local directory path
+  - A git repository URL
+  - A ClawhHub slug (clawhub:<slug>)
+  - A domain URL for .well-known discovery (with --from-well-known or auto-detected)
+
+When --from-well-known is passed (or a bare https:// domain with no git-like path \
+is given), the installer fetches \
+<domain>/.well-known/agent-skills/index.json and presents the available skills \
+for installation. This follows the Agent Skills discovery standard.
+
+Examples:
+  zeroclaw skills install ./my-skill
+  zeroclaw skills install https://github.com/user/skill-repo
+  zeroclaw skills install clawhub:my-skill
+  zeroclaw skills install --from-well-known https://example.com
+  zeroclaw skills install https://example.com")]
     Install {
         /// Source URL or local path
         source: String,
+        /// Discover and install skills via .well-known/agent-skills/index.json
+        #[arg(long)]
+        from_well_known: bool,
     },
     /// Remove an installed skill
     Remove {

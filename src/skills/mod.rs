@@ -1353,6 +1353,264 @@ fn install_clawhub_skill_source(
     }
 }
 
+// ─── .well-known/agent-skills discovery ───────────────────────────────────────
+
+const WELL_KNOWN_PATH: &str = ".well-known/agent-skills/index.json";
+const MAX_WELL_KNOWN_RESPONSE_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+
+/// A single skill entry from the `.well-known/agent-skills/index.json` index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WellKnownSkillEntry {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Download URL for the skill archive (zip) or git repository.
+    pub url: String,
+}
+
+/// The top-level `.well-known/agent-skills/index.json` document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WellKnownIndex {
+    pub skills: Vec<WellKnownSkillEntry>,
+}
+
+/// Determine whether `source` looks like a bare domain URL suitable for
+/// `.well-known` discovery. A bare domain is an `https://` URL whose path is
+/// empty or just `/` — i.e. it does not look like a git repo, ClawhHub link,
+/// or any other path-bearing URL.
+fn is_well_known_candidate(source: &str) -> bool {
+    if is_clawhub_source(source) {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(source) else {
+        return false;
+    };
+    if parsed.scheme() != "https" && parsed.scheme() != "http" {
+        return false;
+    }
+    let path = parsed.path().trim_end_matches('/');
+    path.is_empty()
+}
+
+/// Build the `.well-known/agent-skills/index.json` URL for a given base domain
+/// URL.
+fn well_known_index_url(source: &str) -> Result<String> {
+    let mut parsed = Url::parse(source).context("invalid URL for .well-known discovery")?;
+    // Ensure the path ends with `/` so `join` works correctly.
+    if !parsed.path().ends_with('/') {
+        parsed.set_path(&format!("{}/", parsed.path()));
+    }
+    let full = parsed
+        .join(WELL_KNOWN_PATH)
+        .context("failed to join .well-known path")?;
+    Ok(full.to_string())
+}
+
+/// Fetch and parse the `.well-known/agent-skills/index.json` from a base URL.
+fn fetch_well_known_index(source: &str) -> Result<WellKnownIndex> {
+    let url = well_known_index_url(source)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/json")
+        .send()
+        .with_context(|| format!("failed to fetch {url}"))?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            ".well-known discovery failed: HTTP {} from {url}",
+            resp.status()
+        );
+    }
+
+    let bytes = resp.bytes()?;
+    if bytes.len() > MAX_WELL_KNOWN_RESPONSE_BYTES {
+        anyhow::bail!(
+            ".well-known index too large ({} bytes > {MAX_WELL_KNOWN_RESPONSE_BYTES})",
+            bytes.len()
+        );
+    }
+
+    let index: WellKnownIndex = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse .well-known index from {url}"))?;
+
+    if index.skills.is_empty() {
+        anyhow::bail!("no skills found in .well-known index at {url}");
+    }
+
+    Ok(index)
+}
+
+/// Install all skills listed in a `.well-known/agent-skills/index.json`.
+///
+/// Each entry's `url` field is treated as a git source or a direct zip download:
+/// - If the URL ends in `.git` or looks like a git repo it is cloned.
+/// - Otherwise it is downloaded as a zip and extracted (same logic as ClawhHub).
+fn install_well_known_skills(
+    source: &str,
+    skills_path: &Path,
+    allow_scripts: bool,
+) -> Result<Vec<(PathBuf, usize)>> {
+    let index = fetch_well_known_index(source)?;
+    println!(
+        "  Found {} skill(s) in .well-known index:",
+        index.skills.len()
+    );
+    for entry in &index.skills {
+        println!(
+            "    - {} — {}",
+            console::style(&entry.name).white().bold(),
+            if entry.description.is_empty() {
+                "(no description)"
+            } else {
+                &entry.description
+            }
+        );
+    }
+    println!();
+
+    let mut installed = Vec::new();
+    for entry in &index.skills {
+        println!("  Installing skill '{}'...", entry.name);
+        let result = if is_git_source(&entry.url) {
+            install_git_skill_source(&entry.url, skills_path, allow_scripts)
+                .with_context(|| format!("failed to install '{}' from {}", entry.name, entry.url))
+        } else {
+            install_well_known_zip_skill(entry, skills_path, allow_scripts)
+                .with_context(|| format!("failed to install '{}' from {}", entry.name, entry.url))
+        };
+        match result {
+            Ok(pair) => {
+                println!(
+                    "    {} {} ({} files scanned)",
+                    console::style("✓").green().bold(),
+                    pair.0.display(),
+                    pair.1
+                );
+                installed.push(pair);
+            }
+            Err(e) => {
+                println!(
+                    "    {} Skipped '{}': {e:#}",
+                    console::style("✗").red().bold(),
+                    entry.name
+                );
+            }
+        }
+    }
+
+    if installed.is_empty() {
+        anyhow::bail!("no skills could be installed from .well-known index");
+    }
+
+    Ok(installed)
+}
+
+/// Download a skill from a `.well-known` entry URL as a zip archive, extract it,
+/// and run the security audit.
+fn install_well_known_zip_skill(
+    entry: &WellKnownSkillEntry,
+    skills_path: &Path,
+    allow_scripts: bool,
+) -> Result<(PathBuf, usize)> {
+    let skill_dir_name = normalize_skill_name(&entry.name);
+    let skill_dir_name = if skill_dir_name.is_empty() {
+        "skill".to_string()
+    } else {
+        skill_dir_name
+    };
+    let installed_dir = skills_path.join(&skill_dir_name);
+    if installed_dir.exists() {
+        anyhow::bail!(
+            "Destination skill already exists: {}",
+            installed_dir.display()
+        );
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+
+    let resp = client
+        .get(&entry.url)
+        .send()
+        .with_context(|| format!("failed to download skill from {}", entry.url))?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!(
+            "skill download failed: HTTP {} from {}",
+            resp.status(),
+            entry.url
+        );
+    }
+
+    let bytes = resp.bytes()?.to_vec();
+    if bytes.len() as u64 > MAX_CLAWHUB_ZIP_BYTES {
+        anyhow::bail!(
+            "skill zip rejected: too large ({} bytes > {MAX_CLAWHUB_ZIP_BYTES})",
+            bytes.len()
+        );
+    }
+
+    std::fs::create_dir_all(&installed_dir)?;
+
+    let cursor = Cursor::new(bytes);
+    let mut archive = ZipArchive::new(cursor).context("downloaded content is not a valid zip")?;
+
+    for i in 0..archive.len() {
+        let mut zip_entry = archive.by_index(i)?;
+        let raw_name = zip_entry.name().to_string();
+
+        if raw_name.is_empty()
+            || raw_name.contains("..")
+            || raw_name.starts_with('/')
+            || raw_name.contains('\\')
+            || raw_name.contains(':')
+        {
+            let _ = std::fs::remove_dir_all(&installed_dir);
+            anyhow::bail!("zip entry contains unsafe path: {raw_name}");
+        }
+
+        let out_path = installed_dir.join(&raw_name);
+        if zip_entry.is_dir() {
+            std::fs::create_dir_all(&out_path)?;
+            continue;
+        }
+
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut out_file = std::fs::File::create(&out_path)
+            .with_context(|| format!("failed to create extracted file: {}", out_path.display()))?;
+        std::io::copy(&mut zip_entry, &mut out_file)?;
+    }
+
+    // Ensure a manifest exists.
+    let has_manifest =
+        installed_dir.join("SKILL.md").exists() || installed_dir.join("SKILL.toml").exists();
+    if !has_manifest {
+        std::fs::write(
+            installed_dir.join("SKILL.toml"),
+            format!(
+                "[skill]\nname = \"{}\"\ndescription = \"{}\"\nversion = \"0.1.0\"\n",
+                skill_dir_name,
+                entry.description.replace('"', "\\\""),
+            ),
+        )?;
+    }
+
+    match enforce_skill_security_audit(&installed_dir, allow_scripts) {
+        Ok(report) => Ok((installed_dir, report.files_scanned)),
+        Err(err) => {
+            let _ = std::fs::remove_dir_all(&installed_dir);
+            Err(err)
+        }
+    }
+}
+
 /// Handle the `skills` CLI command
 #[allow(clippy::too_many_lines)]
 pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Config) -> Result<()> {
@@ -1436,11 +1694,33 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             }
             anyhow::bail!("Skill audit failed.");
         }
-        crate::SkillCommands::Install { source } => {
+        crate::SkillCommands::Install {
+            source,
+            from_well_known,
+        } => {
             println!("Installing skill from: {source}");
 
             let skills_path = skills_dir(workspace_dir);
             std::fs::create_dir_all(&skills_path)?;
+
+            // .well-known discovery: explicit flag or auto-detected bare domain.
+            let use_well_known = from_well_known || is_well_known_candidate(&source);
+            if use_well_known {
+                let results =
+                    install_well_known_skills(&source, &skills_path, config.skills.allow_scripts)
+                        .with_context(|| {
+                            format!(
+                                "failed to install skills via .well-known discovery: {source}"
+                            )
+                        })?;
+                println!(
+                    "  {} {} skill(s) installed via .well-known discovery.",
+                    console::style("✓").green().bold(),
+                    results.len()
+                );
+                println!("  Security audit completed successfully.");
+                return Ok(());
+            }
 
             let (installed_dir, files_scanned) = if is_clawhub_source(&source) {
                 install_clawhub_skill_source(&source, &skills_path, config.skills.allow_scripts)
@@ -2184,6 +2464,105 @@ command = "obsidian search {{query}}"
         let skills = load_skills_from_directory(&skills_dir, true);
         assert_eq!(skills.len(), 1, "skill should load when allow_scripts=true");
         assert_eq!(skills[0].name, "obsidian");
+    }
+
+    // ─── .well-known discovery unit tests ──────────────────────────────
+
+    #[test]
+    fn is_well_known_candidate_bare_domain() {
+        assert!(is_well_known_candidate("https://example.com"));
+        assert!(is_well_known_candidate("https://example.com/"));
+        assert!(is_well_known_candidate("http://example.com"));
+        assert!(is_well_known_candidate("http://example.com/"));
+    }
+
+    #[test]
+    fn is_well_known_candidate_rejects_paths() {
+        assert!(!is_well_known_candidate(
+            "https://github.com/user/repo.git"
+        ));
+        assert!(!is_well_known_candidate("https://example.com/some/path"));
+        assert!(!is_well_known_candidate(
+            "https://clawhub.ai/owner/slug"
+        ));
+    }
+
+    #[test]
+    fn is_well_known_candidate_rejects_non_http() {
+        assert!(!is_well_known_candidate("ssh://example.com"));
+        assert!(!is_well_known_candidate("git://example.com"));
+        assert!(!is_well_known_candidate("./local-dir"));
+        assert!(!is_well_known_candidate("clawhub:my-skill"));
+    }
+
+    #[test]
+    fn well_known_index_url_construction() {
+        let url = well_known_index_url("https://example.com").unwrap();
+        assert_eq!(
+            url,
+            "https://example.com/.well-known/agent-skills/index.json"
+        );
+
+        let url = well_known_index_url("https://example.com/").unwrap();
+        assert_eq!(
+            url,
+            "https://example.com/.well-known/agent-skills/index.json"
+        );
+
+        let url = well_known_index_url("http://skills.example.org").unwrap();
+        assert_eq!(
+            url,
+            "http://skills.example.org/.well-known/agent-skills/index.json"
+        );
+    }
+
+    #[test]
+    fn well_known_index_url_rejects_garbage() {
+        assert!(well_known_index_url("not a url at all").is_err());
+    }
+
+    #[test]
+    fn parse_well_known_index_json() {
+        let json = r#"{
+            "skills": [
+                {
+                    "name": "weather",
+                    "description": "Check weather forecasts",
+                    "url": "https://example.com/skills/weather.zip"
+                },
+                {
+                    "name": "translate",
+                    "description": "Translate text",
+                    "url": "https://github.com/example/translate-skill.git"
+                }
+            ]
+        }"#;
+
+        let index: WellKnownIndex = serde_json::from_str(json).unwrap();
+        assert_eq!(index.skills.len(), 2);
+        assert_eq!(index.skills[0].name, "weather");
+        assert_eq!(index.skills[0].description, "Check weather forecasts");
+        assert_eq!(
+            index.skills[0].url,
+            "https://example.com/skills/weather.zip"
+        );
+        assert_eq!(index.skills[1].name, "translate");
+    }
+
+    #[test]
+    fn parse_well_known_index_empty_skills_array() {
+        let json = r#"{"skills": []}"#;
+        let index: WellKnownIndex = serde_json::from_str(json).unwrap();
+        assert!(index.skills.is_empty());
+    }
+
+    #[test]
+    fn parse_well_known_index_minimal_entry() {
+        let json = r#"{"skills": [{"name": "test", "url": "https://x.com/s.zip"}]}"#;
+        let index: WellKnownIndex = serde_json::from_str(json).unwrap();
+        assert_eq!(index.skills.len(), 1);
+        assert_eq!(index.skills[0].name, "test");
+        assert!(index.skills[0].description.is_empty());
     }
 }
 
