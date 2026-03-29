@@ -614,8 +614,12 @@ impl MatrixChannel {
                     match client.encryption().recovery().recover(key).await {
                         Ok(()) => {
                             tracing::info!(
-                                "Matrix E2EE recovery successful — room keys and cross-signing secrets restored from server backup."
+                                "Matrix E2EE recovery successful — cross-signing secrets restored from server backup."
                             );
+
+                            // After cross-signing recovery, download megolm room keys
+                            // from server-side backup so encrypted rooms are readable.
+                            Self::download_room_keys_from_backup(&client).await;
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -633,6 +637,69 @@ impl MatrixChannel {
             .await?;
 
         Ok(client.clone())
+    }
+
+    /// Download megolm room keys from server-side key backup for all joined rooms.
+    ///
+    /// This is called after cross-signing recovery succeeds. Without this step,
+    /// encrypted rooms are unreadable after a crypto store reset because
+    /// `recovery().recover()` only restores cross-signing secrets, not the
+    /// per-room megolm session keys.
+    async fn download_room_keys_from_backup(client: &MatrixSdkClient) {
+        let backups = client.encryption().backups();
+
+        // Check whether a server-side key backup actually exists.
+        let backup_exists = match backups.fetch_exists_on_server().await {
+            Ok(exists) => exists,
+            Err(error) => {
+                tracing::warn!(
+                    "Matrix: could not check for server-side key backup: {error}. \
+                     Skipping room-key download."
+                );
+                return;
+            }
+        };
+
+        if !backup_exists {
+            tracing::info!(
+                "Matrix: no server-side key backup found. \
+                 Skipping room-key download."
+            );
+            return;
+        }
+
+        let joined = client.joined_rooms();
+        if joined.is_empty() {
+            tracing::debug!("Matrix: no joined rooms — nothing to download.");
+            return;
+        }
+
+        tracing::info!(
+            "Downloading room keys from backup for {} joined room(s)...",
+            joined.len()
+        );
+
+        let mut ok_count: usize = 0;
+        let mut err_count: usize = 0;
+
+        for room in &joined {
+            match backups.download_room_keys_for_room(room.room_id()).await {
+                Ok(()) => ok_count += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        "Matrix: failed to download room keys for {}: {error}",
+                        room.room_id()
+                    );
+                    err_count += 1;
+                }
+            }
+        }
+
+        tracing::info!(
+            "Matrix room-key download complete: {ok_count} succeeded, {err_count} failed \
+             (out of {} rooms).",
+            joined.len()
+        );
     }
 
     async fn resolve_room_id(&self) -> anyhow::Result<String> {
