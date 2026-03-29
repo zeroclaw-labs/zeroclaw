@@ -1508,13 +1508,18 @@ async fn fetch_openai_compatible_models(
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
-async fn fetch_anthropic_compatible_models(endpoint: &str, api_key: Option<&str>) -> Result<Vec<String>> {
+async fn fetch_anthropic_compatible_models(
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>> {
     let Some(api_key) = api_key else {
         bail!("Anthropic-compatible model fetch requires API key or OAuth token");
     };
 
     let client = build_model_fetch_client()?;
-    let mut request = client.get(endpoint).header("anthropic-version", "2023-06-01");
+    let mut request = client
+        .get(endpoint)
+        .header("anthropic-version", "2023-06-01");
 
     if api_key.starts_with("sk-ant-oat01-") {
         request = request
@@ -2525,9 +2530,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         }
         println!();
 
-        let base_url: String = Input::new()
-            .with_prompt(base_url_prompt)
-            .interact_text()?;
+        let base_url: String = Input::new().with_prompt(base_url_prompt).interact_text()?;
 
         let base_url = base_url.trim().trim_end_matches('/').to_string();
         if base_url.is_empty() {
