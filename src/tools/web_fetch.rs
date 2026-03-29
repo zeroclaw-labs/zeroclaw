@@ -435,31 +435,36 @@ fn validate_target_url(
         anyhow::bail!("Host '{host}' is in {tool_name}.blocked_domains");
     }
 
-    let private_host_allowed =
-        is_private_or_local_host(&host) && host_matches_allowlist(&host, allowed_private_hosts);
+    // Check if host is explicitly allowed via allowed_private_hosts
+    let explicitly_allowed = host_matches_allowlist(&host, allowed_private_hosts);
+    let is_private = is_private_or_local_host(&host);
 
-    if is_private_or_local_host(&host) && !private_host_allowed {
+    // Block private hosts that aren't explicitly allowed
+    if is_private && !explicitly_allowed {
         anyhow::bail!(
             "Blocked local/private host: {host}. \
              To allow this host, add it to {tool_name}.allowed_private_hosts in config.toml"
         );
     }
 
-    if private_host_allowed {
+    if explicitly_allowed {
         tracing::warn!(
-            "{tool_name}: allowing private/local host '{host}' via allowed_private_hosts"
+            "{tool_name}: allowing host '{host}' via allowed_private_hosts"
         );
     }
 
-    if !private_host_allowed && !host_matches_allowlist(&host, allowed_domains) {
+    // Check allowed_domains only if not explicitly allowed
+    if !explicitly_allowed && !host_matches_allowlist(&host, allowed_domains) {
         anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
     }
 
-    if !private_host_allowed {
+    // Only validate DNS resolution if not explicitly allowed
+    if !explicitly_allowed {
         validate_resolved_host_is_public(&host)?;
     }
 
     Ok(url.to_string())
+
 }
 
 fn append_chunk_with_cap(buffer: &mut Vec<u8>, chunk: &[u8], hard_cap: usize) -> bool {
