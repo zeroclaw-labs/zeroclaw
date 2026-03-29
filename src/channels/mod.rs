@@ -35,6 +35,7 @@ pub mod matrix;
 pub mod mattermost;
 pub mod media_pipeline;
 pub mod mochat;
+pub mod mqtt;
 pub mod nextcloud_talk;
 #[cfg(feature = "channel-nostr")]
 pub mod nostr;
@@ -46,6 +47,7 @@ pub mod session_sqlite;
 pub mod session_store;
 pub mod signal;
 pub mod slack;
+pub mod stall_watchdog;
 pub mod telegram;
 pub mod traits;
 pub mod transcription;
@@ -106,7 +108,7 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scrub_credentials,
+    is_model_switch_requested, run_tool_call_loop, scope_thread_id, scrub_credentials,
 };
 use crate::approval::ApprovalManager;
 use crate::config::Config;
@@ -185,9 +187,12 @@ impl Observer for ChannelNotifyObserver {
 }
 
 /// Per-sender conversation history for channel messages.
-type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
+/// Bounded by `MAX_CONVERSATION_SENDERS` — oldest-accessed senders are evicted.
+type ConversationHistoryMap = Arc<Mutex<lru::LruCache<String, Vec<ChatMessage>>>>;
 /// Senders that requested `/new` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
+/// Maximum conversation senders kept in memory (LRU eviction beyond this).
+const MAX_CONVERSATION_SENDERS: usize = 1000;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -1053,7 +1058,7 @@ fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(sender_key);
+        .pop(sender_key);
 }
 
 fn mark_sender_for_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) {
@@ -1208,7 +1213,7 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
         .conversation_histories
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let turns = histories.entry(sender_key.to_string()).or_default();
+    let turns = histories.get_or_insert_mut(sender_key.to_string(), Vec::new);
     turns.push(turn);
     while turns.len() > max_history {
         turns.remove(0);
@@ -1321,7 +1326,7 @@ fn rollback_orphan_user_turn(
 
     turns.pop();
     if turns.is_empty() {
-        histories.remove(sender_key);
+        histories.pop(sender_key);
     }
 
     // Also remove the orphan turn from the persisted JSONL session store so
@@ -2539,7 +2544,7 @@ async fn process_channel_message(
         ctx.conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&history_key)
+            .peek(&history_key)
             .is_some_and(|turns| !turns.is_empty())
     };
 
@@ -2881,9 +2886,13 @@ async fn process_channel_message(
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
                 result = tokio::time::timeout(
                     Duration::from_secs(timeout_budget_secs),
-                    crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                        cost_tracking_context.clone(),
-                    run_tool_call_loop(
+                    scope_thread_id(
+                        msg.interruption_scope_id.clone()
+                            .or_else(|| msg.thread_ts.clone())
+                            .or_else(|| Some(msg.id.clone())),
+                        crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                            cost_tracking_context.clone(),
+                        run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
                         ctx.tools_registry.as_ref(),
@@ -2914,6 +2923,7 @@ async fn process_channel_message(
                         ctx.max_tool_result_chars,
                         ctx.context_token_budget,
                         None, // shared_budget
+                    ),
                     ),
                     ),
                 ) => LlmExecutionResult::Completed(result),
@@ -4229,7 +4239,8 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     dc.draft_update_interval_ms,
                     dc.multi_message_delay_ms,
                 )
-                .with_transcription(config.transcription.clone()),
+                .with_transcription(config.transcription.clone())
+                .with_stall_timeout(dc.stall_timeout_secs),
             ))
         }
         "slack" => {
@@ -4326,6 +4337,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     wa.pair_phone.clone(),
                     wa.pair_code.clone(),
                     wa.allowed_numbers.clone(),
+                    wa.mention_only,
                     wa.mode.clone(),
                     wa.dm_policy.clone(),
                     wa.group_policy.clone(),
@@ -4440,7 +4452,8 @@ fn collect_configured_channels(
                     dc.multi_message_delay_ms,
                 )
                 .with_proxy_url(dc.proxy_url.clone())
-                .with_transcription(config.transcription.clone()),
+                .with_transcription(config.transcription.clone())
+                .with_stall_timeout(dc.stall_timeout_secs),
             ),
         });
     }
@@ -4615,6 +4628,7 @@ fn collect_configured_channels(
                                 wa.pair_phone.clone(),
                                 wa.pair_code.clone(),
                                 wa.allowed_numbers.clone(),
+                                wa.mention_only,
                                 wa.mode.clone(),
                                 wa.dm_policy.clone(),
                                 wa.group_policy.clone(),
@@ -5420,7 +5434,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        ))),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -5494,19 +5510,42 @@ pub async fn start_channels(config: Config) -> Result<()> {
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
+    // Cap to MAX_CONVERSATION_SENDERS sessions (sorted by file mtime, most recent first)
+    // and trim each to MAX_CHANNEL_HISTORY turns to bound startup memory.
     // If the last persisted turn is a user message (orphan from a crash mid-query),
     // close it with a marker so the LLM doesn't try to continue the old request.
     if let Some(ref store) = runtime_ctx.session_store {
         let mut hydrated = 0usize;
         let mut orphans_closed = 0usize;
+        let session_keys = store.list_sessions();
+
+        // Sort by file mtime (most recently modified first) for predictable hydration.
+        // Collect mtimes up front to avoid repeated FS reads inside the comparator.
+        let mut keyed: Vec<_> = session_keys
+            .into_iter()
+            .map(|k| {
+                let mt = store
+                    .session_mtime(&k)
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                (k, mt)
+            })
+            .collect();
+        keyed.sort_by(|a, b| b.1.cmp(&a.1));
+        keyed.truncate(MAX_CONVERSATION_SENDERS);
+        let session_keys: Vec<String> = keyed.into_iter().map(|(k, _)| k).collect();
+
         let mut histories = runtime_ctx
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        for key in store.list_sessions() {
+        for key in session_keys {
             let mut msgs = store.load(&key);
             if msgs.is_empty() {
                 continue;
+            }
+            // Trim to MAX_CHANNEL_HISTORY turns (keep most recent).
+            if msgs.len() > MAX_CHANNEL_HISTORY {
+                msgs.drain(..msgs.len() - MAX_CHANNEL_HISTORY);
             }
             // Close orphaned user turns from crashed sessions.
             if msgs.last().is_some_and(|m| m.role == "user") {
@@ -5519,7 +5558,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
                 orphans_closed += 1;
             }
             hydrated += 1;
-            histories.insert(key, msgs);
+            histories.push(key, msgs);
         }
         drop(histories);
         if hydrated > 0 {
@@ -5833,9 +5872,10 @@ mod tests {
 
     #[test]
     fn compact_sender_history_keeps_recent_truncated_messages() {
-        let mut histories = HashMap::new();
+        let mut histories =
+            lru::LruCache::new(std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap());
         let sender = "telegram_u1".to_string();
-        histories.insert(
+        histories.push(
             sender.clone(),
             (0..20)
                 .map(|idx| {
@@ -5910,7 +5950,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let kept = locked_histories
-            .get(&sender)
+            .peek(&sender)
             .expect("sender history should remain");
         assert_eq!(kept.len(), CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
         assert!(kept.iter().all(|turn| {
@@ -5984,7 +6024,9 @@ mod tests {
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -6031,7 +6073,9 @@ mod tests {
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let turns = histories.get(&sender).expect("sender history should exist");
+        let turns = histories
+            .peek(&sender)
+            .expect("sender history should exist");
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
@@ -6040,8 +6084,9 @@ mod tests {
     #[test]
     fn rollback_orphan_user_turn_removes_only_latest_matching_user_turn() {
         let sender = "telegram_u3".to_string();
-        let mut histories = HashMap::new();
-        histories.insert(
+        let mut histories =
+            lru::LruCache::new(std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap());
+        histories.push(
             sender.clone(),
             vec![
                 ChatMessage::user("first"),
@@ -6110,7 +6155,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = locked_histories
-            .get(&sender)
+            .peek(&sender)
             .expect("sender history should remain");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "first");
@@ -6136,8 +6181,9 @@ mod tests {
             )
             .unwrap();
 
-        let mut histories = HashMap::new();
-        histories.insert(
+        let mut histories =
+            lru::LruCache::new(std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap());
+        histories.push(
             sender.clone(),
             vec![
                 ChatMessage::user("first"),
@@ -6211,7 +6257,7 @@ mod tests {
             .conversation_histories
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let turns = locked.get(&sender).expect("history should remain");
+        let turns = locked.peek(&sender).expect("history should remain");
         assert_eq!(turns.len(), 2);
 
         // Session store should also have only 2 entries.
@@ -6237,6 +6283,23 @@ mod tests {
             _temperature: f64,
         ) -> anyhow::Result<String> {
             Ok("ok".to_string())
+        }
+    }
+
+    /// A provider that always returns an empty reply, used to test the
+    /// no-reply precheck path (typing indicator should not fire).
+    struct NoReplyProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for NoReplyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
         }
     }
 
@@ -6739,7 +6802,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -6827,7 +6892,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -6895,7 +6962,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("telegram_chat-telegram_alice")
+            .peek("telegram_chat-telegram_alice")
             .expect("telegram history should be stored");
         let assistant_turn = turns
             .iter()
@@ -6929,7 +6996,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7016,7 +7085,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7113,7 +7184,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7231,7 +7304,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
@@ -7330,7 +7405,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7441,7 +7518,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7543,7 +7622,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 12,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7635,7 +7716,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 3,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7853,7 +7936,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -7963,7 +8048,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -8092,7 +8179,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -8218,7 +8307,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -8322,7 +8413,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -8387,6 +8480,91 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn process_channel_message_no_reply_precheck_skips_typing_indicator() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(NoReplyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(crate::config::Config::default()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            media_pipeline: crate::config::MediaPipelineConfig::default(),
+            transcription_config: crate::config::TranscriptionConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: crate::config::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "typing-fast-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-typing".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let starts = channel_impl.start_typing_calls.load(Ordering::SeqCst);
+        assert_eq!(starts, 0, "no-reply precheck should not show typing");
+    }
+
+    #[tokio::test]
     async fn process_channel_message_adds_and_swaps_reactions() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -8409,7 +8587,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -9199,7 +9379,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -9338,7 +9520,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -9435,7 +9619,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             assert!(
-                !histories.contains_key("telegram_chat-refresh_alice"),
+                histories.peek("telegram_chat-refresh_alice").is_none(),
                 "/new should clear the cached sender history before the next message"
             );
         }
@@ -9520,7 +9704,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -9596,7 +9782,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_chat-ctx_alice")
+            .peek("test-channel_chat-ctx_alice")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");
@@ -9612,8 +9798,9 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
-        let mut histories = HashMap::new();
-        histories.insert(
+        let mut histories =
+            lru::LruCache::new(std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap());
+        histories.push(
             "telegram_chat-telegram_alice".to_string(),
             vec![
                 ChatMessage::assistant("stale assistant"),
@@ -10224,7 +10411,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10318,7 +10507,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10412,7 +10603,7 @@ This is an example JSON object for profile settings."#;
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_chat-photo_zeroclaw_user")
+            .peek("test-channel_chat-photo_zeroclaw_user")
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
@@ -10446,7 +10637,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10540,7 +10733,7 @@ This is an example JSON object for profile settings."#;
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let turns = histories
-            .get("test-channel_chat-format_zeroclaw_user")
+            .peek("test-channel_chat-format_zeroclaw_user")
             .expect("history should exist for sender");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
@@ -10618,7 +10811,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10736,7 +10931,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10846,7 +11043,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -10976,7 +11175,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 5,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -11247,7 +11448,9 @@ This is an example JSON object for profile settings."#;
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),

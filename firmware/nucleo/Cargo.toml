@@ -27,6 +27,7 @@ defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 heapless = { version = "0.9", default-features = false }
 critical-section = "1.1"
+zeroclaw-fw-protocol = { path = "../zeroclaw-fw-protocol" }
 
 [package.metadata.embassy]
 build = [

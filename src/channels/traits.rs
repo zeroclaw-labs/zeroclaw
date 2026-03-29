@@ -34,6 +34,9 @@ pub struct SendMessage {
     pub thread_ts: Option<String>,
     /// Optional cancellation token for interruptible delivery (e.g. multi-message mode).
     pub cancellation_token: Option<CancellationToken>,
+    /// File attachments to send with the message.
+    /// Channels that don't support attachments ignore this field.
+    pub attachments: Vec<super::media_pipeline::MediaAttachment>,
 }
 
 impl SendMessage {
@@ -45,6 +48,7 @@ impl SendMessage {
             subject: None,
             thread_ts: None,
             cancellation_token: None,
+            attachments: vec![],
         }
     }
 
@@ -60,6 +64,7 @@ impl SendMessage {
             subject: Some(subject.into()),
             thread_ts: None,
             cancellation_token: None,
+            attachments: vec![],
         }
     }
 
@@ -72,6 +77,15 @@ impl SendMessage {
     /// Attach a cancellation token for interruptible delivery.
     pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
         self.cancellation_token = Some(token);
+        self
+    }
+
+    /// Attach files to this message.
+    pub fn with_attachments(
+        mut self,
+        attachments: Vec<super::media_pipeline::MediaAttachment>,
+    ) -> Self {
+        self.attachments = attachments;
         self
     }
 }

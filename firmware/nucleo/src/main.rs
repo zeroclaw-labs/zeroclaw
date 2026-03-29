@@ -8,101 +8,17 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::Write;
 use core::str;
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::usart::{Config, Uart};
 use heapless::String;
+use zeroclaw_fw_protocol::{copy_id, write_err, write_ok, Command};
 use {defmt_rtt as _, panic_probe as _};
 
 /// Arduino-style pin 13 = PA5 (User LED LD2 on Nucleo-F401RE)
-const LED_PIN: u8 = 13;
-
-/// Parse integer from JSON: "pin":13 or "value":1
-fn parse_arg(line: &[u8], key: &[u8]) -> Option<i32> {
-    // key like b"pin" -> search for b"\"pin\":"
-    let mut suffix: [u8; 32] = [0; 32];
-    suffix[0] = b'"';
-    let mut len = 1;
-    for (i, &k) in key.iter().enumerate() {
-        if i >= 30 {
-            break;
-        }
-        suffix[len] = k;
-        len += 1;
-    }
-    suffix[len] = b'"';
-    suffix[len + 1] = b':';
-    len += 2;
-    let suffix = &suffix[..len];
-
-    let line_len = line.len();
-    if line_len < len {
-        return None;
-    }
-    for i in 0..=line_len - len {
-        if line[i..].starts_with(suffix) {
-            let rest = &line[i + len..];
-            let mut num: i32 = 0;
-            let mut neg = false;
-            let mut j = 0;
-            if j < rest.len() && rest[j] == b'-' {
-                neg = true;
-                j += 1;
-            }
-            while j < rest.len() && rest[j].is_ascii_digit() {
-                num = num * 10 + (rest[j] - b'0') as i32;
-                j += 1;
-            }
-            return Some(if neg { -num } else { num });
-        }
-    }
-    None
-}
-
-fn has_cmd(line: &[u8], cmd: &[u8]) -> bool {
-    let mut pat: [u8; 64] = [0; 64];
-    pat[0..7].copy_from_slice(b"\"cmd\":\"");
-    let clen = cmd.len().min(50);
-    pat[7..7 + clen].copy_from_slice(&cmd[..clen]);
-    pat[7 + clen] = b'"';
-    let pat = &pat[..8 + clen];
-
-    let line_len = line.len();
-    if line_len < pat.len() {
-        return false;
-    }
-    for i in 0..=line_len - pat.len() {
-        if line[i..].starts_with(pat) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Extract "id" for response
-fn copy_id(line: &[u8], out: &mut [u8]) -> usize {
-    let prefix = b"\"id\":\"";
-    if line.len() < prefix.len() + 1 {
-        out[0] = b'0';
-        return 1;
-    }
-    for i in 0..=line.len() - prefix.len() {
-        if line[i..].starts_with(prefix) {
-            let start = i + prefix.len();
-            let mut j = 0;
-            while start + j < line.len() && j < out.len() - 1 && line[start + j] != b'"' {
-                out[j] = line[start + j];
-                j += 1;
-            }
-            return j;
-        }
-    }
-    out[0] = b'0';
-    1
-}
+const LED_PIN: i32 = 13;
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
@@ -129,50 +45,44 @@ async fn main(_spawner: Spawner) {
                     let id_len = copy_id(&line_buf, &mut id_buf);
                     let id_str = str::from_utf8(&id_buf[..id_len]).unwrap_or("0");
 
-                    resp_buf.clear();
-                    if has_cmd(&line_buf, b"ping") {
-                        let _ = write!(resp_buf, "{{\"id\":\"{}\",\"ok\":true,\"result\":\"pong\"}}", id_str);
-                    } else if has_cmd(&line_buf, b"capabilities") {
-                        let _ = write!(
-                            resp_buf,
-                            "{{\"id\":\"{}\",\"ok\":true,\"result\":\"{{\\\"gpio\\\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13],\\\"led_pin\\\":13}}\"}}",
-                            id_str
-                        );
-                    } else if has_cmd(&line_buf, b"gpio_read") {
-                        let pin = parse_arg(&line_buf, b"pin").unwrap_or(-1);
-                        if pin == LED_PIN as i32 {
-                            // Output doesn't support read; return 0 (LED state not readable)
-                            let _ = write!(resp_buf, "{{\"id\":\"{}\",\"ok\":true,\"result\":\"0\"}}", id_str);
-                        } else if pin >= 0 && pin <= 13 {
-                            let _ = write!(resp_buf, "{{\"id\":\"{}\",\"ok\":true,\"result\":\"0\"}}", id_str);
-                        } else {
-                            let _ = write!(
-                                resp_buf,
-                                "{{\"id\":\"{}\",\"ok\":false,\"result\":\"\",\"error\":\"Invalid pin {}\"}}",
-                                id_str, pin
+                    match Command::from_line(&line_buf) {
+                        Some(Command::Ping) => {
+                            write_ok(&mut resp_buf, id_str, "pong");
+                        }
+                        Some(Command::Capabilities) => {
+                            resp_buf.clear();
+                            let _ = core::fmt::Write::write_str(
+                                &mut resp_buf,
+                                concat!(
+                                    r#"{"id":""#,
+                                ),
+                            );
+                            let _ = core::fmt::Write::write_str(&mut resp_buf, id_str);
+                            let _ = core::fmt::Write::write_str(
+                                &mut resp_buf,
+                                r#"","ok":true,"result":"{\"gpio\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13],\"led_pin\":13}"}"#,
                             );
                         }
-                    } else if has_cmd(&line_buf, b"gpio_write") {
-                        let pin = parse_arg(&line_buf, b"pin").unwrap_or(-1);
-                        let value = parse_arg(&line_buf, b"value").unwrap_or(0);
-                        if pin == LED_PIN as i32 {
-                            led.set_level(if value != 0 { Level::High } else { Level::Low });
-                            let _ = write!(resp_buf, "{{\"id\":\"{}\",\"ok\":true,\"result\":\"done\"}}", id_str);
-                        } else if pin >= 0 && pin <= 13 {
-                            let _ = write!(resp_buf, "{{\"id\":\"{}\",\"ok\":true,\"result\":\"done\"}}", id_str);
-                        } else {
-                            let _ = write!(
-                                resp_buf,
-                                "{{\"id\":\"{}\",\"ok\":false,\"result\":\"\",\"error\":\"Invalid pin {}\"}}",
-                                id_str, pin
-                            );
+                        Some(Command::GpioRead { pin }) => {
+                            if pin >= 0 && pin <= 13 {
+                                write_ok(&mut resp_buf, id_str, "0");
+                            } else {
+                                write_err(&mut resp_buf, id_str, "Invalid pin");
+                            }
                         }
-                    } else {
-                        let _ = write!(
-                            resp_buf,
-                            "{{\"id\":\"{}\",\"ok\":false,\"result\":\"\",\"error\":\"Unknown command\"}}",
-                            id_str
-                        );
+                        Some(Command::GpioWrite { pin, value }) => {
+                            if pin == LED_PIN {
+                                led.set_level(if value != 0 { Level::High } else { Level::Low });
+                                write_ok(&mut resp_buf, id_str, "done");
+                            } else if pin >= 0 && pin <= 13 {
+                                write_ok(&mut resp_buf, id_str, "done");
+                            } else {
+                                write_err(&mut resp_buf, id_str, "Invalid pin");
+                            }
+                        }
+                        None => {
+                            write_err(&mut resp_buf, id_str, "Unknown command");
+                        }
                     }
 
                     let _ = usart.blocking_write(resp_buf.as_bytes());

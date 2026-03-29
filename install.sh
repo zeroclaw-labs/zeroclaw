@@ -1773,6 +1773,13 @@ if [[ "$INSTALL_MODE" == "upgrade" ]]; then
   step_dot "Upgrade complete"
 fi
 
+# --- Launch TUI onboarding if interactive TTY and no provider was configured ---
+if [[ -t 0 && -t 1 && -n "$ZEROCLAW_BIN" && "$SKIP_ONBOARD" == false && -z "$API_KEY" && "$PROVIDER" != "ollama" ]]; then
+  echo
+  step_dot "Starting TUI setup"
+  "$ZEROCLAW_BIN" onboard --tui || warn "TUI setup exited — run zeroclaw onboard --tui to retry"
+fi
+
 # --- Dashboard URL ---
 GATEWAY_PORT=42617
 DASHBOARD_URL="http://127.0.0.1:${GATEWAY_PORT}"

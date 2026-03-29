@@ -613,6 +613,7 @@ pub(crate) async fn deliver_announcement(
                     wa.pair_phone.clone(),
                     wa.pair_code.clone(),
                     wa.allowed_numbers.clone(),
+                    wa.mention_only,
                     wa.mode.clone(),
                     wa.dm_policy.clone(),
                     wa.group_policy.clone(),

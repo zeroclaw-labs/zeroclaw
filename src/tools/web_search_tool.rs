@@ -419,7 +419,9 @@ impl Tool for WebSearchTool {
         }
 
         let result = match resolution.route {
-            WebSearchProviderRoute::DuckDuckGo => self.search_duckduckgo(query).await?,
+            WebSearchProviderRoute::DuckDuckGo | WebSearchProviderRoute::Tavily => {
+                self.search_duckduckgo(query).await?
+            } // TODO: implement Tavily search
             WebSearchProviderRoute::Brave => self.search_brave(query).await?,
             WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
         };

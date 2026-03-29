@@ -97,7 +97,7 @@ impl Channel for VoiceWakeChannel {
                 .ok_or_else(|| anyhow::anyhow!("No default audio input device available"))?;
 
             let supported = device.default_input_config()?;
-            sample_rate = supported.sample_rate().0;
+            sample_rate = supported.sample_rate();
             channels_count = supported.channels();
 
             info!(
@@ -239,6 +239,7 @@ impl Channel for VoiceWakeChannel {
                                         thread_ts: None,
                                         interruption_scope_id: None,
                                         attachments: vec![],
+                                        observe_group: false,
                                     };
 
                                     if let Err(e) = tx.send(msg).await {

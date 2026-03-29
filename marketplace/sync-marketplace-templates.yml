@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag (e.g. v0.6.4)"
+        description: "Release tag (e.g. v0.6.7)"
         required: true
         type: string
 
@@ -144,7 +144,7 @@ jobs:
       - name: Checkout Dokploy templates fork
         uses: actions/checkout@v4
         with:
-          repository: zeroclaw-labs/templates
+          repository: zeroclaw-labs/dokploy
           token: ${{ secrets.MARKETPLACE_PAT }}
           ref: main
           path: templates
@@ -297,7 +297,7 @@ jobs:
       - name: Checkout EasyPanel templates fork
         uses: actions/checkout@v4
         with:
-          repository: zeroclaw-labs/templates-1
+          repository: zeroclaw-labs/easypanel
           token: ${{ secrets.MARKETPLACE_PAT }}
           ref: main
           path: easypanel
