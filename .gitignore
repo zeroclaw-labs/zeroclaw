@@ -34,11 +34,14 @@ credentials.json
 .worktrees/
 .zeroclaw/*
 
-# Skill eval workspaces (test outputs, transcripts, grading)
-.claude/skills/*-workspace/
+# Claude Code configuration (local-only, not pushed to main)
+.claude/
 
-# Claude Code agent worktrees (temporary isolated workspaces)
-.claude/worktrees/
+# MCP server configuration (local dev only)
+.mcp.json
+
+# ProjectMan data (local project management state)
+.project/
 
 # Local state backups
 .local-state-backups/
@@ -52,3 +55,6 @@ lcov.info
 
 # Wrangler cache
 .wrangler/
+
+# Test plugin build artifacts
+tests/plugins/target/

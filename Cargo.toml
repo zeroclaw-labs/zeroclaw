@@ -319,6 +319,7 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 wiremock = "0.6"
 scopeguard = "1.2"
 rcgen = "0.13"
+extism = "1.20"
 
 [[test]]
 name = "component"

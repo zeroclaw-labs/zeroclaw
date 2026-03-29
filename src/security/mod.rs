@@ -77,6 +77,44 @@ pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 #[allow(unused_imports)]
 pub use workspace_boundary::{BoundaryVerdict, WorkspaceBoundary};
 
+/// Key names that indicate a sensitive value (case-insensitive substring match).
+const SENSITIVE_KEY_SUBSTRINGS: &[&str] = &[
+    "token", "password", "secret", "credential", "bearer", "api_key", "apikey", "api-key",
+    "user_key", "userkey", "user-key", "auth",
+];
+
+/// Returns true if a JSON key name looks like it holds a sensitive value.
+fn is_sensitive_param_key(key: &str) -> bool {
+    let lower = key.to_lowercase();
+    SENSITIVE_KEY_SUBSTRINGS.iter().any(|pat| lower.contains(pat))
+}
+
+/// Redact sensitive values in a JSON object's top-level keys.
+///
+/// Keys whose names match [`SENSITIVE_KEY_SUBSTRINGS`] have their values replaced
+/// with the output of [`redact`]. Non-sensitive keys are left as-is.
+/// Non-object inputs are returned unchanged.
+pub fn redact_sensitive_params(input: &serde_json::Value) -> serde_json::Value {
+    match input {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if is_sensitive_param_key(k) {
+                    let raw = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    out.insert(k.clone(), serde_json::Value::String(redact(&raw)));
+                } else {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
 /// Redact sensitive values for safe logging. Shows first 4 characters + "***" suffix.
 /// Uses char-boundary-safe indexing to avoid panics on multi-byte UTF-8 strings.
 /// This function intentionally breaks the data-flow taint chain for static analysis.
