@@ -5529,6 +5529,16 @@ pub struct ReliabilityConfig {
     /// Max retries for cron job execution attempts.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
+    /// Enable circuit breaker for provider failover (default: true).
+    /// When enabled, providers that fail repeatedly are temporarily skipped.
+    #[serde(default = "default_circuit_breaker_enabled")]
+    pub circuit_breaker_enabled: Option<bool>,
+    /// Consecutive failures before the circuit breaker opens (default: 3).
+    #[serde(default = "default_circuit_breaker_failure_threshold")]
+    pub circuit_breaker_failure_threshold: Option<u32>,
+    /// Seconds to keep a circuit open before allowing a recovery probe (default: 60).
+    #[serde(default = "default_circuit_breaker_recovery_secs")]
+    pub circuit_breaker_recovery_secs: Option<u64>,
 }
 
 fn default_provider_retries() -> u32 {
@@ -5555,6 +5565,18 @@ fn default_scheduler_retries() -> u32 {
     2
 }
 
+fn default_circuit_breaker_enabled() -> Option<bool> {
+    Some(true)
+}
+
+fn default_circuit_breaker_failure_threshold() -> Option<u32> {
+    Some(3)
+}
+
+fn default_circuit_breaker_recovery_secs() -> Option<u64> {
+    Some(60)
+}
+
 impl Default for ReliabilityConfig {
     fn default() -> Self {
         Self {
@@ -5567,6 +5589,9 @@ impl Default for ReliabilityConfig {
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
+            circuit_breaker_enabled: default_circuit_breaker_enabled(),
+            circuit_breaker_failure_threshold: default_circuit_breaker_failure_threshold(),
+            circuit_breaker_recovery_secs: default_circuit_breaker_recovery_secs(),
         }
     }
 }
