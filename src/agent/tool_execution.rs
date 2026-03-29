@@ -18,6 +18,24 @@ use super::loop_::{ParsedToolCall, ToolLoopCancelled, scrub_credentials};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+/// Run a tool future, catching panics and converting them to `anyhow::Error`.
+async fn catch_unwind_tool(
+    fut: impl std::future::Future<Output = anyhow::Result<crate::tools::ToolResult>>,
+) -> anyhow::Result<crate::tools::ToolResult> {
+    use std::panic::AssertUnwindSafe;
+    match futures_util::FutureExt::catch_unwind(AssertUnwindSafe(fut)).await {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<String>()
+                .map(|s| s.as_str())
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            Err(anyhow::anyhow!("tool panicked: {msg}"))
+        }
+    }
+}
+
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 pub(crate) fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
@@ -75,10 +93,10 @@ pub(crate) async fn execute_one_tool(
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-            result = tool_future => result,
+            result = catch_unwind_tool(tool_future) => result,
         }
     } else {
-        tool_future.await
+        catch_unwind_tool(tool_future).await
     };
 
     match tool_result {
