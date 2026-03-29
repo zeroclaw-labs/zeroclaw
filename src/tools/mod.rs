@@ -121,11 +121,13 @@ pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
 pub use calculator::CalculatorTool;
 pub use canvas::{CanvasStore, CanvasTool};
-pub use claude_code::ClaudeCodeTool;
+#[allow(unused_imports)]
+pub use claude_code::{ClaudeCodeTool, wrapped_claude_code};
 pub use claude_code_runner::ClaudeCodeRunnerTool;
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
-pub use codex_cli::CodexCliTool;
+#[allow(unused_imports)]
+pub use codex_cli::{CodexCliTool, wrapped_codex_cli};
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
 pub use cron_add::CronAddTool;
@@ -144,7 +146,8 @@ pub use escalate::EscalateToHumanTool;
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
-pub use gemini_cli::GeminiCliTool;
+#[allow(unused_imports)]
+pub use gemini_cli::{GeminiCliTool, wrapped_gemini_cli};
 pub use git_operations::GitOperationsTool;
 pub use glob_search::GlobSearchTool;
 pub use google_workspace::GoogleWorkspaceTool;
@@ -175,7 +178,8 @@ pub use model_switch::ModelSwitchTool;
 #[allow(unused_imports)]
 pub use node_tool::NodeTool;
 pub use notion_tool::NotionTool;
-pub use opencode_cli::OpenCodeCliTool;
+#[allow(unused_imports)]
+pub use opencode_cli::{OpenCodeCliTool, wrapped_opencode_cli};
 pub use pdf_read::PdfReadTool;
 pub use poll::{ChannelMapHandle, PollTool};
 pub use project_intel::ProjectIntelTool;
@@ -700,7 +704,7 @@ pub fn all_tools_with_runtime(
 
     // Claude Code delegation tool
     if root_config.claude_code.enabled {
-        tool_arcs.push(Arc::new(ClaudeCodeTool::new(
+        tool_arcs.push(Arc::new(wrapped_claude_code(
             security.clone(),
             root_config.claude_code.clone(),
         )));
@@ -721,7 +725,7 @@ pub fn all_tools_with_runtime(
 
     // Codex CLI delegation tool
     if root_config.codex_cli.enabled {
-        tool_arcs.push(Arc::new(CodexCliTool::new(
+        tool_arcs.push(Arc::new(wrapped_codex_cli(
             security.clone(),
             root_config.codex_cli.clone(),
         )));
@@ -729,7 +733,7 @@ pub fn all_tools_with_runtime(
 
     // Gemini CLI delegation tool
     if root_config.gemini_cli.enabled {
-        tool_arcs.push(Arc::new(GeminiCliTool::new(
+        tool_arcs.push(Arc::new(wrapped_gemini_cli(
             security.clone(),
             root_config.gemini_cli.clone(),
         )));
@@ -737,7 +741,7 @@ pub fn all_tools_with_runtime(
 
     // OpenCode CLI delegation tool
     if root_config.opencode_cli.enabled {
-        tool_arcs.push(Arc::new(OpenCodeCliTool::new(
+        tool_arcs.push(Arc::new(wrapped_opencode_cli(
             security.clone(),
             root_config.opencode_cli.clone(),
         )));
