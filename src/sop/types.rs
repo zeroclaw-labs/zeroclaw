@@ -85,6 +85,11 @@ pub enum SopTrigger {
         condition: Option<String>,
     },
     Manual,
+    Calendar {
+        calendar_source: String,
+        #[serde(default)]
+        calendar_ids: Vec<String>,
+    },
 }
 
 impl fmt::Display for SopTrigger {
@@ -95,6 +100,9 @@ impl fmt::Display for SopTrigger {
             Self::Cron { expression } => write!(f, "cron:{expression}"),
             Self::Peripheral { board, signal, .. } => write!(f, "peripheral:{board}/{signal}"),
             Self::Manual => write!(f, "manual"),
+            Self::Calendar {
+                calendar_source, ..
+            } => write!(f, "calendar:{calendar_source}"),
         }
     }
 }
@@ -234,6 +242,7 @@ pub enum SopTriggerSource {
     Cron,
     Peripheral,
     Manual,
+    Calendar,
 }
 
 impl fmt::Display for SopTriggerSource {
@@ -244,6 +253,7 @@ impl fmt::Display for SopTriggerSource {
             Self::Cron => write!(f, "cron"),
             Self::Peripheral => write!(f, "peripheral"),
             Self::Manual => write!(f, "manual"),
+            Self::Calendar => write!(f, "calendar"),
         }
     }
 }

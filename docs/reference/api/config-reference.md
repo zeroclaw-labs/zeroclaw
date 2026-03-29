@@ -379,6 +379,8 @@ Notes:
 |---|---|---|
 | `enabled` | `false` | Enable `http_request` tool for API interactions |
 | `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
+| `blocked_domains` | `[]` | Blocked domains (always takes priority over `allowed_domains`) |
+| `allowed_private_hosts` | `[]` | Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "localhost:3000"]`) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
 
@@ -386,7 +388,21 @@ Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
 - Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
-- Local/private targets are still blocked even when `"*"` is configured.
+- Local/private targets are blocked by default (SSRF protection). Add them to `allowed_private_hosts` to enable access.
+- `blocked_domains` always takes priority over both `allowed_domains` and `allowed_private_hosts`.
+- Private host examples: `"192.168.1.251"`, `"192.168.1.251:9000"`, `"localhost:3000"`, `"127.0.0.1"`
+
+Example:
+
+```toml
+[http_request]
+enabled = true
+allowed_domains = ["*"]
+blocked_domains = []
+allowed_private_hosts = ["192.168.1.251:9000", "localhost:3000"]
+max_response_size = 1000000
+timeout_secs = 30
+```
 
 ## `[google_workspace]`
 
@@ -459,6 +475,21 @@ When deploying behind a reverse proxy that maps ZeroClaw to a sub-path,
 set `path_prefix` to that sub-path (e.g. `"/zeroclaw"`). All gateway
 routes will be served under this prefix. The value must start with `/`
 and must not end with `/`.
+
+### Admin endpoints
+
+| Method | Path | Access | Purpose |
+|---|---|---|---|
+| `POST` | `/admin/reload-config` | localhost only | Hot-reload `config.toml` from disk |
+| `POST` | `/admin/shutdown` | localhost only | Graceful daemon shutdown |
+| `GET` | `/admin/paircode` | localhost only | Show current pairing code |
+| `POST` | `/admin/paircode/new` | localhost only | Generate new pairing code |
+
+`/admin/reload-config` re-reads, decrypts, validates, and swaps the in-memory config. Non-loopback requests return `403`. If the resolved config path differs from the running instance (e.g. `ZEROCLAW_WORKSPACE` changed), the endpoint returns `409 Conflict`.
+
+Known limitation: only `state.config` is swapped. Fields derived at startup (`default_provider`, `default_model`, `webhook_secret_hash`, pairing state) are **not** updated by reload. The response includes `restart_required: true` and `restart_warnings` when such changes are detected.
+
+CLI shorthand: `zeroclaw config reload`
 
 ## `[autonomy]`
 
@@ -668,6 +699,7 @@ WhatsApp Web mode (native client):
 | `pair_phone` | Optional | Pair-code flow phone number (digits only) |
 | `pair_code` | Optional | Custom pair code (otherwise auto-generated) |
 | `allowed_numbers` | Recommended | Allowed inbound numbers (`[]` = deny all, `"*"` = allow all) |
+| `mention_only` | Optional | When `true`, only respond to group messages that @-mention the bot (DMs always processed) |
 
 Notes:
 

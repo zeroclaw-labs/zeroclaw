@@ -17,7 +17,7 @@ instructions: |
 
 changeLog:
   - date: 2026-03-26
-    description: Initial template (v0.6.4)
+    description: Initial template (v0.6.6)
 
 links:
   - label: Website
@@ -48,7 +48,7 @@ schema:
     appServiceImage:
       type: string
       title: App Service Image
-      default: ghcr.io/zeroclaw-labs/zeroclaw:0.6.4
+      default: ghcr.io/zeroclaw-labs/zeroclaw:0.6.6
     apiKey:
       type: string
       title: LLM Provider API Key

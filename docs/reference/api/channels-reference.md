@@ -266,6 +266,7 @@ phone_number_id = "123456789012345"
 verify_token = "your-verify-token"
 app_secret = "your-app-secret"     # optional but recommended
 allowed_numbers = ["*"]
+interrupt_on_new_message = false   # optional: cancel in-flight same-sender same-chat request
 ```
 
 WhatsApp Web mode:
@@ -276,6 +277,8 @@ session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
 pair_phone = "15551234567"         # optional; omit to use QR flow
 pair_code = ""                     # optional custom pair code
 allowed_numbers = ["*"]
+mention_only = false               # optional: require @mention in groups (DMs always processed)
+interrupt_on_new_message = false   # optional: cancel in-flight same-sender same-chat request
 ```
 
 Notes:
@@ -283,6 +286,8 @@ Notes:
 - Build with `cargo build --features whatsapp-web` (or equivalent run command).
 - Keep `session_path` on persistent storage to avoid relinking after restart.
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
+- `mention_only = true` makes the bot ignore group messages unless the bot is @-mentioned. Direct messages are always processed. Bot identity is seeded from `pair_phone` and updated from the device store on connect.
+- `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
 
 ### 4.8 Webhook Channel Config (Gateway)
 

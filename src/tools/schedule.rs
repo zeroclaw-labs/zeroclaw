@@ -29,7 +29,7 @@ impl Tool for ScheduleTool {
     fn description(&self) -> &str {
         "Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. \
          WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. \
-         To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' \
+         To send a scheduled message to Discord/Telegram/Slack/Matrix/Feishu, use the cron_add tool with job_type='agent' \
          and a delivery config like {\"mode\":\"announce\",\"channel\":\"discord\",\"to\":\"<channel_id>\"}."
     }
 

@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "zeroclawlabs"
-version = "0.6.5"
+version = "0.6.6"
 edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
@@ -46,6 +46,10 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 # HTTP client - minimal features
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "multipart", "stream", "socks"] }
 
+# Archive extraction (for self-update)
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+tar = { version = "0.4", default-features = false }
+
 # Matrix client + E2EE decryption
 matrix-sdk = { version = "0.16", optional = true, default-features = false, features = ["e2e-encryption", "rustls-tls", "markdown", "sqlite"] }
 
@@ -71,9 +75,15 @@ prometheus = { version = "0.14", default-features = false, optional = true }
 # Base64 encoding (screenshots, image data)
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+aes = "0.8"
+ecb = "0.1"
+md5 = "0.8"
 
 # URL encoding for web search
 urlencoding = "2.1"
+
+# CIDR-range matching for SSRF validator
+ipnetwork = "0.20"
 
 # HTML to plain text conversion (web_fetch tool)
 nanohtml2text = "0.2"
@@ -87,9 +97,6 @@ indicatif = "0.18"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
-# Tar/gzip extraction (update pipeline)
-flate2 = "1.1"
-tar = "0.4"
 
 # Zip extraction for ClawhHub / OpenClaw registry installers
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
@@ -133,6 +140,9 @@ ring = "0.17"
 # Protobuf encode/decode (Lark WS frame codec, WhatsApp storage)
 prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
 
+# LRU cache for bounded sender state
+lru = "0.16"
+
 # Memory / persistence
 rusqlite = { version = "0.37", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
@@ -156,6 +166,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip04", "nip59"], optional = true }
 regex = "1.10"
 hostname = "0.4.2"
+socket2 = { version = "0.5", features = ["all"] }
 rustls = "0.23"
 rustls-pemfile = "2"
 rustls-pki-types = "1.14.0"
@@ -205,10 +216,10 @@ pdf-extract = { version = "0.10", optional = true }
 extism = { version = "1.20", optional = true }
 
 # Cross-platform audio capture for voice wake word detection (optional, enable with --features voice-wake)
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.17", optional = true }
 
-# Terminal QR rendering for WhatsApp Web pairing flow.
-qrcode = { version = "0.14", optional = true }
+# Terminal QR rendering for pairing/login flows.
+qrcode = "0.14"
 
 # WhatsApp Web client (wa-rs) — optional, enable with --features whatsapp-web
 # Uses wa-rs for Bot and Client, wa-rs-core for storage traits, custom rusqlite backend avoids Diesel conflict.
@@ -229,7 +240,7 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["observability-prometheus", "skill-creation"]
+default = ["observability-prometheus", "channel-nostr", "channel-lark", "skill-creation"]
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
@@ -256,7 +267,7 @@ rag-pdf = ["dep:pdf-extract"]
 # skill-creation = Autonomous skill creation from successful multi-step tasks
 skill-creation = []
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend
-whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost", "dep:qrcode"]
+whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto", "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport", "dep:serde-big-array", "dep:prost"]
 # voice-wake = Voice wake word detection via microphone (cpal)
 voice-wake = ["dep:cpal"]
 # WASM plugin system (extism-based)
