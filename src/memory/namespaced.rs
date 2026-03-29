@@ -92,10 +92,13 @@ impl Memory for NamespacedMemory {
 
     async fn forget(&self, key: &str) -> anyhow::Result<bool> {
         // First verify the entry is in our namespace before forgetting
-        if let Some(entry) = self.inner.get(key).await? {
-            if entry.namespace == self.namespace {
-                return self.inner.forget(key).await;
-            }
+        if let Some(_entry) = self
+            .inner
+            .get(key)
+            .await?
+            .filter(|e| e.namespace == self.namespace)
+        {
+            return self.inner.forget(key).await;
         }
         Ok(false)
     }
@@ -182,10 +185,8 @@ impl Memory for NamespacedMemory {
         let entries = self.inner.list(None, Some(session_id)).await?;
         let mut count = 0;
         for entry in entries {
-            if entry.namespace == self.namespace {
-                if self.inner.forget(&entry.key).await? {
-                    count += 1;
-                }
+            if entry.namespace == self.namespace && self.inner.forget(&entry.key).await? {
+                count += 1;
             }
         }
         Ok(count)
