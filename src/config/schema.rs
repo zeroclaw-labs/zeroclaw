@@ -432,6 +432,10 @@ pub struct Config {
     /// Shell tool configuration (`[shell_tool]`).
     #[serde(default)]
     pub shell_tool: ShellToolConfig,
+
+    /// File read tool configuration (`[file_read_tool]`).
+    #[serde(default)]
+    pub file_read_tool: FileReadToolConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -2747,6 +2751,28 @@ impl Default for ShellToolConfig {
     fn default() -> Self {
         Self {
             timeout_secs: default_shell_tool_timeout_secs(),
+        }
+    }
+}
+
+// ── File read tool ────────────────────────────────────────────────────
+
+/// File read tool configuration (`[file_read_tool]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FileReadToolConfig {
+    /// Enable binary file detection and preprocessing (default: `true`).
+    #[serde(default = "default_binary_file_detection")]
+    pub binary_file_detection: bool,
+}
+
+fn default_binary_file_detection() -> bool {
+    true
+}
+
+impl Default for FileReadToolConfig {
+    fn default() -> Self {
+        Self {
+            binary_file_detection: default_binary_file_detection(),
         }
     }
 }
@@ -8297,6 +8323,7 @@ impl Default for Config {
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            file_read_tool: FileReadToolConfig::default(),
         }
     }
 }
@@ -11457,6 +11484,7 @@ auto_save = true
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            file_read_tool: FileReadToolConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -11987,6 +12015,7 @@ default_temperature = 0.7
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            file_read_tool: FileReadToolConfig::default(),
         };
 
         config.save().await.unwrap();

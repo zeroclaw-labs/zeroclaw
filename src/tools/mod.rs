@@ -40,6 +40,7 @@ pub mod data_management;
 pub mod delegate;
 pub mod discord_search;
 pub mod escalate;
+pub mod file_detect;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -409,7 +410,10 @@ pub fn all_tools_with_runtime(
             ShellTool::new_with_sandbox(security.clone(), runtime, sandbox)
                 .with_timeout_secs(root_config.shell_tool.timeout_secs),
         ),
-        Arc::new(FileReadTool::new(security.clone())),
+        Arc::new(
+            FileReadTool::new(security.clone())
+                .with_binary_detection(root_config.file_read_tool.binary_file_detection),
+        ),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
         Arc::new(GlobSearchTool::new(security.clone())),
