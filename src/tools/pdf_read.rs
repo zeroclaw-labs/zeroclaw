@@ -75,31 +75,6 @@ impl Tool for PdfReadTool {
             })
             .unwrap_or(DEFAULT_MAX_CHARS);
 
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        if !self.security.is_path_allowed(path) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
-            });
-        }
-
-        // Record action before canonicalization so path-probing still consumes budget.
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
         let full_path = self.security.resolve_tool_path(path);
 
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
@@ -232,6 +207,7 @@ impl Tool for PdfReadTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::{PathGuardedTool, RateLimitedTool};
     use tempfile::TempDir;
 
     fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
@@ -252,6 +228,15 @@ mod tests {
             max_actions_per_hour: max_actions,
             ..SecurityPolicy::default()
         })
+    }
+
+    fn wrapped_pdf_read(
+        security: Arc<SecurityPolicy>,
+    ) -> RateLimitedTool<PathGuardedTool<PdfReadTool>> {
+        RateLimitedTool::new(
+            PathGuardedTool::new(PdfReadTool::new(security.clone()), security.clone()),
+            security,
+        )
     }
 
     #[test]
@@ -294,34 +279,22 @@ mod tests {
 
     #[tokio::test]
     async fn absolute_path_is_blocked() {
-        let tool = PdfReadTool::new(test_security(std::env::temp_dir()));
+        let tool = wrapped_pdf_read(test_security(std::env::temp_dir()));
         let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("not allowed")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("blocked"));
     }
 
     #[tokio::test]
     async fn path_traversal_is_blocked() {
         let tmp = TempDir::new().unwrap();
-        let tool = PdfReadTool::new(test_security(tmp.path().to_path_buf()));
+        let tool = wrapped_pdf_read(test_security(tmp.path().to_path_buf()));
         let result = tool
             .execute(json!({"path": "../../../etc/passwd"}))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("not allowed")
-        );
+        assert!(result.error.as_deref().unwrap_or("").contains("blocked"));
     }
 
     #[tokio::test]
@@ -345,7 +318,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limit_blocks_request() {
         let tmp = TempDir::new().unwrap();
-        let tool = PdfReadTool::new(test_security_with_limit(tmp.path().to_path_buf(), 0));
+        let tool = wrapped_pdf_read(test_security_with_limit(tmp.path().to_path_buf(), 0));
         let result = tool.execute(json!({"path": "any.pdf"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("Rate limit"));
@@ -355,7 +328,7 @@ mod tests {
     async fn probing_nonexistent_consumes_rate_limit_budget() {
         let tmp = TempDir::new().unwrap();
         // Allow 2 actions; both will fail on missing file but must consume budget.
-        let tool = PdfReadTool::new(test_security_with_limit(tmp.path().to_path_buf(), 2));
+        let tool = wrapped_pdf_read(test_security_with_limit(tmp.path().to_path_buf(), 2));
 
         let r1 = tool.execute(json!({"path": "a.pdf"})).await.unwrap();
         assert!(!r1.success);
