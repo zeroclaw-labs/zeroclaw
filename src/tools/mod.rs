@@ -243,6 +243,22 @@ impl Tool for ArcToolRef {
         self.0.parameters_schema()
     }
 
+    fn is_terminal(&self) -> bool {
+        self.0.is_terminal()
+    }
+
+    fn tags(&self) -> &[String] {
+        self.0.tags()
+    }
+
+    fn max_result_chars(&self) -> Option<usize> {
+        self.0.max_result_chars()
+    }
+
+    fn max_calls_per_turn(&self) -> Option<usize> {
+        self.0.max_calls_per_turn()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -271,6 +287,22 @@ impl Tool for ArcDelegatingTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.inner.parameters_schema()
+    }
+
+    fn is_terminal(&self) -> bool {
+        self.inner.is_terminal()
+    }
+
+    fn tags(&self) -> &[String] {
+        self.inner.tags()
+    }
+
+    fn max_result_chars(&self) -> Option<usize> {
+        self.inner.max_result_chars()
+    }
+
+    fn max_calls_per_turn(&self) -> Option<usize> {
+        self.inner.max_calls_per_turn()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1297,6 +1329,10 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                fallback_providers: Vec::new(),
+                max_parallel_tool_calls: None,
+                max_tool_result_chars: None,
+                iteration_cooldown_ms: None,
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
