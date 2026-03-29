@@ -12227,6 +12227,8 @@ default_temperature = 0.7
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         };
         let json = serde_json::to_string(&mc).unwrap();
         let parsed: MatrixConfig = serde_json::from_str(&json).unwrap();
@@ -12253,6 +12255,8 @@ default_temperature = 0.7
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         };
         let toml_str = toml::to_string(&mc).unwrap();
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
@@ -12351,6 +12355,8 @@ allowed_users = ["@ops:matrix.org"]
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
                 recovery_key: None,
+                password: None,
+                mention_only: false,
             }),
             signal: None,
             whatsapp: None,
@@ -15904,6 +15910,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         };
         let fields = mx.secret_fields();
         assert_eq!(fields.len(), 2);
@@ -15929,6 +15937,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         };
         let fields = mx.secret_fields();
         assert!(!fields[0].is_set);
@@ -15949,6 +15959,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         };
         mx.set_secret("channels.matrix.access-token", "new-token".into())
             .unwrap();
@@ -15970,6 +15982,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         };
         assert!(
             mx.set_secret("channels.matrix.nonexistent", "val".into())
@@ -15994,6 +16008,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         });
 
         let fields = config.secret_fields();
@@ -16019,6 +16035,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         });
 
         config
@@ -16065,6 +16083,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         };
 
         // Encrypt
@@ -16095,6 +16115,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         };
 
         mx.encrypt_secrets(&store).unwrap();
@@ -16123,6 +16145,8 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
             recovery_key: None,
+            password: None,
+            mention_only: false,
         };
 
         mx.encrypt_secrets(&store).unwrap();
