@@ -2896,7 +2896,7 @@ fn default_web_search_enabled() -> bool {
 }
 
 fn default_web_search_provider() -> String {
-    "duckduckgo".into()
+    "browser".into()
 }
 
 fn default_web_search_max_results() -> usize {
@@ -2935,6 +2935,9 @@ const WEB_SEARCH_PROVIDER_ALLOWED_VALUES: &[&str] = &[
     "perplexity",
     "exa",
     "jina",
+    "naver",
+    "google",
+    "browser",
 ];
 const WEB_SEARCH_EXA_SEARCH_TYPE_ALLOWED_VALUES: &[&str] = &["auto", "keyword", "neural"];
 
@@ -3051,6 +3054,9 @@ fn normalize_web_search_provider(raw: &str) -> Option<&'static str> {
         "perplexity" => Some("perplexity"),
         "exa" => Some("exa"),
         "jina" => Some("jina"),
+        "naver" => Some("naver"),
+        "google" => Some("google"),
+        "browser" => Some("browser"),
         _ => None,
     }
 }
@@ -3066,7 +3072,7 @@ impl Default for WebSearchConfig {
             perplexity_api_key: None,
             exa_api_key: None,
             jina_api_key: None,
-            fallback_providers: vec!["jina".to_string()],
+            fallback_providers: vec!["duckduckgo".to_string(), "jina".to_string()],
             retries_per_provider: default_web_search_retries_per_provider(),
             retry_backoff_ms: default_web_search_retry_backoff_ms(),
             domain_filter: Vec::new(),
@@ -13121,8 +13127,8 @@ default_temperature = 0.7
     #[test]
     async fn web_search_config_default_extended_fields() {
         let ws = WebSearchConfig::default();
-        assert_eq!(ws.provider, "duckduckgo");
-        assert_eq!(ws.fallback_providers, vec!["jina"]);
+        assert_eq!(ws.provider, "browser");
+        assert_eq!(ws.fallback_providers, vec!["duckduckgo", "jina"]);
         assert_eq!(ws.retries_per_provider, 2);
         assert_eq!(ws.retry_backoff_ms, 250);
         assert!(ws.domain_filter.is_empty());

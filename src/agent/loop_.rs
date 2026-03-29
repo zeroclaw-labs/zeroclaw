@@ -2622,6 +2622,8 @@ pub async fn run(
         ("model_routing_config", "Configure default model, scenario routing, and delegate agents."),
         ("web_search_config", "Configure web search providers/keys/fallbacks at runtime."),
         ("web_access_config", "Configure shared URL access policy (first-visit approval, allowlist/blocklist, approved domains)."),
+        ("credential_store", "Encrypt and save site credentials (ID, password, card) to the LOCAL vault. Never plaintext. Never transmitted externally."),
+        ("credential_recall", "Retrieve stored credentials from the LOCAL encrypted vault. Actions: 'list' (show masked), 'get' (decrypt for browser fill), 'delete' (remove)."),
     ];
     if config.browser.enabled {
         tool_descs.push((
@@ -3358,6 +3360,8 @@ pub async fn process_message_with_session(
         ("model_routing_config", "Configure default model, scenario routing, and delegate agents."),
         ("web_search_config", "Configure web search providers/keys/fallbacks at runtime."),
         ("web_access_config", "Configure shared URL access policy for network tools."),
+        ("credential_store", "Encrypt and save site credentials (ID, password, card) to the LOCAL vault. Never plaintext. Never transmitted externally."),
+        ("credential_recall", "Retrieve stored credentials from the LOCAL encrypted vault. Actions: 'list' (show masked), 'get' (decrypt for browser fill), 'delete' (remove)."),
     ];
     if config.browser.enabled {
         tool_descs.push(("browser_open", "Open approved URLs in browser."));

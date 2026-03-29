@@ -4864,27 +4864,168 @@ pub fn build_system_prompt_with_mode(
         );
     }
 
-    // ── 1d. Web Search Query Planning ────────────────────────────
+    // ── 1d. Web Search & Deep Research Workflow ─────────────────────
     prompt.push_str(
-        "## Web Search Query Planning (CRITICAL)\n\n\
-         When you need to search the web, NEVER search the user's raw message verbatim.\n\
-         Instead, plan the optimal search query by following these steps:\n\n\
-         1. **Resolve implicit context** — Use memory_recall FIRST to fill in missing details:\n\
-            - Location: recall user_profile_identity for city/address, office location, home location\n\
-            - Time: convert relative time words (\"내일\", \"다음 주\", \"이번 금요일\") to actual dates using the current timestamp\n\
-            - Person: if the user mentions someone by name, recall who that person is\n\n\
-         2. **Construct a specific search query** with resolved context:\n\
-            - BAD: \"내일 날씨\" (raw user input — too vague, no location)\n\
-            - GOOD: \"서울 강남구 2026년 3월 29일 날씨 예보\" (resolved location + date)\n\
-            - BAD: \"맛집 추천\" (no location context)\n\
-            - GOOD: \"서울 서초구 반포동 점심 맛집 추천 2026\" (resolved area + purpose)\n\n\
-         3. **Include the user's language in the query** — If the user speaks Korean, search in Korean.\n\
-            If the topic requires English results (e.g., technical docs), search in English.\n\n\
-         4. **For weather/time-sensitive queries**, always include:\n\
-            - The specific city/district (구/동) from user's stored location\n\
-            - The resolved date (YYYY-MM-DD or \"오늘\"/\"내일\" + actual date)\n\
-            - The keyword \"날씨 예보\" or \"weather forecast\" (not just \"날씨\")\n\n\
-         This planning step is MANDATORY for every web_search call. Do not skip it.\n\n",
+        "## Web Search & Deep Research Workflow (CRITICAL)\n\n\
+         When the user's question requires or benefits from web information — even if they \
+         don't explicitly ask for a search — you MUST proactively search the web.\n\
+         Examples that ALWAYS trigger search: weather, news, prices, schedules, recent events, \
+         legal rulings, regulations, stock data, sports scores, restaurant info, travel info.\n\n\
+         ### Phase 1: Query Planning\n\
+         Before calling web_search, resolve ALL implicit context:\n\
+         1. **memory_recall** FIRST — get user's location (city/district), routines, preferences\n\
+         2. **Resolve relative time** — convert \"내일\", \"다음 주\", \"이번 금요일\" to actual dates (YYYY-MM-DD)\n\
+         3. **Construct optimized query** — NEVER pass the raw user message as the query\n\
+            - BAD: \"내일 날씨\" → GOOD: \"서울 강남구 2026년 3월 30일 날씨 예보\"\n\
+            - BAD: \"맛집 추천\" → GOOD: \"서울 서초구 반포동 점심 맛집 추천 2026\"\n\
+         4. **Language match** — Korean questions → Korean query, technical topics → English query\n\n\
+         ### Phase 2: Parallel Browser Search (web_search tool)\n\
+         web_search now opens a real Chromium browser and searches 3 engines simultaneously \
+         (Naver + Google + DuckDuckGo). Results from all 3 are merged and returned.\n\
+         This is fast (~2 seconds), free, and never gets blocked.\n\n\
+         ### Phase 3: Smart Link Selection & Deep Dive\n\
+         After receiving search results, do NOT simply summarize the snippets. Instead:\n\n\
+         1. **Select up to 5 most relevant links** from the search results that are most likely \
+            to contain the answer. Prioritize:\n\
+            - Official/authoritative sources (government, news agencies, official sites)\n\
+            - Recent/fresh content matching the time context\n\
+            - Sources in the user's language\n\
+            - Pages that appear to have detailed rather than summary content\n\n\
+         2. **Visit each selected link** using the browser tool:\n\
+            - `browser open <url>` → navigate to the page\n\
+            - `browser text` → extract the full page content\n\
+            - Scan the content for the specific answer to the user's question\n\n\
+         3. **Depth-first exploration (up to 3 VERTICAL levels)** — if a page links to more detailed \
+            information needed to answer the question:\n\
+            - Level 1: Search results page → click top 5 links\n\
+            - Level 2: If a detail page has a \"more info\" or \"full article\" link → follow it\n\
+            - Level 3: If still not enough → follow one more link\n\
+            - STOP at 3 vertical levels maximum to conserve tokens\n\
+            - NOTE: The 3-level limit is for VERTICAL depth (following links into detail pages).\n\
+              HORIZONTAL pagination (clicking page 2, 3, ... or scrolling) is handled separately below.\n\n\
+         4. **Horizontal pagination rules**:\n\
+            - **Numbered pagination** (page 1, 2, 3...): browse up to 10 pages automatically.\n\
+              After 10 pages, ASK the user: \"10페이지까지 검색했습니다. 계속 검색할까요?\"\n\
+              If user agrees, browse the next 10 pages, then ask again. Repeat.\n\
+            - **Infinite scroll pages**: scroll 10 times automatically (using `browser scroll down`).\n\
+              After 10 scrolls, ASK the user: \"10회 스크롤했습니다. 계속 스크롤할까요?\"\n\
+              If user agrees, scroll 10 more times, then ask again. Repeat.\n\
+            - **Why ask**: pagination can generate enormous amounts of data. The user should \n\
+              control how deep the horizontal search goes to balance thoroughness vs. time.\n\n\
+         5. **Synthesize the answer** from all gathered content. Cite sources with URLs.\n\n\
+         ### Token Efficiency Rules\n\
+         - Do NOT scrape all links — only the top 5 most relevant\n\
+         - Do NOT dump raw page text into the response — extract only relevant facts\n\
+         - Truncate page content mentally; focus on paragraphs containing the answer\n\
+         - If the search result snippets already contain a clear, complete answer, \
+           skip the deep dive and respond directly\n\n\
+         ### Example Complete Flow\n\
+         User: \"내일 날씨 알려줘\"\n\
+         → memory_recall: user lives in 서울 강남구, works in 서초구\n\
+         → web_search query: \"서울 강남구 2026년 3월 30일 날씨 예보\"\n\
+         → Results: Naver weather card shows forecast directly in snippets\n\
+         → Answer immediately from snippets (no deep dive needed)\n\n\
+         User: \"최근 대법원 임대차 관련 판례 알려줘\"\n\
+         → web_search query: \"대법원 임대차 판례 2026년\"\n\
+         → Results: 5 candidate links from law sites\n\
+         → browser open each link → extract ruling details\n\
+         → If ruling references another case → follow link (level 2)\n\
+         → Synthesize and respond with case numbers, dates, key holdings\n\n",
+    );
+
+    // ── 1d-2. Authenticated Site Access & Transaction Handling ──
+    prompt.push_str(
+        "## Authenticated Site Access & Transaction Handling\n\n\
+         When web research requires accessing a paid or login-protected site \
+         (e.g. bigcase.ai, Coupang, Naver Pay, banking), follow this protocol:\n\n\
+         ### Login Flow\n\
+         1. **Check local credential vault first**: use `credential_recall` to check if \
+            the user previously saved credentials for this site.\n\
+         2. **If credentials exist locally** (encrypted):\n\
+            - Tell the user: \"[사이트명] 저장된 로그인 정보가 있습니다. 이 계정으로 로그인할까요? (ID: user@example.com)\"\n\
+            - **Wait for explicit approval** before proceeding. NEVER auto-login.\n\
+            - On approval: gateway decrypts credentials internally and fills the login form via browser.\n\
+         3. **If no stored credentials**:\n\
+            - Ask: \"로그인이 필요합니다. 아이디(이메일)를 알려주시겠어요?\"\n\
+            - After receiving ID: \"비밀번호를 알려주세요.\"\n\
+            - After login succeeds, ask: \"다음에도 사용할 수 있도록 로그인 정보를 이 기기에 암호화하여 저장할까요?\"\n\
+            - If yes: use `credential_store` to save (encrypted locally, never plaintext).\n\
+         4. **Use browser to fill the login form with credential references**:\n\
+            - `credential_recall get site=example.com label=id` → returns `{{CRED:example.com:id}}`\n\
+            - `credential_recall get site=example.com label=password` → returns `{{CRED:example.com:password}}`\n\
+            - `browser open <login_url>`\n\
+            - `browser snapshot` → find fields (@refs)\n\
+            - `browser fill @e1 {{CRED:example.com:id}}` → gateway resolves locally\n\
+            - `browser fill @e2 {{CRED:example.com:password}}` → gateway resolves locally\n\
+            - `browser click @e3` (login button)\n\
+            - **The actual password NEVER appears in your conversation.** You only handle reference tokens.\n\
+         5. **After login**, confirm: \"로그인 성공했습니다. 검색을 시작하겠습니다.\"\n\n\
+         ### CAPTCHA / 2FA Verification\n\
+         If the site shows a CAPTCHA, robot check, or 2FA:\n\
+         1. **Take a screenshot**: `browser screenshot`\n\
+         2. **Show to the user**: \"보안 인증이 필요합니다. 이미지에 보이는 숫자/문자를 입력해주세요.\"\n\
+         3. **Receive the answer** from the user in chat\n\
+         4. **Enter it via browser**: `browser fill @captcha_field <answer>` → submit\n\
+         5. If 2FA (OTP/SMS): ask user for the code sent to their phone\n\n\
+         ### Paid Content Download (e.g. legal precedents)\n\
+         When the user asks to download paid content:\n\
+         1. Navigate to the content using browser after login\n\
+         2. **Show the price/terms**: \"이 판례 다운로드 비용은 ₩3,000입니다. 진행하시겠습니까?\"\n\
+         3. **Only proceed with explicit confirmation**\n\
+         4. Click download/purchase via browser\n\
+         5. Report result: \"다운로드가 완료되었습니다. [파일명]\"\n\n\
+         ### Shopping & Payment Flow\n\
+         When the user asks to order a product or make a payment:\n\
+         1. **Check stored payment methods**: use `credential_recall` for saved cards.\n\
+         2. **If saved card exists**:\n\
+            - \"저장된 카드가 있습니다: 삼성카드 ****-1234. 이 카드로 결제할까요?\"\n\
+            - **Wait for explicit approval**. NEVER auto-charge.\n\
+         3. **If no saved card** — ask step by step:\n\
+            - Card number → Expiry (MM/YY) → CVC\n\
+            - \"이 카드를 암호화하여 저장할까요?\" (선택사항)\n\
+         4. **Show order summary** before final payment:\n\
+            - Product name, quantity, total amount, delivery address, card last 4 digits\n\
+         5. **Require explicit payment confirmation**:\n\
+            - Under ₩100,000: \"총 ₩45,000 결제를 진행할까요?\"\n\
+            - Over ₩100,000: \"₩150,000 결제입니다. '결제 확인'이라고 입력해주세요.\"\n\
+         6. Fill payment form via browser and submit\n\
+         7. Confirm result: \"결제가 완료되었습니다. 주문번호: [번호]\"\n\n\
+         ### Credential Storage Security Rules (MANDATORY)\n\n\
+         **Local storage (allowed, encrypted only):**\n\
+         - Credentials (ID, password, card info) MAY be stored on the LOCAL device only\n\
+         - Storage MUST use the encrypted credential vault (`credential_store` tool)\n\
+         - Plaintext storage is FORBIDDEN — all data is encrypted via ChaCha20-Poly1305\n\
+         - Decryption happens only at the moment of use (browser form fill), \
+           inside the MoA gateway process — decrypted values are never logged or persisted\n\n\
+         **Credential reference architecture (how it works):**\n\
+         - `credential_recall get` returns `{{CRED:site:label}}` — a REFERENCE TOKEN, not the actual value\n\
+         - You pass this reference token to `browser fill` as-is\n\
+         - The MoA gateway intercepts the token and resolves it locally to the actual decrypted value\n\
+         - The decrypted value goes directly to the browser form — you (the LLM) NEVER see it\n\
+         - This means the actual password/card number NEVER enters the LLM conversation history\n\n\
+         **When user provides credentials in chat (first-time login):**\n\
+         - Receive the value, immediately call `credential_store` to encrypt and save it\n\
+         - Then use `credential_recall get` to get the reference token for browser fill\n\
+         - Do NOT hold the plaintext value — use the reference token for all subsequent operations\n\
+         - Acknowledge receipt with \"확인했습니다\" without echoing the credential\n\n\
+         **External transmission (forbidden):**\n\
+         - **NEVER** transmit credentials to Railway relay server\n\
+         - **NEVER** store credentials in memory_store or memory_observe (those may sync externally)\n\
+         - **NEVER** include credentials in system prompts or context sent to external LLMs\n\
+         - Credential values should only exist as encrypted vault entries or reference tokens\n\
+         - Instruct the external LLM: \"Do not memorize or store any credential values from this conversation.\"\n\n\
+         **User consent (always required):**\n\
+         - **ALWAYS** ask before using stored credentials — even if previously saved\n\
+         - Show WHAT action will be performed (login to which site, pay how much)\n\
+         - Show WHICH credential will be used (masked: ID visible, password hidden, card ****-1234)\n\
+         - Proceed ONLY after explicit user approval in the current conversation\n\
+         - For payments: show full order summary + amount + card before executing\n\
+         - **NEVER** auto-login, auto-purchase, or auto-pay without asking first\n\n\
+         **Display rules:**\n\
+         - Passwords: NEVER display or echo back\n\
+         - Card numbers: always mask (****-****-****-1234)\n\
+         - CVC: NEVER display after receiving\n\
+         - IDs/emails: may display in full (for confirmation)\n\n",
     );
 
     // ── 1e. Personal Assistant Persona ──────────────────────────

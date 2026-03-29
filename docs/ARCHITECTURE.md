@@ -1373,7 +1373,7 @@ src/
 ├── memory/              # SQLite + sqlite-vec + FTS5 long-term memory
 ├── providers/           # Model providers (Gemini, Claude, OpenAI, Ollama, etc.)
 ├── channels/            # KakaoTalk, Telegram, Discord, Slack, LINE, Web chat
-├── tools/               # Tool execution (shell, file, memory, browser)
+├── tools/               # Tool execution (shell, file, memory, browser, credential vault)
 ├── coding/              # Multi-model code review pipeline ← MoA addition
 ├── voice/               # Real-time voice interpretation  ← MoA addition
 ├── sandbox/             # Coding sandbox (run→observe→fix loop)
@@ -1401,10 +1401,11 @@ clients/tauri/               # Native desktop/mobile app (Tauri 2.x + React + Ty
 │   ├── Login.tsx / SignUp.tsx / Settings.tsx
 │   └── ...
 ├── src/lib/
-│   ├── api.ts               # API client (ZeroClaw gateway + Railway relay)
+│   ├── api.ts               # API client — uses gateway_fetch IPC proxy in Tauri mode
+│   ├── tauri-bridge.ts      # Tauri IPC wrappers (gateway_fetch, auth, sync, lifecycle)
 │   ├── i18n.ts              # Locale support (ko, en)
 │   └── storage.ts           # Chat session persistence (localStorage)
-├── src-tauri/src/lib.rs     # Tauri Rust host — IPC commands, PDF conversion pipeline
+├── src-tauri/src/lib.rs     # Tauri Rust host — IPC commands, gateway_fetch proxy, PDF pipeline
 └── src-tauri/Cargo.toml
 
 web/                     # Web dashboard UI (Vite + React + TypeScript)  ← MoA addition
@@ -1583,9 +1584,9 @@ Every user request follows a structured 4-phase protocol:
    criteria, register plan via `task_plan` tool
 
 2. **Phase 2 — Execute**: Execute plan step by step using selected tools.
-   After each step, evaluate result and update `task_plan` status.
-   For web searches: `perplexity_search` → `web_search` → `web_fetch`
-   fallback chain (silently, without telling user about failures)
+   For web searches: **Playwright browser search is the default** (see
+   Web Research Architecture below). API-based search (DuckDuckGo, Jina)
+   serves as fallback.
 
 3. **Phase 3 — Verify**: Self-check loop (max 2 retries) —
    completeness, accuracy, freshness, sufficiency checks.
@@ -1593,6 +1594,166 @@ Every user request follows a structured 4-phase protocol:
 
 4. **Phase 4 — Present**: Direct answer first → supporting details →
    source URLs → 2-3 follow-up suggestions. Language-matched formatting.
+
+### Web Research Architecture (Playwright-First)
+
+MoA uses a **Playwright browser-first** approach for web research instead of
+traditional API-based search. The persistent Chromium daemon eliminates bot
+detection issues and enables parallel multi-engine search.
+
+#### 3-Phase Web Research Workflow
+
+```
+사용자: "최근 대법원 임대차 판례 알려줘"
+         │
+Phase 1 — Query Planning
+         │ memory_recall → 사용자 컨텍스트 (위치, 직업, 관심사)
+         │ 시간 해석 → "최근" = 2026년
+         │ 최적 쿼리 생성 → "대법원 임대차 판례 2026년"
+         ▼
+Phase 2 — Parallel Browser Search (~2초)
+         │ Playwright 데몬이 3개 탭 동시 오픈:
+         │ ┌──────────┬──────────┬──────────┐
+         │ │ Tab 1    │ Tab 2    │ Tab 3    │
+         │ │ Naver    │ Google   │ DuckDuckGo│
+         │ └──────────┴──────────┴──────────┘
+         │ 모든 결과 병합 → LLM에게 전달
+         ▼
+Phase 3 — Smart Deep Dive (3-level vertical depth)
+         │
+    Level 1: 검색 결과에서 상위 5개 관련 링크 선택
+    Level 2: 각 링크 방문 → 관련 내용 추출
+    Level 3: 참조 링크 1단계 더 추적
+         │
+    수평 탐색: 10페이지 자동 → 이용자에게 계속 여부 확인
+         │
+         ▼
+Phase 4 — 답변 생성 + 출처 URL
+```
+
+#### Provider Chain
+
+| Priority | Provider | Method | Speed | Cost | Bot Detection |
+|----------|----------|--------|-------|------|---------------|
+| **1 (Default)** | `browser` | Playwright: Naver+Google+DDG 병렬 | ~2s | Free | None |
+| 2 (Fallback) | `duckduckgo` | HTTP API (HTML scraping) | ~1s | Free | Possible |
+| 3 (Fallback) | `jina` | Jina Search API | ~1s | Free tier | None |
+| Optional | `brave`, `perplexity`, `exa` | API | ~1s | Paid | None |
+
+#### Depth vs Breadth Navigation Rules
+
+```
+수직 탐색 (Vertical Depth): 3단계 제한
+  검색결과 → 상세페이지 → 참조링크 → STOP
+  (링크의 링크의 링크까지만)
+
+수평 탐색 (Horizontal Pagination): 10페이지씩 사용자 확인
+  ┌─ 번호 페이지네이션 ────────────────────────┐
+  │ 1~10페이지 자동 → "계속할까요?" → 11~20 ... │
+  └────────────────────────────────────────────┘
+  ┌─ 무한 스크롤 ──────────────────────────────┐
+  │ 10회 스크롤 자동 → "계속할까요?" → 10회 ...  │
+  └────────────────────────────────────────────┘
+```
+
+#### Key Design Decisions
+
+- **왜 Playwright가 기본인가?** DuckDuckGo HTTP API는 User-Agent 기반 봇
+  탐지로 인해 빈번하게 차단됨. Playwright는 실제 Chromium을 사용하므로
+  차단이 불가능하고, Naver 검색은 한국어 쿼리에서 가장 정확한 결과를 제공.
+- **왜 병렬 3-사이트인가?** 단일 사이트 검색과 동일한 ~2초 안에 3배의 결과를
+  얻을 수 있음. 각 검색엔진의 강점(Naver: 한국어, Google: 영어/범용,
+  DDG: 프라이버시)을 동시에 활용.
+- **왜 검색과 스크래핑이 한 단계인가?** 기존 방식(web_search → web_fetch
+  2단계)은 ~4초 소요. Playwright는 검색 페이지를 열면서 동시에 텍스트를
+  추출하므로 ~2초로 단축.
+
+### Encrypted Credential Vault & Browser Automation
+
+MoA는 유료 사이트 로그인 및 결제를 사용자 대신 수행할 수 있습니다.
+보안은 **참조 토큰 방식**으로 구현되어, 실제 비밀번호/카드번호가
+외부 LLM에 노출되지 않습니다.
+
+#### Security Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                로컬 기기 (암호화 저장)                  │
+│                                                     │
+│  credential_vault.json.enc ← ChaCha20-Poly1305      │
+│  ┌────────────────────────────────────────┐          │
+│  │ site: bigcase.ai                       │          │
+│  │   id: enc2:a3f7... (hint: user@mail)   │          │
+│  │   pw: enc2:8b2c... (hint: ••••••)      │          │
+│  │ site: coupang.com                      │          │
+│  │   card: enc2:d9e1... (hint: ****-1234) │          │
+│  └────────────────────────────────────────┘          │
+│                                                     │
+│  MoA Gateway: 사용 시점에만 복호화                    │
+│  → browser fill @e2 [복호화된 값]                     │
+│  → 복호화된 값은 즉시 폐기                            │
+└─────────────────────────────────────────────────────┘
+         │
+         ✗ 절대 전송 금지
+         ▼
+┌─────────────────────────────────────────────────────┐
+│  Railway / 외부 LLM (금지)                            │
+│  - 자격증명 저장 ✗                                   │
+│  - LLM 대화 기록에 포함 ✗                             │
+│  - memory_store에 저장 ✗ (외부 동기화 가능)            │
+└─────────────────────────────────────────────────────┘
+```
+
+#### Reference Token Flow
+
+LLM은 실제 비밀번호를 절대 알 수 없습니다:
+
+```
+1. LLM: credential_recall get site=coupang.com label=password
+2. Tool: "{{CRED:coupang.com:password}}" (참조 토큰 반환)
+3. LLM: browser fill @e2 {{CRED:coupang.com:password}}
+4. MoA Gateway: 토큰을 로컬에서 복호화 → Chromium 폼에 직접 입력
+5. 복호화된 값은 메모리에서 즉시 폐기
+   → LLM 대화 기록에는 참조 토큰만 존재, 실제 값 없음
+```
+
+#### Tools
+
+| Tool | Function |
+|------|----------|
+| `credential_store` | 자격증명 암호화 저장 (ChaCha20-Poly1305) |
+| `credential_recall list` | 저장된 자격증명 목록 (마스킹: ****-1234) |
+| `credential_recall get` | 참조 토큰 반환 (실제 값 아님) |
+| `credential_recall delete` | 자격증명 삭제 |
+
+#### Consent-Before-Use (필수)
+
+저장된 자격증명이 있더라도, 사용 전 반드시 사용자 동의 확인:
+
+```
+MoA: "쿠팡 저장된 계정이 있습니다.
+      ID: user@email.com으로 로그인할까요?"
+      ↓
+사용자: "응"  ← 명시적 동의 후에만 진행
+
+결제 시:
+  - ₩100,000 미만: "총 ₩45,000 결제할까요?"
+  - ₩100,000 이상: "'결제 확인'이라고 입력해주세요" (이중 확인)
+```
+
+### Web Tools Summary
+
+| Tool | Purpose | Default | Cost |
+|------|---------|---------|------|
+| `web_search` | 웹 검색 (Playwright 병렬 기본) | Enabled | Free |
+| `web_fetch` | URL 텍스트 추출 (HTML→Markdown) | Enabled | Free |
+| `http_request` | 범용 HTTP 요청 | Enabled (allowlist 필요) | Free |
+| `browser` | Chromium 자동화 (@ref 시스템) | Enabled | Free |
+| `perplexity_search` | Perplexity AI 검색 | Disabled | Paid/Free tier |
+| `web_search_config` | 검색 설정 런타임 변경 | Always | N/A |
+| `web_access_config` | URL 접근 정책 런타임 변경 | Always | N/A |
+| `credential_store` | 자격증명 암호화 저장 | Always | N/A |
+| `credential_recall` | 자격증명 조회/삭제 | Always | N/A |
 
 ---
 

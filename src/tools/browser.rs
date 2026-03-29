@@ -872,6 +872,27 @@ impl BrowserTool {
             );
         }
 
+        // ── Credential reference resolution ──
+        // If any string value in the payload contains {{CRED:site:label}},
+        // resolve it to the actual decrypted value from the local vault.
+        // This ensures the LLM never sees the real credential — it only
+        // passes the reference token, and the gateway resolves it here.
+        {
+            // Use the same workspace_dir that the credential tools use,
+            // derived from SecurityPolicy (matches config.workspace_dir).
+            let vault_dir = &self.security.workspace_dir;
+            let keys: Vec<String> = payload.keys().cloned().collect();
+            for key in keys {
+                if let Some(serde_json::Value::String(val)) = payload.get(&key) {
+                    if super::credential_vault::contains_credential_ref(val) {
+                        let resolved =
+                            super::credential_vault::resolve_credential_refs(val, vault_dir);
+                        payload.insert(key, serde_json::Value::String(resolved));
+                    }
+                }
+            }
+        }
+
         // For open action, validate URL
         if let BrowserAction::Open { ref url } = action {
             self.validate_url(url)?;

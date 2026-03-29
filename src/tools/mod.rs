@@ -80,6 +80,7 @@ pub mod traits;
 pub mod url_validation;
 pub mod wasm_module;
 pub mod wasm_tool;
+pub mod credential_vault;
 pub mod web_access_config;
 pub mod web_fetch;
 pub mod perplexity_search;
@@ -380,6 +381,8 @@ pub fn all_tools_with_runtime(
         Arc::new(ProxyConfigTool::new(config.clone(), security.clone())),
         Arc::new(WebAccessConfigTool::new(config.clone(), security.clone())),
         Arc::new(WebSearchConfigTool::new(config.clone(), security.clone())),
+        Arc::new(credential_vault::CredentialStoreTool::new(workspace_dir)),
+        Arc::new(credential_vault::CredentialRecallTool::new(workspace_dir)),
         Arc::new(ManageAuthProfileTool::new(config.clone())),
         Arc::new(CheckProviderQuotaTool::new(config.clone())),
         Arc::new(SwitchProviderTool::new(config.clone())),
