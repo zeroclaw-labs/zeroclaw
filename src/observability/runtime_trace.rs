@@ -1,6 +1,6 @@
 use crate::config::ObservabilityConfig;
 use anyhow::Result;
-use chrono::{Local, Utc};
+use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::{self, OpenOptions};
@@ -126,7 +126,7 @@ impl RuntimeTraceLogger {
         let tmp = self.path.with_extension(format!(
             "tmp.{}.{}",
             std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+            Local::now().timestamp_nanos_opt().unwrap_or_default()
         ));
         fs::write(&tmp, rewritten)?;
 
@@ -367,7 +367,7 @@ mod tests {
         for i in 0..5 {
             let event = RuntimeTraceEvent {
                 id: format!("id-{i}"),
-                timestamp: Utc::now().to_rfc3339(),
+                timestamp: Local::now().to_rfc3339(),
                 event_type: "test".into(),
                 channel: None,
                 provider: None,
@@ -395,7 +395,7 @@ mod tests {
         let target_id = "target-event";
         let event = RuntimeTraceEvent {
             id: target_id.into(),
-            timestamp: Utc::now().to_rfc3339(),
+            timestamp: Local::now().to_rfc3339(),
             event_type: "tool_call_result".into(),
             channel: Some("telegram".into()),
             provider: Some("openrouter".into()),

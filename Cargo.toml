@@ -82,7 +82,7 @@ nanohtml2text = "0.2"
 fantoccini = { version = "0.22.1", optional = true, default-features = false, features = ["rustls-tls"] }
 
 # MQTT client for IoT / SOP event fan-in
-rumqttc = "0.24"
+rumqttc = { version = "0.24", optional = true }
 
 # Tarball extraction for binary updates
 flate2 = "1"
@@ -240,6 +240,7 @@ default = ["observability-prometheus", "skill-creation"]
 channel-nostr = ["dep:nostr-sdk"]
 hardware = ["nusb", "tokio-serial"]
 channel-matrix = ["dep:matrix-sdk"]
+channel-mqtt = ["dep:rumqttc"]
 channel-lark = ["dep:prost"]
 channel-feishu = ["channel-lark"]  # Alias for Feishu users (Lark and Feishu are the same platform)
 observability-prometheus = ["dep:prometheus"]
@@ -276,6 +277,7 @@ ci-all = [
     "channel-nostr",
     "hardware",
     "channel-matrix",
+    "channel-mqtt",
     "channel-lark",
     "observability-prometheus",
     "observability-otel",
