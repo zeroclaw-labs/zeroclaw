@@ -238,7 +238,8 @@ impl Tool for DelegateTool {
          prompt by default; with agentic=true it can iterate with a filtered tool-call loop. \
          Supports background execution (returns a task_id immediately) and parallel execution \
          (runs multiple agents concurrently). Use action='check_result' with a task_id to \
-         retrieve background results."
+         retrieve background results. Use action='await_sessions' with task_ids to block until \
+         multiple background tasks complete."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -249,10 +250,11 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["delegate", "check_result", "list_results", "cancel_task"],
+                    "enum": ["delegate", "check_result", "list_results", "cancel_task", "await_sessions"],
                     "description": "Action to perform. Default: 'delegate'. Use 'check_result' to \
                                     retrieve a background task result, 'list_results' to list all \
-                                    background tasks, 'cancel_task' to cancel a running background task.",
+                                    background tasks, 'cancel_task' to cancel a running background task, \
+                                    'await_sessions' to block until multiple background tasks complete.",
                     "default": "delegate"
                 },
                 "agent": {
@@ -294,6 +296,19 @@ impl Tool for DelegateTool {
                     "type": "string",
                     "description": "Task ID for check_result/cancel_task actions (returned by \
                                     background delegation)."
+                },
+                "task_ids": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Array of task IDs for await_sessions action. Blocks until all \
+                                    specified background tasks complete or timeout is reached."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Timeout in seconds for await_sessions action (default: 300). \
+                                    Returns partial results if timeout is reached.",
+                    "default": 300,
+                    "minimum": 1
                 }
             },
             "required": []
@@ -310,13 +325,14 @@ impl Tool for DelegateTool {
             "check_result" => return self.handle_check_result(&args).await,
             "list_results" => return self.handle_list_results().await,
             "cancel_task" => return self.handle_cancel_task(&args).await,
+            "await_sessions" => return self.handle_await_sessions(&args).await,
             "delegate" => {} // fall through to delegation logic
             other => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Unknown action '{other}'. Use delegate/check_result/list_results/cancel_task."
+                        "Unknown action '{other}'. Use delegate/check_result/list_results/cancel_task/await_sessions."
                     )),
                 });
             }
@@ -1002,6 +1018,147 @@ impl DelegateTool {
             output: format!("Task '{task_id}' cancellation requested."),
             error: None,
         })
+    }
+
+    // ── Await Sessions ─────────────────────────────────────────────
+
+    /// Block until all specified background tasks complete, or until timeout.
+    /// Returns combined results with per-task status. If the timeout is reached
+    /// before all tasks finish, partial results are returned with remaining
+    /// tasks marked as "running" (timed_out).
+    async fn handle_await_sessions(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        let task_ids: Vec<String> = args
+            .get("task_ids")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'task_ids' array for await_sessions"))?
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if task_ids.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("'task_ids' must contain at least one task ID".into()),
+            });
+        }
+
+        // Validate all task IDs upfront
+        for tid in &task_ids {
+            if let Err(e) = Self::validate_task_id(tid) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(e),
+                });
+            }
+        }
+
+        let timeout_secs = args
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300);
+
+        let results_dir = self.results_dir();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let poll_interval = Duration::from_millis(250);
+
+        // Poll until all tasks are terminal or timeout
+        loop {
+            let mut all_terminal = true;
+            let mut results: Vec<serde_json::Value> = Vec::with_capacity(task_ids.len());
+
+            for tid in &task_ids {
+                let result_path = results_dir.join(format!("{tid}.json"));
+                if !result_path.exists() {
+                    all_terminal = false;
+                    results.push(json!({
+                        "task_id": tid,
+                        "status": "not_found",
+                        "error": format!("No result file found for task_id '{tid}'"),
+                    }));
+                    continue;
+                }
+
+                match tokio::fs::read_to_string(&result_path).await {
+                    Ok(content) => match serde_json::from_str::<BackgroundDelegateResult>(&content)
+                    {
+                        Ok(bg) => {
+                            let is_terminal = bg.status != BackgroundTaskStatus::Running;
+                            if !is_terminal {
+                                all_terminal = false;
+                            }
+                            results.push(json!({
+                                "task_id": bg.task_id,
+                                "agent": bg.agent,
+                                "status": bg.status,
+                                "output": bg.output,
+                                "error": bg.error,
+                                "started_at": bg.started_at,
+                                "finished_at": bg.finished_at,
+                            }));
+                        }
+                        Err(e) => {
+                            all_terminal = false;
+                            results.push(json!({
+                                "task_id": tid,
+                                "status": "parse_error",
+                                "error": format!("Failed to parse result: {e}"),
+                            }));
+                        }
+                    },
+                    Err(e) => {
+                        all_terminal = false;
+                        results.push(json!({
+                            "task_id": tid,
+                            "status": "read_error",
+                            "error": format!("Failed to read result file: {e}"),
+                        }));
+                    }
+                }
+            }
+
+            if all_terminal {
+                let all_success = results.iter().all(|r| {
+                    r.get("status")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s == "completed")
+                        .unwrap_or(false)
+                });
+                return Ok(ToolResult {
+                    success: all_success,
+                    output: serde_json::to_string_pretty(&json!({
+                        "completed": true,
+                        "timed_out": false,
+                        "results": results,
+                    }))?,
+                    error: if all_success {
+                        None
+                    } else {
+                        Some("One or more tasks did not complete successfully".into())
+                    },
+                });
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(ToolResult {
+                    success: false,
+                    output: serde_json::to_string_pretty(&json!({
+                        "completed": false,
+                        "timed_out": true,
+                        "timeout_secs": timeout_secs,
+                        "results": results,
+                    }))?,
+                    error: Some(format!(
+                        "Timed out after {timeout_secs}s waiting for {} task(s)",
+                        task_ids.len()
+                    )),
+                });
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Cancel all background tasks (cascade control).
@@ -2937,5 +3094,307 @@ mod tests {
         assert!(result.error.unwrap().contains("Invalid task_id"));
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    // ── Await Sessions tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn await_sessions_missing_task_ids() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool.execute(json!({"action": "await_sessions"})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn await_sessions_empty_task_ids_rejected() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": []
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("at least one task ID"));
+    }
+
+    #[tokio::test]
+    async fn await_sessions_invalid_task_id_rejected() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": ["../../etc/passwd"]
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Invalid task_id"));
+    }
+
+    #[tokio::test]
+    async fn await_sessions_returns_completed_results() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_complete_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let results_dir = workspace.join("delegate_results");
+        std::fs::create_dir_all(&results_dir).unwrap();
+
+        let task_id_1 = uuid::Uuid::new_v4().to_string();
+        let task_id_2 = uuid::Uuid::new_v4().to_string();
+
+        // Write completed results for both tasks
+        for (tid, agent) in [(&task_id_1, "researcher"), (&task_id_2, "coder")] {
+            let result = BackgroundDelegateResult {
+                task_id: tid.clone(),
+                agent: agent.to_string(),
+                status: BackgroundTaskStatus::Completed,
+                output: Some(format!("Result from {agent}")),
+                error: None,
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                finished_at: Some("2026-01-01T00:00:05Z".to_string()),
+            };
+            let path = results_dir.join(format!("{tid}.json"));
+            std::fs::write(&path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+        }
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id_1, task_id_2]
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(result.output.contains("\"completed\": true"));
+        assert!(result.output.contains("\"timed_out\": false"));
+        assert!(result.output.contains("researcher"));
+        assert!(result.output.contains("coder"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_returns_partial_on_failure() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_partial_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let results_dir = workspace.join("delegate_results");
+        std::fs::create_dir_all(&results_dir).unwrap();
+
+        let task_id_ok = uuid::Uuid::new_v4().to_string();
+        let task_id_fail = uuid::Uuid::new_v4().to_string();
+
+        // One completed, one failed
+        let ok_result = BackgroundDelegateResult {
+            task_id: task_id_ok.clone(),
+            agent: "researcher".to_string(),
+            status: BackgroundTaskStatus::Completed,
+            output: Some("Success".to_string()),
+            error: None,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            finished_at: Some("2026-01-01T00:00:05Z".to_string()),
+        };
+        let fail_result = BackgroundDelegateResult {
+            task_id: task_id_fail.clone(),
+            agent: "coder".to_string(),
+            status: BackgroundTaskStatus::Failed,
+            output: None,
+            error: Some("Provider error".to_string()),
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            finished_at: Some("2026-01-01T00:00:03Z".to_string()),
+        };
+
+        std::fs::write(
+            results_dir.join(format!("{task_id_ok}.json")),
+            serde_json::to_vec_pretty(&ok_result).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            results_dir.join(format!("{task_id_fail}.json")),
+            serde_json::to_vec_pretty(&fail_result).unwrap(),
+        )
+        .unwrap();
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id_ok, task_id_fail]
+            }))
+            .await
+            .unwrap();
+
+        // All terminal but not all success
+        assert!(!result.success);
+        assert!(result.output.contains("\"completed\": true"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("did not complete successfully")
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_times_out_with_running_task() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_timeout_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let results_dir = workspace.join("delegate_results");
+        std::fs::create_dir_all(&results_dir).unwrap();
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+
+        // Write a "running" result that never completes
+        let running_result = BackgroundDelegateResult {
+            task_id: task_id.clone(),
+            agent: "researcher".to_string(),
+            status: BackgroundTaskStatus::Running,
+            output: None,
+            error: None,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            finished_at: None,
+        };
+        std::fs::write(
+            results_dir.join(format!("{task_id}.json")),
+            serde_json::to_vec_pretty(&running_result).unwrap(),
+        )
+        .unwrap();
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id],
+                "timeout_secs": 1
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("\"timed_out\": true"));
+        assert!(result.error.unwrap().contains("Timed out"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_nonexistent_task_times_out() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_missing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&workspace).unwrap();
+
+        let fake_id = uuid::Uuid::new_v4().to_string();
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [fake_id],
+                "timeout_secs": 1
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.output.contains("\"timed_out\": true"));
+        assert!(result.output.contains("not_found"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_polls_until_task_completes() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_await_poll_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let results_dir = workspace.join("delegate_results");
+        std::fs::create_dir_all(&results_dir).unwrap();
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+
+        // Write initial "running" status
+        let running = BackgroundDelegateResult {
+            task_id: task_id.clone(),
+            agent: "researcher".to_string(),
+            status: BackgroundTaskStatus::Running,
+            output: None,
+            error: None,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            finished_at: None,
+        };
+        let result_path = results_dir.join(format!("{task_id}.json"));
+        std::fs::write(&result_path, serde_json::to_vec_pretty(&running).unwrap()).unwrap();
+
+        // Spawn a task that completes the result after a delay
+        let task_id_clone = task_id.clone();
+        let path_clone = result_path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let completed = BackgroundDelegateResult {
+                task_id: task_id_clone,
+                agent: "researcher".to_string(),
+                status: BackgroundTaskStatus::Completed,
+                output: Some("Delayed result".to_string()),
+                error: None,
+                started_at: "2026-01-01T00:00:00Z".to_string(),
+                finished_at: Some("2026-01-01T00:00:01Z".to_string()),
+            };
+            let _ =
+                tokio::fs::write(&path_clone, serde_json::to_vec_pretty(&completed).unwrap()).await;
+        });
+
+        let tool = DelegateTool::new(sample_agents(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let result = tool
+            .execute(json!({
+                "action": "await_sessions",
+                "task_ids": [task_id],
+                "timeout_secs": 5
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert!(result.output.contains("\"completed\": true"));
+        assert!(result.output.contains("Delayed result"));
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn await_sessions_schema_present() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["task_ids"].is_object());
+        assert!(schema["properties"]["timeout_secs"].is_object());
+        let action_enum = schema["properties"]["action"]["enum"].as_array().unwrap();
+        assert!(
+            action_enum
+                .iter()
+                .any(|v| v.as_str() == Some("await_sessions"))
+        );
     }
 }
