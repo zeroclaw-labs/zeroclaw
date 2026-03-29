@@ -503,7 +503,7 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            false,
+            config.mention_only,
             LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
@@ -2987,6 +2987,7 @@ mod tests {
             allowed_users: vec!["ou_user1".into(), "ou_user2".into()],
             mention_only: false,
             use_feishu: false,
+            interrupt_on_new_message: false,
             receive_mode: LarkReceiveMode::default(),
             port: None,
             proxy_url: None,
@@ -3010,6 +3011,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             mention_only: false,
             use_feishu: false,
+            interrupt_on_new_message: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
@@ -3045,6 +3047,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             mention_only: false,
             use_feishu: false,
+            interrupt_on_new_message: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
@@ -3070,6 +3073,7 @@ mod tests {
             allowed_users: vec!["*".into()],
             mention_only: false,
             use_feishu: true,
+            interrupt_on_new_message: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
@@ -3092,6 +3096,8 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
+            interrupt_on_new_message: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
@@ -3102,6 +3108,44 @@ mod tests {
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
         assert_eq!(ch.name(), "feishu");
+    }
+
+    #[test]
+    fn feishu_config_defaults_optional_fields() {
+        use crate::config::schema::FeishuConfig;
+        let json = r#"{"app_id":"a","app_secret":"s"}"#;
+        let parsed: FeishuConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.verification_token.is_none());
+        assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.mention_only);
+        assert!(!parsed.interrupt_on_new_message);
+    }
+
+    #[test]
+    fn feishu_from_config_respects_mention_only() {
+        use crate::config::schema::{FeishuConfig, LarkReceiveMode};
+        let cfg = FeishuConfig {
+            app_id: "cli_app".into(),
+            app_secret: "secret".into(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec!["*".into()],
+            mention_only: true,
+            interrupt_on_new_message: false,
+            receive_mode: LarkReceiveMode::Websocket,
+            port: None,
+            proxy_url: None,
+        };
+        let ch = LarkChannel::from_feishu_config(&cfg);
+        assert!(ch.mention_only);
+    }
+
+    #[test]
+    fn lark_config_defaults_interrupt_on_new_message() {
+        use crate::config::schema::LarkConfig;
+        let json = r#"{"app_id":"a","app_secret":"s"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert!(!parsed.interrupt_on_new_message);
     }
 
     #[tokio::test]
@@ -3291,6 +3335,8 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
+            interrupt_on_new_message: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,

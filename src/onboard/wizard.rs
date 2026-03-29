@@ -5406,6 +5406,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     allowed_users,
                     mention_only: existing_lk.map(|l| l.mention_only).unwrap_or(false),
                     use_feishu: is_feishu,
+                    interrupt_on_new_message: existing_lk
+                        .map(|l| l.interrupt_on_new_message)
+                        .unwrap_or(false),
                     receive_mode,
                     port,
                     proxy_url: existing_lk.and_then(|l| l.proxy_url.clone()),
@@ -7824,6 +7827,8 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec!["*".into()],
+            mention_only: false,
+            interrupt_on_new_message: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,

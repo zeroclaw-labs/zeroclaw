@@ -2175,7 +2175,7 @@ fn maybe_inject_channel_delivery_defaults(
 
     if !matches!(
         channel_name,
-        "telegram" | "discord" | "slack" | "mattermost" | "matrix"
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "lark" | "feishu"
     ) {
         return;
     }
@@ -6452,6 +6452,72 @@ mod tests {
                 "mode": "announce",
                 "channel": "telegram",
                 "to": "chat-42",
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_injects_delivery_defaults_for_feishu() {
+        let provider = ScriptedProvider::from_text_responses(vec![
+            r#"<tool_call>
+{"name":"cron_add","arguments":{"job_type":"agent","prompt":"send morning briefing","schedule":{"kind":"every","every_ms":86400000}}}
+</tool_call>"#,
+            "done",
+        ]);
+
+        let recorded_args = Arc::new(Mutex::new(Vec::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingArgsTool::new(
+            "cron_add",
+            Arc::clone(&recorded_args),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("schedule a morning briefing"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "feishu",
+            Some("oc_abc123"),
+            &crate::config::MultimodalConfig::default(),
+            4,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &crate::config::PacingConfig::default(),
+            0,
+            0,
+            None,
+        )
+        .await
+        .expect("cron_add delivery defaults should be injected for feishu");
+
+        assert_eq!(result, "done");
+
+        let recorded = recorded_args
+            .lock()
+            .expect("recorded args lock should be valid");
+        let delivery = recorded[0]["delivery"].clone();
+        assert_eq!(
+            delivery,
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "feishu",
+                "to": "oc_abc123",
             })
         );
     }

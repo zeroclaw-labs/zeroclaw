@@ -324,7 +324,7 @@ const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "zeroclaw.service"
 const OPENRC_STATUS_ARGS: [&str; 2] = ["zeroclaw", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["zeroclaw", "restart"];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 #[allow(clippy::struct_excessive_bools)]
 struct InterruptOnNewMessageConfig {
     telegram: bool,
@@ -332,6 +332,8 @@ struct InterruptOnNewMessageConfig {
     discord: bool,
     mattermost: bool,
     matrix: bool,
+    lark: bool,
+    feishu: bool,
 }
 
 impl InterruptOnNewMessageConfig {
@@ -342,6 +344,8 @@ impl InterruptOnNewMessageConfig {
             "discord" => self.discord,
             "mattermost" => self.mattermost,
             "matrix" => self.matrix,
+            "lark" => self.lark,
+            "feishu" => self.feishu,
             _ => false,
         }
     }
@@ -630,6 +634,14 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
                [VIDEO:<path-or-url>], [VOICE:<path-or-url>]\n\
              - Voice supports .wav, .mp3, .silk formats only. Other audio formats use [DOCUMENT:]\n\
              - Keep normal text outside markers and never wrap markers in code fences.\n",
+        ),
+        "lark" | "feishu" => Some(
+            "When responding on Lark/Feishu:\n\
+             - Use Markdown formatting (bold, italic, code blocks, headings)\n\
+             - Be concise and direct\n\
+             - You are running as a full agent with tool access. Use tools proactively to fulfill requests.\n\
+             - When the user asks you to do something, act on it using your tools rather than just describing what could be done.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.\n",
         ),
         _ => None,
     }
@@ -5411,6 +5423,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .matrix
         .as_ref()
         .is_some_and(|mx| mx.interrupt_on_new_message);
+    let interrupt_on_new_message_lark = config
+        .channels_config
+        .lark
+        .as_ref()
+        .is_some_and(|lk| lk.interrupt_on_new_message);
+    let interrupt_on_new_message_feishu = config
+        .channels_config
+        .feishu
+        .as_ref()
+        .is_some_and(|fs| fs.interrupt_on_new_message);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -5444,6 +5466,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             discord: interrupt_on_new_message_discord,
             mattermost: interrupt_on_new_message_mattermost,
             matrix: interrupt_on_new_message_matrix,
+            lark: interrupt_on_new_message_lark,
+            feishu: interrupt_on_new_message_feishu,
         },
         multimodal: config.multimodal.clone(),
         media_pipeline: config.media_pipeline.clone(),
@@ -5901,13 +5925,7 @@ mod tests {
             api_key: None,
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -6025,13 +6043,7 @@ mod tests {
             api_key: None,
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -6106,13 +6118,7 @@ mod tests {
             api_key: None,
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -6204,13 +6210,7 @@ mod tests {
             api_key: None,
             api_url: None,
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -6807,13 +6807,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
@@ -6897,13 +6891,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
@@ -7001,13 +6989,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -7090,13 +7072,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -7189,13 +7165,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -7309,13 +7279,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -7410,13 +7374,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -7526,13 +7484,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -7627,13 +7579,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -7721,13 +7667,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -7941,13 +7881,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -8055,10 +7989,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
+                ..Default::default()
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8185,11 +8116,8 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
                 slack: true,
-                discord: false,
-                mattermost: false,
-                matrix: false,
+                ..Default::default()
             },
             ack_reactions: true,
             show_tool_calls: true,
@@ -8314,10 +8242,7 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
                 telegram: true,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
+                ..Default::default()
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
@@ -8418,13 +8343,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -8505,13 +8424,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -8592,13 +8505,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -9384,13 +9291,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -9525,13 +9426,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(config.workspace_dir.clone()),
             prompt_config: Arc::new(config.clone()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -9709,13 +9604,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -9825,13 +9714,7 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -10412,13 +10295,7 @@ This is an example JSON object for profile settings."#;
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -10508,13 +10385,7 @@ This is an example JSON object for profile settings."#;
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -10638,13 +10509,7 @@ This is an example JSON object for profile settings."#;
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
@@ -10812,13 +10677,7 @@ This is an example JSON object for profile settings."#;
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -10932,13 +10791,7 @@ This is an example JSON object for profile settings."#;
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -11044,13 +10897,7 @@ This is an example JSON object for profile settings."#;
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -11176,13 +11023,7 @@ This is an example JSON object for profile settings."#;
             workspace_dir: Arc::new(std::env::temp_dir()),
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-            },
+            interrupt_on_new_message: InterruptOnNewMessageConfig::default(),
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
@@ -11317,52 +11158,74 @@ This is an example JSON object for profile settings."#;
     #[test]
     fn interrupt_on_new_message_enabled_for_mattermost_when_true() {
         let cfg = InterruptOnNewMessageConfig {
-            telegram: false,
-            slack: false,
-            discord: false,
             mattermost: true,
-            matrix: false,
+            ..Default::default()
         };
         assert!(cfg.enabled_for_channel("mattermost"));
     }
 
     #[test]
     fn interrupt_on_new_message_disabled_for_mattermost_by_default() {
-        let cfg = InterruptOnNewMessageConfig {
-            telegram: false,
-            slack: false,
-            discord: false,
-            mattermost: false,
-            matrix: false,
-        };
+        let cfg = InterruptOnNewMessageConfig::default();
         assert!(!cfg.enabled_for_channel("mattermost"));
     }
 
     #[test]
     fn interrupt_on_new_message_enabled_for_discord() {
         let cfg = InterruptOnNewMessageConfig {
-            telegram: false,
-            slack: false,
             discord: true,
-            mattermost: false,
-            matrix: false,
+            ..Default::default()
         };
         assert!(cfg.enabled_for_channel("discord"));
     }
 
     #[test]
     fn interrupt_on_new_message_disabled_for_discord_by_default() {
-        let cfg = InterruptOnNewMessageConfig {
-            telegram: false,
-            slack: false,
-            discord: false,
-            mattermost: false,
-            matrix: false,
-        };
+        let cfg = InterruptOnNewMessageConfig::default();
         assert!(!cfg.enabled_for_channel("discord"));
     }
 
     // ── interruption_scope_key tests ──────────────────────────────────────
+
+    #[test]
+    fn interrupt_on_new_message_enabled_for_lark_when_true() {
+        let cfg = InterruptOnNewMessageConfig {
+            lark: true,
+            ..Default::default()
+        };
+        assert!(cfg.enabled_for_channel("lark"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_enabled_for_feishu_when_true() {
+        let cfg = InterruptOnNewMessageConfig {
+            feishu: true,
+            ..Default::default()
+        };
+        assert!(cfg.enabled_for_channel("feishu"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_disabled_for_lark_by_default() {
+        let cfg = InterruptOnNewMessageConfig::default();
+        assert!(!cfg.enabled_for_channel("lark"));
+    }
+
+    #[test]
+    fn interrupt_on_new_message_disabled_for_feishu_by_default() {
+        let cfg = InterruptOnNewMessageConfig::default();
+        assert!(!cfg.enabled_for_channel("feishu"));
+    }
+
+    #[test]
+    fn channel_delivery_instructions_includes_lark() {
+        assert!(channel_delivery_instructions("lark").is_some());
+    }
+
+    #[test]
+    fn channel_delivery_instructions_includes_feishu() {
+        assert!(channel_delivery_instructions("feishu").is_some());
+    }
 
     #[test]
     fn interruption_scope_key_without_scope_id_is_three_component() {
@@ -11450,11 +11313,8 @@ This is an example JSON object for profile settings."#;
             prompt_config: Arc::new(crate::config::Config::default()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
                 slack: true,
-                discord: false,
-                mattermost: false,
-                matrix: false,
+                ..Default::default()
             },
             multimodal: crate::config::MultimodalConfig::default(),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
