@@ -92,6 +92,7 @@ pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod security_ops;
+pub mod send_channel_message;
 pub mod sessions;
 pub mod shell;
 pub mod skill_http;
@@ -189,6 +190,7 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
+pub use send_channel_message::SendChannelMessageTool;
 pub use sessions::{SessionsHistoryTool, SessionsListTool, SessionsSendTool};
 pub use shell::ShellTool;
 #[allow(unused_imports)]
@@ -786,6 +788,12 @@ pub fn all_tools_with_runtime(
     // Poll tool — always registered; uses late-bound channel map handle
     let channel_map_handle: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
     tool_arcs.push(Arc::new(PollTool::new(
+        security.clone(),
+        Arc::clone(&channel_map_handle),
+    )));
+
+    // Direct channel message delivery — always registered; shares the poll channel map handle
+    tool_arcs.push(Arc::new(SendChannelMessageTool::with_channel_map(
         security.clone(),
         Arc::clone(&channel_map_handle),
     )));
