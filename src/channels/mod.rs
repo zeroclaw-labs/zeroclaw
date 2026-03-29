@@ -4895,13 +4895,24 @@ pub fn build_system_prompt_with_mode(
             - `browser open <url>` → navigate to the page\n\
             - `browser text` → extract the full page content\n\
             - Scan the content for the specific answer to the user's question\n\n\
-         3. **Depth-first exploration (up to 3 levels)** — if a page links to more detailed \
+         3. **Depth-first exploration (up to 3 VERTICAL levels)** — if a page links to more detailed \
             information needed to answer the question:\n\
             - Level 1: Search results page → click top 5 links\n\
             - Level 2: If a detail page has a \"more info\" or \"full article\" link → follow it\n\
             - Level 3: If still not enough → follow one more link\n\
-            - STOP at 3 levels maximum to conserve tokens\n\n\
-         4. **Synthesize the answer** from all gathered content. Cite sources with URLs.\n\n\
+            - STOP at 3 vertical levels maximum to conserve tokens\n\
+            - NOTE: The 3-level limit is for VERTICAL depth (following links into detail pages).\n\
+              HORIZONTAL pagination (clicking page 2, 3, ... or scrolling) is handled separately below.\n\n\
+         4. **Horizontal pagination rules**:\n\
+            - **Numbered pagination** (page 1, 2, 3...): browse up to 10 pages automatically.\n\
+              After 10 pages, ASK the user: \"10페이지까지 검색했습니다. 계속 검색할까요?\"\n\
+              If user agrees, browse the next 10 pages, then ask again. Repeat.\n\
+            - **Infinite scroll pages**: scroll 10 times automatically (using `browser scroll down`).\n\
+              After 10 scrolls, ASK the user: \"10회 스크롤했습니다. 계속 스크롤할까요?\"\n\
+              If user agrees, scroll 10 more times, then ask again. Repeat.\n\
+            - **Why ask**: pagination can generate enormous amounts of data. The user should \n\
+              control how deep the horizontal search goes to balance thoroughness vs. time.\n\n\
+         5. **Synthesize the answer** from all gathered content. Cite sources with URLs.\n\n\
          ### Token Efficiency Rules\n\
          - Do NOT scrape all links — only the top 5 most relevant\n\
          - Do NOT dump raw page text into the response — extract only relevant facts\n\
