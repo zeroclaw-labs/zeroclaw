@@ -1,3 +1,4 @@
+use crate::memory::media_cache::{self, MediaCache};
 use crate::providers::traits::ChatMessage;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,7 @@ pub struct PruneStats {
     pub messages_after: usize,
     pub collapsed_pairs: usize,
     pub dropped_messages: usize,
+    pub cached_images: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -89,6 +91,18 @@ fn protected_indices(messages: &[ChatMessage], keep_recent: usize) -> Vec<bool> 
 // ---------------------------------------------------------------------------
 
 pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConfig) -> PruneStats {
+    prune_history_with_cache(messages, config, None)
+}
+
+/// Prune history with optional media cache support.
+///
+/// When a `media_cache` is provided, images in dropped/collapsed messages are
+/// saved to disk and their markers replaced with `[CACHED_IMAGE:{hash}]`.
+pub fn prune_history_with_cache(
+    messages: &mut Vec<ChatMessage>,
+    config: &HistoryPrunerConfig,
+    media_cache: Option<&MediaCache>,
+) -> PruneStats {
     let messages_before = messages.len();
     if !config.enabled || messages.is_empty() {
         return PruneStats {
@@ -96,10 +110,12 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
             messages_after: messages_before,
             collapsed_pairs: 0,
             dropped_messages: 0,
+            cached_images: 0,
         };
     }
 
     let mut collapsed_pairs: usize = 0;
+    let mut cached_images: usize = 0;
 
     // Phase 1 – collapse assistant+tool pairs
     if config.collapse_tool_results {
@@ -111,6 +127,11 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
                 && !protected[i]
                 && !protected[i + 1]
             {
+                // Cache images from the tool result before collapsing.
+                if let Some(cache) = media_cache {
+                    cached_images += cache_images_from_content(&messages[i + 1].content, cache);
+                }
+
                 let tool_content = &messages[i + 1].content;
                 let truncated: String = tool_content.chars().take(100).collect();
                 let summary = format!("[Tool result: {truncated}...]");
@@ -136,6 +157,18 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
             .find(|&(_, &p)| !p)
             .map(|(i, _)| i)
         {
+            // Cache images from the message before dropping it.
+            if let Some(cache) = media_cache {
+                let count = cache_images_from_content(&messages[idx].content, cache);
+                if count > 0 {
+                    // Replace the message content with cached markers before drop,
+                    // in case the caller inspects dropped messages.
+                    messages[idx].content =
+                        media_cache::cache_images_in_message(&messages[idx].content, cache);
+                    cached_images += count;
+                }
+            }
+
             messages.remove(idx);
             dropped_messages += 1;
         } else {
@@ -148,12 +181,44 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
         messages_after: messages.len(),
         collapsed_pairs,
         dropped_messages,
+        cached_images,
     }
+}
+
+/// Count (and cache) data-URI images from a message's content.
+/// Returns the number of images successfully cached.
+fn cache_images_from_content(content: &str, cache: &MediaCache) -> usize {
+    let prefix = "[IMAGE:";
+    let mut count = 0usize;
+    let mut cursor = 0usize;
+
+    while let Some(rel_start) = content[cursor..].find(prefix) {
+        let start = cursor + rel_start;
+        let marker_start = start + prefix.len();
+        let Some(rel_end) = content[marker_start..].find(']') else {
+            break;
+        };
+        let end = marker_start + rel_end;
+        let image_ref = content[marker_start..end].trim();
+
+        if image_ref.starts_with("data:") {
+            if let Some((mime, bytes)) = media_cache::decode_data_uri(image_ref) {
+                if cache.put(&bytes, &mime, None).is_ok() {
+                    count += 1;
+                }
+            }
+        }
+
+        cursor = end + 1;
+    }
+
+    count
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {
@@ -279,5 +344,52 @@ mod tests {
         let stats = prune_history(&mut messages, &config);
         assert_eq!(stats.messages_before, 0);
         assert_eq!(stats.messages_after, 0);
+    }
+
+    #[test]
+    fn prune_caches_images_from_dropped_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cache = MediaCache::new(tmp.path(), 100).unwrap();
+        let png_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        let b64 = STANDARD.encode(&png_bytes);
+        let big_image_msg = format!("{} [IMAGE:data:image/png;base64,{b64}]", "x".repeat(40_000));
+
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", &big_image_msg),
+            msg("assistant", "old"),
+            msg("user", "recent1"),
+            msg("assistant", "recent2"),
+        ];
+
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100,
+            keep_recent: 2,
+            collapse_tool_results: false,
+        };
+
+        let stats = prune_history_with_cache(&mut messages, &config, Some(&cache));
+        assert!(stats.dropped_messages > 0);
+        assert_eq!(stats.cached_images, 1);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn prune_without_cache_reports_zero_cached() {
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", &"x".repeat(40_000)),
+            msg("user", "recent"),
+            msg("assistant", "recent"),
+        ];
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100,
+            keep_recent: 2,
+            collapse_tool_results: false,
+        };
+        let stats = prune_history(&mut messages, &config);
+        assert_eq!(stats.cached_images, 0);
     }
 }

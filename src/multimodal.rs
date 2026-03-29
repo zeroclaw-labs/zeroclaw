@@ -1,4 +1,5 @@
 use crate::config::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
+use crate::memory::media_cache::{self, MediaCache};
 use crate::providers::ChatMessage;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
@@ -174,6 +175,36 @@ pub async fn prepare_messages_for_provider(
         messages: normalized_messages,
         contains_images: true,
     })
+}
+
+/// Prepare messages for the provider, restoring any cached images first.
+///
+/// This is the cache-aware entry point: any `[CACHED_IMAGE:{hash}]` markers
+/// are resolved back to `[IMAGE:data:...]` before standard preparation runs.
+pub async fn prepare_messages_with_cache(
+    messages: &[ChatMessage],
+    config: &MultimodalConfig,
+    media_cache: Option<&MediaCache>,
+) -> anyhow::Result<PreparedMessages> {
+    let resolved: Vec<ChatMessage> = if let Some(cache) = media_cache {
+        messages
+            .iter()
+            .map(|m| {
+                if m.content.contains(media_cache::CACHED_IMAGE_MARKER_PREFIX) {
+                    ChatMessage {
+                        role: m.role.clone(),
+                        content: media_cache::restore_cached_images(&m.content, cache),
+                    }
+                } else {
+                    m.clone()
+                }
+            })
+            .collect()
+    } else {
+        messages.to_vec()
+    };
+
+    prepare_messages_for_provider(&resolved, config).await
 }
 
 /// Strip image markers from older messages (oldest first) until total image

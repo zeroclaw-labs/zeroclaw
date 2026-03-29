@@ -4907,6 +4907,14 @@ pub struct MemoryConfig {
     #[serde(default = "default_response_cache_hot_entries")]
     pub response_cache_hot_entries: usize,
 
+    // ── Media Cache (preserve pruned images on disk) ──────────
+    /// Enable disk-based media cache for images pruned from history. Default: false.
+    #[serde(default)]
+    pub media_cache_enabled: Option<bool>,
+    /// Maximum media cache size in MB before LRU eviction. Default: 100.
+    #[serde(default)]
+    pub media_cache_max_size_mb: Option<u64>,
+
     // ── Memory Snapshot (soul backup to Markdown) ─────────────
     /// Enable periodic export of core memories to MEMORY_SNAPSHOT.md
     #[serde(default)]
@@ -5073,6 +5081,8 @@ impl Default for MemoryConfig {
             response_cache_ttl_minutes: default_response_cache_ttl(),
             response_cache_max_entries: default_response_cache_max(),
             response_cache_hot_entries: default_response_cache_hot_entries(),
+            media_cache_enabled: None,
+            media_cache_max_size_mb: None,
             snapshot_enabled: false,
             snapshot_on_hygiene: false,
             auto_hydrate: true,

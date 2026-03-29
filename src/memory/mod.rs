@@ -11,6 +11,7 @@ pub mod importance;
 pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
+pub mod media_cache;
 pub mod namespaced;
 pub mod none;
 pub mod policy;
@@ -34,6 +35,7 @@ pub use backend::{
 };
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
+pub use media_cache::MediaCache;
 pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
@@ -402,6 +404,32 @@ pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Opt
         }
         Err(e) => {
             tracing::warn!("Response cache disabled due to error: {e}");
+            None
+        }
+    }
+}
+
+/// Factory: create an optional media cache from config.
+pub fn create_media_cache(config: &MemoryConfig, workspace_dir: &Path) -> Option<MediaCache> {
+    if !config.media_cache_enabled.unwrap_or(false) {
+        return None;
+    }
+
+    let max_mb = config.media_cache_max_size_mb.unwrap_or(100);
+    match MediaCache::new(workspace_dir, max_mb) {
+        Ok(cache) => {
+            tracing::info!(
+                "Media cache enabled (max: {} MB, dir: {})",
+                max_mb,
+                workspace_dir
+                    .join(".zeroclaw")
+                    .join("media_cache")
+                    .display()
+            );
+            Some(cache)
+        }
+        Err(e) => {
+            tracing::warn!("Media cache disabled due to error: {e}");
             None
         }
     }
