@@ -1,6 +1,6 @@
-# ZeroClaw Repository Map
+# Hrafn Repository Map
 
-ZeroClaw is a Rust-first autonomous agent runtime. It receives messages from messaging platforms, routes them through an LLM, executes tool calls, persists memory, and returns responses. It can also control hardware peripherals and run as a long-lived daemon.
+Hrafn is a Rust-first autonomous agent runtime. It receives messages from messaging platforms, routes them through an LLM, executes tool calls, persists memory, and returns responses. It can also control hardware peripherals and run as a long-lived daemon.
 
 ## Runtime Flow
 
@@ -38,7 +38,7 @@ User message (Telegram/Discord/Slack/...)
 ## Top-Level Layout
 
 ```
-zeroclaw/
+hrafn/
 ├── src/                  # Rust source (the runtime)
 ├── crates/robot-kit/     # Separate crate for hardware robot kit
 ├── tests/                # Integration/E2E tests
@@ -66,7 +66,7 @@ zeroclaw/
 
 | File | Lines | Role |
 |---|---|---|
-| `main.rs` | 1,977 | CLI entrypoint. Clap parser, command dispatch. All `zeroclaw <subcommand>` routing lives here. |
+| `main.rs` | 1,977 | CLI entrypoint. Clap parser, command dispatch. All `hrafn <subcommand>` routing lives here. |
 | `lib.rs` | 436 | Module declarations, visibility (`pub` vs `pub(crate)`), CLI command enums (`ServiceCommands`, `ChannelCommands`, `SkillCommands`, etc.) shared between lib and binary. |
 
 ### Core Runtime
@@ -150,7 +150,7 @@ Sandboxing: `bubblewrap.rs`, `firejail.rs`, `landlock.rs`, `docker.rs`, `detect.
 
 | Module | Key Files | Role |
 |---|---|---|
-| `skills/` | `mod.rs` (1.5k), `audit.rs` | **User/community-authored capabilities.** Loaded from `~/.zeroclaw/workspace/skills/<name>/SKILL.md`. CLI: list, install, audit, remove. Optional community sync from open-skills repo. |
+| `skills/` | `mod.rs` (1.5k), `audit.rs` | **User/community-authored capabilities.** Loaded from `~/.hrafn/workspace/skills/<name>/SKILL.md`. CLI: list, install, audit, remove. Optional community sync from open-skills repo. |
 | `skillforge/` | `scout.rs`, `evaluate.rs`, `integrate.rs`, `mod.rs` | **Skill discovery and evaluation.** Scouts for skills, evaluates quality/fitness, integrates into the runtime. |
 
 ### SOP (Standard Operating Procedures)
@@ -230,7 +230,7 @@ Traits never import concrete implementations.
 ## CLI Command Tree
 
 ```
-zeroclaw
+hrafn
 ├── onboard [--force] [--reinit] [--channels-only]     # First-run setup
 ├── agent [-m "msg"] [-p provider]        # Start agent loop
 ├── daemon [-p port]                      # Full runtime (gateway+channels+cron+heartbeat)

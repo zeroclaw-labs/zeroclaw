@@ -1,4 +1,4 @@
-# ZeroClaw Project Triage Snapshot (2026-02-18)
+# Hrafn Project Triage Snapshot (2026-02-18)
 
 As-of date: **February 18, 2026**.
 
@@ -6,7 +6,7 @@ This snapshot captures open PR/issue signals to guide docs and information-archi
 
 ## Data Source
 
-Collected via GitHub CLI against `zeroclaw-labs/zeroclaw`:
+Collected via GitHub CLI against the upstream `zeroclaw-labs/zeroclaw` repo:
 
 - `gh repo view ...`
 - `gh pr list --state open --limit 500 ...`

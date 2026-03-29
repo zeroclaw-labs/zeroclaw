@@ -1,4 +1,4 @@
-# AGENTS.md — ZeroClaw
+# AGENTS.md — Hrafn
 
 Cross-tool agent instructions for any AI coding assistant working on this repository.
 
@@ -20,7 +20,7 @@ Docs-only changes: run markdown lint and link-integrity checks. If touching boot
 
 ## Project Snapshot
 
-ZeroClaw is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
+Hrafn is a Rust-first autonomous agent runtime optimized for performance, efficiency, stability, extensibility, sustainability, and security.
 
 Core architecture is trait-driven and modular. Extend by implementing traits and registering in factory modules.
 

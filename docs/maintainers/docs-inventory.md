@@ -1,4 +1,4 @@
-# ZeroClaw Documentation Inventory
+# Hrafn Documentation Inventory
 
 This inventory classifies docs by intent so readers can quickly distinguish runtime-contract guides from design proposals.
 

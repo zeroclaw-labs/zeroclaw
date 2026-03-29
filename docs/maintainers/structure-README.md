@@ -1,4 +1,4 @@
-# ZeroClaw Docs Structure Map
+# Hrafn Docs Structure Map
 
 This page defines the documentation structure across three axes:
 
