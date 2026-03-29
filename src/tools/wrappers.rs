@@ -27,6 +27,9 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+/// Type alias to reduce complexity of the optional path-extraction closure.
+type ValueExtractor = Box<dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync>;
+
 // ── RateLimitedTool ───────────────────────────────────────────────────────────
 
 /// Wraps any [`Tool`] and enforces the [`SecurityPolicy`] rate limit.
@@ -96,7 +99,7 @@ pub struct PathGuardedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,
     /// Optional override: extract a path string from the args JSON.
-    extractor: Option<Box<dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync>>,
+    extractor: Option<ValueExtractor>,
 }
 
 impl<T: Tool> PathGuardedTool<T> {
@@ -117,7 +120,7 @@ impl<T: Tool> PathGuardedTool<T> {
         self
     }
 
-    fn extract_path_string<'a>(&self, args: &'a serde_json::Value) -> Option<String> {
+    fn extract_path_string(&self, args: &serde_json::Value) -> Option<String> {
         if let Some(ref f) = self.extractor {
             return f(args);
         }
