@@ -4537,15 +4537,26 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                             style("The 'whatsapp-web' feature is not compiled in. WhatsApp Web will not work at runtime.").yellow()
                         );
                         println!(
-                            "  {} Rebuild with: {}",
+                            "  {} Build/run with: {}",
                             style("→").dim(),
                             style("cargo build --features whatsapp-web").white().bold()
+                        );
+                        println!(
+                            "  {} If installed to PATH, reinstall with: {}",
+                            style("→").dim(),
+                            style(
+                                "cargo install --path . --force --locked --features whatsapp-web"
+                            )
+                            .white()
+                            .bold()
                         );
                         println!();
                     }
 
                     println!("  {}", style("Mode: WhatsApp Web").dim());
-                    print_bullet("1. Build with --features whatsapp-web");
+                    print_bullet(
+                        "1. Build/run with --features whatsapp-web; if installed globally, reinstall with --features whatsapp-web",
+                    );
                     print_bullet(
                         "2. Start channel/daemon and scan QR in WhatsApp > Linked Devices",
                     );

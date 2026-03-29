@@ -4638,12 +4638,15 @@ fn collect_configured_channels(
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
                     tracing::warn!(
-                        "WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web"
+                        "WhatsApp Web backend requires 'whatsapp-web' feature. Build/run with --features whatsapp-web"
                     );
                     eprintln!(
                         "  ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in."
                     );
-                    eprintln!("    Rebuild with: cargo build --features whatsapp-web");
+                    eprintln!("    Build/run with: cargo build --features whatsapp-web");
+                    eprintln!(
+                        "    If installed to PATH, reinstall with: cargo install --path . --force --locked --features whatsapp-web"
+                    );
                 }
             }
             _ => {

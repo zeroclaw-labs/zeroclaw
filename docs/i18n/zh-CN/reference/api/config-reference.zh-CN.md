@@ -575,6 +575,7 @@ WhatsApp Web 模式（原生客户端）：
 注意事项：
 
 - WhatsApp Web 需要构建标志 `whatsapp-web`。
+- 如果安装到 PATH，请使用 `cargo install --path . --force --locked --features whatsapp-web`。
 - 如果同时存在云和 Web 字段，云模式优先以保持向后兼容性。
 
 ### `[channels_config.linq]`

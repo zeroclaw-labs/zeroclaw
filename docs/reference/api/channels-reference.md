@@ -282,7 +282,8 @@ interrupt_on_new_message = false   # optional: cancel in-flight same-sender same
 
 Notes:
 
-- Build with `cargo build --features whatsapp-web` (or equivalent run command).
+- Build/run with `--features whatsapp-web`.
+- If installed to PATH, use `cargo install --path . --force --locked --features whatsapp-web`.
 - Keep `session_path` on persistent storage to avoid relinking after restart.
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
 - `mention_only = true` makes the bot ignore group messages unless the bot is @-mentioned. Direct messages are always processed. Bot identity is seeded from `pair_phone` and updated from the device store on connect.

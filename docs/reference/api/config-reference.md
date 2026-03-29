@@ -736,6 +736,7 @@ WhatsApp Web mode (native client):
 Notes:
 
 - WhatsApp Web requires build flag `whatsapp-web`.
+- If installed to PATH, use `cargo install --path . --force --locked --features whatsapp-web`.
 - If both Cloud and Web fields are present, Cloud mode wins for backward compatibility.
 
 ### `[channels_config.linq]`
