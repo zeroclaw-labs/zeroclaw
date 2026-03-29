@@ -2009,6 +2009,44 @@ fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> 
     format!("[Used tools: {}]", tool_names.join(", "))
 }
 
+/// Build a fallback notice string to append to the delivered response, or `None`
+/// if no notice should be shown.
+///
+/// When `fallback_notice_enabled` is `true`, any provider *or* model change
+/// produces a compact, user-visible footer.  Otherwise the legacy behaviour
+/// applies: only cross-family provider changes are surfaced.
+fn build_fallback_notice(
+    fb: &crate::providers::reliable::ProviderFallbackInfo,
+    fallback_notice_enabled: bool,
+) -> Option<String> {
+    let provider_changed = fb.actual_provider != fb.requested_provider;
+    let model_changed = fb.actual_model != fb.requested_model;
+
+    if fallback_notice_enabled && (provider_changed || model_changed) {
+        Some(format!(
+            "\n\n---\n_\u{26A1} Fallback: responded via {}/{} (requested {}/{})_",
+            fb.actual_provider, fb.actual_model, fb.requested_provider, fb.requested_model,
+        ))
+    } else if !fallback_notice_enabled {
+        // Legacy: only cross-family provider changes.
+        let req_base = fb.requested_provider.split(':').next().unwrap_or("");
+        let act_base = fb.actual_provider.split(':').next().unwrap_or("");
+        let same_family = req_base == act_base
+            || req_base.starts_with(act_base)
+            || act_base.starts_with(req_base);
+        if same_family {
+            None
+        } else {
+            Some(format!(
+                "\n\n---\n\u{26A1} `{}` unavailable \u{2014} response from **{}** (`{}`)\nSwitch model: /models",
+                fb.requested_provider, fb.actual_provider, fb.actual_model,
+            ))
+        }
+    } else {
+        None
+    }
+}
+
 fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
@@ -3117,22 +3155,11 @@ async fn process_channel_message(
                 sanitized_response
             };
 
-            // Append a footer when the response was served by a different provider family.
-            // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
+            // Append a footer when the response was served by a different provider/model.
             if let Some(fb) = fallback_info.as_ref() {
-                let req_base = fb.requested_provider.split(':').next().unwrap_or("");
-                let act_base = fb.actual_provider.split(':').next().unwrap_or("");
-                let same_family = req_base == act_base
-                    || req_base.starts_with(act_base)
-                    || act_base.starts_with(req_base);
-                if !same_family {
-                    use std::fmt::Write as _;
-                    write!(
-                        delivered_response,
-                        "\n\n---\n\u{26A1} `{}` unavailable \u{2014} response from **{}** (`{}`)\nSwitch model: /models",
-                        fb.requested_provider, fb.actual_provider, fb.actual_model,
-                    )
-                    .ok();
+                let notice_enabled = ctx.reliability.fallback_notice.unwrap_or(false);
+                if let Some(notice) = build_fallback_notice(fb, notice_enabled) {
+                    delivered_response.push_str(&notice);
                 }
             }
 
@@ -11623,5 +11650,89 @@ This is an example JSON object for profile settings."#;
     fn default_keep_tool_context_turns_is_two() {
         let config = crate::config::schema::AgentConfig::default();
         assert_eq!(config.keep_tool_context_turns, 2);
+    }
+
+    // ── Fallback notice tests ───────────────────────────────────────
+
+    mod fallback_notice_tests {
+        use super::super::build_fallback_notice;
+        use crate::providers::reliable::ProviderFallbackInfo;
+
+        fn fb(
+            req_provider: &str,
+            req_model: &str,
+            act_provider: &str,
+            act_model: &str,
+        ) -> ProviderFallbackInfo {
+            ProviderFallbackInfo {
+                requested_provider: req_provider.to_string(),
+                requested_model: req_model.to_string(),
+                actual_provider: act_provider.to_string(),
+                actual_model: act_model.to_string(),
+            }
+        }
+
+        #[test]
+        fn enabled_shows_notice_on_provider_change() {
+            let info = fb("minimax", "m2.7", "anthropic", "claude-sonnet-4-20250514");
+            let notice = build_fallback_notice(&info, true);
+            assert!(notice.is_some());
+            let text = notice.unwrap();
+            assert!(text.contains("Fallback: responded via anthropic/claude-sonnet-4-20250514"));
+            assert!(text.contains("requested minimax/m2.7"));
+        }
+
+        #[test]
+        fn enabled_shows_notice_on_model_change_same_provider() {
+            let info = fb(
+                "anthropic",
+                "claude-opus-4-20250514",
+                "anthropic",
+                "claude-sonnet-4-20250514",
+            );
+            let notice = build_fallback_notice(&info, true);
+            assert!(notice.is_some());
+            let text = notice.unwrap();
+            assert!(text.contains("responded via anthropic/claude-sonnet-4-20250514"));
+            assert!(text.contains("requested anthropic/claude-opus-4-20250514"));
+        }
+
+        #[test]
+        fn enabled_no_notice_when_same_provider_and_model() {
+            let info = fb("minimax", "m2.7", "minimax", "m2.7");
+            let notice = build_fallback_notice(&info, true);
+            assert!(notice.is_none());
+        }
+
+        #[test]
+        fn disabled_no_notice_for_intra_family_fallback() {
+            let info = fb("minimax", "m2.7", "minimax-cn", "m2.7");
+            let notice = build_fallback_notice(&info, false);
+            assert!(notice.is_none(), "intra-family should be suppressed");
+        }
+
+        #[test]
+        fn disabled_shows_legacy_notice_for_cross_family() {
+            let info = fb("minimax", "m2.7", "anthropic", "claude-sonnet-4-20250514");
+            let notice = build_fallback_notice(&info, false);
+            assert!(notice.is_some());
+            let text = notice.unwrap();
+            assert!(text.contains("unavailable"));
+            assert!(text.contains("Switch model: /models"));
+        }
+
+        #[test]
+        fn config_default_is_none() {
+            let config = crate::config::schema::ReliabilityConfig::default();
+            assert!(config.fallback_notice.is_none());
+        }
+
+        #[test]
+        fn enabled_intra_family_different_model_shows_notice() {
+            // With notice enabled, even intra-family model changes should show.
+            let info = fb("minimax", "m2.7", "minimax-cn", "m2.5");
+            let notice = build_fallback_notice(&info, true);
+            assert!(notice.is_some());
+        }
     }
 }

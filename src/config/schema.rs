@@ -5529,6 +5529,11 @@ pub struct ReliabilityConfig {
     /// Max retries for cron job execution attempts.
     #[serde(default = "default_scheduler_retries")]
     pub scheduler_retries: u32,
+    /// When `true`, append a compact notice to the assistant's response whenever
+    /// the request was served by a different provider or model than originally
+    /// requested (i.e. any fallback, not just cross-family).  Defaults to `false`.
+    #[serde(default)]
+    pub fallback_notice: Option<bool>,
 }
 
 fn default_provider_retries() -> u32 {
@@ -5567,6 +5572,7 @@ impl Default for ReliabilityConfig {
             channel_max_backoff_secs: default_channel_backoff_max_secs(),
             scheduler_poll_secs: default_scheduler_poll_secs(),
             scheduler_retries: default_scheduler_retries(),
+            fallback_notice: None,
         }
     }
 }
