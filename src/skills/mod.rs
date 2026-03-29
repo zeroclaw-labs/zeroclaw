@@ -17,7 +17,7 @@ pub mod creator;
 pub mod improver;
 pub mod testing;
 
-const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
+const DEFAULT_OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
 
@@ -124,7 +124,7 @@ fn warn_skipped_skill(path: &Path, summary: &str, allow_scripts: bool) {
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None, None)
+    load_skills_with_open_skills_config(workspace_dir, None, None, None, None, None)
 }
 
 /// Load skills using runtime config values (preferred at runtime).
@@ -134,6 +134,8 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
         Some(config.skills.allow_scripts),
+        config.skills.open_skills_repo.as_deref(),
+        config.skills.open_skills_repo_pinned_commit.as_deref(),
     )
 }
 
@@ -148,6 +150,8 @@ pub fn load_skills_with_open_skills_settings(
         Some(open_skills_enabled),
         open_skills_dir,
         None,
+        None,
+        None,
     )
 }
 
@@ -156,13 +160,24 @@ fn load_skills_with_open_skills_config(
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
     config_allow_scripts: Option<bool>,
+    config_repo_url: Option<&str>,
+    config_pinned_commit: Option<&str>,
 ) -> Vec<Skill> {
     let mut skills = Vec::new();
     let allow_scripts = config_allow_scripts.unwrap_or(false);
 
-    if let Some(open_skills_dir) =
-        ensure_open_skills_repo(config_open_skills_enabled, config_open_skills_dir)
-    {
+    if let Some(open_skills_dir) = ensure_open_skills_repo(
+        config_open_skills_enabled,
+        config_open_skills_dir,
+        config_repo_url,
+        config_pinned_commit,
+    ) {
+        if allow_scripts {
+            tracing::warn!(
+                "open_skills_enabled + allow_scripts = true: \
+                 third-party skills can execute arbitrary commands"
+            );
+        }
         skills.extend(load_open_skills(&open_skills_dir, allow_scripts));
     }
 
@@ -420,19 +435,34 @@ fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathB
     )
 }
 
+fn resolve_open_skills_repo_url(config_repo_url: Option<&str>) -> &str {
+    config_repo_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_OPEN_SKILLS_REPO_URL)
+}
+
 fn ensure_open_skills_repo(
     config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
+    config_repo_url: Option<&str>,
+    config_pinned_commit: Option<&str>,
 ) -> Option<PathBuf> {
     if !open_skills_enabled(config_open_skills_enabled) {
         return None;
     }
 
     let repo_dir = resolve_open_skills_dir(config_open_skills_dir)?;
+    let repo_url = resolve_open_skills_repo_url(config_repo_url);
 
     if !repo_dir.exists() {
-        if !clone_open_skills_repo(&repo_dir) {
+        if !clone_open_skills_repo(&repo_dir, repo_url) {
             return None;
+        }
+        if let Some(commit) = config_pinned_commit {
+            if !checkout_pinned_commit(&repo_dir, commit) {
+                return None;
+            }
         }
         let _ = mark_open_skills_synced(&repo_dir);
         return Some(repo_dir);
@@ -440,6 +470,15 @@ fn ensure_open_skills_repo(
 
     if should_sync_open_skills(&repo_dir) {
         if pull_open_skills_repo(&repo_dir) {
+            if let Some(commit) = config_pinned_commit {
+                if !checkout_pinned_commit(&repo_dir, commit) {
+                    tracing::warn!(
+                        "open-skills pinned commit checkout failed; \
+                         using local copy from {}",
+                        repo_dir.display()
+                    );
+                }
+            }
             let _ = mark_open_skills_synced(&repo_dir);
         } else {
             tracing::warn!(
@@ -452,7 +491,7 @@ fn ensure_open_skills_repo(
     Some(repo_dir)
 }
 
-fn clone_open_skills_repo(repo_dir: &Path) -> bool {
+fn clone_open_skills_repo(repo_dir: &Path, repo_url: &str) -> bool {
     if let Some(parent) = repo_dir.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
             tracing::warn!(
@@ -463,8 +502,10 @@ fn clone_open_skills_repo(repo_dir: &Path) -> bool {
         }
     }
 
+    tracing::info!("cloning open-skills from {repo_url}");
+
     let output = Command::new("git")
-        .args(["clone", "--depth", "1", OPEN_SKILLS_REPO_URL])
+        .args(["clone", "--depth", "1", repo_url])
         .arg(repo_dir)
         .output();
 
@@ -480,6 +521,49 @@ fn clone_open_skills_repo(repo_dir: &Path) -> bool {
         }
         Err(err) => {
             tracing::warn!("failed to run git clone for open-skills: {err}");
+            false
+        }
+    }
+}
+
+/// Checkout a specific pinned commit for supply-chain safety.
+fn checkout_pinned_commit(repo_dir: &Path, commit: &str) -> bool {
+    // Fetch the specific commit (shallow clones may not include it).
+    let fetch = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["fetch", "origin", commit, "--depth", "1"])
+        .output();
+
+    if let Ok(result) = &fetch {
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to fetch pinned commit {commit}: {stderr}");
+            return false;
+        }
+    } else if let Err(err) = fetch {
+        tracing::warn!("failed to run git fetch for pinned commit: {err}");
+        return false;
+    }
+
+    let checkout = Command::new("git")
+        .arg("-C")
+        .arg(repo_dir)
+        .args(["checkout", commit])
+        .output();
+
+    match checkout {
+        Ok(result) if result.status.success() => {
+            tracing::info!("open-skills pinned to commit {commit}");
+            true
+        }
+        Ok(result) => {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            tracing::warn!("failed to checkout pinned commit {commit}: {stderr}");
+            false
+        }
+        Err(err) => {
+            tracing::warn!("failed to run git checkout for pinned commit: {err}");
             false
         }
     }
@@ -2184,6 +2268,69 @@ command = "obsidian search {{query}}"
         let skills = load_skills_from_directory(&skills_dir, true);
         assert_eq!(skills.len(), 1, "skill should load when allow_scripts=true");
         assert_eq!(skills[0].name, "obsidian");
+    }
+
+    #[test]
+    fn resolve_open_skills_repo_url_uses_config_or_default() {
+        assert_eq!(
+            resolve_open_skills_repo_url(None),
+            DEFAULT_OPEN_SKILLS_REPO_URL
+        );
+        assert_eq!(
+            resolve_open_skills_repo_url(Some("")),
+            DEFAULT_OPEN_SKILLS_REPO_URL
+        );
+        assert_eq!(
+            resolve_open_skills_repo_url(Some("   ")),
+            DEFAULT_OPEN_SKILLS_REPO_URL
+        );
+        assert_eq!(
+            resolve_open_skills_repo_url(Some("https://github.com/my-org/my-skills")),
+            "https://github.com/my-org/my-skills"
+        );
+        assert_eq!(
+            resolve_open_skills_repo_url(Some("  https://example.com/skills  ")),
+            "https://example.com/skills"
+        );
+    }
+
+    #[test]
+    fn config_new_fields_default_to_none() {
+        let config = crate::config::Config::default();
+        assert!(config.skills.open_skills_repo.is_none());
+        assert!(config.skills.open_skills_repo_pinned_commit.is_none());
+    }
+
+    #[test]
+    fn load_skills_with_config_passes_repo_url_and_pinned_commit() {
+        let _env_guard = open_skills_env_lock().lock().unwrap();
+        let _enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_ENABLED");
+        let _dir_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_DIR");
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_dir = dir.path().join("workspace");
+        fs::create_dir_all(workspace_dir.join("skills")).unwrap();
+
+        let open_skills_dir = dir.path().join("open-skills-local");
+        fs::create_dir_all(open_skills_dir.join("skills/my_skill")).unwrap();
+        fs::write(
+            open_skills_dir.join("skills/my_skill/SKILL.md"),
+            "# My Skill\nA custom skill.\n",
+        )
+        .unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.workspace_dir = workspace_dir.clone();
+        config.skills.open_skills_enabled = true;
+        config.skills.open_skills_dir = Some(open_skills_dir.to_string_lossy().to_string());
+        config.skills.open_skills_repo =
+            Some("https://github.com/custom-org/custom-skills".to_string());
+        config.skills.open_skills_repo_pinned_commit = Some("abc123def456".to_string());
+
+        // Should still load from the local dir (no network needed).
+        let skills = load_skills_with_config(&workspace_dir, &config);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "my_skill");
     }
 }
 

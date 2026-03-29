@@ -1544,6 +1544,20 @@ pub struct SkillsConfig {
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
+    /// Git URL for the open-skills repository.
+    /// Default: `https://github.com/besoeasy/open-skills`.
+    ///
+    /// **Security note**: when `open_skills_enabled = true` the repository at this URL is cloned
+    /// and its contents are loaded as skills.  Combined with `allow_scripts = true` this grants
+    /// arbitrary code-execution to the repository owner.  Pin to a trusted commit hash via
+    /// `open_skills_repo_pinned_commit` for reproducibility and supply-chain safety.
+    #[serde(default)]
+    pub open_skills_repo: Option<String>,
+    /// Optional commit hash to pin the open-skills checkout to.
+    /// When set, the repository is checked out at this exact commit after cloning or pulling,
+    /// ensuring reproducible and tamper-resistant skill loading.
+    #[serde(default)]
+    pub open_skills_repo_pinned_commit: Option<String>,
     /// Allow script-like files in skills (`.sh`, `.bash`, `.ps1`, shebang shell files).
     /// Default: `false` (secure by default).
     #[serde(default)]
@@ -10189,6 +10203,22 @@ impl Config {
             let trimmed = path.trim();
             if !trimmed.is_empty() {
                 self.skills.open_skills_dir = Some(trimmed.to_string());
+            }
+        }
+
+        // Open-skills repo URL override: ZEROCLAW_OPEN_SKILLS_REPO
+        if let Ok(url) = std::env::var("ZEROCLAW_OPEN_SKILLS_REPO") {
+            let trimmed = url.trim();
+            if !trimmed.is_empty() {
+                self.skills.open_skills_repo = Some(trimmed.to_string());
+            }
+        }
+
+        // Open-skills pinned commit override: ZEROCLAW_OPEN_SKILLS_PINNED_COMMIT
+        if let Ok(hash) = std::env::var("ZEROCLAW_OPEN_SKILLS_PINNED_COMMIT") {
+            let trimmed = hash.trim();
+            if !trimmed.is_empty() {
+                self.skills.open_skills_repo_pinned_commit = Some(trimmed.to_string());
             }
         }
 
