@@ -543,7 +543,7 @@ function SessionsTab() {
                       className="text-sm font-medium font-mono truncate"
                       style={{ color: "var(--pc-text-primary)" }}
                     >
-                      {session.id.slice(0, 8)}...
+                      {session.id?.slice(0, 8) ?? session.id}...
                     </span>
                     <span
                       className="text-[10px] uppercase font-medium px-2 py-0.5 rounded-full"
