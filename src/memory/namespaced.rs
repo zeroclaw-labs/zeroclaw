@@ -182,10 +182,8 @@ impl Memory for NamespacedMemory {
         let entries = self.inner.list(None, Some(session_id)).await?;
         let mut count = 0;
         for entry in entries {
-            if entry.namespace == self.namespace {
-                if self.inner.forget(&entry.key).await? {
-                    count += 1;
-                }
+            if entry.namespace == self.namespace && self.inner.forget(&entry.key).await? {
+                count += 1;
             }
         }
         Ok(count)
