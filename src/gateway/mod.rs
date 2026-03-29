@@ -1307,13 +1307,21 @@ async fn run_gateway_chat_simple(state: &AppState, message: &str) -> anyhow::Res
 }
 
 /// Full-featured chat with tools for channel handlers (WhatsApp, Linq, Nextcloud Talk).
+/// Falls back to the simple provider-only path when the full agent loop cannot
+/// be initialised (e.g. missing runtime or memory backend in tests).
 async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<String> {
     let config = state.config.lock().clone();
-    Box::pin(crate::agent::process_message(config, message, session_id)).await
+    match Box::pin(crate::agent::process_message(config, message, session_id)).await {
+        Ok(reply) => Ok(reply),
+        Err(e) => {
+            tracing::warn!("Full agent loop failed, falling back to simple chat: {e:#}");
+            run_gateway_chat_simple(state, message).await
+        }
+    }
 }
 
 /// Webhook request body

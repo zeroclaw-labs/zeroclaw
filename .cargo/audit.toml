@@ -9,4 +9,6 @@ ignore = [
     "RUSTSEC-2026-0021",  # WASI http fields panic
     # instant crate unmaintained — transitive dep via nostr; no upstream fix
     "RUSTSEC-2024-0384",
+    # proc-macro-error unmaintained — transitive dep via gtk3-macros/glib-macros (tauri); no upstream fix
+    "RUSTSEC-2024-0370",
 ]
