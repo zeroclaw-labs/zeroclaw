@@ -82,6 +82,8 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 
 // ── PathGuardedTool ───────────────────────────────────────────────────────────
 
+type PathExtractor = Box<dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync>;
+
 /// Wraps any [`Tool`] and blocks calls whose arguments contain a forbidden path.
 ///
 /// Replaces the `forbidden_path_argument()` guard blocks previously inlined in
@@ -96,7 +98,7 @@ pub struct PathGuardedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,
     /// Optional override: extract a path string from the args JSON.
-    extractor: Option<Box<dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync>>,
+    extractor: Option<PathExtractor>,
 }
 
 impl<T: Tool> PathGuardedTool<T> {
@@ -117,7 +119,7 @@ impl<T: Tool> PathGuardedTool<T> {
         self
     }
 
-    fn extract_path_string<'a>(&self, args: &'a serde_json::Value) -> Option<String> {
+    fn extract_path_string(&self, args: &serde_json::Value) -> Option<String> {
         if let Some(ref f) = self.extractor {
             return f(args);
         }
