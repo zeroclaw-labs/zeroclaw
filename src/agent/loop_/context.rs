@@ -332,15 +332,21 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 
 /// Build cross-session recent conversation context from stored turns.
 ///
-/// Formats the most recent turns as `[Recent conversation history]` for injection
-/// into the LLM context, providing conversational continuity across sessions.
+/// Uses a **memo substitution** strategy inspired by how humans handle conversation:
+/// - Short turns (< MEMO_THRESHOLD chars): included verbatim — these are natural dialogue
+/// - Long turns (>= MEMO_THRESHOLD chars): likely contain attached documents, search results,
+///   code blocks, or RAG output. These are replaced with a compact memo:
+///   `[opening] ... [MEMO: summary — full content searchable via "keyword"] ... [closing]`
+///
+/// This preserves conversational flow and nuance while avoiding token waste on
+/// professional/technical content that can be retrieved on demand via vector search.
 ///
 /// # Parameters
 /// - `turns`: recent conversation turns (oldest-first, chronological order)
 /// - `skip_current`: number of trailing turns to skip (e.g. 1 to skip the
 ///   current user message that was just appended)
 /// - `max_bytes`: maximum total bytes for the context block
-/// - `turn_max_chars`: maximum characters per individual turn content
+/// - `turn_max_chars`: maximum characters per individual turn content (used as MEMO_THRESHOLD)
 pub(super) fn build_cross_session_context(
     turns: &[ChatMessage],
     skip_current: usize,
@@ -357,45 +363,53 @@ pub(super) fn build_cross_session_context(
     }
 
     const HEADER: &str = "[Recent conversation history — verbatim, continue this conversation naturally]\n";
+    // Threshold for memo substitution: turns shorter than this are verbatim.
+    // Typical human conversation turns are well under 2000 chars.
+    // Longer turns are almost always documents, code, search results, or RAG output.
+    let memo_threshold = turn_max_chars.min(2000);
 
-    // Pre-allocate: estimate ~80 bytes per turn to reduce reallocations for
-    // large turn counts (up to 600).
-    let estimated = HEADER.len() + take_count.min(600) * 80;
-    let mut ctx = String::with_capacity(estimated.min(max_bytes + 256));
+    let estimated = HEADER.len() + take_count.min(600) * 120;
+    let mut ctx = String::with_capacity(estimated.min(max_bytes + 512));
     ctx.push_str(HEADER);
     let mut total = HEADER.len();
 
     for turn in turns.iter().take(take_count) {
         let label = if turn.role == "user" { "User" } else { "Assistant" };
         let content = &turn.content;
-
-        // Calculate line length without allocating a temporary String when
-        // the turn content fits within the character limit.
         let char_count = content.chars().count();
-        if char_count <= turn_max_chars {
-            // Fast path: content fits — write directly into ctx.
-            let line_len = label.len() + 2 + content.len() + 1; // "Label: content\n"
-            if total + line_len > max_bytes {
-                break;
-            }
-            total += line_len;
-            ctx.push_str(label);
-            ctx.push_str(": ");
-            ctx.push_str(content);
-            ctx.push('\n');
+
+        let formatted = if char_count <= memo_threshold {
+            // ── Short turn: verbatim (natural conversation) ──
+            format!("{label}: {content}\n")
         } else {
-            // Slow path: content needs truncation.
-            let truncated = truncate_chars(content, turn_max_chars);
-            let line_len = label.len() + 2 + truncated.len() + 1;
-            if total + line_len > max_bytes {
-                break;
-            }
-            total += line_len;
-            ctx.push_str(label);
-            ctx.push_str(": ");
-            ctx.push_str(&truncated);
-            ctx.push('\n');
+            // ── Long turn: memo substitution ──
+            // Preserve: opening (~300 chars), closing (~300 chars), generate memo for middle
+            let opening_chars = 300;
+            let closing_chars = 300;
+
+            let opening: String = content.chars().take(opening_chars).collect();
+            let closing: String = content
+                .chars()
+                .rev()
+                .take(closing_chars)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+
+            // Generate a compact memo from the middle content
+            let memo = generate_turn_memo(content, char_count);
+
+            format!(
+                "{label}: {opening}\n  [📋 MEMO ({char_count}자 중 요약): {memo}]\n  ...{closing}\n"
+            )
+        };
+
+        if total + formatted.len() > max_bytes {
+            break;
         }
+        total += formatted.len();
+        ctx.push_str(&formatted);
     }
 
     if ctx.len() == HEADER.len() {
@@ -403,6 +417,63 @@ pub(super) fn build_cross_session_context(
     } else {
         ctx.push('\n');
         ctx
+    }
+}
+
+/// Generate a compact memo (~200 chars) from a long conversation turn.
+///
+/// Extracts the key information: topic, 6W (who/what/when/where/why/how),
+/// and any trailing questions or action items.
+fn generate_turn_memo(content: &str, char_count: usize) -> String {
+    let mut memo_parts: Vec<String> = Vec::new();
+
+    // 1. Extract first meaningful sentence as topic indicator
+    let first_line = content
+        .lines()
+        .find(|l| l.trim().len() > 10)
+        .unwrap_or("")
+        .trim();
+    if !first_line.is_empty() {
+        let topic: String = first_line.chars().take(80).collect();
+        memo_parts.push(format!("주제: {topic}"));
+    }
+
+    // 2. Detect content type
+    if content.contains("```") || content.contains("fn ") || content.contains("function ") {
+        memo_parts.push("코드 포함".to_string());
+    }
+    if content.contains("http://") || content.contains("https://") {
+        memo_parts.push("URL 포함".to_string());
+    }
+    if content.contains("검색 결과") || content.contains("Search results") {
+        memo_parts.push("검색결과".to_string());
+    }
+
+    // 3. Extract trailing question or action item (last 2 non-empty lines)
+    let last_lines: Vec<&str> = content
+        .lines()
+        .rev()
+        .filter(|l| l.trim().len() > 5)
+        .take(2)
+        .collect();
+    for line in last_lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.contains('?') || trimmed.contains("할까") || trimmed.contains("드릴까")
+            || trimmed.contains("하시겠") || trimmed.contains("해줘") || trimmed.contains("알려")
+        {
+            let question: String = trimmed.chars().take(80).collect();
+            memo_parts.push(format!("질문/요청: {question}"));
+            break;
+        }
+    }
+
+    let memo = memo_parts.join(" | ");
+    if memo.is_empty() {
+        format!("{char_count}자 장문 내용 — 필요 시 memory_recall로 검색 가능")
+    } else {
+        // Cap at ~200 chars
+        let result: String = memo.chars().take(200).collect();
+        result
     }
 }
 
@@ -459,11 +530,27 @@ mod tests {
 
     #[test]
     fn build_cross_session_truncates_long_turns() {
+        // Long turns (>= memo_threshold) should be memo-substituted, not just truncated
         let turns = vec![ChatMessage {
             role: "user".into(),
-            content: "a".repeat(1000),
+            content: "a".repeat(3000),
         }];
-        let ctx = build_cross_session_context(&turns, 0, 16000, 10);
-        assert!(ctx.contains(&format!("User: {}…", "a".repeat(10))));
+        let ctx = build_cross_session_context(&turns, 0, 16000, 2000);
+        // Should contain memo marker, not raw 3000 'a's
+        assert!(ctx.contains("MEMO"));
+        // Should NOT contain the full 3000-char content
+        assert!(ctx.len() < 2000);
+    }
+
+    #[test]
+    fn build_cross_session_short_turns_verbatim() {
+        let turns = vec![
+            ChatMessage { role: "user".into(), content: "안녕하세요 변호사님".into() },
+            ChatMessage { role: "assistant".into(), content: "네, 변호사님! 무엇을 도와드릴까요?".into() },
+        ];
+        let ctx = build_cross_session_context(&turns, 0, 16000, 2000);
+        // Short turns should be verbatim
+        assert!(ctx.contains("User: 안녕하세요 변호사님"));
+        assert!(ctx.contains("Assistant: 네, 변호사님! 무엇을 도와드릴까요?"));
     }
 }
