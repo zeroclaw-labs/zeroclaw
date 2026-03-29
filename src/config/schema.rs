@@ -432,6 +432,10 @@ pub struct Config {
     /// Shell tool configuration (`[shell_tool]`).
     #[serde(default)]
     pub shell_tool: ShellToolConfig,
+
+    /// A2A (Agent-to-Agent) protocol configuration (`[a2a]`).
+    #[serde(default)]
+    pub a2a: A2aConfig,
 }
 
 /// Multi-client workspace isolation configuration.
@@ -3769,6 +3773,53 @@ impl Default for OpenCodeCliConfig {
             max_output_bytes: default_opencode_cli_max_output_bytes(),
             env_passthrough: Vec::new(),
         }
+    }
+}
+
+// ── A2A (Agent-to-Agent) protocol ────────────────────────────────
+
+/// A2A (Agent-to-Agent) protocol configuration (`[a2a]`).
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct A2aConfig {
+    /// Enable the A2A protocol server and client tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Agent name advertised in the agent card.
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    /// Agent description advertised in the agent card.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Public URL for the agent card (auto-derived from gateway host/port if omitted).
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// Bearer token for authenticating inbound A2A requests.
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    /// Protocol version advertised in the agent card (defaults to crate version).
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Capability tags advertised in the agent card skills list.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Telegram chat ID for A2A activity notifications (e.g. a group chat).
+    /// When set, inbound A2A task results are also posted to this chat.
+    #[serde(default)]
+    pub notify_chat_id: Option<i64>,
+}
+
+impl std::fmt::Debug for A2aConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("A2aConfig")
+            .field("enabled", &self.enabled)
+            .field("agent_name", &self.agent_name)
+            .field("description", &self.description)
+            .field("public_url", &self.public_url)
+            .field("bearer_token", &self.bearer_token.as_ref().map(|_| "***"))
+            .field("version", &self.version)
+            .field("capabilities", &self.capabilities)
+            .field("notify_chat_id", &self.notify_chat_id)
+            .finish()
     }
 }
 
@@ -8427,6 +8478,7 @@ impl Default for Config {
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            a2a: A2aConfig::default(),
         }
     }
 }
@@ -11589,6 +11641,7 @@ auto_save = true
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            a2a: A2aConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -12119,6 +12172,7 @@ default_temperature = 0.7
             opencode_cli: OpenCodeCliConfig::default(),
             sop: SopConfig::default(),
             shell_tool: ShellToolConfig::default(),
+            a2a: A2aConfig::default(),
         };
 
         config.save().await.unwrap();

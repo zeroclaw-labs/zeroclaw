@@ -833,11 +833,46 @@ Notes:
 - Place `.md`/`.txt` datasheet files named by board (e.g. `nucleo-f401re.md`, `rpi-gpio.md`) in `datasheet_dir` for RAG retrieval.
 - See [hardware-peripherals-design.md](../../hardware/hardware-peripherals-design.md) for board protocol and firmware notes.
 
+## `[a2a]`
+
+A2A (Agent-to-Agent) protocol configuration. Enables discovery and inter-agent communication via the [A2A open standard](https://google.github.io/A2A/).
+
+| Key | Default | Purpose |
+|---|---|---|
+| `enabled` | `false` | Enable A2A protocol server and client tool |
+| `agent_name` | `"ZeroClaw Agent"` | Name advertised in the agent card |
+| `description` | `"ZeroClaw autonomous agent"` | Description advertised in the agent card |
+| `public_url` | auto (gateway host:port) | Public URL for the agent card; set this to avoid exposing internal bind address |
+| `bearer_token` | unset | Bearer token for authenticating inbound A2A requests |
+| `version` | crate version | Protocol version advertised in the agent card |
+| `capabilities` | `[]` | Capability tags advertised in the agent card skills list |
+
+```toml
+[a2a]
+enabled = true
+agent_name = "my-agent"
+description = "My autonomous coding agent"
+public_url = "https://agent.example.com"
+bearer_token = "secret-token-here"
+capabilities = ["code", "search"]
+```
+
+Notes:
+
+- When `enabled = false` (default), the `/.well-known/agent-card.json` and `/a2a` endpoints return 404 and the `a2a` tool is not registered.
+- `GET /.well-known/agent-card.json` is unauthenticated (metadata-only discovery, per A2A spec).
+- `POST /a2a` requires authentication: dedicated `bearer_token` if set, otherwise falls back to gateway pairing. If neither is configured, the endpoint is open — a startup warning is emitted.
+- Set `public_url` to avoid leaking internal bind address in the agent card. A startup warning is emitted if omitted.
+- Inbound tasks are processed through the standard `process_message` pipeline with all existing rate limits, context caps, and tool iteration limits.
+- The in-memory task store is capped at 10,000 entries; excess requests return 503.
+- The outbound `a2a` tool enforces SSRF protection: only HTTP/HTTPS, private/local hosts blocked, redirect policy restricts post-redirect targets.
+
 ## Security-Relevant Defaults
 
 - deny-by-default channel allowlists (`[]` means deny all)
 - pairing required on gateway by default
 - public bind disabled by default
+- A2A protocol disabled by default; startup warnings when enabled without auth
 
 ## Validation Commands
 

@@ -671,11 +671,45 @@ transport = \"native\"
 - 将按板卡命名的 `.md`/`.txt` 数据手册文件（例如 `nucleo-f401re.md`、`rpi-gpio.md`）放在 `datasheet_dir` 中用于 RAG 检索。
 - 板卡协议和固件说明请参见 [hardware-peripherals-design.zh-CN.md](../../hardware/hardware-peripherals-design.zh-CN.md)。
 
+## `[a2a]`
+
+A2A（Agent-to-Agent）协议配置。启用通过 [A2A 开放标准](https://google.github.io/A2A/) 的 agent 发现和通信。
+
+| 键 | 默认值 | 用途 |
+|---|---|---|
+| `enabled` | `false` | 启用 A2A 协议服务器和客户端工具 |
+| `agent_name` | `"ZeroClaw Agent"` | agent card 中显示的名称 |
+| `description` | `"ZeroClaw autonomous agent"` | agent card 中的描述 |
+| `public_url` | 自动（gateway host:port） | agent card 的公共 URL；设置以避免暴露内部绑定地址 |
+| `bearer_token` | 未设置 | 用于验证入站 A2A 请求的 bearer token |
+| `version` | crate 版本 | agent card 中的协议版本 |
+| `capabilities` | `[]` | agent card skills 列表中的能力标签 |
+
+```toml
+[a2a]
+enabled = true
+agent_name = "my-agent"
+description = "我的自主编程代理"
+public_url = "https://agent.example.com"
+bearer_token = "secret-token-here"
+capabilities = ["code", "search"]
+```
+
+注意事项：
+
+- 当 `enabled = false`（默认）时，`/.well-known/agent-card.json` 和 `/a2a` 端点返回 404，`a2a` 工具不注册。
+- `GET /.well-known/agent-card.json` 无需认证（仅元数据，符合 A2A 规范）。
+- `POST /a2a` 需要认证：优先使用专用 `bearer_token`，否则回退到网关配对。如果都未配置，端点开放——启动时会发出警告。
+- 设置 `public_url` 以避免在 agent card 中泄露内部绑定地址。
+- 内存中的任务存储限制为 10,000 个条目；超出返回 503。
+- 出站 `a2a` 工具具有 SSRF 防护：仅 HTTP/HTTPS，阻止私有/本地主机。
+
 ## 安全相关默认值
 
 - 默认拒绝的渠道白名单（`[]` 表示拒绝所有）
 - 网关上默认需要配对
 - 默认禁用公共绑定
+- A2A 协议默认禁用；未配置认证时启动发出警告
 
 ## 验证命令
 

@@ -1057,6 +1057,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
         mask_required_secret(&mut email.password);
     }
     mask_optional_secret(&mut masked.transcription.api_key);
+    mask_optional_secret(&mut masked.a2a.bearer_token);
     masked
 }
 
@@ -1248,6 +1249,7 @@ fn restore_masked_sensitive_fields(
         &mut incoming.transcription.api_key,
         &current.transcription.api_key,
     );
+    restore_optional_secret(&mut incoming.a2a.bearer_token, &current.a2a.bearer_token);
 }
 
 fn hydrate_config_for_save(
@@ -1648,6 +1650,8 @@ mod tests {
             canvas_store: crate::tools::canvas::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         }
     }
 

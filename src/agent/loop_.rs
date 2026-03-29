@@ -4678,6 +4678,13 @@ pub async fn process_message(
         ));
     }
 
+    if config.a2a.enabled {
+        tool_descs.push((
+            "a2a",
+            "Communicate with remote A2A-compatible agents. Actions: 'discover' (fetch agent card), 'send' (dispatch a task message), 'status' (check task progress), 'result' (retrieve output). Use when: user asks to contact, message, or delegate to another agent by name.",
+        ));
+    }
+
     // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
     // Skip when autonomy is `Full` — full-autonomy agents keep all tools.
     if config.autonomy.level != AutonomyLevel::Full {

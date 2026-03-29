@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod a2a;
 pub mod api;
 pub mod api_pairing;
 #[cfg(feature = "plugins-wasm")]
@@ -373,6 +374,10 @@ pub struct AppState {
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
+    /// Cached A2A agent card (populated when `a2a.enabled`)
+    pub a2a_agent_card: Option<Arc<serde_json::Value>>,
+    /// In-memory A2A task store (populated when `a2a.enabled`)
+    pub a2a_task_store: Option<Arc<a2a::TaskStore>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -819,6 +824,38 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
+    // ── A2A (Agent-to-Agent) protocol ────────────────────────
+    let (a2a_agent_card, a2a_task_store) = if config.a2a.enabled {
+        // Security: warn when no authentication is configured for A2A
+        let has_bearer = config
+            .a2a
+            .bearer_token
+            .as_ref()
+            .is_some_and(|t| !t.is_empty());
+        if !has_bearer && !config.gateway.require_pairing {
+            tracing::warn!(
+                "A2A protocol enabled WITHOUT authentication — \
+                 set [a2a] bearer_token or enable gateway pairing to secure the /a2a endpoint"
+            );
+        }
+
+        // Security: warn when agent card exposes internal bind address
+        if config.a2a.public_url.is_none() {
+            tracing::warn!(
+                "A2A agent card will advertise internal bind address ({}:{}) — \
+                 set [a2a] public_url to expose only the public-facing URL",
+                config.gateway.host,
+                config.gateway.port
+            );
+        }
+
+        let card = a2a::generate_agent_card(&config);
+        tracing::info!("A2A protocol enabled — agent card generated");
+        (Some(Arc::new(card)), Some(Arc::new(a2a::TaskStore::new())))
+    } else {
+        (None, None)
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -876,6 +913,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         } else {
             None
         },
+        a2a_agent_card,
+        a2a_task_store,
     };
 
     // Config PUT needs larger body limit (1MB)
@@ -962,7 +1001,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route(
             "/api/canvas/{id}/history",
             get(canvas::handle_canvas_history),
-        );
+        )
+        // ── A2A (Agent-to-Agent) protocol routes ──
+        .route(
+            "/.well-known/agent-card.json",
+            get(a2a::handle_agent_card),
+        )
+        .route("/a2a", post(a2a::handle_a2a_rpc));
 
     // ── WebAuthn hardware key authentication API (requires webauthn feature) ──
     #[cfg(feature = "webauthn")]
@@ -2345,6 +2390,8 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2413,6 +2460,8 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2807,6 +2856,8 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -2890,6 +2941,8 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         };
 
         let headers = HeaderMap::new();
@@ -2979,6 +3032,8 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         };
 
         let response = handle_webhook(
@@ -3041,6 +3096,8 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3108,6 +3165,8 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3183,6 +3242,8 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         };
 
         let response = Box::pin(handle_nextcloud_talk_webhook(
@@ -3252,6 +3313,8 @@ mod tests {
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
+            a2a_agent_card: None,
+            a2a_task_store: None,
         };
 
         let mut headers = HeaderMap::new();

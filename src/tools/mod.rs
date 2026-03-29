@@ -15,6 +15,7 @@
 //! To add a new tool, implement [`Tool`] in a new submodule and register it in
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
+pub mod a2a;
 pub mod ask_user;
 pub mod backup_tool;
 pub mod browser;
@@ -996,6 +997,23 @@ pub fn all_tools_with_runtime(
         tool_arcs.push(Arc::new(VerifiableIntentTool::new(
             security.clone(),
             strictness,
+        )));
+    }
+
+    // A2A (Agent-to-Agent) outbound client tool
+    if root_config.a2a.enabled {
+        // Allow localhost A2A when public_url points to a local address
+        // (same-host multi-instance setup).
+        let allow_local = root_config
+            .a2a
+            .public_url
+            .as_deref()
+            .map(|u| u.contains("127.0.0.1") || u.contains("localhost"))
+            .unwrap_or(false);
+        tool_arcs.push(Arc::new(a2a::A2aTool::new(
+            security.clone(),
+            30,
+            allow_local,
         )));
     }
 
