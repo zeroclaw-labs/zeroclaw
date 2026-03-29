@@ -512,6 +512,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 fn contains_unquoted_single_ampersand(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let mut prev = ' ';
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -524,10 +525,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::Double => {
                 if escaped {
                     escaped = false;
+                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    prev = ch;
                     continue;
                 }
                 if ch == '"' {
@@ -537,24 +540,37 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::None => {
                 if escaped {
                     escaped = false;
+                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    prev = ch;
                     continue;
                 }
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     '&' => {
-                        if chars.next_if_eq(&'&').is_none() {
-                            return true;
+                        // `&&` is a logical-AND separator, not a background op.
+                        if chars.next_if_eq(&'&').is_some() {
+                            prev = '&';
+                            continue;
                         }
+                        // `>&N` and `<&N` are fd redirects, not background ops.
+                        if (prev == '>' || prev == '<')
+                            || chars.peek().is_some_and(|c| c.is_ascii_digit())
+                        {
+                            prev = ch;
+                            continue;
+                        }
+                        return true;
                     }
                     _ => {}
                 }
             }
         }
+        prev = ch;
     }
 
     false
@@ -713,17 +729,49 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+/// Extract the file target from a redirection token, returning `None` for
+/// fd-only redirects (e.g. `2>&1`) and standalone operators (e.g. `>`).
 fn redirection_target(token: &str) -> Option<&str> {
-    let marker_idx = token.find(['<', '>'])?;
+    match parse_redirection(token) {
+        RedirectionParse::Target(t) => Some(t),
+        _ => None,
+    }
+}
+
+/// Result of parsing a redirection token.
+enum RedirectionParse<'a> {
+    /// Token contains a redirect operator with an inline target, e.g. `>/dev/null`.
+    Target(&'a str),
+    /// Token is a pure file-descriptor redirect like `2>&1` — always safe.
+    FdOnly,
+    /// Token is a bare redirect operator (e.g. `>`, `>>`, `<`) — the target is the next token.
+    NeedsNextToken,
+    /// Token contains no redirection.
+    None,
+}
+
+fn parse_redirection(token: &str) -> RedirectionParse<'_> {
+    let Some(marker_idx) = token.find(['<', '>']) else {
+        return RedirectionParse::None;
+    };
     let mut rest = &token[marker_idx + 1..];
     rest = rest.trim_start_matches(['<', '>']);
-    rest = rest.trim_start_matches('&');
+
+    // Check for fd redirect: `&` followed by only digits (e.g. `2>&1`, `>&2`).
+    if let Some(after_amp) = rest.strip_prefix('&') {
+        let after_digits = after_amp.trim_start_matches(|c: char| c.is_ascii_digit());
+        if after_digits.is_empty() {
+            return RedirectionParse::FdOnly;
+        }
+    }
+
+    // Strip leading digits (fd number before operator, e.g. the `2` in `2>/dev/null`).
     rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        None
+        RedirectionParse::NeedsNextToken
     } else {
-        Some(trimmed)
+        RedirectionParse::Target(trimmed)
     }
 }
 
@@ -1078,24 +1126,46 @@ impl SecurityPolicy {
             // Check if all redirections target safe destinations
             for segment in split_unquoted_segments(command) {
                 let cmd_part = skip_env_assignments(&segment);
-                let mut words = cmd_part.split_whitespace();
+                let words: Vec<&str> = cmd_part.split_whitespace().collect();
 
-                // Check inline redirections on executable itself, e.g., `cat</dev/null`
-                if let Some(executable) = words.next() {
-                    if let Some(target) = redirection_target(strip_wrapping_quotes(executable)) {
-                        if !safe_redirect_target(target) {
+                let mut i = 0;
+                // Skip the executable (first word)
+                if !words.is_empty() {
+                    // Check inline redirections on executable itself, e.g., `cat</dev/null`
+                    match parse_redirection(strip_wrapping_quotes(words[0])) {
+                        RedirectionParse::Target(target) => {
+                            if !safe_redirect_target(target) {
+                                return false;
+                            }
+                        }
+                        RedirectionParse::NeedsNextToken => {
+                            // Bare redirect as executable is invalid, block it
                             return false;
                         }
+                        RedirectionParse::FdOnly | RedirectionParse::None => {}
                     }
+                    i = 1;
                 }
 
                 // Check redirections in remaining arguments
-                for token in words {
-                    if let Some(target) = redirection_target(token) {
-                        if !safe_redirect_target(target) {
-                            return false;
+                while i < words.len() {
+                    match parse_redirection(words[i]) {
+                        RedirectionParse::Target(target) => {
+                            if !safe_redirect_target(target) {
+                                return false;
+                            }
                         }
+                        RedirectionParse::NeedsNextToken => {
+                            // Standalone redirect operator — next token is the target
+                            i += 1;
+                            let target = words.get(i).map(|w| w.trim()).unwrap_or("");
+                            if !safe_redirect_target(target) {
+                                return false;
+                            }
+                        }
+                        RedirectionParse::FdOnly | RedirectionParse::None => {}
                     }
+                    i += 1;
                 }
             }
         }
@@ -2381,7 +2451,7 @@ mod tests {
     #[test]
     fn safe_redirect_to_dev_zero_allowed() {
         let p = default_policy();
-        assert!(p.is_command_allowed("dd if=/dev/zero of=/dev/null"));
+        assert!(p.is_command_allowed("cat /dev/zero > /dev/null"));
     }
 
     #[test]
@@ -3308,7 +3378,7 @@ mod tests {
         assert!(t.record_within("chat_a", 2)); // count=1 ≤ 2 → ok
         assert!(t.record_within("chat_a", 2)); // count=2 ≤ 2 → ok
         assert!(!t.record_within("chat_a", 2)); // count=3 > 2 → blocked
-                                                // sender B is unaffected — its bucket is empty
+        // sender B is unaffected — its bucket is empty
         assert!(t.record_within("chat_b", 2)); // count=1 ≤ 2 → ok
         assert!(t.record_within("chat_b", 2)); // count=2 ≤ 2 → ok
         assert!(!t.record_within("chat_b", 2)); // count=3 > 2 → blocked

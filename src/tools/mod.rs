@@ -105,13 +105,13 @@ pub mod swarm;
 pub mod text_browser;
 pub mod tool_search;
 pub mod traits;
-pub mod wrappers;
 pub mod verifiable_intent;
 pub mod weather_tool;
 pub mod web_fetch;
 mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod workspace_tool;
+pub mod wrappers;
 
 pub use ask_user::AskUserTool;
 pub use backup_tool::BackupTool;
@@ -191,7 +191,6 @@ pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
 pub use sessions::{SessionsHistoryTool, SessionsListTool, SessionsSendTool};
 pub use shell::ShellTool;
-pub use wrappers::{PathGuardedTool, RateLimitedTool};
 #[allow(unused_imports)]
 pub use skill_http::SkillHttpTool;
 #[allow(unused_imports)]
@@ -212,6 +211,7 @@ pub use weather_tool::WeatherTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
+pub use wrappers::{PathGuardedTool, RateLimitedTool};
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
@@ -433,7 +433,7 @@ pub fn all_tools_with_runtime(
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
-        Arc::new(MemoryPurgeTool::new(memory, security.clone())),
+        Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -1300,6 +1300,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
 

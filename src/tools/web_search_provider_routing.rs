@@ -3,6 +3,7 @@ pub enum WebSearchProviderRoute {
     DuckDuckGo,
     Brave,
     SearXNG,
+    Tavily,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,6 +16,7 @@ pub struct WebSearchProviderResolution {
 pub const DEFAULT_WEB_SEARCH_PROVIDER: &str = "duckduckgo";
 const BRAVE_PROVIDER: &str = "brave";
 const SEARXNG_PROVIDER: &str = "searxng";
+const TAVILY_PROVIDER: &str = "tavily";
 
 pub fn resolve_web_search_provider(raw_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_provider.trim().to_ascii_lowercase();

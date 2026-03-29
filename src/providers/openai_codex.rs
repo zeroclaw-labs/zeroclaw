@@ -767,7 +767,7 @@ impl Provider for OpenAiCodexProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::test_util::{env_lock, EnvGuard};
+    use crate::providers::test_util::{EnvGuard, env_lock};
 
     #[test]
     fn extracts_output_text_first() {

@@ -4,7 +4,6 @@ mod backup_cron_scheduling;
 mod channel_matrix;
 mod channel_routing;
 mod email_attachments;
-mod hook_execution_post_send;
 mod hooks;
 mod memory_comparison;
 mod memory_loop_continuity;

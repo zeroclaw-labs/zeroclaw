@@ -186,11 +186,7 @@ fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessa
         .filter(|(_, m)| m.role == "user")
         .filter_map(|(i, m)| {
             let count = parse_image_markers(&m.content).1.len();
-            if count > 0 {
-                Some((i, count))
-            } else {
-                None
-            }
+            if count > 0 { Some((i, count)) } else { None }
         })
         .collect();
 

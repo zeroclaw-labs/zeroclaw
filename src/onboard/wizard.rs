@@ -4015,9 +4015,7 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     multi_message_delay_ms: existing_dc
                         .map(|d| d.multi_message_delay_ms)
                         .unwrap_or(800),
-                    stall_timeout_secs: existing_dc
-                        .map(|d| d.stall_timeout_secs)
-                        .unwrap_or(0),
+                    stall_timeout_secs: existing_dc.map(|d| d.stall_timeout_secs).unwrap_or(0),
                 });
             }
             ChannelMenuChoice::Slack => {
@@ -7849,6 +7847,7 @@ mod tests {
             stream_mode: StreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stall_timeout_secs: 0,
         });
         existing.matrix = Some(MatrixConfig {
             homeserver: "https://m.org".into(),

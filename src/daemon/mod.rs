@@ -830,18 +830,16 @@ fn has_supervised_channels(config: &Config) -> bool {
 }
 
 async fn run_mqtt_sop_listener(config: &crate::config::MqttConfig) -> Result<()> {
-    use std::sync::{Arc, Mutex};
-    use crate::sop::{SopEngine, SopAuditLogger};
     use crate::config::SopConfig;
     use crate::memory::NoneMemory;
+    use crate::sop::{SopAuditLogger, SopEngine};
+    use std::sync::{Arc, Mutex};
 
     // Initialize SOP engine
     let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
 
     // Initialize SOP audit logger with NoneMemory (MQTT listener is headless)
-    let audit = Arc::new(SopAuditLogger::new(
-        Arc::new(NoneMemory)
-    ));
+    let audit = Arc::new(SopAuditLogger::new(Arc::new(NoneMemory)));
 
     // Validate MQTT config and run the listener
     config.validate()?;

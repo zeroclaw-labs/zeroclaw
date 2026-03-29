@@ -93,7 +93,7 @@ fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
 }
 
 fn base64url_no_pad(data: &[u8]) -> String {
-    use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+    use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
     URL_SAFE_NO_PAD.encode(data)
 }
 
@@ -2614,7 +2614,7 @@ mod tests {
 
     #[test]
     fn zhipu_jwt_header_is_correct() {
-        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
         let result = zhipu_jwt_bearer("myid.mysecret").unwrap();
         let jwt = result.strip_prefix("Bearer ").unwrap();
         let header_b64 = jwt.split('.').next().unwrap();
@@ -2627,7 +2627,7 @@ mod tests {
 
     #[test]
     fn zhipu_jwt_payload_contains_api_key_and_timestamps() {
-        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
         let result = zhipu_jwt_bearer("myapiid.mysecretkey").unwrap();
         let jwt = result.strip_prefix("Bearer ").unwrap();
         let payload_b64 = jwt.split('.').nth(1).unwrap();
@@ -2653,7 +2653,7 @@ mod tests {
 
         // Verify HMAC-SHA256 signature
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
-        use base64::engine::{general_purpose::URL_SAFE_NO_PAD, Engine};
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
         let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
         ring::hmac::verify(&key, signing_input.as_bytes(), &sig_bytes)
             .expect("signature must verify");

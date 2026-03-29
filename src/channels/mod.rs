@@ -109,7 +109,6 @@ pub use whatsapp_web::WhatsAppWebChannel;
 use crate::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scope_thread_id, scrub_credentials,
-    EMPTY_MODEL_REPLY_PLACEHOLDER,
 };
 use crate::approval::ApprovalManager;
 use crate::config::Config;
@@ -2894,7 +2893,7 @@ async fn process_channel_message(
                         crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                             cost_tracking_context.clone(),
                         run_tool_call_loop(
-                        thinking_provider.as_deref().unwrap_or(active_provider.as_ref()),
+                        active_provider.as_ref(),
                         &mut history,
                         ctx.tools_registry.as_ref(),
                         notify_observer.as_ref() as &dyn Observer,
@@ -6279,6 +6278,23 @@ mod tests {
         }
     }
 
+    /// A provider that always returns an empty reply, used to test the
+    /// no-reply precheck path (typing indicator should not fire).
+    struct NoReplyProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for NoReplyProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
     struct FormatErrorProvider;
 
     #[async_trait::async_trait]
@@ -8563,7 +8579,9 @@ BTC is currently around $65,000 based on latest tool output."#
             auto_save_memory: false,
             max_tool_iterations: 10,
             min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),

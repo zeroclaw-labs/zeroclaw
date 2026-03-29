@@ -2381,9 +2381,8 @@ pub(crate) mod test_util {
 
 #[cfg(test)]
 mod tests {
-    use super::test_util::{env_lock, EnvGuard};
+    use super::test_util::{EnvGuard, env_lock};
     use super::*;
-
 
     #[test]
     fn resolve_provider_credential_prefers_explicit_argument() {

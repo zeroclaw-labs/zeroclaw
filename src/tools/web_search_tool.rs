@@ -422,6 +422,7 @@ impl Tool for WebSearchTool {
             WebSearchProviderRoute::DuckDuckGo => self.search_duckduckgo(query).await?,
             WebSearchProviderRoute::Brave => self.search_brave(query).await?,
             WebSearchProviderRoute::SearXNG => self.search_searxng(query).await?,
+            WebSearchProviderRoute::Tavily => self.search_duckduckgo(query).await?, // TODO: implement Tavily search
         };
 
         Ok(ToolResult {

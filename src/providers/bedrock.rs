@@ -1187,9 +1187,8 @@ impl Provider for BedrockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::test_util::{env_lock, EnvGuard};
+    use crate::providers::test_util::{EnvGuard, env_lock};
     use crate::providers::traits::ChatMessage;
-
 
     // ── SigV4 signing tests ─────────────────────────────────────
 
