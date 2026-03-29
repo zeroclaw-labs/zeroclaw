@@ -105,15 +105,6 @@ impl Tool for ClaudeCodeRunnerTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
         // Enforce act policy
         if let Err(error) = self
             .security
@@ -182,15 +173,6 @@ impl Tool for ClaudeCodeRunnerTool {
             .get("slack_channel")
             .and_then(|v| v.as_str())
             .map(String::from);
-
-        // Record action budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
 
         // Generate a unique session ID
         let session_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
@@ -330,6 +312,18 @@ impl Tool for ClaudeCodeRunnerTool {
     }
 }
 
+/// Convenience constructor used in tests and in `mod.rs` assembly.
+pub fn wrapped_claude_code_runner(
+    security: Arc<SecurityPolicy>,
+    config: ClaudeCodeRunnerConfig,
+    gateway_url: String,
+) -> super::wrappers::RateLimitedTool<ClaudeCodeRunnerTool> {
+    super::wrappers::RateLimitedTool::new(
+        ClaudeCodeRunnerTool::new(security.clone(), config, gateway_url),
+        security,
+    )
+}
+
 /// Minimal shell escaping for values embedded in tmux send-keys.
 fn shell_escape(s: &str) -> String {
     if s.chars()
@@ -437,7 +431,7 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let tool =
-            ClaudeCodeRunnerTool::new(security, test_config(), "http://localhost:3000".into());
+            wrapped_claude_code_runner(security, test_config(), "http://localhost:3000".into());
         let result = tool
             .execute(json!({"prompt": "hello"}))
             .await

@@ -122,7 +122,8 @@ pub use browser_open::BrowserOpenTool;
 pub use calculator::CalculatorTool;
 pub use canvas::{CanvasStore, CanvasTool};
 pub use claude_code::ClaudeCodeTool;
-pub use claude_code_runner::ClaudeCodeRunnerTool;
+#[allow(unused_imports)]
+pub use claude_code_runner::{ClaudeCodeRunnerTool, wrapped_claude_code_runner};
 pub use cloud_ops::CloudOpsTool;
 pub use cloud_patterns::CloudPatternsTool;
 pub use codex_cli::CodexCliTool;
@@ -712,7 +713,7 @@ pub fn all_tools_with_runtime(
             "http://{}:{}",
             root_config.gateway.host, root_config.gateway.port
         );
-        tool_arcs.push(Arc::new(ClaudeCodeRunnerTool::new(
+        tool_arcs.push(Arc::new(wrapped_claude_code_runner(
             security.clone(),
             root_config.claude_code_runner.clone(),
             gateway_url,
