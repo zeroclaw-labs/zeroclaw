@@ -48,7 +48,7 @@ impl Channel for CliChannel {
                     .unwrap_or_default()
                     .as_secs(),
                 thread_ts: None,
-            reply_to_message_id: None,
+                reply_to_message_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             };
@@ -79,7 +79,7 @@ mod tests {
                 recipient: "user".into(),
                 subject: None,
                 thread_ts: None,
-            reply_to_message_id: None,
+                reply_to_message_id: None,
                 cancellation_token: None,
                 attachments: vec![],
             })
@@ -96,7 +96,7 @@ mod tests {
                 recipient: String::new(),
                 subject: None,
                 thread_ts: None,
-            reply_to_message_id: None,
+                reply_to_message_id: None,
                 cancellation_token: None,
                 attachments: vec![],
             })

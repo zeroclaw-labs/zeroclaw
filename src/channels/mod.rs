@@ -7990,7 +7990,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -8004,7 +8004,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -9192,7 +9192,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -9210,7 +9210,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: Some("1741234567.123456".into()),
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -9231,7 +9231,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "cli".into(),
             timestamp: 1,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -9249,7 +9249,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -9261,7 +9261,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -9285,7 +9285,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -9297,7 +9297,7 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -11421,7 +11421,7 @@ This is an example JSON object for profile settings."#;
             channel: "matrix".into(),
             timestamp: 0,
             thread_ts: None,
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -11438,7 +11438,7 @@ This is an example JSON object for profile settings."#;
             channel: "matrix".into(),
             timestamp: 0,
             thread_ts: Some("$thread1".into()),
-                reply_to_message_id: None,
+            reply_to_message_id: None,
             interruption_scope_id: Some("$thread1".into()),
             attachments: vec![],
         };
@@ -11456,8 +11456,8 @@ This is an example JSON object for profile settings."#;
             channel: "slack".into(),
             timestamp: 0,
             thread_ts: Some("1234567890.000100".into()), // Slack top-level fallback
-                reply_to_message_id: None,
-            interruption_scope_id: None,                 // but NOT a thread reply
+            reply_to_message_id: None,
+            interruption_scope_id: None, // but NOT a thread reply
             attachments: vec![],
         };
         assert_eq!(interruption_scope_key(&msg), "slack_C123_alice");
