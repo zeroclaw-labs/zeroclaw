@@ -79,6 +79,12 @@ pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
 
+/// Shared type for per-sender conversation histories (channel subsystem).
+/// Uses LruCache for bounded memory and automatic eviction.
+type SharedHistoryMap = crate::channels::ConversationHistoryMap;
+/// Shared type for the pending-new-session set (channel subsystem).
+type SharedPendingNewSessions = Arc<std::sync::Mutex<std::collections::HashSet<String>>>;
+
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
 }
@@ -310,6 +316,20 @@ fn client_key_from_request(
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Write a service token to a file with mode 0600.
+fn write_service_token_file(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    use std::io::Write;
+    f.write_all(token.as_bytes())?;
+    Ok(())
+}
+
 fn normalize_max_keys(configured: usize, fallback: usize) -> usize {
     if configured == 0 {
         fallback.max(1)
@@ -368,6 +388,14 @@ pub struct AppState {
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
+    /// Shared per-sender conversation histories (from channel subsystem).
+    /// Used by DELETE /api/history/{sender_key} to clear in-memory history.
+    pub conversation_histories: Option<SharedHistoryMap>,
+    /// Shared set of senders pending a fresh session (from channel subsystem).
+    pub pending_new_sessions: Option<SharedPendingNewSessions>,
+    /// Session persistence store (from channel subsystem).
+    /// Used by DELETE /api/history/{sender_key} to also clear the on-disk JSONL.
+    pub session_store: Option<Arc<crate::channels::session_store::SessionStore>>,
     /// Shared canvas store for Live Canvas (A2UI) system
     pub canvas_store: CanvasStore,
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
@@ -695,6 +723,32 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.gateway.require_pairing,
         &config.gateway.paired_tokens,
     ));
+
+    // ── Service token for trusted skills ─────────────────
+    {
+        let service_token = pairing.generate_service_token();
+
+        // Write token file for external tools (E2E tests, scripts)
+        let token_path = config
+            .workspace_dir
+            .parent()
+            .map(|p| p.join("gateway_token"))
+            .unwrap_or_else(|| std::path::PathBuf::from("gateway_token"));
+        if let Err(e) = write_service_token_file(&token_path, &service_token) {
+            tracing::warn!(error = %e, "Failed to write gateway_token file");
+        } else {
+            tracing::info!(path = %token_path.display(), "Wrote gateway_token file");
+        }
+
+        // Set process-global context for skill execution
+        let gateway_url = format!("http://{}:{}", host, actual_port);
+        crate::skills::set_service_token_context(crate::skills::ServiceTokenContext {
+            token: service_token,
+            gateway_url,
+            trusted_skills: config.skills.trusted.iter().cloned().collect(),
+        });
+    }
+
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -850,6 +904,9 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
         pending_pairings,
+        conversation_histories: Some(crate::channels::global_conversation_histories()),
+        pending_new_sessions: Some(crate::channels::global_pending_new_sessions()),
+        session_store: crate::channels::global_session_store(),
         path_prefix: path_prefix.unwrap_or("").to_string(),
         canvas_store,
         #[cfg(feature = "webauthn")]
@@ -941,7 +998,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             get(api::handle_api_session_messages),
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
-        .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route("/api/history", get(api::handle_api_history_list))
+        .route(
+            "/api/history/{sender_key}",
+            get(api::handle_api_history_get).delete(api::handle_api_history_delete),
+        )
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
@@ -2342,6 +2403,9 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -2410,6 +2474,9 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -2619,6 +2686,7 @@ mod tests {
             channel: "whatsapp".into(),
             timestamp: 1,
             thread_ts: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -2804,6 +2872,9 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -2882,6 +2953,9 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -2972,6 +3046,9 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3034,6 +3111,9 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3101,6 +3181,9 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3173,6 +3256,9 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3242,6 +3328,9 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,

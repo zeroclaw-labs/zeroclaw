@@ -1454,7 +1454,7 @@ pub async fn handle_api_sessions_running(
 }
 
 /// GET /api/sessions/{id}/state — get session state
-pub async fn handle_api_session_state(
+pub fn handle_api_session_state(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -1525,6 +1525,120 @@ pub async fn handle_claude_code_hook(
     );
 
     Json(serde_json::json!({ "ok": true }))
+}
+
+/// GET /api/history — list all active chats grouped by sender_key.
+pub async fn handle_api_history_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let chats = if let Some(ref histories) = state.conversation_histories {
+        let mut map = histories.lock().unwrap_or_else(|e| e.into_inner());
+        map.iter()
+            .map(|(key, turns)| {
+                serde_json::json!({
+                    "sender_key": key,
+                    "message_count": turns.len(),
+                    "last_message": turns.last().map(|m| serde_json::json!({
+                        "role": &m.role,
+                        "content": m.content.chars().take(100).collect::<String>(),
+                    })),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![]
+    };
+
+    Json(serde_json::json!({
+        "chats": chats,
+        "count": chats.len(),
+    }))
+    .into_response()
+}
+
+/// GET /api/history/{sender_key} — read conversation history for a sender.
+pub async fn handle_api_history_get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(sender_key): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let messages = if let Some(ref histories) = state.conversation_histories {
+        let mut map = histories.lock().unwrap_or_else(|e| e.into_inner());
+        map.get(&sender_key)
+            .map(|turns| {
+                turns
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "role": &m.role,
+                            "content": &m.content,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+
+    Json(serde_json::json!({
+        "sender_key": sender_key,
+        "messages": messages,
+        "count": messages.len(),
+    }))
+    .into_response()
+}
+
+/// DELETE /api/history/{sender_key} — clear in-memory conversation history for a sender.
+///
+/// This is used by external skills (e.g. the coder skill `/reset` command) to ensure
+/// ZeroClaw's per-sender history is wiped so the LLM starts fresh on the next message.
+/// The `sender_key` format matches the internal channel key:
+/// `{channel}_{reply_target}_{thread_id}_{sender}` (Telegram forum topics) or
+/// `{channel}_{reply_target}_{sender}` (direct chats).
+pub async fn handle_api_history_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(sender_key): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let cleared = if let Some(ref histories) = state.conversation_histories {
+        let mut map = histories.lock().unwrap_or_else(|e| e.into_inner());
+        map.pop(&sender_key).is_some()
+    } else {
+        false
+    };
+
+    // Also clear the on-disk JSONL session store so history doesn't resurface after restart.
+    if let Some(ref store) = state.session_store {
+        if let Err(e) = store.delete_session(&sender_key) {
+            tracing::warn!("Failed to delete persisted session for {sender_key}: {e}");
+        }
+    }
+
+    // Mark sender for a fresh session so the next message gets a clean system prompt.
+    if let Some(ref pending) = state.pending_new_sessions {
+        let mut set = pending.lock().unwrap_or_else(|e| e.into_inner());
+        set.insert(sender_key.clone());
+    }
+
+    Json(serde_json::json!({
+        "cleared": cleared,
+        "sender_key": sender_key,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -1644,6 +1758,9 @@ mod tests {
             )),
             device_registry: None,
             pending_pairings: None,
+            conversation_histories: None,
+            pending_new_sessions: None,
+            session_store: None,
             path_prefix: String::new(),
             canvas_store: crate::tools::canvas::CanvasStore::new(),
             #[cfg(feature = "webauthn")]
