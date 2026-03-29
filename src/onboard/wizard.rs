@@ -2338,6 +2338,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
         "🏠 Local / private (Ollama, llama.cpp server, vLLM — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
+        "🔧 Custom — bring your own Anthropic-compatible API",
     ];
 
     let tier_idx = Select::new()
@@ -2421,11 +2422,61 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             ("cohere", "Cohere — Command R+ & embeddings"),
         ],
         4 => local_provider_choices(),
-        _ => vec![], // Custom — handled below
+        // Tier 5 (OpenAI-compatible) and 6 (Anthropic-compatible) are custom
+        // flows handled after the match via the `providers.is_empty()` branch.
+        _ => vec![],
     };
 
     // ── Custom / BYOP flow ──
     if providers.is_empty() {
+        let is_anthropic_custom = tier_idx == 6;
+
+        if is_anthropic_custom {
+            println!();
+            println!(
+                "  {} {}",
+                style("Anthropic-Compatible Endpoint Setup").white().bold(),
+                style("— any API that speaks the Anthropic messages format").dim()
+            );
+            print_bullet("ZeroClaw works with ANY API that speaks the Anthropic messages format.");
+            print_bullet(
+                "Examples: Amazon Bedrock (Anthropic), Azure AI (Claude), custom Anthropic proxies, etc.",
+            );
+            println!();
+
+            let base_url: String = Input::new()
+                .with_prompt(
+                    "  API base URL (e.g. https://my-anthropic-proxy.com or https://bedrock-runtime.us-east-1.amazonaws.com)",
+                )
+                .interact_text()?;
+
+            let base_url = base_url.trim().trim_end_matches('/').to_string();
+            if base_url.is_empty() {
+                anyhow::bail!("Anthropic-compatible provider requires a base URL.");
+            }
+
+            let api_key: String = Input::new()
+                .with_prompt("  API key (or Enter to skip if not needed)")
+                .allow_empty(true)
+                .interact_text()?;
+
+            let model: String = Input::new()
+                .with_prompt("  Model name (e.g. claude-sonnet-4-5-20250929, claude-3-haiku)")
+                .default("claude-sonnet-4-5-20250929")
+                .interact_text()?;
+
+            let provider_name = format!("anthropic-custom:{base_url}");
+
+            println!(
+                "  {} Provider: {} | Model: {}",
+                style("✓").green().bold(),
+                style(&provider_name).green(),
+                style(&model).green()
+            );
+
+            return Ok((provider_name, api_key, model, None));
+        }
+
         println!();
         println!(
             "  {} {}",
@@ -6323,6 +6374,115 @@ mod tests {
         );
         assert!(config.api_key.is_none());
         assert!(config.api_url.is_none());
+    }
+
+    #[test]
+    fn apply_provider_update_anthropic_custom_stores_provider_name() {
+        let mut config = Config::default();
+
+        apply_provider_update(
+            &mut config,
+            "anthropic-custom:https://my-proxy.example.com".to_string(),
+            "sk-custom-key".to_string(),
+            "claude-sonnet-4-5-20250929".to_string(),
+            None,
+        );
+
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some("anthropic-custom:https://my-proxy.example.com")
+        );
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert_eq!(config.api_key.as_deref(), Some("sk-custom-key"));
+        // api_url is None because the URL is embedded in the provider name
+        assert!(config.api_url.is_none());
+    }
+
+    #[test]
+    fn apply_provider_update_anthropic_custom_clears_key_when_empty() {
+        let mut config = Config::default();
+        config.api_key = Some("sk-old".to_string());
+
+        apply_provider_update(
+            &mut config,
+            "anthropic-custom:https://bedrock.example.com".to_string(),
+            String::new(),
+            "claude-3-haiku".to_string(),
+            None,
+        );
+
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some("anthropic-custom:https://bedrock.example.com")
+        );
+        assert_eq!(config.default_model.as_deref(), Some("claude-3-haiku"));
+        assert!(config.api_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn quick_setup_anthropic_custom_persists_to_config() {
+        let _env_guard = env_lock().lock().await;
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+        let tmp = TempDir::new().unwrap();
+
+        let config = Box::pin(run_quick_setup_with_home(
+            Some("sk-bedrock"),
+            Some("anthropic-custom:https://bedrock.example.com"),
+            Some("claude-sonnet-4-5-20250929"),
+            Some("sqlite"),
+            false,
+            tmp.path(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some("anthropic-custom:https://bedrock.example.com")
+        );
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert_eq!(config.api_key.as_deref(), Some("sk-bedrock"));
+
+        let config_raw = tokio::fs::read_to_string(config.config_path).await.unwrap();
+        assert!(
+            config_raw
+                .contains("default_provider = \"anthropic-custom:https://bedrock.example.com\"")
+        );
+        assert!(config_raw.contains("default_model = \"claude-sonnet-4-5-20250929\""));
+    }
+
+    #[tokio::test]
+    async fn quick_setup_anthropic_custom_without_model_uses_default() {
+        let _env_guard = env_lock().lock().await;
+        let _workspace_env = EnvVarGuard::unset("ZEROCLAW_WORKSPACE");
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+        let tmp = TempDir::new().unwrap();
+
+        let config = Box::pin(run_quick_setup_with_home(
+            Some("sk-proxy"),
+            Some("anthropic-custom:https://proxy.example.com"),
+            None,
+            Some("sqlite"),
+            false,
+            tmp.path(),
+        ))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            config.default_provider.as_deref(),
+            Some("anthropic-custom:https://proxy.example.com")
+        );
+        // default_model_for_provider falls through to the catch-all default
+        let expected = default_model_for_provider("anthropic-custom:https://proxy.example.com");
+        assert_eq!(config.default_model.as_deref(), Some(expected.as_str()));
     }
 
     #[tokio::test]
