@@ -27,22 +27,6 @@ impl CronUpdateTool {
             });
         }
 
-        if self.security.is_rate_limited() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".to_string()),
-            });
-        }
-
         None
     }
 }
@@ -246,6 +230,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::security::AutonomyLevel;
+    use crate::tools::RateLimitedTool;
     use tempfile::TempDir;
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
@@ -265,6 +250,13 @@ mod tests {
             &cfg.autonomy,
             &cfg.workspace_dir,
         ))
+    }
+
+    fn wrapped_cron_update(
+        cfg: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+    ) -> RateLimitedTool<CronUpdateTool> {
+        RateLimitedTool::new(CronUpdateTool::new(cfg, security.clone()), security)
     }
 
     #[tokio::test]
@@ -493,7 +485,7 @@ mod tests {
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = Arc::new(config);
         let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
-        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg));
+        let tool = wrapped_cron_update(cfg.clone(), test_security(&cfg));
 
         let result = tool
             .execute(json!({
