@@ -32,6 +32,12 @@ impl XlsxReadTool {
 /// `xl/sharedStrings.xml` with a string pool, and `xl/workbook.xml` with sheet
 /// names. Text cells reference the shared string pool by index; inline and
 /// numeric values are taken directly from `<v>` elements.
+/// Read an XLSX file from disk and extract text. Public API for cross-tool use.
+pub fn extract_xlsx_text_from_path(path: &std::path::Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)?;
+    extract_xlsx_text(&bytes)
+}
+
 fn extract_xlsx_text(bytes: &[u8]) -> anyhow::Result<String> {
     extract_xlsx_text_with_limits(bytes, MAX_TOTAL_SHEET_XML_BYTES)
 }

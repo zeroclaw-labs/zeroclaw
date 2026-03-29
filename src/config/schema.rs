@@ -1198,7 +1198,7 @@ fn default_cross_session_max_bytes() -> usize {
 }
 
 fn default_cross_session_turn_max_chars() -> usize {
-    2_000
+    6_000 // Full conversation turns — do NOT summarize, preserve exact wording and nuance
 }
 
 fn default_loop_detection_no_progress_threshold() -> usize {

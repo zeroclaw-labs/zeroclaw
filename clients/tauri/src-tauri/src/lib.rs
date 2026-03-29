@@ -1818,12 +1818,24 @@ async fn convert_pdf_dual(
         return Err("Both pdf2htmlEX and PyMuPDF conversion failed. Install pdf2htmlEX and/or pymupdf4llm.".to_string());
     }
 
+    // Handle partial failures: one engine succeeded but the other failed
+    let mut warnings = Vec::new();
+    if !viewer_html.is_empty() && markdown.is_empty() {
+        warnings.push("PyMuPDF markdown extraction failed — editor will show HTML-only preview.");
+        // Generate basic markdown from viewer HTML as fallback
+        markdown = nanohtml2text::html2text(&viewer_html);
+    }
+    if viewer_html.is_empty() && !markdown.is_empty() {
+        warnings.push("pdf2htmlEX not available — viewer will show simplified HTML from PyMuPDF.");
+    }
+
     Ok(serde_json::json!({
         "success": true,
         "viewer_html": viewer_html,
         "markdown": markdown,
         "page_count": page_count,
         "engine": engine,
+        "warnings": warnings,
     }))
 }
 

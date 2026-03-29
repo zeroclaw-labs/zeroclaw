@@ -1757,6 +1757,94 @@ MoA: "쿠팡 저장된 계정이 있습니다.
 
 ---
 
+### Conversation Context Token Optimization — Memo Substitution
+
+MoA uses a **human-inspired memo substitution** strategy to maintain
+conversation continuity while minimizing token waste.
+
+#### Core Insight
+
+Normal human conversation turns rarely exceed 2,000 characters.
+When a turn is longer, it's almost always:
+- Attached documents or reports
+- Search results or RAG output
+- Code blocks or technical analysis
+- Copy-pasted external content
+
+These are **reference material**, not conversational flow. Humans don't
+memorize entire documents mid-conversation — they take notes and refer
+back when needed. MoA does the same.
+
+#### How It Works
+
+```
+Storage: Always stores FULL verbatim text (no data loss)
+Recall:  Smart context injection based on turn length
+
+Turn < 2,000 chars → Verbatim (natural conversation)
+Turn ≥ 2,000 chars → Memo substitution:
+
+  ┌─────────────────────────────────────────────────┐
+  │ Opening 300 chars  (대화 도입부 — 주제/맥락)      │
+  │ ─────────────────────────────────────────────── │
+  │ 📋 MEMO (10% of original):                      │
+  │   [콘텐츠 유형: 코드, URL, 검색결과]               │
+  │   섹션별 6W 요약:                                 │
+  │   - 주제1: 누가/무엇을/언제/어디서/왜/어떻게       │
+  │   - 주제2: ...                                   │
+  │   ▸ 질문/요청: 마지막 질문이나 제안                │
+  │ ─────────────────────────────────────────────── │
+  │ Closing 300 chars  (추가 질문, 대화 전환점)       │
+  └─────────────────────────────────────────────────┘
+```
+
+#### Proportional Memo Size (10% Rule)
+
+| Original | Memo Size | Rationale |
+|----------|-----------|-----------|
+| 2,000자 | ~200자 | Short professional content |
+| 10,000자 | ~1,000자 | Multi-topic analysis |
+| 50,000자 | ~5,000자 | Large document with many sections |
+| 100,000자 | ~10,000자 (cap) | Full report — section-level summaries |
+
+#### Memo Structure
+
+For multi-topic content, each section is summarized separately:
+
+```
+[코드, URL]
+§1. 대법원 2026다12345 — 임대차보호법 제3조 위반 | 원고 승소
+§2. 대법원 2026다67890 — 상가임대차 갱신권 | 기각, 임대인 정당사유 인정
+§3. 관련 하급심 — 서울고법 2025나45678 | 항소 기각
+▸ 질문: 두번째 판례 자세히 알려드릴까요?
+```
+
+#### On-Demand Deep Retrieval
+
+When the memo is insufficient and the user needs full detail:
+1. LLM recognizes the topic from the memo
+2. Calls `memory_recall` with specific keywords
+3. Full original text is retrieved via vector/keyword search
+4. Injected as additional context for that specific question
+
+```
+User: "아까 두번째 판례 원문 보여줘"
+  → LLM sees memo: "§2. 대법원 2026다67890 — 상가임대차 갱신권"
+  → memory_recall("대법원 2026다67890 상가임대차")
+  → Full 5,000 char analysis retrieved and provided
+```
+
+#### Token Savings
+
+| Scenario | Without Memo | With Memo | Savings |
+|----------|-------------|-----------|---------|
+| 10-turn chat (3 long) | ~17,000자 | ~5,000자 | **70%** |
+| 20-turn coding session | ~40,000자 | ~8,000자 | **80%** |
+| Normal short chat | ~2,000자 | ~2,000자 | 0% |
+| 100K doc discussion | ~100,000자 | ~12,000자 | **88%** |
+
+---
+
 ## 6★★. MoA Unified Memory Architecture — Cross-Referenced Dual-Store System
 
 ### Overview

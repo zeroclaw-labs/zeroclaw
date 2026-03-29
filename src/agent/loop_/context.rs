@@ -33,6 +33,47 @@ pub(super) async fn build_context(
     let mut seen_memory_keys = HashSet::new();
     let mut cross_search_keywords = Vec::new();
 
+    // ── Phase 0: Essential profile recall (ALWAYS loaded) ──────
+    // These keys are loaded regardless of the user's message content.
+    // Without this, greeting messages like "안녕" would not retrieve
+    // the user's name, occupation, or preferred form of address.
+    const ESSENTIAL_PROFILE_KEYS: &[&str] = &[
+        "user_profile_identity",
+        "user_profile_family",
+        "user_profile_work",
+        "user_profile_lifestyle",
+        "user_profile_communication",
+        "user_profile_routine",
+        "user_moa_preferences",
+    ];
+
+    let mut essential_loaded = false;
+    for key in ESSENTIAL_PROFILE_KEYS {
+        if let Ok(Some(entry)) = mem.get(key).await {
+            if !essential_loaded {
+                context.push_str("[User profile — always loaded]\n");
+                essential_loaded = true;
+            }
+            seen_memory_keys.insert(entry.key.clone());
+            let ts_hint = if entry.timestamp.is_empty() {
+                String::new()
+            } else {
+                let short_ts = if entry.timestamp.len() > 19 {
+                    &entry.timestamp[..19]
+                } else {
+                    &entry.timestamp
+                };
+                format!(" [{}]", short_ts)
+            };
+            let line = format!("- {}:{} {}\n", entry.key, ts_hint, entry.content);
+            context.push_str(&line);
+            extract_cross_search_keywords(&entry.content, &mut cross_search_keywords);
+        }
+    }
+    if essential_loaded {
+        context.push('\n');
+    }
+
     // ── Phase 1: Primary memory recall ──────────────────────────
     if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
         let relevant: Vec<_> = entries
@@ -50,7 +91,19 @@ pub(super) async fn build_context(
                     continue;
                 }
                 seen_memory_keys.insert(entry.key.clone());
-                let line = format!("- {}: {}\n", entry.key, entry.content);
+                // Include timestamp so the LLM knows WHEN this memory was recorded
+                let ts_hint = if entry.timestamp.is_empty() {
+                    String::new()
+                } else {
+                    // Truncate to date+time (no timezone suffix) for readability
+                    let short_ts = if entry.timestamp.len() > 19 {
+                        &entry.timestamp[..19]
+                    } else {
+                        &entry.timestamp
+                    };
+                    format!(" [{}]", short_ts)
+                };
+                let line = format!("- {}:{} {}\n", entry.key, ts_hint, entry.content);
                 context.push_str(&line);
 
                 // Extract time/place/person keywords from memory content
@@ -279,15 +332,21 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 
 /// Build cross-session recent conversation context from stored turns.
 ///
-/// Formats the most recent turns as `[Recent conversation history]` for injection
-/// into the LLM context, providing conversational continuity across sessions.
+/// Uses a **memo substitution** strategy inspired by how humans handle conversation:
+/// - Short turns (< MEMO_THRESHOLD chars): included verbatim — these are natural dialogue
+/// - Long turns (>= MEMO_THRESHOLD chars): likely contain attached documents, search results,
+///   code blocks, or RAG output. These are replaced with a compact memo:
+///   `[opening] ... [MEMO: summary — full content searchable via "keyword"] ... [closing]`
+///
+/// This preserves conversational flow and nuance while avoiding token waste on
+/// professional/technical content that can be retrieved on demand via vector search.
 ///
 /// # Parameters
 /// - `turns`: recent conversation turns (oldest-first, chronological order)
 /// - `skip_current`: number of trailing turns to skip (e.g. 1 to skip the
 ///   current user message that was just appended)
 /// - `max_bytes`: maximum total bytes for the context block
-/// - `turn_max_chars`: maximum characters per individual turn content
+/// - `turn_max_chars`: maximum characters per individual turn content (used as MEMO_THRESHOLD)
 pub(super) fn build_cross_session_context(
     turns: &[ChatMessage],
     skip_current: usize,
@@ -303,46 +362,54 @@ pub(super) fn build_cross_session_context(
         return String::new();
     }
 
-    const HEADER: &str = "[Recent conversation history]\n";
+    const HEADER: &str = "[Recent conversation history — verbatim, continue this conversation naturally]\n";
+    // Threshold for memo substitution: turns shorter than this are verbatim.
+    // Typical human conversation turns are well under 2000 chars.
+    // Longer turns are almost always documents, code, search results, or RAG output.
+    let memo_threshold = turn_max_chars.min(2000);
 
-    // Pre-allocate: estimate ~80 bytes per turn to reduce reallocations for
-    // large turn counts (up to 600).
-    let estimated = HEADER.len() + take_count.min(600) * 80;
-    let mut ctx = String::with_capacity(estimated.min(max_bytes + 256));
+    let estimated = HEADER.len() + take_count.min(600) * 120;
+    let mut ctx = String::with_capacity(estimated.min(max_bytes + 512));
     ctx.push_str(HEADER);
     let mut total = HEADER.len();
 
     for turn in turns.iter().take(take_count) {
         let label = if turn.role == "user" { "User" } else { "Assistant" };
         let content = &turn.content;
-
-        // Calculate line length without allocating a temporary String when
-        // the turn content fits within the character limit.
         let char_count = content.chars().count();
-        if char_count <= turn_max_chars {
-            // Fast path: content fits — write directly into ctx.
-            let line_len = label.len() + 2 + content.len() + 1; // "Label: content\n"
-            if total + line_len > max_bytes {
-                break;
-            }
-            total += line_len;
-            ctx.push_str(label);
-            ctx.push_str(": ");
-            ctx.push_str(content);
-            ctx.push('\n');
+
+        let formatted = if char_count <= memo_threshold {
+            // ── Short turn: verbatim (natural conversation) ──
+            format!("{label}: {content}\n")
         } else {
-            // Slow path: content needs truncation.
-            let truncated = truncate_chars(content, turn_max_chars);
-            let line_len = label.len() + 2 + truncated.len() + 1;
-            if total + line_len > max_bytes {
-                break;
-            }
-            total += line_len;
-            ctx.push_str(label);
-            ctx.push_str(": ");
-            ctx.push_str(&truncated);
-            ctx.push('\n');
+            // ── Long turn: memo substitution ──
+            // Preserve: opening (~300 chars), closing (~300 chars), generate memo for middle
+            let opening_chars = 300;
+            let closing_chars = 300;
+
+            let opening: String = content.chars().take(opening_chars).collect();
+            let closing: String = content
+                .chars()
+                .rev()
+                .take(closing_chars)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+
+            // Generate a compact memo from the middle content
+            let memo = generate_turn_memo(content, char_count);
+
+            format!(
+                "{label}: {opening}\n  [📋 MEMO ({char_count}자 중 요약): {memo}]\n  ...{closing}\n"
+            )
+        };
+
+        if total + formatted.len() > max_bytes {
+            break;
         }
+        total += formatted.len();
+        ctx.push_str(&formatted);
     }
 
     if ctx.len() == HEADER.len() {
@@ -351,6 +418,186 @@ pub(super) fn build_cross_session_context(
         ctx.push('\n');
         ctx
     }
+}
+
+/// Generate a proportional memo from a long conversation turn.
+///
+/// Memo size = 10% of the original content length (not a fixed 200 chars).
+/// For multi-topic content, each topic/item is summarized separately
+/// following the 6W principle (who/what/when/where/why/how).
+///
+/// Examples:
+/// - 2,000 char turn → ~200 char memo
+/// - 10,000 char turn → ~1,000 char memo
+/// - 100,000 char turn → ~10,000 char memo
+fn generate_turn_memo(content: &str, char_count: usize) -> String {
+    // Memo budget: 10% of original, minimum 100 chars, maximum 10,000 chars
+    let memo_budget = (char_count / 10).clamp(100, 10_000);
+
+    let mut memo_parts: Vec<String> = Vec::new();
+
+    // 1. Content type detection
+    let mut content_types = Vec::new();
+    if content.contains("```") || content.contains("fn ") || content.contains("function ") {
+        content_types.push("코드");
+    }
+    if content.contains("http://") || content.contains("https://") {
+        content_types.push("URL");
+    }
+    if content.contains("검색 결과") || content.contains("Search results") {
+        content_types.push("검색결과");
+    }
+    if !content_types.is_empty() {
+        memo_parts.push(format!("[{}]", content_types.join(", ")));
+    }
+
+    // 2. Extract section-level summaries for multi-topic content
+    //    Split by blank lines, headers (##, ###), or numbered items (1., 2.)
+    let sections = split_into_sections(content);
+    let chars_per_section = if sections.is_empty() {
+        memo_budget
+    } else {
+        (memo_budget / sections.len()).max(50)
+    };
+
+    for section in &sections {
+        let summary = summarize_section(section, chars_per_section);
+        if !summary.is_empty() {
+            memo_parts.push(summary);
+        }
+    }
+
+    // 3. Extract trailing question or action item
+    let last_lines: Vec<&str> = content
+        .lines()
+        .rev()
+        .filter(|l| l.trim().len() > 5)
+        .take(3)
+        .collect();
+    for line in last_lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.contains('?') || trimmed.contains("할까") || trimmed.contains("드릴까")
+            || trimmed.contains("하시겠") || trimmed.contains("해줘") || trimmed.contains("알려")
+            || trimmed.contains("확인") || trimmed.contains("제안")
+        {
+            let question: String = trimmed.chars().take(chars_per_section).collect();
+            memo_parts.push(format!("▸ 질문/요청: {question}"));
+            break;
+        }
+    }
+
+    let memo = memo_parts.join("\n");
+    if memo.is_empty() {
+        format!("{char_count}자 장문 — 필요 시 memory_recall로 검색 가능")
+    } else {
+        // Final cap at memo_budget
+        let result: String = memo.chars().take(memo_budget).collect();
+        result
+    }
+}
+
+/// Split content into logical sections by blank lines, headers, or numbered lists.
+fn split_into_sections(content: &str) -> Vec<String> {
+    let mut sections: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Section break: blank line, markdown header, or numbered item start
+        let is_break = trimmed.is_empty()
+            || trimmed.starts_with("## ")
+            || trimmed.starts_with("### ")
+            || trimmed.starts_with("---")
+            || (trimmed.len() > 2
+                && trimmed.chars().next().map_or(false, |c| c.is_ascii_digit())
+                && (trimmed.contains(". ") || trimmed.contains(") ")));
+
+        if is_break && !current.trim().is_empty() {
+            sections.push(std::mem::take(&mut current));
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        sections.push(current);
+    }
+
+    // Merge very small sections (< 50 chars) into previous
+    let mut merged: Vec<String> = Vec::new();
+    for section in sections {
+        if section.trim().chars().count() < 50 {
+            if let Some(last) = merged.last_mut() {
+                last.push_str(&section);
+            } else {
+                merged.push(section);
+            }
+        } else {
+            merged.push(section);
+        }
+    }
+
+    merged
+}
+
+/// Summarize a single section to fit within `budget` characters.
+/// Extracts the 6W essence: who did what, when, where, why, how.
+fn summarize_section(section: &str, budget: usize) -> String {
+    let trimmed = section.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // If section fits within budget, return as-is
+    let char_count = trimmed.chars().count();
+    if char_count <= budget {
+        return trimmed.to_string();
+    }
+
+    // Extract first meaningful line as topic
+    let first_line = trimmed
+        .lines()
+        .find(|l| l.trim().len() > 5)
+        .unwrap_or("")
+        .trim();
+
+    let topic: String = first_line.chars().take(budget.min(120)).collect();
+
+    // If budget allows, add more context from the section
+    if budget > 150 {
+        let remaining_budget = budget - topic.chars().count() - 10;
+        // Extract key sentences (lines containing important markers)
+        let key_sentences: Vec<&str> = trimmed
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                let t = l.trim();
+                t.len() > 10
+                    && (t.contains("결과") || t.contains("결론") || t.contains("요약")
+                        || t.contains("중요") || t.contains("핵심") || t.contains("따라서")
+                        || t.contains("때문") || t.contains("위해") || t.contains("Result")
+                        || t.contains("Summary") || t.contains("because") || t.contains("therefore")
+                        || t.starts_with("- ") || t.starts_with("* "))
+            })
+            .collect();
+
+        if !key_sentences.is_empty() {
+            let mut extra = String::new();
+            for sentence in key_sentences {
+                let s = sentence.trim();
+                if extra.chars().count() + s.chars().count() > remaining_budget {
+                    break;
+                }
+                extra.push_str(" | ");
+                extra.push_str(s);
+            }
+            if !extra.is_empty() {
+                return format!("{topic}{extra}");
+            }
+        }
+    }
+
+    topic
 }
 
 #[cfg(test)]
@@ -406,11 +653,27 @@ mod tests {
 
     #[test]
     fn build_cross_session_truncates_long_turns() {
+        // Long turns (>= memo_threshold) should be memo-substituted, not just truncated
         let turns = vec![ChatMessage {
             role: "user".into(),
-            content: "a".repeat(1000),
+            content: "a".repeat(3000),
         }];
-        let ctx = build_cross_session_context(&turns, 0, 16000, 10);
-        assert!(ctx.contains(&format!("User: {}…", "a".repeat(10))));
+        let ctx = build_cross_session_context(&turns, 0, 16000, 2000);
+        // Should contain memo marker, not raw 3000 'a's
+        assert!(ctx.contains("MEMO"));
+        // Should NOT contain the full 3000-char content
+        assert!(ctx.len() < 2000);
+    }
+
+    #[test]
+    fn build_cross_session_short_turns_verbatim() {
+        let turns = vec![
+            ChatMessage { role: "user".into(), content: "안녕하세요 변호사님".into() },
+            ChatMessage { role: "assistant".into(), content: "네, 변호사님! 무엇을 도와드릴까요?".into() },
+        ];
+        let ctx = build_cross_session_context(&turns, 0, 16000, 2000);
+        // Short turns should be verbatim
+        assert!(ctx.contains("User: 안녕하세요 변호사님"));
+        assert!(ctx.contains("Assistant: 네, 변호사님! 무엇을 도와드릴까요?"));
     }
 }

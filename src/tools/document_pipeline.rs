@@ -425,6 +425,7 @@ impl DocumentPipelineTool {
     }
 
     /// Process office documents (HWP, DOCX, XLSX, PPTX) via Hancom DocsConverter API.
+    /// Falls back to local parsers for DOCX/XLSX/PPTX if Hancom is unreachable.
     async fn process_office_document(
         &self,
         path: &Path,
@@ -432,6 +433,75 @@ impl DocumentPipelineTool {
     ) -> anyhow::Result<DocumentOutput> {
         tracing::info!("Processing office document: {} ({})", path.display(), ext);
 
+        // Try Hancom first, fall back to local parsing for supported formats
+        match self.process_office_via_hancom(path, ext).await {
+            Ok(output) => return Ok(output),
+            Err(e) => {
+                tracing::warn!("Hancom conversion failed: {e}, trying local fallback...");
+
+                // Local fallback for formats we can parse directly
+                match ext {
+                    "docx" => {
+                        let text = super::docx_read::extract_docx_text_from_path(path)?;
+                        let html = format!("<div class=\"docx-content\">{}</div>",
+                            text.lines()
+                                .map(|l| format!("<p>{}</p>", html_escape(l)))
+                                .collect::<Vec<_>>()
+                                .join("\n"));
+                        return Ok(DocumentOutput {
+                            markdown: text.clone(),
+                            html,
+                            doc_type: "office_docx".to_string(),
+                            page_count: 0,
+                            engine: "local_docx_parser".to_string(),
+                        });
+                    }
+                    "xlsx" => {
+                        let text = super::xlsx_read::extract_xlsx_text_from_path(path)?;
+                        let html = format!("<pre>{}</pre>", html_escape(&text));
+                        return Ok(DocumentOutput {
+                            markdown: text,
+                            html,
+                            doc_type: "office_xlsx".to_string(),
+                            page_count: 0,
+                            engine: "local_xlsx_parser".to_string(),
+                        });
+                    }
+                    "pptx" => {
+                        let text = super::pptx_read::extract_pptx_text_from_path(path)?;
+                        let html = format!("<div class=\"pptx-content\">{}</div>",
+                            text.lines()
+                                .map(|l| format!("<p>{}</p>", html_escape(l)))
+                                .collect::<Vec<_>>()
+                                .join("\n"));
+                        return Ok(DocumentOutput {
+                            markdown: text,
+                            html,
+                            doc_type: "office_pptx".to_string(),
+                            page_count: 0,
+                            engine: "local_pptx_parser".to_string(),
+                        });
+                    }
+                    "hwp" | "hwpx" => {
+                        // No local fallback for HWP — return error with guidance
+                        anyhow::bail!(
+                            "HWP/HWPX 변환에 실패했습니다 (Hancom 서버 미응답). \
+                             HWP 파일은 한컴오피스에서 DOCX로 변환 후 다시 시도해주세요. \
+                             원인: {e}"
+                        );
+                    }
+                    _ => return Err(e),
+                }
+            }
+        }
+    }
+
+    /// Internal: Process via Hancom DocsConverter API.
+    async fn process_office_via_hancom(
+        &self,
+        path: &Path,
+        ext: &str,
+    ) -> anyhow::Result<DocumentOutput> {
         let module = hancom_module_code(ext).ok_or_else(|| {
             anyhow::anyhow!("Unsupported extension for Hancom DocsConverter: .{ext}")
         })?;
@@ -853,6 +923,14 @@ fn text_to_markdown(text: &str) -> String {
 /// Public wrapper for HTML→Markdown conversion used by gateway endpoints.
 pub fn html_to_markdown_public(html: &str) -> String {
     html_to_markdown(html)
+}
+
+/// Escape HTML special characters for safe embedding in HTML output.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 /// Convert HTML to Markdown (simplified conversion).

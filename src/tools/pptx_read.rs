@@ -30,6 +30,12 @@ impl PptxReadTool {
 ///
 /// PPTX is a ZIP archive containing `ppt/slides/slide*.xml`.
 /// Text lives inside `<a:t>` elements; paragraphs are delimited by `<a:p>`.
+/// Read a PPTX file from disk and extract text. Public API for cross-tool use.
+pub fn extract_pptx_text_from_path(path: &std::path::Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)?;
+    extract_pptx_text(&bytes)
+}
+
 fn extract_pptx_text(bytes: &[u8]) -> anyhow::Result<String> {
     extract_pptx_text_with_limits(bytes, MAX_TOTAL_SLIDE_XML_BYTES)
 }

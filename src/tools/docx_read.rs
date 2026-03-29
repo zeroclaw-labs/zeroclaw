@@ -24,6 +24,12 @@ impl DocxReadTool {
 
 /// Extract plain text from DOCX bytes.
 ///
+/// Read a DOCX file from disk and extract text. Public API for cross-tool use.
+pub fn extract_docx_text_from_path(path: &std::path::Path) -> anyhow::Result<String> {
+    let bytes = std::fs::read(path)?;
+    extract_docx_text(&bytes)
+}
+
 /// DOCX is a ZIP archive containing `word/document.xml`.
 /// Text lives inside `<w:t>` elements; paragraphs are delimited by `<w:p>`.
 fn extract_docx_text(bytes: &[u8]) -> anyhow::Result<String> {

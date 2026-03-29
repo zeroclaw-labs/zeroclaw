@@ -1094,17 +1094,21 @@ export class MoAClient {
     // and is sent per-request in the chat body.
     if (!this.gatewayAlive) return;
 
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+      ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
+    };
+    const body = JSON.stringify({ provider, api_key: key });
+
     try {
-      const res = await fetch(`${this.serverUrl}/api/config/api-key`, {
-        method: "PUT",
-        headers: {
-          "Content-Type": "application/json",
-          ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
-        },
-        body: JSON.stringify({ provider, api_key: key }),
-      });
-      if (!res.ok) {
-        // Non-critical — key lives in localStorage
+      if (isTauri()) {
+        await gatewayFetch(
+          `${this.serverUrl}/api/config/api-key`, "PUT", headers, body,
+        );
+      } else {
+        await fetch(`${this.serverUrl}/api/config/api-key`, {
+          method: "PUT", headers, body,
+        });
       }
     } catch {
       // Local gateway unreachable — key is safe in localStorage
@@ -1232,22 +1236,37 @@ export class MoAClient {
    *  so all file tools (file_read, file_write, file_edit, etc.) work immediately. */
   async setWorkspaceDir(dirPath: string): Promise<string> {
     await this.requireGateway();
-    const headers = {
+    const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
     };
 
-    // 1. Set workspace_dir in config
-    const res = await fetch(`${this.serverUrl}/api/workspace`, {
-      method: "PUT",
-      headers,
-      body: JSON.stringify({ path: dirPath }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({ error: "Failed to set workspace" }));
-      throw new Error(data.error || `Failed to set workspace (${res.status})`);
+    // 1. Set workspace_dir in config (use gateway proxy in Tauri mode)
+    let data: Record<string, string>;
+    if (isTauri()) {
+      const result = await gatewayFetch(
+        `${this.serverUrl}/api/workspace`,
+        "PUT",
+        headers,
+        JSON.stringify({ path: dirPath }),
+      );
+      if (!result || result.status >= 400) {
+        const errBody = result ? JSON.parse(result.body) : { error: "Gateway unreachable" };
+        throw new Error(errBody.error || `Failed to set workspace (${result?.status})`);
+      }
+      data = JSON.parse(result.body);
+    } else {
+      const res = await fetch(`${this.serverUrl}/api/workspace`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ path: dirPath }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({ error: "Failed to set workspace" }));
+        throw new Error(errData.error || `Failed to set workspace (${res.status})`);
+      }
+      data = await res.json();
     }
-    const data = await res.json();
     this.workspaceConnected = true;
     this.workspacePath = data.workspace_dir ?? dirPath;
 
@@ -1255,11 +1274,20 @@ export class MoAClient {
     //    This enables file_read/file_write/file_edit/glob_search etc.
     //    The user clicking "폴더 연결" is implicit consent for folder access.
     try {
-      await fetch(`${this.serverUrl}/api/workspace/folder`, {
-        method: "PUT",
-        headers,
-        body: JSON.stringify({ path: this.workspacePath }),
-      });
+      if (isTauri()) {
+        await gatewayFetch(
+          `${this.serverUrl}/api/workspace/folder`,
+          "PUT",
+          headers,
+          JSON.stringify({ path: this.workspacePath }),
+        );
+      } else {
+        await fetch(`${this.serverUrl}/api/workspace/folder`, {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({ path: this.workspacePath }),
+        });
+      }
     } catch {
       // Non-critical — workspace is set, tools may still work within workspace_dir
     }
@@ -1271,30 +1299,55 @@ export class MoAClient {
    *  Also grants folder access automatically after clone. */
   async connectGitHubRepo(repoUrl: string): Promise<string> {
     await this.requireGateway();
-    const headers = {
+    const headers: Record<string, string> = {
       "Content-Type": "application/json",
       ...(this.token ? { Authorization: `Bearer ${this.token}` } : {}),
     };
-    const res = await fetch(`${this.serverUrl}/api/workspace`, {
-      method: "PUT",
-      headers,
-      body: JSON.stringify({ git_url: repoUrl }),
-    });
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({ error: "Failed to connect repo" }));
-      throw new Error(data.error || `Failed to connect repo (${res.status})`);
+
+    let data: Record<string, string>;
+    if (isTauri()) {
+      const result = await gatewayFetch(
+        `${this.serverUrl}/api/workspace`,
+        "PUT",
+        headers,
+        JSON.stringify({ git_url: repoUrl }),
+      );
+      if (!result || result.status >= 400) {
+        const errBody = result ? JSON.parse(result.body) : { error: "Gateway unreachable" };
+        throw new Error(errBody.error || `Failed to connect repo (${result?.status})`);
+      }
+      data = JSON.parse(result.body);
+    } else {
+      const res = await fetch(`${this.serverUrl}/api/workspace`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify({ git_url: repoUrl }),
+      });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({ error: "Failed to connect repo" }));
+        throw new Error(errData.error || `Failed to connect repo (${res.status})`);
+      }
+      data = await res.json();
     }
-    const data = await res.json();
     this.workspaceConnected = true;
     this.workspacePath = data.workspace_dir ?? repoUrl;
 
     // Grant folder access for cloned repo
     try {
-      await fetch(`${this.serverUrl}/api/workspace/folder`, {
-        method: "PUT",
-        headers,
-        body: JSON.stringify({ path: this.workspacePath }),
-      });
+      if (isTauri()) {
+        await gatewayFetch(
+          `${this.serverUrl}/api/workspace/folder`,
+          "PUT",
+          headers,
+          JSON.stringify({ path: this.workspacePath }),
+        );
+      } else {
+        await fetch(`${this.serverUrl}/api/workspace/folder`, {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({ path: this.workspacePath }),
+        });
+      }
     } catch {
       // Non-critical
     }

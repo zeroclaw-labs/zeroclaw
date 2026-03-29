@@ -55,3 +55,12 @@ credentials.json
 # Nix
 result
 model_pricing.toml
+
+# Document skills: only include the 4 core skills (docx, pdf, xlsx, pptx)
+# Law-specific skills are excluded from the general MoA app
+.claude/skills/document_skills/*
+!.claude/skills/document_skills/docx/
+!.claude/skills/document_skills/pdf/
+!.claude/skills/document_skills/xlsx/
+!.claude/skills/document_skills/pptx/
+!.claude/skills/document_skills/CATEGORY_STRUCTURE.md

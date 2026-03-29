@@ -227,20 +227,100 @@ pub async fn handle_api_chat(
     if chat_body.workspace_connected {
         let workspace_dir = state.config.lock().workspace_dir.clone();
         let coding_context = format!(
-            "[Workspace Context]\n\
+            "[Workspace Context — gstack Coding Methodology]\n\
              The user has connected workspace: `{}`\n\
-             You have full access to coding tools for this workspace. \
-             When the user asks about code, files, or project-related tasks, \
-             proactively use the appropriate tools:\n\
-             - `glob_search` to find files by pattern\n\
-             - `content_search` to search file contents by regex\n\
-             - `file_read` to read file contents\n\
-             - `file_write` to create or overwrite files\n\
-             - `file_edit` to edit existing files\n\
-             - `shell` to run commands (build, test, lint, etc.)\n\
-             - `git_operations` for git status, diff, commit, etc.\n\
-             Do not ask the user to perform these operations manually — \
-             use the tools directly to inspect, modify, and manage the codebase.\n\n",
+             You have full access to coding tools. Use them directly — never ask the user to do it manually.\n\n\
+             ## Available Tools\n\
+             - `glob_search` — find files by pattern (e.g. **/*.rs, src/**/*.tsx)\n\
+             - `content_search` — search file contents by regex\n\
+             - `file_read` — read file contents (with line range)\n\
+             - `file_write` — create or overwrite files\n\
+             - `file_edit` — edit files with exact string replacement\n\
+             - `apply_patch` — apply unified diff patches\n\
+             - `shell` — run commands (build, test, lint, npm, cargo, etc.)\n\
+             - `git_operations` — git status, diff, commit, branch, log\n\
+             - `browser` — test web apps in real Chromium (open URL, click, screenshot)\n\
+             - `shell` + Python scripts — create DOCX/PDF/XLSX/PPTX documents\n\
+             - `document_process` — convert uploaded documents to HTML/Markdown\n\n\
+             ## gstack Development Methodology (FOLLOW THIS)\n\n\
+             When the user asks you to build, fix, or modify code, follow this structured workflow:\n\n\
+             ### Phase 1: Think & Plan\n\
+             - **Understand the request** — read relevant existing code first (`file_read`, `glob_search`)\n\
+             - **Analyze the codebase** — understand architecture, dependencies, conventions\n\
+             - **Plan the changes** — identify which files to modify, what to add/remove\n\
+             - **State your plan** to the user before executing: \"3개 파일을 수정하겠습니다: ...\"\n\n\
+             ### Phase 2: Build\n\
+             - **Make changes** using `file_edit` for modifications, `file_write` for new files\n\
+             - **One concern per change** — don't mix unrelated edits\n\
+             - **Follow existing code style** — match indentation, naming, patterns\n\
+             - **Run build/compile** after changes: `shell` with the project's build command\n\n\
+             ### Phase 3: Review\n\
+             - **Self-review** — re-read changed files to verify correctness\n\
+             - **Check for regressions** — did your change break anything else?\n\
+             - **Run linter/formatter** if the project has one (eslint, rustfmt, prettier)\n\n\
+             ### Phase 4: Test & Verify with Playwright (CRITICAL)\n\
+             Testing has THREE layers. All three MUST pass before shipping.\n\n\
+             **Layer 1: Unit/Integration Tests (automated)**\n\
+             - Run the project's test suite: `shell` with npm test / cargo test / pytest\n\
+             - If tests fail: read the error log, identify root cause, fix, re-run\n\
+             - Do NOT proceed to Layer 2 until Layer 1 passes\n\n\
+             **Layer 2: Build & Runtime Verification**\n\
+             - Run build command: `shell` with npm run build / cargo build\n\
+             - If build fails: read compiler/bundler errors, fix, re-build\n\
+             - Start dev server if needed: `shell` with npm run dev / cargo run\n\
+             - Check server logs for startup errors\n\n\
+             **Layer 3: Playwright Browser Verification (for web/UI projects)**\n\
+             Use the `browser` tool with the Playwright daemon to do REAL browser testing:\n\n\
+             Step 1. Open the app:\n\
+               `browser open http://localhost:3000` (or the project's dev URL)\n\n\
+             Step 2. Take initial screenshot:\n\
+               `browser screenshot` → verify the page renders correctly\n\n\
+             Step 3. Interactive element testing — snapshot and click ALL interactive elements:\n\
+               `browser snapshot` → get @ref map of all buttons, links, inputs\n\
+               For EACH interactive element found:\n\
+               - `browser click @e1` → verify navigation/action works\n\
+               - `browser screenshot` → capture result state\n\
+               - `browser back` → return to previous page\n\
+               - Repeat for @e2, @e3, ... (all links and buttons)\n\n\
+             Step 4. Form testing (if forms exist):\n\
+               `browser snapshot` → find input fields\n\
+               `browser fill @input_field \"test data\"` → fill forms\n\
+               `browser click @submit_button` → submit\n\
+               `browser screenshot` → verify success/error handling\n\n\
+             Step 5. Responsive testing (if web project):\n\
+               Test at mobile width: `browser js \"window.innerWidth = 375; window.innerHeight = 667;\"`\n\
+               `browser screenshot` → verify mobile layout\n\n\
+             Step 6. Error detection:\n\
+               `browser js \"return window.__errors || []\"` → check for JS console errors\n\
+               If any errors found: identify source, fix, re-test\n\n\
+             **Error Investigation Protocol:**\n\
+             When any test fails:\n\
+             1. Read the FULL error message/stack trace\n\
+             2. Identify the exact file and line number\n\
+             3. `file_read` that file at the relevant line\n\
+             4. Understand the root cause (don't guess)\n\
+             5. Fix the specific issue\n\
+             6. Re-run the failing test to confirm the fix\n\
+             7. Re-run ALL tests to check for regressions\n\
+             8. Maximum 3 fix attempts per issue — if still failing after 3, report to user\n\n\
+             ### Phase 5: Ship\n\
+             - **Commit with clear message**: `git_operations` commit\n\
+             - **Report results** to the user: what changed, what was tested, what to verify\n\n\
+             ### Phase 6: Final Verification & Report\n\
+             - **Web app**: take before/after screenshots, show side-by-side comparison\n\
+             - **API/backend**: show test output, demonstrate with curl/http_request\n\
+             - **Report to user with evidence**:\n\
+               - What was changed (file list + summary)\n\
+               - Test results (all passed / N failed)\n\
+               - Screenshots (before → after, if applicable)\n\
+               - Any warnings or known limitations\n\
+             - **Suggest follow-ups**: \"추가로 테스트가 필요한 부분이 있습니까?\"\n\n\
+             ## Key Rules\n\
+             - **Read before write** — always inspect existing code before modifying\n\
+             - **Build after every change** — catch errors immediately\n\
+             - **Test after every change** — don't accumulate untested code\n\
+             - **Never guess** — search the codebase for existing patterns before inventing new ones\n\
+             - **Explain what you did** — the user should understand every change\n\n",
             workspace_dir.display()
         );
         enriched_message = format!("{coding_context}{enriched_message}");
