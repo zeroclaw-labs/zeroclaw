@@ -4,6 +4,7 @@ use matrix_sdk::{
     Client as MatrixSdkClient, LoopCtrl, Room, RoomState, SessionMeta, SessionTokens,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
+    encryption::{BackupDownloadStrategy, EncryptionSettings},
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId,
         api::client::receipt::create_receipt,
@@ -580,7 +581,13 @@ impl MatrixChannel {
                     }
                 };
 
-                let mut client_builder = MatrixSdkClient::builder().homeserver_url(&self.homeserver);
+                let mut client_builder = MatrixSdkClient::builder()
+                    .homeserver_url(&self.homeserver)
+                    .with_encryption_settings(EncryptionSettings {
+                        auto_enable_cross_signing: true,
+                        auto_enable_backups: true,
+                        backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
+                    });
 
                 if let Some(store_dir) = self.matrix_store_dir() {
                     tokio::fs::create_dir_all(&store_dir).await.map_err(|error| {
@@ -608,6 +615,16 @@ impl MatrixChannel {
 
                 client.restore_session(session).await?;
                 tracing::debug!("Matrix session restored for device");
+
+                // Wait for the SDK's E2EE initialization tasks to complete.
+                // With the encryption settings above, this bootstraps
+                // cross-signing (so other devices will share room keys with
+                // us) and creates a key backup if none exists yet.
+                client
+                    .encryption()
+                    .wait_for_e2ee_initialization_tasks()
+                    .await;
+                tracing::debug!("Matrix E2EE initialization tasks completed");
 
                 // Attempt E2EE key recovery if a recovery key is configured
                 if let Some(ref key) = self.recovery_key {
@@ -774,20 +791,17 @@ impl MatrixChannel {
 
         if client.encryption().backups().are_enabled().await {
             tracing::info!("Matrix room-key backup is enabled for this device.");
+        } else if self.recovery_key.is_some() {
+            tracing::info!(
+                "Matrix room-key backup is not active on this device, but a recovery key is configured. \
+                 Room keys will be restored from server backup on startup."
+            );
         } else {
-            let _ = client.encryption().backups().disable().await;
-            if self.recovery_key.is_some() {
-                tracing::info!(
-                    "Matrix room-key backup is not active on this device, but a recovery key is configured. \
-                     Room keys will be restored from server backup on startup."
-                );
-            } else {
-                tracing::warn!(
-                    "Matrix room-key backup is not enabled for this device. \
-                     To automatically restore room keys after a device reset, set recovery_key in your Matrix config. \
-                     See docs/security/matrix-e2ee-guide.md section 4I."
-                );
-            }
+            tracing::warn!(
+                "Matrix room-key backup is not enabled for this device. \
+                 To automatically restore room keys after a device reset, set recovery_key in your Matrix config. \
+                 See docs/security/matrix-e2ee-guide.md section 4I."
+            );
         }
     }
 }
