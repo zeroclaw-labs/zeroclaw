@@ -27,9 +27,6 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::sync::Arc;
 
-/// Type alias for a path-extraction closure used by [`PathGuardedTool`].
-type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
-
 // ── RateLimitedTool ───────────────────────────────────────────────────────────
 
 /// Wraps any [`Tool`] and enforces the [`SecurityPolicy`] rate limit.
@@ -85,6 +82,8 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 
 // ── PathGuardedTool ───────────────────────────────────────────────────────────
 
+type PathExtractor = Box<dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync>;
+
 /// Wraps any [`Tool`] and blocks calls whose arguments contain a forbidden path.
 ///
 /// Replaces the `forbidden_path_argument()` guard blocks previously inlined in
@@ -99,7 +98,7 @@ pub struct PathGuardedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,
     /// Optional override: extract a path string from the args JSON.
-    extractor: Option<Box<PathExtractor>>,
+    extractor: Option<PathExtractor>,
 }
 
 impl<T: Tool> PathGuardedTool<T> {
