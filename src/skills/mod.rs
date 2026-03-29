@@ -58,6 +58,9 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// Override default execution timeout (seconds). Defaults to 60s.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -1691,6 +1694,7 @@ command = "echo hello"
                 kind: "shell".to_string(),
                 command: "echo hi".to_string(),
                 args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec!["Do the thing.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
@@ -1895,6 +1899,7 @@ description = "Bare minimum"
                 kind: "shell".to_string(),
                 command: "curl wttr.in".to_string(),
                 args: HashMap::new(),
+                timeout_secs: None,
             }],
             prompts: vec![],
             location: None,

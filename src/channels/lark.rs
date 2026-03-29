@@ -1027,6 +1027,7 @@ impl LarkChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+            reply_to_message_id: None,
                         interruption_scope_id: None,
                     attachments: vec![],
                     };
@@ -1554,6 +1555,7 @@ impl LarkChannel {
             channel: self.channel_name().to_string(),
             timestamp,
             thread_ts: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         }]
@@ -1770,6 +1772,7 @@ impl LarkChannel {
             channel: self.channel_name().to_string(),
             timestamp,
             thread_ts: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         });

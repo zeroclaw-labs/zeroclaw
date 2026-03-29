@@ -198,6 +198,7 @@ impl Channel for MochatChannel {
                                     .unwrap_or_default()
                                     .as_secs(),
                                 thread_ts: None,
+            reply_to_message_id: None,
                                 interruption_scope_id: None,
                                 attachments: vec![],
                             };

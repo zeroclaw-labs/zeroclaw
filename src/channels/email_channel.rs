@@ -539,6 +539,7 @@ impl EmailChannel {
                 channel: "email".to_string(),
                 timestamp: email.timestamp,
                 thread_ts: None,
+            reply_to_message_id: None,
                 interruption_scope_id: None,
                 attachments: email.attachments,
             };

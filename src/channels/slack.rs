@@ -2505,6 +2505,7 @@ impl SlackChannel {
                 .and_then(|m| m.get("thread_ts"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -2738,6 +2739,7 @@ impl SlackChannel {
                                             .unwrap_or_default()
                                             .as_secs(),
                                         thread_ts,
+                                        reply_to_message_id: None,
                                         interruption_scope_id: scope_id,
                                         attachments: vec![],
                                     };
@@ -2835,6 +2837,7 @@ impl SlackChannel {
                     } else {
                         Self::inbound_thread_ts_genuine_only(event)
                     },
+                    reply_to_message_id: None,
                     interruption_scope_id: Self::inbound_interruption_scope_id(event, ts),
                     attachments: vec![],
                 };
@@ -3837,6 +3840,7 @@ impl Channel for SlackChannel {
                             } else {
                                 Self::inbound_thread_ts_genuine_only(msg)
                             },
+                            reply_to_message_id: None,
                             interruption_scope_id: Self::inbound_interruption_scope_id(msg, ts),
                             attachments: vec![],
                         };
@@ -3921,6 +3925,7 @@ impl Channel for SlackChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: Some(thread_ts.clone()),
+                        reply_to_message_id: None,
                         interruption_scope_id: Some(thread_ts.clone()),
                         attachments: vec![],
                     };
@@ -4933,6 +4938,7 @@ mod tests {
             channel: "slack".into(),
             timestamp: 0,
             thread_ts: None, // thread_replies=false → no fallback to ts
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -4959,6 +4965,7 @@ mod tests {
             channel: "slack".into(),
             timestamp: 0,
             thread_ts: Some(ts.to_string()), // thread_replies=true → ts as thread_ts
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };
