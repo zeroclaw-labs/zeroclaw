@@ -215,6 +215,18 @@ async fn handle_clear(
     category: Option<String>,
     yes: bool,
 ) -> Result<()> {
+    let backend = effective_memory_backend_name(
+        &config.memory.backend,
+        Some(&config.storage.provider.config),
+    );
+    if matches!(
+        classify_memory_backend(&backend),
+        MemoryBackendKind::Markdown
+    ) {
+        bail!(
+            "memory clear is unsupported for append-only backend 'markdown'; switch to a deletable backend (sqlite, lucid, postgres, or qdrant)"
+        );
+    }
     let mem = create_cli_memory(config)?;
 
     // Single-key deletion (exact or prefix match).
@@ -329,6 +341,7 @@ fn truncate_content(s: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn parse_category_known_variants() {
@@ -367,5 +380,67 @@ mod tests {
     #[test]
     fn truncate_content_empty_string() {
         assert_eq!(truncate_content("", 10), "");
+    }
+
+    #[tokio::test]
+    async fn clear_rejects_append_only_markdown_backend() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.memory.backend = "markdown".into();
+
+        let err = handle_command(
+            crate::MemoryCommands::Clear {
+                key: None,
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("append-only backend 'markdown'"));
+        assert!(msg.contains("switch to a deletable backend"));
+    }
+
+    #[tokio::test]
+    async fn clear_does_not_reject_qdrant_backend_constructed_as_markdown() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.memory.backend = "qdrant".into();
+
+        handle_command(
+            crate::MemoryCommands::Clear {
+                key: None,
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_does_not_reject_storage_configured_qdrant_backend() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.memory.backend = "markdown".into();
+        config.storage.provider.config.provider = "qdrant".into();
+
+        handle_command(
+            crate::MemoryCommands::Clear {
+                key: None,
+                category: None,
+                yes: true,
+            },
+            &config,
+        )
+        .await
+        .unwrap();
     }
 }
