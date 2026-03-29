@@ -89,6 +89,7 @@ Last refreshed: **February 18, 2026**.
 - [nextcloud-talk-setup.md](setup-guides/nextcloud-talk-setup.md)
 - [config-reference.md](reference/api/config-reference.md)
 - [custom-providers.md](contributing/custom-providers.md)
+- [copilot-provider.md](setup-guides/copilot-provider.md)
 - [zai-glm-setup.md](setup-guides/zai-glm-setup.md)
 - [langgraph-integration.md](contributing/langgraph-integration.md)
 

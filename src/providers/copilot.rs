@@ -587,7 +587,10 @@ impl CopilotProvider {
 
             anyhow::bail!(
                 "Failed to get Copilot API key ({status}): {sanitized}. \
-                 Ensure your GitHub account has an active Copilot subscription."
+                 Ensure your GitHub account has an active Copilot subscription \
+                 (check https://github.com/settings/copilot). If using a personal access token, \
+                 verify it has the 'read:user' scope. To re-authenticate, delete the cached \
+                 tokens: rm -rf ~/.config/zeroclaw/copilot/"
             );
         }
 

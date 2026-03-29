@@ -138,7 +138,7 @@ For detailed setup guidance, see [Multi-Model Setup and Fallback Chains](/docs/g
 | `novita` | — | No | `NOVITA_API_KEY` |
 | `perplexity` | — | No | `PERPLEXITY_API_KEY` |
 | `cohere` | — | No | `COHERE_API_KEY` |
-| `copilot` | `github-copilot` | No | (use config/`API_KEY` fallback with GitHub token) |
+| `copilot` | `github-copilot` | No | OAuth device flow (no key needed); or `API_KEY` with a GitHub PAT. See [Copilot setup guide](../../setup-guides/copilot-provider.md). |
 | `lmstudio` | `lm-studio` | Yes | (optional; local by default) |
 | `llamacpp` | `llama.cpp` | Yes | `LLAMACPP_API_KEY` (optional; only if server auth is enabled) |
 | `sglang` | — | Yes | `SGLANG_API_KEY` (optional) |

@@ -876,6 +876,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "sglang" | "vllm" | "osaurus" | "opencode-go" => "default".into(),
+        "copilot" => "gpt-4o".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
@@ -1301,6 +1302,24 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             (
                 "anthropic.claude-sonnet-4-5-20250929-v1:0".to_string(),
                 "Claude Sonnet 4.5".to_string(),
+            ),
+        ],
+        "copilot" => vec![
+            (
+                "gpt-4o".to_string(),
+                "GPT-4o (recommended default)".to_string(),
+            ),
+            (
+                "gpt-4o-mini".to_string(),
+                "GPT-4o mini (faster, lower cost)".to_string(),
+            ),
+            (
+                "claude-3.5-sonnet".to_string(),
+                "Claude 3.5 Sonnet (if enabled on your plan)".to_string(),
+            ),
+            (
+                "o1-mini".to_string(),
+                "o1 mini (reasoning model)".to_string(),
             ),
         ],
         "gemini" => vec![
@@ -2366,6 +2385,10 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
             (
                 "gemini",
                 "Google Gemini — Gemini 2.0 Flash & Pro (supports CLI auth)",
+            ),
+            (
+                "copilot",
+                "GitHub Copilot — use your Copilot subscription (OAuth device flow, no API key)",
             ),
         ],
         1 => vec![

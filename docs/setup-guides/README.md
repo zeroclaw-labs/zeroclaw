@@ -27,6 +27,11 @@ For first-time setup and quick orientation.
 - Ollama cloud models (`:cloud`) require a remote `api_url` and API key (for example `api_url = "https://ollama.com"`).
 - Validate environment: `zeroclaw status` + `zeroclaw doctor`
 
+## Provider-Specific Guides
+
+- [GitHub Copilot Provider](copilot-provider.md) — use your Copilot subscription with ZeroClaw (OAuth device flow)
+- [Z.AI GLM Setup](zai-glm-setup.md) — Z.AI/GLM models through OpenAI-compatible endpoints
+
 ## Next
 
 - Runtime operations: [../ops/README.md](../ops/README.md)
