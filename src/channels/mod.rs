@@ -1837,6 +1837,10 @@ async fn handle_runtime_command_if_needed(
             }
         }
         ChannelRuntimeCommand::NewSession => {
+            // Fire session_end for the old session before clearing history.
+            if let Some(ref hooks) = ctx.hooks {
+                hooks.fire_session_end(&sender_key, channel.name()).await;
+            }
             clear_sender_history(ctx, &sender_key);
             if let Some(ref store) = ctx.session_store {
                 if let Err(e) = store.delete_session(&sender_key) {
@@ -1844,6 +1848,10 @@ async fn handle_runtime_command_if_needed(
                 }
             }
             mark_sender_for_new_session(ctx, &sender_key);
+            // Fire session_start for the fresh session.
+            if let Some(ref hooks) = ctx.hooks {
+                hooks.fire_session_start(&sender_key, channel.name()).await;
+            }
             "Conversation history cleared. Starting fresh.".to_string()
         }
     };
@@ -2547,6 +2555,13 @@ async fn process_channel_message(
             .peek(&history_key)
             .is_some_and(|turns| !turns.is_empty())
     };
+
+    // Fire session_start hook for brand-new conversations.
+    if !had_prior_history && !force_fresh_session {
+        if let Some(ref hooks) = ctx.hooks {
+            hooks.fire_session_start(&history_key, &msg.channel).await;
+        }
+    }
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
@@ -5456,6 +5471,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
             if config.hooks.builtin.webhook_audit.enabled {
                 runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
                     config.hooks.builtin.webhook_audit.clone(),
+                )));
+            }
+            if config.hooks.builtin.session_summary_on_end == Some(true) {
+                runner.register(Box::new(crate::hooks::builtin::SessionSummaryHook::new(
+                    config.workspace_dir.clone(),
                 )));
             }
             Some(Arc::new(runner))

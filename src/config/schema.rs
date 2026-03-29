@@ -5178,6 +5178,14 @@ pub struct BuiltinHooksConfig {
     /// that matches one of `tool_patterns`.
     #[serde(default)]
     pub webhook_audit: WebhookAuditConfig,
+    /// Write a JSON summary file when a session ends.
+    ///
+    /// When `true`, the `session-summary` builtin hook writes a
+    /// `session_<id>.json` file into the workspace `sessions/` directory
+    /// containing the session ID, channel, start time, message count and
+    /// duration.
+    #[serde(default)]
+    pub session_summary_on_end: Option<bool>,
 }
 
 /// Configuration for the webhook-audit builtin hook.

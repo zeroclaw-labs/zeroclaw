@@ -227,6 +227,11 @@ async fn handle_socket(
         .send(Message::Text(session_start.to_string().into()))
         .await;
 
+    // Fire session_start hook
+    if let Some(ref hooks) = state.hooks {
+        hooks.fire_session_start(&session_id, "websocket").await;
+    }
+
     // ── Optional connect handshake ──────────────────────────────────
     // The first message may be a `{"type":"connect",...}` frame carrying
     // connection parameters.  If it is, we extract the params, send an
@@ -368,6 +373,11 @@ async fn handle_socket(
         }
 
         process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
+    }
+
+    // Fire session_end hook when the WebSocket connection closes.
+    if let Some(ref hooks) = state.hooks {
+        hooks.fire_session_end(&session_id, "websocket").await;
     }
 }
 

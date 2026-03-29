@@ -133,10 +133,12 @@ impl SessionActorQueue {
     }
 
     /// Remove idle session slots that haven't been accessed within the TTL.
-    pub async fn evict_idle(&self) -> usize {
+    ///
+    /// Returns the list of evicted session keys so callers can fire lifecycle
+    /// hooks (e.g. `fire_session_end`) for each one.
+    pub async fn evict_idle(&self) -> Vec<String> {
         let mut slots = self.slots.lock().await;
         let now = Instant::now();
-        let before = slots.len();
         let ttl = self.idle_ttl;
 
         let mut to_remove = Vec::new();
@@ -150,7 +152,7 @@ impl SessionActorQueue {
             slots.remove(key);
         }
 
-        before - slots.len()
+        to_remove
     }
 }
 
@@ -217,7 +219,8 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
         let evicted = queue.evict_idle().await;
-        assert_eq!(evicted, 1);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0], "s1");
     }
 
     #[tokio::test]

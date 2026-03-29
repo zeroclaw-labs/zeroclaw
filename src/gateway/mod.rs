@@ -368,6 +368,8 @@ pub struct AppState {
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
+    /// Lifecycle hook runner (optional, gated by `[hooks] enabled`).
+    pub hooks: Option<std::sync::Arc<crate::hooks::HookRunner>>,
     /// Shared canvas store for Live Canvas (A2UI) system
     pub canvas_store: CanvasStore,
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
@@ -392,7 +394,21 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
 
     // ── Hooks ──────────────────────────────────────────────────────
     let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
-        Some(std::sync::Arc::new(crate::hooks::HookRunner::new()))
+        let mut runner = crate::hooks::HookRunner::new();
+        if config.hooks.builtin.command_logger {
+            runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+        }
+        if config.hooks.builtin.webhook_audit.enabled {
+            runner.register(Box::new(crate::hooks::builtin::WebhookAuditHook::new(
+                config.hooks.builtin.webhook_audit.clone(),
+            )));
+        }
+        if config.hooks.builtin.session_summary_on_end == Some(true) {
+            runner.register(Box::new(crate::hooks::builtin::SessionSummaryHook::new(
+                config.workspace_dir.clone(),
+            )));
+        }
+        Some(std::sync::Arc::new(runner))
     } else {
         None
     };
@@ -851,6 +867,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
+        hooks: hooks.clone(),
         canvas_store,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
@@ -2342,6 +2359,7 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            hooks: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -2410,6 +2428,7 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            hooks: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -2804,6 +2823,7 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            hooks: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -2882,6 +2902,7 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            hooks: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -2972,6 +2993,7 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            hooks: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3034,6 +3056,7 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            hooks: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3101,6 +3124,7 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            hooks: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3173,6 +3197,7 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            hooks: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
@@ -3242,6 +3267,7 @@ mod tests {
             ),
             device_registry: None,
             pending_pairings: None,
+            hooks: None,
             canvas_store: CanvasStore::new(),
             #[cfg(feature = "webauthn")]
             webauthn: None,
