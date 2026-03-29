@@ -476,13 +476,6 @@ impl Tool for SkillToolHandler {
         {
             cmd.env("ZC_SENDER_KEY", sender_key.clone());
 
-            // Inject the OpenCode session ID so coder.py can reuse the
-            // Rust-managed OpenCode session instead of creating a separate one.
-            if let Some(oc_mgr) = crate::opencode::oc_manager() {
-                if let Some(session_id) = oc_mgr.get_session_id(&sender_key).await {
-                    cmd.env("ZC_OC_SESSION_ID", session_id);
-                }
-            }
         }
 
         let output = cmd

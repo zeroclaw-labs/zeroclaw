@@ -32,6 +32,26 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Semantic tags for tool classification (e.g. `["search-phase"]`).
+    fn tags(&self) -> &[String] {
+        &[]
+    }
+
+    /// Whether this tool is a terminal action whose result can be returned directly.
+    fn is_terminal(&self) -> bool {
+        false
+    }
+
+    /// Maximum chars kept in result for conversation history.
+    fn max_result_chars(&self) -> Option<usize> {
+        None
+    }
+
+    /// Maximum times this tool may be called in a single agent turn.
+    fn max_calls_per_turn(&self) -> Option<usize> {
+        None
+    }
+
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {
         ToolSpec {

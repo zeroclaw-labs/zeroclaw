@@ -231,6 +231,12 @@ mod tests {
             kind: "shell".to_string(),
             command: "lint --file {{file}} --format {{format}}".to_string(),
             args,
+            tags: Vec::new(),
+            terminal: false,
+            max_parallel: None,
+            max_result_chars: None,
+            max_calls_per_turn: None,
+            env: std::collections::HashMap::new(),
         }
     }
 
@@ -289,6 +295,12 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello".to_string(),
             args: HashMap::new(),
+            tags: Vec::new(),
+            terminal: false,
+            max_parallel: None,
+            max_result_chars: None,
+            max_calls_per_turn: None,
+            env: HashMap::new(),
         };
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
@@ -305,6 +317,12 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello-skill".to_string(),
             args: HashMap::new(),
+            tags: Vec::new(),
+            terminal: false,
+            max_parallel: None,
+            max_result_chars: None,
+            max_calls_per_turn: None,
+            env: HashMap::new(),
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
