@@ -1,59 +1,15 @@
-name: Bug Report
-description: Report a reproducible defect in ZeroClaw
-title: "[Bug]: "
-labels:
-  - bug
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
 body:
-  - type: markdown
-    attributes:
-      value: |
-        Thanks for taking the time to report a bug.
-        Please provide a minimal reproducible case so maintainers can triage quickly.
-        Do not include personal/sensitive data; redact and anonymize all logs/payloads.
-
-  - type: dropdown
-    id: component
-    attributes:
-      label: Affected component
-      options:
-        - runtime/daemon
-        - provider
-        - channel
-        - memory
-        - security/sandbox
-        - tooling/ci
-        - docs
-        - unknown
-    validations:
-      required: true
-
-  - type: dropdown
-    id: severity
-    attributes:
-      label: Severity
-      options:
-        - S0 - data loss / security risk
-        - S1 - workflow blocked
-        - S2 - degraded behavior
-        - S3 - minor issue
-    validations:
-      required: true
-
   - type: textarea
-    id: current
+    id: what-happened
     attributes:
-      label: Current behavior
-      description: What is happening now?
-      placeholder: The process exits with ...
-    validations:
-      required: true
-
-  - type: textarea
-    id: expected
-    attributes:
-      label: Expected behavior
-      description: What should happen instead?
-      placeholder: The daemon should stay alive and ...
+      label: What happened?
+      description: Describe the bug. What did you expect vs. what actually happened?
+      placeholder: |
+        Expected: ...
+        Actual: ...
     validations:
       required: true
 
@@ -61,78 +17,44 @@ body:
     id: reproduce
     attributes:
       label: Steps to reproduce
-      description: Please provide exact commands/config.
+      description: Minimal steps to trigger the bug.
       placeholder: |
-        1. zeroclaw onboard
-        2. zeroclaw daemon
-        3. Observe crash in logs
-      render: bash
+        1. Set config key `x` to `y`
+        2. Run `hrafn agent -m "..."`
+        3. Observe error in logs
     validations:
       required: true
-
-  - type: textarea
-    id: impact
-    attributes:
-      label: Impact
-      description: Who is affected, how often, and practical consequences (optional but helps triage).
-      placeholder: |
-        Affected users: ...
-        Frequency: always/intermittent
-        Consequence: ...
-    validations:
-      required: false
-
-  - type: textarea
-    id: logs
-    attributes:
-      label: Logs / stack traces
-      description: Paste relevant logs (redact secrets, personal identifiers, and sensitive data).
-      render: text
-    validations:
-      required: false
 
   - type: input
     id: version
     attributes:
-      label: ZeroClaw version
-      placeholder: v0.1.0 / commit SHA
+      label: Hrafn version
+      description: Output of `hrafn --version`
+      placeholder: "0.1.0"
     validations:
       required: true
-
-  - type: input
-    id: rust
-    attributes:
-      label: Rust version
-      description: Required for runtime/build bugs; optional for docs/config issues.
-      placeholder: rustc 1.xx.x
-    validations:
-      required: false
 
   - type: input
     id: os
     attributes:
-      label: Operating system
-      placeholder: Ubuntu 24.04 / macOS 15 / Windows 11
+      label: OS and architecture
+      placeholder: "Ubuntu 24.04 aarch64 / macOS 15.2 arm64 / etc."
     validations:
       required: true
 
-  - type: dropdown
-    id: regression
+  - type: textarea
+    id: logs
     attributes:
-      label: Regression?
-      options:
-        - Unknown
-        - Yes, it worked before
-        - No, first-time setup
+      label: Relevant logs
+      description: Paste error output or logs. Redact secrets and personal data.
+      render: shell
     validations:
-      required: true
+      required: false
 
-  - type: checkboxes
-    id: checks
+  - type: textarea
+    id: context
     attributes:
-      label: Pre-flight checks
-      options:
-        - label: I reproduced this on the latest master branch or latest release.
-          required: true
-        - label: I redacted secrets, tokens, and personal data from all submitted content.
-          required: true
+      label: Additional context
+      description: Config snippets, screenshots, related issues, etc.
+    validations:
+      required: false

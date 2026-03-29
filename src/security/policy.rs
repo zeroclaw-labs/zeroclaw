@@ -1192,7 +1192,11 @@ impl SecurityPolicy {
             let cmd_part = skip_env_assignments(segment);
 
             let mut words = cmd_part.split_whitespace();
-            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            // Strip inline redirections from executable (e.g. `cat</dev/null` → `cat`)
+            let executable = raw_executable
+                .find(['<', '>'])
+                .map_or(raw_executable, |i| &raw_executable[..i]);
             let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
             let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
 

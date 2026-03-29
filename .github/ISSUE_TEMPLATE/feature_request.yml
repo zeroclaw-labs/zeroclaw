@@ -1,31 +1,13 @@
-name: Feature Request
-description: Propose an improvement or new capability
-title: "[Feature]: "
-labels:
-  - enhancement
+name: Feature request
+description: Suggest an improvement or new capability
+labels: ["enhancement"]
 body:
-  - type: markdown
-    attributes:
-      value: |
-        Thanks for sharing your idea.
-        Please focus on user value, constraints, and rollout safety.
-        Do not include personal/sensitive data; use neutral project-scoped placeholders.
-
-  - type: input
-    id: summary
-    attributes:
-      label: Summary
-      description: One-line statement of the requested capability.
-      placeholder: Add a provider-level retry budget override for long-running channels.
-    validations:
-      required: true
-
   - type: textarea
     id: problem
     attributes:
-      label: Problem statement
-      description: What user pain does this solve and why is current behavior insufficient?
-      placeholder: Teams operating in unstable networks cannot tune retries per provider...
+      label: Problem
+      description: What problem does this solve? Describe the use case, not just the solution.
+      placeholder: "I want to ... but currently ..."
     validations:
       required: true
 
@@ -33,17 +15,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: Describe preferred behavior and interfaces.
-      placeholder: Add `[provider.retry]` config and enforce bounds in config validation.
-    validations:
-      required: true
-
-  - type: textarea
-    id: non_goals
-    attributes:
-      label: Non-goals / out of scope
-      description: Clarify what should not be included in the first iteration (optional but helps scope discussion).
-      placeholder: No UI changes, no cross-provider dynamic adaptation in v1.
+      description: How would you solve it? Config example, CLI usage, trait extension, etc.
     validations:
       required: false
 
@@ -51,57 +23,34 @@ body:
     id: alternatives
     attributes:
       label: Alternatives considered
-      description: What alternatives did you evaluate?
-      placeholder: Keep current behavior, use wrapper scripts, etc.
-    validations:
-      required: false
-
-  - type: textarea
-    id: acceptance
-    attributes:
-      label: Acceptance criteria
-      description: What outcomes would make this request complete? (optional — can be defined during triage)
-      placeholder: |
-        - Config key is documented and validated
-        - Runtime path uses configured retry budget
-        - Regression tests cover fallback and invalid config
-    validations:
-      required: false
-
-  - type: textarea
-    id: architecture
-    attributes:
-      label: Architecture impact
-      description: Which subsystem(s) are affected? (optional — maintainers will assess during triage)
-      placeholder: providers/, channels/, memory/, runtime/, security/, docs/ ...
-    validations:
-      required: false
-
-  - type: textarea
-    id: risk
-    attributes:
-      label: Risk and rollback
-      description: Main risk + how to disable/revert quickly (optional — can be defined during planning).
-      placeholder: Risk is ... rollback is ...
+      description: What else did you try or consider?
     validations:
       required: false
 
   - type: dropdown
-    id: breaking
+    id: scope
     attributes:
-      label: Breaking change?
+      label: Scope
+      description: Which part of Hrafn is affected?
       options:
-        - "No"
-        - "Yes"
+        - Core / agent loop
+        - Channel (Telegram, Discord, ...)
+        - Tool
+        - Provider
+        - Memory
+        - Gateway / web dashboard
+        - CLI
+        - Config
+        - OC Bridge
+        - Documentation
+        - Other
     validations:
       required: true
 
   - type: checkboxes
-    id: hygiene
+    id: contribution
     attributes:
-      label: Data hygiene checks
+      label: Contribution
       options:
-        - label: I removed personal/sensitive data from examples, payloads, and logs.
-          required: true
-        - label: I used neutral, project-focused wording and placeholders.
-          required: true
+        - label: I'm willing to submit a PR for this
+          required: false

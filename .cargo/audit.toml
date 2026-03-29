@@ -9,4 +9,6 @@ ignore = [
     "RUSTSEC-2026-0021",  # WASI http fields panic
     # instant crate unmaintained — transitive dep via nostr; no upstream fix
     "RUSTSEC-2024-0384",
+    # rustls-webpki 0.102.8 CRL matching — pinned by rumqttc 0.25; no upstream fix yet
+    "RUSTSEC-2026-0049",
 ]
