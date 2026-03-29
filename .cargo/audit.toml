@@ -12,3 +12,7 @@ ignore = [
     # proc-macro-error unmaintained — transitive dep via gtk3-macros/glib-macros (tauri); no upstream fix
     "RUSTSEC-2024-0370",
 ]
+
+[yanked]
+# unicode-segmentation 1.13.1 yanked — transitive dep via tao/keyboard-types (tauri); awaiting upstream bump
+ignore = ["unicode-segmentation"]
