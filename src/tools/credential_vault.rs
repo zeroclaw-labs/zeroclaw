@@ -232,10 +232,10 @@ impl Tool for CredentialRecallTool {
 
         let store = SecretStore::new(&self.workspace_dir, true);
         let path = vault_path(&self.workspace_dir);
-        let mut vault = load_vault(&path, &store);
 
         match action {
             "list" => {
+                let vault = load_vault(&path, &store);
                 let entries: Vec<_> = vault
                     .credentials
                     .iter()
@@ -276,6 +276,7 @@ impl Tool for CredentialRecallTool {
                     });
                 }
 
+                let vault = load_vault(&path, &store);
                 let entry = vault
                     .credentials
                     .iter()
@@ -312,6 +313,7 @@ impl Tool for CredentialRecallTool {
                     });
                 }
 
+                let mut vault = load_vault(&path, &store);
                 let before = vault.credentials.len();
                 vault
                     .credentials
