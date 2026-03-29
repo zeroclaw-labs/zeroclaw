@@ -2525,6 +2525,12 @@ pub struct HttpRequestConfig {
     /// Default: false (deny private hosts for SSRF protection).
     #[serde(default)]
     pub allow_private_hosts: bool,
+    /// Private/internal hosts allowed to bypass SSRF protection
+    /// (e.g. `["192.168.1.100", "homeassistant.local"]`).
+    /// More granular alternative to `allow_private_hosts`: only the listed
+    /// hosts/IPs are exempted instead of blanket-allowing all private addresses.
+    #[serde(default)]
+    pub allowed_private_hosts: Vec<String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -2535,6 +2541,7 @@ impl Default for HttpRequestConfig {
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
+            allowed_private_hosts: vec![],
         }
     }
 }
