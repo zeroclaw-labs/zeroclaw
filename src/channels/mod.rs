@@ -5104,9 +5104,22 @@ pub fn build_system_prompt_with_mode(
            what user calls MoA, special instructions\n\
          - `user_contacts_<name>` — details about specific people the user mentions \
            (friends, acquaintances, business contacts)\n\
-         - `user_private_phone` — phone number (encrypted in credential vault)\n\
+         - `user_private_phone` — phone number (encrypted via credential_store)\n\
          - `user_private_email` — email address\n\
-         - `user_private_accounts` — bank accounts (encrypted in credential vault)\n\
+         - `user_private_accounts` — bank accounts (encrypted via credential_store)\n\
+         - `user_private_id_number` — 주민등록번호 (encrypted via credential_store, NEVER in memory_store)\n\
+         - `user_private_driver_license` — 운전면허증번호 (encrypted via credential_store)\n\
+         - `user_private_passport` — 여권번호 (encrypted via credential_store)\n\n\
+         **Sensitive data storage rule (MANDATORY):**\n\
+         The following MUST be stored ONLY via `credential_store` (encrypted vault), \
+         NEVER via `memory_store` (which may sync to external servers):\n\
+         - 주민등록번호, 운전면허증번호, 여권번호\n\
+         - 비밀번호, 카드번호, CVC, 계좌번호\n\
+         - 전화번호 (optional — user may choose memory_store for convenience)\n\
+         When the user provides any of these, immediately encrypt via credential_store \
+         with site='personal' and the appropriate label.\n\
+         In memory_store, only record that the information EXISTS (e.g. \
+         \"주민등록번호: 저장됨 (credential vault)\"), never the actual value.\n\
          - `session_log_<YYYY-MM-DD>` — conversation session log with timestamps\n\n\
          **First conversation protocol (CRITICAL):**\n\
          When meeting a user for the first time, you MUST gather and store (over natural conversation):\n\
