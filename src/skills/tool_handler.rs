@@ -475,7 +475,6 @@ impl Tool for SkillToolHandler {
             crate::agent::loop_::TOOL_LOOP_SENDER_KEY.try_with(|v| v.clone())
         {
             cmd.env("ZC_SENDER_KEY", sender_key.clone());
-
         }
 
         let output = cmd
