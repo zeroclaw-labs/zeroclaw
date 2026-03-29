@@ -17,11 +17,7 @@
   <a href="https://github.com/zeroclaw-labs/zeroclaw/graphs/contributors"><img src="https://img.shields.io/github/contributors/zeroclaw-labs/zeroclaw?color=green" alt="Contributors" /></a>
   <a href="https://buymeacoffee.com/argenistherose"><img src="https://img.shields.io/badge/Buy%20Me%20a%20Coffee-Donate-yellow.svg?style=flat&logo=buy-me-a-coffee" alt="Buy Me a Coffee" /></a>
   <a href="https://x.com/zeroclawlabs?s=21"><img src="https://img.shields.io/badge/X-%40zeroclawlabs-000000?style=flat&logo=x&logoColor=white" alt="X: @zeroclawlabs" /></a>
-  <a href="https://www.facebook.com/groups/zeroclawlabs"><img src="https://img.shields.io/badge/Facebook-Group-1877F2?style=flat&logo=facebook&logoColor=white" alt="Facebook Group" /></a>
   <a href="https://discord.com/invite/wDshRVqRjx"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord" /></a>
-  <a href="https://www.instagram.com/therealzeroclaw"><img src="https://img.shields.io/badge/Instagram-%40therealzeroclaw-E4405F?style=flat&logo=instagram&logoColor=white" alt="Instagram: @therealzeroclaw" /></a>
-  <a href="https://www.tiktok.com/@zeroclawlabs"><img src="https://img.shields.io/badge/TikTok-%40zeroclawlabs-000000?style=flat&logo=tiktok&logoColor=white" alt="TikTok: @zeroclawlabs" /></a>
-  <a href="https://www.rednote.com/user/profile/69b735e6000000002603927e"><img src="https://img.shields.io/badge/RedNote-Official-FF2442?style=flat" alt="RedNote" /></a>
   <a href="https://www.reddit.com/r/zeroclawlabs/"><img src="https://img.shields.io/badge/Reddit-r%2Fzeroclawlabs-FF4500?style=flat&logo=reddit&logoColor=white" alt="Reddit: r/zeroclawlabs" /></a>
 </p>
 
@@ -202,7 +198,6 @@ ZeroClawは実際のメッセージングサービスに接続します。着信
 | 日付 (UTC) | レベル | 通知 | 対応 |
 | ---------- | ------ | ---- | ---- |
 | 2026-02-19 | _重大_ | 当プロジェクトは `openagen/zeroclaw`、`zeroclaw.org`、`zeroclaw.net` とは**一切関係ありません**。`zeroclaw.org` と `zeroclaw.net` ドメインは現在 `openagen/zeroclaw` フォークを指しており、そのドメイン/リポジトリは当プロジェクトの公式ウェブサイト/プロジェクトを偽装しています。 | それらのソースからの情報、バイナリ、資金調達、告知を信頼しないでください。[このリポジトリ](https://github.com/zeroclaw-labs/zeroclaw)と認証済みのソーシャルアカウントのみを使用してください。 |
-| 2026-02-21 | _重要_ | 公式ウェブサイトが公開されました：[zeroclawlabs.ai](https://zeroclawlabs.ai)。ローンチ準備中のお待ちいただき、ありがとうございます。引き続き偽装行為が確認されていますので、公式チャンネルを通じて公開されない限り、ZeroClawの名前を使った投資や資金調達活動には**参加しないでください**。 | [このリポジトリ](https://github.com/zeroclaw-labs/zeroclaw)を唯一の信頼できる情報源として使用してください。公式アップデートは [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21)、[Facebook (Group)](https://www.facebook.com/groups/zeroclawlabs)、[Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/) をフォローしてください。 |
 | 2026-02-19 | _重要_ | Anthropicは2026-02-19に認証と資格情報の使用に関する規約を更新しました。Claude Code OAuthトークン（Free、Pro、Max）はClaude CodeおよびClaude.ai専用です。Claude Free/Pro/MaxのOAuthトークンを他の製品、ツール、サービス（Agent SDKを含む）で使用することは許可されておらず、消費者利用規約に違反する可能性があります。 | 潜在的な損失を防ぐため、一時的にClaude Code OAuth統合を避けてください。元の条項：[Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)。 |
 
 ## ハイライト
