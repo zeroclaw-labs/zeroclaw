@@ -24,7 +24,7 @@ use console::style;
 use dialoguer::{Confirm, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -61,7 +61,7 @@ const BANNER: &str = r"
 const LIVE_MODEL_MAX_OPTIONS: usize = 120;
 const MODEL_PREVIEW_LIMIT: usize = 20;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
-const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
+pub const MODEL_CACHE_TTL_SECS: u64 = 12 * 60 * 60;
 const CUSTOM_MODEL_SENTINEL: &str = "__custom_model__";
 
 fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
@@ -158,6 +158,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         agent: crate::config::schema::AgentConfig::default(),
         pacing: crate::config::PacingConfig::default(),
         skills: crate::config::SkillsConfig::default(),
+        opencode: crate::config::OpenCodeConfig::default(),
         pipeline: crate::config::PipelineConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
@@ -616,6 +617,7 @@ async fn run_quick_setup_with_home(
         agent: crate::config::schema::AgentConfig::default(),
         pacing: crate::config::PacingConfig::default(),
         skills: crate::config::SkillsConfig::default(),
+        opencode: crate::config::OpenCodeConfig::default(),
         pipeline: crate::config::PipelineConfig::default(),
         model_routes: Vec::new(),
         embedding_routes: Vec::new(),
@@ -1848,6 +1850,84 @@ async fn cache_live_models_for_provider(
     save_model_cache_state(workspace_dir, &state).await
 }
 
+// ── Provider defaults ───────────────────────────────────────────
+
+const PROVIDER_DEFAULTS_FILE: &str = "provider_defaults.json";
+
+fn provider_defaults_path(workspace_dir: &Path) -> PathBuf {
+    workspace_dir.join("state").join(PROVIDER_DEFAULTS_FILE)
+}
+
+pub async fn load_provider_defaults(workspace_dir: &Path) -> Result<HashMap<String, String>> {
+    let path = provider_defaults_path(workspace_dir);
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("failed to read provider defaults at {}", path.display()))?;
+
+    match serde_json::from_str::<HashMap<String, String>>(&raw) {
+        Ok(map) => Ok(map),
+        Err(_) => Ok(HashMap::new()),
+    }
+}
+
+pub async fn save_provider_default(
+    workspace_dir: &Path,
+    provider: &str,
+    model: &str,
+) -> Result<()> {
+    let path = provider_defaults_path(workspace_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    let mut defaults = load_provider_defaults(workspace_dir).await?;
+    defaults.insert(provider.to_string(), model.to_string());
+
+    let json =
+        serde_json::to_vec_pretty(&defaults).context("failed to serialize provider defaults")?;
+    fs::write(&path, json)
+        .await
+        .with_context(|| format!("failed to write provider defaults at {}", path.display()))?;
+
+    Ok(())
+}
+
+/// Resolve the default model for a provider.
+/// Priority: explicit default > first model_route > first cached model > None.
+pub async fn resolve_default_model_for_provider(
+    workspace_dir: &Path,
+    provider: &str,
+    model_routes: &[crate::config::ModelRouteConfig],
+) -> Option<String> {
+    // 1. Explicit default
+    if let Ok(defaults) = load_provider_defaults(workspace_dir).await {
+        if let Some(model) = defaults.get(provider) {
+            return Some(model.clone());
+        }
+    }
+
+    // 2. First model_route for this provider
+    if let Some(route) = model_routes.iter().find(|r| r.provider == provider) {
+        return Some(route.model.clone());
+    }
+
+    // 3. First model from cache
+    let cache_path = workspace_dir.join("state").join(MODEL_CACHE_FILE);
+    if let Ok(raw) = tokio::fs::read_to_string(&cache_path).await {
+        if let Ok(state) = serde_json::from_str::<ModelCacheState>(&raw) {
+            if let Some(entry) = state.entries.iter().find(|e| e.provider == provider) {
+                return entry.models.first().cloned();
+            }
+        }
+    }
+
+    None
+}
+
 async fn load_cached_models_for_provider_internal(
     workspace_dir: &Path,
     provider_name: &str,
@@ -2160,6 +2240,65 @@ pub async fn run_models_refresh_all(config: &Config, force: bool) -> Result<()> 
         anyhow::bail!("Model refresh failed for all providers")
     }
     Ok(())
+}
+
+/// Background-safe model refresh. Uses tracing instead of println.
+/// Returns the number of models fetched, or Ok(0) if cache is still fresh.
+///
+/// Accepts workspace_dir, api_key, api_url directly so callers don't need a full `Config`.
+pub async fn refresh_models_quiet(
+    workspace_dir: &std::path::Path,
+    provider: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    force: bool,
+) -> Result<usize> {
+    let provider_name = canonical_provider_name(provider).to_string();
+
+    if !supports_live_model_fetch(&provider_name) {
+        return Ok(0);
+    }
+
+    if !force {
+        if let Some(_cached) =
+            load_cached_models_for_provider(workspace_dir, &provider_name, MODEL_CACHE_TTL_SECS)
+                .await?
+        {
+            return Ok(0); // cache still fresh
+        }
+    }
+
+    let owned_key = api_key.unwrap_or("").to_string();
+    let owned_url = api_url.map(str::to_string);
+    let pname = provider_name.clone();
+
+    let result = tokio::spawn(async move {
+        fetch_live_models_for_provider(&pname, &owned_key, owned_url.as_deref()).await
+    })
+    .await;
+
+    let models = match result {
+        Ok(Ok(models)) if !models.is_empty() => models,
+        Ok(Ok(_)) => {
+            tracing::warn!(
+                "Model refresh for '{provider_name}' returned empty list; keeping stale cache"
+            );
+            return Ok(0);
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("Model refresh for '{provider_name}' failed: {e}");
+            return Ok(0);
+        }
+        Err(e) => {
+            tracing::warn!("Model refresh task for '{provider_name}' panicked: {e}");
+            return Ok(0);
+        }
+    };
+
+    let count = models.len();
+    cache_live_models_for_provider(workspace_dir, &provider_name, &models).await?;
+    tracing::info!("Refreshed '{provider_name}' model cache: {count} models");
+    Ok(count)
 }
 
 // ── Step helpers ─────────────────────────────────────────────────
@@ -7831,6 +7970,7 @@ mod tests {
         assert!(has_launchable_channels(&channels));
     }
 
+
     #[test]
     fn channels_repair_preserves_unmodified_channels() {
         use crate::config::schema::{DiscordConfig, MatrixConfig, StreamMode};
@@ -7946,5 +8086,63 @@ mod tests {
         assert!(config.matrix.is_none());
         assert!(config.telegram.is_none());
         assert!(config.slack.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_defaults_roundtrip() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+
+        let defaults = load_provider_defaults(&ws).await.unwrap();
+        assert!(defaults.is_empty());
+
+        save_provider_default(&ws, "gemini", "gemini-3-flash-preview")
+            .await
+            .unwrap();
+        let defaults = load_provider_defaults(&ws).await.unwrap();
+        assert_eq!(
+            defaults.get("gemini").map(String::as_str),
+            Some("gemini-3-flash-preview")
+        );
+
+        save_provider_default(&ws, "gemini", "gemini-2.5-pro")
+            .await
+            .unwrap();
+        let defaults = load_provider_defaults(&ws).await.unwrap();
+        assert_eq!(
+            defaults.get("gemini").map(String::as_str),
+            Some("gemini-2.5-pro")
+        );
+
+        save_provider_default(&ws, "openai-codex", "gpt-5.1-codex")
+            .await
+            .unwrap();
+        let defaults = load_provider_defaults(&ws).await.unwrap();
+        assert_eq!(defaults.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_default_model_uses_explicit_then_routes_then_cache() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+
+        let routes = vec![crate::config::ModelRouteConfig {
+            hint: "flash".into(),
+            provider: "gemini".into(),
+            model: "gemini-3-flash-preview".into(),
+            api_key: None,
+        }];
+
+        let model = resolve_default_model_for_provider(&ws, "gemini", &routes).await;
+        assert_eq!(model, Some("gemini-3-flash-preview".to_string()));
+
+        save_provider_default(&ws, "gemini", "gemini-2.5-pro")
+            .await
+            .unwrap();
+        let model = resolve_default_model_for_provider(&ws, "gemini", &routes).await;
+        assert_eq!(model, Some("gemini-2.5-pro".to_string()));
+
+        let model = resolve_default_model_for_provider(&ws, "unknown", &[]).await;
+        assert_eq!(model, None);
     }
 }
