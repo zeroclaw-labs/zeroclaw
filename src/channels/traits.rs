@@ -13,6 +13,10 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Platform-specific message ID for reply-to (e.g. Telegram `message_id`).
+    /// Filled by the channel's `listen()` so callers don't need to parse the `id` field.
+    pub reply_to_message_id: Option<String>,
+
     /// Thread scope identifier for interruption/cancellation grouping.
     /// Distinct from `thread_ts` (reply anchor): this is `Some` only when the message
     /// is genuinely inside a reply thread and should be isolated from other threads.
@@ -32,6 +36,8 @@ pub struct SendMessage {
     pub subject: Option<String>,
     /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
     pub thread_ts: Option<String>,
+    /// Platform-specific message ID to reply to (e.g. Telegram `message_id`).
+    pub reply_to_message_id: Option<String>,
     /// Optional cancellation token for interruptible delivery (e.g. multi-message mode).
     pub cancellation_token: Option<CancellationToken>,
     /// File attachments to send with the message.
@@ -47,6 +53,7 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            reply_to_message_id: None,
             cancellation_token: None,
             attachments: vec![],
         }
@@ -63,6 +70,7 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: Some(subject.into()),
             thread_ts: None,
+            reply_to_message_id: None,
             cancellation_token: None,
             attachments: vec![],
         }
@@ -71,6 +79,12 @@ impl SendMessage {
     /// Set the thread identifier for threaded replies.
     pub fn in_thread(mut self, thread_ts: Option<String>) -> Self {
         self.thread_ts = thread_ts;
+        self
+    }
+
+    /// Set the platform-specific message ID this message replies to.
+    pub fn reply_to(mut self, reply_to_message_id: Option<String>) -> Self {
+        self.reply_to_message_id = reply_to_message_id;
         self
     }
 
@@ -101,6 +115,20 @@ pub trait Channel: Send + Sync {
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
+
+    /// Channel-specific formatting instructions appended to the system prompt
+    /// so the LLM produces output appropriate for this platform.
+    fn delivery_instructions(&self) -> Option<&str> {
+        None
+    }
+
+    /// Format the content of an incoming message for the LLM.
+    ///
+    /// Channels may prepend sender identity or other context.
+    /// Default: returns the content unmodified.
+    fn format_incoming_content(&self, msg: &ChannelMessage) -> String {
+        msg.content.clone()
+    }
 
     /// Check if channel is healthy
     async fn health_check(&self) -> bool {
@@ -148,6 +176,11 @@ pub trait Channel: Send + Sync {
         _message_id: &str,
         _text: &str,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Delete a previously sent draft/status message (e.g. when no final reply is needed).
+    async fn delete_draft(&self, _recipient: &str, _message_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -255,6 +288,7 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                reply_to_message_id: None,
                 interruption_scope_id: None,
                 attachments: vec![],
             })
@@ -273,6 +307,7 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         };

@@ -57,6 +57,7 @@ pub struct MatrixChannel {
     multi_message_sent_len: Arc<Mutex<HashMap<String, usize>>>,
     /// Thread context captured from `send_draft()` for MultiMessage paragraph delivery.
     multi_message_thread_ts: Arc<Mutex<HashMap<String, Option<String>>>>,
+    reply_to_message_id: None,
 }
 
 impl std::fmt::Debug for MatrixChannel {
@@ -253,6 +254,7 @@ impl MatrixChannel {
             last_draft_edit: Arc::new(Mutex::new(HashMap::new())),
             multi_message_sent_len: Arc::new(Mutex::new(HashMap::new())),
             multi_message_thread_ts: Arc::new(Mutex::new(HashMap::new())),
+            reply_to_message_id: None,
         }
     }
 
@@ -1186,6 +1188,7 @@ impl Channel for MatrixChannel {
                         .unwrap_or_default()
                         .as_secs(),
                     thread_ts: thread_ts.clone(),
+            reply_to_message_id: None,
                     interruption_scope_id: thread_ts,
                     attachments: vec![],
                 };

@@ -493,6 +493,7 @@ impl GmailPushChannel {
                         channel: "gmail_push".to_string(),
                         timestamp,
                         thread_ts: Some(gmail_msg.thread_id),
+                        reply_to_message_id: None,
                         interruption_scope_id: None,
                         attachments: Vec::new(),
                     };

@@ -1169,6 +1169,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -1300,6 +1301,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: thread_id,
+            reply_to_message_id: None,
             interruption_scope_id: None,
             attachments: vec![],
         })
@@ -1504,6 +1506,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            reply_to_message_id: None,
             thread_ts: thread_id,
             interruption_scope_id: None,
             attachments: vec![],
