@@ -45,6 +45,11 @@ fn source_does_not_use_legacy_reply_to_field() {
         });
 
         for (line_idx, line) in content.lines().enumerate() {
+            // `reply_to_message_id` is the approved field for threading;
+            // skip lines that only mention it to avoid false positives.
+            if line.contains("reply_to_message_id") {
+                continue;
+            }
             for pattern in FORBIDDEN_PATTERNS {
                 if line.contains(pattern) {
                     let rel = file_path
