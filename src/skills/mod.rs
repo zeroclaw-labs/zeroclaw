@@ -11,6 +11,36 @@ use std::time::{Duration, SystemTime};
 use zip::ZipArchive;
 
 mod audit;
+pub mod tool_handler;
+
+use crate::security::SecurityPolicy;
+use crate::tools::traits::Tool;
+use std::sync::{Arc, RwLock};
+
+/// Runtime context for injecting gateway credentials into trusted skills.
+pub struct ServiceTokenContext {
+    pub token: String,
+    pub gateway_url: String,
+    pub trusted_skills: HashSet<String>,
+}
+
+static SERVICE_TOKEN_CTX: RwLock<Option<ServiceTokenContext>> = RwLock::new(None);
+
+/// Set the process-global service token context (called once at gateway startup).
+pub fn set_service_token_context(ctx: ServiceTokenContext) {
+    *SERVICE_TOKEN_CTX.write().unwrap() = Some(ctx);
+}
+
+/// Get gateway credentials for a skill if it is trusted.
+pub(crate) fn get_gateway_creds_for_skill(skill_name: &str) -> Option<(String, String)> {
+    let guard = SERVICE_TOKEN_CTX.read().unwrap();
+    let ctx = guard.as_ref()?;
+    if ctx.trusted_skills.contains(skill_name) {
+        Some((ctx.token.clone(), ctx.gateway_url.clone()))
+    } else {
+        None
+    }
+}
 #[cfg(feature = "skill-creation")]
 pub mod creator;
 #[cfg(feature = "skill-creation")]
@@ -58,6 +88,28 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    /// Semantic tags for tool classification (e.g. `["search-phase"]`).
+    /// Used by the agent loop to determine execution ordering.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// When `true`, the tool is a terminal action whose output can be returned
+    /// directly to the user without an additional LLM turn.
+    #[serde(default)]
+    pub terminal: bool,
+    /// Maximum concurrent executions of this tool. Overrides global `max_parallel_tool_calls`.
+    #[serde(default)]
+    pub max_parallel: Option<usize>,
+    /// Maximum chars kept in result for conversation history. Overrides global `max_tool_result_chars`.
+    #[serde(default)]
+    pub max_result_chars: Option<usize>,
+    /// Maximum times this tool may be called in a single agent turn.
+    /// Excess calls receive a synthetic skip message instead of executing.
+    #[serde(default)]
+    pub max_calls_per_turn: Option<usize>,
+    /// Per-tool environment variables passed to subprocess.
+    /// Defined in SKILL.toml as `[tools.env]` section.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// Skill manifest parsed from SKILL.toml
@@ -149,6 +201,59 @@ pub fn load_skills_with_open_skills_settings(
         open_skills_dir,
         None,
     )
+}
+
+/// Create native `Tool` trait objects from all loaded skills.
+///
+/// Each `[[tools]]` entry in a SKILL.toml with `kind = "shell"` becomes a
+/// real `Tool` that LLM providers can call via native function calling.
+pub fn create_skill_tools(
+    workspace_dir: &Path,
+    config: &crate::config::Config,
+    security: &Arc<SecurityPolicy>,
+) -> Vec<Arc<dyn Tool>> {
+    let skills = load_skills_with_config(workspace_dir, config);
+    let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+
+    for skill in skills {
+        let skill_name = skill.name.clone();
+        let skill_dir = skill
+            .location
+            .as_ref()
+            .and_then(|p| p.parent().map(PathBuf::from));
+        let gateway_creds = get_gateway_creds_for_skill(&skill_name);
+
+        for tool_def in skill.tools {
+            let tool_name = tool_def.name.clone();
+            match tool_handler::SkillToolHandler::new(
+                skill_name.clone(),
+                tool_def,
+                security.clone(),
+                skill_dir.clone(),
+                gateway_creds.clone(),
+            ) {
+                Ok(handler) => {
+                    tracing::info!(
+                        tool = %tool_name,
+                        skill = %skill_name,
+                        "Registered skill tool"
+                    );
+                    tools.push(Arc::new(handler));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        tool = %tool_name,
+                        skill = %skill_name,
+                        "Failed to create skill tool handler"
+                    );
+                }
+            }
+        }
+    }
+
+    tracing::info!(count = tools.len(), "Skill tools created");
+    tools
 }
 
 fn load_skills_with_open_skills_config(
@@ -1691,6 +1796,12 @@ command = "echo hello"
                 kind: "shell".to_string(),
                 command: "echo hi".to_string(),
                 args: HashMap::new(),
+                tags: vec![],
+                terminal: false,
+                max_parallel: None,
+                max_result_chars: None,
+                max_calls_per_turn: None,
+                env: HashMap::new(),
             }],
             prompts: vec!["Do the thing.".to_string()],
             location: Some(PathBuf::from("/tmp/workspace/skills/test/SKILL.md")),
@@ -1895,6 +2006,12 @@ description = "Bare minimum"
                 kind: "shell".to_string(),
                 command: "curl wttr.in".to_string(),
                 args: HashMap::new(),
+                tags: vec![],
+                terminal: false,
+                max_parallel: None,
+                max_result_chars: None,
+                max_calls_per_turn: None,
+                env: HashMap::new(),
             }],
             prompts: vec![],
             location: None,
@@ -2113,6 +2230,51 @@ description = "Bare minimum"
     }
 
     #[test]
+    fn skill_tool_deserializes_env_section() {
+        let toml_str = r#"
+[skill]
+name = "test"
+description = "test skill"
+version = "1.0.0"
+
+[[tools]]
+name = "my_tool"
+description = "a tool"
+kind = "shell"
+command = "echo hello"
+
+[tools.env]
+SKILL_URL_VERIFY_TIMEOUT = "5"
+SKILL_VERBATIM_GATE = "0"
+"#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.tools.len(), 1);
+        let env = &manifest.tools[0].env;
+        assert_eq!(env.len(), 2);
+        assert_eq!(env.get("SKILL_URL_VERIFY_TIMEOUT").unwrap(), "5");
+        assert_eq!(env.get("SKILL_VERBATIM_GATE").unwrap(), "0");
+    }
+
+    #[test]
+    fn skill_tool_deserializes_without_env_section() {
+        let toml_str = r#"
+[skill]
+name = "test"
+description = "test skill"
+version = "1.0.0"
+
+[[tools]]
+name = "my_tool"
+description = "a tool"
+kind = "shell"
+command = "echo hello"
+"#;
+        let manifest: SkillManifest = toml::from_str(toml_str).unwrap();
+        assert_eq!(manifest.tools.len(), 1);
+        assert!(manifest.tools[0].env.is_empty());
+    }
+
+    #[test]
     fn load_open_skill_md_frontmatter_uses_metadata_and_strips_block() {
         let _env_guard = open_skills_env_lock().lock().unwrap();
         let _enabled_guard = EnvVarGuard::unset("ZEROCLAW_OPEN_SKILLS_ENABLED");
@@ -2147,6 +2309,26 @@ description = "Bare minimum"
         assert!(skills[0].tags.iter().any(|tag| tag == "open-skills"));
         assert!(skills[0].prompts[0].contains("# PDF Guide"));
         assert!(!skills[0].prompts[0].contains("description: Use this skill"));
+    }
+
+    #[test]
+    fn service_token_context_trusted_and_untrusted() {
+        // Single test to avoid race conditions on the global RwLock.
+        set_service_token_context(ServiceTokenContext {
+            token: "zc_test_token".to_string(),
+            gateway_url: "http://127.0.0.1:42617".to_string(),
+            trusted_skills: ["my-skill".to_string()].into_iter().collect(),
+        });
+
+        // Trusted skill gets credentials
+        let creds = get_gateway_creds_for_skill("my-skill");
+        assert!(creds.is_some());
+        let (token, url) = creds.unwrap();
+        assert_eq!(token, "zc_test_token");
+        assert_eq!(url, "http://127.0.0.1:42617");
+
+        // Untrusted skill gets None
+        assert!(get_gateway_creds_for_skill("untrusted-skill").is_none());
     }
 
     #[test]

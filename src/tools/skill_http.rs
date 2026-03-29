@@ -167,6 +167,12 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/weather?city={{city}}".to_string(),
             args,
+            tags: Vec::new(),
+            terminal: false,
+            max_parallel: None,
+            max_result_chars: None,
+            max_calls_per_turn: None,
+            env: HashMap::new(),
         }
     }
 
@@ -216,6 +222,12 @@ mod tests {
             kind: "http".to_string(),
             command: "https://api.example.com/ping".to_string(),
             args: HashMap::new(),
+            tags: Vec::new(),
+            terminal: false,
+            max_parallel: None,
+            max_result_chars: None,
+            max_calls_per_turn: None,
+            env: HashMap::new(),
         };
         let tool = SkillHttpTool::new("s", &st);
         let schema = tool.parameters_schema();
