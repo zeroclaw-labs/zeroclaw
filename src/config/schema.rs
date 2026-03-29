@@ -202,6 +202,10 @@ pub struct Config {
     #[serde(default)]
     pub query_classification: QueryClassificationConfig,
 
+    /// Automatic complexity-based model routing (`[auto_routing]`).
+    #[serde(default)]
+    pub auto_routing: AutoRoutingConfig,
+
     /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
@@ -5669,6 +5673,34 @@ pub struct EmbeddingRouteConfig {
     pub api_key: Option<String>,
 }
 
+// ── Auto Routing ─────────────────────────────────────────────────
+
+/// Automatic complexity-based model routing. When enabled, the agent
+/// estimates conversation complexity before each LLM call and routes to
+/// the appropriate model tier via hints (`hint:auto-simple`,
+/// `hint:auto-moderate`, `hint:auto-complex`).
+///
+/// ```toml
+/// [auto_routing]
+/// enabled = true
+/// simple_hint = "cost-optimized"   # cheapest model
+/// complex_hint = "reasoning"       # most capable model
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AutoRoutingConfig {
+    /// Enable automatic complexity-based routing. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Route hint for simple messages. Default: `"cost-optimized"`.
+    #[serde(default)]
+    pub simple_hint: Option<String>,
+
+    /// Route hint for complex messages. Default: `"reasoning"`.
+    #[serde(default)]
+    pub complex_hint: Option<String>,
+}
+
 // ── Query Classification ─────────────────────────────────────────
 
 /// Automatic query classification — classifies user messages by keyword/pattern
@@ -8406,6 +8438,7 @@ impl Default for Config {
             hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
+            auto_routing: AutoRoutingConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
             mcp: McpConfig::default(),
@@ -11478,6 +11511,7 @@ auto_save = true
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
+            auto_routing: AutoRoutingConfig::default(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
@@ -12066,6 +12100,7 @@ default_temperature = 0.7
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             query_classification: QueryClassificationConfig::default(),
+            auto_routing: AutoRoutingConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             cron: CronConfig::default(),
             channels_config: ChannelsConfig::default(),

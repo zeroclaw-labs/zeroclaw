@@ -21,6 +21,7 @@ pub mod azure_openai;
 pub mod bedrock;
 pub mod claude_code;
 pub mod compatible;
+pub mod complexity;
 pub mod copilot;
 pub mod gemini;
 pub mod gemini_cli;

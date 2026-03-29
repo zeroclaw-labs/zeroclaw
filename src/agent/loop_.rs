@@ -51,6 +51,43 @@ pub(crate) use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// Apply automatic complexity-based routing to the model name.
+///
+/// When `auto_routing.enabled` is true, estimates the conversation complexity
+/// from the history and returns the corresponding hint string. Otherwise
+/// returns the original model name unchanged.
+///
+/// This is the public entry point used by both the agent loop and channels.
+pub fn apply_auto_routing_from_config(
+    config: &crate::config::AutoRoutingConfig,
+    history: &[ChatMessage],
+    original_model: &str,
+) -> String {
+    if !config.enabled {
+        return original_model.to_string();
+    }
+
+    // Skip auto-routing if the model is already a hint.
+    if original_model.starts_with("hint:") {
+        return original_model.to_string();
+    }
+
+    let complexity = crate::providers::complexity::estimate(history);
+    let hint = complexity.to_hint(
+        config.simple_hint.as_deref(),
+        config.complex_hint.as_deref(),
+    );
+
+    tracing::info!(
+        complexity = %complexity,
+        hint = %hint,
+        original_model = %original_model,
+        "Auto-routing: estimated complexity"
+    );
+
+    hint
+}
+
 /// Callback type for checking if model has been switched during tool execution.
 /// Returns Some((provider, model)) if a switch was requested, None otherwise.
 pub type ModelSwitchCallback = Arc<Mutex<Option<(String, String)>>>;
@@ -3954,6 +3991,8 @@ pub async fn run(
 
         #[allow(unused_assignments)]
         let mut response = String::new();
+        let effective_model =
+            apply_auto_routing_from_config(&config.auto_routing, &history, &model_name);
         loop {
             match run_tool_call_loop(
                 provider.as_ref(),
@@ -3961,7 +4000,7 @@ pub async fn run(
                 &tools_registry,
                 observer.as_ref(),
                 &provider_name,
-                &model_name,
+                &effective_model,
                 effective_temperature,
                 false,
                 approval_manager.as_ref(),
@@ -4260,6 +4299,8 @@ pub async fn run(
                 }
             });
 
+            let effective_model_interactive =
+                apply_auto_routing_from_config(&config.auto_routing, &history, &model_name);
             let response = loop {
                 match run_tool_call_loop(
                     provider.as_ref(),
@@ -4267,7 +4308,7 @@ pub async fn run(
                     &tools_registry,
                     observer.as_ref(),
                     &provider_name,
-                    &model_name,
+                    &effective_model_interactive,
                     turn_temperature,
                     true,
                     approval_manager.as_ref(),
@@ -4772,13 +4813,15 @@ pub async fn process_message(
         excluded_tools.extend(config.autonomy.non_cli_excluded_tools.iter().cloned());
     }
 
+    let effective_model_pm =
+        apply_auto_routing_from_config(&config.auto_routing, &history, &model_name);
     agent_turn(
         provider.as_ref(),
         &mut history,
         &tools_registry,
         observer.as_ref(),
         provider_name,
-        &model_name,
+        &effective_model_pm,
         effective_temperature,
         true,
         "daemon",

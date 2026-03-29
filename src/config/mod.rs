@@ -4,7 +4,7 @@ pub mod workspace;
 
 #[allow(unused_imports)]
 pub use schema::{
-    AgentConfig, AssemblyAiSttConfig, AuditConfig, AutonomyConfig, BackupConfig,
+    AgentConfig, AssemblyAiSttConfig, AuditConfig, AutoRoutingConfig, AutonomyConfig, BackupConfig,
     BrowserComputerUseConfig, BrowserConfig, BuiltinHooksConfig, ChannelsConfig,
     ClassificationRule, ClaudeCodeConfig, ClaudeCodeRunnerConfig, CloudOpsConfig, CodexCliConfig,
     ComposioConfig, Config, ConversationalAiConfig, CostConfig, CronConfig, CronJobDecl,

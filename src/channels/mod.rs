@@ -2881,6 +2881,11 @@ async fn process_channel_message(
     let elapsed_before_llm_ms = started_at.elapsed().as_millis() as u64;
     tracing::info!(elapsed_before_llm_ms, "⏱ Starting LLM call");
     let (llm_result, fallback_info) = scope_provider_fallback(async {
+        let effective_model_ch = crate::agent::loop_::apply_auto_routing_from_config(
+            &ctx.prompt_config.auto_routing,
+            &history,
+            route.model.as_str(),
+        );
         let llm_result = loop {
             let loop_result = tokio::select! {
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
@@ -2898,7 +2903,7 @@ async fn process_channel_message(
                         ctx.tools_registry.as_ref(),
                         notify_observer.as_ref() as &dyn Observer,
                         route.provider.as_str(),
-                        route.model.as_str(),
+                        effective_model_ch.as_str(),
                         runtime_defaults.temperature,
                         true,
                         Some(&*ctx.approval_manager),
