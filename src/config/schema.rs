@@ -5872,6 +5872,26 @@ pub struct CronJobDecl {
     /// Delivery configuration.
     #[serde(default)]
     pub delivery: Option<DeliveryConfigDecl>,
+    /// Optional conditional schedule that overrides the primary schedule
+    /// when a condition is active (e.g. more frequent polling near a deadline).
+    #[serde(default)]
+    pub conditional_schedule: Option<ConditionalScheduleDecl>,
+}
+
+/// Declarative conditional schedule configuration.
+///
+/// When the condition is active, the `schedule` expression replaces the
+/// primary job schedule (typically a more frequent interval).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ConditionalScheduleDecl {
+    /// Cron expression to use while the condition is active.
+    pub schedule: CronScheduleDecl,
+    /// Condition type. Currently only `"date_range"` is supported.
+    pub condition_type: String,
+    /// RFC 3339 timestamp: start of the condition window (inclusive).
+    pub condition_start: String,
+    /// RFC 3339 timestamp: end of the condition window (inclusive).
+    pub condition_end: String,
 }
 
 /// Schedule variant for declarative cron jobs.

@@ -1,7 +1,8 @@
 use crate::config::Config;
 use crate::cron::{
-    CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
-    next_run_for_schedule, schedule_cron_expression, validate_delivery_config, validate_schedule,
+    ConditionalSchedule, CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule,
+    SessionTarget, effective_next_run, next_run_for_schedule, schedule_cron_expression,
+    validate_delivery_config, validate_schedule,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -49,8 +50,8 @@ pub fn add_shell_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, created_at, next_run
-             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9)",
+                enabled, delivery, delete_after_run, created_at, next_run, conditional_schedule
+             ) VALUES (?1, ?2, ?3, ?4, 'shell', NULL, ?5, 'isolated', NULL, 1, ?6, ?7, ?8, ?9, NULL)",
             params![
                 id,
                 expression,
@@ -95,8 +96,8 @@ pub fn add_agent_job(
         conn.execute(
             "INSERT INTO cron_jobs (
                 id, expression, command, schedule, job_type, prompt, name, session_target, model,
-                enabled, delivery, delete_after_run, allowed_tools, created_at, next_run
-             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12)",
+                enabled, delivery, delete_after_run, allowed_tools, created_at, next_run, conditional_schedule
+             ) VALUES (?1, ?2, '', ?3, 'agent', ?4, ?5, ?6, ?7, 1, ?8, ?9, ?10, ?11, ?12, NULL)",
             params![
                 id,
                 expression,
@@ -124,7 +125,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, conditional_schedule
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -143,7 +144,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, conditional_schedule
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -177,7 +178,7 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, conditional_schedule
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC
@@ -207,7 +208,7 @@ pub fn all_overdue_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJ
         let mut stmt = conn.prepare(
             "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    allowed_tools, source
+                    allowed_tools, source, conditional_schedule
              FROM cron_jobs
              WHERE enabled = 1 AND next_run <= ?1
              ORDER BY next_run ASC",
@@ -269,9 +270,13 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             job.allowed_tools = Some(allowed_tools);
         }
     }
+    if let Some(cond) = patch.conditional_schedule {
+        job.conditional_schedule = cond;
+    }
 
     if schedule_changed {
-        job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+        job.next_run =
+            effective_next_run(&job.schedule, job.conditional_schedule.as_ref(), Utc::now())?;
     }
 
     with_connection(config, |conn| {
@@ -279,8 +284,8 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
             "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 allowed_tools = ?12, next_run = ?13
-             WHERE id = ?14",
+                 allowed_tools = ?12, next_run = ?13, conditional_schedule = ?14
+             WHERE id = ?15",
             params![
                 job.expression,
                 job.command,
@@ -295,6 +300,7 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 if job.delete_after_run { 1 } else { 0 },
                 encode_allowed_tools(job.allowed_tools.as_ref())?,
                 job.next_run.to_rfc3339(),
+                encode_conditional_schedule(job.conditional_schedule.as_ref())?,
                 job.id,
             ],
         )
@@ -350,7 +356,7 @@ pub fn reschedule_after_run(
             Ok(())
         })
     } else {
-        let next_run = next_run_for_schedule(&job.schedule, now)?;
+        let next_run = effective_next_run(&job.schedule, job.conditional_schedule.as_ref(), now)?;
         with_connection(config, |conn| {
             conn.execute(
                 "UPDATE cron_jobs
@@ -496,6 +502,7 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
     let created_at_raw: String = row.get(12)?;
     let allowed_tools_raw: Option<String> = row.get(17)?;
     let source: Option<String> = row.get(18)?;
+    let conditional_schedule_raw: Option<String> = row.get(19)?;
 
     Ok(CronJob {
         id: row.get(0)?,
@@ -520,6 +527,8 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         last_status: row.get(15)?,
         last_output: row.get(16)?,
         allowed_tools: decode_allowed_tools(allowed_tools_raw.as_deref())
+            .map_err(sql_conversion_error)?,
+        conditional_schedule: decode_conditional_schedule(conditional_schedule_raw.as_deref())
             .map_err(sql_conversion_error)?,
     })
 }
@@ -568,6 +577,24 @@ fn decode_allowed_tools(raw: Option<&str>) -> Result<Option<Vec<String>>> {
             return serde_json::from_str(trimmed)
                 .map(Some)
                 .with_context(|| format!("Failed to parse cron allowed_tools JSON: {trimmed}"));
+        }
+    }
+    Ok(None)
+}
+
+fn encode_conditional_schedule(cond: Option<&ConditionalSchedule>) -> Result<Option<String>> {
+    cond.map(serde_json::to_string)
+        .transpose()
+        .context("Failed to serialize conditional_schedule")
+}
+
+fn decode_conditional_schedule(raw: Option<&str>) -> Result<Option<ConditionalSchedule>> {
+    if let Some(raw) = raw {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return serde_json::from_str(trimmed)
+                .map(Some)
+                .with_context(|| format!("Failed to parse conditional_schedule JSON: {trimmed}"));
         }
     }
     Ok(None)
@@ -651,6 +678,11 @@ pub fn sync_declarative_jobs(
             };
             let delivery_json = serde_json::to_string(&delivery)?;
             let allowed_tools_json = encode_allowed_tools(decl.allowed_tools.as_ref())?;
+            let conditional = match &decl.conditional_schedule {
+                Some(c) => Some(convert_conditional_schedule_decl(c)?),
+                None => None,
+            };
+            let conditional_json = encode_conditional_schedule(conditional.as_ref())?;
             let command = decl.command.as_deref().unwrap_or("");
             let delete_after_run = matches!(decl.schedule, CronScheduleDecl::At { .. });
 
@@ -673,14 +705,15 @@ pub fn sync_declarative_jobs(
                 let schedule_changed = current_schedule_raw.as_deref() != Some(&schedule_json);
 
                 if schedule_changed {
-                    let next_run = next_run_for_schedule(&schedule, now)?;
+                    let next_run = effective_next_run(&schedule, conditional.as_ref(), now)?;
                     conn.execute(
                         "UPDATE cron_jobs
                          SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                             allowed_tools = ?12, source = 'declarative', next_run = ?13
-                         WHERE id = ?14",
+                             allowed_tools = ?12, source = 'declarative', next_run = ?13,
+                             conditional_schedule = ?14
+                         WHERE id = ?15",
                         params![
                             expression,
                             command,
@@ -695,6 +728,7 @@ pub fn sync_declarative_jobs(
                             if delete_after_run { 1 } else { 0 },
                             allowed_tools_json,
                             next_run.to_rfc3339(),
+                            conditional_json,
                             decl.id,
                         ],
                     )
@@ -707,8 +741,9 @@ pub fn sync_declarative_jobs(
                          SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4,
                              prompt = ?5, name = ?6, session_target = ?7, model = ?8,
                              enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                             allowed_tools = ?12, source = 'declarative'
-                         WHERE id = ?13",
+                             allowed_tools = ?12, source = 'declarative',
+                             conditional_schedule = ?13
+                         WHERE id = ?14",
                         params![
                             expression,
                             command,
@@ -722,6 +757,7 @@ pub fn sync_declarative_jobs(
                             delivery_json,
                             if delete_after_run { 1 } else { 0 },
                             allowed_tools_json,
+                            conditional_json,
                             decl.id,
                         ],
                     )
@@ -733,13 +769,13 @@ pub fn sync_declarative_jobs(
                 tracing::debug!(job_id = %decl.id, "Updated declarative cron job");
             } else {
                 // Insert new declarative job.
-                let next_run = next_run_for_schedule(&schedule, now)?;
+                let next_run = effective_next_run(&schedule, conditional.as_ref(), now)?;
                 conn.execute(
                     "INSERT INTO cron_jobs (
                         id, expression, command, schedule, job_type, prompt, name,
                         session_target, model, enabled, delivery, delete_after_run,
-                        allowed_tools, source, created_at, next_run
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15)",
+                        allowed_tools, source, created_at, next_run, conditional_schedule
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'declarative', ?14, ?15, ?16)",
                     params![
                         decl.id,
                         expression,
@@ -756,6 +792,7 @@ pub fn sync_declarative_jobs(
                         allowed_tools_json,
                         now.to_rfc3339(),
                         next_run.to_rfc3339(),
+                        conditional_json,
                     ],
                 )
                 .with_context(|| {
@@ -842,6 +879,46 @@ fn convert_delivery_decl(decl: &crate::config::schema::DeliveryConfigDecl) -> De
         to: decl.to.clone(),
         best_effort: decl.best_effort,
     }
+}
+
+/// Convert a `ConditionalScheduleDecl` to the runtime `ConditionalSchedule`.
+fn convert_conditional_schedule_decl(
+    decl: &crate::config::schema::ConditionalScheduleDecl,
+) -> Result<ConditionalSchedule> {
+    use crate::cron::ConditionType;
+
+    let schedule = convert_schedule_decl(&decl.schedule)?;
+    let condition_type = decl
+        .condition_type
+        .parse::<ConditionType>()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let condition_start = DateTime::parse_from_rfc3339(&decl.condition_start)
+        .with_context(|| {
+            format!(
+                "Invalid RFC3339 timestamp in conditional_schedule.condition_start: {}",
+                decl.condition_start
+            )
+        })?
+        .with_timezone(&Utc);
+    let condition_end = DateTime::parse_from_rfc3339(&decl.condition_end)
+        .with_context(|| {
+            format!(
+                "Invalid RFC3339 timestamp in conditional_schedule.condition_end: {}",
+                decl.condition_end
+            )
+        })?
+        .with_timezone(&Utc);
+
+    if condition_end <= condition_start {
+        anyhow::bail!("conditional_schedule.condition_end must be after condition_start");
+    }
+
+    Ok(ConditionalSchedule {
+        schedule,
+        condition_type,
+        condition_start,
+        condition_end,
+    })
 }
 
 fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
@@ -935,6 +1012,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
     add_column_if_missing(&conn, "allowed_tools", "TEXT")?;
     add_column_if_missing(&conn, "source", "TEXT DEFAULT 'imperative'")?;
+    add_column_if_missing(&conn, "conditional_schedule", "TEXT")?;
 
     f(&conn)
 }
@@ -1470,6 +1548,7 @@ mod tests {
             allowed_tools: None,
             session_target: None,
             delivery: None,
+            conditional_schedule: None,
         }
     }
 
@@ -1489,6 +1568,7 @@ mod tests {
             allowed_tools: None,
             session_target: None,
             delivery: None,
+            conditional_schedule: None,
         }
     }
 
@@ -1643,6 +1723,7 @@ mod tests {
             allowed_tools: None,
             session_target: None,
             delivery: None,
+            conditional_schedule: None,
         };
 
         sync_declarative_jobs(&config, &[decl]).unwrap();

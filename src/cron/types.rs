@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 /// Try to deserialize a `serde_json::Value` as `T`.  If the value is a JSON
 /// string that looks like an object (i.e. the LLM double-serialized it), parse
@@ -84,6 +85,50 @@ impl SessionTarget {
     }
 }
 
+/// Condition type for conditional schedules.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditionType {
+    /// Active during a date/time range.
+    DateRange,
+}
+
+impl FromStr for ConditionType {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "date_range" => Ok(Self::DateRange),
+            other => Err(format!(
+                "Invalid condition type '{other}'. Expected one of: 'date_range'"
+            )),
+        }
+    }
+}
+
+/// A conditional schedule that overrides the primary schedule when its
+/// condition is active.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConditionalSchedule {
+    /// The more frequent schedule to use when the condition is active.
+    pub schedule: Schedule,
+    /// The type of condition that activates this schedule.
+    pub condition_type: ConditionType,
+    /// Start of the condition window (inclusive).
+    pub condition_start: DateTime<Utc>,
+    /// End of the condition window (inclusive).
+    pub condition_end: DateTime<Utc>,
+}
+
+impl ConditionalSchedule {
+    /// Returns `true` if the condition is active at the given timestamp.
+    pub fn is_active(&self, now: DateTime<Utc>) -> bool {
+        match self.condition_type {
+            ConditionType::DateRange => now >= self.condition_start && now <= self.condition_end,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Schedule {
@@ -150,6 +195,10 @@ pub struct CronJob {
     /// When `None`, all tools are available (backward compatible default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+    /// Optional conditional schedule that overrides the primary schedule
+    /// when its condition is active (e.g. more frequent polling near a deadline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditional_schedule: Option<ConditionalSchedule>,
     /// How the job was created: `"imperative"` (CLI/API) or `"declarative"` (config).
     #[serde(default = "default_source")]
     pub source: String,
@@ -183,6 +232,7 @@ pub struct CronJobPatch {
     pub session_target: Option<SessionTarget>,
     pub delete_after_run: Option<bool>,
     pub allowed_tools: Option<Vec<String>>,
+    pub conditional_schedule: Option<Option<ConditionalSchedule>>,
 }
 
 #[cfg(test)]

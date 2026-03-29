@@ -1,8 +1,34 @@
-use crate::cron::Schedule;
+use crate::cron::{ConditionalSchedule, Schedule};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use cron::Schedule as CronExprSchedule;
 use std::str::FromStr;
+
+/// Compute the next run time considering an optional conditional schedule.
+///
+/// If `conditional` is active at `from`, uses the conditional schedule;
+/// otherwise uses the primary `schedule`. If the conditional schedule would
+/// produce a next_run after the condition window ends, falls back to the
+/// primary schedule instead.
+pub fn effective_next_run(
+    schedule: &Schedule,
+    conditional: Option<&ConditionalSchedule>,
+    from: DateTime<Utc>,
+) -> Result<DateTime<Utc>> {
+    if let Some(cond) = conditional {
+        if cond.is_active(from) {
+            let candidate = next_run_for_schedule(&cond.schedule, from)?;
+            // Only use the conditional schedule if the next occurrence falls
+            // within (or at) the condition window end.
+            if candidate <= cond.condition_end {
+                return Ok(candidate);
+            }
+            // Condition will expire before the next conditional run;
+            // fall through to the primary schedule.
+        }
+    }
+    next_run_for_schedule(schedule, from)
+}
 
 pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result<DateTime<Utc>> {
     match schedule {
@@ -302,5 +328,120 @@ mod tests {
         };
         let next = next_run_for_schedule(&schedule, monday).unwrap();
         assert_eq!(next.weekday(), chrono::Weekday::Sun);
+    }
+
+    // ── Conditional schedule tests ────────────────────────────────
+
+    use crate::cron::{ConditionType, ConditionalSchedule};
+
+    fn make_conditional(
+        expr: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> ConditionalSchedule {
+        ConditionalSchedule {
+            schedule: Schedule::Cron {
+                expr: expr.to_string(),
+                tz: None,
+            },
+            condition_type: ConditionType::DateRange,
+            condition_start: start,
+            condition_end: end,
+        }
+    }
+
+    #[test]
+    fn effective_next_run_uses_primary_when_no_conditional() {
+        let from = Utc.with_ymd_and_hms(2026, 3, 28, 12, 0, 0).unwrap();
+        let primary = Schedule::Cron {
+            expr: "0 */6 * * *".into(),
+            tz: None,
+        };
+        let next = effective_next_run(&primary, None, from).unwrap();
+        // Next 6-hourly slot after 12:00 is 18:00
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 3, 28, 18, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn effective_next_run_uses_conditional_when_active() {
+        let from = Utc.with_ymd_and_hms(2026, 3, 29, 10, 0, 0).unwrap();
+        let primary = Schedule::Cron {
+            expr: "0 */6 * * *".into(),
+            tz: None,
+        };
+        let cond = make_conditional(
+            "*/30 * * * *",
+            Utc.with_ymd_and_hms(2026, 3, 28, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 3, 31, 23, 59, 59).unwrap(),
+        );
+        let next = effective_next_run(&primary, Some(&cond), from).unwrap();
+        // Should use 30-min schedule: next after 10:00 is 10:30
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 3, 29, 10, 30, 0).unwrap());
+    }
+
+    #[test]
+    fn effective_next_run_uses_primary_when_condition_inactive() {
+        let from = Utc.with_ymd_and_hms(2026, 4, 5, 10, 0, 0).unwrap();
+        let primary = Schedule::Cron {
+            expr: "0 */6 * * *".into(),
+            tz: None,
+        };
+        let cond = make_conditional(
+            "*/30 * * * *",
+            Utc.with_ymd_and_hms(2026, 3, 28, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 3, 31, 23, 59, 59).unwrap(),
+        );
+        let next = effective_next_run(&primary, Some(&cond), from).unwrap();
+        // Condition ended on March 31, so primary schedule applies
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 4, 5, 12, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn effective_next_run_falls_back_when_conditional_exceeds_window() {
+        // Condition ends soon but conditional schedule is infrequent
+        let from = Utc.with_ymd_and_hms(2026, 3, 31, 23, 50, 0).unwrap();
+        let primary = Schedule::Cron {
+            expr: "0 */6 * * *".into(),
+            tz: None,
+        };
+        // Conditional is every 6 hours too, but condition ends at 23:59:59
+        let cond = make_conditional(
+            "0 */6 * * *",
+            Utc.with_ymd_and_hms(2026, 3, 28, 0, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 3, 31, 23, 59, 59).unwrap(),
+        );
+        let next = effective_next_run(&primary, Some(&cond), from).unwrap();
+        // The conditional schedule's next run (06:00 April 1) exceeds the
+        // condition window end, so we fall back to the primary schedule.
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn conditional_schedule_is_active_at_boundaries() {
+        let start = Utc.with_ymd_and_hms(2026, 3, 28, 0, 0, 0).unwrap();
+        let end = Utc.with_ymd_and_hms(2026, 3, 31, 23, 59, 59).unwrap();
+        let cond = make_conditional("*/30 * * * *", start, end);
+
+        // Exactly at start
+        assert!(cond.is_active(start));
+        // Exactly at end
+        assert!(cond.is_active(end));
+        // One second before start
+        assert!(!cond.is_active(start - ChronoDuration::seconds(1)));
+        // One second after end
+        assert!(!cond.is_active(end + ChronoDuration::seconds(1)));
+    }
+
+    #[test]
+    fn condition_type_parses_date_range() {
+        assert_eq!(
+            "date_range".parse::<ConditionType>().unwrap(),
+            ConditionType::DateRange
+        );
+        assert_eq!(
+            "DATE_RANGE".parse::<ConditionType>().unwrap(),
+            ConditionType::DateRange
+        );
+        assert!("unknown".parse::<ConditionType>().is_err());
     }
 }

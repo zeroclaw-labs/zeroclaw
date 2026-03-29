@@ -10,7 +10,8 @@ pub mod scheduler;
 
 #[allow(unused_imports)]
 pub use schedule::{
-    next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule,
+    effective_next_run, next_run_for_schedule, normalize_expression, schedule_cron_expression,
+    validate_schedule,
 };
 #[allow(unused_imports)]
 pub use store::{
@@ -18,8 +19,8 @@ pub use store::{
     record_run, remove_job, reschedule_after_run, sync_declarative_jobs, update_job,
 };
 pub use types::{
-    CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
-    deserialize_maybe_stringified,
+    ConditionType, ConditionalSchedule, CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType,
+    Schedule, SessionTarget, deserialize_maybe_stringified,
 };
 
 /// Validate a shell command against the full security policy (allowlist + risk gate).

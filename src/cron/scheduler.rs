@@ -55,6 +55,7 @@ pub async fn run(config: Config) -> Result<()> {
             allowed_tools: None,
             session_target: None,
             delivery: None,
+            conditional_schedule: None,
         };
         tracing::debug!(
             schedule = %schedule_cron,
@@ -801,6 +802,7 @@ mod tests {
             delivery: DeliveryConfig::default(),
             delete_after_run: false,
             allowed_tools: None,
+            conditional_schedule: None,
             source: "imperative".into(),
             created_at: Utc::now(),
             next_run: Utc::now(),
