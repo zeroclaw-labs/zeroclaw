@@ -301,14 +301,6 @@ impl Tool for WebFetchTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
-
         let url = match self.validate_url(url) {
             Ok(v) => v,
             Err(e) => {
@@ -656,6 +648,30 @@ fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
         || v6.to_ipv4_mapped().is_some_and(is_non_global_v4)
 }
 
+/// Construct a `WebFetchTool` wrapped in a `RateLimitedTool`.
+pub fn wrapped_web_fetch(
+    security: Arc<SecurityPolicy>,
+    allowed_domains: Vec<String>,
+    blocked_domains: Vec<String>,
+    max_response_size: usize,
+    timeout_secs: u64,
+    firecrawl: crate::config::schema::FirecrawlConfig,
+    allowed_private_hosts: Vec<String>,
+) -> super::wrappers::RateLimitedTool<WebFetchTool> {
+    super::wrappers::RateLimitedTool::new(
+        WebFetchTool::new(
+            security.clone(),
+            allowed_domains,
+            blocked_domains,
+            max_response_size,
+            timeout_secs,
+            firecrawl,
+            allowed_private_hosts,
+        ),
+        security,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,7 +968,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = WebFetchTool::new(
+        let tool = wrapped_web_fetch(
             security,
             vec!["example.com".into()],
             vec![],
@@ -966,7 +982,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("rate limit"));
+        assert!(result.error.unwrap().contains("Rate limit"));
     }
 
     // ── Response truncation ──────────────────────────────────────
