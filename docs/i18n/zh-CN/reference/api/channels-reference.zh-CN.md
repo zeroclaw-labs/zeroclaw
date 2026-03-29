@@ -255,7 +255,8 @@ allowed_numbers = [\"*\"]
 
 注意事项：
 
-- 使用 `cargo build --features whatsapp-web` 构建（或等效的运行命令）。
+- 预构建的发布二进制文件（stable 和 beta）默认包含 `whatsapp-web`，无需额外步骤。
+- 从源代码构建时，使用 `cargo build --features whatsapp-web` 启用（或在 `install.sh` 中设置 `ZEROCLAW_CARGO_FEATURES=whatsapp-web`）。
 - 将 `session_path` 保留在持久存储上，以避免重启后重新链接。
 - 回复路由使用发起聊天的 JID，因此直接和群组回复都能正常工作。
 

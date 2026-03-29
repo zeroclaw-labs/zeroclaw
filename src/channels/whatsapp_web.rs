@@ -1630,15 +1630,17 @@ impl Channel for WhatsAppWebChannel {
 
     async fn send(&self, _message: &SendMessage) -> Result<()> {
         anyhow::bail!(
-            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web"
+            "WhatsApp Web channel requires the 'whatsapp-web' compile-time feature, \
+            but this binary was built without it. \
+            Install a prebuilt release binary or rebuild with: cargo build --features whatsapp-web"
         );
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         anyhow::bail!(
-            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web"
+            "WhatsApp Web channel requires the 'whatsapp-web' compile-time feature, \
+            but this binary was built without it. \
+            Install a prebuilt release binary or rebuild with: cargo build --features whatsapp-web"
         );
     }
 
@@ -1648,15 +1650,17 @@ impl Channel for WhatsAppWebChannel {
 
     async fn start_typing(&self, _recipient: &str) -> Result<()> {
         anyhow::bail!(
-            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web"
+            "WhatsApp Web channel requires the 'whatsapp-web' compile-time feature, \
+            but this binary was built without it. \
+            Install a prebuilt release binary or rebuild with: cargo build --features whatsapp-web"
         );
     }
 
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
         anyhow::bail!(
-            "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web"
+            "WhatsApp Web channel requires the 'whatsapp-web' compile-time feature, \
+            but this binary was built without it. \
+            Install a prebuilt release binary or rebuild with: cargo build --features whatsapp-web"
         );
     }
 }

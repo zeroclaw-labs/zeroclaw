@@ -4341,7 +4341,12 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
             }
             #[cfg(not(feature = "whatsapp-web"))]
             {
-                anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
+                anyhow::bail!(
+                    "WhatsApp channel requires the `whatsapp-web` compile-time feature, \
+                     but this binary was built without it. \
+                     Install a prebuilt release binary (includes whatsapp-web) or \
+                     rebuild from source with: cargo build --features whatsapp-web"
+                );
             }
         }
         "qq" => {
@@ -4637,13 +4642,22 @@ fn collect_configured_channels(
                 }
                 #[cfg(not(feature = "whatsapp-web"))]
                 {
-                    tracing::warn!(
-                        "WhatsApp Web backend requires 'whatsapp-web' feature. Enable with: cargo build --features whatsapp-web"
+                    tracing::error!(
+                        "WhatsApp Web backend requires the 'whatsapp-web' compile-time feature, \
+                         but this binary was built without it. \
+                         Prebuilt release binaries include this feature — \
+                         reinstall from a release asset or rebuild from source with: \
+                         cargo build --features whatsapp-web"
                     );
                     eprintln!(
-                        "  ⚠ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled in."
+                        "  ✖ WhatsApp Web is configured but the 'whatsapp-web' feature is not compiled into this binary."
                     );
-                    eprintln!("    Rebuild with: cargo build --features whatsapp-web");
+                    eprintln!(
+                        "    Option 1: Install a prebuilt release binary (includes whatsapp-web by default)."
+                    );
+                    eprintln!(
+                        "    Option 2: Rebuild from source with: cargo build --features whatsapp-web"
+                    );
                 }
             }
             _ => {
