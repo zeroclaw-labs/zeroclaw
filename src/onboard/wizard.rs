@@ -7968,7 +7968,6 @@ mod tests {
         assert!(has_launchable_channels(&channels));
     }
 
-
     #[test]
     fn channels_repair_preserves_unmodified_channels() {
         use crate::config::schema::{DiscordConfig, MatrixConfig, StreamMode};
