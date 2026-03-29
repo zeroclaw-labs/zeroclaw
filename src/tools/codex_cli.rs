@@ -60,15 +60,6 @@ impl Tool for CodexCliTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        // Rate limit check
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
         // Enforce act policy
         if let Err(error) = self
             .security
@@ -135,15 +126,6 @@ impl Tool for CodexCliTool {
         } else {
             self.security.workspace_dir.clone()
         };
-
-        // Record action budget
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
 
         // Build CLI command
         let codex_bin = if cfg!(target_os = "windows") {
@@ -236,6 +218,14 @@ impl Tool for CodexCliTool {
     }
 }
 
+/// Convenience constructor used in tests and in `mod.rs` assembly.
+pub fn wrapped_codex_cli(
+    security: Arc<SecurityPolicy>,
+    config: CodexCliConfig,
+) -> super::wrappers::RateLimitedTool<CodexCliTool> {
+    super::wrappers::RateLimitedTool::new(CodexCliTool::new(security.clone(), config), security)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,7 +272,7 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = CodexCliTool::new(security, test_config());
+        let tool = wrapped_codex_cli(security, test_config());
         let result = tool
             .execute(json!({"prompt": "hello"}))
             .await
