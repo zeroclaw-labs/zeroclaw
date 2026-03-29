@@ -241,6 +241,22 @@ impl McpRegistry {
             }
         }
 
+        if !configs.is_empty() && servers.is_empty() {
+            tracing::warn!(
+                "All {} configured MCP server(s) failed to connect — \
+                 check server commands/URLs and ensure the MCP processes are reachable. \
+                 Run with RUST_LOG=debug for detailed connection errors.",
+                configs.len()
+            );
+        } else if !configs.is_empty() && servers.len() < configs.len() {
+            tracing::warn!(
+                "Only {}/{} MCP server(s) connected successfully — \
+                 check logs above for connection failures",
+                servers.len(),
+                configs.len()
+            );
+        }
+
         Ok(Self {
             servers,
             tool_index,

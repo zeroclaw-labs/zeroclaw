@@ -4065,6 +4065,13 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
 const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 
 fn validate_mcp_config(config: &McpConfig) -> Result<()> {
+    if config.servers.is_empty() {
+        tracing::warn!(
+            "mcp.enabled is true but no servers are configured — \
+             add [[mcp.servers]] entries in config.toml to connect MCP tool servers"
+        );
+        return Ok(());
+    }
     let mut seen_names = std::collections::HashSet::new();
     for (i, server) in config.servers.iter().enumerate() {
         let name = server.name.trim();
@@ -9783,6 +9790,12 @@ impl Config {
         // MCP
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
+        } else if !self.mcp.servers.is_empty() {
+            tracing::warn!(
+                "MCP servers are configured ({} server(s)) but mcp.enabled is false — \
+                 set `mcp.enabled = true` in config.toml to activate them",
+                self.mcp.servers.len()
+            );
         }
 
         // Knowledge graph
@@ -15476,6 +15489,17 @@ require_otp_to_resume = true
         let cfg = McpConfig::default();
         assert!(!cfg.enabled);
         assert!(cfg.servers.is_empty());
+    }
+
+    #[test]
+    async fn validate_mcp_config_enabled_no_servers_succeeds() {
+        // enabled=true with no servers should succeed (warning is logged, not an error)
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![],
+            ..Default::default()
+        };
+        assert!(validate_mcp_config(&cfg).is_ok());
     }
 
     #[test]
