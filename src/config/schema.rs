@@ -9611,6 +9611,11 @@ impl Config {
                 if prefix.ends_with('/') {
                     anyhow::bail!("gateway.path_prefix must not end with '/' (including bare '/')");
                 }
+                // Reject protocol-relative URLs ("//evil.com") which browsers
+                // interpret as external redirects — an open-redirect vector.
+                if prefix.contains("//") {
+                    anyhow::bail!("gateway.path_prefix must not contain '//' (double slash)");
+                }
                 // Reject characters unsafe for URL paths or HTML/JS injection.
                 // Whitespace is intentionally excluded from the allowed set.
                 if let Some(bad) = prefix.chars().find(|c| {

@@ -177,9 +177,10 @@ pub async fn handle_hardware_pin(
     // Create devices dir + file if missing, then append.
     if let Some(parent) = device_path.parent() {
         if let Err(e) = fs::create_dir_all(parent).await {
+            tracing::error!("Failed to create hardware directory: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to create directory: {e}") })),
+                Json(serde_json::json!({ "error": "Internal server error" })),
             )
                 .into_response();
         }
@@ -204,11 +205,14 @@ pub async fn handle_hardware_pin(
             )
                 .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Failed to write: {e}") })),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to write pin registration: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal server error" })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -285,9 +289,10 @@ pub async fn handle_hardware_context_post(
 
     if let Some(parent) = device_path.parent() {
         if let Err(e) = fs::create_dir_all(parent).await {
+            tracing::error!("Failed to create hardware directory: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Failed to create directory: {e}") })),
+                Json(serde_json::json!({ "error": "Internal server error" })),
             )
                 .into_response();
         }
@@ -304,11 +309,14 @@ pub async fn handle_hardware_context_post(
             tracing::info!(device = %req.device, bytes = content.len(), "Hardware context appended");
             (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": format!("Failed to write: {e}") })),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to write hardware context: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Internal server error" })),
+            )
+                .into_response()
+        }
     }
 }
 

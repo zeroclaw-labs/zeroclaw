@@ -1069,7 +1069,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Nest under path prefix when configured (axum strips prefix before routing).
     // nest() at "/prefix" handles both "/prefix" and "/prefix/*" but not "/prefix/"
     // with a trailing slash, so we add a fallback redirect for that case.
+    //
+    // SAFETY: prefix originates from `gateway.path_prefix` in config, validated
+    // by `Config::validate()` to start with '/', reject '//', and contain only
+    // safe URI characters. The runtime assertion below is defense-in-depth
+    // against open-redirect via protocol-relative URLs ("//evil.com").
     let app = if let Some(prefix) = path_prefix {
+        assert!(
+            prefix.starts_with('/') && !prefix.contains("//"),
+            "gateway path_prefix must be a relative path starting with '/' and must not contain '//'"
+        );
         let redirect_target = prefix.to_string();
         Router::new().nest(prefix, inner).route(
             &format!("{prefix}/"),
