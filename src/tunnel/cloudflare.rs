@@ -56,17 +56,17 @@ impl Tunnel for CloudflareTunnel {
     }
 
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
-        // cloudflared tunnel --no-autoupdate run --token <TOKEN> --url http://localhost:<port>
+        // cloudflared tunnel --no-autoupdate run --url http://localhost:<port>
+        // Token passed via env var to avoid exposure in ps/proc on shared systems.
         let mut child = Command::new("cloudflared")
             .args([
                 "tunnel",
                 "--no-autoupdate",
                 "run",
-                "--token",
-                &self.token,
                 "--url",
                 &format!("http://localhost:{local_port}"),
             ])
+            .env("TUNNEL_TOKEN", &self.token)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)

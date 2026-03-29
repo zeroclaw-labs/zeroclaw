@@ -30,7 +30,9 @@ impl Tunnel for NgrokTunnel {
     }
 
     async fn start(&self, _local_host: &str, local_port: u16) -> Result<String> {
-        // Set auth token
+        // Set auth token via a short-lived config command. The token appears in
+        // process args briefly, but the command exits immediately and the
+        // long-running tunnel process (`ngrok http`) does not re-expose it.
         Command::new("ngrok")
             .args(["config", "add-authtoken", &self.auth_token])
             .output()
