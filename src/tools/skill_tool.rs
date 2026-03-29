@@ -231,6 +231,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "lint --file {{file}} --format {{format}}".to_string(),
             args,
+            timeout_secs: None,
         }
     }
 
@@ -289,6 +290,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("s", &st, test_security());
         let schema = tool.parameters_schema();
@@ -305,6 +307,7 @@ mod tests {
             kind: "shell".to_string(),
             command: "echo hello-skill".to_string(),
             args: HashMap::new(),
+            timeout_secs: None,
         };
         let tool = SkillShellTool::new("test", &st, test_security());
         let result = tool.execute(serde_json::json!({})).await.unwrap();
