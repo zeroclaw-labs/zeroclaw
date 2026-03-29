@@ -3178,6 +3178,77 @@ async fn process_channel_message(
                 strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
             }
 
+            // Post-turn context compression: summarize older history so
+            // channel conversations preserve long-context signal instead
+            // of losing everything beyond the most recent N messages.
+            // Mirrors the CLI interactive loop compression (#4880).
+            {
+                let cc_config = ctx.prompt_config.agent.context_compression.clone();
+                if cc_config.enabled {
+                    let compressor = crate::agent::context_compressor::ContextCompressor::new(
+                        cc_config,
+                        ctx.context_token_budget,
+                    )
+                    .with_memory(Arc::clone(&ctx.memory));
+
+                    // Build a temporary history vec from the stored sender
+                    // turns so the compressor can operate on it.
+                    let mut sender_history = {
+                        let mut guard = ctx
+                            .conversation_histories
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        guard.get(&history_key).cloned().unwrap_or_default()
+                    };
+
+                    if !sender_history.is_empty() {
+                        // Prepend the system prompt so the compressor can
+                        // correctly identify protected head messages.
+                        sender_history.insert(0, ChatMessage::system(&base_system_prompt));
+
+                        match compressor
+                            .compress_if_needed(
+                                &mut sender_history,
+                                active_provider.as_ref(),
+                                route.model.as_str(),
+                            )
+                            .await
+                        {
+                            Ok(result) if result.compressed => {
+                                // Strip the synthetic system prompt before
+                                // writing back to the sender store.
+                                if sender_history.first().is_some_and(|m| m.role == "system") {
+                                    sender_history.remove(0);
+                                }
+                                let mut guard = ctx
+                                    .conversation_histories
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                if let Some(turns) = guard.get_mut(&history_key) {
+                                    *turns = sender_history;
+                                }
+                                tracing::info!(
+                                    channel = %msg.channel,
+                                    sender = %msg.sender,
+                                    tokens_before = result.tokens_before,
+                                    tokens_after = result.tokens_after,
+                                    passes = result.passes_used,
+                                    "Post-turn context compression applied"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Post-turn context compression failed, \
+                                     relying on history trim"
+                                );
+                            }
+                            _ => {} // No compression needed
+                        }
+                    }
+                }
+            }
+
             // Fire-and-forget LLM-driven memory consolidation.
             if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
                 let provider = Arc::clone(&ctx.provider);
@@ -3260,7 +3331,84 @@ async fn process_channel_message(
                     }
                 }
             } else if is_context_window_overflow_error(&e) {
-                let compacted = compact_sender_history(ctx.as_ref(), &history_key);
+                // Attempt LLM-driven compression before falling back to
+                // the naive compact_sender_history (#4880).
+                let mut compressed_ok = false;
+                {
+                    let cc_config = ctx.prompt_config.agent.context_compression.clone();
+                    if cc_config.enabled {
+                        let mut compressor =
+                            crate::agent::context_compressor::ContextCompressor::new(
+                                cc_config,
+                                ctx.context_token_budget,
+                            )
+                            .with_memory(Arc::clone(&ctx.memory));
+
+                        let mut sender_history = {
+                            let mut guard = ctx
+                                .conversation_histories
+                                .lock()
+                                .unwrap_or_else(|err| err.into_inner());
+                            guard.get(&history_key).cloned().unwrap_or_default()
+                        };
+
+                        if !sender_history.is_empty() {
+                            sender_history.insert(0, ChatMessage::system(&base_system_prompt));
+
+                            let error_msg = format!("{e}");
+                            match compressor
+                                .compress_on_error(
+                                    &mut sender_history,
+                                    active_provider.as_ref(),
+                                    route.model.as_str(),
+                                    &error_msg,
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    if sender_history.first().is_some_and(|m| m.role == "system") {
+                                        sender_history.remove(0);
+                                    }
+                                    let mut guard = ctx
+                                        .conversation_histories
+                                        .lock()
+                                        .unwrap_or_else(|err| err.into_inner());
+                                    if let Some(turns) = guard.get_mut(&history_key) {
+                                        *turns = sender_history;
+                                    }
+                                    compressed_ok = true;
+                                    tracing::info!(
+                                        channel = %msg.channel,
+                                        sender = %msg.sender,
+                                        "Context recovered via \
+                                         compress_on_error"
+                                    );
+                                }
+                                Ok(false) => {
+                                    tracing::warn!(
+                                        "compress_on_error ran but \
+                                         couldn't reduce enough"
+                                    );
+                                }
+                                Err(compress_err) => {
+                                    tracing::warn!(
+                                        error = %compress_err,
+                                        "compress_on_error failed, \
+                                         falling back to compact"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fall back to naive compaction when compression is
+                // disabled or failed.
+                let compacted = if compressed_ok {
+                    true
+                } else {
+                    compact_sender_history(ctx.as_ref(), &history_key)
+                };
                 let error_text = if compacted {
                     "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
                 } else {
