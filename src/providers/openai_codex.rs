@@ -2,9 +2,12 @@ use crate::auth::AuthService;
 use crate::auth::openai_oauth::extract_account_id_from_jwt;
 use crate::multimodal;
 use crate::providers::ProviderRuntimeOptions;
-use crate::providers::traits::{ChatMessage, Provider, ProviderCapabilities};
+use crate::providers::traits::{
+    ChatMessage, Provider, ProviderCapabilities, StreamChunk, StreamError, StreamOptions,
+    StreamResult,
+};
 use async_trait::async_trait;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -593,12 +596,15 @@ async fn decode_responses_body(response: reqwest::Response) -> anyhow::Result<St
 }
 
 impl OpenAiCodexProvider {
-    async fn send_responses_request(
+    /// Build and send the Responses API HTTP request, returning the raw
+    /// `reqwest::Response`.  Both the buffered (`send_responses_request`) and
+    /// streaming (`stream_responses_request`) paths share this.
+    async fn send_raw_responses_request(
         &self,
         input: Vec<ResponsesInput>,
         instructions: String,
         model: &str,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<reqwest::Response> {
         let use_gateway_api_key_auth = self.custom_endpoint && self.gateway_api_key.is_some();
         let profile = match self
             .auth
@@ -711,6 +717,18 @@ impl OpenAiCodexProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
+        Ok(response)
+    }
+
+    async fn send_responses_request(
+        &self,
+        input: Vec<ResponsesInput>,
+        instructions: String,
+        model: &str,
+    ) -> anyhow::Result<String> {
+        let response = self
+            .send_raw_responses_request(input, instructions, model)
+            .await?;
         decode_responses_body(response).await
     }
 }
@@ -761,6 +779,283 @@ impl Provider for OpenAiCodexProvider {
         let (instructions, input) = build_responses_input(&prepared.messages);
         self.send_responses_request(input, instructions, model)
             .await
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    fn stream_chat_with_history(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        _temperature: f64,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamChunk::final_chunk()) }).boxed();
+        }
+
+        // Prepare messages synchronously-ish: we need to spawn a task because
+        // the Provider trait method is not async.  The channel bridges the gap.
+        let messages = messages.to_vec();
+        let model = model.to_string();
+        let responses_url = self.responses_url.clone();
+        let client = self.client.clone();
+        let auth = self.auth.clone();
+        let auth_profile_override = self.auth_profile_override.clone();
+        let custom_endpoint = self.custom_endpoint;
+        let gateway_api_key = self.gateway_api_key.clone();
+        let reasoning_effort = self.reasoning_effort.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
+
+        tokio::spawn(async move {
+            // Prepare multimodal messages (image marker normalization).
+            let config = crate::config::MultimodalConfig::default();
+            let prepared =
+                match crate::multimodal::prepare_messages_for_provider(&messages, &config).await {
+                    Ok(p) => p,
+                    Err(err) => {
+                        let _ = tx
+                            .send(Err(StreamError::Provider(format!(
+                                "multimodal preparation failed: {err}"
+                            ))))
+                            .await;
+                        return;
+                    }
+                };
+
+            let (instructions, input) = build_responses_input(&prepared.messages);
+
+            // Resolve auth — mirrors send_raw_responses_request logic.
+            let use_gateway_api_key_auth = custom_endpoint && gateway_api_key.is_some();
+
+            let profile = match auth
+                .get_profile("openai-codex", auth_profile_override.as_deref())
+                .await
+            {
+                Ok(p) => p,
+                Err(err) if use_gateway_api_key_auth => {
+                    tracing::warn!(error = %err, "codex stream: failed to load profile, continuing with API key mode");
+                    None
+                }
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::Provider(format!("auth error: {err}"))))
+                        .await;
+                    return;
+                }
+            };
+
+            let oauth_access_token = match auth
+                .get_valid_openai_access_token(auth_profile_override.as_deref())
+                .await
+            {
+                Ok(t) => t,
+                Err(err) if use_gateway_api_key_auth => {
+                    tracing::warn!(error = %err, "codex stream: token refresh failed, continuing with API key mode");
+                    None
+                }
+                Err(err) => {
+                    let _ = tx
+                        .send(Err(StreamError::Provider(format!(
+                            "token refresh error: {err}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            let account_id = profile.and_then(|p| p.account_id).or_else(|| {
+                oauth_access_token
+                    .as_deref()
+                    .and_then(extract_account_id_from_jwt)
+            });
+
+            let access_token = if use_gateway_api_key_auth {
+                oauth_access_token
+            } else {
+                match oauth_access_token {
+                    Some(t) => Some(t),
+                    None => {
+                        let _ = tx.send(Err(StreamError::Provider(
+                            "OpenAI Codex auth profile not found. Run `zeroclaw auth login --provider openai-codex`.".into(),
+                        ))).await;
+                        return;
+                    }
+                }
+            };
+            let account_id = if use_gateway_api_key_auth {
+                account_id
+            } else {
+                match account_id {
+                    Some(id) => Some(id),
+                    None => {
+                        let _ = tx.send(Err(StreamError::Provider(
+                            "OpenAI Codex account id not found. Run `zeroclaw auth login --provider openai-codex` again.".into(),
+                        ))).await;
+                        return;
+                    }
+                }
+            };
+
+            let normalized_model = normalize_model_id(&model);
+            let request = ResponsesRequest {
+                model: normalized_model.to_string(),
+                input,
+                instructions,
+                store: false,
+                stream: true,
+                text: ResponsesTextOptions {
+                    verbosity: "medium".to_string(),
+                },
+                reasoning: ResponsesReasoningOptions {
+                    effort: resolve_reasoning_effort(normalized_model, reasoning_effort.as_deref()),
+                    summary: "auto".to_string(),
+                },
+                include: vec!["reasoning.encrypted_content".to_string()],
+                tool_choice: "auto".to_string(),
+                parallel_tool_calls: true,
+            };
+
+            let bearer_token = if use_gateway_api_key_auth {
+                gateway_api_key.as_deref().unwrap_or_default().to_string()
+            } else {
+                access_token.as_deref().unwrap_or_default().to_string()
+            };
+
+            let mut request_builder = client
+                .post(&responses_url)
+                .header("Authorization", format!("Bearer {bearer_token}"))
+                .header("OpenAI-Beta", "responses=experimental")
+                .header("originator", "pi")
+                .header("accept", "text/event-stream")
+                .header("Content-Type", "application/json");
+
+            if let Some(ref id) = account_id {
+                request_builder = request_builder.header("chatgpt-account-id", id.as_str());
+            }
+
+            if use_gateway_api_key_auth {
+                if let Some(ref token) = access_token {
+                    request_builder =
+                        request_builder.header("x-openai-access-token", token.as_str());
+                }
+                if let Some(ref id) = account_id {
+                    request_builder = request_builder.header("x-openai-account-id", id.as_str());
+                }
+            }
+
+            let response = match request_builder.json(&request).send().await {
+                Ok(r) => r,
+                Err(err) => {
+                    let _ = tx.send(Err(StreamError::Http(err))).await;
+                    return;
+                }
+            };
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                let _ = tx
+                    .send(Err(StreamError::Provider(format!(
+                        "OpenAI Codex HTTP {status}: {}",
+                        super::sanitize_api_error(&body)
+                    ))))
+                    .await;
+                return;
+            }
+
+            // Stream SSE events incrementally.
+            let mut byte_stream = response.bytes_stream();
+            let mut pending_utf8: Vec<u8> = Vec::new();
+            let mut sse_buffer = String::new();
+
+            while let Some(chunk_result) = byte_stream.next().await {
+                let bytes = match chunk_result {
+                    Ok(b) => b,
+                    Err(err) => {
+                        let _ = tx.send(Err(StreamError::Http(err))).await;
+                        return;
+                    }
+                };
+
+                // Decode UTF-8 incrementally.
+                if let Err(err) =
+                    append_utf8_stream_chunk(&mut sse_buffer, &mut pending_utf8, &bytes)
+                {
+                    let _ = tx
+                        .send(Err(StreamError::Provider(format!(
+                            "UTF-8 decode error: {err}"
+                        ))))
+                        .await;
+                    return;
+                }
+
+                // Process complete SSE events (separated by double-newline).
+                while let Some(idx) = sse_buffer.find("\n\n") {
+                    let event_text = sse_buffer[..idx].to_string();
+                    sse_buffer = sse_buffer[idx + 2..].to_string();
+
+                    // Parse data lines from the SSE event.
+                    let data_lines: Vec<&str> = event_text
+                        .lines()
+                        .filter_map(|line| line.strip_prefix("data:"))
+                        .map(|line| line.trim())
+                        .collect();
+
+                    if data_lines.is_empty() {
+                        continue;
+                    }
+
+                    let joined = data_lines.join("\n");
+                    let trimmed = joined.trim();
+                    if trimmed.is_empty() || trimmed == "[DONE]" {
+                        continue;
+                    }
+
+                    let event: Value = match serde_json::from_str(trimmed) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    // Check for error events.
+                    if let Some(message) = extract_stream_error_message(&event) {
+                        let _ = tx
+                            .send(Err(StreamError::Provider(format!(
+                                "OpenAI Codex stream error: {message}"
+                            ))))
+                            .await;
+                        return;
+                    }
+
+                    let event_type = event.get("type").and_then(Value::as_str);
+
+                    if event_type == Some("response.output_text.delta") {
+                        if let Some(delta) =
+                            nonempty_preserve(event.get("delta").and_then(Value::as_str))
+                        {
+                            if tx
+                                .send(Ok(StreamChunk::delta(delta).with_token_estimate()))
+                                .await
+                                .is_err()
+                            {
+                                return; // receiver dropped
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Signal end of stream.
+            let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
+        });
+
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|chunk| (chunk, rx))
+        })
+        .boxed()
     }
 }
 
