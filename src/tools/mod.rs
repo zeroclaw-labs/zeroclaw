@@ -423,10 +423,19 @@ pub fn all_tools_with_runtime(
         Arc::new(FileEditTool::new(security.clone())),
         Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(ContentSearchTool::new(security.clone())),
-        Arc::new(CronAddTool::new(config.clone(), security.clone())),
+        Arc::new(RateLimitedTool::new(
+            CronAddTool::new(config.clone(), security.clone()),
+            security.clone(),
+        )),
         Arc::new(CronListTool::new(config.clone())),
-        Arc::new(CronRemoveTool::new(config.clone(), security.clone())),
-        Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
+        Arc::new(RateLimitedTool::new(
+            CronRemoveTool::new(config.clone(), security.clone()),
+            security.clone(),
+        )),
+        Arc::new(RateLimitedTool::new(
+            CronUpdateTool::new(config.clone(), security.clone()),
+            security.clone(),
+        )),
         Arc::new(CronRunTool::new(config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
