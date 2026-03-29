@@ -9,7 +9,7 @@ use crate::security::SecurityPolicy;
 use crate::skills::SkillTool;
 use crate::tools::shell::collect_allowed_shell_env_vars;
 use crate::tools::traits::{Tool, ToolResult};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
@@ -960,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_zc_thread_id_injected() {
-        use crate::agent::loop_::{scope_thread_id, TOOL_LOOP_THREAD_ID};
+        use crate::agent::loop_::{TOOL_LOOP_THREAD_ID, scope_thread_id};
         let thread_id = Some("tg_thread_42".to_string());
         let result = scope_thread_id(thread_id.clone(), None, async {
             TOOL_LOOP_THREAD_ID.try_with(|v| v.clone()).unwrap()
