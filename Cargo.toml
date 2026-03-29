@@ -279,6 +279,7 @@ webauthn = []
 ci-all = [
     "channel-nostr",
     "hardware",
+    "ci-skip-firmware",
     "channel-matrix",
     "channel-lark",
     "observability-prometheus",
@@ -293,6 +294,11 @@ ci-all = [
     "whatsapp-web",
     "plugins-wasm",
 ]
+# Note: voice-wake excluded from ci-all (requires libasound2-dev)
+# Skip firmware embedding in CI (files not present in repo)
+ci-skip-firmware = []
+# Skip voice-wake in CI (requires libasound2-dev on Linux)
+ci-skip-voice-wake = []
 
 [profile.dev]
 incremental = true

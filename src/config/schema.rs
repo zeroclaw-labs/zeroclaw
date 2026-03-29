@@ -6139,7 +6139,7 @@ pub struct ChannelsConfig {
     /// Voice call channel configuration (Twilio/Telnyx/Plivo).
     pub voice_call: Option<crate::channels::voice_call::VoiceCallConfig>,
     /// Voice wake word detection channel configuration.
-    #[cfg(feature = "voice-wake")]
+    #[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
     pub voice_wake: Option<VoiceWakeConfig>,
     /// MQTT channel configuration (SOP listener).
     pub mqtt: Option<MqttConfig>,
@@ -6275,7 +6275,7 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.bluesky.as_ref())),
                 self.bluesky.is_some(),
             ),
-            #[cfg(feature = "voice-wake")]
+            #[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
             (
                 Box::new(ConfigWrapper::new(self.voice_wake.as_ref())),
                 self.voice_wake.is_some(),
@@ -6339,7 +6339,7 @@ impl Default for ChannelsConfig {
             reddit: None,
             bluesky: None,
             voice_call: None,
-            #[cfg(feature = "voice-wake")]
+            #[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
             voice_wake: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
@@ -7875,7 +7875,7 @@ impl ChannelConfig for BlueskyConfig {
 /// Listens on the default microphone for a configurable wake word,
 /// then captures the following utterance and transcribes it via the
 /// existing transcription API.
-#[cfg(feature = "voice-wake")]
+#[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct VoiceWakeConfig {
     /// Wake word phrase to listen for (case-insensitive substring match).
@@ -7896,27 +7896,27 @@ pub struct VoiceWakeConfig {
     pub max_capture_secs: u32,
 }
 
-#[cfg(feature = "voice-wake")]
+#[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
 fn default_voice_wake_word() -> String {
     "hey zeroclaw".into()
 }
 
-#[cfg(feature = "voice-wake")]
+#[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
 fn default_voice_wake_silence_timeout_ms() -> u32 {
     2000
 }
 
-#[cfg(feature = "voice-wake")]
+#[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
 fn default_voice_wake_energy_threshold() -> f32 {
     0.01
 }
 
-#[cfg(feature = "voice-wake")]
+#[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
 fn default_voice_wake_max_capture_secs() -> u32 {
     30
 }
 
-#[cfg(feature = "voice-wake")]
+#[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
 impl Default for VoiceWakeConfig {
     fn default() -> Self {
         Self {
@@ -7928,7 +7928,7 @@ impl Default for VoiceWakeConfig {
     }
 }
 
-#[cfg(feature = "voice-wake")]
+#[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
 impl ChannelConfig for VoiceWakeConfig {
     fn name() -> &'static str {
         "VoiceWake"
@@ -11528,7 +11528,7 @@ auto_save = true
                 reddit: None,
                 bluesky: None,
                 voice_call: None,
-                #[cfg(feature = "voice-wake")]
+                #[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
                 voice_wake: None,
                 mqtt: None,
                 message_timeout_secs: 300,
@@ -12568,7 +12568,7 @@ allowed_users = ["@ops:matrix.org"]
             reddit: None,
             bluesky: None,
             voice_call: None,
-            #[cfg(feature = "voice-wake")]
+            #[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
             voice_wake: None,
             mqtt: None,
             message_timeout_secs: 300,
@@ -12942,7 +12942,7 @@ channel_ids = ["C123", "D456"]
             reddit: None,
             bluesky: None,
             voice_call: None,
-            #[cfg(feature = "voice-wake")]
+            #[cfg(all(feature = "voice-wake", not(feature = "ci-skip-voice-wake")))]
             voice_wake: None,
             mqtt: None,
             message_timeout_secs: 300,
