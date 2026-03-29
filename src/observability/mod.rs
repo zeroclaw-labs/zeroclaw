@@ -212,3 +212,4 @@ mod tests {
         assert_eq!(create_observer(&cfg).name(), "noop");
     }
 }
+pub mod session_recorder;
