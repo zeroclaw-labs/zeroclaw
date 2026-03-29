@@ -842,6 +842,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            debounce_window_ms: 0,
         });
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();

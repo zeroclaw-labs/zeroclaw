@@ -6408,6 +6408,13 @@ pub struct TelegramConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Debounce window in milliseconds for rapid inbound messages.
+    /// When set to a positive value, rapid messages from the same sender within
+    /// this window are accumulated and dispatched as a single concatenated message.
+    /// `0` or absent disables per-channel debouncing (falls through to global
+    /// `debounce_ms` if configured). Default: `0`.
+    #[serde(default)]
+    pub debounce_window_ms: u64,
 }
 
 impl ChannelConfig for TelegramConfig {
@@ -11499,6 +11506,7 @@ auto_save = true
                     mention_only: false,
                     ack_reactions: None,
                     proxy_url: None,
+                    debounce_window_ms: 0,
                 }),
                 discord: None,
                 discord_history: None,
@@ -12314,6 +12322,7 @@ default_temperature = 0.7
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            debounce_window_ms: 200,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -12322,6 +12331,7 @@ default_temperature = 0.7
         assert_eq!(parsed.stream_mode, StreamMode::Partial);
         assert_eq!(parsed.draft_update_interval_ms, 500);
         assert!(parsed.interrupt_on_new_message);
+        assert_eq!(parsed.debounce_window_ms, 200);
     }
 
     #[test]
@@ -12331,6 +12341,7 @@ default_temperature = 0.7
         assert_eq!(parsed.stream_mode, StreamMode::Off);
         assert_eq!(parsed.draft_update_interval_ms, 1000);
         assert!(!parsed.interrupt_on_new_message);
+        assert_eq!(parsed.debounce_window_ms, 0);
     }
 
     #[test]
@@ -15189,6 +15200,7 @@ require_otp_to_resume = true
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            debounce_window_ms: 0,
         });
 
         // Save (triggers encryption)

@@ -4215,6 +4215,7 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 )
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_debounce_window(std::time::Duration::from_millis(tg.debounce_window_ms))
                 .with_transcription(config.transcription.clone())
                 .with_tts(config.tts.clone())
                 .with_workspace_dir(config.workspace_dir.clone()),
@@ -4422,6 +4423,7 @@ fn collect_configured_channels(
                 )
                 .with_ack_reactions(ack)
                 .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_debounce_window(std::time::Duration::from_millis(tg.debounce_window_ms))
                 .with_transcription(config.transcription.clone())
                 .with_tts(config.tts.clone())
                 .with_workspace_dir(config.workspace_dir.clone())
@@ -11264,6 +11266,7 @@ This is an example JSON object for profile settings."#;
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            debounce_window_ms: 0,
         });
         match build_channel_by_id(&config, "telegram") {
             Ok(channel) => assert_eq!(channel.name(), "telegram"),

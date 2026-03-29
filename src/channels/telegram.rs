@@ -340,6 +340,8 @@ pub struct TelegramChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Per-channel proxy URL override.
     proxy_url: Option<String>,
+    /// Per-channel inbound message debouncer.
+    debouncer: super::debounce::MessageDebouncer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,7 +386,14 @@ impl TelegramChannel {
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             proxy_url: None,
+            debouncer: super::debounce::MessageDebouncer::new(Duration::ZERO),
         }
+    }
+
+    /// Set the per-channel debounce window. A zero duration disables debouncing.
+    pub fn with_debounce_window(mut self, window: Duration) -> Self {
+        self.debouncer = super::debounce::MessageDebouncer::new(window);
+        self
     }
 
     /// Configure whether Telegram-native acknowledgement reactions are sent.
@@ -2950,6 +2959,37 @@ Ensure only one `zeroclaw` process is using this bot token."
                         .send()
                         .await; // Ignore errors for typing indicator
 
+                    // ── Per-channel debounce ──────────────────────────
+                    if self.debouncer.enabled() {
+                        let debounce_key = format!("{}::{}", msg.sender, msg.reply_target);
+                        match self.debouncer.debounce(&debounce_key, &msg.content).await {
+                            super::debounce::DebounceResult::Pending(rx) => {
+                                // Spawn a lightweight task that waits for the debounce
+                                // window to expire, then forwards the combined message.
+                                let tx_clone = tx.clone();
+                                let mut debounce_msg = msg;
+                                tokio::spawn(async move {
+                                    if let Ok(combined) = rx.await {
+                                        debounce_msg.content = combined;
+                                        let _ = tx_clone.send(debounce_msg).await;
+                                    }
+                                    // RecvError means superseded — do nothing.
+                                });
+                                continue;
+                            }
+                            super::debounce::DebounceResult::Passthrough(content) => {
+                                // Window is zero; should not happen since we check
+                                // `enabled()`, but handle gracefully.
+                                let mut m = msg;
+                                m.content = content;
+                                if tx.send(m).await.is_err() {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                        }
+                    }
+
                     if tx.send(msg).await.is_err() {
                         return Ok(());
                     }
@@ -5096,5 +5136,27 @@ mod tests {
         let photo_content = "[IMAGE:/tmp/photo.jpg]".to_string();
         let content = format!("{attr}{photo_content}");
         assert_eq!(content, "[Forwarded from @bob] [IMAGE:/tmp/photo.jpg]");
+    }
+
+    // ── Debounce integration tests ──────────────────────────────
+
+    #[test]
+    fn with_debounce_window_sets_enabled() {
+        let ch = TelegramChannel::new("tok".into(), vec!["*".into()], false)
+            .with_debounce_window(Duration::from_millis(500));
+        assert!(ch.debouncer.enabled());
+    }
+
+    #[test]
+    fn with_debounce_window_zero_is_disabled() {
+        let ch = TelegramChannel::new("tok".into(), vec!["*".into()], false)
+            .with_debounce_window(Duration::ZERO);
+        assert!(!ch.debouncer.enabled());
+    }
+
+    #[test]
+    fn default_debouncer_is_disabled() {
+        let ch = TelegramChannel::new("tok".into(), vec!["*".into()], false);
+        assert!(!ch.debouncer.enabled());
     }
 }

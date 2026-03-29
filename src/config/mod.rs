@@ -64,6 +64,7 @@ mod tests {
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
+            debounce_window_ms: 0,
         };
 
         let discord = DiscordConfig {
