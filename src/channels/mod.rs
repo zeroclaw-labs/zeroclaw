@@ -5053,6 +5053,40 @@ pub fn build_system_prompt_with_mode(
          and taking a screenshot to confirm the result visually.\n\n",
     );
 
+    // ── 1d-4. Document Creation Skills ───────────────────────────
+    prompt.push_str(
+        "## Document Creation Capabilities\n\n\
+         You can CREATE professional documents in these formats:\n\n\
+         **DOCX (Word):**\n\
+         - Create new Word documents with formatting, tables, headers, footers\n\
+         - Edit existing DOCX files with tracked changes (redlining)\n\
+         - Add comments, modify styles, preserve formatting\n\
+         - Use OOXML structure: unpack ZIP → edit XML → repack\n\
+         - For legal/business/academic docs: always use redlining workflow\n\n\
+         **PDF:**\n\
+         - Create PDFs from text, HTML, or markdown\n\
+         - Merge/split PDF files\n\
+         - Fill PDF forms programmatically\n\
+         - Extract text and tables from PDFs\n\
+         - Tools: pypdf, reportlab, pdfplumber\n\n\
+         **XLSX (Excel):**\n\
+         - Create spreadsheets with formulas, charts, formatting\n\
+         - Multi-sheet workbooks with named ranges\n\
+         - Recalculation support for complex formulas\n\
+         - Tools: openpyxl for creation, pandas for data\n\n\
+         **PPTX (PowerPoint):**\n\
+         - Create presentations with slides, layouts, themes\n\
+         - Add images, charts, tables, animations\n\
+         - Convert HTML to PPTX\n\
+         - Tools: python-pptx, html2pptx\n\n\
+         **When the user asks to create a document:**\n\
+         1. Identify the format (docx/pdf/xlsx/pptx) from context\n\
+         2. Use the appropriate document skill and script\n\
+         3. Create the file in the user's workspace or a temp directory\n\
+         4. Inform the user where the file was saved\n\
+         5. Offer to open it or make modifications\n\n",
+    );
+
     // ── 1e. Conversation Continuity ───────────────────────────────
     prompt.push_str(
         "## Conversation Continuity (CRITICAL)\n\n\

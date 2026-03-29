@@ -239,7 +239,9 @@ pub async fn handle_api_chat(
              - `apply_patch` — apply unified diff patches\n\
              - `shell` — run commands (build, test, lint, npm, cargo, etc.)\n\
              - `git_operations` — git status, diff, commit, branch, log\n\
-             - `browser` — test web apps in real Chromium (open URL, click, screenshot)\n\n\
+             - `browser` — test web apps in real Chromium (open URL, click, screenshot)\n\
+             - `shell` + Python scripts — create DOCX/PDF/XLSX/PPTX documents\n\
+             - `document_process` — convert uploaded documents to HTML/Markdown\n\n\
              ## gstack Development Methodology (FOLLOW THIS)\n\n\
              When the user asks you to build, fix, or modify code, follow this structured workflow:\n\n\
              ### Phase 1: Think & Plan\n\
