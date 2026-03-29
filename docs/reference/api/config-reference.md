@@ -277,6 +277,7 @@ Delegate sub-agent configurations. Each key under `[agents]` defines a named sub
 | `timeout_secs` | `120` | Timeout in seconds for non-agentic provider calls (1–3600) |
 | `agentic_timeout_secs` | `300` | Timeout in seconds for agentic sub-agent loops (1–3600) |
 | `skills_directory` | unset | Optional skills directory path (workspace-relative) for scoped skill loading |
+| `pinned_skills` | unset | Optional list of skill names always loaded for this agent regardless of keyword matching |
 
 Notes:
 
@@ -285,6 +286,7 @@ Notes:
 - The `delegate` tool is excluded from sub-agent allowlists to prevent re-entrant delegation loops.
 - Sub-agents receive an enriched system prompt containing: tools section (allowed tools with parameters), skills section (from scoped or default directory), workspace path, current date/time, safety constraints, and shell policy when `shell` is in the effective tool list.
 - When `skills_directory` is unset or empty, the sub-agent loads skills from the default workspace `skills/` directory. When set, skills are loaded exclusively from that directory (relative to workspace root), enabling per-agent scoped skill sets.
+- When `pinned_skills` is set, only the listed skill names are included in the agent's prompt. When unset, all skills from the effective directory are loaded.
 
 ```toml
 [agents.researcher]
@@ -310,6 +312,7 @@ system_prompt = "You are an expert code reviewer focused on security and perform
 agentic = true
 allowed_tools = ["file_read", "shell"]
 skills_directory = "skills/code-review"
+pinned_skills = ["lint-check", "security-scan"]
 ```
 
 ## `[runtime]`

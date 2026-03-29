@@ -591,6 +591,10 @@ pub struct DelegateAgentConfig {
     /// preventing cross-contamination with memory from other agents.
     #[serde(default)]
     pub memory_namespace: Option<String>,
+    /// Optional list of skill names that are always loaded for this agent regardless of
+    /// keyword matching. Skills are resolved from the effective skills directory.
+    #[serde(default)]
+    pub pinned_skills: Option<Vec<String>>,
 }
 
 fn default_delegate_timeout_secs() -> u64 {
@@ -12184,6 +12188,7 @@ default_temperature = 0.7
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
 

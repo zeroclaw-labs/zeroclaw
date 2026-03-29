@@ -570,6 +570,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         agents.insert(
@@ -588,6 +589,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         agents

@@ -1026,7 +1026,15 @@ impl DelegateTool {
             .filter(|s| !s.trim().is_empty())
             .map(|dir| workspace_dir.join(dir))
             .unwrap_or_else(|| crate::skills::skills_dir(workspace_dir));
-        let skills = crate::skills::load_skills_from_directory(&skills_dir, false);
+        let mut skills = crate::skills::load_skills_from_directory(&skills_dir, false);
+
+        // When pinned_skills is set, filter to only the pinned skill names so the
+        // agent receives a deterministic, curated skill set.
+        if let Some(ref pinned) = agent_config.pinned_skills {
+            let pinned_set: std::collections::HashSet<&str> =
+                pinned.iter().map(|s| s.as_str()).collect();
+            skills.retain(|s| pinned_set.contains(s.name.as_str()));
+        }
 
         // Determine shell policy instructions when the `shell` tool is in the
         // effective tool list.
@@ -1287,6 +1295,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         agents.insert(
@@ -1305,6 +1314,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         agents
@@ -1462,6 +1472,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         }
     }
 
@@ -1578,6 +1589,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1692,6 +1704,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1733,6 +1746,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -2022,6 +2036,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2076,6 +2091,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         struct MockShellTool;
@@ -2147,6 +2163,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2176,6 +2193,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2210,6 +2228,7 @@ mod tests {
             agentic_timeout_secs: Some(600),
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2266,6 +2285,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2294,6 +2314,7 @@ mod tests {
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2322,6 +2343,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2350,6 +2372,7 @@ mod tests {
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2378,6 +2401,7 @@ mod tests {
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2402,6 +2426,7 @@ mod tests {
                 agentic_timeout_secs: None,
                 skills_directory: None,
                 memory_namespace: None,
+                pinned_skills: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2435,6 +2460,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2482,6 +2508,7 @@ mod tests {
             agentic_timeout_secs: None,
             skills_directory: None,
             memory_namespace: None,
+            pinned_skills: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2496,6 +2523,119 @@ mod tests {
         assert!(
             prompt.contains("deploy"),
             "should contain skills from default workspace skills/ directory"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_filters_skills_to_pinned_set() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_pinned_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let skills_dir = workspace.join("skills");
+        // Create two skills: "lint" and "deploy".
+        for name in &["lint", "deploy"] {
+            std::fs::create_dir_all(skills_dir.join(name)).unwrap();
+            std::fs::write(
+                skills_dir.join(format!("{name}/SKILL.toml")),
+                format!(
+                    "[skill]\nname = \"{name}\"\ndescription = \"Skill {name}\"\nversion = \"1.0.0\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+            memory_namespace: None,
+            pinned_skills: Some(vec!["lint".to_string()]),
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("lint"),
+            "should contain pinned skill 'lint'"
+        );
+        assert!(
+            !prompt.contains("Skill deploy"),
+            "should NOT contain non-pinned skill 'deploy'"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn enriched_prompt_loads_all_skills_when_pinned_is_none() {
+        let workspace = std::env::temp_dir().join(format!(
+            "zeroclaw_delegate_no_pin_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let skills_dir = workspace.join("skills");
+        for name in &["alpha", "beta"] {
+            std::fs::create_dir_all(skills_dir.join(name)).unwrap();
+            std::fs::write(
+                skills_dir.join(format!("{name}/SKILL.toml")),
+                format!(
+                    "[skill]\nname = \"{name}\"\ndescription = \"Skill {name}\"\nversion = \"1.0.0\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let config = DelegateAgentConfig {
+            provider: "openrouter".to_string(),
+            model: "test-model".to_string(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools: vec!["echo_tool".to_string()],
+            max_iterations: 10,
+            timeout_secs: None,
+            agentic_timeout_secs: None,
+            skills_directory: None,
+            memory_namespace: None,
+            pinned_skills: None,
+        };
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.clone());
+
+        let prompt = tool
+            .build_enriched_system_prompt(&config, &tools, &workspace)
+            .unwrap();
+
+        assert!(
+            prompt.contains("alpha"),
+            "should contain skill 'alpha' when pinned_skills is None"
+        );
+        assert!(
+            prompt.contains("beta"),
+            "should contain skill 'beta' when pinned_skills is None"
         );
 
         let _ = std::fs::remove_dir_all(workspace);
