@@ -7,6 +7,16 @@
 
 Claude Code should read and follow all instructions in `AGENTS.md` at the repository root for project conventions, commands, risk tiers, workflow rules, and anti-patterns.
 
+## Testing
+
+Always use the `dev/test.sh` harness for running tests — do **not** use bare `cargo test`.
+
+```bash
+./dev/test.sh              # Full: fmt, clippy, build, all tests
+./dev/test.sh plugins      # Build + plugin tests only
+./dev/test.sh quick        # Fmt + clippy + unit tests
+```
+
 ## Hooks
 
 _No custom hooks defined yet._
