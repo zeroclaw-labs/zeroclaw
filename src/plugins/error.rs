@@ -53,6 +53,9 @@ pub enum PluginError {
         level: String,
     },
 
+    #[error("plugin '{plugin}' declares wildcard tool delegation which is forbidden at {level} security level")]
+    WildcardDelegationRejected { plugin: String, level: String },
+
     #[error("plugin '{plugin}' declares forbidden path '{path}' in allowed_paths")]
     ForbiddenPath { plugin: String, path: String },
 

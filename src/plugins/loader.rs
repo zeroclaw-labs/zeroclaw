@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 use super::error::PluginError;
 use super::PluginManifest;
 use crate::config::schema::Config;
@@ -68,6 +70,39 @@ fn is_wildcard_host(host: &str) -> bool {
     host.contains('*')
 }
 
+/// Validate a plugin's `allowed_tools` delegation against the given [`NetworkSecurityLevel`].
+///
+/// In `Strict` or `Paranoid` mode, a wildcard entry (`"*"`) in `allowed_tools` is
+/// rejected with [`PluginError::WildcardDelegationRejected`]. In `Default` mode
+/// wildcard delegation produces a warning log but is allowed through.
+pub fn validate_allowed_tools_delegation(
+    plugin_name: &str,
+    allowed_tools: &[String],
+    level: NetworkSecurityLevel,
+) -> Result<(), PluginError> {
+    let has_wildcard = allowed_tools.iter().any(|t| t == "*");
+    if !has_wildcard {
+        return Ok(());
+    }
+    match level {
+        NetworkSecurityLevel::Relaxed => {}
+        NetworkSecurityLevel::Default => {
+            tracing::warn!(
+                plugin = %plugin_name,
+                "plugin declares wildcard tool delegation which is allowed at Default security level \
+                 but would be rejected at Strict or Paranoid"
+            );
+        }
+        NetworkSecurityLevel::Strict | NetworkSecurityLevel::Paranoid => {
+            return Err(PluginError::WildcardDelegationRejected {
+                plugin: plugin_name.to_string(),
+                level: format!("{:?}", level),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Validate a plugin's `allowed_hosts` against the given [`NetworkSecurityLevel`].
 ///
 /// In `Strict` or `Paranoid` mode, any host containing a wildcard (`*`) is
@@ -107,7 +142,7 @@ pub fn validate_allowed_hosts(
 }
 
 /// Expand `~` and `~/…` prefixes to the user's home directory.
-fn expand_user_path(path: &str) -> PathBuf {
+pub fn expand_user_path(path: &str) -> PathBuf {
     if path == "~" {
         if let Some(home) = home_dir() {
             return home;
@@ -290,6 +325,11 @@ impl<'a> PluginLoader<'a> {
         // 2. Validate allowed_hosts against the security level.
         validate_allowed_hosts(&manifest.name, &manifest.allowed_hosts, level)?;
 
+        // 2b. Validate wildcard tool delegation against the security level.
+        if let Some(ref td) = manifest.host_capabilities.tool_delegation {
+            validate_allowed_tools_delegation(&manifest.name, &td.allowed_tools, level)?;
+        }
+
         // 3. Reject forbidden paths (all levels).
         let forbidden: Vec<String> = FORBIDDEN_PATHS.iter().map(|s| (*s).to_string()).collect();
         validate_allowed_paths(&manifest.name, &manifest.allowed_paths, &forbidden)?;
@@ -418,6 +458,44 @@ impl<'a> PluginLoader<'a> {
     }
 }
 
+/// Verify the integrity of a WASM binary before instantiation.
+///
+/// Reads the SHA-256 hash from the `.wasm.sha256` sidecar file (written at
+/// install time) and compares it against a freshly computed hash of the binary.
+/// Returns [`PluginError::HashMismatch`] when the hashes differ.
+///
+/// If no sidecar file exists (pre-hash install or WASM file absent), a warning
+/// is logged and the check is skipped for backwards compatibility.
+pub fn verify_wasm_integrity(plugin_name: &str, wasm_path: &Path) -> Result<(), PluginError> {
+    let sidecar = wasm_path.with_extension("wasm.sha256");
+    if sidecar.exists() {
+        let expected = std::fs::read_to_string(&sidecar)?.trim().to_string();
+        let bytes = std::fs::read(wasm_path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual = hex::encode(hasher.finalize());
+        if actual != expected {
+            return Err(PluginError::HashMismatch {
+                plugin: plugin_name.to_string(),
+                expected,
+                actual,
+            });
+        }
+    } else if wasm_path.exists() {
+        tracing::warn!(
+            plugin = %plugin_name,
+            "no stored SHA-256 hash for plugin; skipping integrity check \
+             (pre-hash install or missing sidecar)"
+        );
+    } else {
+        tracing::warn!(
+            plugin = %plugin_name,
+            "WASM file not found; skipping integrity check"
+        );
+    }
+    Ok(())
+}
+
 /// The result of building an Extism manifest from a ZeroClaw plugin manifest.
 ///
 /// Holds the [`extism::Manifest`] plus the WASI flag (which is applied at
@@ -515,6 +593,7 @@ mod tests {
             timeout_ms: 30_000,
             signature: None,
             publisher_key: None,
+            host_capabilities: Default::default(),
         }
     }
 

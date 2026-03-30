@@ -204,7 +204,7 @@ pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
-pub use traits::{ToolResult, ToolSpec};
+pub use traits::{RiskLevel, ToolResult, ToolSpec};
 pub use verifiable_intent::VerifiableIntentTool;
 pub use weather_tool::WeatherTool;
 pub use web_fetch::WebFetchTool;
@@ -241,6 +241,10 @@ impl Tool for ArcToolRef {
         self.0.parameters_schema()
     }
 
+    fn risk_level(&self) -> RiskLevel {
+        self.0.risk_level()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -269,6 +273,10 @@ impl Tool for ArcDelegatingTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.inner.parameters_schema()
+    }
+
+    fn risk_level(&self) -> RiskLevel {
+        self.inner.risk_level()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1157,6 +1165,20 @@ pub fn all_tools_with_runtime(
                                 );
                                 continue;
                             }
+                        }
+
+                        // Verify WASM binary integrity before instantiation.
+                        let wasm_path = descriptor.plugin_dir.join(&manifest.wasm_path);
+                        if let Err(e) = crate::plugins::loader::verify_wasm_integrity(
+                            &manifest.name,
+                            &wasm_path,
+                        ) {
+                            tracing::warn!(
+                                plugin = manifest.name,
+                                error = %e,
+                                "Skipping plugin that failed WASM integrity check"
+                            );
+                            continue;
                         }
 
                         // Build extism manifest via the loader for consistent

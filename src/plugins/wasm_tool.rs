@@ -1,6 +1,8 @@
 //! Bridge between WASM plugins and the Tool trait.
 
+use crate::tools::traits::RiskLevel;
 use crate::security::audit::{AuditLogger, HttpRequestEntry, PluginExecutionLog};
+use crate::security::policy::{SecurityPolicy, ToolOperation};
 use crate::security::redact_sensitive_params;
 use crate::tools::traits::{Tool, ToolResult};
 use async_trait::async_trait;
@@ -16,8 +18,10 @@ pub struct WasmTool {
     plugin_version: String,
     function_name: String,
     parameters_schema: Value,
+    risk_level: RiskLevel,
     plugin: Arc<Mutex<Plugin>>,
     audit_logger: Option<Arc<AuditLogger>>,
+    security: Option<Arc<SecurityPolicy>>,
 }
 
 impl WasmTool {
@@ -37,14 +41,28 @@ impl WasmTool {
             plugin_version,
             function_name,
             parameters_schema,
+            risk_level: RiskLevel::Low,
             plugin,
             audit_logger: None,
+            security: None,
         }
+    }
+
+    /// Set the risk level for this tool.
+    pub fn with_risk_level(mut self, level: RiskLevel) -> Self {
+        self.risk_level = level;
+        self
     }
 
     /// Attach an audit logger to this tool.
     pub fn with_audit_logger(mut self, logger: Arc<AuditLogger>) -> Self {
         self.audit_logger = Some(logger);
+        self
+    }
+
+    /// Attach a security policy for rate-limit enforcement.
+    pub fn with_security_policy(mut self, policy: Arc<SecurityPolicy>) -> Self {
+        self.security = Some(policy);
         self
     }
 }
@@ -63,7 +81,22 @@ impl Tool for WasmTool {
         self.parameters_schema.clone()
     }
 
+    fn risk_level(&self) -> RiskLevel {
+        self.risk_level
+    }
+
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
+        // Enforce rate limit if a security policy is attached.
+        if let Some(ref security) = self.security {
+            if let Err(error) = security.enforce_tool_operation(ToolOperation::Act, &self.name) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error),
+                });
+            }
+        }
+
         let start = std::time::Instant::now();
         let json_bytes = serde_json::to_vec(&args).unwrap_or_default();
 

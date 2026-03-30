@@ -3205,6 +3205,9 @@ pub struct PluginsConfig {
     /// Plugin signature verification security settings
     #[serde(default)]
     pub security: PluginSecurityConfig,
+    /// Plugins that have been explicitly disabled by the user.
+    #[serde(default)]
+    pub disabled_plugins: Vec<String>,
     /// Per-plugin configuration: `[plugins.<name>]` sections map key-value pairs
     /// that are passed to the plugin as Extism config.
     #[serde(default, flatten)]
@@ -3272,6 +3275,7 @@ impl Default for PluginsConfig {
             auto_discover: false,
             max_plugins: default_max_plugins(),
             security: PluginSecurityConfig::default(),
+            disabled_plugins: Vec::new(),
             per_plugin: std::collections::HashMap::new(),
         }
     }

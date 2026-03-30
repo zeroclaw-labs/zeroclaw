@@ -5,6 +5,7 @@
 
 pub mod error;
 pub mod host;
+pub mod host_functions;
 pub mod loader;
 pub mod signature;
 pub mod wasm_channel;
@@ -58,6 +59,9 @@ pub struct PluginManifest {
     /// Hex-encoded Ed25519 public key of the publisher who signed this manifest.
     #[serde(default)]
     pub publisher_key: Option<String>,
+    /// Host-side capabilities this plugin requests (memory, tool delegation, etc.).
+    #[serde(default)]
+    pub host_capabilities: PluginCapabilities,
 }
 
 fn default_wasi() -> bool {
@@ -100,14 +104,9 @@ pub enum PluginPermission {
     MemoryWrite,
 }
 
-/// Risk level for a plugin tool.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum RiskLevel {
-    Low,
-    Medium,
-    High,
-}
+/// Re-export from [`crate::tools::traits::RiskLevel`] so that existing code
+/// that imports `crate::plugins::RiskLevel` continues to compile.
+pub use crate::tools::traits::RiskLevel;
 
 /// A tool declared in a plugin manifest via `[[tools]]`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -126,6 +125,85 @@ pub struct ToolDefinition {
     pub parameters_schema: Option<serde_json::Value>,
 }
 
+/// Host-side capabilities a plugin may request via `[plugin.host_capabilities]`.
+///
+/// Each field maps to a subsystem the plugin wants to interact with through
+/// host functions. All fields are optional and default to `None` — a plugin
+/// that declares no host capabilities receives no host-function imports.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PluginCapabilities {
+    /// Access to the agent memory subsystem.
+    #[serde(default)]
+    pub memory: Option<MemoryCapability>,
+    /// Ability to delegate work to other tools registered in the agent.
+    #[serde(default)]
+    pub tool_delegation: Option<ToolDelegationCapability>,
+    /// Ability to send messages through agent channels.
+    #[serde(default)]
+    pub messaging: Option<MessagingCapability>,
+    /// Access to runtime context (session, user identity, agent config).
+    #[serde(default)]
+    pub context: Option<ContextCapability>,
+}
+
+/// Memory subsystem access.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryCapability {
+    /// Whether the plugin can read from agent memory.
+    #[serde(default)]
+    pub read: bool,
+    /// Whether the plugin can write to agent memory.
+    #[serde(default)]
+    pub write: bool,
+}
+
+/// Tool delegation capability — allows a plugin to invoke other tools.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolDelegationCapability {
+    /// Tool names this plugin is allowed to delegate to.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
+}
+
+/// Messaging capability — allows a plugin to send messages via channels.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MessagingCapability {
+    /// Channel names this plugin is allowed to send messages through.
+    #[serde(default)]
+    pub allowed_channels: Vec<String>,
+    /// Maximum messages per plugin per channel within the rate limit window.
+    /// Defaults to 60 if not specified.
+    #[serde(default = "default_messaging_rate_limit")]
+    pub rate_limit_per_hour: u32,
+}
+
+fn default_messaging_rate_limit() -> u32 {
+    60
+}
+
+impl Default for MessagingCapability {
+    fn default() -> Self {
+        Self {
+            allowed_channels: Vec::new(),
+            rate_limit_per_hour: default_messaging_rate_limit(),
+        }
+    }
+}
+
+/// Context access capability — controls what runtime context a plugin can read.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextCapability {
+    /// Access to session-level context (conversation state).
+    #[serde(default)]
+    pub session: bool,
+    /// Access to user identity information.
+    #[serde(default)]
+    pub user_identity: bool,
+    /// Access to agent configuration.
+    #[serde(default)]
+    pub agent_config: bool,
+}
+
 /// Information about a loaded plugin.
 #[derive(Debug, Clone, Serialize)]
 pub struct PluginInfo {
@@ -134,10 +212,21 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub capabilities: Vec<PluginCapability>,
     pub permissions: Vec<PluginPermission>,
+    pub tools: Vec<ToolDefinition>,
     pub wasm_path: PathBuf,
     pub loaded: bool,
+    /// Whether this plugin is enabled (user-togglable).
+    pub enabled: bool,
     /// SHA-256 hash of the WASM binary recorded at install/discover time.
     pub wasm_sha256: Option<String>,
+    /// Hosts the plugin is allowed to make network requests to.
+    pub allowed_hosts: Vec<String>,
+    /// Filesystem path mappings the plugin is allowed to access.
+    pub allowed_paths: HashMap<String, String>,
+    /// Plugin configuration key-value pairs from manifest.
+    pub config: HashMap<String, serde_json::Value>,
+    /// Host-side capabilities this plugin requests.
+    pub host_capabilities: PluginCapabilities,
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +269,8 @@ struct NestedPluginSection {
     network: Option<NetworkSection>,
     #[serde(default)]
     filesystem: Option<FilesystemSection>,
+    #[serde(default)]
+    host_capabilities: PluginCapabilities,
 }
 
 /// `[plugin.network]` section.
@@ -262,6 +353,7 @@ impl PluginManifest {
             timeout_ms: p.timeout_ms,
             signature: p.signature,
             publisher_key: p.publisher_key,
+            host_capabilities: p.host_capabilities,
         })
     }
 
@@ -294,6 +386,114 @@ impl PluginManifest {
         let end = msg[start..].find('`')? + start;
         Some(msg[start..end].to_string())
     }
+}
+
+/// Build a human-readable audit summary of a plugin manifest.
+///
+/// Returns a formatted string showing the plugin's identity, network access,
+/// filesystem access, host capabilities, and tool risk levels with approval
+/// requirements per autonomy level — without installing anything.
+pub fn format_audit_summary(manifest: &PluginManifest) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    // Header
+    writeln!(out, "Plugin: {} v{}", manifest.name, manifest.version).unwrap();
+    if let Some(desc) = &manifest.description {
+        writeln!(out, "  Description: {desc}").unwrap();
+    }
+    if let Some(author) = &manifest.author {
+        writeln!(out, "  Author: {author}").unwrap();
+    }
+    writeln!(out).unwrap();
+
+    // Network access
+    writeln!(out, "Network access:").unwrap();
+    if manifest.allowed_hosts.is_empty() {
+        writeln!(out, "  (none)").unwrap();
+    } else {
+        for host in &manifest.allowed_hosts {
+            writeln!(out, "  \u{2713} {host}").unwrap();
+        }
+    }
+    writeln!(out).unwrap();
+
+    // Filesystem access
+    writeln!(out, "Filesystem access:").unwrap();
+    if manifest.allowed_paths.is_empty() {
+        writeln!(out, "  (none)").unwrap();
+    } else {
+        for (logical, physical) in &manifest.allowed_paths {
+            writeln!(out, "  \u{2713} {logical} \u{2192} {physical}").unwrap();
+        }
+    }
+    writeln!(out).unwrap();
+
+    // Host capabilities
+    writeln!(out, "Host capabilities:").unwrap();
+    if manifest.capabilities.is_empty() && manifest.permissions.is_empty() {
+        writeln!(out, "  (none)").unwrap();
+    } else {
+        for cap in &manifest.capabilities {
+            let label = match cap {
+                PluginCapability::Tool => "tool provider",
+                PluginCapability::Channel => "channel provider",
+                PluginCapability::Memory => "memory backend",
+                PluginCapability::Observer => "observer/metrics",
+            };
+            writeln!(out, "  \u{2713} {label}").unwrap();
+        }
+        for perm in &manifest.permissions {
+            let label = match perm {
+                PluginPermission::HttpClient => "http client",
+                PluginPermission::FileRead => "filesystem (read)",
+                PluginPermission::FileWrite => "filesystem (write)",
+                PluginPermission::EnvRead => "environment variables (read)",
+                PluginPermission::MemoryRead => "memory (read)",
+                PluginPermission::MemoryWrite => "memory (write)",
+            };
+            writeln!(out, "  \u{2713} {label}").unwrap();
+        }
+    }
+    writeln!(out).unwrap();
+
+    // Risk levels
+    writeln!(out, "Risk levels:").unwrap();
+    if manifest.tools.is_empty() {
+        writeln!(out, "  (no tools)").unwrap();
+    } else {
+        for tool in &manifest.tools {
+            let (level_str, approval) = match tool.risk_level {
+                RiskLevel::Low => ("low", ""),
+                RiskLevel::Medium => {
+                    ("medium", " (requires approval in supervised mode)")
+                }
+                RiskLevel::High => {
+                    ("high", " (requires approval in supervised mode)")
+                }
+            };
+            writeln!(
+                out,
+                "  \u{2022} {:<24}\u{2192} {level_str}{approval}",
+                tool.name
+            )
+            .unwrap();
+        }
+    }
+
+    // Trim trailing newline for clean output
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Display a human-readable audit summary of a plugin manifest.
+///
+/// Shows the plugin's identity, network access, filesystem access,
+/// host capabilities, and tool risk levels without installing anything.
+pub fn display_audit(manifest: &PluginManifest) {
+    println!("{}", format_audit_summary(manifest));
 }
 
 /// Returns `true` if a manifest config declaration marks the key as sensitive.
