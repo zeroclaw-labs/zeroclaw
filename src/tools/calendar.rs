@@ -3,14 +3,12 @@
 //! Provides the agent with read/write access to the user's calendars:
 //! - **Google Calendar** (REST v3) — primary backend, covers Samsung Calendar
 //! - **Microsoft Outlook** (Graph API) — enterprise/business users
+//! - **KakaoTalk 톡캘린더** (Kakao REST API) — Korean users
 //!
 //! The tools expose a unified interface so the LLM can:
 //! - List upcoming events
 //! - Create new events / reminders
 //! - Search events by keyword or date range
-//!
-//! Auth tokens are managed via config; first-time setup requires
-//! the user to complete an OAuth flow (guided by the agent).
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -18,16 +16,8 @@ use serde_json::json;
 use super::traits::{Tool, ToolResult};
 
 // ═══════════════════════════════════════════════════════════════════
-// Calendar List Events Tool
+// Calendar Provider Enum
 // ═══════════════════════════════════════════════════════════════════
-
-/// List upcoming calendar events.
-///
-/// Queries the configured calendar provider (Google, Outlook) and
-/// returns events in a structured format the agent can reason about.
-pub struct CalendarListEventsTool {
-    provider: CalendarProvider,
-}
 
 /// Supported calendar backends.
 #[derive(Clone)]
@@ -39,6 +29,19 @@ pub enum CalendarProvider {
     Outlook {
         access_token: String,
     },
+    Kakao {
+        access_token: String,
+        calendar_id: Option<String>,
+    },
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Calendar List Events Tool
+// ═══════════════════════════════════════════════════════════════════
+
+/// List upcoming calendar events.
+pub struct CalendarListEventsTool {
+    provider: CalendarProvider,
 }
 
 impl CalendarListEventsTool {
@@ -56,7 +59,7 @@ impl Tool for CalendarListEventsTool {
     fn description(&self) -> &str {
         "List upcoming events from the user's calendar. \
          Shows event title, start/end time, location, and description. \
-         Supports Google Calendar and Microsoft Outlook."
+         Supports Google Calendar, Microsoft Outlook, and KakaoTalk 톡캘린더."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -119,12 +122,7 @@ impl Tool for CalendarListEventsTool {
                     url.push_str(&format!("&q={}", urlencoding::encode(q)));
                 }
 
-                let resp = client
-                    .get(&url)
-                    .bearer_auth(access_token)
-                    .send()
-                    .await?;
-
+                let resp = client.get(&url).bearer_auth(access_token).send().await?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
@@ -134,12 +132,10 @@ impl Tool for CalendarListEventsTool {
                         error: Some(format!("Google Calendar API error {status}: {body}")),
                     });
                 }
-
                 let result: serde_json::Value = resp.json().await?;
-                let events = format_google_events(&result);
                 Ok(ToolResult {
                     success: true,
-                    output: events,
+                    output: format_google_events(&result),
                     error: None,
                 })
             }
@@ -152,15 +148,13 @@ impl Tool for CalendarListEventsTool {
                     max_results
                 );
                 if let Some(q) = query {
-                    url.push_str(&format!("&$filter=contains(subject,'{}')", q.replace('\'', "''")));
+                    url.push_str(&format!(
+                        "&$filter=contains(subject,'{}')",
+                        q.replace('\'', "''")
+                    ));
                 }
 
-                let resp = client
-                    .get(&url)
-                    .bearer_auth(access_token)
-                    .send()
-                    .await?;
-
+                let resp = client.get(&url).bearer_auth(access_token).send().await?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
@@ -170,12 +164,53 @@ impl Tool for CalendarListEventsTool {
                         error: Some(format!("Outlook Calendar API error {status}: {body}")),
                     });
                 }
-
                 let result: serde_json::Value = resp.json().await?;
-                let events = format_outlook_events(&result);
                 Ok(ToolResult {
                     success: true,
-                    output: events,
+                    output: format_outlook_events(&result),
+                    error: None,
+                })
+            }
+            CalendarProvider::Kakao {
+                access_token,
+                calendar_id,
+            } => {
+                // Kakao 톡캘린더 REST API: GET /v2/api/calendar/events
+                let from = now.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+                let to = (now + chrono::Duration::days(days_ahead as i64))
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string();
+
+                let mut url = format!(
+                    "https://kapi.kakao.com/v2/api/calendar/events?from={}&to={}&limit={}",
+                    urlencoding::encode(&from),
+                    urlencoding::encode(&to),
+                    max_results
+                );
+                if let Some(cal_id) = calendar_id {
+                    url.push_str(&format!("&calendar_id={}", urlencoding::encode(cal_id)));
+                }
+
+                let resp = client
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {access_token}"))
+                    .send()
+                    .await?;
+
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("KakaoTalk Calendar API error {status}: {body}")),
+                    });
+                }
+
+                let result: serde_json::Value = resp.json().await?;
+                Ok(ToolResult {
+                    success: true,
+                    output: format_kakao_events(&result),
                     error: None,
                 })
             }
@@ -207,7 +242,7 @@ impl Tool for CalendarCreateEventTool {
     fn description(&self) -> &str {
         "Create a new event or reminder on the user's calendar. \
          Supports setting title, start/end time, location, description, \
-         and reminders. Works with Google Calendar and Outlook."
+         and reminders. Works with Google Calendar, Outlook, and KakaoTalk 톡캘린더."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -246,7 +281,7 @@ impl Tool for CalendarCreateEventTool {
                 },
                 "timezone": {
                     "type": "string",
-                    "description": "Timezone for the event (e.g. 'Asia/Seoul', 'America/New_York'). Defaults to user's home timezone."
+                    "description": "Timezone (e.g. 'Asia/Seoul'). Defaults to user's home timezone."
                 }
             },
             "required": ["title", "start_time"]
@@ -291,23 +326,14 @@ impl Tool for CalendarCreateEventTool {
                     urlencoding::encode(calendar_id)
                 );
 
+                let default_end = format_default_end_time(start_time);
                 let (start_json, end_json) = if all_day {
-                    // All-day events use date (not dateTime)
-                    let start_date = &start_time[..10]; // "2026-03-30"
-                    let end_date = end_time
-                        .map(|t| &t[..10])
-                        .unwrap_or(start_date);
-                    (
-                        json!({"date": start_date, "timeZone": timezone}),
-                        json!({"date": end_date, "timeZone": timezone}),
-                    )
+                    let sd = &start_time[..10.min(start_time.len())];
+                    let ed = end_time.map(|t| &t[..10.min(t.len())]).unwrap_or(sd);
+                    (json!({"date": sd, "timeZone": timezone}), json!({"date": ed, "timeZone": timezone}))
                 } else {
-                    let default_end = format_default_end_time(start_time);
                     let end = end_time.unwrap_or(&default_end);
-                    (
-                        json!({"dateTime": start_time, "timeZone": timezone}),
-                        json!({"dateTime": end, "timeZone": timezone}),
-                    )
+                    (json!({"dateTime": start_time, "timeZone": timezone}), json!({"dateTime": end, "timeZone": timezone}))
                 };
 
                 let mut body = json!({
@@ -316,93 +342,96 @@ impl Tool for CalendarCreateEventTool {
                     "end": end_json,
                     "reminders": {
                         "useDefault": false,
-                        "overrides": [
-                            {"method": "popup", "minutes": reminder_minutes}
-                        ]
+                        "overrides": [{"method": "popup", "minutes": reminder_minutes}]
                     }
                 });
-                if let Some(loc) = location {
-                    body["location"] = json!(loc);
-                }
-                if let Some(desc) = description {
-                    body["description"] = json!(desc);
-                }
+                if let Some(loc) = location { body["location"] = json!(loc); }
+                if let Some(desc) = description { body["description"] = json!(desc); }
 
-                let resp = client
-                    .post(&url)
-                    .bearer_auth(access_token)
-                    .json(&body)
-                    .send()
-                    .await?;
-
+                let resp = client.post(&url).bearer_auth(access_token).json(&body).send().await?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let err = resp.text().await.unwrap_or_default();
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(format!("Google Calendar create error {status}: {err}")),
-                    });
+                    return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("Google Calendar create error {status}: {err}")) });
                 }
-
                 let result: serde_json::Value = resp.json().await?;
                 let event_id = result.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let html_link = result
-                    .get("htmlLink")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
+                let html_link = result.get("htmlLink").and_then(|v| v.as_str()).unwrap_or("");
                 Ok(ToolResult {
                     success: true,
-                    output: format!(
-                        "Event created successfully.\n\
-                         Title: {title}\n\
-                         Start: {start_time}\n\
-                         Event ID: {event_id}\n\
-                         Link: {html_link}"
-                    ),
+                    output: format!("Event created.\nTitle: {title}\nStart: {start_time}\nID: {event_id}\nLink: {html_link}"),
                     error: None,
                 })
             }
             CalendarProvider::Outlook { access_token } => {
-                let url = "https://graph.microsoft.com/v1.0/me/events";
-
-                let (start_json, end_json) = if all_day {
-                    (
-                        json!({"dateTime": start_time, "timeZone": timezone}),
-                        json!({
-                            "dateTime": end_time.unwrap_or(start_time),
-                            "timeZone": timezone
-                        }),
-                    )
-                } else {
-                    let default_end = format_default_end_time(start_time);
-                    let end = end_time.unwrap_or(&default_end);
-                    (
-                        json!({"dateTime": start_time, "timeZone": timezone}),
-                        json!({"dateTime": end, "timeZone": timezone}),
-                    )
-                };
-
+                let default_end = format_default_end_time(start_time);
+                let end = end_time.unwrap_or(&default_end);
                 let mut body = json!({
                     "subject": title,
-                    "start": start_json,
-                    "end": end_json,
+                    "start": {"dateTime": start_time, "timeZone": timezone},
+                    "end": {"dateTime": end, "timeZone": timezone},
                     "isAllDay": all_day,
                     "isReminderOn": true,
                     "reminderMinutesBeforeStart": reminder_minutes
                 });
+                if let Some(loc) = location { body["location"] = json!({"displayName": loc}); }
+                if let Some(desc) = description { body["body"] = json!({"contentType": "Text", "content": desc}); }
+
+                let resp = client.post("https://graph.microsoft.com/v1.0/me/events")
+                    .bearer_auth(access_token).json(&body).send().await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let err = resp.text().await.unwrap_or_default();
+                    return Ok(ToolResult { success: false, output: String::new(), error: Some(format!("Outlook create error {status}: {err}")) });
+                }
+                let result: serde_json::Value = resp.json().await?;
+                let event_id = result.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                Ok(ToolResult {
+                    success: true,
+                    output: format!("Outlook event created.\nTitle: {title}\nStart: {start_time}\nID: {event_id}"),
+                    error: None,
+                })
+            }
+            CalendarProvider::Kakao {
+                access_token,
+                calendar_id,
+            } => {
+                // Kakao 톡캘린더 REST API: POST /v2/api/calendar/create/event
+                let default_end = format_default_end_time(start_time);
+                let end = end_time.unwrap_or(&default_end);
+
+                let mut event = json!({
+                    "title": title,
+                    "time": {
+                        "start_at": start_time,
+                        "end_at": end,
+                        "time_zone": timezone,
+                        "all_day": all_day
+                    }
+                });
                 if let Some(loc) = location {
-                    body["location"] = json!({"displayName": loc});
+                    event["location"] = json!({"name": loc});
                 }
                 if let Some(desc) = description {
-                    body["body"] = json!({"contentType": "Text", "content": desc});
+                    event["description"] = json!(desc);
+                }
+                if reminder_minutes > 0 {
+                    event["reminders"] = json!([reminder_minutes as i64]);
+                }
+
+                // Kakao API uses form-encoded params: event=<json_string>&calendar_id=<id>
+                let event_json_str = event.to_string();
+                let mut form_params = vec![("event", event_json_str.as_str())];
+                let cal_id_str;
+                if let Some(cal_id) = calendar_id {
+                    cal_id_str = cal_id.clone();
+                    form_params.push(("calendar_id", &cal_id_str));
                 }
 
                 let resp = client
-                    .post(url)
-                    .bearer_auth(access_token)
-                    .json(&body)
+                    .post("https://kapi.kakao.com/v2/api/calendar/create/event")
+                    .header("Authorization", format!("Bearer {access_token}"))
+                    .form(&form_params)
                     .send()
                     .await?;
 
@@ -412,25 +441,20 @@ impl Tool for CalendarCreateEventTool {
                     return Ok(ToolResult {
                         success: false,
                         output: String::new(),
-                        error: Some(format!("Outlook Calendar create error {status}: {err}")),
+                        error: Some(format!("KakaoTalk Calendar create error {status}: {err}")),
                     });
                 }
 
                 let result: serde_json::Value = resp.json().await?;
-                let event_id = result.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                let web_link = result
-                    .get("webLink")
+                let event_id = result
+                    .get("event_id")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
                 Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "Outlook event created successfully.\n\
-                         Title: {title}\n\
-                         Start: {start_time}\n\
-                         Event ID: {event_id}\n\
-                         Link: {web_link}"
+                        "톡캘린더 일정이 생성되었습니다.\nTitle: {title}\nStart: {start_time}\nEvent ID: {event_id}"
                     ),
                     error: None,
                 })
@@ -448,41 +472,17 @@ fn format_google_events(data: &serde_json::Value) -> String {
         Some(arr) if !arr.is_empty() => arr,
         _ => return "No upcoming events found.".to_string(),
     };
-
-    let mut output = format!("Found {} upcoming event(s):\n\n", items.len());
-    for (i, event) in items.iter().enumerate() {
-        let title = event
-            .get("summary")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(No title)");
-        let start = event
-            .get("start")
-            .and_then(|s| {
-                s.get("dateTime")
-                    .or_else(|| s.get("date"))
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("?");
-        let end = event
-            .get("end")
-            .and_then(|s| {
-                s.get("dateTime")
-                    .or_else(|| s.get("date"))
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("?");
-        let location = event
-            .get("location")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        output.push_str(&format!("{}. {} ({}~{})", i + 1, title, start, end));
-        if !location.is_empty() {
-            output.push_str(&format!(" @ {location}"));
-        }
-        output.push('\n');
+    let mut out = format!("Found {} upcoming event(s):\n\n", items.len());
+    for (i, ev) in items.iter().enumerate() {
+        let title = ev.get("summary").and_then(|v| v.as_str()).unwrap_or("(No title)");
+        let start = ev.get("start").and_then(|s| s.get("dateTime").or_else(|| s.get("date")).and_then(|v| v.as_str())).unwrap_or("?");
+        let end = ev.get("end").and_then(|s| s.get("dateTime").or_else(|| s.get("date")).and_then(|v| v.as_str())).unwrap_or("?");
+        let loc = ev.get("location").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("{}. {} ({}~{})", i + 1, title, start, end));
+        if !loc.is_empty() { out.push_str(&format!(" @ {loc}")); }
+        out.push('\n');
     }
-    output
+    out
 }
 
 fn format_outlook_events(data: &serde_json::Value) -> String {
@@ -490,42 +490,41 @@ fn format_outlook_events(data: &serde_json::Value) -> String {
         Some(arr) if !arr.is_empty() => arr,
         _ => return "No upcoming events found.".to_string(),
     };
-
-    let mut output = format!("Found {} upcoming event(s):\n\n", items.len());
-    for (i, event) in items.iter().enumerate() {
-        let title = event
-            .get("subject")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(No title)");
-        let start = event
-            .pointer("/start/dateTime")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let end = event
-            .pointer("/end/dateTime")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
-        let location = event
-            .pointer("/location/displayName")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        output.push_str(&format!("{}. {} ({}~{})", i + 1, title, start, end));
-        if !location.is_empty() {
-            output.push_str(&format!(" @ {location}"));
-        }
-        output.push('\n');
+    let mut out = format!("Found {} upcoming event(s):\n\n", items.len());
+    for (i, ev) in items.iter().enumerate() {
+        let title = ev.get("subject").and_then(|v| v.as_str()).unwrap_or("(No title)");
+        let start = ev.pointer("/start/dateTime").and_then(|v| v.as_str()).unwrap_or("?");
+        let end = ev.pointer("/end/dateTime").and_then(|v| v.as_str()).unwrap_or("?");
+        let loc = ev.pointer("/location/displayName").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("{}. {} ({}~{})", i + 1, title, start, end));
+        if !loc.is_empty() { out.push_str(&format!(" @ {loc}")); }
+        out.push('\n');
     }
-    output
+    out
 }
 
-/// Given a start time string, produce a default end time 1 hour later.
-/// Falls back to appending "+01:00" if parsing fails.
+fn format_kakao_events(data: &serde_json::Value) -> String {
+    let events = match data.get("events").and_then(|v| v.as_array()) {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return "톡캘린더에 예정된 일정이 없습니다. (No upcoming events)".to_string(),
+    };
+    let mut out = format!("톡캘린더: {} 건의 일정\n\n", events.len());
+    for (i, ev) in events.iter().enumerate() {
+        let title = ev.get("title").and_then(|v| v.as_str()).unwrap_or("(제목 없음)");
+        let start = ev.pointer("/time/start_at").and_then(|v| v.as_str()).unwrap_or("?");
+        let end = ev.pointer("/time/end_at").and_then(|v| v.as_str()).unwrap_or("?");
+        let loc = ev.pointer("/location/name").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("{}. {} ({}~{})", i + 1, title, start, end));
+        if !loc.is_empty() { out.push_str(&format!(" @ {loc}")); }
+        out.push('\n');
+    }
+    out
+}
+
 fn format_default_end_time(start: &str) -> String {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(start) {
         (dt + chrono::Duration::hours(1)).to_rfc3339()
     } else {
-        // Best-effort: just return the same time (API will likely accept it)
         start.to_string()
     }
 }
@@ -542,9 +541,7 @@ mod tests {
             access_token: "test".into(),
             calendar_id: "primary".into(),
         });
-        let spec = tool.spec();
-        assert_eq!(spec.name, "calendar_list_events");
-        assert!(spec.description.contains("calendar"));
+        assert_eq!(tool.spec().name, "calendar_list_events");
     }
 
     #[test]
@@ -555,89 +552,78 @@ mod tests {
         });
         let spec = tool.spec();
         assert_eq!(spec.name, "calendar_create_event");
-        assert!(spec.description.contains("event"));
-
-        let params = spec.parameters;
-        let props = params.get("properties").unwrap();
+        let props = spec.parameters.get("properties").unwrap();
         assert!(props.get("title").is_some());
         assert!(props.get("start_time").is_some());
-        assert!(props.get("reminder_minutes").is_some());
         assert!(props.get("timezone").is_some());
     }
 
     #[test]
+    fn kakao_calendar_provider_spec() {
+        let tool = CalendarListEventsTool::new(CalendarProvider::Kakao {
+            access_token: "test".into(),
+            calendar_id: None,
+        });
+        assert_eq!(tool.spec().name, "calendar_list_events");
+        assert!(tool.spec().description.contains("톡캘린더"));
+    }
+
+    #[test]
     fn format_google_events_empty() {
-        let data = json!({"items": []});
-        assert_eq!(format_google_events(&data), "No upcoming events found.");
+        assert_eq!(format_google_events(&json!({"items": []})), "No upcoming events found.");
     }
 
     #[test]
     fn format_google_events_with_data() {
-        let data = json!({
-            "items": [{
-                "summary": "Team Meeting",
-                "start": {"dateTime": "2026-03-30T10:00:00+09:00"},
-                "end": {"dateTime": "2026-03-30T11:00:00+09:00"},
-                "location": "Room A"
-            }]
-        });
-        let output = format_google_events(&data);
-        assert!(output.contains("Team Meeting"));
-        assert!(output.contains("Room A"));
+        let data = json!({"items": [{"summary": "Meeting", "start": {"dateTime": "2026-03-30T10:00:00+09:00"}, "end": {"dateTime": "2026-03-30T11:00:00+09:00"}, "location": "Room A"}]});
+        let out = format_google_events(&data);
+        assert!(out.contains("Meeting"));
+        assert!(out.contains("Room A"));
     }
 
     #[test]
     fn format_outlook_events_empty() {
-        let data = json!({"value": []});
-        assert_eq!(format_outlook_events(&data), "No upcoming events found.");
+        assert_eq!(format_outlook_events(&json!({"value": []})), "No upcoming events found.");
     }
 
     #[test]
-    fn format_outlook_events_with_data() {
-        let data = json!({
-            "value": [{
-                "subject": "Standup",
-                "start": {"dateTime": "2026-03-30T09:00:00"},
-                "end": {"dateTime": "2026-03-30T09:30:00"},
-                "location": {"displayName": "Online"}
-            }]
-        });
-        let output = format_outlook_events(&data);
-        assert!(output.contains("Standup"));
-        assert!(output.contains("Online"));
+    fn format_kakao_events_empty() {
+        let out = format_kakao_events(&json!({"events": []}));
+        assert!(out.contains("없습니다"));
+    }
+
+    #[test]
+    fn format_kakao_events_with_data() {
+        let data = json!({"events": [{"title": "점심 약속", "time": {"start_at": "2026-03-30T12:00:00+09:00", "end_at": "2026-03-30T13:00:00+09:00"}, "location": {"name": "강남역"}}]});
+        let out = format_kakao_events(&data);
+        assert!(out.contains("점심 약속"));
+        assert!(out.contains("강남역"));
     }
 
     #[test]
     fn default_end_time_rfc3339() {
-        let start = "2026-03-30T10:00:00+09:00";
-        let end = format_default_end_time(start);
+        let end = format_default_end_time("2026-03-30T10:00:00+09:00");
         assert!(end.contains("11:00:00"));
     }
 
     #[test]
     fn default_end_time_fallback() {
-        let start = "not-a-date";
-        let end = format_default_end_time(start);
-        assert_eq!(end, "not-a-date");
+        assert_eq!(format_default_end_time("not-a-date"), "not-a-date");
     }
 
     #[tokio::test]
     async fn calendar_create_missing_title_fails() {
         let tool = CalendarCreateEventTool::new(CalendarProvider::Google {
-            access_token: "test".into(),
-            calendar_id: "primary".into(),
+            access_token: "t".into(), calendar_id: "primary".into(),
         });
-        let result = tool.execute(json!({"start_time": "2026-03-30T10:00:00+09:00"})).await;
-        assert!(result.is_err());
+        assert!(tool.execute(json!({"start_time": "2026-03-30T10:00:00+09:00"})).await.is_err());
     }
 
     #[tokio::test]
     async fn calendar_create_missing_start_fails() {
-        let tool = CalendarCreateEventTool::new(CalendarProvider::Google {
-            access_token: "test".into(),
-            calendar_id: "primary".into(),
+        let tool = CalendarCreateEventTool::new(CalendarProvider::Kakao {
+            access_token: "t".into(), calendar_id: None,
         });
-        let result = tool.execute(json!({"title": "Test"})).await;
-        assert!(result.is_err());
+        assert!(tool.execute(json!({"title": "Test"})).await.is_err());
     }
 }

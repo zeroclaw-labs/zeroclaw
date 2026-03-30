@@ -14,7 +14,7 @@ permissions:
     pull-requests: write
 
 env:
-    GEMINI_MODEL: "gemini-2.5-flash"
+    GEMINI_MODEL: "gemini-3.1-pro-preview"
     MAX_DIFF_CHARS: "120000"
     MAX_REVIEW_ROUNDS: "3"
 
@@ -115,7 +115,20 @@ jobs:
                         core.setOutput('has_previous', 'false');
                       }
 
+            - name: Check API key is available
+              id: key_check
+              env:
+                  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+              run: |
+                  if [ -z "$GEMINI_API_KEY" ]; then
+                    echo "::warning::GEMINI_API_KEY secret is not set. Skipping review."
+                    echo "has_key=false" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "has_key=true" >> "$GITHUB_OUTPUT"
+                  fi
+
             - name: Call Gemini API for review
+              if: steps.key_check.outputs.has_key == 'true'
               id: review
               env:
                   GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -232,7 +245,7 @@ jobs:
                       }],
                       generationConfig: {
                         temperature: 0.2,
-                        maxOutputTokens: 4096
+                        maxOutputTokens: 8192
                       }
                     }')
 
@@ -262,6 +275,7 @@ jobs:
                   echo "$RESPONSE" > /tmp/review_result.txt
 
             - name: Post review comment on PR
+              if: steps.key_check.outputs.has_key == 'true'
               uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
               env:
                   CURRENT_ROUND: ${{ steps.round.outputs.current_round }}

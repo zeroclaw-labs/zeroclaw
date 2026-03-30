@@ -16,7 +16,7 @@ permissions:
     statuses: write
 
 env:
-    GEMINI_MODEL: "gemini-2.5-flash"
+    GEMINI_MODEL: "gemini-3.1-pro-preview"
     MAX_DIFF_CHARS: "120000"
     MAX_REVIEW_ROUNDS: "3"
 
@@ -292,7 +292,7 @@ jobs:
                       }],
                       generationConfig: {
                         temperature: 0.2,
-                        maxOutputTokens: 4096
+                        maxOutputTokens: 8192
                       }
                     }')
 

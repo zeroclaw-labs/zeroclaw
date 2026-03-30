@@ -1343,9 +1343,9 @@ MoA organizes all user interactions into **7 top-bar categories** and
 | **WebGeneral** | 웹/일반 | default chat | BASE + VISION |
 | **Document** | 문서 | `document` editor (2-layer viewer+Tiptap) | BASE + DOCUMENT |
 | **Coding** | 코딩 | `sandbox` | ALL tools (unrestricted) |
-| **Image** | 이미지 | default chat | BASE + VISION |
-| **Music** | 음악 | default chat | BASE |
-| **Video** | 비디오 | default chat | BASE + VISION |
+| **Image** | 이미지 | default chat | BASE + VISION + MEDIA_IMAGE |
+| **Music** | 음악 | default chat | BASE + MEDIA_MUSIC |
+| **Video** | 비디오 | default chat | BASE + VISION + MEDIA_VIDEO |
 | **Translation** | 통역 | `voice_interpret` | MINIMAL (memory + browser + file I/O) |
 
 ### Sidebar (Navigation)
@@ -1355,6 +1355,110 @@ MoA organizes all user interactions into **7 top-bar categories** and
 | **Channels** | 채널 | KakaoTalk, Telegram, Discord, Slack, LINE, Web chat management |
 | **Billing** | 결제 | Credits, usage, payment |
 | **MyPage** | 마이페이지 | User profile, API key settings, device management |
+
+### Media Generation API Stack (미디어 생성 API)
+
+MoA provides AI-powered media creation through external API integrations.
+Each tool follows the `Tool` trait and is registered in
+`src/tools/media_gen.rs` + `src/tools/mod.rs`.
+
+| Tool Name | API Provider | Capability | Pricing Model |
+|-----------|-------------|------------|---------------|
+| `image_generate` | **Freepik Mystic** | Text→image (2K/4K), LoRA styles, engines (magnific_sharpy/sparkle/illusio) | Subscription + credits |
+| `image_upscale` | **Freepik Magnific** | AI upscaling up to 16K (2x/4x/8x), optimization presets | Subscription + credits |
+| `image_to_video` | **Freepik** | Static image → short motion video | Subscription + credits |
+| `video_generate` | **Runway Gen-4** | Text/image→video, camera control, lip sync (5s/10s) | Credit-based (~$0.05-0.50/clip) |
+| `music_generate` | **Suno** (via apibox.erweima.ai) | Text→full song (vocals + instruments), style tags, custom lyrics | Subscription (500 songs/mo) |
+| `elevenlabs_tts` | **ElevenLabs** | Premium TTS, 29+ languages, voice cloning, multiple voices | Dual billing (see below) |
+
+**ElevenLabs dual billing model:**
+- **User key** (`ELEVENLABS_API_KEY` in config): User pays API directly → no MoA credit charge
+- **Platform key** (`ADMIN_ELEVENLABS_API_KEY` on Railway): Operator pays → user charged **2.2× credits** per request
+
+**Config** (`config.toml`):
+```toml
+[media_api.freepik]
+enabled = true
+api_key = "fpk_..."        # or FREEPIK_API_KEY env var
+engine = "magnific_sharpy"  # default rendering engine
+resolution = "2k"           # default output resolution
+
+[media_api.suno]
+enabled = true
+api_key = "..."             # or SUNO_API_KEY env var
+
+[media_api.runway]
+enabled = true
+api_key = "..."             # or RUNWAY_API_KEY env var
+model = "gen4_turbo"
+
+[media_api.elevenlabs]
+enabled = true
+api_key = "..."             # user's own key (optional)
+credit_multiplier = 2.2     # platform key billing rate
+default_voice_id = "21m00Tcm4TlvDq8ikWAM"  # "Rachel"
+model = "eleven_multilingual_v2"
+```
+
+**Implementation files:**
+- `src/tools/media_gen.rs` — All 6 media tool implementations
+- `src/config/schema.rs` — `MediaApiConfig`, `FreepikApiConfig`, `SunoApiConfig`, `RunwayApiConfig`, `ElevenLabsApiConfig`
+- `src/billing/llm_router.rs` — `AdminKeys` (includes freepik, suno, runway, elevenlabs)
+
+### Calendar Integration (캘린더 연동)
+
+MoA can read and create events on the user's calendars. This enables the
+agent to set alarms, check schedules, and create reminders via natural
+conversation in any channel (KakaoTalk, Telegram, web chat, etc.).
+
+| Tool Name | Providers | Capability |
+|-----------|-----------|------------|
+| `calendar_list_events` | Google Calendar, Outlook, KakaoTalk 톡캘린더 | Query events by date range, search by keyword |
+| `calendar_create_event` | Google Calendar, Outlook, KakaoTalk 톡캘린더 | Create events with title, time, location, reminders, all-day |
+
+**Supported calendar providers:**
+
+| Provider | API | Auth | Coverage |
+|----------|-----|------|----------|
+| **Google Calendar** | REST v3 | OAuth2 (`calendar.events` scope) | Covers Samsung Calendar (synced via Google account) |
+| **Microsoft Outlook** | Graph API v1.0 | OAuth2 (device code flow) | Enterprise/business users |
+| **KakaoTalk 톡캘린더** | Kakao REST API (`kapi.kakao.com`) | Kakao OAuth2 (`talk_calendar` scope) | Korean users |
+| **Apple Calendar** | CalDAV (planned) | App-specific password | iOS users |
+| **Naver Calendar** | Write-only API (limited) | Naver OAuth2 | Recommend Google sync instead |
+
+**Config** (`config.toml`):
+```toml
+[calendar.google]
+enabled = true
+client_id = "..."         # Google Cloud project
+client_secret = "..."
+refresh_token = "..."     # obtained after first OAuth consent
+calendar_id = "primary"
+
+[calendar.kakao]
+enabled = true
+rest_api_key = "..."      # Kakao Developers REST API key
+access_token = "..."      # user's OAuth token
+calendar_id = "..."       # optional: specific sub-calendar
+
+[calendar.outlook]
+enabled = true
+client_id = "..."         # Azure AD app
+tenant_id = "common"
+refresh_token = "..."
+```
+
+**Implementation files:**
+- `src/tools/calendar.rs` — `CalendarListEventsTool`, `CalendarCreateEventTool`, `CalendarProvider` enum
+- `src/config/schema.rs` — `CalendarConfig`, `GoogleCalendarConfig`, `OutlookCalendarConfig`, `KakaoCalendarConfig`, `AppleCalendarConfig`
+
+**User flow example** (via KakaoTalk):
+```
+User: "내일 오후 3시에 치과 예약 있어. 30분 전에 알려줘."
+MoA:  calendar_create_event(title="치과 예약", start_time="2026-03-31T15:00:00+09:00",
+      reminder_minutes=30, timezone="Asia/Seoul")
+      → 톡캘린더에 일정 생성 + cron job으로 14:30 알림 예약
+```
 
 ---
 
@@ -1373,7 +1477,7 @@ src/
 ├── memory/              # SQLite + sqlite-vec + FTS5 long-term memory
 ├── providers/           # Model providers (Gemini, Claude, OpenAI, Ollama, etc.)
 ├── channels/            # KakaoTalk, Telegram, Discord, Slack, LINE, Web chat
-├── tools/               # Tool execution (shell, file, memory, browser, credential vault)
+├── tools/               # Tool execution (shell, file, memory, browser, media, calendar, credential vault)
 ├── coding/              # Multi-model code review pipeline ← MoA addition
 ├── voice/               # Real-time voice interpretation  ← MoA addition
 ├── sandbox/             # Coding sandbox (run→observe→fix loop)

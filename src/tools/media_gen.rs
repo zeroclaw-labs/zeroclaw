@@ -1,13 +1,12 @@
-//! Media generation tool integrations for MoA.
+//! Image, video, music, and TTS generation tool integrations.
 //!
 //! Provides structured tools for AI-powered media generation:
 //! - **Image generation** via Freepik Mystic API (text-to-image, 2K/4K)
-//! - **Image upscaling** via Freepik Magnific API (up to 16K)
-//! - **Image editing** via Freepik API (background removal, relighting)
-//! - **Image-to-video** via Freepik API (simple motion conversion)
-//! - **Video generation** via Runway Gen-4 API (text/image-to-video)
-//! - **Music generation** via Suno API (text-to-song with vocals)
-//! - **Premium TTS** via ElevenLabs API (multilingual, voice selection)
+//! - **Image upscaling** via Freepik Magnific (up to 16K)
+//! - **Image-to-video** via Freepik (simple motion from still image)
+//! - **Video generation** via Runway Gen-4 (text/image-to-video)
+//! - **Music generation** via Suno (apibox.erweima.ai)
+//! - **Text-to-speech** via ElevenLabs (premium TTS with dual billing)
 //!
 //! Each tool follows the [`Tool`] trait pattern and returns structured
 //! results with download URLs and metadata.
@@ -18,44 +17,30 @@ use serde_json::json;
 use super::traits::{Tool, ToolResult};
 
 // ═══════════════════════════════════════════════════════════════════
-// Freepik Image Generation Tool (Mystic)
+// Image Generation Tool — Freepik Mystic API
 // ═══════════════════════════════════════════════════════════════════
 
 /// Image generation tool using Freepik Mystic API.
 ///
-/// Supports text-to-image generation with multiple engine choices,
-/// resolution up to 4K, and LoRA style presets.
+/// Supports text-to-image generation with 2K/4K resolution, engine
+/// selection, realism toggle, creative detailing, and aspect ratios.
 pub struct ImageGenTool {
     api_key: String,
     api_url: String,
-    default_engine: String,
-    default_resolution: String,
 }
 
 impl ImageGenTool {
-    /// Create a new Freepik image generation tool.
+    /// Create a new image generation tool with the default Freepik Mystic endpoint.
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
             api_url: "https://api.freepik.com/v1/ai/mystic".into(),
-            default_engine: "magnific_sharpy".into(),
-            default_resolution: "2k".into(),
         }
     }
 
-    /// Create with custom configuration.
-    pub fn with_config(
-        api_key: String,
-        api_url: String,
-        engine: String,
-        resolution: String,
-    ) -> Self {
-        Self {
-            api_key,
-            api_url,
-            default_engine: engine,
-            default_resolution: resolution,
-        }
+    /// Create with a custom API endpoint.
+    pub fn with_api_url(api_key: String, api_url: String) -> Self {
+        Self { api_key, api_url }
     }
 }
 
@@ -66,9 +51,9 @@ impl Tool for ImageGenTool {
     }
 
     fn description(&self) -> &str {
-        "Generate an AI image from a text description using Freepik Mystic. \
-         Supports 2K/4K resolution, multiple aspect ratios, and style engines. \
-         Returns a URL to the generated image."
+        "Generate an image from a text description using Freepik Mystic API. \
+         Returns a URL to the generated image. Supports 2K/4K resolution, \
+         engine selection, realism toggle, and creative detailing."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -83,34 +68,31 @@ impl Tool for ImageGenTool {
                     "type": "string",
                     "enum": ["2k", "4k"],
                     "default": "2k",
-                    "description": "Output resolution (2K or 4K)"
-                },
-                "aspect_ratio": {
-                    "type": "string",
-                    "enum": [
-                        "square_1_1", "classic_4_3", "traditional_3_4",
-                        "widescreen_16_9", "social_story_9_16"
-                    ],
-                    "default": "square_1_1",
-                    "description": "Image aspect ratio"
+                    "description": "Output resolution"
                 },
                 "engine": {
                     "type": "string",
-                    "enum": ["automatic", "magnific_illusio", "magnific_sharpy", "magnific_sparkle"],
-                    "default": "magnific_sharpy",
-                    "description": "Rendering engine style"
+                    "enum": ["magnific_illusio", "sharpy", "sparkle"],
+                    "default": "magnific_illusio",
+                    "description": "Rendering engine to use"
                 },
                 "realism": {
                     "type": "boolean",
-                    "default": true,
-                    "description": "Enable photorealistic mode"
+                    "default": false,
+                    "description": "Enable photorealistic rendering"
                 },
                 "creative_detailing": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 100,
                     "default": 50,
-                    "description": "Creative detail level (0=faithful, 100=creative)"
+                    "description": "Creative detail level (0-100)"
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["1:1", "3:2", "2:3", "16:9", "9:16", "4:3", "3:4"],
+                    "default": "1:1",
+                    "description": "Image aspect ratio"
                 }
             },
             "required": ["prompt"]
@@ -126,32 +108,32 @@ impl Tool for ImageGenTool {
         let resolution = args
             .get("resolution")
             .and_then(|v| v.as_str())
-            .unwrap_or(&self.default_resolution);
-        let aspect_ratio = args
-            .get("aspect_ratio")
-            .and_then(|v| v.as_str())
-            .unwrap_or("square_1_1");
+            .unwrap_or("2k");
         let engine = args
             .get("engine")
             .and_then(|v| v.as_str())
-            .unwrap_or(&self.default_engine);
+            .unwrap_or("magnific_illusio");
         let realism = args
             .get("realism")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+            .unwrap_or(false);
         let creative_detailing = args
             .get("creative_detailing")
             .and_then(|v| v.as_u64())
             .unwrap_or(50);
+        let aspect_ratio = args
+            .get("aspect_ratio")
+            .and_then(|v| v.as_str())
+            .unwrap_or("1:1");
 
         let client = crate::config::build_runtime_proxy_client("tool.image_gen");
         let body = json!({
             "prompt": prompt,
             "resolution": resolution,
-            "aspect_ratio": aspect_ratio,
             "engine": engine,
             "realism": realism,
-            "creative_detailing": creative_detailing
+            "creative_detailing": creative_detailing,
+            "aspect_ratio": aspect_ratio
         });
 
         let resp = client
@@ -167,42 +149,28 @@ impl Tool for ImageGenTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Freepik image generation API error {status}: {body}")),
+                error: Some(format!("Image generation API error {status}: {body}")),
             });
         }
 
         let result: serde_json::Value = resp.json().await?;
-
-        // Freepik Mystic returns async task — extract task_id or direct image URL
         let image_url = result
-            .pointer("/data/0/url")
-            .or_else(|| result.pointer("/data/url"))
+            .get("data")
+            .and_then(|d| d.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("url"))
             .and_then(|u| u.as_str())
             .unwrap_or("");
-        let task_id = result
-            .pointer("/data/task_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
 
-        let output = if !image_url.is_empty() {
-            format!(
-                "Image generated successfully.\n\
-                 URL: {image_url}\n\
-                 Resolution: {resolution}\n\
-                 Aspect ratio: {aspect_ratio}\n\
-                 Engine: {engine}"
-            )
-        } else if !task_id.is_empty() {
-            format!(
-                "Image generation task submitted.\n\
-                 Task ID: {task_id}\n\
-                 Resolution: {resolution}\n\
-                 Status: Processing — poll GET {}/{{task_id}} to get the result URL.",
-                self.api_url
-            )
-        } else {
-            format!("Freepik response: {result}")
-        };
+        let output = format!(
+            "Image generated successfully.\n\
+             URL: {image_url}\n\
+             Resolution: {resolution}\n\
+             Engine: {engine}\n\
+             Realism: {realism}\n\
+             Creative detailing: {creative_detailing}\n\
+             Aspect ratio: {aspect_ratio}"
+        );
 
         Ok(ToolResult {
             success: true,
@@ -213,23 +181,30 @@ impl Tool for ImageGenTool {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Freepik Image Upscale Tool
+// Image Upscale Tool — Freepik Magnific
 // ═══════════════════════════════════════════════════════════════════
 
-/// Image upscaling tool using Freepik Magnific API.
+/// Image upscaling tool using Freepik Magnific.
 ///
-/// Supports upscaling images up to 16K resolution with AI enhancement.
+/// Supports upscaling up to 16K with configurable scale factor,
+/// optimization target, and creativity level.
 pub struct ImageUpscaleTool {
     api_key: String,
     api_url: String,
 }
 
 impl ImageUpscaleTool {
+    /// Create a new image upscale tool with the default Freepik Magnific endpoint.
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
-            api_url: "https://api.freepik.com/v1/ai/upscale".into(),
+            api_url: "https://api.freepik.com/v1/ai/magnific".into(),
         }
+    }
+
+    /// Create with a custom API endpoint.
+    pub fn with_api_url(api_key: String, api_url: String) -> Self {
+        Self { api_key, api_url }
     }
 }
 
@@ -240,8 +215,8 @@ impl Tool for ImageUpscaleTool {
     }
 
     fn description(&self) -> &str {
-        "Upscale an image using Freepik Magnific AI, enhancing resolution up to 16K. \
-         Provide an image URL and desired scale factor."
+        "Upscale an image up to 16K resolution using Freepik Magnific. \
+         Supports configurable scale factor, optimization target, and creativity."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -250,7 +225,7 @@ impl Tool for ImageUpscaleTool {
             "properties": {
                 "image_url": {
                     "type": "string",
-                    "description": "URL of the image to upscale"
+                    "description": "URL of the source image to upscale"
                 },
                 "scale_factor": {
                     "type": "integer",
@@ -262,14 +237,14 @@ impl Tool for ImageUpscaleTool {
                     "type": "string",
                     "enum": ["general", "portrait", "landscape", "art"],
                     "default": "general",
-                    "description": "Optimization preset for the upscaling algorithm"
+                    "description": "Optimization target for the upscale"
                 },
                 "creativity": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 100,
-                    "default": 30,
-                    "description": "How much creative detail to add (0=faithful, 100=creative)"
+                    "default": 50,
+                    "description": "Creativity level (0-100) — higher adds more detail"
                 }
             },
             "required": ["image_url"]
@@ -293,7 +268,7 @@ impl Tool for ImageUpscaleTool {
         let creativity = args
             .get("creativity")
             .and_then(|v| v.as_u64())
-            .unwrap_or(30);
+            .unwrap_or(50);
 
         let client = crate::config::build_runtime_proxy_client("tool.image_upscale");
         let body = json!({
@@ -316,38 +291,24 @@ impl Tool for ImageUpscaleTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Freepik upscale API error {status}: {body}")),
+                error: Some(format!("Image upscale API error {status}: {body}")),
             });
         }
 
         let result: serde_json::Value = resp.json().await?;
-        let output_url = result
-            .pointer("/data/url")
-            .or_else(|| result.pointer("/data/0/url"))
+        let upscaled_url = result
+            .get("data")
+            .and_then(|d| d.get("url"))
             .and_then(|u| u.as_str())
             .unwrap_or("");
-        let task_id = result
-            .pointer("/data/task_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
 
-        let output = if !output_url.is_empty() {
-            format!(
-                "Image upscaled successfully.\n\
-                 URL: {output_url}\n\
-                 Scale: {scale_factor}x\n\
-                 Optimized for: {optimized_for}"
-            )
-        } else if !task_id.is_empty() {
-            format!(
-                "Image upscale task submitted.\n\
-                 Task ID: {task_id}\n\
-                 Scale: {scale_factor}x\n\
-                 Status: Processing"
-            )
-        } else {
-            format!("Freepik upscale response: {result}")
-        };
+        let output = format!(
+            "Image upscaled successfully.\n\
+             URL: {upscaled_url}\n\
+             Scale factor: {scale_factor}x\n\
+             Optimized for: {optimized_for}\n\
+             Creativity: {creativity}"
+        );
 
         Ok(ToolResult {
             success: true,
@@ -358,38 +319,41 @@ impl Tool for ImageUpscaleTool {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Freepik Image-to-Video Tool (simple motion)
+// Freepik Image-to-Video Tool
 // ═══════════════════════════════════════════════════════════════════
 
-/// Simple image-to-video conversion via Freepik API.
+/// Simple image-to-video tool using Freepik.
 ///
-/// Converts a static image into a short motion video with
-/// customizable motion effects. For advanced video generation,
-/// use the `video_generate` tool (Runway).
+/// Converts a still image into a short video with optional motion prompt.
 pub struct FreepikImageToVideoTool {
     api_key: String,
     api_url: String,
 }
 
 impl FreepikImageToVideoTool {
+    /// Create a new Freepik image-to-video tool with the default endpoint.
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
             api_url: "https://api.freepik.com/v1/ai/image-to-video".into(),
         }
     }
+
+    /// Create with a custom API endpoint.
+    pub fn with_api_url(api_key: String, api_url: String) -> Self {
+        Self { api_key, api_url }
+    }
 }
 
 #[async_trait]
 impl Tool for FreepikImageToVideoTool {
     fn name(&self) -> &str {
-        "image_to_video"
+        "freepik_image_to_video"
     }
 
     fn description(&self) -> &str {
-        "Convert a static image into a short animated video using Freepik AI. \
-         Good for simple motion effects. For advanced video generation with \
-         camera control and lip sync, use the video_generate tool instead."
+        "Convert a still image into a short video using Freepik. \
+         Requires the source image URL and accepts an optional motion prompt."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -398,11 +362,11 @@ impl Tool for FreepikImageToVideoTool {
             "properties": {
                 "image_url": {
                     "type": "string",
-                    "description": "URL of the source image"
+                    "description": "URL of the source image to animate"
                 },
                 "motion_prompt": {
                     "type": "string",
-                    "description": "Description of the desired motion effect"
+                    "description": "Optional description of the desired motion"
                 }
             },
             "required": ["image_url"]
@@ -415,16 +379,15 @@ impl Tool for FreepikImageToVideoTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing required parameter: image_url"))?;
 
-        let motion_prompt = args
-            .get("motion_prompt")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let motion_prompt = args.get("motion_prompt").and_then(|v| v.as_str());
 
-        let client = crate::config::build_runtime_proxy_client("tool.freepik_img2video");
+        let client = crate::config::build_runtime_proxy_client("tool.freepik_i2v");
+        let mut body = json!({
+            "image_url": image_url
+        });
 
-        let mut body = json!({ "image_url": image_url });
-        if !motion_prompt.is_empty() {
-            body["prompt"] = json!(motion_prompt);
+        if let Some(mp) = motion_prompt {
+            body["motion_prompt"] = json!(mp);
         }
 
         let resp = client
@@ -446,31 +409,35 @@ impl Tool for FreepikImageToVideoTool {
 
         let result: serde_json::Value = resp.json().await?;
         let task_id = result
-            .pointer("/data/task_id")
-            .or_else(|| result.get("id"))
+            .get("data")
+            .and_then(|d| d.get("task_id"))
             .and_then(|v| v.as_str())
+            .or_else(|| result.get("id").and_then(|v| v.as_str()))
             .unwrap_or("");
+
+        let output = format!(
+            "Image-to-video task submitted.\n\
+             Task ID: {task_id}\n\
+             Motion prompt: {}\n\
+             Status: Processing — poll the task status endpoint to get the result URL.",
+            motion_prompt.unwrap_or("(none)")
+        );
 
         Ok(ToolResult {
             success: true,
-            output: format!(
-                "Image-to-video task submitted.\n\
-                 Task ID: {task_id}\n\
-                 Status: Processing — poll for the result video URL."
-            ),
+            output,
             error: None,
         })
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Runway Video Generation Tool (Gen-4)
+// Video Generation Tool — Runway Gen-4
 // ═══════════════════════════════════════════════════════════════════
 
-/// Advanced video generation tool using Runway Gen-4 API.
+/// Video generation tool using Runway Gen-4.
 ///
-/// Supports text-to-video and image-to-video with camera controls,
-/// motion brush, and lip sync capabilities.
+/// Supports text-to-video and image-to-video generation with 5/10s duration.
 pub struct VideoGenTool {
     api_key: String,
     api_url: String,
@@ -478,7 +445,7 @@ pub struct VideoGenTool {
 }
 
 impl VideoGenTool {
-    /// Create a new Runway video generation tool.
+    /// Create a new video generation tool with the default Runway endpoint.
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
@@ -504,9 +471,8 @@ impl Tool for VideoGenTool {
     }
 
     fn description(&self) -> &str {
-        "Generate a video from a text description or source image using Runway Gen-4. \
-         Supports camera control, motion effects, and lip sync. \
-         Returns a task ID to poll for the result."
+        "Generate a short video from a text description or source image \
+         using Runway Gen-4. Returns a task ID to poll for the result."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -570,43 +536,43 @@ impl Tool for VideoGenTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Runway video generation API error {status}: {body}")),
+                error: Some(format!("Video generation API error {status}: {body}")),
             });
         }
 
         let result: serde_json::Value = resp.json().await?;
         let task_id = result.get("id").and_then(|v| v.as_str()).unwrap_or("");
 
+        let output = format!(
+            "Video generation task submitted.\n\
+             Task ID: {task_id}\n\
+             Duration: {duration}s\n\
+             Status: Processing — poll the task status endpoint to get the result URL."
+        );
+
         Ok(ToolResult {
             success: true,
-            output: format!(
-                "Video generation task submitted.\n\
-                 Task ID: {task_id}\n\
-                 Duration: {duration}s\n\
-                 Model: {}\n\
-                 Status: Processing — poll the task status endpoint to get the result URL.",
-                self.model
-            ),
+            output,
             error: None,
         })
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Suno Music Generation Tool
+// Music Generation Tool — Suno via apibox.erweima.ai
 // ═══════════════════════════════════════════════════════════════════
 
-/// Music generation tool using Suno API.
+/// Music generation tool using Suno via apibox.erweima.ai.
 ///
-/// Generates complete songs with vocals, instruments, and structure
-/// from text descriptions. Supports style tags and instrumental mode.
+/// Supports text-to-music with style tags, custom lyrics, and
+/// instrumental mode.
 pub struct MusicGenTool {
     api_key: String,
     api_url: String,
 }
 
 impl MusicGenTool {
-    /// Create a new Suno music generation tool.
+    /// Create a new music generation tool with the default Suno endpoint.
     pub fn new(api_key: String) -> Self {
         Self {
             api_key,
@@ -627,9 +593,8 @@ impl Tool for MusicGenTool {
     }
 
     fn description(&self) -> &str {
-        "Generate a complete song (vocals + instruments) from a text description \
-         using Suno AI. Supports genre/style tags, custom lyrics, and instrumental mode. \
-         Returns a task ID to poll for the audio download URL."
+        "Generate music from a text description using Suno. Returns a task ID \
+         to poll for the audio download URL."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -638,24 +603,24 @@ impl Tool for MusicGenTool {
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Text description of the music to generate (genre, mood, instruments, theme)"
+                    "description": "Text description of the music to generate (genre, mood, instruments)"
                 },
                 "title": {
                     "type": "string",
-                    "description": "Title for the generated song"
+                    "description": "Title for the generated music"
                 },
                 "style": {
                     "type": "string",
-                    "description": "Music style tags (e.g. 'jazz piano, chill, ambient', 'K-pop, energetic, female vocal')"
+                    "description": "Music style tags (e.g. 'jazz piano, chill, ambient')"
                 },
-                "lyrics": {
+                "custom_lyrics": {
                     "type": "string",
-                    "description": "Custom lyrics for the song (optional, auto-generated if omitted)"
+                    "description": "Custom lyrics for vocal tracks"
                 },
                 "instrumental": {
                     "type": "boolean",
-                    "default": false,
-                    "description": "Generate instrumental-only without vocals"
+                    "default": true,
+                    "description": "Whether to generate instrumental-only (no vocals)"
                 }
             },
             "required": ["prompt"]
@@ -673,11 +638,11 @@ impl Tool for MusicGenTool {
             .and_then(|v| v.as_str())
             .unwrap_or("Untitled");
         let style = args.get("style").and_then(|v| v.as_str()).unwrap_or("");
-        let lyrics = args.get("lyrics").and_then(|v| v.as_str());
+        let custom_lyrics = args.get("custom_lyrics").and_then(|v| v.as_str());
         let instrumental = args
             .get("instrumental")
             .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         let client = crate::config::build_runtime_proxy_client("tool.music_gen");
 
@@ -687,8 +652,9 @@ impl Tool for MusicGenTool {
             "tags": style,
             "make_instrumental": instrumental,
         });
-        if let Some(lyric_text) = lyrics {
-            body["lyrics"] = json!(lyric_text);
+
+        if let Some(lyrics) = custom_lyrics {
+            body["custom_lyrics"] = json!(lyrics);
         }
 
         let resp = client
@@ -704,7 +670,7 @@ impl Tool for MusicGenTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Suno music generation API error {status}: {body}")),
+                error: Some(format!("Music generation API error {status}: {body}")),
             });
         }
 
@@ -716,98 +682,94 @@ impl Tool for MusicGenTool {
             .or_else(|| result.get("id").and_then(|v| v.as_str()))
             .unwrap_or("");
 
+        let output = format!(
+            "Music generation task submitted.\n\
+             Task ID: {task_id}\n\
+             Title: {title}\n\
+             Style: {style}\n\
+             Instrumental: {instrumental}\n\
+             Status: Processing — poll the task status endpoint to get the audio URL."
+        );
+
         Ok(ToolResult {
             success: true,
-            output: format!(
-                "Music generation task submitted.\n\
-                 Task ID: {task_id}\n\
-                 Title: {title}\n\
-                 Style: {style}\n\
-                 Instrumental: {instrumental}\n\
-                 Status: Processing — poll the task status endpoint to get the audio URL."
-            ),
+            output,
             error: None,
         })
     }
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// ElevenLabs Premium TTS Tool
+// ElevenLabs TTS Tool
 // ═══════════════════════════════════════════════════════════════════
 
-/// Premium text-to-speech tool using ElevenLabs API.
+/// Billing key type for ElevenLabs TTS.
+enum ElevenLabsBillingKey {
+    /// User provides their own API key — no platform credit charge.
+    UserKey(String),
+    /// Platform-managed key with a credit multiplier for billing.
+    PlatformKey {
+        api_key: String,
+        credit_multiplier: f64,
+    },
+}
+
+/// Premium text-to-speech tool using ElevenLabs.
 ///
-/// Supports multiple voices (male/female, various ages and styles),
-/// multilingual output, and high-quality audio generation.
-///
-/// **Dual billing model:**
-/// - User provides their own API key → no credit charge
-/// - Platform (operator) key used → user charged `credit_multiplier` (default 2.2×)
+/// Supports voice selection, model choice, stability/similarity tuning,
+/// and dual billing modes (user key vs platform key with credit multiplier).
 pub struct ElevenLabsTtsTool {
-    /// Resolved API key (user's own or operator's fallback).
-    api_key: String,
+    billing_key: ElevenLabsBillingKey,
     api_url: String,
-    default_voice_id: String,
-    default_model: String,
-    /// Whether this is using the operator's key (triggers credit billing).
-    is_platform_key: bool,
-    /// Credit multiplier for platform-key usage.
-    credit_multiplier: f64,
 }
 
 impl ElevenLabsTtsTool {
-    /// Create with a user-supplied API key (no credit charge).
+    /// Create with a user-supplied API key (no platform billing).
     pub fn new_user_key(api_key: String) -> Self {
         Self {
-            api_key,
-            api_url: "https://api.elevenlabs.io/v1".into(),
-            default_voice_id: "21m00Tcm4TlvDq8ikWAM".into(),
-            default_model: "eleven_multilingual_v2".into(),
-            is_platform_key: false,
-            credit_multiplier: 0.0,
+            billing_key: ElevenLabsBillingKey::UserKey(api_key),
+            api_url: "https://api.elevenlabs.io".into(),
         }
     }
 
-    /// Create with the operator's platform key (credit billing active).
+    /// Create with a platform-managed API key and credit multiplier.
     pub fn new_platform_key(api_key: String, credit_multiplier: f64) -> Self {
         Self {
-            api_key,
-            api_url: "https://api.elevenlabs.io/v1".into(),
-            default_voice_id: "21m00Tcm4TlvDq8ikWAM".into(),
-            default_model: "eleven_multilingual_v2".into(),
-            is_platform_key: true,
-            credit_multiplier,
+            billing_key: ElevenLabsBillingKey::PlatformKey {
+                api_key,
+                credit_multiplier,
+            },
+            api_url: "https://api.elevenlabs.io".into(),
         }
     }
 
-    /// Create with full configuration.
-    pub fn with_config(
-        api_key: String,
-        api_url: String,
-        default_voice_id: String,
-        model: String,
-        is_platform_key: bool,
-        credit_multiplier: f64,
-    ) -> Self {
-        Self {
-            api_key,
-            api_url,
-            default_voice_id,
-            default_model: model,
-            is_platform_key,
-            credit_multiplier,
-        }
-    }
-
-    /// Returns `true` if this tool instance uses the platform key
-    /// and will charge credits at the configured multiplier.
+    /// Whether this tool uses platform billing.
     pub fn is_platform_billing(&self) -> bool {
-        self.is_platform_key
+        matches!(self.billing_key, ElevenLabsBillingKey::PlatformKey { .. })
     }
 
-    /// Credit multiplier applied when using the platform key.
+    /// Return the credit multiplier (1.0 for user keys).
     pub fn credit_multiplier(&self) -> f64 {
-        self.credit_multiplier
+        match &self.billing_key {
+            ElevenLabsBillingKey::UserKey(_) => 1.0,
+            ElevenLabsBillingKey::PlatformKey {
+                credit_multiplier, ..
+            } => *credit_multiplier,
+        }
+    }
+
+    /// Estimate credit cost from character count.
+    fn estimate_credit_cost(&self, char_count: usize) -> f64 {
+        // Base cost: 1 credit per 100 characters (rough estimate).
+        let base = char_count as f64 / 100.0;
+        base * self.credit_multiplier()
+    }
+
+    fn api_key(&self) -> &str {
+        match &self.billing_key {
+            ElevenLabsBillingKey::UserKey(key) => key,
+            ElevenLabsBillingKey::PlatformKey { api_key, .. } => api_key,
+        }
     }
 }
 
@@ -818,10 +780,8 @@ impl Tool for ElevenLabsTtsTool {
     }
 
     fn description(&self) -> &str {
-        "Generate high-quality speech audio from text using ElevenLabs. \
-         Choose from multiple voices (male, female, various ages and accents). \
-         Supports 29+ languages including Korean, English, Japanese, Chinese. \
-         Returns a URL or base64 audio data."
+        "Generate premium text-to-speech audio using ElevenLabs. \
+         Supports voice selection, model choice, and stability/similarity tuning."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -830,43 +790,39 @@ impl Tool for ElevenLabsTtsTool {
             "properties": {
                 "text": {
                     "type": "string",
-                    "description": "Text to convert to speech"
+                    "description": "The text to synthesize into speech"
                 },
                 "voice_id": {
                     "type": "string",
-                    "description": "ElevenLabs voice ID (use list_voices to discover available voices). \
-                                    Popular: '21m00Tcm4TlvDq8ikWAM' (Rachel, female), \
-                                    'pNInz6obpgDQGcFmaJgB' (Adam, male), \
-                                    'EXAVITQu4vr4xnSDxMaL' (Bella, young female)"
+                    "description": "ElevenLabs voice ID to use"
                 },
-                "model": {
+                "model_id": {
                     "type": "string",
-                    "enum": ["eleven_multilingual_v2", "eleven_turbo_v2_5", "eleven_flash_v2_5"],
                     "default": "eleven_multilingual_v2",
-                    "description": "TTS model: multilingual_v2 (best quality), turbo (faster), flash (fastest)"
+                    "description": "TTS model to use (e.g. eleven_multilingual_v2, eleven_turbo_v2)"
                 },
                 "stability": {
                     "type": "number",
                     "minimum": 0.0,
                     "maximum": 1.0,
                     "default": 0.5,
-                    "description": "Voice stability (0=variable/expressive, 1=stable/consistent)"
+                    "description": "Voice stability (0.0-1.0)"
                 },
                 "similarity_boost": {
                     "type": "number",
                     "minimum": 0.0,
                     "maximum": 1.0,
                     "default": 0.75,
-                    "description": "Voice similarity to the original (higher = more similar)"
+                    "description": "Voice similarity boost (0.0-1.0)"
                 },
                 "output_format": {
                     "type": "string",
-                    "enum": ["mp3_44100_128", "mp3_22050_32", "pcm_16000", "pcm_24000"],
+                    "enum": ["mp3_44100_128", "mp3_44100_192", "pcm_16000", "pcm_22050", "pcm_24000", "pcm_44100"],
                     "default": "mp3_44100_128",
                     "description": "Audio output format"
                 }
             },
-            "required": ["text"]
+            "required": ["text", "voice_id"]
         })
     }
 
@@ -879,11 +835,12 @@ impl Tool for ElevenLabsTtsTool {
         let voice_id = args
             .get("voice_id")
             .and_then(|v| v.as_str())
-            .unwrap_or(&self.default_voice_id);
-        let model = args
-            .get("model")
+            .ok_or_else(|| anyhow::anyhow!("Missing required parameter: voice_id"))?;
+
+        let model_id = args
+            .get("model_id")
             .and_then(|v| v.as_str())
-            .unwrap_or(&self.default_model);
+            .unwrap_or("eleven_multilingual_v2");
         let stability = args
             .get("stability")
             .and_then(|v| v.as_f64())
@@ -897,66 +854,65 @@ impl Tool for ElevenLabsTtsTool {
             .and_then(|v| v.as_str())
             .unwrap_or("mp3_44100_128");
 
-        let url = format!(
-            "{}/text-to-speech/{}?output_format={}",
-            self.api_url, voice_id, output_format
-        );
+        let char_count = text.len();
+        let estimated_cost = self.estimate_credit_cost(char_count);
 
         let client = crate::config::build_runtime_proxy_client("tool.elevenlabs_tts");
+        let url = format!(
+            "{}/v1/text-to-speech/{}",
+            self.api_url.trim_end_matches('/'),
+            voice_id
+        );
+
         let body = json!({
             "text": text,
-            "model_id": model,
+            "model_id": model_id,
             "voice_settings": {
                 "stability": stability,
                 "similarity_boost": similarity_boost
-            }
+            },
+            "output_format": output_format
         });
 
         let resp = client
             .post(&url)
-            .header("xi-api-key", &self.api_key)
-            .header("Accept", "application/json")
+            .header("xi-api-key", self.api_key())
             .json(&body)
             .send()
             .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let err_body = resp.text().await.unwrap_or_default();
+            let body = resp.text().await.unwrap_or_default();
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("ElevenLabs TTS API error {status}: {err_body}")),
+                error: Some(format!("ElevenLabs TTS API error {status}: {body}")),
             });
         }
 
-        // ElevenLabs returns audio bytes directly; estimate cost from character count
-        let char_count = text.chars().count();
-        let audio_size = resp.content_length().unwrap_or(0);
+        let content_length = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
 
-        let billing_note = if self.is_platform_key {
-            // Estimate: ~$0.30 per 1000 characters for multilingual_v2
-            let estimated_cost_usd = (char_count as f64 / 1000.0) * 0.30;
-            let credit_cost = estimated_cost_usd * self.credit_multiplier;
-            format!(
-                "\nBilling: Platform key used — estimated {:.1} credits ({:.1}× of ${:.4} API cost)",
-                credit_cost, self.credit_multiplier, estimated_cost_usd
-            )
-        } else {
-            "\nBilling: User key — no credit charge".into()
-        };
+        let output = format!(
+            "TTS audio generated successfully.\n\
+             Voice: {voice_id}\n\
+             Model: {model_id}\n\
+             Characters: {char_count}\n\
+             Estimated credits: {estimated_cost:.2}\n\
+             Platform billing: {}\n\
+             Output format: {output_format}\n\
+             Content-Length: {content_length}",
+            self.is_platform_billing()
+        );
 
         Ok(ToolResult {
             success: true,
-            output: format!(
-                "Speech generated successfully.\n\
-                 Voice: {voice_id}\n\
-                 Model: {model}\n\
-                 Characters: {char_count}\n\
-                 Audio size: {audio_size} bytes\n\
-                 Format: {output_format}\
-                 {billing_note}"
-            ),
+            output,
             error: None,
         })
     }
@@ -979,8 +935,10 @@ mod tests {
         let props = params.get("properties").unwrap();
         assert!(props.get("prompt").is_some());
         assert!(props.get("resolution").is_some());
-        assert!(props.get("aspect_ratio").is_some());
         assert!(props.get("engine").is_some());
+        assert!(props.get("realism").is_some());
+        assert!(props.get("creative_detailing").is_some());
+        assert!(props.get("aspect_ratio").is_some());
     }
 
     #[test]
@@ -994,14 +952,21 @@ mod tests {
         let props = params.get("properties").unwrap();
         assert!(props.get("image_url").is_some());
         assert!(props.get("scale_factor").is_some());
+        assert!(props.get("optimized_for").is_some());
+        assert!(props.get("creativity").is_some());
     }
 
     #[test]
-    fn freepik_img2video_tool_spec() {
+    fn freepik_image_to_video_tool_spec() {
         let tool = FreepikImageToVideoTool::new("test-key".into());
         let spec = tool.spec();
-        assert_eq!(spec.name, "image_to_video");
+        assert_eq!(spec.name, "freepik_image_to_video");
         assert!(spec.description.contains("image"));
+
+        let params = spec.parameters;
+        let props = params.get("properties").unwrap();
+        assert!(props.get("image_url").is_some());
+        assert!(props.get("motion_prompt").is_some());
     }
 
     #[test]
@@ -1023,14 +988,14 @@ mod tests {
         let tool = MusicGenTool::new("test-key".into());
         let spec = tool.spec();
         assert_eq!(spec.name, "music_generate");
-        assert!(spec.description.contains("music") || spec.description.contains("song"));
+        assert!(spec.description.contains("music"));
 
         let params = spec.parameters;
         let props = params.get("properties").unwrap();
         assert!(props.get("prompt").is_some());
         assert!(props.get("title").is_some());
         assert!(props.get("style").is_some());
-        assert!(props.get("lyrics").is_some());
+        assert!(props.get("custom_lyrics").is_some());
         assert!(props.get("instrumental").is_some());
     }
 
@@ -1039,59 +1004,94 @@ mod tests {
         let tool = ElevenLabsTtsTool::new_user_key("test-key".into());
         let spec = tool.spec();
         assert_eq!(spec.name, "elevenlabs_tts");
-        assert!(spec.description.contains("speech"));
+        assert!(spec.description.contains("text-to-speech"));
 
         let params = spec.parameters;
         let props = params.get("properties").unwrap();
         assert!(props.get("text").is_some());
         assert!(props.get("voice_id").is_some());
-        assert!(props.get("model").is_some());
+        assert!(props.get("model_id").is_some());
+        assert!(props.get("stability").is_some());
+        assert!(props.get("similarity_boost").is_some());
+        assert!(props.get("output_format").is_some());
     }
 
     #[test]
     fn elevenlabs_user_key_no_billing() {
-        let tool = ElevenLabsTtsTool::new_user_key("user-key".into());
+        let tool = ElevenLabsTtsTool::new_user_key("user-key-123".into());
         assert!(!tool.is_platform_billing());
-        assert_eq!(tool.credit_multiplier(), 0.0);
+        assert!((tool.credit_multiplier() - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn elevenlabs_platform_key_billing() {
-        let tool = ElevenLabsTtsTool::new_platform_key("admin-key".into(), 2.2);
+        let tool = ElevenLabsTtsTool::new_platform_key("platform-key-456".into(), 2.5);
         assert!(tool.is_platform_billing());
-        assert!((tool.credit_multiplier() - 2.2).abs() < f64::EPSILON);
+        assert!((tool.credit_multiplier() - 2.5).abs() < f64::EPSILON);
+        // Estimate: 500 chars => 5.0 base credits * 2.5 multiplier = 12.5
+        let cost = tool.estimate_credit_cost(500);
+        assert!((cost - 12.5).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn image_gen_custom_config() {
-        let tool = ImageGenTool::with_config(
-            "key".into(),
-            "https://custom.api/mystic".into(),
-            "magnific_sparkle".into(),
-            "4k".into(),
-        );
+    fn image_gen_custom_url() {
+        let tool = ImageGenTool::with_api_url("key".into(), "https://custom.api/mystic".into());
         assert_eq!(tool.name(), "image_generate");
-        assert_eq!(tool.default_engine, "magnific_sparkle");
-        assert_eq!(tool.default_resolution, "4k");
+        assert_eq!(tool.api_url, "https://custom.api/mystic");
+    }
+
+    #[test]
+    fn image_upscale_custom_url() {
+        let tool =
+            ImageUpscaleTool::with_api_url("key".into(), "https://custom.api/magnific".into());
+        assert_eq!(tool.name(), "image_upscale");
+        assert_eq!(tool.api_url, "https://custom.api/magnific");
+    }
+
+    #[test]
+    fn freepik_i2v_custom_url() {
+        let tool =
+            FreepikImageToVideoTool::with_api_url("key".into(), "https://custom.api/i2v".into());
+        assert_eq!(tool.name(), "freepik_image_to_video");
+        assert_eq!(tool.api_url, "https://custom.api/i2v");
     }
 
     #[test]
     fn video_gen_custom_config() {
-        let tool =
-            VideoGenTool::with_config("key".into(), "https://custom.api/video".into(), "gen4".into());
+        let tool = VideoGenTool::with_config(
+            "key".into(),
+            "https://custom.api/video".into(),
+            "gen4_custom".into(),
+        );
         assert_eq!(tool.name(), "video_generate");
-        assert_eq!(tool.model, "gen4");
+        assert_eq!(tool.model, "gen4_custom");
+        assert_eq!(tool.api_url, "https://custom.api/video");
     }
 
     #[test]
     fn music_gen_custom_url() {
         let tool = MusicGenTool::with_api_url("key".into(), "https://custom.api/music".into());
         assert_eq!(tool.name(), "music_generate");
+        assert_eq!(tool.api_url, "https://custom.api/music");
     }
 
     #[tokio::test]
     async fn image_gen_missing_prompt_fails() {
         let tool = ImageGenTool::new("test-key".into());
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn image_upscale_missing_image_url_fails() {
+        let tool = ImageUpscaleTool::new("test-key".into());
+        let result = tool.execute(json!({})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn freepik_i2v_missing_image_url_fails() {
+        let tool = FreepikImageToVideoTool::new("test-key".into());
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
@@ -1111,23 +1111,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn image_upscale_missing_url_fails() {
-        let tool = ImageUpscaleTool::new("test-key".into());
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn freepik_img2video_missing_url_fails() {
-        let tool = FreepikImageToVideoTool::new("test-key".into());
-        let result = tool.execute(json!({})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     async fn elevenlabs_tts_missing_text_fails() {
         let tool = ElevenLabsTtsTool::new_user_key("test-key".into());
-        let result = tool.execute(json!({})).await;
+        let result = tool.execute(json!({"voice_id": "abc"})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn elevenlabs_tts_missing_voice_id_fails() {
+        let tool = ElevenLabsTtsTool::new_user_key("test-key".into());
+        let result = tool.execute(json!({"text": "hello"})).await;
         assert!(result.is_err());
     }
 }
