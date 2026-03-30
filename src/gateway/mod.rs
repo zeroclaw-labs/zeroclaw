@@ -495,9 +495,12 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
                     );
                     let activated =
                         std::sync::Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
+                    let builtin_specs: Vec<tools::ToolSpec> =
+                        tools_registry_raw.iter().map(|t| t.spec()).collect();
                     tools_registry_raw.push(Box::new(tools::ToolSearchTool::new(
                         deferred_set,
                         activated,
+                        builtin_specs,
                     )));
                 } else {
                     let names = registry.tool_names();
@@ -529,6 +532,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             }
         }
     }
+
+    tools::tool_search::ensure_registered(&mut tools_registry_raw);
 
     let tools_registry: Arc<Vec<ToolSpec>> =
         Arc::new(tools_registry_raw.iter().map(|t| t.spec()).collect());

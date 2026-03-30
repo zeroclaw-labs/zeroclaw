@@ -3774,6 +3774,20 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     }
 
+    // ── 1a. Tool discovery hint ────────────────────────────────────
+    // The tools listed above are NOT exhaustive. Many more built-in tools
+    // are registered but not shown to save context. Nudge the LLM to
+    // use tool_search when it needs a capability not listed above.
+    if tools.iter().any(|(name, _)| *name == "tool_search") {
+        prompt.push_str(
+            "**Note:** The tools listed above are only the most common ones. \
+             Many more are available. When you need a capability not listed here \
+             (e.g. HTTP requests, git operations, web search, notifications, \
+             integrations, image generation), use **tool_search** with keywords \
+             to discover the right tool.\n\n",
+        );
+    }
+
     // ── 1b. Hardware (when gpio/arduino tools present) ───────────
     let has_hardware = tools.iter().any(|(name, _)| {
         *name == "gpio_read"
@@ -5136,9 +5150,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
                         crate::tools::ActivatedToolSet::new(),
                     ));
                     ch_activated_handle = Some(std::sync::Arc::clone(&activated));
+                    let builtin_specs: Vec<crate::tools::ToolSpec> =
+                        built_tools.iter().map(|t| t.spec()).collect();
                     built_tools.push(Box::new(crate::tools::ToolSearchTool::new(
                         deferred_set,
                         activated,
+                        builtin_specs,
                     )));
                 } else {
                     let names = registry.tool_names();
@@ -5171,6 +5188,8 @@ pub async fn start_channels(config: Config) -> Result<()> {
             }
         }
     }
+
+    crate::tools::tool_search::ensure_registered(&mut built_tools);
 
     let tools_registry = Arc::new(built_tools);
 

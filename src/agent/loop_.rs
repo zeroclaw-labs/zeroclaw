@@ -3596,9 +3596,12 @@ pub async fn run(
                         crate::tools::ActivatedToolSet::new(),
                     ));
                     activated_handle = Some(std::sync::Arc::clone(&activated));
+                    let builtin_specs: Vec<crate::tools::ToolSpec> =
+                        tools_registry.iter().map(|t| t.spec()).collect();
                     tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
                         deferred_set,
                         activated,
+                        builtin_specs,
                     )));
                 } else {
                     // Eager path: register all MCP tools directly
@@ -3631,6 +3634,8 @@ pub async fn run(
             }
         }
     }
+
+    crate::tools::tool_search::ensure_registered(&mut tools_registry);
 
     // ── Resolve provider ─────────────────────────────────────────
     let mut provider_name = provider_override
@@ -3728,6 +3733,10 @@ pub async fn run(
         ),
     ];
     tool_descs.push((
+        "tool_search",
+        "Discover available tools by keyword. Use when: you need a capability but aren't sure which tool provides it, or you want to inspect a tool's parameters. Searches all registered tools.",
+    ));
+    tool_descs.push((
         "use_skill",
         "Invoke a skill by name. BLOCKING REQUIREMENT: when the user's request matches a skill description in <available_skills> or the user mentions a skill by name, invoke use_skill BEFORE generating any other response. Don't use when: no available skill matches the user's intent.",
     ));
@@ -3749,14 +3758,6 @@ pub async fn run(
         "Force-run a cron job immediately and record a run history entry.",
     ));
     tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
-    tool_descs.push((
-        "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
-    ));
-    tool_descs.push((
-        "image_info",
-        "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
-    ));
     if config.browser.enabled {
         tool_descs.push((
             "browser_open",
@@ -4529,9 +4530,12 @@ pub async fn process_message(
                         crate::tools::ActivatedToolSet::new(),
                     ));
                     activated_handle_pm = Some(std::sync::Arc::clone(&activated));
+                    let builtin_specs: Vec<crate::tools::ToolSpec> =
+                        tools_registry.iter().map(|t| t.spec()).collect();
                     tools_registry.push(Box::new(crate::tools::ToolSearchTool::new(
                         deferred_set,
                         activated,
+                        builtin_specs,
                     )));
                 } else {
                     let names = registry.tool_names();
@@ -4563,6 +4567,8 @@ pub async fn process_message(
             }
         }
     }
+
+    crate::tools::tool_search::ensure_registered(&mut tools_registry);
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
@@ -4621,9 +4627,8 @@ pub async fn process_message(
             "model_routing_config",
             "Configure default model, scenario routing, and delegate agents.",
         ),
-        ("screenshot", "Capture a screenshot."),
-        ("image_info", "Read image metadata."),
     ];
+    tool_descs.push(("tool_search", "Discover available tools by keyword."));
     tool_descs.push(("use_skill", "Invoke a skill by name."));
     if config.browser.enabled {
         tool_descs.push(("browser_open", "Open approved URLs in browser."));

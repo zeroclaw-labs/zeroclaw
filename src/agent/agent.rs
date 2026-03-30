@@ -443,9 +443,12 @@ impl Agent {
                         let activated =
                             Arc::new(std::sync::Mutex::new(tools::ActivatedToolSet::new()));
                         activated_tools = Some(Arc::clone(&activated));
+                        let builtin_specs: Vec<tools::ToolSpec> =
+                            tools.iter().map(|t| t.spec()).collect();
                         tools.push(Box::new(tools::ToolSearchTool::new(
                             deferred_set,
                             activated,
+                            builtin_specs,
                         )));
                     } else {
                         let names = registry.tool_names();
@@ -477,6 +480,8 @@ impl Agent {
                 }
             }
         }
+
+        tools::tool_search::ensure_registered(&mut tools);
 
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
 
