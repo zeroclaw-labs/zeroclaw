@@ -101,7 +101,17 @@ Last refreshed: **February 18, 2026**.
 - [network-deployment.md](ops/network-deployment.md)
 - [mattermost-setup.md](setup-guides/mattermost-setup.md)
 
-### 4) Security Design & Proposals
+### 4) Plugins
+
+- [plugins/README.md](plugins/README.md)
+- [quickstart.md](plugins/quickstart.md)
+- [manifest-reference.md](plugins/manifest-reference.md)
+- [sdk-reference.md](plugins/sdk-reference.md)
+- [security.md](plugins/security.md)
+- [cli-reference.md](plugins/cli-reference.md)
+- [api-reference.md](plugins/api-reference.md)
+
+### 5) Security Design & Proposals
 
 - [security/README.md](security/README.md)
 - [agnostic-security.md](security/agnostic-security.md)
@@ -111,7 +121,7 @@ Last refreshed: **February 18, 2026**.
 - [audit-logging.md](security/audit-logging.md)
 - [security-roadmap.md](security/security-roadmap.md)
 
-### 5) Hardware & Peripherals
+### 6) Hardware & Peripherals
 
 - [hardware/README.md](hardware/README.md)
 - [hardware-peripherals-design.md](hardware/hardware-peripherals-design.md)
@@ -122,7 +132,7 @@ Last refreshed: **February 18, 2026**.
 - [datasheets/arduino-uno.md](hardware/datasheets/arduino-uno.md)
 - [datasheets/esp32.md](hardware/datasheets/esp32.md)
 
-### 6) Contribution & CI
+### 7) Contribution & CI
 
 - [contributing/README.md](contributing/README.md)
 - [../CONTRIBUTING.md](../CONTRIBUTING.md)
@@ -133,7 +143,7 @@ Last refreshed: **February 18, 2026**.
 - [extension-examples.md](contributing/extension-examples.md)
 - [testing.md](contributing/testing.md)
 
-### 7) Project Status & Snapshot
+### 8) Project Status & Snapshot
 
 - [maintainers/README.md](maintainers/README.md)
 - [project-triage-snapshot-2026-02-18.md](maintainers/project-triage-snapshot-2026-02-18.md)
