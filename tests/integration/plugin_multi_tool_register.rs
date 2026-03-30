@@ -19,12 +19,12 @@ fn load_manifest() -> PluginManifest {
 }
 
 #[test]
-fn multi_tool_manifest_declares_five_tools() {
+fn multi_tool_manifest_declares_six_tools() {
     let manifest = load_manifest();
     assert_eq!(
         manifest.tools.len(),
-        5,
-        "multi-tool-plugin should declare exactly 5 tools, got: {:?}",
+        6,
+        "multi-tool-plugin should declare exactly 6 tools, got: {:?}",
         manifest.tools.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 }
@@ -39,6 +39,7 @@ fn multi_tool_names_are_correct() {
         "tool_reverse_string",
         "tool_lookup_config",
         "tool_http_get",
+        "tool_http_get_auth",
         "tool_read_file",
     ];
     for name in &expected {

@@ -104,6 +104,7 @@ fn encrypted_config_value_is_decrypted_before_reaching_plugin() {
         timeout_ms: 5_000,
         signature: None,
         publisher_key: None,
+        host_capabilities: Default::default(),
     };
 
     let loader_manifest =

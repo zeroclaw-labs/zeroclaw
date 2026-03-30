@@ -135,6 +135,7 @@ fn config_toml_values_mapped_through_full_pipeline() {
         timeout_ms: 5_000,
         signature: None,
         publisher_key: None,
+        host_capabilities: Default::default(),
     };
 
     // Use "/" as plugin_dir since wasm_path is already absolute.
@@ -206,6 +207,7 @@ fn config_toml_defaults_reach_wasm_when_key_omitted() {
         timeout_ms: 5_000,
         signature: None,
         publisher_key: None,
+        host_capabilities: Default::default(),
     };
 
     let loader_manifest =

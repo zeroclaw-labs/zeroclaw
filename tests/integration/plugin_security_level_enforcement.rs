@@ -49,6 +49,7 @@ fn manifest(
         timeout_ms: 5000,
         signature: None,
         publisher_key: None,
+        host_capabilities: Default::default(),
     }
 }
 
