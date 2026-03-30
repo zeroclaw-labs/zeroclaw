@@ -616,8 +616,7 @@ async fn handle_webhook(
             .into_response();
     }
 
-    // Handle direct message callback format (plain StatusCode response).
-    // Mutually exclusive with the Chatbot Skill format above (which always returns).
+    // Also handle direct message callback format (plain StatusCode response)
     if let Some(content) = payload.get("content") {
         let user_id = payload
             .get("user_id")
@@ -734,11 +733,10 @@ impl Channel for KakaoTalkChannel {
         match result {
             Ok(resp) => {
                 if resp.status().as_u16() == 401 {
-                    tracing::warn!("KakaoTalk health_check: admin key is invalid (401)");
-                    false
-                } else {
-                    resp.status().is_success()
+                    tracing::warn!("KakaoTalk health_check: 401 Unauthorized — admin key may be invalid");
+                    return false;
                 }
+                resp.status().is_success()
             }
             Err(_) => false,
         }

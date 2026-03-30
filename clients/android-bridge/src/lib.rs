@@ -452,27 +452,39 @@ fn find_zeroclaw_binary(data_dir: &str) -> Option<String> {
 // ── Helpers ────────────────────────────────────────────────────────
 
 fn uuid_v4() -> String {
-    // Generate a proper RFC-4122 v4 UUID using random bytes.
-    // Avoids `uuid` crate dependency by constructing from random bits.
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    // Mix timestamp with a simple hash to increase entropy
-    let seed = nanos.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    let hi = (seed >> 64) as u64;
-    let lo = seed as u64;
-    // Set version (4) and variant (RFC 4122) bits
-    let hi = (hi & 0xFFFF_FFFF_FFFF_0FFF) | 0x0000_0000_0000_4000;
-    let lo = (lo & 0x3FFF_FFFF_FFFF_FFFF) | 0x8000_0000_0000_0000;
+
+    // Mix timestamp with a hash to fill 128 bits
+    let mut hasher = DefaultHasher::new();
+    nanos.hash(&mut hasher);
+    let hash_hi = hasher.finish();
+    let mut hasher2 = DefaultHasher::new();
+    (nanos.wrapping_mul(6_364_136_223_846_793_005)).hash(&mut hasher2);
+    let hash_lo = hasher2.finish();
+
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&hash_hi.to_be_bytes());
+    bytes[8..].copy_from_slice(&hash_lo.to_be_bytes());
+
+    // Set version 4 (bits 48-51)
+    bytes[6] = (bytes[6] & 0x0F) | 0x40;
+    // Set variant 1 (bits 64-65)
+    bytes[8] = (bytes[8] & 0x3F) | 0x80;
+
     format!(
         "{:08x}-{:04x}-{:04x}-{:04x}-{:012x}",
-        (hi >> 32) as u32,
-        (hi >> 16) as u16 & 0xFFFF,
-        hi as u16 & 0xFFFF,
-        (lo >> 48) as u16 & 0xFFFF,
-        lo & 0x0000_FFFF_FFFF_FFFF
+        u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        u16::from_be_bytes([bytes[4], bytes[5]]),
+        u16::from_be_bytes([bytes[6], bytes[7]]),
+        u16::from_be_bytes([bytes[8], bytes[9]]),
+        u64::from_be_bytes([0, 0, bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]]),
     )
 }
 

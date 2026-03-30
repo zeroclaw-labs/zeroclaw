@@ -494,7 +494,7 @@ pub struct Config {
     pub media_api: MediaApiConfig,
 
     /// Calendar integration configuration (`[calendar]`).
-    /// Google Calendar, Microsoft Outlook, Apple CalDAV.
+    /// Google Calendar, Microsoft Outlook, KakaoTalk 톡캘린더, Apple CalDAV.
     #[serde(default)]
     pub calendar: CalendarConfig,
 
@@ -856,21 +856,14 @@ impl Default for TranscriptionConfig {
 // ── Calendar ───────────────────────────────────────────────────
 
 /// Calendar integration configuration (`[calendar]`).
-///
-/// Supports Google Calendar (REST v3), Microsoft Outlook (Graph API),
-/// and Apple Calendar (CalDAV). The agent can read events, create
-/// reminders, and push scheduled notifications to messaging channels.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CalendarConfig {
-    /// Google Calendar integration.
     #[serde(default)]
     pub google: GoogleCalendarConfig,
-
-    /// Microsoft Outlook Calendar integration.
     #[serde(default)]
     pub outlook: OutlookCalendarConfig,
-
-    /// Apple Calendar integration (CalDAV).
+    #[serde(default)]
+    pub kakao: KakaoCalendarConfig,
     #[serde(default)]
     pub apple: AppleCalendarConfig,
 }
@@ -880,32 +873,23 @@ impl Default for CalendarConfig {
         Self {
             google: GoogleCalendarConfig::default(),
             outlook: OutlookCalendarConfig::default(),
+            kakao: KakaoCalendarConfig::default(),
             apple: AppleCalendarConfig::default(),
         }
     }
 }
 
-/// Google Calendar API configuration.
-///
-/// OAuth tokens are managed at runtime after user authorizes via
-/// the Google consent screen. The `client_id` and `client_secret`
-/// come from a Google Cloud project; the operator can set these
-/// as env vars (`GOOGLE_CALENDAR_CLIENT_ID`, `GOOGLE_CALENDAR_CLIENT_SECRET`).
+/// Google Calendar API configuration (OAuth2).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GoogleCalendarConfig {
-    /// Enable Google Calendar tools.
     #[serde(default)]
     pub enabled: bool,
-    /// Google OAuth2 client ID. Falls back to `GOOGLE_CALENDAR_CLIENT_ID` env var.
     #[serde(default)]
     pub client_id: Option<String>,
-    /// Google OAuth2 client secret. Falls back to `GOOGLE_CALENDAR_CLIENT_SECRET` env var.
     #[serde(default)]
     pub client_secret: Option<String>,
-    /// Cached OAuth2 refresh token (persisted after first authorization).
     #[serde(default)]
     pub refresh_token: Option<String>,
-    /// Specific calendar ID to use (default: "primary").
     #[serde(default = "default_google_calendar_id")]
     pub calendar_id: String,
 }
@@ -927,22 +911,14 @@ impl Default for GoogleCalendarConfig {
 }
 
 /// Microsoft Outlook Calendar (Graph API) configuration.
-///
-/// Uses device code flow for headless auth — user visits a URL and
-/// enters a code to authorize.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OutlookCalendarConfig {
-    /// Enable Outlook Calendar tools.
     #[serde(default)]
     pub enabled: bool,
-    /// Azure AD application (client) ID.
-    /// Falls back to `OUTLOOK_CALENDAR_CLIENT_ID` env var.
     #[serde(default)]
     pub client_id: Option<String>,
-    /// Azure AD tenant ID (default: "common" for multi-tenant).
     #[serde(default = "default_outlook_tenant")]
     pub tenant_id: String,
-    /// Cached OAuth2 refresh token.
     #[serde(default)]
     pub refresh_token: Option<String>,
 }
@@ -962,22 +938,51 @@ impl Default for OutlookCalendarConfig {
     }
 }
 
-/// Apple Calendar (CalDAV) configuration.
+/// KakaoTalk 톡캘린더 (Talk Calendar) API configuration.
 ///
-/// Uses app-specific password (not iCloud password).
-/// User generates one at appleid.apple.com.
+/// Uses Kakao OAuth2 with `talk_calendar` consent scope.
+/// Requires Kakao Developers business app registration for production use.
+/// API base: `https://kapi.kakao.com/v2/api/calendar`
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct AppleCalendarConfig {
-    /// Enable Apple Calendar tools.
+pub struct KakaoCalendarConfig {
+    /// Enable KakaoTalk Calendar tools.
     #[serde(default)]
     pub enabled: bool,
-    /// Apple ID email address.
+    /// Kakao REST API key. Falls back to `KAKAO_REST_API_KEY` env var.
+    #[serde(default)]
+    pub rest_api_key: Option<String>,
+    /// Kakao OAuth2 access token (obtained after user consent).
+    #[serde(default)]
+    pub access_token: Option<String>,
+    /// Kakao OAuth2 refresh token for auto-renewal.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Default sub-calendar ID. If unset, uses the user's default calendar.
+    #[serde(default)]
+    pub calendar_id: Option<String>,
+}
+
+impl Default for KakaoCalendarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rest_api_key: None,
+            access_token: None,
+            refresh_token: None,
+            calendar_id: None,
+        }
+    }
+}
+
+/// Apple Calendar (CalDAV) configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AppleCalendarConfig {
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default)]
     pub apple_id: Option<String>,
-    /// App-specific password for CalDAV access.
     #[serde(default)]
     pub app_password: Option<String>,
-    /// CalDAV server URL.
     #[serde(default = "default_apple_caldav_url")]
     pub caldav_url: String,
 }

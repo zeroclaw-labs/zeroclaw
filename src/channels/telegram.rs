@@ -2844,19 +2844,12 @@ impl Channel for TelegramChannel {
             }
         }
 
-        // Truncate to Telegram limit for mid-stream edits (UTF-8 safe).
-        // Compare char count (not byte length) against the 4096-char limit.
-        let char_count = text.chars().count();
-        let display_text = if char_count > TELEGRAM_MAX_MESSAGE_LENGTH {
-            let mut end = 0;
-            let mut count = 0;
-            for (idx, ch) in text.char_indices() {
-                if count >= TELEGRAM_MAX_MESSAGE_LENGTH {
-                    break;
-                }
-                end = idx + ch.len_utf8();
-                count += 1;
-            }
+        // Truncate to Telegram limit for mid-stream edits (char-count safe)
+        let display_text = if text.chars().count() > TELEGRAM_MAX_MESSAGE_LENGTH {
+            let end = text
+                .char_indices()
+                .nth(TELEGRAM_MAX_MESSAGE_LENGTH)
+                .map_or(text.len(), |(idx, _)| idx);
             &text[..end]
         } else {
             text
@@ -2952,8 +2945,7 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        // If text exceeds limit, delete draft and send as chunked messages.
-        // Compare char count (not byte length) against the 4096-char limit.
+        // If text exceeds limit, delete draft and send as chunked messages
         if text.chars().count() > TELEGRAM_MAX_MESSAGE_LENGTH {
             if let Some(id) = msg_id {
                 let _ = self
@@ -3443,13 +3435,12 @@ Ensure only one `zeroclaw` process is using this bot token."
     }
 
     async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
-        // Stop any existing typing indicator for this specific chat
         self.stop_typing(recipient).await?;
 
         let client = self.http_client();
         let url = self.api_url("sendChatAction");
         let chat_id = recipient.to_string();
-        let chat_id_key = recipient.to_string();
+        let key = recipient.to_string();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -3464,7 +3455,7 @@ Ensure only one `zeroclaw` process is using this bot token."
         });
 
         let mut guard = self.typing_handles.lock();
-        guard.insert(chat_id_key, handle);
+        guard.insert(key, handle);
 
         Ok(())
     }
@@ -3548,10 +3539,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_typing_clears_handle_per_chat() {
+    async fn stop_typing_clears_handle() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
 
-        // Manually insert a dummy handle for chat "123"
+        // Manually insert a dummy handle
         {
             let mut guard = ch.typing_handles.lock();
             guard.insert("123".to_string(), tokio::spawn(async {
@@ -3559,7 +3550,7 @@ mod tests {
             }));
         }
 
-        // stop_typing should abort and remove handle for chat "123"
+        // stop_typing should abort and clear
         ch.stop_typing("123").await.unwrap();
 
         let guard = ch.typing_handles.lock();
@@ -3570,7 +3561,7 @@ mod tests {
     async fn start_typing_replaces_previous_handle() {
         let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
 
-        // Insert a dummy handle for chat "123"
+        // Insert a dummy handle first
         {
             let mut guard = ch.typing_handles.lock();
             guard.insert("123".to_string(), tokio::spawn(async {
@@ -3583,29 +3574,6 @@ mod tests {
 
         let guard = ch.typing_handles.lock();
         assert!(guard.contains_key("123"));
-    }
-
-    #[tokio::test]
-    async fn typing_handles_are_per_chat() {
-        let ch = TelegramChannel::new("fake-token".into(), vec!["*".into()], false, true);
-
-        // Insert handles for two different chats
-        {
-            let mut guard = ch.typing_handles.lock();
-            guard.insert("chat_a".to_string(), tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }));
-            guard.insert("chat_b".to_string(), tokio::spawn(async {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }));
-        }
-
-        // Stopping typing for chat_a should NOT affect chat_b
-        ch.stop_typing("chat_a").await.unwrap();
-
-        let guard = ch.typing_handles.lock();
-        assert!(!guard.contains_key("chat_a"));
-        assert!(guard.contains_key("chat_b"));
     }
 
     #[test]

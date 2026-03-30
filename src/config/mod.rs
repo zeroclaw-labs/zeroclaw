@@ -32,7 +32,7 @@ pub use schema::{
     WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
     PerplexitySearchApiConfig, MediaApiConfig, FreepikApiConfig, SunoApiConfig,
     RunwayApiConfig, ElevenLabsApiConfig, CalendarConfig, GoogleCalendarConfig,
-    OutlookCalendarConfig, AppleCalendarConfig, DEFAULT_MODEL_FALLBACK,
+    OutlookCalendarConfig, KakaoCalendarConfig, AppleCalendarConfig, DEFAULT_MODEL_FALLBACK,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {

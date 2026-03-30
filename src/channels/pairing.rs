@@ -378,9 +378,6 @@ pub fn persist_channel_allowlist(channel_name: &str, identity: &str) -> anyhow::
     };
 
     if added {
-        // Serialize and write synchronously — this function is called from
-        // `spawn_blocking` contexts where `.block_on(async)` would deadlock
-        // on single-threaded Tokio runtimes.
         let toml_str = toml::to_string_pretty(&config)
             .map_err(|e| anyhow::anyhow!("Failed to serialize config: {e}"))?;
         std::fs::write(&config.config_path, toml_str)

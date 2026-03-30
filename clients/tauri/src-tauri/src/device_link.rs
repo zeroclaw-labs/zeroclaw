@@ -127,6 +127,9 @@ fn urlencoded(s: &str) -> String {
 }
 
 /// Handle a single WebSocket connection session.
+///
+/// Uses an outbound mpsc channel so that the heartbeat task and message
+/// handlers never contend on the WebSocket sink directly.
 async fn handle_connection(
     ws_stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -135,16 +138,26 @@ async fn handle_connection(
     token: &str,
     stop_flag: &AtomicBool,
 ) {
-    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let (ws_sender, mut ws_receiver) = ws_stream.split();
 
-    // Channel for sending WebSocket messages (heartbeat pings + responses)
-    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Message>(32);
+    // Outbound channel: heartbeat + response handlers send here; a dedicated
+    // task drains it to the actual WebSocket sink.
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Message>(64);
 
-    // Spawn heartbeat task — sends ping frames to keep the connection alive.
-    // Without this, firewalls/proxies may silently close idle WebSockets.
+    // Sender task — sole owner of ws_sender
+    let sender_task = tokio::spawn(async move {
+        let mut ws_sender = ws_sender;
+        while let Some(msg) = outbound_rx.recv().await {
+            if ws_sender.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Heartbeat task — sends Ping via the outbound channel
+    let heartbeat_tx = outbound_tx.clone();
     let stop_clone = Arc::new(AtomicBool::new(false));
     let stop_for_heartbeat = stop_clone.clone();
-    let heartbeat_tx = outbound_tx.clone();
     let heartbeat_task = tokio::spawn(async move {
         loop {
             tokio::time::sleep(tokio::time::Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
@@ -152,15 +165,6 @@ async fn handle_connection(
                 break;
             }
             if heartbeat_tx.send(Message::Ping(vec![])).await.is_err() {
-                break; // ws_sender dropped, connection closed
-            }
-        }
-    });
-
-    // Spawn outbound sender task — drains the channel and writes to WebSocket
-    let sender_task = tokio::spawn(async move {
-        while let Some(msg) = outbound_rx.recv().await {
-            if ws_sender.send(msg).await.is_err() {
                 break;
             }
         }
@@ -234,7 +238,7 @@ async fn handle_connection(
                 )
                 .await;
 
-                send_response_via_channel(&outbound_tx, &msg_id, &response_text).await;
+                send_response(&outbound_tx, &msg_id, &response_text).await;
             }
 
             // ── hybrid_relay: no LLM key, use proxy token for LLM ──
@@ -256,7 +260,7 @@ async fn handle_connection(
                 )
                 .await;
 
-                send_response_via_channel(&outbound_tx, &msg_id, &response_text).await;
+                send_response(&outbound_tx, &msg_id, &response_text).await;
             }
 
             // ── channel_relay: channel message (KakaoTalk, WhatsApp, etc.) ──
@@ -281,7 +285,7 @@ async fn handle_connection(
                 )
                 .await;
 
-                send_response_via_channel(&outbound_tx, &msg_id, &response_text).await;
+                send_response(&outbound_tx, &msg_id, &response_text).await;
             }
 
             _ => {
@@ -290,15 +294,16 @@ async fn handle_connection(
         }
     }
 
-    // Shut down heartbeat and sender tasks
     stop_clone.store(true, Ordering::Relaxed);
     heartbeat_task.abort();
-    sender_task.abort();
+    // Drop outbound_tx so the sender task finishes
+    drop(outbound_tx);
+    let _ = sender_task.await;
 }
 
 /// Send a response (done or error) back to Railway via the outbound channel.
-async fn send_response_via_channel(
-    tx: &tokio::sync::mpsc::Sender<Message>,
+async fn send_response(
+    outbound_tx: &tokio::sync::mpsc::Sender<Message>,
     msg_id: &str,
     response_text: &str,
 ) {
@@ -307,7 +312,7 @@ async fn send_response_via_channel(
         "id": msg_id,
         "content": response_text,
     });
-    let _ = tx
+    let _ = outbound_tx
         .send(Message::Text(response.to_string().into()))
         .await;
 }
