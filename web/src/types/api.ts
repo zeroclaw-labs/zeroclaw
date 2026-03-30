@@ -60,6 +60,39 @@ export interface CronRun {
   duration_ms: number | null;
 }
 
+export interface PluginToolDef {
+  name: string;
+  description: string;
+  export: string;
+  risk_level: 'low' | 'medium' | 'high';
+  parameters_schema: any | null;
+}
+
+export interface Plugin {
+  name: string;
+  version: string;
+  description: string | null;
+  status: 'loaded' | 'discovered';
+  tools: PluginToolDef[];
+  capabilities: string[];
+  allowed_hosts: string[];
+  allowed_paths: Record<string, string>;
+  config: Record<string, any>;
+}
+
+export interface PluginDetail extends Plugin {
+  permissions: string[];
+  wasm_path: string;
+  wasm_sha256: string | null;
+  config_status: 'ok' | 'not_loaded';
+}
+
+export interface PluginsResponse {
+  plugins_enabled: boolean;
+  plugins_dir: string;
+  plugins: Plugin[];
+}
+
 export interface Integration {
   name: string;
   description: string;
