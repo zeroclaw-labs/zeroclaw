@@ -8,6 +8,7 @@
 //! - Header sanitization (handled by axum/hyper)
 
 pub mod api;
+pub mod signed_url;
 pub mod sse;
 pub mod static_files;
 pub mod ws;
@@ -665,7 +666,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/admin/paircode", get(handle_admin_paircode))
         .route("/admin/paircode/new", post(handle_admin_paircode_new))
         // ── Existing routes ──
-        .route("/download/{filename}", get(handle_workspace_download))
+        .route("/download/{*filepath}", get(handle_workspace_download))
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
@@ -744,36 +745,109 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     Json(body)
 }
 
-/// GET /download/{filename} — download a generated report from workspace
+/// Query parameters for signed download URLs.
+#[derive(serde::Deserialize)]
+struct DownloadQuery {
+    expires: Option<u64>,
+    sig: Option<String>,
+}
+
+/// GET /download/*filepath — download a workspace file with signed-URL verification.
 async fn handle_workspace_download(
     State(state): State<AppState>,
-    axum::extract::Path(filename): axum::extract::Path<String>,
+    axum::extract::Path(filepath): axum::extract::Path<String>,
+    Query(query): Query<DownloadQuery>,
 ) -> impl IntoResponse {
-    let workspace_dir = {
+    let (workspace_dir, download_secret) = {
         let guard = state.config.lock();
-        guard.workspace_dir.clone()
+        (guard.workspace_dir.clone(), guard.resolve_download_secret())
     };
-    
-    // Basic path traversal prevention
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
-        return (StatusCode::BAD_REQUEST, "Invalid filename").into_response();
+
+    // Decode percent-encoded path (e.g. `reports%2Fsummary.md` → `reports/summary.md`)
+    let decoded = urlencoding::decode(&filepath).unwrap_or(std::borrow::Cow::Borrowed(&filepath));
+    let file_path = decoded.as_ref();
+
+    // Path traversal prevention: reject `..` and `\`
+    if file_path.contains("..") || file_path.contains('\\') {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
-    
-    let path = workspace_dir.join(&filename);
-    match tokio::fs::read(&path).await {
+
+    // Verify signed URL if signature parameters are present.
+    // If neither expires nor sig is provided, reject (require signing).
+    eprintln!(
+        "[DOWNLOAD] path={file_path:?} expires={:?} sig_present={} sig_len={}",
+        query.expires,
+        query.sig.is_some(),
+        query.sig.as_deref().map(|s| s.len()).unwrap_or(0)
+    );
+    tracing::info!(
+        path = %file_path,
+        expires = ?query.expires,
+        sig_present = query.sig.is_some(),
+        sig_len = query.sig.as_deref().map(|s| s.len()).unwrap_or(0),
+        "download: checking signed URL"
+    );
+    match (query.expires, query.sig.as_deref()) {
+        (Some(expires), Some(sig)) => {
+            let ok = signed_url::verify_download_url(file_path, &download_secret, expires, sig);
+            tracing::info!(path = %file_path, expires, sig_ok = ok, "download: signature verified");
+            if !ok {
+                return (StatusCode::FORBIDDEN, "Invalid or expired signature").into_response();
+            }
+        }
+        _ => {
+            tracing::warn!(path = %file_path, expires = ?query.expires, sig = ?query.sig, "download: missing expires or sig — returning 403");
+            return (StatusCode::FORBIDDEN, "Signed URL required").into_response();
+        }
+    }
+
+    // Resolve and verify the path stays within workspace
+    let full_path = workspace_dir.join(file_path);
+    let canonical = match tokio::fs::canonicalize(&full_path).await {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
+    };
+    let canonical_workspace = match tokio::fs::canonicalize(&workspace_dir).await {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Workspace error").into_response(),
+    };
+    if !canonical.starts_with(&canonical_workspace) {
+        return (StatusCode::FORBIDDEN, "Path escapes workspace").into_response();
+    }
+
+    match tokio::fs::read(&canonical).await {
         Ok(bytes) => {
-            let encoded_name = urlencoding::encode(&filename);
-            let disposition = format!("attachment; filename*=UTF-8''{}", encoded_name);
+            let display_name = file_path.rsplit('/').next().unwrap_or(file_path);
+            let encoded_name = urlencoding::encode(display_name);
+            let disposition = format!("attachment; filename*=UTF-8''{encoded_name}");
+            let content_type = guess_content_type(file_path);
             (
                 StatusCode::OK,
                 [
-                    (header::CONTENT_TYPE, "application/octet-stream".to_string()),
-                    (header::CONTENT_DISPOSITION, disposition)
+                    (header::CONTENT_TYPE, content_type.to_string()),
+                    (header::CONTENT_DISPOSITION, disposition),
                 ],
-                bytes
-            ).into_response()
+                bytes,
+            )
+                .into_response()
         }
         Err(_) => (StatusCode::NOT_FOUND, "File not found").into_response(),
+    }
+}
+
+/// Guess a reasonable Content-Type from the file extension.
+fn guess_content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().map(str::to_lowercase).as_deref() {
+        Some("md") => "text/markdown; charset=utf-8",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("json") => "application/json",
+        Some("csv") => "text/csv; charset=utf-8",
+        Some("html" | "htm") => "text/html; charset=utf-8",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
     }
 }
 

@@ -465,8 +465,7 @@ fn extract_description(content: &str) -> String {
     //   name: skill-name
     //   description: What this skill does
     //   ---
-    if content.starts_with("---") {
-        let after_first = &content[3..];
+    if let Some(after_first) = content.strip_prefix("---") {
         if let Some(end) = after_first.find("\n---") {
             let frontmatter = &after_first[..end];
             for line in frontmatter.lines() {

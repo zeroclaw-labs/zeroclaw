@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -281,6 +282,76 @@ fn ensure_lark_send_success(
     Ok(())
 }
 
+/// Extract signed download URLs from message content and return:
+/// - `cleaned`: content with download URL lines removed (avoids duplicate display)
+/// - `buttons`: `(label, url)` pairs to render as Lark card action buttons
+///
+/// Using card buttons rather than markdown inline links avoids the `&` → `&amp;`
+/// HTML-entity escaping that Lark applies to markdown hrefs, which would break the
+/// `?expires=...&sig=...` query string when users click through.
+///
+/// Recognises lines of the form produced by `FileWriteTool`:
+/// ```
+/// Download: http://host/download/file?expires=NNN&sig=HEX
+/// ```
+/// and bare/markdown-linked URLs containing `/download/` with signed params.
+fn extract_download_links(content: &str) -> (String, Vec<(String, String)>) {
+    use regex::Regex;
+    use std::sync::OnceLock;
+
+    // Matches a signed download URL anywhere in a line (bare or inside markdown link).
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"https?://[^\s\)]+/download/[^\s\)]+\?[^\s\)]*expires=\d+[^\s\)]*&[^\s\)]*sig=[0-9a-fA-F]+[^\s\)]*")
+            .expect("download URL regex is valid")
+    });
+
+    let mut buttons: Vec<(String, String)> = Vec::new();
+    let mut cleaned_lines: Vec<&str> = Vec::new();
+
+    for line in content.lines() {
+        if let Some(m) = re.find(line) {
+            let dl_url = m.as_str().to_string();
+
+            // Derive a friendly button label from the filename in the URL path.
+            // e.g. `/download/%E5%B7%A5%E4%BD%9C%E6%80%BB%E7%BB%93.md` → "工作总结.md"
+            let label = {
+                let path_part = dl_url
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("下载文件");
+                urlencoding::decode(path_part)
+                    .map(|s| format!("⬇ {s}"))
+                    .unwrap_or_else(|_| "⬇ 下载文件".to_string())
+            };
+
+            // Avoid duplicates (same URL appears twice in content).
+            if !buttons.iter().any(|(_, u)| u == &dl_url) {
+                buttons.push((label, dl_url));
+            }
+
+            // Drop the download-link line from the cleaned content to avoid
+            // showing a broken markdown link alongside the button.
+            continue;
+        }
+        cleaned_lines.push(line);
+    }
+
+    // Trim trailing blank lines left after removing download-link lines.
+    while cleaned_lines
+        .last()
+        .map(|l| l.trim().is_empty())
+        .unwrap_or(false)
+    {
+        cleaned_lines.pop();
+    }
+
+    (cleaned_lines.join("\n"), buttons)
+}
+
 /// Lark/Feishu channel.
 ///
 /// Supports two receive modes (configured via `receive_mode` in config):
@@ -304,6 +375,8 @@ pub struct LarkChannel {
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
     ws_seen_ids: Arc<RwLock<HashMap<String, Instant>>>,
+    /// Optional workspace directory to save downloaded attachments
+    workspace_dir: Option<PathBuf>,
 }
 
 impl LarkChannel {
@@ -347,7 +420,13 @@ impl LarkChannel {
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
+            workspace_dir: None,
         }
+    }
+
+    pub fn with_workspace_dir(mut self, workspace_dir: PathBuf) -> Self {
+        self.workspace_dir = Some(workspace_dir);
+        self
     }
 
     /// Build from `LarkConfig` using legacy compatibility:
@@ -801,6 +880,12 @@ impl LarkChannel {
                             Some(details) => (details.text, details.mentioned_open_ids),
                             None => continue,
                         },
+                        "file" | "image" | "media" | "folder" => {
+                            match self.download_lark_resource(&lark_msg.message_id, &lark_msg.message_type, &lark_msg.content).await {
+                                Some(text) => (text, Vec::new()),
+                                None => continue,
+                            }
+                        },
                         _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
                     };
 
@@ -1020,6 +1105,71 @@ impl LarkChannel {
     }
 
     /// Parse an event callback payload and extract text messages
+
+    async fn download_lark_resource(&self, msg_id: &str, msg_type: &str, content_str: &str) -> Option<String> {
+        let v: serde_json::Value = serde_json::from_str(content_str).ok()?;
+        let resource_key = v.get("file_key")
+            .or_else(|| v.get("image_key"))
+            .or_else(|| v.get("folder_key"))
+            .and_then(|k| k.as_str())
+            .unwrap_or_default();
+            
+        let file_name = v.get("file_name")
+            .or_else(|| v.get("image_name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("");
+
+        let fallback_ext = if msg_type == "image" { ".png" } else { "" };
+        let file_name = if file_name.is_empty() {
+            format!("{}{}", resource_key, fallback_ext)
+        } else {
+            file_name.to_string()
+        };
+
+        if resource_key.is_empty() {
+            return None;
+        }
+
+        let workspace_dir = self.workspace_dir.as_ref()?;
+        let token = self.get_tenant_access_token().await.ok()?;
+        
+        let api_type = match msg_type {
+            "image" => "image",
+            _ => "file",
+        };
+
+        let url = format!(
+            "{}/im/v1/messages/{}/resources/{}?type={}",
+            self.platform.api_base(),
+            msg_id,
+            resource_key,
+            api_type
+        );
+
+        let response = self
+            .http_client()
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .ok()?;
+
+        if !response.status().is_success() {
+            tracing::error!("Feishu download failed for {}: HTTP {}", file_name, response.status());
+            return None;
+        }
+
+        let bytes = response.bytes().await.ok()?;
+        let save_path = workspace_dir.join(&file_name);
+        tokio::fs::write(&save_path, bytes).await.ok()?;
+        let msg = if msg_type == "image" {
+            format!("[System: User uploaded image '{}', successfully saved to workspace]\n[IMAGE:{}]", file_name, save_path.display())
+        } else {
+            format!("[System: User uploaded file '{}', successfully saved to workspace]", file_name)
+        };
+        Some(msg)
+    }
+
     pub fn parse_event_payload(&self, payload: &serde_json::Value) -> Vec<ChannelMessage> {
         let mut messages = Vec::new();
 
@@ -1096,6 +1246,11 @@ impl LarkChannel {
                 Some(details) => (details.text, details.mentioned_open_ids),
                 None => return messages,
             },
+            "file" | "image" | "media" | "folder" => {
+                let msg_id = event.pointer("/message/message_id").and_then(|id| id.as_str()).unwrap_or_default();
+                let text = format!("[lark_download:{}:{}:{}]", msg_id, msg_type, content_str);
+                (text, Vec::new())
+            },
             _ => {
                 tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
                 return messages;
@@ -1156,31 +1311,68 @@ impl Channel for LarkChannel {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
 
+        // Extract download URLs from message content and render them as card
+        // action buttons. This avoids the `&` → `&amp;` HTML-entity escaping
+        // that Lark applies to inline markdown links, which breaks the signed-URL
+        // query string when users click through from the chat card.
+        let (cleaned_content, download_buttons) = extract_download_links(&message.content);
+
         let mut card_map = serde_json::Map::new();
         card_map.insert("schema".to_string(), serde_json::json!("2.0"));
-        
-        card_map.insert("config".to_string(), serde_json::json!({
-            "wide_screen_mode": true
-        }));
 
-        card_map.insert("body".to_string(), serde_json::json!({
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": message.content
-                }
-            ]
-        }));
+        card_map.insert(
+            "config".to_string(),
+            serde_json::json!({
+                "wide_screen_mode": true
+            }),
+        );
+
+        // Build card body elements: markdown text + optional download buttons.
+        let mut elements: Vec<serde_json::Value> = vec![serde_json::json!({
+            "tag": "markdown",
+            "content": cleaned_content
+        })];
+
+        if !download_buttons.is_empty() {
+            let actions: Vec<serde_json::Value> = download_buttons
+                .iter()
+                .map(|(label, dl_url)| {
+                    serde_json::json!({
+                        "tag": "button",
+                        "text": { "tag": "plain_text", "content": label },
+                        "type": "primary",
+                        "multi_url": {
+                            "url": dl_url,
+                            "android_url": dl_url,
+                            "ios_url": dl_url,
+                            "pc_url": dl_url
+                        }
+                    })
+                })
+                .collect();
+            elements.push(serde_json::json!({
+                "tag": "action",
+                "actions": actions
+            }));
+        }
+
+        card_map.insert(
+            "body".to_string(),
+            serde_json::json!({ "elements": elements }),
+        );
 
         if let Some(subject) = &message.subject {
             if !subject.is_empty() {
-                card_map.insert("header".to_string(), serde_json::json!({
-                    "template": "blue",
-                    "title": {
-                        "tag": "plain_text",
-                        "content": subject
-                    }
-                }));
+                card_map.insert(
+                    "header".to_string(),
+                    serde_json::json!({
+                        "template": "blue",
+                        "title": {
+                            "tag": "plain_text",
+                            "content": subject
+                        }
+                    }),
+                );
             }
         }
 
@@ -1215,18 +1407,78 @@ impl Channel for LarkChannel {
         // (code 230099 or 11310), we fall back to `post` msg_type which
         // renders markdown (including tables) without this restriction.
         let code = extract_lark_response_code(&response).unwrap_or(0);
-        if code == 230099 || code == 11310 || response.to_string().contains("table number over limit") {
+        if code == 230_099
+            || code == 11_310
+            || response.to_string().contains("table number over limit")
+        {
             tracing::warn!("Lark: interactive card table limit exceeded (code {}), falling back to 'post' message type", code);
 
             // Re-fetch token in case we refreshed earlier; fall back to original if unavailable.
             let best_token = self.get_tenant_access_token().await.unwrap_or(token);
 
+            // Build post-format paragraphs. Use `cleaned_content` (download
+            // URL lines already stripped) for the markdown paragraph so that
+            // download links don't appear as inline hrefs that Lark would
+            // HTML-escape (`&` → `&amp;`), breaking signed-URL query strings.
+            // Download links are appended as explicit `a href` rich-text
+            // elements — JSON string fields, not markdown — so `&` is preserved.
+            let mut post_paragraphs: Vec<serde_json::Value> = Vec::new();
+            
+            // To avoid Feishu's ~10,000 character/byte truncation per single `md` node
+            // in post messages, we split large texts into multiple paragraph nodes.
+            let mut current_text = String::new();
+            for block in cleaned_content.split("\n\n") {
+                if current_text.len() + block.len() > 8000 && !current_text.is_empty() {
+                    post_paragraphs.push(serde_json::json!([{ "tag": "md", "text": current_text }]));
+                    current_text.clear();
+                }
+                if !current_text.is_empty() {
+                    current_text.push_str("\n\n");
+                }
+                
+                // If a single block is still > 8000 chars (e.g. a giant continuous table),
+                // we forcefully chunk it, though it might occasionally break MD formatting.
+                if block.len() > 8000 {
+                    let mut slice = block;
+                    while !slice.is_empty() {
+                        let split_at = slice.char_indices()
+                            .map(|(idx, _)| idx)
+                            .take_while(|&idx| idx <= 8000)
+                            .last()
+                            .unwrap_or(slice.len());
+                        
+                        let part = &slice[..split_at];
+                        slice = &slice[split_at..];
+                        
+                        if current_text.len() + part.len() > 8000 && !current_text.is_empty() {
+                            post_paragraphs.push(serde_json::json!([{ "tag": "md", "text": current_text }]));
+                            current_text.clear();
+                        }
+                        current_text.push_str(part);
+                    }
+                } else {
+                    current_text.push_str(block);
+                }
+            }
+            if !current_text.is_empty() {
+                post_paragraphs.push(serde_json::json!([{ "tag": "md", "text": current_text }]));
+            }
+
+            for (label, dl_url) in &download_buttons {
+                post_paragraphs.push(serde_json::json!([{
+                    "tag": "a",
+                    "text": label,
+                    "href": dl_url
+                }]));
+            }
+
             let fallback_content = serde_json::json!({
                 "zh_cn": {
                     "title": message.subject.as_deref().unwrap_or(""),
-                    "content": [[{ "tag": "md", "text": message.content }]]
+                    "content": post_paragraphs
                 }
-            }).to_string();
+            })
+            .to_string();
 
             let fallback_body = serde_json::json!({
                 "receive_id": message.recipient,
@@ -1234,7 +1486,9 @@ impl Channel for LarkChannel {
                 "content": fallback_content,
             });
 
-            let (fb_status, fb_response) = self.send_text_once(&url, &best_token, &fallback_body).await?;
+            let (fb_status, fb_response) = self
+                .send_text_once(&url, &best_token, &fallback_body)
+                .await?;
             ensure_lark_send_success(fb_status, &fb_response, "post fallback")?;
             return Ok(());
         }
@@ -1297,7 +1551,27 @@ impl LarkChannel {
             }
 
             // Parse event messages
-            let messages = state.channel.parse_event_payload(&payload);
+            let mut messages = state.channel.parse_event_payload(&payload);
+            for m in &mut messages {
+                if m.content.starts_with("[lark_download:") {
+                    let parts: Vec<&str> = m.content.splitn(4, ':').collect();
+                    if parts.len() == 4 {
+                        let msg_id = parts[1];
+                        let msg_type = parts[2];
+                        let content_str = parts[3];
+                        // Need to remove the trailing bracket if we split naively, but wait!
+                        // The trailing bracket is from splitn or format? Actually it ends with `]`.
+                        // Wait, `[lark_download:{msg_id}:{msg_type}:{content_str}]` -- `content_str` contains `]`.
+                        let content_str = &content_str[..content_str.len()-1]; // drop trailing ]
+                        
+                        if let Some(text) = state.channel.download_lark_resource(msg_id, msg_type, content_str).await {
+                            m.content = text;
+                        } else {
+                            m.content = "[System: Failed to download user attachment]".to_string();
+                        }
+                    }
+                }
+            }
             if !messages.is_empty() {
                 if let Some(message_id) = payload
                     .pointer("/event/message/message_id")
@@ -1362,7 +1636,7 @@ fn pick_uniform_index(len: usize) -> usize {
     loop {
         let value = rand::random::<u64>();
         if value < reject_threshold {
-            return (value % upper) as usize;
+            return usize::try_from(value % upper).unwrap_or(0);
         }
     }
 }
@@ -1708,6 +1982,48 @@ fn should_respond_in_group(
 mod tests {
     use super::*;
 
+    // ── extract_download_links ──────────────────────────────────
+
+    #[test]
+    fn extract_download_links_bare_url() {
+        let content = "文件已生成。\nDownload: http://100.1.2.3:42617/download/%E6%96%87%E4%BB%B6.md?expires=9999999999&sig=aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233";
+        let (cleaned, buttons) = extract_download_links(content);
+        assert_eq!(cleaned, "文件已生成。");
+        assert_eq!(buttons.len(), 1);
+        assert!(
+            buttons[0].0.contains("文件.md"),
+            "label should decode filename"
+        );
+        assert!(buttons[0].1.contains("expires=9999999999"), "url preserved");
+        assert!(buttons[0].1.contains("&sig="), "& not mangled");
+    }
+
+    #[test]
+    fn extract_download_links_no_urls() {
+        let content = "普通回复，没有下载链接。";
+        let (cleaned, buttons) = extract_download_links(content);
+        assert_eq!(cleaned, content);
+        assert!(buttons.is_empty());
+    }
+
+    #[test]
+    fn extract_download_links_deduplicates() {
+        let url = "http://host/download/f.md?expires=1000&sig=aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd";
+        let content = format!("Download: {url}\nDownload: {url}");
+        let (_, buttons) = extract_download_links(&content);
+        assert_eq!(buttons.len(), 1, "duplicate URLs collapsed to one button");
+    }
+
+    #[test]
+    fn extract_download_links_preserves_surrounding_text() {
+        let content = "前言\nDownload: http://h/download/a.md?expires=1&sig=aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd\n后记";
+        let (cleaned, buttons) = extract_download_links(content);
+        assert!(cleaned.contains("前言"));
+        assert!(cleaned.contains("后记"));
+        assert!(!cleaned.contains("expires="), "download line stripped");
+        assert_eq!(buttons.len(), 1);
+    }
+
     fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
         ch.set_resolved_bot_open_id(Some(bot_open_id.to_string()));
         ch
@@ -1962,7 +2278,7 @@ mod tests {
             "event": {
                 "sender": { "sender_id": { "open_id": "ou_user" } },
                 "message": {
-                    "message_type": "image",
+                    "message_type": "unknown_type_for_test",
                     "content": "{}",
                     "chat_id": "oc_chat"
                 }

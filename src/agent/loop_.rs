@@ -784,14 +784,10 @@ fn extract_json_values(input: &str) -> Vec<serde_json::Value> {
                     continue;
                 }
             } else {
-                // Attempt to auto-fix EOF errors by appending closing braces which 
+                // Attempt to auto-fix EOF errors by appending closing braces which
                 // frequently happens when agent truncates outer JSON response blocks.
                 let mut fixed_value = None;
-                for suffix in [
-                    "}", "}}", "}}}", 
-                    "]", "]}", "]}}", 
-                    "\"]}", "\"} }",
-                ] {
+                for suffix in ["}", "}}", "}}}", "]", "]}", "]}}", "\"]}", "\"} }"] {
                     let patched = format!("{}{}", slice.trim_end(), suffix);
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&patched) {
                         fixed_value = Some(v);

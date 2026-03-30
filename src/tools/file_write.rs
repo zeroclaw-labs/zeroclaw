@@ -4,14 +4,35 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
 
+/// Configuration for generating signed download URLs in tool output.
+#[derive(Clone)]
+pub struct DownloadUrlConfig {
+    /// Public base URL of the gateway (e.g. `https://myhost.ts.net:42617`).
+    pub base_url: String,
+    /// HMAC secret for signing download URLs.
+    pub secret: Vec<u8>,
+}
+
 /// Write file contents with path sandboxing
 pub struct FileWriteTool {
     security: Arc<SecurityPolicy>,
+    download: Option<DownloadUrlConfig>,
 }
 
 impl FileWriteTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            download: None,
+        }
+    }
+
+    /// Create with download URL generation support.
+    pub fn with_download(security: Arc<SecurityPolicy>, download: DownloadUrlConfig) -> Self {
+        Self {
+            security,
+            download: Some(download),
+        }
     }
 }
 
@@ -147,11 +168,30 @@ impl Tool for FileWriteTool {
         }
 
         match tokio::fs::write(&resolved_target, content).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!("Written {} bytes to {path}", content.len()),
-                error: None,
-            }),
+            Ok(()) => {
+                let mut output = format!("Written {} bytes to {path}", content.len());
+                if let Some(ref dl) = self.download {
+                    // Always sign the relative path from workspace_dir so gateway routing works stably.
+                    let relative_path = resolved_target
+                        .strip_prefix(&self.security.workspace_dir)
+                        .unwrap_or(&resolved_target);
+                    let rel_str = relative_path.to_string_lossy();
+                    
+                    let url = crate::gateway::signed_url::sign_download_url(
+                        &dl.base_url,
+                        &rel_str,
+                        &dl.secret,
+                        crate::gateway::signed_url::DEFAULT_TTL_SECS,
+                    );
+                    use std::fmt::Write;
+                    let _ = write!(output, "\nDownload: {url}");
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),

@@ -212,7 +212,19 @@ pub fn all_tools_with_runtime(
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::new(security.clone(), runtime)),
         Arc::new(FileReadTool::new(security.clone())),
-        Arc::new(FileWriteTool::new(security.clone())),
+        Arc::new(
+            if let Some(gateway_url) = root_config.resolve_gateway_public_url() {
+                FileWriteTool::with_download(
+                    security.clone(),
+                    file_write::DownloadUrlConfig {
+                        base_url: gateway_url,
+                        secret: root_config.resolve_download_secret(),
+                    },
+                )
+            } else {
+                FileWriteTool::new(security.clone())
+            },
+        ),
         Arc::new(FileEditTool::new(security.clone())),
         Arc::new(GlobSearchTool::new(security.clone())),
         Arc::new(ContentSearchTool::new(security.clone())),

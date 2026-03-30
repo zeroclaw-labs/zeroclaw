@@ -1,6 +1,5 @@
 use crate::channels::{
-    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel,
-    TelegramChannel,
+    Channel, DiscordChannel, MattermostChannel, SendMessage, SlackChannel, TelegramChannel,
 };
 use crate::config::Config;
 use crate::cron::{
@@ -368,17 +367,23 @@ pub(crate) async fn deliver_announcement(
             channel.send(&SendMessage::new(output, target)).await?;
         }
         #[cfg(feature = "channel-lark")]
-        "feishu" => {
-            let fs = config
-                .channels_config
-                .feishu
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("feishu channel not configured"))?;
-            let channel = crate::channels::LarkChannel::from_feishu_config(fs);
+        "feishu" | "lark" => {
+            let channel = if let Some(fs) = config.channels_config.feishu.as_ref() {
+                crate::channels::LarkChannel::from_feishu_config(fs).with_workspace_dir(config.workspace_dir.clone())
+            } else if let Some(lk) = config.channels_config.lark.as_ref() {
+                if channel == "feishu" && !lk.use_feishu {
+                    anyhow::bail!("feishu channel not configured (lark channel exists but use_feishu=false)");
+                }
+                crate::channels::LarkChannel::from_config(lk).with_workspace_dir(config.workspace_dir.clone())
+            } else {
+                anyhow::bail!("{} channel not configured", channel);
+            };
             channel.send(&SendMessage::new(output, target)).await?;
         }
         #[cfg(not(feature = "channel-lark"))]
-        "feishu" => anyhow::bail!("feishu channel is not compiled in this build; please enable 'channel-lark' feature"),
+        "feishu" => anyhow::bail!(
+            "feishu channel is not compiled in this build; please enable 'channel-lark' feature"
+        ),
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
 

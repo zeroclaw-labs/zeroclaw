@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "zeroclaw"
-version = "0.1.12"
+version = "1.1.13"
 edition = "2021"
 authors = ["guangjunma"]
 license = "MIT OR Apache-2.0"

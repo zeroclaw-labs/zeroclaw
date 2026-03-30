@@ -1001,6 +1001,16 @@ pub struct GatewayConfig {
     /// Maximum distinct idempotency keys retained in memory.
     #[serde(default = "default_gateway_idempotency_max_keys")]
     pub idempotency_max_keys: usize,
+
+    /// Explicit public URL for the gateway (e.g. `https://myhost.ts.net:42617`).
+    /// If not set, auto-computed from tunnel config or `http://{host}:{port}`.
+    /// Used to generate download links for workspace files.
+    #[serde(default)]
+    pub public_url: Option<String>,
+
+    /// HMAC secret for signing download URLs. If not set, derived from workspace path.
+    #[serde(default)]
+    pub download_secret: Option<String>,
 }
 
 fn default_gateway_port() -> u16 {
@@ -1049,6 +1059,8 @@ impl Default for GatewayConfig {
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
+            public_url: None,
+            download_secret: None,
         }
     }
 }
@@ -4850,6 +4862,62 @@ impl Config {
         Ok(())
     }
 
+    /// Resolve the effective public URL for the gateway.
+    ///
+    /// Priority: `gateway.public_url` (explicit) → auto-compute from tunnel config → local fallback.
+    pub fn resolve_gateway_public_url(&self) -> Option<String> {
+        // 1. Explicit setting wins
+        if let Some(ref url) = self.gateway.public_url {
+            let trimmed = url.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+
+        // 2. Auto-compute from tunnel config
+        let port = self.gateway.port;
+        match self.tunnel.provider.as_str() {
+            "tailscale" => {
+                if let Some(ref ts) = self.tunnel.tailscale {
+                    if let Some(ref hostname) = ts.hostname {
+                        // Tailscale Serve/Funnel terminates TLS on port 443;
+                        // the gateway port is only used internally.
+                        return Some(format!("https://{hostname}"));
+                    }
+                }
+            }
+            "ngrok" => {
+                if let Some(ref ng) = self.tunnel.ngrok {
+                    if let Some(ref domain) = ng.domain {
+                        return Some(format!("https://{domain}"));
+                    }
+                }
+            }
+            // Cloudflare quick tunnels and custom tunnels have dynamic URLs;
+            // the user must set gateway.public_url explicitly.
+            _ => {}
+        }
+
+        // 3. Fallback to local address (useful for LAN access)
+        if self.gateway.host != "127.0.0.1" && self.gateway.host != "localhost" {
+            return Some(format!("http://{}:{port}", self.gateway.host));
+        }
+
+        None
+    }
+
+    /// Resolve the HMAC secret for signing download URLs.
+    ///
+    /// Priority: `gateway.download_secret` → derived from workspace path.
+    pub fn resolve_download_secret(&self) -> Vec<u8> {
+        if let Some(ref secret) = self.gateway.download_secret {
+            if !secret.is_empty() {
+                return secret.as_bytes().to_vec();
+            }
+        }
+        crate::gateway::signed_url::derive_secret_from_workspace(&self.workspace_dir)
+    }
+
     /// Apply environment variable overrides to config
     pub fn apply_env_overrides(&mut self) {
         // API Key: ZEROCLAW_API_KEY or API_KEY (generic)
@@ -6705,6 +6773,8 @@ channel_id = "C123"
             rate_limit_max_keys: 2048,
             idempotency_ttl_secs: 600,
             idempotency_max_keys: 4096,
+            public_url: None,
+            download_secret: None,
         };
         let toml_str = toml::to_string(&g).unwrap();
         let parsed: GatewayConfig = toml::from_str(&toml_str).unwrap();
