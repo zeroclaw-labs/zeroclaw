@@ -21,6 +21,7 @@ pub mod auth_profile;
 pub mod bg_run;
 pub mod browser;
 pub mod browser_open;
+pub mod calendar;
 pub mod channel_ack_config;
 pub mod cli_discovery;
 pub mod composio;
@@ -96,6 +97,8 @@ pub use bg_run::{
 };
 pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
+#[allow(unused_imports)]
+pub use calendar::{CalendarCreateEventTool, CalendarListEventsTool, CalendarProvider};
 pub use channel_ack_config::ChannelAckConfigTool;
 pub use composio::ComposioTool;
 pub use content_search::ContentSearchTool;
@@ -127,7 +130,10 @@ pub use image_info::ImageInfoTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_tool::McpToolWrapper;
 #[allow(unused_imports)]
-pub use media_gen::{ImageGenTool, MusicGenTool, VideoGenTool};
+pub use media_gen::{
+    ElevenLabsTtsTool, FreepikImageToVideoTool, ImageGenTool, ImageUpscaleTool, MusicGenTool,
+    VideoGenTool,
+};
 pub use memory_forget::MemoryForgetTool;
 pub use memory_observe::MemoryObserveTool;
 pub use memory_recall::MemoryRecallTool;

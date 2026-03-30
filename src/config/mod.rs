@@ -30,7 +30,9 @@ pub use schema::{
     TelegramConfig, TelemetryConfig, TranscriptionConfig, TunnelConfig, UrlAccessConfig,
     VoiceConfig, WasmCapabilityEscalationMode, WasmConfig, WasmModuleHashPolicy, WasmRuntimeConfig,
     WasmSecurityConfig, WebFetchConfig, WebSearchConfig, WebhookConfig,
-    PerplexitySearchApiConfig, DEFAULT_MODEL_FALLBACK,
+    PerplexitySearchApiConfig, MediaApiConfig, FreepikApiConfig, SunoApiConfig,
+    RunwayApiConfig, ElevenLabsApiConfig, CalendarConfig, GoogleCalendarConfig,
+    OutlookCalendarConfig, AppleCalendarConfig, DEFAULT_MODEL_FALLBACK,
 };
 
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {

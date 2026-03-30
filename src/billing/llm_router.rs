@@ -154,6 +154,15 @@ pub struct AdminKeys {
     pub perplexity: Option<String>,
     /// Upstage Document Parse API key (for image PDF OCR).
     pub upstage: Option<String>,
+    /// Freepik API key (image generation/editing/upscaling).
+    pub freepik: Option<String>,
+    /// Suno API key (music generation).
+    pub suno: Option<String>,
+    /// Runway API key (video generation).
+    pub runway: Option<String>,
+    /// ElevenLabs API key (premium TTS voices).
+    /// When set, users without their own key are charged 2.2× credits.
+    pub elevenlabs: Option<String>,
 }
 
 impl AdminKeys {
@@ -172,6 +181,10 @@ impl AdminKeys {
             upstage: std::env::var("ADMIN_UPSTAGE_API_KEY")
                 .or_else(|_| std::env::var("UPSTAGE_API_KEY"))
                 .ok(),
+            freepik: std::env::var("ADMIN_FREEPIK_API_KEY").ok(),
+            suno: std::env::var("ADMIN_SUNO_API_KEY").ok(),
+            runway: std::env::var("ADMIN_RUNWAY_API_KEY").ok(),
+            elevenlabs: std::env::var("ADMIN_ELEVENLABS_API_KEY").ok(),
         }
     }
 
@@ -183,6 +196,10 @@ impl AdminKeys {
             "gemini" | "google" => self.gemini.as_deref(),
             "perplexity" => self.perplexity.as_deref(),
             "upstage" => self.upstage.as_deref(),
+            "freepik" => self.freepik.as_deref(),
+            "suno" => self.suno.as_deref(),
+            "runway" => self.runway.as_deref(),
+            "elevenlabs" => self.elevenlabs.as_deref(),
             _ => None,
         }
     }
@@ -318,6 +335,10 @@ mod tests {
             gemini: None,
             perplexity: None,
             upstage: None,
+            freepik: None,
+            suno: None,
+            runway: None,
+            elevenlabs: None,
         }
     }
 

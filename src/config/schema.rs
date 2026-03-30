@@ -488,6 +488,16 @@ pub struct Config {
     #[serde(default)]
     pub transcription: TranscriptionConfig,
 
+    /// Media generation API configuration (`[media_api]`).
+    /// Freepik (image), Suno (music), Runway (video), ElevenLabs (TTS).
+    #[serde(default)]
+    pub media_api: MediaApiConfig,
+
+    /// Calendar integration configuration (`[calendar]`).
+    /// Google Calendar, Microsoft Outlook, Apple CalDAV.
+    #[serde(default)]
+    pub calendar: CalendarConfig,
+
     /// Inter-process agent communication (`[agents_ipc]`).
     #[serde(default)]
     pub agents_ipc: AgentsIpcConfig,
@@ -839,6 +849,352 @@ impl Default for TranscriptionConfig {
             model: default_transcription_model(),
             language: None,
             max_duration_secs: default_transcription_max_duration_secs(),
+        }
+    }
+}
+
+// ── Calendar ───────────────────────────────────────────────────
+
+/// Calendar integration configuration (`[calendar]`).
+///
+/// Supports Google Calendar (REST v3), Microsoft Outlook (Graph API),
+/// and Apple Calendar (CalDAV). The agent can read events, create
+/// reminders, and push scheduled notifications to messaging channels.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CalendarConfig {
+    /// Google Calendar integration.
+    #[serde(default)]
+    pub google: GoogleCalendarConfig,
+
+    /// Microsoft Outlook Calendar integration.
+    #[serde(default)]
+    pub outlook: OutlookCalendarConfig,
+
+    /// Apple Calendar integration (CalDAV).
+    #[serde(default)]
+    pub apple: AppleCalendarConfig,
+}
+
+impl Default for CalendarConfig {
+    fn default() -> Self {
+        Self {
+            google: GoogleCalendarConfig::default(),
+            outlook: OutlookCalendarConfig::default(),
+            apple: AppleCalendarConfig::default(),
+        }
+    }
+}
+
+/// Google Calendar API configuration.
+///
+/// OAuth tokens are managed at runtime after user authorizes via
+/// the Google consent screen. The `client_id` and `client_secret`
+/// come from a Google Cloud project; the operator can set these
+/// as env vars (`GOOGLE_CALENDAR_CLIENT_ID`, `GOOGLE_CALENDAR_CLIENT_SECRET`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct GoogleCalendarConfig {
+    /// Enable Google Calendar tools.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Google OAuth2 client ID. Falls back to `GOOGLE_CALENDAR_CLIENT_ID` env var.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Google OAuth2 client secret. Falls back to `GOOGLE_CALENDAR_CLIENT_SECRET` env var.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    /// Cached OAuth2 refresh token (persisted after first authorization).
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Specific calendar ID to use (default: "primary").
+    #[serde(default = "default_google_calendar_id")]
+    pub calendar_id: String,
+}
+
+fn default_google_calendar_id() -> String {
+    "primary".into()
+}
+
+impl Default for GoogleCalendarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: None,
+            client_secret: None,
+            refresh_token: None,
+            calendar_id: default_google_calendar_id(),
+        }
+    }
+}
+
+/// Microsoft Outlook Calendar (Graph API) configuration.
+///
+/// Uses device code flow for headless auth — user visits a URL and
+/// enters a code to authorize.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct OutlookCalendarConfig {
+    /// Enable Outlook Calendar tools.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Azure AD application (client) ID.
+    /// Falls back to `OUTLOOK_CALENDAR_CLIENT_ID` env var.
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Azure AD tenant ID (default: "common" for multi-tenant).
+    #[serde(default = "default_outlook_tenant")]
+    pub tenant_id: String,
+    /// Cached OAuth2 refresh token.
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+}
+
+fn default_outlook_tenant() -> String {
+    "common".into()
+}
+
+impl Default for OutlookCalendarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            client_id: None,
+            tenant_id: default_outlook_tenant(),
+            refresh_token: None,
+        }
+    }
+}
+
+/// Apple Calendar (CalDAV) configuration.
+///
+/// Uses app-specific password (not iCloud password).
+/// User generates one at appleid.apple.com.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AppleCalendarConfig {
+    /// Enable Apple Calendar tools.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Apple ID email address.
+    #[serde(default)]
+    pub apple_id: Option<String>,
+    /// App-specific password for CalDAV access.
+    #[serde(default)]
+    pub app_password: Option<String>,
+    /// CalDAV server URL.
+    #[serde(default = "default_apple_caldav_url")]
+    pub caldav_url: String,
+}
+
+fn default_apple_caldav_url() -> String {
+    "https://caldav.icloud.com".into()
+}
+
+impl Default for AppleCalendarConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            apple_id: None,
+            app_password: None,
+            caldav_url: default_apple_caldav_url(),
+        }
+    }
+}
+
+// ── Media API ──────────────────────────────────────────────────
+
+/// Configuration for external media generation APIs (`[media_api]`).
+///
+/// Controls Freepik (image), Suno (music), Runway (video), and
+/// ElevenLabs (TTS voice) integrations. Each sub-section can be
+/// individually enabled and configured with API keys.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MediaApiConfig {
+    /// Freepik API configuration for image generation, editing, upscaling,
+    /// and simple image-to-video conversion.
+    #[serde(default)]
+    pub freepik: FreepikApiConfig,
+
+    /// Suno API configuration for AI music/song generation.
+    #[serde(default)]
+    pub suno: SunoApiConfig,
+
+    /// Runway API configuration for advanced video generation.
+    #[serde(default)]
+    pub runway: RunwayApiConfig,
+
+    /// ElevenLabs API configuration for premium TTS voices.
+    /// Supports dual billing: user-supplied key (free) or platform key (2.2x credits).
+    #[serde(default)]
+    pub elevenlabs: ElevenLabsApiConfig,
+}
+
+impl Default for MediaApiConfig {
+    fn default() -> Self {
+        Self {
+            freepik: FreepikApiConfig::default(),
+            suno: SunoApiConfig::default(),
+            runway: RunwayApiConfig::default(),
+            elevenlabs: ElevenLabsApiConfig::default(),
+        }
+    }
+}
+
+/// Freepik API configuration.
+///
+/// Supports Mystic (image gen), image upscaling (Magnific), relighting,
+/// background removal, and image-to-video conversion.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FreepikApiConfig {
+    /// Enable Freepik media tools.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Freepik API key. Falls back to `FREEPIK_API_KEY` env var.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Base URL for the Freepik API.
+    #[serde(default = "default_freepik_api_url")]
+    pub api_url: String,
+    /// Default image generation model/engine.
+    #[serde(default = "default_freepik_engine")]
+    pub engine: String,
+    /// Default resolution for generated images.
+    #[serde(default = "default_freepik_resolution")]
+    pub resolution: String,
+}
+
+fn default_freepik_api_url() -> String {
+    "https://api.freepik.com".into()
+}
+fn default_freepik_engine() -> String {
+    "magnific_sharpy".into()
+}
+fn default_freepik_resolution() -> String {
+    "2k".into()
+}
+
+impl Default for FreepikApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            api_url: default_freepik_api_url(),
+            engine: default_freepik_engine(),
+            resolution: default_freepik_resolution(),
+        }
+    }
+}
+
+/// Suno API configuration for music generation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SunoApiConfig {
+    /// Enable Suno music generation tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Suno API key. Falls back to `SUNO_API_KEY` env var.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Suno-compatible API base URL (e.g. apibox.erweima.ai proxy).
+    #[serde(default = "default_suno_api_url")]
+    pub api_url: String,
+}
+
+fn default_suno_api_url() -> String {
+    "https://apibox.erweima.ai/api/v1/generate".into()
+}
+
+impl Default for SunoApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            api_url: default_suno_api_url(),
+        }
+    }
+}
+
+/// Runway API configuration for video generation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RunwayApiConfig {
+    /// Enable Runway video generation tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Runway API key. Falls back to `RUNWAY_API_KEY` env var.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Runway API base URL.
+    #[serde(default = "default_runway_api_url")]
+    pub api_url: String,
+    /// Default video generation model.
+    #[serde(default = "default_runway_model")]
+    pub model: String,
+}
+
+fn default_runway_api_url() -> String {
+    "https://api.dev.runwayml.com/v1".into()
+}
+fn default_runway_model() -> String {
+    "gen4_turbo".into()
+}
+
+impl Default for RunwayApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            api_url: default_runway_api_url(),
+            model: default_runway_model(),
+        }
+    }
+}
+
+/// ElevenLabs API configuration for premium TTS voices.
+///
+/// Two billing modes:
+/// - **User key**: User provides their own `api_key` → no credit charge.
+/// - **Platform key**: Operator sets `ADMIN_ELEVENLABS_API_KEY` env var →
+///   user is charged `credit_multiplier` (default 2.2×) credits per request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ElevenLabsApiConfig {
+    /// Enable ElevenLabs premium TTS tool.
+    #[serde(default)]
+    pub enabled: bool,
+    /// User-supplied ElevenLabs API key. Falls back to `ELEVENLABS_API_KEY` env var.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// ElevenLabs API base URL.
+    #[serde(default = "default_elevenlabs_api_url")]
+    pub api_url: String,
+    /// Default voice ID for TTS generation.
+    #[serde(default = "default_elevenlabs_voice_id")]
+    pub default_voice_id: String,
+    /// Default TTS model.
+    #[serde(default = "default_elevenlabs_model")]
+    pub model: String,
+    /// Credit multiplier applied when using the platform (operator) key.
+    /// Set to 0 to disable platform-key billing entirely.
+    #[serde(default = "default_elevenlabs_credit_multiplier")]
+    pub credit_multiplier: f64,
+}
+
+fn default_elevenlabs_api_url() -> String {
+    "https://api.elevenlabs.io/v1".into()
+}
+fn default_elevenlabs_voice_id() -> String {
+    "21m00Tcm4TlvDq8ikWAM".into() // "Rachel" — default female voice
+}
+fn default_elevenlabs_model() -> String {
+    "eleven_multilingual_v2".into()
+}
+fn default_elevenlabs_credit_multiplier() -> f64 {
+    2.2
+}
+
+impl Default for ElevenLabsApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            api_url: default_elevenlabs_api_url(),
+            default_voice_id: default_elevenlabs_voice_id(),
+            model: default_elevenlabs_model(),
+            credit_multiplier: default_elevenlabs_credit_multiplier(),
         }
     }
 }
@@ -7208,6 +7564,8 @@ impl Default for Config {
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
+            media_api: MediaApiConfig::default(),
+            calendar: CalendarConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
@@ -11448,6 +11806,8 @@ ws_url = "ws://127.0.0.1:3002"
             voice: VoiceConfig::default(),
             coding: CodingConfig::default(),
             transcription: TranscriptionConfig::default(),
+            media_api: MediaApiConfig::default(),
+            calendar: CalendarConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
@@ -11838,6 +12198,8 @@ tool_dispatcher = "xml"
             voice: VoiceConfig::default(),
             coding: CodingConfig::default(),
             transcription: TranscriptionConfig::default(),
+            media_api: MediaApiConfig::default(),
+            calendar: CalendarConfig::default(),
             agents_ipc: AgentsIpcConfig::default(),
             mcp: McpConfig::default(),
             model_support_vision: None,
