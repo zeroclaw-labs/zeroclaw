@@ -10,7 +10,7 @@ PLUGINS_DIR="$SCRIPT_DIR/tests/plugins"
 ARTIFACTS_DIR="$PLUGINS_DIR/artifacts"
 TARGET="wasm32-wasip1"
 
-PLUGINS=("echo-plugin" "multi-tool-plugin" "bad-actor-plugin" "http-plugin" "fs-plugin")
+PLUGINS=("echo-plugin" "multi-tool-plugin" "bad-actor-plugin" "http-plugin" "fs-plugin" "channel-plugin")
 
 # Ensure wasm32-wasip1 target is installed
 if ! rustup target list --installed | grep -q "$TARGET"; then
