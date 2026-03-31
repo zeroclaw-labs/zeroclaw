@@ -30,6 +30,8 @@ mod plugin_csharp_entry_point_json_marshalling;
 mod plugin_csharp_extism_pdk_reference;
 mod plugin_csharp_net8_wasi_build;
 mod plugin_csharp_sdk_structure;
+mod plugin_csharp_memory_error_handling;
+mod plugin_csharp_memory_wire_format;
 mod plugin_csharp_messaging_host_function_call;
 mod plugin_csharp_tools_error_throws_exception;
 mod plugin_csharp_tools_exposes_tool_call;
