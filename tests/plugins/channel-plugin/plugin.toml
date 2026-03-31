@@ -1,0 +1,6 @@
+[plugin]
+name = "channel-plugin"
+version = "0.1.0"
+description = "Test channel plugin — implements channel_send and channel_listen exports for integration testing the WasmChannel bridge."
+wasm_path = "channel_plugin.wasm"
+capabilities = ["channel"]

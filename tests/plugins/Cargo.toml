@@ -6,6 +6,7 @@ members = [
     "http-plugin",
     "fs-plugin",
     "sdk-example-plugin",
+    "channel-plugin",
 ]
 resolver = "2"
 
