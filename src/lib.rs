@@ -100,7 +100,7 @@ pub mod providers;
 pub mod rag;
 #[cfg(feature = "desktop")]
 pub mod routines;
-#[cfg(feature = "desktop")]
+#[cfg(any(feature = "desktop", feature = "target-esp32"))]
 pub mod runtime;
 #[cfg(feature = "desktop")]
 pub(crate) mod security;
