@@ -35,56 +35,100 @@
     dead_code
 )]
 
+#[cfg(feature = "desktop")]
 use clap::Subcommand;
+#[cfg(feature = "desktop")]
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "desktop")]
 pub mod agent;
+#[cfg(feature = "desktop")]
 pub(crate) mod approval;
+#[cfg(feature = "desktop")]
 pub(crate) mod auth;
+#[cfg(feature = "desktop")]
 pub mod channels;
+#[cfg(feature = "desktop")]
 pub(crate) mod cli_input;
+#[cfg(feature = "desktop")]
 pub mod commands;
+#[cfg(feature = "desktop")]
 pub mod config;
+#[cfg(feature = "desktop")]
 pub(crate) mod cost;
+#[cfg(feature = "desktop")]
 pub mod cron;
+#[cfg(feature = "desktop")]
 pub(crate) mod daemon;
+#[cfg(feature = "desktop")]
 pub(crate) mod doctor;
+#[cfg(feature = "desktop")]
 pub mod gateway;
+#[cfg(feature = "desktop")]
 pub mod hands;
+#[cfg(feature = "desktop")]
 pub(crate) mod hardware;
+#[cfg(feature = "desktop")]
 pub(crate) mod health;
+#[cfg(feature = "desktop")]
 pub(crate) mod heartbeat;
+#[cfg(feature = "desktop")]
 pub mod hooks;
+#[cfg(feature = "desktop")]
 pub mod i18n;
+#[cfg(feature = "desktop")]
 pub(crate) mod identity;
+#[cfg(feature = "desktop")]
 pub(crate) mod integrations;
+#[cfg(feature = "desktop")]
 pub mod memory;
+#[cfg(feature = "desktop")]
 pub(crate) mod migration;
+#[cfg(feature = "desktop")]
 pub(crate) mod multimodal;
+#[cfg(feature = "desktop")]
 pub mod nodes;
+#[cfg(feature = "desktop")]
 pub mod observability;
+#[cfg(feature = "desktop")]
 pub(crate) mod onboard;
+#[cfg(feature = "desktop")]
 pub mod peripherals;
+#[cfg(feature = "desktop")]
 pub mod providers;
+#[cfg(feature = "desktop")]
 pub mod rag;
+#[cfg(feature = "desktop")]
 pub mod routines;
+#[cfg(any(feature = "desktop", feature = "target-esp32"))]
 pub mod runtime;
+#[cfg(feature = "desktop")]
 pub(crate) mod security;
+#[cfg(feature = "desktop")]
 pub(crate) mod service;
+#[cfg(feature = "desktop")]
 pub(crate) mod skills;
+#[cfg(feature = "desktop")]
 pub mod sop;
+#[cfg(feature = "desktop")]
 pub mod tools;
+#[cfg(feature = "desktop")]
 pub(crate) mod trust;
+#[cfg(feature = "desktop")]
 pub(crate) mod tunnel;
+#[cfg(feature = "desktop")]
 pub(crate) mod util;
+#[cfg(feature = "desktop")]
 pub mod verifiable_intent;
 
 #[cfg(feature = "plugins-wasm")]
 pub mod plugins;
 
+#[cfg(feature = "desktop")]
 pub use config::Config;
 
 /// Gateway management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GatewayCommands {
     /// Start the gateway server (default if no subcommand specified)
@@ -151,6 +195,7 @@ Examples:
 }
 
 /// Service management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
     /// Install daemon service unit for auto-start and restart
@@ -177,6 +222,7 @@ pub enum ServiceCommands {
 }
 
 /// Channel management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ChannelCommands {
     /// List all configured channels
@@ -251,6 +297,7 @@ Examples:
 }
 
 /// Skills management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillCommands {
     /// List all installed skills
@@ -281,6 +328,7 @@ pub enum SkillCommands {
 }
 
 /// Migration subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MigrateCommands {
     /// Import memory from an `OpenClaw` workspace into this `Hrafn` workspace
@@ -296,6 +344,7 @@ pub enum MigrateCommands {
 }
 
 /// Cron subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CronCommands {
     /// List all scheduled tasks
@@ -439,6 +488,7 @@ Examples:
 }
 
 /// Memory management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryCommands {
     /// List memory entries with optional filters
@@ -478,6 +528,7 @@ pub enum MemoryCommands {
 }
 
 /// Integration subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IntegrationCommands {
     /// Show details about a specific integration
@@ -488,6 +539,7 @@ pub enum IntegrationCommands {
 }
 
 /// Hardware discovery subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HardwareCommands {
     /// Enumerate USB devices (VID/PID) and show known boards
@@ -532,6 +584,7 @@ Examples:
 }
 
 /// Peripheral (hardware) management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PeripheralCommands {
     /// List configured peripherals
@@ -583,6 +636,7 @@ Examples:
 }
 
 /// SOP management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SopCommands {
     /// List loaded SOPs

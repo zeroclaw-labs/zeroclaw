@@ -1,14 +1,24 @@
+#[cfg(feature = "desktop")]
 pub mod docker;
+#[cfg(feature = "target-esp32")]
+pub mod esp32;
+#[cfg(feature = "desktop")]
 pub mod native;
 pub mod traits;
 
+#[cfg(feature = "desktop")]
 pub use docker::DockerRuntime;
+#[cfg(feature = "target-esp32")]
+pub use esp32::Esp32Runtime;
+#[cfg(feature = "desktop")]
 pub use native::NativeRuntime;
 pub use traits::RuntimeAdapter;
 
+#[cfg(feature = "desktop")]
 use crate::config::RuntimeConfig;
 
 /// Factory: create the right runtime from config
+#[cfg(feature = "desktop")]
 pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeAdapter>> {
     match config.kind.as_str() {
         "native" => Ok(Box::new(NativeRuntime::new())),
@@ -24,6 +34,7 @@ pub fn create_runtime(config: &RuntimeConfig) -> anyhow::Result<Box<dyn RuntimeA
 }
 
 #[cfg(test)]
+#[cfg(feature = "desktop")]
 mod tests {
     use super::*;
 
