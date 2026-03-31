@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "hrafn"
-version = "0.6.5"
+version = "0.1.0"
 edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"

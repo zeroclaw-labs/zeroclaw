@@ -210,6 +210,7 @@ jobs:
             artifact: hrafn
             ext: tar.gz
             ndk: true
+            features: channel-matrix,channel-lark
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: hrafn.exe
@@ -246,7 +247,7 @@ jobs:
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --features "${{ env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
+          cargo build --release --locked --features "${{ matrix.features || env.RELEASE_CARGO_FEATURES }}" --target ${{ matrix.target }}
 
       - name: Check binary size
         shell: bash
