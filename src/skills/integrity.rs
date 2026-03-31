@@ -39,10 +39,7 @@ pub enum VerifyResult {
     /// Skill is not present in the lockfile.
     NotLocked,
     /// Hash does not match the lockfile entry.
-    Mismatch {
-        expected: String,
-        actual: String,
-    },
+    Mismatch { expected: String, actual: String },
 }
 
 /// Compute the SHA-256 hex digest of a byte slice.
@@ -72,8 +69,7 @@ pub fn read_lockfile(skills_dir: &Path) -> Result<SkillsLockfile> {
 /// Write the lockfile to disk.
 pub fn write_lockfile(skills_dir: &Path, lockfile: &SkillsLockfile) -> Result<()> {
     let path = lockfile_path(skills_dir);
-    let content = serde_json::to_string_pretty(lockfile)
-        .context("failed to serialize lockfile")?;
+    let content = serde_json::to_string_pretty(lockfile).context("failed to serialize lockfile")?;
     fs::write(&path, content.as_bytes())
         .with_context(|| format!("failed to write lockfile at {}", path.display()))
 }
@@ -257,7 +253,11 @@ mod tests {
 
         let skill_b = skills_dir.join("beta");
         fs::create_dir_all(&skill_b).unwrap();
-        fs::write(skill_b.join("SKILL.toml"), b"[skill]\nname = \"beta\"\ndescription = \"B\"\n").unwrap();
+        fs::write(
+            skill_b.join("SKILL.toml"),
+            b"[skill]\nname = \"beta\"\ndescription = \"B\"\n",
+        )
+        .unwrap();
 
         let lockfile = lock_all_skills(skills_dir).unwrap();
         assert_eq!(lockfile.skills.len(), 2);

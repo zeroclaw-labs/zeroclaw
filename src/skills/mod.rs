@@ -11,11 +11,11 @@ use std::time::{Duration, SystemTime};
 use zip::ZipArchive;
 
 mod audit;
-pub mod integrity;
 #[cfg(feature = "skill-creation")]
 pub mod creator;
 #[cfg(feature = "skill-creation")]
 pub mod improver;
+pub mod integrity;
 pub mod testing;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
@@ -246,7 +246,9 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
                     tracing::warn!(
                         "skill '{}' failed integrity check: expected SHA-256 {}, got {} — \
                          run `hrafn skills lock` after reviewing changes",
-                        skill_name, expected, actual,
+                        skill_name,
+                        expected,
+                        actual,
                     );
                     eprintln!(
                         "warning: skill '{}' skipped: integrity mismatch (expected {}, got {}). \
@@ -258,10 +260,7 @@ pub fn load_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Vec
                     continue;
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        "skill '{}' integrity check failed: {err}",
-                        skill_name,
-                    );
+                    tracing::warn!("skill '{}' integrity check failed: {err}", skill_name,);
                     continue;
                 }
             }
@@ -347,15 +346,14 @@ fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Ve
             match integrity::verify_skill(&lockfile, skill_name, &manifest_file) {
                 Ok(integrity::VerifyResult::Ok) => {}
                 Ok(integrity::VerifyResult::NotLocked) => {
-                    tracing::warn!(
-                        "open-skill '{}' is not present in skills.lock",
-                        skill_name,
-                    );
+                    tracing::warn!("open-skill '{}' is not present in skills.lock", skill_name,);
                 }
                 Ok(integrity::VerifyResult::Mismatch { expected, actual }) => {
                     tracing::warn!(
                         "open-skill '{}' failed integrity check: expected SHA-256 {}, got {}",
-                        skill_name, expected, actual,
+                        skill_name,
+                        expected,
+                        actual,
                     );
                     eprintln!(
                         "warning: open-skill '{}' skipped: integrity mismatch (expected {}, got {}).",
@@ -366,10 +364,7 @@ fn load_open_skills_from_directory(skills_dir: &Path, allow_scripts: bool) -> Ve
                     continue;
                 }
                 Err(err) => {
-                    tracing::warn!(
-                        "open-skill '{}' integrity check failed: {err}",
-                        skill_name,
-                    );
+                    tracing::warn!("open-skill '{}' integrity check failed: {err}", skill_name,);
                     continue;
                 }
             }
@@ -1574,7 +1569,10 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 } else if let Err(err) = integrity::write_lockfile(&skills_path, &lockfile) {
                     tracing::warn!("failed to write skills.lock: {err}");
                 } else {
-                    println!("  {} skills.lock updated.", console::style("✓").green().bold());
+                    println!(
+                        "  {} skills.lock updated.",
+                        console::style("✓").green().bold()
+                    );
                 }
             }
 
@@ -1677,7 +1675,12 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 integrity::lockfile_path(&skills_path).display(),
             );
             for (name, entry) in &lockfile.skills {
-                println!("    {} {} ({})", console::style("·").dim(), name, &entry.sha256[..12]);
+                println!(
+                    "    {} {} ({})",
+                    console::style("·").dim(),
+                    name,
+                    &entry.sha256[..12]
+                );
             }
             Ok(())
         }
@@ -1699,11 +1702,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             for (name, result) in &results {
                 match result {
                     integrity::VerifyResult::Ok => {
-                        println!(
-                            "  {} {}",
-                            console::style("✓").green().bold(),
-                            name,
-                        );
+                        println!("  {} {}", console::style("✓").green().bold(), name,);
                     }
                     integrity::VerifyResult::NotLocked => {
                         println!(
