@@ -52,8 +52,8 @@ async fn sensitive_input_params_are_redacted_in_audit_log() {
 
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
-    let plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate echo plugin");
+    let plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate echo plugin");
     let plugin = Arc::new(Mutex::new(plugin));
 
     let tool = zeroclaw::plugins::wasm_tool::WasmTool::new(
@@ -138,8 +138,8 @@ async fn raw_sensitive_values_absent_from_full_audit_line() {
 
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
-    let plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate echo plugin");
+    let plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate echo plugin");
     let plugin = Arc::new(Mutex::new(plugin));
 
     let tool = zeroclaw::plugins::wasm_tool::WasmTool::new(
@@ -191,9 +191,15 @@ fn redact_sensitive_params_handles_known_keys() {
     let obj = redacted.as_object().expect("should be object");
 
     // Sensitive keys are redacted
-    assert_eq!(obj["api_key"].as_str().unwrap(), redact("sk-live-1234567890"));
+    assert_eq!(
+        obj["api_key"].as_str().unwrap(),
+        redact("sk-live-1234567890")
+    );
     assert_eq!(obj["password"].as_str().unwrap(), redact("hunter2hunter2"));
-    assert_eq!(obj["secret"].as_str().unwrap(), redact("my-deep-secret-val"));
+    assert_eq!(
+        obj["secret"].as_str().unwrap(),
+        redact("my-deep-secret-val")
+    );
     assert_eq!(obj["token"].as_str().unwrap(), redact("tok-abcdefghijk"));
 
     // Non-sensitive keys are untouched

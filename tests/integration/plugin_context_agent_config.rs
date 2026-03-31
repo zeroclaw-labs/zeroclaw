@@ -61,7 +61,11 @@ fn context_agent_config_registered_when_enabled() {
     let fns = registry.build_functions(&manifest);
     let names: Vec<&str> = fns.iter().map(|f| f.name()).collect();
 
-    assert_eq!(fns.len(), 1, "agent_config-only context should yield 1 function");
+    assert_eq!(
+        fns.len(),
+        1,
+        "agent_config-only context should yield 1 function"
+    );
     assert!(
         names.contains(&"context_agent_config"),
         "expected context_agent_config, got: {names:?}"

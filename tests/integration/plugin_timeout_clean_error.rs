@@ -147,10 +147,16 @@ async fn plugin_is_still_usable_after_timeout() {
     );
 
     // First call: times out.
-    let r1 = wasm_tool.execute(json!({})).await.expect("first call should return Ok");
+    let r1 = wasm_tool
+        .execute(json!({}))
+        .await
+        .expect("first call should return Ok");
     assert!(!r1.success, "first call should fail with timeout");
 
     // Second call: also times out, but crucially does NOT panic, deadlock, or crash.
-    let r2 = wasm_tool.execute(json!({})).await.expect("second call should return Ok");
+    let r2 = wasm_tool
+        .execute(json!({}))
+        .await
+        .expect("second call should return Ok");
     assert!(!r2.success, "second call should also fail cleanly");
 }

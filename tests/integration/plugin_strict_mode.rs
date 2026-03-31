@@ -69,10 +69,7 @@ fn strict_rejects_wildcard_among_valid_hosts() {
 
 #[test]
 fn strict_allows_explicit_hosts() {
-    let hosts = vec![
-        "api.example.com".to_string(),
-        "cdn.example.com".to_string(),
-    ];
+    let hosts = vec!["api.example.com".to_string(), "cdn.example.com".to_string()];
     let result = validate_allowed_hosts("good-plugin", &hosts, NetworkSecurityLevel::Strict);
 
     assert!(
@@ -172,10 +169,7 @@ fn strict_allows_absolute_path_inside_workspace() {
     std::fs::create_dir_all(&inner).ok();
 
     let mut allowed = HashMap::new();
-    allowed.insert(
-        "/data".to_string(),
-        inner.to_string_lossy().into_owned(),
-    );
+    allowed.insert("/data".to_string(), inner.to_string_lossy().into_owned());
 
     let result = validate_workspace_paths("abs-inner-plugin", &allowed, &workspace);
 

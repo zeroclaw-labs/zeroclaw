@@ -108,7 +108,9 @@ parameters_schema = { type = "object" }
         .split("Network access:")
         .nth(1)
         .expect("should have Network access section");
-    let section_end = network_section.find("\n\n").unwrap_or(network_section.len());
+    let section_end = network_section
+        .find("\n\n")
+        .unwrap_or(network_section.len());
     let section = &network_section[..section_end];
 
     assert!(

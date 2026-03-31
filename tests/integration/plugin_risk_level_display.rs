@@ -158,16 +158,25 @@ parameters_schema = { type = "object" }
     let output = format_audit_summary(&manifest);
 
     // All three tools should appear under the "Risk levels:" heading
-    assert!(output.contains("Risk levels:"), "should have Risk levels heading");
+    assert!(
+        output.contains("Risk levels:"),
+        "should have Risk levels heading"
+    );
 
     let search_line = output.lines().find(|l| l.contains("search")).unwrap();
     let update_line = output.lines().find(|l| l.contains("update")).unwrap();
     let destroy_line = output.lines().find(|l| l.contains("destroy")).unwrap();
 
     assert!(search_line.contains("low"), "search should be low risk");
-    assert!(!search_line.contains("requires approval"), "low should not require approval");
+    assert!(
+        !search_line.contains("requires approval"),
+        "low should not require approval"
+    );
 
-    assert!(update_line.contains("medium"), "update should be medium risk");
+    assert!(
+        update_line.contains("medium"),
+        "update should be medium risk"
+    );
     assert!(
         update_line.contains("requires approval in supervised mode"),
         "medium should require approval"

@@ -45,10 +45,22 @@ fn from_config_maps_paranoid() {
 
 #[test]
 fn from_config_is_case_insensitive() {
-    assert_eq!(NetworkSecurityLevel::from_config("STRICT"), NetworkSecurityLevel::Strict);
-    assert_eq!(NetworkSecurityLevel::from_config("Paranoid"), NetworkSecurityLevel::Paranoid);
-    assert_eq!(NetworkSecurityLevel::from_config("Relaxed"), NetworkSecurityLevel::Relaxed);
-    assert_eq!(NetworkSecurityLevel::from_config("DEFAULT"), NetworkSecurityLevel::Default);
+    assert_eq!(
+        NetworkSecurityLevel::from_config("STRICT"),
+        NetworkSecurityLevel::Strict
+    );
+    assert_eq!(
+        NetworkSecurityLevel::from_config("Paranoid"),
+        NetworkSecurityLevel::Paranoid
+    );
+    assert_eq!(
+        NetworkSecurityLevel::from_config("Relaxed"),
+        NetworkSecurityLevel::Relaxed
+    );
+    assert_eq!(
+        NetworkSecurityLevel::from_config("DEFAULT"),
+        NetworkSecurityLevel::Default
+    );
 }
 
 // ── Unknown values fall back to Default ──────────────────────────────

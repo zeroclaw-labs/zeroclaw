@@ -77,17 +77,17 @@ async fn subsequent_calls_after_limit_continue_to_be_rejected() {
     // Use up the single action.
     let first = tool.execute(json!({})).await.unwrap();
     assert!(
-        first.error.as_deref().map_or(true, |e| !e.contains("Rate limit")),
+        first
+            .error
+            .as_deref()
+            .map_or(true, |e| !e.contains("Rate limit")),
         "first call should not be rate-limited"
     );
 
     // Verify that multiple subsequent calls are ALL rejected, not just the first.
     for i in 0..5 {
         let result = tool.execute(json!({})).await.unwrap();
-        assert!(
-            !result.success,
-            "call {i} after budget exhausted must fail"
-        );
+        assert!(!result.success, "call {i} after budget exhausted must fail");
         let err = result.error.as_deref().expect("error must be set");
         assert!(
             err.contains("Rate limit"),

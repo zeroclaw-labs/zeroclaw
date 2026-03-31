@@ -38,10 +38,7 @@ fn sdk_example_plugin_has_source() {
     let lib_rs = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(EXAMPLE_DIR)
         .join("src/lib.rs");
-    assert!(
-        lib_rs.is_file(),
-        "SDK example plugin is missing src/lib.rs"
-    );
+    assert!(lib_rs.is_file(), "SDK example plugin is missing src/lib.rs");
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +121,11 @@ fn sdk_example_uses_at_least_two_sdk_modules() {
     if src.contains("send_message") || src.contains("get_channels") || src.contains("messaging::") {
         modules_used += 1;
     }
-    if src.contains("session") || src.contains("user_identity") || src.contains("agent_config") || src.contains("context::") {
+    if src.contains("session")
+        || src.contains("user_identity")
+        || src.contains("agent_config")
+        || src.contains("context::")
+    {
         modules_used += 1;
     }
     assert!(
@@ -140,8 +141,7 @@ fn sdk_example_uses_at_least_two_sdk_modules() {
 
 #[test]
 fn sdk_example_in_test_plugins_workspace() {
-    let ws_toml = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/plugins/Cargo.toml");
+    let ws_toml = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/plugins/Cargo.toml");
     let toml = std::fs::read_to_string(&ws_toml).expect("failed to read tests/plugins/Cargo.toml");
     assert!(
         toml.contains("sdk-example-plugin"),

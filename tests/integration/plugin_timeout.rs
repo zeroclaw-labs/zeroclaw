@@ -24,11 +24,10 @@ fn infinite_loop_is_killed_by_timeout() {
 
     let timeout = Duration::from_secs(2);
 
-    let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
-        .with_timeout(timeout);
+    let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)]).with_timeout(timeout);
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate bad-actor plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate bad-actor plugin");
 
     let start = Instant::now();
     let result = plugin.call::<&str, &str>("tool_infinite_loop", "{}");

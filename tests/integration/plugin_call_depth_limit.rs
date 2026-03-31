@@ -83,7 +83,11 @@ async fn depth_at_limit_is_blocked() {
 
     assert!(!result.success, "delegation at max_depth should fail");
     assert!(
-        result.error.as_deref().unwrap_or("").contains("depth limit"),
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("depth limit"),
         "error should mention depth limit"
     );
 }
@@ -103,7 +107,11 @@ async fn depth_above_limit_is_blocked() {
 
     assert!(!result.success, "delegation beyond max_depth should fail");
     assert!(
-        result.error.as_deref().unwrap_or("").contains("depth limit"),
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("depth limit"),
         "error should mention depth limit"
     );
 }
@@ -121,7 +129,10 @@ async fn depth_limit_error_includes_values() {
         .unwrap();
 
     let err = result.error.expect("should have error");
-    assert!(err.contains("5/5"), "error should show depth/max (5/5), got: {err}");
+    assert!(
+        err.contains("5/5"),
+        "error should show depth/max (5/5), got: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -151,12 +162,13 @@ async fn depth_5_boundary_comprehensive() {
         .execute(json!({"agent": "worker", "prompt": "test"}))
         .await
         .unwrap();
+    assert!(!result.success, "depth 5 with max_depth 5 MUST be blocked");
     assert!(
-        !result.success,
-        "depth 5 with max_depth 5 MUST be blocked"
-    );
-    assert!(
-        result.error.as_deref().unwrap_or("").contains("depth limit"),
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("depth limit"),
         "depth 5 should produce depth limit error"
     );
 }

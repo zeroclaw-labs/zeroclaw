@@ -52,11 +52,17 @@ async fn plugin_calls_count_against_rate_limit() {
     // First 3 calls should be allowed (they'll fail at the WASM level because
     // there's no export, but the rate limiter should still record each one).
     for i in 0..3 {
-        let result = tool.execute(json!({})).await.expect("execute should return Ok");
+        let result = tool
+            .execute(json!({}))
+            .await
+            .expect("execute should return Ok");
         // The call fails because the minimal WASM has no exports, but it was
         // NOT blocked by the rate limiter — the error comes from Extism.
         assert!(
-            result.error.as_deref().map_or(true, |e| !e.contains("Rate limit")),
+            result
+                .error
+                .as_deref()
+                .map_or(true, |e| !e.contains("Rate limit")),
             "call {} should not be rate-limited, got: {:?}",
             i,
             result.error
@@ -64,11 +70,11 @@ async fn plugin_calls_count_against_rate_limit() {
     }
 
     // 4th call should be blocked by the rate limiter before reaching WASM.
-    let result = tool.execute(json!({})).await.expect("execute should return Ok");
-    assert!(
-        !result.success,
-        "4th call must fail"
-    );
+    let result = tool
+        .execute(json!({}))
+        .await
+        .expect("execute should return Ok");
+    assert!(!result.success, "4th call must fail");
     let err = result.error.as_deref().expect("error must be set");
     assert!(
         err.contains("Rate limit"),
@@ -101,14 +107,18 @@ async fn rate_limit_shared_across_plugin_tools() {
     // tool_a uses 1 action
     let r1 = tool_a.execute(json!({})).await.unwrap();
     assert!(
-        r1.error.as_deref().map_or(true, |e| !e.contains("Rate limit")),
+        r1.error
+            .as_deref()
+            .map_or(true, |e| !e.contains("Rate limit")),
         "first call should not be rate-limited"
     );
 
     // tool_b uses 1 action (total: 2, at limit)
     let r2 = tool_b.execute(json!({})).await.unwrap();
     assert!(
-        r2.error.as_deref().map_or(true, |e| !e.contains("Rate limit")),
+        r2.error
+            .as_deref()
+            .map_or(true, |e| !e.contains("Rate limit")),
         "second call should not be rate-limited"
     );
 
@@ -133,7 +143,10 @@ async fn rate_limited_response_has_empty_output() {
 
     let result = tool.execute(json!({})).await.unwrap();
     assert!(!result.success);
-    assert!(result.output.is_empty(), "rate-limited output should be empty");
+    assert!(
+        result.output.is_empty(),
+        "rate-limited output should be empty"
+    );
     assert!(
         result.error.as_deref().unwrap().contains("Rate limit"),
         "error should mention rate limit"

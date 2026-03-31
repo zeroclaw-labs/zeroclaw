@@ -93,7 +93,10 @@ fn no_host_capabilities_denies_all_memory_functions() {
 
     let fns = registry.build_functions(&manifest);
     assert_no_memory_functions(&fns, "no host_capabilities");
-    assert!(fns.is_empty(), "no host capabilities should yield zero functions");
+    assert!(
+        fns.is_empty(),
+        "no host capabilities should yield zero functions"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -132,7 +135,11 @@ fn messaging_only_denies_memory_functions() {
 
     let fns = registry.build_functions(&manifest);
     assert_no_memory_functions(&fns, "messaging only");
-    assert_eq!(fns.len(), 2, "zeroclaw_send_message + zeroclaw_get_channels should be registered");
+    assert_eq!(
+        fns.len(),
+        2,
+        "zeroclaw_send_message + zeroclaw_get_channels should be registered"
+    );
 }
 
 // ---------------------------------------------------------------------------

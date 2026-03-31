@@ -106,9 +106,9 @@ fn api_plugins_each_plugin_has_status() {
     let response = build_api_response(&host);
 
     for plugin in response["plugins"].as_array().unwrap() {
-        let status = plugin["status"]
-            .as_str()
-            .unwrap_or_else(|| panic!("each plugin must have a string 'status' field, got: {plugin}"));
+        let status = plugin["status"].as_str().unwrap_or_else(|| {
+            panic!("each plugin must have a string 'status' field, got: {plugin}")
+        });
         assert!(
             status == "loaded" || status == "discovered",
             "status must be 'loaded' or 'discovered', got: '{status}'"
@@ -155,9 +155,18 @@ fn api_plugins_echo_plugin_has_expected_shape() {
 
     assert_eq!(echo["name"], "echo-plugin");
     assert_eq!(echo["version"], "0.1.0");
-    assert!(echo["description"].is_string(), "echo-plugin should have a description");
-    assert!(echo["status"].is_string(), "echo-plugin should have a status");
-    assert!(echo["capabilities"].is_array(), "echo-plugin should have capabilities");
+    assert!(
+        echo["description"].is_string(),
+        "echo-plugin should have a description"
+    );
+    assert!(
+        echo["status"].is_string(),
+        "echo-plugin should have a status"
+    );
+    assert!(
+        echo["capabilities"].is_array(),
+        "echo-plugin should have capabilities"
+    );
 
     let tools = echo["tools"].as_array().unwrap();
     assert!(

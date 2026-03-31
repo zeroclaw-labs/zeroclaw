@@ -171,7 +171,12 @@ async fn registry_memory_store_preserves_category() {
         .unwrap();
     registry
         .memory
-        .store("k3", "v3", MemoryCategory::Custom("plugin_data".into()), None)
+        .store(
+            "k3",
+            "v3",
+            MemoryCategory::Custom("plugin_data".into()),
+            None,
+        )
         .await
         .unwrap();
 
@@ -241,7 +246,11 @@ fn memory_write_function_registered_when_write_capability_enabled() {
 
     let fns = registry.build_functions(&manifest);
     // With read=false, write=true we expect two functions: store + forget
-    assert_eq!(fns.len(), 2, "write-only capability should yield 2 functions (store + forget)");
+    assert_eq!(
+        fns.len(),
+        2,
+        "write-only capability should yield 2 functions (store + forget)"
+    );
 }
 
 #[test]
@@ -291,8 +300,5 @@ fn no_memory_functions_when_no_memory_capability() {
     let manifest: PluginManifest = toml::from_str(toml_str).expect("valid manifest TOML");
 
     let fns = registry.build_functions(&manifest);
-    assert!(
-        fns.is_empty(),
-        "no memory capability => no host functions"
-    );
+    assert!(fns.is_empty(), "no memory capability => no host functions");
 }

@@ -4,7 +4,9 @@
 //! security level without producing warnings, and that the relaxed level does
 //! not enforce the plugin allowlist or workspace path restrictions.
 
-use zeroclaw::plugins::loader::{validate_allowed_hosts, validate_plugin_allowlist, NetworkSecurityLevel};
+use zeroclaw::plugins::loader::{
+    validate_allowed_hosts, validate_plugin_allowlist, NetworkSecurityLevel,
+};
 
 // ── Relaxed mode allows wildcard hosts ──────────────────────────────
 
@@ -52,10 +54,7 @@ fn relaxed_allows_multiple_wildcards_among_hosts() {
 
 #[test]
 fn relaxed_allows_explicit_hosts() {
-    let hosts = vec![
-        "api.example.com".to_string(),
-        "cdn.example.com".to_string(),
-    ];
+    let hosts = vec!["api.example.com".to_string(), "cdn.example.com".to_string()];
     let result = validate_allowed_hosts("my-plugin", &hosts, NetworkSecurityLevel::Relaxed);
 
     assert!(
@@ -85,10 +84,7 @@ fn strict_rejects_same_wildcard_that_relaxed_allows() {
     let relaxed_result = validate_allowed_hosts("my-plugin", &hosts, NetworkSecurityLevel::Relaxed);
     let strict_result = validate_allowed_hosts("my-plugin", &hosts, NetworkSecurityLevel::Strict);
 
-    assert!(
-        relaxed_result.is_ok(),
-        "relaxed should allow wildcard"
-    );
+    assert!(relaxed_result.is_ok(), "relaxed should allow wildcard");
     assert!(
         strict_result.is_err(),
         "strict should reject the same wildcard that relaxed allows"
@@ -100,12 +96,10 @@ fn paranoid_rejects_same_wildcard_that_relaxed_allows() {
     let hosts = vec!["*".to_string()];
 
     let relaxed_result = validate_allowed_hosts("my-plugin", &hosts, NetworkSecurityLevel::Relaxed);
-    let paranoid_result = validate_allowed_hosts("my-plugin", &hosts, NetworkSecurityLevel::Paranoid);
+    let paranoid_result =
+        validate_allowed_hosts("my-plugin", &hosts, NetworkSecurityLevel::Paranoid);
 
-    assert!(
-        relaxed_result.is_ok(),
-        "relaxed should allow bare wildcard"
-    );
+    assert!(relaxed_result.is_ok(), "relaxed should allow bare wildcard");
     assert!(
         paranoid_result.is_err(),
         "paranoid should reject the same wildcard that relaxed allows"
@@ -129,8 +123,7 @@ fn relaxed_does_not_enforce_allowlist() {
 #[test]
 fn relaxed_does_not_enforce_empty_allowlist() {
     let allowed: Vec<String> = vec![];
-    let result =
-        validate_plugin_allowlist("any-plugin", &allowed, NetworkSecurityLevel::Relaxed);
+    let result = validate_plugin_allowlist("any-plugin", &allowed, NetworkSecurityLevel::Relaxed);
 
     assert!(
         result.is_ok(),
@@ -148,9 +141,18 @@ fn relaxed_config_string_maps_to_relaxed_level() {
 
 #[test]
 fn relaxed_config_string_case_insensitive() {
-    assert_eq!(NetworkSecurityLevel::from_config("Relaxed"), NetworkSecurityLevel::Relaxed);
-    assert_eq!(NetworkSecurityLevel::from_config("RELAXED"), NetworkSecurityLevel::Relaxed);
-    assert_eq!(NetworkSecurityLevel::from_config("rElAxEd"), NetworkSecurityLevel::Relaxed);
+    assert_eq!(
+        NetworkSecurityLevel::from_config("Relaxed"),
+        NetworkSecurityLevel::Relaxed
+    );
+    assert_eq!(
+        NetworkSecurityLevel::from_config("RELAXED"),
+        NetworkSecurityLevel::Relaxed
+    );
+    assert_eq!(
+        NetworkSecurityLevel::from_config("rElAxEd"),
+        NetworkSecurityLevel::Relaxed
+    );
 }
 
 #[test]

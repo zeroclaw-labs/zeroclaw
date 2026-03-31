@@ -24,20 +24,16 @@ fn http_plugin_fetches_from_allowed_host() {
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(10))
         .with_allowed_hosts(["example.com"].iter().map(|s| s.to_string()))
-        .with_config(
-            [("base_url", "http://example.com"), ("auth_token", "unused")]
-                .into_iter(),
-        );
+        .with_config([("base_url", "http://example.com"), ("auth_token", "unused")].into_iter());
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate http-plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate http-plugin");
 
     let output = plugin
         .call::<&str, &str>("tool_http_fetch", "{}")
         .expect("tool_http_fetch call failed");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(output).expect("output is not valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(output).expect("output is not valid JSON");
 
     assert_eq!(
         parsed["status_code"].as_u64(),
@@ -45,13 +41,8 @@ fn http_plugin_fetches_from_allowed_host() {
         "expected status_code=200, got: {parsed}"
     );
 
-    let body = parsed["body"]
-        .as_str()
-        .expect("body should be a string");
-    assert!(
-        !body.is_empty(),
-        "expected non-empty body from example.com"
-    );
+    let body = parsed["body"].as_str().expect("body should be a string");
+    assert!(!body.is_empty(), "expected non-empty body from example.com");
     assert!(
         body.contains("Example Domain"),
         "expected body to contain 'Example Domain', got: {body:.200}"

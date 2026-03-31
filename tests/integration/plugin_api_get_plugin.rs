@@ -110,10 +110,11 @@ fn api_plugin_detail_has_tools_with_full_schema() {
     let info = get_echo_plugin();
     let detail = build_plugin_detail(&info);
 
-    let tools = detail["tools"]
-        .as_array()
-        .expect("tools must be an array");
-    assert!(!tools.is_empty(), "echo-plugin should have at least one tool");
+    let tools = detail["tools"].as_array().expect("tools must be an array");
+    assert!(
+        !tools.is_empty(),
+        "echo-plugin should have at least one tool"
+    );
 
     let tool_echo = tools
         .iter()
@@ -122,9 +123,15 @@ fn api_plugin_detail_has_tools_with_full_schema() {
 
     // Full tool schema includes name, description, export, risk_level
     assert!(tool_echo["name"].is_string(), "tool must have name");
-    assert!(tool_echo["description"].is_string(), "tool must have description");
+    assert!(
+        tool_echo["description"].is_string(),
+        "tool must have description"
+    );
     assert!(tool_echo["export"].is_string(), "tool must have export");
-    assert!(tool_echo["risk_level"].is_string(), "tool must have risk_level");
+    assert!(
+        tool_echo["risk_level"].is_string(),
+        "tool must have risk_level"
+    );
 }
 
 #[test]

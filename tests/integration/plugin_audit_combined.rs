@@ -51,8 +51,8 @@ async fn successful_call_logs_correct_fields_and_redacts_sensitive_input() {
 
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
-    let plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate echo plugin");
+    let plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate echo plugin");
     let plugin = Arc::new(Mutex::new(plugin));
 
     let tool = zeroclaw::plugins::wasm_tool::WasmTool::new(
@@ -154,8 +154,8 @@ async fn successful_call_logs_correct_fields_and_redacts_sensitive_input() {
     );
 
     // Raw secrets must not appear anywhere in the full log line
-    let raw_log = std::fs::read_to_string(tmp.path().join("audit.jsonl"))
-        .expect("should read audit log");
+    let raw_log =
+        std::fs::read_to_string(tmp.path().join("audit.jsonl")).expect("should read audit log");
     assert!(
         !raw_log.contains(secret_api_key),
         "raw audit log must not contain full api_key"
@@ -211,10 +211,7 @@ async fn failed_call_logs_failure_status_and_correct_fields() {
     let entry = &events[0];
 
     // Event type
-    assert_eq!(
-        entry["event_type"].as_str(),
-        Some("plugin_execution"),
-    );
+    assert_eq!(entry["event_type"].as_str(), Some("plugin_execution"),);
 
     // Plugin name, version, tool name
     assert_eq!(
@@ -262,8 +259,8 @@ async fn failed_call_logs_failure_status_and_correct_fields() {
     );
 
     // Full log line must not contain raw secret
-    let raw_log = std::fs::read_to_string(tmp.path().join("audit.jsonl"))
-        .expect("should read audit log");
+    let raw_log =
+        std::fs::read_to_string(tmp.path().join("audit.jsonl")).expect("should read audit log");
     assert!(
         !raw_log.contains(secret_token),
         "raw audit log must not contain full token"

@@ -31,7 +31,8 @@ fn diagnose_plugin_reports_invalid_manifest_with_parse_error() {
 
     // 3. The error message includes the parse error details (format!(..., e))
     assert!(
-        dp_body.contains("invalid manifest.toml: {e}") || dp_body.contains("invalid plugin.toml: {e}"),
+        dp_body.contains("invalid manifest.toml: {e}")
+            || dp_body.contains("invalid plugin.toml: {e}"),
         "diagnose_plugin() must include the parse error in the diagnostic message"
     );
 

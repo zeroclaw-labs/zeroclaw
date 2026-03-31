@@ -16,14 +16,8 @@ use zeroclaw::plugins::resolve_plugin_config;
 #[test]
 fn missing_config_error_does_not_leak_supplied_values() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
-    manifest_config.insert(
-        "db_url".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
+    manifest_config.insert("db_url".to_string(), serde_json::json!({"required": true}));
 
     // Supply api_key but not db_url — the error should mention db_url (the missing key)
     // but must NOT include the value of api_key.
@@ -52,14 +46,8 @@ fn missing_config_error_does_not_leak_supplied_values() {
 #[test]
 fn missing_config_error_does_not_leak_any_supplied_value() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
-    manifest_config.insert(
-        "db_url".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
+    manifest_config.insert("db_url".to_string(), serde_json::json!({"required": true}));
     manifest_config.insert(
         "webhook_secret".to_string(),
         serde_json::json!({"required": true}),
@@ -99,14 +87,8 @@ fn missing_config_error_does_not_leak_any_supplied_value() {
 #[test]
 fn missing_config_error_does_not_leak_encrypted_values() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
-    manifest_config.insert(
-        "token".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
+    manifest_config.insert("token".to_string(), serde_json::json!({"required": true}));
 
     let encrypted_value = "enc2:deadbeefcafebabe1234567890abcdef";
     let mut config_values: HashMap<String, String> = HashMap::new();
@@ -137,10 +119,7 @@ fn missing_config_error_does_not_leak_encrypted_values() {
 #[test]
 fn missing_config_error_does_not_leak_default_values() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
     manifest_config.insert(
         "model".to_string(),
         serde_json::json!({"default": "gpt-4-internal-staging"}),
@@ -173,10 +152,7 @@ fn missing_config_error_does_not_leak_default_values() {
 #[test]
 fn successful_resolution_contains_only_expected_keys() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
     manifest_config.insert("model".to_string(), serde_json::json!("gpt-4"));
 
     let secret = "sk-live-extremely-secret-key-xyz";
@@ -191,5 +167,9 @@ fn successful_resolution_contains_only_expected_keys() {
     assert_eq!(resolved.get("model").map(String::as_str), Some("gpt-4"));
 
     // But the resolved map should not contain any extra keys or leak info
-    assert_eq!(resolved.len(), 2, "resolved config should have exactly the expected keys");
+    assert_eq!(
+        resolved.len(),
+        2,
+        "resolved config should have exactly the expected keys"
+    );
 }

@@ -26,7 +26,10 @@ fn enable_plugin_transitions_disabled_to_enabled() {
 
     // Verify it is disabled
     let info = host.get_plugin("echo-plugin").expect("plugin should exist");
-    assert!(!info.enabled, "plugin should be disabled after disable_plugin");
+    assert!(
+        !info.enabled,
+        "plugin should be disabled after disable_plugin"
+    );
 
     // Enable it
     host.enable_plugin("echo-plugin")
@@ -78,7 +81,10 @@ fn enable_plugin_reflected_in_list_plugins() {
         .find(|p| p.name == "echo-plugin")
         .expect("echo-plugin should appear in list_plugins");
 
-    assert!(echo.enabled, "re-enabled plugin should show enabled in list");
+    assert!(
+        echo.enabled,
+        "re-enabled plugin should show enabled in list"
+    );
 }
 
 #[test]

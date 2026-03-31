@@ -166,16 +166,17 @@ fn plugin_with_messaging_but_no_memory_gets_no_memory_functions() {
     .expect("valid manifest");
 
     let fns = registry.build_functions(&manifest);
-    let memory_fns: Vec<_> = fns
-        .iter()
-        .filter(|f| f.name().contains("memory"))
-        .collect();
+    let memory_fns: Vec<_> = fns.iter().filter(|f| f.name().contains("memory")).collect();
 
     assert!(
         memory_fns.is_empty(),
         "plugin with messaging but no memory capability must have zero memory functions"
     );
-    assert_eq!(fns.len(), 2, "zeroclaw_send_message + zeroclaw_get_channels should be registered");
+    assert_eq!(
+        fns.len(),
+        2,
+        "zeroclaw_send_message + zeroclaw_get_channels should be registered"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +230,11 @@ fn plugin_with_memory_read_gets_memory_read_function() {
     .expect("valid manifest");
 
     let fns = registry.build_functions(&manifest);
-    assert_eq!(fns.len(), 1, "read-only memory plugin gets exactly 1 function");
+    assert_eq!(
+        fns.len(),
+        1,
+        "read-only memory plugin gets exactly 1 function"
+    );
 }
 
 #[test]
@@ -250,7 +255,11 @@ fn plugin_with_memory_write_gets_memory_write_functions() {
     .expect("valid manifest");
 
     let fns = registry.build_functions(&manifest);
-    assert_eq!(fns.len(), 2, "write-only memory plugin gets store + forget functions");
+    assert_eq!(
+        fns.len(),
+        2,
+        "write-only memory plugin gets store + forget functions"
+    );
     let names: Vec<&str> = fns.iter().map(|f| f.name()).collect();
     assert!(names.contains(&"zeroclaw_memory_store"));
     assert!(names.contains(&"zeroclaw_memory_forget"));

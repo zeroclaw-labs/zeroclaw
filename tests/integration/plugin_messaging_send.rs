@@ -49,10 +49,7 @@ impl Channel for TrackingChannel {
         Ok(())
     }
 
-    async fn listen(
-        &self,
-        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -77,7 +74,10 @@ fn make_manifest_with_messaging(allowed_channels: Vec<String>) -> PluginManifest
     "#;
     let mut m: PluginManifest = toml::from_str(toml_str).expect("valid manifest");
     m.host_capabilities = PluginCapabilities {
-        messaging: Some(MessagingCapability { allowed_channels, ..Default::default() }),
+        messaging: Some(MessagingCapability {
+            allowed_channels,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     m
@@ -138,8 +138,7 @@ fn registry_holds_channel_references() {
     channels.insert("slack".to_string(), channel);
 
     let memory = Arc::new(NoneMemory::new());
-    let registry = HostFunctionRegistry::new(memory, vec![], make_audit())
-        .with_channels(channels);
+    let registry = HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
 
     assert_eq!(registry.channels.len(), 1);
     assert!(registry.channels.contains_key("slack"));
@@ -159,13 +158,15 @@ async fn dispatch_routes_to_named_channel() {
     channels.insert("slack".to_string(), channel);
 
     let memory = Arc::new(NoneMemory::new());
-    let registry = HostFunctionRegistry::new(memory, vec![], make_audit())
-        .with_channels(channels);
+    let registry = HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
 
     // Simulate the dispatch logic: find channel by name and send
     let target_name = "slack";
     let found = registry.channels.get(target_name);
-    assert!(found.is_some(), "channel 'slack' must be findable in registry");
+    assert!(
+        found.is_some(),
+        "channel 'slack' must be findable in registry"
+    );
 
     let msg = SendMessage::new("hello world", "user123");
     found.unwrap().send(&msg).await.unwrap();
@@ -180,25 +181,35 @@ async fn dispatch_routes_to_named_channel() {
 async fn dispatch_selects_correct_channel_among_multiple() {
     let calls_slack = Arc::new(Mutex::new(Vec::new()));
     let calls_email = Arc::new(Mutex::new(Vec::new()));
-    let ch_slack: Arc<dyn Channel> =
-        Arc::new(TrackingChannel::new("slack", calls_slack.clone()));
-    let ch_email: Arc<dyn Channel> =
-        Arc::new(TrackingChannel::new("email", calls_email.clone()));
+    let ch_slack: Arc<dyn Channel> = Arc::new(TrackingChannel::new("slack", calls_slack.clone()));
+    let ch_email: Arc<dyn Channel> = Arc::new(TrackingChannel::new("email", calls_email.clone()));
 
     let mut channels = HashMap::new();
     channels.insert("slack".to_string(), ch_slack);
     channels.insert("email".to_string(), ch_email);
 
     let memory = Arc::new(NoneMemory::new());
-    let registry = HostFunctionRegistry::new(memory, vec![], make_audit())
-        .with_channels(channels);
+    let registry = HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
 
     // Dispatch to "email"
     let msg = SendMessage::new("test message", "alice@example.com");
-    registry.channels.get("email").unwrap().send(&msg).await.unwrap();
+    registry
+        .channels
+        .get("email")
+        .unwrap()
+        .send(&msg)
+        .await
+        .unwrap();
 
-    assert!(calls_slack.lock().is_empty(), "slack should not have been called");
-    assert_eq!(calls_email.lock().len(), 1, "email should have been called once");
+    assert!(
+        calls_slack.lock().is_empty(),
+        "slack should not have been called"
+    );
+    assert_eq!(
+        calls_email.lock().len(),
+        1,
+        "email should have been called once"
+    );
     assert_eq!(calls_email.lock()[0].0, "alice@example.com");
     assert_eq!(calls_email.lock()[0].1, "test message");
 }
@@ -216,8 +227,7 @@ fn unknown_channel_not_found_in_registry() {
     channels.insert("slack".to_string(), channel);
 
     let memory = Arc::new(NoneMemory::new());
-    let registry = HostFunctionRegistry::new(memory, vec![], make_audit())
-        .with_channels(channels);
+    let registry = HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
 
     let found = registry.channels.get("nonexistent");
     assert!(found.is_none(), "nonexistent channel must not be found");
@@ -263,8 +273,7 @@ async fn zeroclaw_send_message_uses_channel_trait_send() {
     channels.insert("slack".to_string(), channel);
 
     let memory = Arc::new(NoneMemory::new());
-    let registry = HostFunctionRegistry::new(memory, vec![], make_audit())
-        .with_channels(channels);
+    let registry = HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
 
     let manifest = make_manifest_with_messaging(vec!["slack".into()]);
 
@@ -300,16 +309,27 @@ async fn multiple_channels_dispatch_independently() {
     channels.insert("telegram".to_string(), ch_b);
 
     let memory = Arc::new(NoneMemory::new());
-    let registry = HostFunctionRegistry::new(memory, vec![], make_audit())
-        .with_channels(channels);
+    let registry = HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
 
     // Send via slack
     let msg1 = SendMessage::new("slack msg", "chan1");
-    registry.channels.get("slack").unwrap().send(&msg1).await.unwrap();
+    registry
+        .channels
+        .get("slack")
+        .unwrap()
+        .send(&msg1)
+        .await
+        .unwrap();
 
     // Send via telegram
     let msg2 = SendMessage::new("telegram msg", "chat42");
-    registry.channels.get("telegram").unwrap().send(&msg2).await.unwrap();
+    registry
+        .channels
+        .get("telegram")
+        .unwrap()
+        .send(&msg2)
+        .await
+        .unwrap();
 
     assert_eq!(calls_a.lock().len(), 1);
     assert_eq!(calls_a.lock()[0].1, "slack msg");

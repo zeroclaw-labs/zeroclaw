@@ -48,8 +48,8 @@ async fn config_patch_persists_single_key_to_toml() {
     config.save().await.expect("save should succeed");
 
     // Reload from disk
-    let raw = std::fs::read_to_string(tmp.path().join("config.toml"))
-        .expect("config.toml should exist");
+    let raw =
+        std::fs::read_to_string(tmp.path().join("config.toml")).expect("config.toml should exist");
     let reloaded: Config = toml::from_str(&raw).expect("config.toml should parse");
 
     let plugin_cfg = reloaded
@@ -76,8 +76,8 @@ async fn config_patch_persists_multiple_keys_to_toml() {
 
     config.save().await.expect("save should succeed");
 
-    let raw = std::fs::read_to_string(tmp.path().join("config.toml"))
-        .expect("config.toml should exist");
+    let raw =
+        std::fs::read_to_string(tmp.path().join("config.toml")).expect("config.toml should exist");
     let reloaded: Config = toml::from_str(&raw).expect("config.toml should parse");
 
     let plugin_cfg = reloaded
@@ -85,7 +85,10 @@ async fn config_patch_persists_multiple_keys_to_toml() {
         .per_plugin
         .get("multi-tool")
         .expect("[plugins.multi-tool] section should exist");
-    assert_eq!(plugin_cfg.get("api_key").map(String::as_str), Some("sk-multi"));
+    assert_eq!(
+        plugin_cfg.get("api_key").map(String::as_str),
+        Some("sk-multi")
+    );
     assert_eq!(plugin_cfg.get("model").map(String::as_str), Some("gpt-4o"));
 }
 
@@ -104,8 +107,8 @@ async fn config_patch_persists_multiple_plugins_to_toml() {
 
     config.save().await.expect("save should succeed");
 
-    let raw = std::fs::read_to_string(tmp.path().join("config.toml"))
-        .expect("config.toml should exist");
+    let raw =
+        std::fs::read_to_string(tmp.path().join("config.toml")).expect("config.toml should exist");
     let reloaded: Config = toml::from_str(&raw).expect("config.toml should parse");
 
     let alpha_cfg = reloaded
@@ -143,8 +146,8 @@ async fn config_patch_overwrites_existing_value_and_persists() {
     apply_patch(&mut config, "multi-tool", &updates2);
     config.save().await.expect("second save");
 
-    let raw = std::fs::read_to_string(tmp.path().join("config.toml"))
-        .expect("config.toml should exist");
+    let raw =
+        std::fs::read_to_string(tmp.path().join("config.toml")).expect("config.toml should exist");
     let reloaded: Config = toml::from_str(&raw).expect("config.toml should parse");
 
     let plugin_cfg = reloaded
@@ -171,8 +174,8 @@ async fn config_patch_toml_contains_plugin_section() {
     config.save().await.expect("save should succeed");
 
     // Verify the raw TOML contains the expected section header
-    let raw = std::fs::read_to_string(tmp.path().join("config.toml"))
-        .expect("config.toml should exist");
+    let raw =
+        std::fs::read_to_string(tmp.path().join("config.toml")).expect("config.toml should exist");
     assert!(
         raw.contains("[plugins.my-plugin]"),
         "TOML should contain [plugins.my-plugin] section, got:\n{raw}"
@@ -196,8 +199,8 @@ async fn config_patch_preserves_other_config_fields() {
 
     config.save().await.expect("save should succeed");
 
-    let raw = std::fs::read_to_string(tmp.path().join("config.toml"))
-        .expect("config.toml should exist");
+    let raw =
+        std::fs::read_to_string(tmp.path().join("config.toml")).expect("config.toml should exist");
     let reloaded: Config = toml::from_str(&raw).expect("config.toml should parse");
 
     assert!(

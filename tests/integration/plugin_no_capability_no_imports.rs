@@ -28,7 +28,11 @@ fn setup_plugins(specs: &[(&str, &[&str])]) -> tempfile::TempDir {
     for (name, capabilities) in specs {
         let plugin_dir = plugins_base.join(name);
         std::fs::create_dir_all(&plugin_dir).unwrap();
-        std::fs::write(plugin_dir.join("manifest.toml"), manifest(name, capabilities)).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            manifest(name, capabilities),
+        )
+        .unwrap();
     }
 
     dir
@@ -87,7 +91,11 @@ fn only_declared_capabilities_grant_imports() {
 
     let host = PluginHost::new(dir.path()).unwrap();
 
-    assert_eq!(host.tool_plugins().len(), 1, "tool-only appears in tool list");
+    assert_eq!(
+        host.tool_plugins().len(),
+        1,
+        "tool-only appears in tool list"
+    );
     assert_eq!(
         host.channel_plugins().len(),
         0,

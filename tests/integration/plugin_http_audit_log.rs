@@ -51,14 +51,10 @@ async fn http_request_logged_with_url_and_method() {
 
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(10))
-        .with_allowed_hosts(
-            ["example.com"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
+        .with_allowed_hosts(["example.com"].iter().map(|s| s.to_string()));
 
-    let plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate multi-tool plugin");
+    let plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate multi-tool plugin");
     let plugin = Arc::new(Mutex::new(plugin));
 
     let tool = zeroclaw::plugins::wasm_tool::WasmTool::new(
@@ -78,7 +74,11 @@ async fn http_request_logged_with_url_and_method() {
         .await
         .expect("execute should not return Err");
 
-    assert!(result.success, "tool_http_get should succeed, got: {:?}", result.error);
+    assert!(
+        result.success,
+        "tool_http_get should succeed, got: {:?}",
+        result.error
+    );
 
     let events = read_audit_events(tmp.path());
     assert!(
@@ -126,8 +126,8 @@ async fn http_requests_not_logged_for_non_http_tools() {
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
 
-    let plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate multi-tool plugin");
+    let plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate multi-tool plugin");
     let plugin = Arc::new(Mutex::new(plugin));
 
     // Use the non-HTTP tool_add function
@@ -175,14 +175,10 @@ async fn http_request_logs_only_url_and_method() {
 
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(10))
-        .with_allowed_hosts(
-            ["example.com"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
+        .with_allowed_hosts(["example.com"].iter().map(|s| s.to_string()));
 
-    let plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate multi-tool plugin");
+    let plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate multi-tool plugin");
     let plugin = Arc::new(Mutex::new(plugin));
 
     let tool = zeroclaw::plugins::wasm_tool::WasmTool::new(
@@ -207,7 +203,9 @@ async fn http_request_logs_only_url_and_method() {
     let req = &entry["action"]["http_requests"][0];
 
     // Verify only url and method are present (no body, headers, etc.)
-    let req_obj = req.as_object().expect("http request entry should be an object");
+    let req_obj = req
+        .as_object()
+        .expect("http request entry should be an object");
     let keys: Vec<&String> = req_obj.keys().collect();
     assert!(
         keys.contains(&&"url".to_string()),

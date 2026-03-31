@@ -69,7 +69,11 @@ fn relaxed_allows_wildcard_hosts_through_loader() {
     let security = security_with_workspace(PathBuf::from("."));
     let loader = PluginLoader::new(&config, &security);
 
-    let m = manifest("wildcard-plugin", vec!["*.example.com".to_string()], HashMap::new());
+    let m = manifest(
+        "wildcard-plugin",
+        vec!["*.example.com".to_string()],
+        HashMap::new(),
+    );
     let result = loader.validate_security_policy(&m);
 
     assert!(
@@ -212,7 +216,11 @@ fn strict_rejects_wildcard_hosts_through_loader() {
     let security = security_with_workspace(PathBuf::from("."));
     let loader = PluginLoader::new(&config, &security);
 
-    let m = manifest("wildcard-plugin", vec!["*.example.com".to_string()], HashMap::new());
+    let m = manifest(
+        "wildcard-plugin",
+        vec!["*.example.com".to_string()],
+        HashMap::new(),
+    );
     let result = loader.validate_security_policy(&m);
 
     assert!(result.is_err(), "strict mode should reject wildcard hosts");
@@ -380,7 +388,11 @@ fn paranoid_rejects_wildcard_hosts_through_loader() {
     let security = security_with_workspace(PathBuf::from("."));
     let loader = PluginLoader::new(&config, &security);
 
-    let m = manifest("my-plugin", vec!["*.example.com".to_string()], HashMap::new());
+    let m = manifest(
+        "my-plugin",
+        vec!["*.example.com".to_string()],
+        HashMap::new(),
+    );
     let result = loader.validate_security_policy(&m);
 
     assert!(
@@ -550,7 +562,11 @@ fn unknown_security_level_falls_back_to_default_behaviour() {
     let loader = PluginLoader::new(&config, &security);
 
     // Default allows wildcards (with warning) — so should "banana"
-    let m = manifest("test-plugin", vec!["*.example.com".to_string()], HashMap::new());
+    let m = manifest(
+        "test-plugin",
+        vec!["*.example.com".to_string()],
+        HashMap::new(),
+    );
     let result = loader.validate_security_policy(&m);
 
     assert!(
@@ -565,7 +581,11 @@ fn empty_security_level_falls_back_to_default_behaviour() {
     let security = security_with_workspace(PathBuf::from("."));
     let loader = PluginLoader::new(&config, &security);
 
-    let m = manifest("test-plugin", vec!["*.example.com".to_string()], HashMap::new());
+    let m = manifest(
+        "test-plugin",
+        vec!["*.example.com".to_string()],
+        HashMap::new(),
+    );
     let result = loader.validate_security_policy(&m);
 
     assert!(
@@ -581,7 +601,11 @@ fn case_insensitive_level_selection() {
     // "STRICT" should behave like "strict"
     let config = config_with_level("STRICT", vec![]);
     let loader = PluginLoader::new(&config, &security);
-    let m = manifest("test-plugin", vec!["*.example.com".to_string()], HashMap::new());
+    let m = manifest(
+        "test-plugin",
+        vec!["*.example.com".to_string()],
+        HashMap::new(),
+    );
     assert!(
         loader.validate_security_policy(&m).is_err(),
         "STRICT (uppercase) should reject wildcard hosts"

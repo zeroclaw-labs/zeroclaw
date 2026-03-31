@@ -27,14 +27,10 @@ fn tool_http_get_auth_passes_authorization_header_from_config() {
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(10))
         .with_config(config.into_iter())
-        .with_allowed_hosts(
-            ["httpbin.org"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
+        .with_allowed_hosts(["httpbin.org"].iter().map(|s| s.to_string()));
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate multi-tool plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate multi-tool plugin");
 
     // httpbin.org/headers echoes back request headers as JSON
     let input = r#"{"url": "http://httpbin.org/headers"}"#;
@@ -42,8 +38,7 @@ fn tool_http_get_auth_passes_authorization_header_from_config() {
         .call::<&str, &str>("tool_http_get_auth", input)
         .expect("tool_http_get_auth call failed");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(output).expect("output is not valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(output).expect("output is not valid JSON");
 
     assert_eq!(
         parsed["status_code"].as_u64(),
@@ -52,9 +47,7 @@ fn tool_http_get_auth_passes_authorization_header_from_config() {
     );
 
     // Parse the inner body (httpbin returns JSON with a "headers" object)
-    let body = parsed["body"]
-        .as_str()
-        .expect("body should be a string");
+    let body = parsed["body"].as_str().expect("body should be a string");
     let body_json: serde_json::Value =
         serde_json::from_str(body).expect("httpbin body should be valid JSON");
 

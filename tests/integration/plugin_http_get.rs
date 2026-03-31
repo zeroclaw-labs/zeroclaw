@@ -23,22 +23,17 @@ fn tool_http_get_fetches_from_allowed_host() {
 
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(10))
-        .with_allowed_hosts(
-            ["httpbin.org", "example.com"]
-                .iter()
-                .map(|s| s.to_string()),
-        );
+        .with_allowed_hosts(["httpbin.org", "example.com"].iter().map(|s| s.to_string()));
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate multi-tool plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate multi-tool plugin");
 
     let input = r#"{"url": "http://example.com"}"#;
     let output = plugin
         .call::<&str, &str>("tool_http_get", input)
         .expect("tool_http_get call failed");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(output).expect("output is not valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(output).expect("output is not valid JSON");
 
     // Assert status_code is 200
     assert_eq!(
@@ -48,13 +43,8 @@ fn tool_http_get_fetches_from_allowed_host() {
     );
 
     // Assert body is non-empty and contains expected content from example.com
-    let body = parsed["body"]
-        .as_str()
-        .expect("body should be a string");
-    assert!(
-        !body.is_empty(),
-        "expected non-empty body from example.com"
-    );
+    let body = parsed["body"].as_str().expect("body should be a string");
+    assert!(!body.is_empty(), "expected non-empty body from example.com");
     assert!(
         body.contains("Example Domain"),
         "expected body to contain 'Example Domain', got: {body:.200}"

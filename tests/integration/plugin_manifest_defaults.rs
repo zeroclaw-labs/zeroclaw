@@ -107,7 +107,10 @@ fn operator_value_overrides_manifest_default() {
 #[test]
 fn declaration_without_default_or_required_omits_key() {
     let resolved = resolve(
-        vec![("optional_flag", serde_json::json!({"description": "some flag"}))],
+        vec![(
+            "optional_flag",
+            serde_json::json!({"description": "some flag"}),
+        )],
         vec![],
     );
 

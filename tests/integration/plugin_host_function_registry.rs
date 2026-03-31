@@ -27,7 +27,10 @@ fn host_function_registry_accepts_subsystem_references() {
     let registry = HostFunctionRegistry::new(memory.clone(), vec![], audit.clone());
 
     // The registry should hold the same Arc references we passed in.
-    assert!(Arc::ptr_eq(&registry.memory, &(memory as Arc<dyn zeroclaw::memory::traits::Memory>)));
+    assert!(Arc::ptr_eq(
+        &registry.memory,
+        &(memory as Arc<dyn zeroclaw::memory::traits::Memory>)
+    ));
     assert!(registry.tools.is_empty());
     assert!(Arc::ptr_eq(&registry.audit, &audit));
 }
@@ -72,10 +75,8 @@ fn host_function_registry_accepts_multiple_tools() {
         .expect("failed to create AuditLogger"),
     );
 
-    let tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(StubTool("tool_a")),
-        Arc::new(StubTool("tool_b")),
-    ];
+    let tools: Vec<Arc<dyn Tool>> =
+        vec![Arc::new(StubTool("tool_a")), Arc::new(StubTool("tool_b"))];
 
     let registry = HostFunctionRegistry::new(memory, tools, audit);
 

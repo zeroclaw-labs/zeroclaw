@@ -51,8 +51,8 @@ async fn audit_entry_contains_plugin_name_version_tool_name_and_duration() {
 
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
-    let plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate echo plugin");
+    let plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate echo plugin");
     let plugin = Arc::new(Mutex::new(plugin));
 
     let tool = zeroclaw::plugins::wasm_tool::WasmTool::new(

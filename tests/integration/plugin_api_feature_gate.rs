@@ -21,14 +21,9 @@ fn api_plugins_module_is_feature_gated() {
     let gateway_mod = read_src("src/gateway/mod.rs");
 
     // The `pub mod api_plugins` declaration must be preceded by a cfg gate.
-    let has_gated_mod = gateway_mod
-        .lines()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|w| {
-            w[0].contains("#[cfg(feature = \"plugins-wasm\")]")
-                && w[1].contains("pub mod api_plugins")
-        });
+    let has_gated_mod = gateway_mod.lines().collect::<Vec<_>>().windows(2).any(|w| {
+        w[0].contains("#[cfg(feature = \"plugins-wasm\")]") && w[1].contains("pub mod api_plugins")
+    });
 
     assert!(
         has_gated_mod,
@@ -42,14 +37,10 @@ fn plugin_routes_module_is_feature_gated() {
     let api_plugins = read_src("src/gateway/api_plugins.rs");
 
     // The plugin_routes module inside api_plugins.rs must be behind a cfg gate.
-    let has_gated_routes = api_plugins
-        .lines()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|w| {
-            w[0].contains("#[cfg(feature = \"plugins-wasm\")]")
-                && w[1].contains("pub mod plugin_routes")
-        });
+    let has_gated_routes = api_plugins.lines().collect::<Vec<_>>().windows(2).any(|w| {
+        w[0].contains("#[cfg(feature = \"plugins-wasm\")]")
+            && w[1].contains("pub mod plugin_routes")
+    });
 
     assert!(
         has_gated_routes,

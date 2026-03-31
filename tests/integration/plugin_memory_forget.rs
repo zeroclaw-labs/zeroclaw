@@ -218,7 +218,10 @@ async fn forget_same_key_twice_returns_false_second_time() {
     let second = registry.memory.forget("ephemeral").await.unwrap();
 
     assert!(first, "first forget should return true");
-    assert!(!second, "second forget should return false — key already gone");
+    assert!(
+        !second,
+        "second forget should return false — key already gone"
+    );
 
     let calls = memory.recorded_calls();
     assert_eq!(calls.len(), 2, "both calls should be recorded");
@@ -234,11 +237,7 @@ async fn multiple_forgets_recorded() {
     let registry = HostFunctionRegistry::new(memory.clone(), vec![], make_audit());
 
     for i in 0..4 {
-        registry
-            .memory
-            .forget(&format!("key_{i}"))
-            .await
-            .unwrap();
+        registry.memory.forget(&format!("key_{i}")).await.unwrap();
     }
 
     let calls = memory.recorded_calls();

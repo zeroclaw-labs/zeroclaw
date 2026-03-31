@@ -55,8 +55,7 @@ capabilities = ["tool"]
     let host = PluginHost::new(dir.path()).unwrap();
 
     // First load succeeds.
-    host.load_plugin("tampered")
-        .expect("first load must pass");
+    host.load_plugin("tampered").expect("first load must pass");
 
     // Tamper with the binary.
     std::fs::write(plugin_dir.join("plugin.wasm"), b"malicious-content").unwrap();

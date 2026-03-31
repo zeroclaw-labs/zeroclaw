@@ -5,7 +5,9 @@
 //! default level does not enforce the plugin allowlist or workspace path
 //! restrictions.
 
-use zeroclaw::plugins::loader::{validate_allowed_hosts, validate_plugin_allowlist, NetworkSecurityLevel};
+use zeroclaw::plugins::loader::{
+    validate_allowed_hosts, validate_plugin_allowlist, NetworkSecurityLevel,
+};
 
 // ── Default mode allows wildcard hosts ─────────────────────────────
 
@@ -53,10 +55,7 @@ fn default_allows_multiple_wildcards_among_hosts() {
 
 #[test]
 fn default_allows_explicit_hosts() {
-    let hosts = vec![
-        "api.example.com".to_string(),
-        "cdn.example.com".to_string(),
-    ];
+    let hosts = vec!["api.example.com".to_string(), "cdn.example.com".to_string()];
     let result = validate_allowed_hosts("my-plugin", &hosts, NetworkSecurityLevel::Default);
 
     assert!(
@@ -86,10 +85,7 @@ fn strict_rejects_same_wildcard_that_default_allows() {
     let default_result = validate_allowed_hosts("my-plugin", &hosts, NetworkSecurityLevel::Default);
     let strict_result = validate_allowed_hosts("my-plugin", &hosts, NetworkSecurityLevel::Strict);
 
-    assert!(
-        default_result.is_ok(),
-        "default should allow wildcard"
-    );
+    assert!(default_result.is_ok(), "default should allow wildcard");
     assert!(
         strict_result.is_err(),
         "strict should reject the same wildcard that default allows"
@@ -113,8 +109,7 @@ fn default_does_not_enforce_allowlist() {
 #[test]
 fn default_does_not_enforce_empty_allowlist() {
     let allowed: Vec<String> = vec![];
-    let result =
-        validate_plugin_allowlist("any-plugin", &allowed, NetworkSecurityLevel::Default);
+    let result = validate_plugin_allowlist("any-plugin", &allowed, NetworkSecurityLevel::Default);
 
     assert!(
         result.is_ok(),

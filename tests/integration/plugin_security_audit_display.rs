@@ -77,7 +77,11 @@ fn audit_display_multi_tool_host_count() {
     let info = get_multi_tool_plugin();
     let detail = build_audit_json(&info);
     let hosts = detail["allowed_hosts"].as_array().unwrap();
-    assert_eq!(hosts.len(), 2, "multi-tool-plugin declares exactly 2 allowed hosts");
+    assert_eq!(
+        hosts.len(),
+        2,
+        "multi-tool-plugin declares exactly 2 allowed hosts"
+    );
 }
 
 #[test]
@@ -109,9 +113,7 @@ fn audit_display_multi_tool_has_allowed_paths_object() {
 fn audit_display_multi_tool_has_expected_paths() {
     let info = get_multi_tool_plugin();
     let detail = build_audit_json(&info);
-    let paths = detail["allowed_paths"]
-        .as_object()
-        .unwrap();
+    let paths = detail["allowed_paths"].as_object().unwrap();
     assert!(
         paths.contains_key("/data"),
         "should contain /data path mapping"
@@ -146,7 +148,11 @@ fn audit_display_fs_plugin_has_filesystem_paths() {
     let paths = detail["allowed_paths"]
         .as_object()
         .expect("allowed_paths must be a JSON object");
-    assert_eq!(paths.len(), 2, "fs-plugin declares exactly 2 filesystem paths");
+    assert_eq!(
+        paths.len(),
+        2,
+        "fs-plugin declares exactly 2 filesystem paths"
+    );
     assert!(paths.contains_key("/input"), "should contain /input");
     assert!(paths.contains_key("/output"), "should contain /output");
 }

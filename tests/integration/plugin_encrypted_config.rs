@@ -55,8 +55,7 @@ fn encrypted_config_value_is_decrypted_before_reaching_plugin() {
     config_values.insert("model".to_string(), "claude-3".to_string());
 
     // Step 1: decrypt encrypted values via SecretStore
-    decrypt_plugin_config_values(&mut config_values, &store)
-        .expect("decryption should succeed");
+    decrypt_plugin_config_values(&mut config_values, &store).expect("decryption should succeed");
 
     // Verify decryption happened
     assert_eq!(
@@ -72,10 +71,7 @@ fn encrypted_config_value_is_decrypted_before_reaching_plugin() {
 
     // Step 2: resolve config
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
     manifest_config.insert("model".to_string(), serde_json::json!("gpt-4"));
 
     let resolved = resolve_plugin_config("multi-tool", &manifest_config, Some(&config_values))
@@ -117,8 +113,7 @@ fn encrypted_config_value_is_decrypted_before_reaching_plugin() {
         .call::<&str, &str>("tool_lookup_config", "{}")
         .expect("tool_lookup_config call failed");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(output).expect("output is not valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(output).expect("output is not valid JSON");
 
     assert_eq!(
         parsed["api_key"].as_str(),
@@ -138,7 +133,10 @@ fn non_encrypted_values_pass_through_unchanged() {
 
     let mut config_values: HashMap<String, String> = HashMap::new();
     config_values.insert("api_key".to_string(), "plaintext-key".to_string());
-    config_values.insert("endpoint".to_string(), "https://api.example.com".to_string());
+    config_values.insert(
+        "endpoint".to_string(),
+        "https://api.example.com".to_string(),
+    );
 
     decrypt_plugin_config_values(&mut config_values, &store)
         .expect("decryption of plaintext values should succeed");
@@ -160,8 +158,7 @@ fn legacy_enc_prefix_is_also_decrypted() {
     let mut config_values: HashMap<String, String> = HashMap::new();
     config_values.insert("token".to_string(), encrypted);
 
-    decrypt_plugin_config_values(&mut config_values, &store)
-        .expect("decryption should succeed");
+    decrypt_plugin_config_values(&mut config_values, &store).expect("decryption should succeed");
 
     assert_eq!(
         config_values["token"], secret,
@@ -177,7 +174,10 @@ fn decrypt_with_invalid_encrypted_value_returns_error() {
     config_values.insert("bad_key".to_string(), "enc2:not-valid-hex!!".to_string());
 
     let result = decrypt_plugin_config_values(&mut config_values, &store);
-    assert!(result.is_err(), "invalid encrypted value should produce an error");
+    assert!(
+        result.is_err(),
+        "invalid encrypted value should produce an error"
+    );
 
     let err = result.unwrap_err();
     let msg = err.to_string();

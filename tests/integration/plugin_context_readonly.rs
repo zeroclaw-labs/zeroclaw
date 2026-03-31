@@ -87,7 +87,11 @@ fn context_all_enabled_produces_only_read_functions() {
     let names: Vec<&str> = fns.iter().map(|f| f.name()).collect();
 
     // Should produce exactly the 3 read-only getters
-    assert_eq!(fns.len(), 3, "all context flags should yield exactly 3 read-only functions");
+    assert_eq!(
+        fns.len(),
+        3,
+        "all context flags should yield exactly 3 read-only functions"
+    );
     for expected in CONTEXT_READ_FNS {
         assert!(
             names.contains(expected),
@@ -210,7 +214,11 @@ fn context_functions_isolated_from_other_capabilities() {
     // Memory functions: recall (read) + store + forget (write) = 3
     // Context functions: session + user_identity + agent_config = 3
     // Total = 6
-    assert_eq!(fns.len(), 6, "memory(rw) + context(all) should yield 6 functions");
+    assert_eq!(
+        fns.len(),
+        6,
+        "memory(rw) + context(all) should yield 6 functions"
+    );
 
     // Context functions are strictly read-only getters
     for ctx_fn in CONTEXT_READ_FNS {

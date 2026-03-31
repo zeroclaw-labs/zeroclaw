@@ -46,8 +46,7 @@ fn tool_read_file_reads_from_allowed_path() {
         .call::<&str, &str>("tool_read_file", input)
         .expect("tool_read_file call failed");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(output).expect("output is not valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(output).expect("output is not valid JSON");
 
     let contents = parsed["contents"]
         .as_str()

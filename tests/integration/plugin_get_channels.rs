@@ -51,10 +51,7 @@ impl Channel for ChannelWithSecret {
         Ok(())
     }
 
-    async fn listen(
-        &self,
-        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -79,7 +76,10 @@ fn make_manifest_with_messaging(allowed_channels: Vec<String>) -> PluginManifest
     "#;
     let mut m: PluginManifest = toml::from_str(toml_str).expect("valid manifest");
     m.host_capabilities = PluginCapabilities {
-        messaging: Some(MessagingCapability { allowed_channels, ..Default::default() }),
+        messaging: Some(MessagingCapability {
+            allowed_channels,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     m
@@ -123,10 +123,22 @@ fn get_channel_names_returns_only_names() {
         let name = channel.name();
         assert_eq!(name, key.as_str());
         // Name must not contain any credential-like content
-        assert!(!name.contains("xoxb"), "channel name must not leak Slack token");
-        assert!(!name.contains("bot123456"), "channel name must not leak Telegram token");
-        assert!(!name.contains("password"), "channel name must not leak password");
-        assert!(!name.contains("://"), "channel name must not leak endpoint URL");
+        assert!(
+            !name.contains("xoxb"),
+            "channel name must not leak Slack token"
+        );
+        assert!(
+            !name.contains("bot123456"),
+            "channel name must not leak Telegram token"
+        );
+        assert!(
+            !name.contains("password"),
+            "channel name must not leak password"
+        );
+        assert!(
+            !name.contains("://"),
+            "channel name must not leak endpoint URL"
+        );
     }
 }
 
@@ -140,7 +152,10 @@ fn empty_registry_returns_no_channels() {
     let registry = HostFunctionRegistry::new(memory, vec![], make_audit());
 
     let names: Vec<String> = registry.channels.keys().cloned().collect();
-    assert!(names.is_empty(), "empty registry must return no channel names");
+    assert!(
+        names.is_empty(),
+        "empty registry must return no channel names"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -149,9 +164,11 @@ fn empty_registry_returns_no_channels() {
 
 #[test]
 fn single_channel_returns_one_name() {
-    let registry = make_registry_with_channels(vec![
-        ("slack", "xoxb-secret-token", "https://slack.com/api"),
-    ]);
+    let registry = make_registry_with_channels(vec![(
+        "slack",
+        "xoxb-secret-token",
+        "https://slack.com/api",
+    )]);
 
     let names: Vec<String> = registry.channels.keys().cloned().collect();
     assert_eq!(names.len(), 1);
@@ -252,19 +269,31 @@ fn wildcard_allowed_channels_exposes_all() {
 #[test]
 fn channel_name_free_of_credential_patterns() {
     let registry = make_registry_with_channels(vec![
-        ("slack", "xoxb-1234567890-abcdefgh", "https://hooks.slack.com/secret"),
-        ("telegram", "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11", "https://api.telegram.org/bot123456"),
-        ("email", "hunter2", "smtp://user:hunter2@mail.example.com:587"),
+        (
+            "slack",
+            "xoxb-1234567890-abcdefgh",
+            "https://hooks.slack.com/secret",
+        ),
+        (
+            "telegram",
+            "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
+            "https://api.telegram.org/bot123456",
+        ),
+        (
+            "email",
+            "hunter2",
+            "smtp://user:hunter2@mail.example.com:587",
+        ),
     ]);
 
     let credential_patterns = [
         "xoxb", "xoxp", "xoxa",   // Slack tokens
-        "bot",                      // Telegram bot prefix
-        "bearer",                   // Auth headers
-        "password", "passwd",       // Password strings
-        "secret",                   // Generic secret
-        "://",                      // URLs that might leak endpoints
-        "hunter2",                  // The example secret
+        "bot",    // Telegram bot prefix
+        "bearer", // Auth headers
+        "password", "passwd",  // Password strings
+        "secret",  // Generic secret
+        "://",     // URLs that might leak endpoints
+        "hunter2", // The example secret
     ];
 
     for (_key, channel) in &registry.channels {

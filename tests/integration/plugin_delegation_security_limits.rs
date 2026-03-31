@@ -15,7 +15,7 @@ use zeroclaw::config::AuditConfig;
 use zeroclaw::memory::none::NoneMemory;
 use zeroclaw::plugins::host_functions::HostFunctionRegistry;
 use zeroclaw::plugins::{
-    PluginCapabilities, PluginManifest, RiskLevel, ToolDelegationCapability, ToolDefinition,
+    PluginCapabilities, PluginManifest, RiskLevel, ToolDefinition, ToolDelegationCapability,
 };
 use zeroclaw::security::audit::AuditLogger;
 use zeroclaw::security::SecurityPolicy;
@@ -81,10 +81,7 @@ fn make_audit() -> Arc<AuditLogger> {
     Arc::new(AuditLogger::new(cfg, path).expect("audit logger"))
 }
 
-fn make_manifest(
-    tool_risk_levels: &[RiskLevel],
-    allowed_tools: Vec<String>,
-) -> PluginManifest {
+fn make_manifest(tool_risk_levels: &[RiskLevel], allowed_tools: Vec<String>) -> PluginManifest {
     let toml_str = r#"
         name = "security_test_plugin"
         version = "0.1.0"
@@ -161,8 +158,11 @@ fn unauthorized_tool_rejected_by_allowed_check() {
 #[tokio::test]
 async fn unauthorized_tool_in_registry_never_called() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let unauthorized: Arc<dyn Tool> =
-        Arc::new(TrackingTool::new("admin_delete", RiskLevel::Low, calls.clone()));
+    let unauthorized: Arc<dyn Tool> = Arc::new(TrackingTool::new(
+        "admin_delete",
+        RiskLevel::Low,
+        calls.clone(),
+    ));
     let authorized: Arc<dyn Tool> = Arc::new(TrackingTool::new(
         "safe_read",
         RiskLevel::Low,
@@ -170,8 +170,7 @@ async fn unauthorized_tool_in_registry_never_called() {
     ));
 
     let memory = Arc::new(NoneMemory::new());
-    let registry =
-        HostFunctionRegistry::new(memory, vec![authorized, unauthorized], make_audit());
+    let registry = HostFunctionRegistry::new(memory, vec![authorized, unauthorized], make_audit());
 
     // Only safe_read is allowed
     let manifest = make_manifest(&[RiskLevel::Low], vec!["safe_read".into()]);
@@ -191,7 +190,10 @@ async fn unauthorized_tool_in_registry_never_called() {
     );
 
     // Tool must never have been called
-    assert!(calls.lock().is_empty(), "unauthorized tool must not be executed");
+    assert!(
+        calls.lock().is_empty(),
+        "unauthorized tool must not be executed"
+    );
 }
 
 #[test]
@@ -223,7 +225,11 @@ async fn depth_5_rejected_with_max_depth_5() {
 
     assert!(!result.success, "delegation at depth 5 must fail");
     assert!(
-        result.error.as_deref().unwrap_or("").contains("depth limit"),
+        result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("depth limit"),
         "error must mention depth limit"
     );
 }
@@ -231,19 +237,19 @@ async fn depth_5_rejected_with_max_depth_5() {
 #[tokio::test]
 async fn depth_exceeding_5_rejected() {
     for depth in [6, 7, 10, 100] {
-        let tool =
-            DelegateTool::with_depth(agent_with_max_depth(5), None, test_security(), depth);
+        let tool = DelegateTool::with_depth(agent_with_max_depth(5), None, test_security(), depth);
         let result = tool
             .execute(json!({"agent": "worker", "prompt": "test"}))
             .await
             .unwrap();
 
+        assert!(!result.success, "delegation at depth {depth} must fail");
         assert!(
-            !result.success,
-            "delegation at depth {depth} must fail"
-        );
-        assert!(
-            result.error.as_deref().unwrap_or("").contains("depth limit"),
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("depth limit"),
             "depth {depth}: error must mention depth limit"
         );
     }
@@ -252,8 +258,7 @@ async fn depth_exceeding_5_rejected() {
 #[tokio::test]
 async fn depth_below_5_not_blocked_by_depth_check() {
     for depth in 0..5u32 {
-        let tool =
-            DelegateTool::with_depth(agent_with_max_depth(5), None, test_security(), depth);
+        let tool = DelegateTool::with_depth(agent_with_max_depth(5), None, test_security(), depth);
         let result = tool
             .execute(json!({"agent": "worker", "prompt": "test"}))
             .await
@@ -275,8 +280,11 @@ async fn depth_below_5_not_blocked_by_depth_check() {
 #[tokio::test]
 async fn low_risk_plugin_cannot_delegate_to_high_risk_tool() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let high_tool: Arc<dyn Tool> =
-        Arc::new(TrackingTool::new("dangerous_op", RiskLevel::High, calls.clone()));
+    let high_tool: Arc<dyn Tool> = Arc::new(TrackingTool::new(
+        "dangerous_op",
+        RiskLevel::High,
+        calls.clone(),
+    ));
 
     let memory = Arc::new(NoneMemory::new());
     let _registry = HostFunctionRegistry::new(memory, vec![high_tool.clone()], make_audit());
@@ -292,14 +300,20 @@ async fn low_risk_plugin_cannot_delegate_to_high_risk_tool() {
     );
 
     // Tool must not be called
-    assert!(calls.lock().is_empty(), "high-risk tool must not execute under low-risk ceiling");
+    assert!(
+        calls.lock().is_empty(),
+        "high-risk tool must not execute under low-risk ceiling"
+    );
 }
 
 #[tokio::test]
 async fn low_risk_plugin_cannot_delegate_to_medium_risk_tool() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let medium_tool: Arc<dyn Tool> =
-        Arc::new(TrackingTool::new("moderate_op", RiskLevel::Medium, calls.clone()));
+    let medium_tool: Arc<dyn Tool> = Arc::new(TrackingTool::new(
+        "moderate_op",
+        RiskLevel::Medium,
+        calls.clone(),
+    ));
 
     let memory = Arc::new(NoneMemory::new());
     let _registry = HostFunctionRegistry::new(memory, vec![medium_tool.clone()], make_audit());
@@ -313,7 +327,10 @@ async fn low_risk_plugin_cannot_delegate_to_medium_risk_tool() {
         "medium-risk tool must exceed low-risk ceiling"
     );
 
-    assert!(calls.lock().is_empty(), "medium-risk tool must not execute under low-risk ceiling");
+    assert!(
+        calls.lock().is_empty(),
+        "medium-risk tool must not execute under low-risk ceiling"
+    );
 }
 
 #[tokio::test]
@@ -328,7 +345,11 @@ async fn low_risk_plugin_can_delegate_to_low_risk_tool() {
     let manifest = make_manifest(&[RiskLevel::Low], vec!["safe_op".into()]);
     let caller_max = manifest.tools.iter().map(|t| t.risk_level).max().unwrap();
 
-    let target = registry.tools.iter().find(|t| t.name() == "safe_op").unwrap();
+    let target = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "safe_op")
+        .unwrap();
     assert!(
         target.risk_level() <= caller_max,
         "low-risk tool should be allowed by low-risk caller"
@@ -363,7 +384,10 @@ async fn combined_unauthorized_and_high_risk_both_blocked() {
     let caller_max = manifest.tools.iter().map(|t| t.risk_level).max().unwrap();
 
     // Blocked by allowed_tools check
-    assert!(!is_tool_allowed(allowed, "nuke"), "nuke not in allowed_tools");
+    assert!(
+        !is_tool_allowed(allowed, "nuke"),
+        "nuke not in allowed_tools"
+    );
     // Also blocked by risk ceiling
     assert!(
         high_tool.risk_level() > caller_max,

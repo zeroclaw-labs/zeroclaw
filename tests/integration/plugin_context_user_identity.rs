@@ -61,7 +61,11 @@ fn context_user_identity_registered_when_enabled() {
     let fns = registry.build_functions(&manifest);
     let names: Vec<&str> = fns.iter().map(|f| f.name()).collect();
 
-    assert_eq!(fns.len(), 1, "user_identity-only context should yield 1 function");
+    assert_eq!(
+        fns.len(),
+        1,
+        "user_identity-only context should yield 1 function"
+    );
     assert!(
         names.contains(&"context_user_identity"),
         "expected context_user_identity, got: {names:?}"

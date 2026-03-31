@@ -30,9 +30,7 @@ fn reload_full_cycle_add_remove_modify() {
         .find("fn test_reload_full_cycle")
         .expect("test_reload_full_cycle must exist");
     let test_body = &tests[test_pos..];
-    let body_end = test_body
-        .find("\n    #[test]")
-        .unwrap_or(test_body.len());
+    let body_end = test_body.find("\n    #[test]").unwrap_or(test_body.len());
     let test_body = &test_body[..body_end];
 
     // --- Phase 1: start with A, add B, reload ---
@@ -108,9 +106,7 @@ fn reload_full_cycle_checks_summary_fields() {
         .find("fn test_reload_full_cycle")
         .expect("test_reload_full_cycle must exist");
     let test_body = &tests[test_pos..];
-    let body_end = test_body
-        .find("\n    #[test]")
-        .unwrap_or(test_body.len());
+    let body_end = test_body.find("\n    #[test]").unwrap_or(test_body.len());
     let test_body = &test_body[..body_end];
 
     // The test must check summary.loaded and summary.unloaded across phases

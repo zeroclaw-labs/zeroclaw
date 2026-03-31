@@ -69,7 +69,11 @@ capabilities = ["tool"]
     host.remove("cycle-test").unwrap();
 
     // Update source with a new legitimate binary
-    std::fs::write(source_dir.join("plugin.wasm"), b"updated-legitimate-binary-v2").unwrap();
+    std::fs::write(
+        source_dir.join("plugin.wasm"),
+        b"updated-legitimate-binary-v2",
+    )
+    .unwrap();
     host.install(source_dir.to_str().unwrap()).unwrap();
 
     // === Step 6: Load succeeds — hash recalculated ===

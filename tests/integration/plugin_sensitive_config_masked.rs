@@ -87,31 +87,46 @@ fn simulate_patch(
 #[test]
 fn sensitive_key_object_with_flag_true() {
     let decl = serde_json::json!({ "required": true, "sensitive": true });
-    assert!(is_sensitive_key(&decl), "object with sensitive=true must be sensitive");
+    assert!(
+        is_sensitive_key(&decl),
+        "object with sensitive=true must be sensitive"
+    );
 }
 
 #[test]
 fn sensitive_key_object_with_flag_false() {
     let decl = serde_json::json!({ "required": true, "sensitive": false });
-    assert!(!is_sensitive_key(&decl), "object with sensitive=false must not be sensitive");
+    assert!(
+        !is_sensitive_key(&decl),
+        "object with sensitive=false must not be sensitive"
+    );
 }
 
 #[test]
 fn sensitive_key_object_without_flag() {
     let decl = serde_json::json!({ "required": true });
-    assert!(!is_sensitive_key(&decl), "object without sensitive field must not be sensitive");
+    assert!(
+        !is_sensitive_key(&decl),
+        "object without sensitive field must not be sensitive"
+    );
 }
 
 #[test]
 fn sensitive_key_bare_string_is_not_sensitive() {
     let decl = serde_json::json!("gpt-4");
-    assert!(!is_sensitive_key(&decl), "bare string value must never be sensitive");
+    assert!(
+        !is_sensitive_key(&decl),
+        "bare string value must never be sensitive"
+    );
 }
 
 #[test]
 fn sensitive_key_bare_number_is_not_sensitive() {
     let decl = serde_json::json!(42);
-    assert!(!is_sensitive_key(&decl), "bare number value must never be sensitive");
+    assert!(
+        !is_sensitive_key(&decl),
+        "bare number value must never be sensitive"
+    );
 }
 
 #[test]
@@ -228,7 +243,10 @@ fn patch_rejects_sensitive_key() {
 
     let result = simulate_patch(&info, &updates, &mut per_plugin);
     assert!(result.is_err(), "PATCH must reject sensitive key edits");
-    assert_eq!(result.unwrap_err(), "Cannot edit sensitive config keys via API");
+    assert_eq!(
+        result.unwrap_err(),
+        "Cannot edit sensitive config keys via API"
+    );
     assert!(
         !per_plugin.contains_key("secret_token"),
         "rejected key must not be persisted"

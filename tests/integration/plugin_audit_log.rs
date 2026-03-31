@@ -55,8 +55,8 @@ async fn plugin_execution_creates_audit_log_entry() {
     // Build Extism plugin
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
-    let plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate echo plugin");
+    let plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate echo plugin");
     let plugin = Arc::new(Mutex::new(plugin));
 
     // Create WasmTool with audit logger
@@ -161,8 +161,8 @@ async fn multiple_executions_create_multiple_audit_entries() {
 
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
-    let plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate echo plugin");
+    let plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate echo plugin");
     let plugin = Arc::new(Mutex::new(plugin));
 
     let tool = zeroclaw::plugins::wasm_tool::WasmTool::new(

@@ -14,14 +14,8 @@ use zeroclaw::plugins::resolve_plugin_config;
 #[test]
 fn missing_all_required_keys_names_plugin_and_keys() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
-    manifest_config.insert(
-        "db_url".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
+    manifest_config.insert("db_url".to_string(), serde_json::json!({"required": true}));
 
     // No config values supplied at all.
     let err = resolve_plugin_config("weather-plugin", &manifest_config, None)
@@ -46,14 +40,8 @@ fn missing_all_required_keys_names_plugin_and_keys() {
 #[test]
 fn partial_config_lists_only_unsupplied_required_keys() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
-    manifest_config.insert(
-        "db_url".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
+    manifest_config.insert("db_url".to_string(), serde_json::json!({"required": true}));
     manifest_config.insert("model".to_string(), serde_json::json!("gpt-4"));
 
     // Supply only api_key — db_url is still missing.
@@ -82,10 +70,7 @@ fn partial_config_lists_only_unsupplied_required_keys() {
 #[test]
 fn all_required_keys_supplied_succeeds() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
     manifest_config.insert("model".to_string(), serde_json::json!("gpt-4"));
 
     let mut config_values: HashMap<String, String> = HashMap::new();
@@ -94,7 +79,10 @@ fn all_required_keys_supplied_succeeds() {
     let resolved = resolve_plugin_config("weather-plugin", &manifest_config, Some(&config_values))
         .expect("should succeed when all required keys are supplied");
 
-    assert_eq!(resolved.get("api_key").map(String::as_str), Some("sk-valid"));
+    assert_eq!(
+        resolved.get("api_key").map(String::as_str),
+        Some("sk-valid")
+    );
     assert_eq!(resolved.get("model").map(String::as_str), Some("gpt-4"));
 }
 
@@ -102,10 +90,7 @@ fn all_required_keys_supplied_succeeds() {
 #[test]
 fn empty_config_section_triggers_missing_required() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "token".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("token".to_string(), serde_json::json!({"required": true}));
 
     let empty = HashMap::new();
     let err = resolve_plugin_config("slack-bridge", &manifest_config, Some(&empty))
@@ -127,18 +112,9 @@ fn empty_config_section_triggers_missing_required() {
 fn missing_keys_are_sorted_alphabetically() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
     // Insert in reverse-alpha order to verify sorting.
-    manifest_config.insert(
-        "z_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
-    manifest_config.insert(
-        "a_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
-    manifest_config.insert(
-        "m_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("z_key".to_string(), serde_json::json!({"required": true}));
+    manifest_config.insert("a_key".to_string(), serde_json::json!({"required": true}));
+    manifest_config.insert("m_key".to_string(), serde_json::json!({"required": true}));
 
     let err = resolve_plugin_config("sort-test", &manifest_config, None)
         .expect_err("should fail with all keys missing");

@@ -173,7 +173,12 @@ async fn store_then_recall_roundtrips_through_backend() {
     let tagged = HostFunctionRegistry::tagged_key(plugin_name, "greeting");
     registry
         .memory
-        .store(&tagged, "Hello from plugin", MemoryCategory::Custom("plugin".into()), None)
+        .store(
+            &tagged,
+            "Hello from plugin",
+            MemoryCategory::Custom("plugin".into()),
+            None,
+        )
         .await
         .expect("store should succeed");
 
@@ -199,7 +204,12 @@ async fn store_then_recall_preserves_content_exactly() {
     let tagged = HostFunctionRegistry::tagged_key(plugin_name, "weather_data");
     registry
         .memory
-        .store(&tagged, content, MemoryCategory::Custom("plugin".into()), None)
+        .store(
+            &tagged,
+            content,
+            MemoryCategory::Custom("plugin".into()),
+            None,
+        )
         .await
         .unwrap();
 
@@ -210,7 +220,10 @@ async fn store_then_recall_preserves_content_exactly() {
         .unwrap();
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].content, content, "content must survive round-trip unchanged");
+    assert_eq!(
+        results[0].content, content,
+        "content must survive round-trip unchanged"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +239,12 @@ async fn tagged_keys_are_consistent_for_store_and_recall() {
     let tagged = HostFunctionRegistry::tagged_key(plugin_name, "forecast");
     registry
         .memory
-        .store(&tagged, "sunny", MemoryCategory::Custom("plugin".into()), None)
+        .store(
+            &tagged,
+            "sunny",
+            MemoryCategory::Custom("plugin".into()),
+            None,
+        )
         .await
         .unwrap();
 
@@ -251,7 +269,12 @@ async fn different_plugins_store_under_isolated_namespaces() {
     let key_a = HostFunctionRegistry::tagged_key("plugin_a", "data");
     registry
         .memory
-        .store(&key_a, "value_a", MemoryCategory::Custom("plugin".into()), None)
+        .store(
+            &key_a,
+            "value_a",
+            MemoryCategory::Custom("plugin".into()),
+            None,
+        )
         .await
         .unwrap();
 
@@ -259,7 +282,12 @@ async fn different_plugins_store_under_isolated_namespaces() {
     let key_b = HostFunctionRegistry::tagged_key("plugin_b", "data");
     registry
         .memory
-        .store(&key_b, "value_b", MemoryCategory::Custom("plugin".into()), None)
+        .store(
+            &key_b,
+            "value_b",
+            MemoryCategory::Custom("plugin".into()),
+            None,
+        )
         .await
         .unwrap();
 
@@ -329,7 +357,12 @@ async fn store_recall_forget_recall_cycle() {
     // Store
     registry
         .memory
-        .store(&tagged, "temporary", MemoryCategory::Custom("plugin".into()), None)
+        .store(
+            &tagged,
+            "temporary",
+            MemoryCategory::Custom("plugin".into()),
+            None,
+        )
         .await
         .unwrap();
 

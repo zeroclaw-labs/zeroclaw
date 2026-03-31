@@ -90,9 +90,7 @@ fn make_manifest_with_delegation(allowed_tools: Vec<String>) -> PluginManifest {
 /// Simulate the allowed_tools check from the host function:
 /// `!allowed_tools.iter().any(|t| t == "*" || t == &tool_name)`
 fn is_tool_allowed(allowed_tools: &[String], tool_name: &str) -> bool {
-    allowed_tools
-        .iter()
-        .any(|t| t == "*" || t == tool_name)
+    allowed_tools.iter().any(|t| t == "*" || t == tool_name)
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +120,11 @@ async fn allowed_tool_can_be_dispatched() {
     );
 
     // Dispatch succeeds
-    let found = registry.tools.iter().find(|t| t.name() == target_name).unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == target_name)
+        .unwrap();
     let result = found.execute(json!({})).await.unwrap();
     assert!(result.success);
     assert_eq!(calls.lock().len(), 1);
@@ -176,7 +178,10 @@ async fn unlisted_tool_present_in_registry_still_rejected() {
     );
 
     // Tool was never called
-    assert!(calls.lock().is_empty(), "rejected tool must not be executed");
+    assert!(
+        calls.lock().is_empty(),
+        "rejected tool must not be executed"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -252,12 +257,10 @@ async fn multiple_allowed_tools_selective_dispatch() {
     let tool_c: Arc<dyn Tool> = Arc::new(TrackingTool::new("file_write", calls_c.clone()));
 
     let memory = Arc::new(NoneMemory::new());
-    let registry =
-        HostFunctionRegistry::new(memory, vec![tool_a, tool_b, tool_c], make_audit());
+    let registry = HostFunctionRegistry::new(memory, vec![tool_a, tool_b, tool_c], make_audit());
 
     // Only echo and file_read are allowed
-    let manifest =
-        make_manifest_with_delegation(vec!["echo".into(), "file_read".into()]);
+    let manifest = make_manifest_with_delegation(vec!["echo".into(), "file_read".into()]);
     let allowed = &manifest
         .host_capabilities
         .tool_delegation
@@ -296,8 +299,7 @@ fn build_functions_produces_tool_call_fn_with_allowed_tools() {
     let memory = Arc::new(NoneMemory::new());
     let registry = HostFunctionRegistry::new(memory, vec![], make_audit());
 
-    let manifest =
-        make_manifest_with_delegation(vec!["echo".into(), "file_read".into()]);
+    let manifest = make_manifest_with_delegation(vec!["echo".into(), "file_read".into()]);
 
     let fns = registry.build_functions(&manifest);
     let names: Vec<&str> = fns.iter().map(|f| f.name()).collect();

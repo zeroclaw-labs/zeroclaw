@@ -169,10 +169,7 @@ async fn mixed_executions_record_correct_status_per_entry() {
     .with_audit_logger(Arc::clone(&logger));
 
     // --- Failing tool ---
-    let wasm_bytes: &[u8] = &[
-        0x00, 0x61, 0x73, 0x6d,
-        0x01, 0x00, 0x00, 0x00,
-    ];
+    let wasm_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
     let manifest = extism::Manifest::new([extism::Wasm::data(wasm_bytes)]);
     let plugin = extism::Plugin::new(&manifest, [], true).expect("minimal wasm should load");
     let plugin = Arc::new(Mutex::new(plugin));

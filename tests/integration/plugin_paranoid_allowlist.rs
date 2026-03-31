@@ -12,7 +12,8 @@ use zeroclaw::plugins::loader::{validate_plugin_allowlist, NetworkSecurityLevel}
 #[test]
 fn paranoid_rejects_plugin_not_on_allowlist() {
     let allowed: Vec<String> = vec!["trusted-plugin".to_string()];
-    let result = validate_plugin_allowlist("rogue-plugin", &allowed, NetworkSecurityLevel::Paranoid);
+    let result =
+        validate_plugin_allowlist("rogue-plugin", &allowed, NetworkSecurityLevel::Paranoid);
 
     assert!(
         result.is_err(),
@@ -32,10 +33,7 @@ fn paranoid_rejects_plugin_not_on_allowlist() {
 
 #[test]
 fn paranoid_allows_plugin_on_allowlist() {
-    let allowed: Vec<String> = vec![
-        "trusted-plugin".to_string(),
-        "another-trusted".to_string(),
-    ];
+    let allowed: Vec<String> = vec!["trusted-plugin".to_string(), "another-trusted".to_string()];
     let result =
         validate_plugin_allowlist("trusted-plugin", &allowed, NetworkSecurityLevel::Paranoid);
 
@@ -49,8 +47,7 @@ fn paranoid_allows_plugin_on_allowlist() {
 #[test]
 fn paranoid_rejects_when_allowlist_is_empty() {
     let allowed: Vec<String> = vec![];
-    let result =
-        validate_plugin_allowlist("any-plugin", &allowed, NetworkSecurityLevel::Paranoid);
+    let result = validate_plugin_allowlist("any-plugin", &allowed, NetworkSecurityLevel::Paranoid);
 
     assert!(
         result.is_err(),
@@ -75,8 +72,7 @@ fn default_level_allows_any_plugin_regardless_of_allowlist() {
 #[test]
 fn strict_level_allows_any_plugin_regardless_of_allowlist() {
     let allowed: Vec<String> = vec![];
-    let result =
-        validate_plugin_allowlist("some-plugin", &allowed, NetworkSecurityLevel::Strict);
+    let result = validate_plugin_allowlist("some-plugin", &allowed, NetworkSecurityLevel::Strict);
 
     assert!(
         result.is_ok(),

@@ -25,8 +25,8 @@ fn http_request_to_non_allowed_host_is_blocked() {
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate bad-actor plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate bad-actor plugin");
 
     let result = plugin.call::<&str, &str>("tool_http_blocked", "{}");
 
@@ -47,8 +47,8 @@ fn http_request_blocked_when_different_host_allowed() {
         .with_timeout(std::time::Duration::from_secs(5))
         .with_allowed_hosts(["example.com"].iter().map(|s| s.to_string()));
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate bad-actor plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate bad-actor plugin");
 
     let result = plugin.call::<&str, &str>("tool_http_blocked", "{}");
 

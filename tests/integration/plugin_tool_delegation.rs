@@ -21,7 +21,7 @@ use zeroclaw::config::AuditConfig;
 use zeroclaw::memory::none::NoneMemory;
 use zeroclaw::plugins::host_functions::HostFunctionRegistry;
 use zeroclaw::plugins::{
-    PluginCapabilities, PluginManifest, RiskLevel, ToolDelegationCapability, ToolDefinition,
+    PluginCapabilities, PluginManifest, RiskLevel, ToolDefinition, ToolDelegationCapability,
 };
 use zeroclaw::security::audit::AuditLogger;
 use zeroclaw::tools::traits::{Tool, ToolResult};
@@ -134,9 +134,7 @@ fn make_plain_manifest() -> PluginManifest {
 
 /// Simulate the allowed_tools check from the host function.
 fn is_tool_allowed(allowed_tools: &[String], tool_name: &str) -> bool {
-    allowed_tools
-        .iter()
-        .any(|t| t == "*" || t == tool_name)
+    allowed_tools.iter().any(|t| t == "*" || t == tool_name)
 }
 
 // ===========================================================================
@@ -172,7 +170,10 @@ async fn delegation_to_allowed_builtin_tool_succeeds() {
 
     // Step 3: tool found in registry and executed
     let found = registry.tools.iter().find(|t| t.name() == "echo").unwrap();
-    let result = found.execute(json!({ "message": "hello world" })).await.unwrap();
+    let result = found
+        .execute(json!({ "message": "hello world" }))
+        .await
+        .unwrap();
 
     assert!(result.success);
     assert_eq!(result.output, "echo executed");
@@ -204,7 +205,11 @@ async fn delegation_passes_arguments_through_to_builtin_tool() {
         "max_bytes": 4096
     });
 
-    let found = registry.tools.iter().find(|t| t.name() == "file_read").unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "file_read")
+        .unwrap();
     let result = found.execute(args.clone()).await.unwrap();
 
     assert!(result.success);
@@ -231,11 +236,20 @@ async fn delegation_returns_builtin_tool_custom_output() {
     let manifest = make_delegating_manifest(vec!["calculator".into()]);
 
     assert!(is_tool_allowed(
-        &manifest.host_capabilities.tool_delegation.as_ref().unwrap().allowed_tools,
+        &manifest
+            .host_capabilities
+            .tool_delegation
+            .as_ref()
+            .unwrap()
+            .allowed_tools,
         "calculator"
     ));
 
-    let found = registry.tools.iter().find(|t| t.name() == "calculator").unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "calculator")
+        .unwrap();
     let result = found.execute(json!({ "expr": "6 * 7" })).await.unwrap();
 
     assert!(result.success);
@@ -305,7 +319,11 @@ async fn delegation_among_multiple_tools_only_allowed_succeed() {
 
     // safe_read: allowed → dispatch
     assert!(is_tool_allowed(allowed, "safe_read"));
-    let found = registry.tools.iter().find(|t| t.name() == "safe_read").unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "safe_read")
+        .unwrap();
     let result = found.execute(json!({})).await.unwrap();
     assert!(result.success);
     assert_eq!(calls_allowed.lock().len(), 1);
@@ -344,10 +362,7 @@ fn delegation_to_nonexistent_tool_not_found() {
 
     // But tool lookup fails
     let found = registry.tools.iter().find(|t| t.name() == "ghost_tool");
-    assert!(
-        found.is_none(),
-        "ghost_tool must not be found in registry"
-    );
+    assert!(found.is_none(), "ghost_tool must not be found in registry");
 }
 
 // ===========================================================================
@@ -383,9 +398,8 @@ fn plugin_without_delegation_has_no_zeroclaw_tool_call() {
 #[tokio::test]
 async fn delegation_to_higher_risk_tool_is_blocked() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let high_tool: Arc<dyn Tool> = Arc::new(
-        BuiltinMock::new("dangerous_op", calls.clone()).with_risk(RiskLevel::High),
-    );
+    let high_tool: Arc<dyn Tool> =
+        Arc::new(BuiltinMock::new("dangerous_op", calls.clone()).with_risk(RiskLevel::High));
 
     let memory = Arc::new(NoneMemory::new());
     let registry = HostFunctionRegistry::new(memory, vec![high_tool.clone()], make_audit());
@@ -413,7 +427,11 @@ async fn delegation_to_higher_risk_tool_is_blocked() {
     );
 
     // But risk ceiling check prevents execution
-    let found = registry.tools.iter().find(|t| t.name() == "dangerous_op").unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "dangerous_op")
+        .unwrap();
     assert!(
         found.risk_level() > caller_max,
         "risk ceiling enforcement: High > Low"
@@ -446,13 +464,20 @@ async fn delegation_to_same_risk_tool_succeeds() {
 
     assert!(is_tool_allowed(allowed, "safe_op"));
 
-    let found = registry.tools.iter().find(|t| t.name() == "safe_op").unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "safe_op")
+        .unwrap();
     assert!(
         found.risk_level() <= caller_max,
         "Low-risk tool within Low-risk ceiling"
     );
 
-    let result = found.execute(json!({ "action": "read_status" })).await.unwrap();
+    let result = found
+        .execute(json!({ "action": "read_status" }))
+        .await
+        .unwrap();
     assert!(result.success);
     assert_eq!(result.output, "safe_op executed");
     assert_eq!(calls.lock().len(), 1);
@@ -468,13 +493,13 @@ async fn full_delegation_pipeline_end_to_end() {
     let read_calls = Arc::new(Mutex::new(Vec::new()));
     let write_calls = Arc::new(Mutex::new(Vec::new()));
 
-    let echo: Arc<dyn Tool> = Arc::new(
-        BuiltinMock::new("echo", echo_calls.clone()).with_response(ToolResult {
+    let echo: Arc<dyn Tool> = Arc::new(BuiltinMock::new("echo", echo_calls.clone()).with_response(
+        ToolResult {
             success: true,
             output: "hello from echo".into(),
             error: None,
-        }),
-    );
+        },
+    ));
     let file_read: Arc<dyn Tool> = Arc::new(
         BuiltinMock::new("file_read", read_calls.clone()).with_response(ToolResult {
             success: true,
@@ -482,9 +507,8 @@ async fn full_delegation_pipeline_end_to_end() {
             error: None,
         }),
     );
-    let file_write: Arc<dyn Tool> = Arc::new(
-        BuiltinMock::new("file_write", write_calls.clone()).with_risk(RiskLevel::High),
-    );
+    let file_write: Arc<dyn Tool> =
+        Arc::new(BuiltinMock::new("file_write", write_calls.clone()).with_risk(RiskLevel::High));
 
     let memory = Arc::new(NoneMemory::new());
     let registry =
@@ -513,7 +537,11 @@ async fn full_delegation_pipeline_end_to_end() {
 
     // Dispatch file_read — allowed, exists, same risk → success
     assert!(is_tool_allowed(allowed, "file_read"));
-    let found = registry.tools.iter().find(|t| t.name() == "file_read").unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "file_read")
+        .unwrap();
     let result = found.execute(json!({ "path": "/tmp/test" })).await.unwrap();
     assert!(result.success);
     assert_eq!(result.output, "file contents here");

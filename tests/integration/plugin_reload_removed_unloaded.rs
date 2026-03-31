@@ -34,9 +34,7 @@ fn reload_unloads_removed_plugins() {
         .find("fn test_reload_drops_removed_plugins")
         .expect("reload drops-removed test must exist");
     let test_body = &tests[test_pos..];
-    let body_end = test_body
-        .find("\n    #[test]")
-        .unwrap_or(test_body.len());
+    let body_end = test_body.find("\n    #[test]").unwrap_or(test_body.len());
     let test_body = &test_body[..body_end];
 
     // The test creates a plugin, then removes its directory from disk
@@ -79,9 +77,7 @@ fn reload_computes_unloaded_via_set_difference() {
     let host_rs = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plugins/host.rs");
     let source = fs::read_to_string(&host_rs).expect("failed to read src/plugins/host.rs");
 
-    let reload_pos = source
-        .find("fn reload(")
-        .expect("reload method must exist");
+    let reload_pos = source.find("fn reload(").expect("reload method must exist");
     let reload_body = &source[reload_pos..];
     let body_end = reload_body
         .find("\n    pub fn ")

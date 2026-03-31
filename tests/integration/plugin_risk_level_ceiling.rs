@@ -18,7 +18,7 @@ use zeroclaw::config::AuditConfig;
 use zeroclaw::memory::none::NoneMemory;
 use zeroclaw::plugins::host_functions::HostFunctionRegistry;
 use zeroclaw::plugins::{
-    PluginCapabilities, PluginManifest, RiskLevel, ToolDelegationCapability, ToolDefinition,
+    PluginCapabilities, PluginManifest, RiskLevel, ToolDefinition, ToolDelegationCapability,
 };
 use zeroclaw::security::audit::AuditLogger;
 use zeroclaw::tools::traits::{Tool, ToolResult};
@@ -165,11 +165,14 @@ async fn medium_plugin_can_call_low_risk_tool() {
     let registry = HostFunctionRegistry::new(memory, vec![low_tool.clone()], make_audit());
 
     // Medium-risk plugin calling a low-risk tool: should be allowed
-    let manifest =
-        make_manifest_with_risk(&[RiskLevel::Medium], vec!["safe_tool".into()]);
+    let manifest = make_manifest_with_risk(&[RiskLevel::Medium], vec!["safe_tool".into()]);
 
     // Simulate the dispatch: find tool, check risk, execute
-    let target = registry.tools.iter().find(|t| t.name() == "safe_tool").unwrap();
+    let target = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "safe_tool")
+        .unwrap();
     let caller_max = manifest.tools.iter().map(|t| t.risk_level).max().unwrap();
     assert!(
         target.risk_level() <= caller_max,
@@ -190,10 +193,13 @@ async fn high_plugin_can_call_any_risk_tool() {
     let memory = Arc::new(NoneMemory::new());
     let registry = HostFunctionRegistry::new(memory, vec![high_tool.clone()], make_audit());
 
-    let manifest =
-        make_manifest_with_risk(&[RiskLevel::High], vec!["dangerous".into()]);
+    let manifest = make_manifest_with_risk(&[RiskLevel::High], vec!["dangerous".into()]);
 
-    let target = registry.tools.iter().find(|t| t.name() == "dangerous").unwrap();
+    let target = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "dangerous")
+        .unwrap();
     let caller_max = manifest.tools.iter().map(|t| t.risk_level).max().unwrap();
     assert!(
         target.risk_level() <= caller_max,
@@ -213,10 +219,13 @@ async fn medium_plugin_cannot_call_high_risk_tool() {
     let memory = Arc::new(NoneMemory::new());
     let registry = HostFunctionRegistry::new(memory, vec![high_tool], make_audit());
 
-    let manifest =
-        make_manifest_with_risk(&[RiskLevel::Medium], vec!["risky_op".into()]);
+    let manifest = make_manifest_with_risk(&[RiskLevel::Medium], vec!["risky_op".into()]);
 
-    let target = registry.tools.iter().find(|t| t.name() == "risky_op").unwrap();
+    let target = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "risky_op")
+        .unwrap();
     let caller_max = manifest.tools.iter().map(|t| t.risk_level).max().unwrap();
     assert!(
         target.risk_level() > caller_max,
@@ -236,8 +245,7 @@ async fn low_plugin_cannot_call_high_risk_tool() {
     let memory = Arc::new(NoneMemory::new());
     let _registry = HostFunctionRegistry::new(memory, vec![high_tool.clone()], make_audit());
 
-    let manifest =
-        make_manifest_with_risk(&[RiskLevel::Low], vec!["danger".into()]);
+    let manifest = make_manifest_with_risk(&[RiskLevel::Low], vec!["danger".into()]);
 
     let caller_max = manifest.tools.iter().map(|t| t.risk_level).max().unwrap();
     assert_eq!(caller_max, RiskLevel::Low);
@@ -305,8 +313,7 @@ async fn same_risk_level_is_allowed() {
     let memory = Arc::new(NoneMemory::new());
     let registry = HostFunctionRegistry::new(memory, vec![medium_tool], make_audit());
 
-    let manifest =
-        make_manifest_with_risk(&[RiskLevel::Medium], vec!["peer".into()]);
+    let manifest = make_manifest_with_risk(&[RiskLevel::Medium], vec!["peer".into()]);
 
     let target = registry.tools.iter().find(|t| t.name() == "peer").unwrap();
     let caller_max = manifest.tools.iter().map(|t| t.risk_level).max().unwrap();

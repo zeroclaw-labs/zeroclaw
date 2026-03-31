@@ -52,8 +52,7 @@ fn tools_module_imports_zeroclaw_tool_call() {
 fn tools_module_uses_tool_call_request_struct() {
     let src = sdk_tools_source();
     assert!(
-        src.contains("ToolCallRequest")
-            || (src.contains("tool_name") && src.contains("arguments")),
+        src.contains("ToolCallRequest") || (src.contains("tool_name") && src.contains("arguments")),
         "tool_call wrapper should serialize a typed request with tool_name and arguments fields"
     );
 }
@@ -62,8 +61,7 @@ fn tools_module_uses_tool_call_request_struct() {
 fn tools_module_uses_tool_call_response_struct() {
     let src = sdk_tools_source();
     assert!(
-        src.contains("ToolCallResponse")
-            || (src.contains("success") && src.contains("output")),
+        src.contains("ToolCallResponse") || (src.contains("success") && src.contains("output")),
         "tool_call wrapper should deserialize a typed response with success and output fields"
     );
 }

@@ -52,10 +52,7 @@ impl Channel for TrackingChannel {
         Ok(())
     }
 
-    async fn listen(
-        &self,
-        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -79,18 +76,15 @@ fn make_registry_with_channels() -> (
     let calls_slack = Arc::new(Mutex::new(Vec::new()));
     let calls_email = Arc::new(Mutex::new(Vec::new()));
 
-    let ch_slack: Arc<dyn Channel> =
-        Arc::new(TrackingChannel::new("slack", calls_slack.clone()));
-    let ch_email: Arc<dyn Channel> =
-        Arc::new(TrackingChannel::new("email", calls_email.clone()));
+    let ch_slack: Arc<dyn Channel> = Arc::new(TrackingChannel::new("slack", calls_slack.clone()));
+    let ch_email: Arc<dyn Channel> = Arc::new(TrackingChannel::new("email", calls_email.clone()));
 
     let mut channels = HashMap::new();
     channels.insert("slack".to_string(), ch_slack);
     channels.insert("email".to_string(), ch_email);
 
     let memory = Arc::new(NoneMemory::new());
-    let registry =
-        HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
+    let registry = HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
 
     (registry, calls_slack, calls_email)
 }
@@ -232,7 +226,10 @@ fn rate_limit_exceeded_rejects_further_sends() {
     assert!(result.is_err(), "4th send must be rate-limited");
 
     let err = result.unwrap_err();
-    assert!(err.contains("Rate limit"), "error should mention rate limit");
+    assert!(
+        err.contains("Rate limit"),
+        "error should mention rate limit"
+    );
     assert!(err.contains("sec_plugin"), "error should name the plugin");
     assert!(err.contains("slack"), "error should name the channel");
 }

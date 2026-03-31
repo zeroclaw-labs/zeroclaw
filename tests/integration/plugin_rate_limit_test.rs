@@ -47,21 +47,30 @@ async fn six_rapid_calls_with_limit_of_five_rejects_sixth() {
     // First 5 calls should be allowed (they fail at the WASM level because the
     // minimal module has no exports, but the rate limiter must not block them).
     for i in 1..=5 {
-        let result = tool.execute(json!({})).await.expect("execute should return Ok");
+        let result = tool
+            .execute(json!({}))
+            .await
+            .expect("execute should return Ok");
         assert!(
-            result.error.as_deref().map_or(true, |e| !e.contains("Rate limit")),
+            result
+                .error
+                .as_deref()
+                .map_or(true, |e| !e.contains("Rate limit")),
             "call {i} of 5 should not be rate-limited, got: {:?}",
             result.error
         );
     }
 
     // 6th call must be rejected by the rate limiter.
-    let result = tool.execute(json!({})).await.expect("execute should return Ok");
-    assert!(
-        !result.success,
-        "6th call must fail when budget is 5"
-    );
-    let err = result.error.as_deref().expect("error field must be set on 6th call");
+    let result = tool
+        .execute(json!({}))
+        .await
+        .expect("execute should return Ok");
+    assert!(!result.success, "6th call must fail when budget is 5");
+    let err = result
+        .error
+        .as_deref()
+        .expect("error field must be set on 6th call");
     assert!(
         err.contains("Rate limit"),
         "6th call should be rate-limited, got: {err}"
@@ -83,7 +92,10 @@ async fn rate_limit_error_message_is_clear() {
     }
 
     // Verify the error on the 6th call is clear and actionable.
-    let result = tool.execute(json!({})).await.expect("execute should return Ok");
+    let result = tool
+        .execute(json!({}))
+        .await
+        .expect("execute should return Ok");
     let err = result.error.as_deref().expect("error must be set");
 
     // Must mention "Rate limit" so operators/LLMs can identify the cause.

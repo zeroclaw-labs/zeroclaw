@@ -27,10 +27,18 @@ fn fixtures_path() -> std::path::PathBuf {
 #[test]
 fn path_traversal_via_dotdot_is_denied() {
     let wasm = fs_wasm_path();
-    assert!(wasm.is_file(), "fs_plugin.wasm not found at {}", wasm.display());
+    assert!(
+        wasm.is_file(),
+        "fs_plugin.wasm not found at {}",
+        wasm.display()
+    );
 
     let fixtures = fixtures_path();
-    assert!(fixtures.is_dir(), "fixtures dir not found at {}", fixtures.display());
+    assert!(
+        fixtures.is_dir(),
+        "fixtures dir not found at {}",
+        fixtures.display()
+    );
 
     // Mount only /input -> fixtures dir
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm)])
@@ -56,7 +64,11 @@ fn path_traversal_via_dotdot_is_denied() {
 #[test]
 fn direct_etc_passwd_read_is_denied() {
     let wasm = bad_actor_wasm_path();
-    assert!(wasm.is_file(), "bad_actor_plugin.wasm not found at {}", wasm.display());
+    assert!(
+        wasm.is_file(),
+        "bad_actor_plugin.wasm not found at {}",
+        wasm.display()
+    );
 
     let fixtures = fixtures_path();
 
@@ -82,7 +94,11 @@ fn direct_etc_passwd_read_is_denied() {
 #[test]
 fn absolute_path_outside_mount_is_denied() {
     let wasm = fs_wasm_path();
-    assert!(wasm.is_file(), "fs_plugin.wasm not found at {}", wasm.display());
+    assert!(
+        wasm.is_file(),
+        "fs_plugin.wasm not found at {}",
+        wasm.display()
+    );
 
     let fixtures = fixtures_path();
 

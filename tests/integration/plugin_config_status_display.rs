@@ -120,8 +120,7 @@ fn config_status_model_is_set_because_has_default() {
     // A bare string value means "has a default" → the key is set.
     // The frontend logic: `hasDefault || (isObject && decl.value !== undefined)`
     let is_bare_string = model.is_string();
-    let has_default = is_bare_string
-        || (model.is_object() && model.get("default").is_some());
+    let has_default = is_bare_string || (model.is_object() && model.get("default").is_some());
     assert!(
         has_default,
         "model should be considered 'set' because it has a default value, got: {model}"
@@ -138,11 +137,9 @@ fn config_status_api_key_is_missing_when_no_value_provided() {
     // appear as "missing" in the UI.
     // Frontend logic: isSet = hasDefault || (isObject && decl.value !== undefined)
     let is_bare_string = api_key.is_string();
-    let has_default = is_bare_string
-        || (api_key.is_object() && api_key.get("default").is_some());
-    let has_value = api_key.is_object()
-        && api_key.get("value").is_some()
-        && !api_key["value"].is_null();
+    let has_default = is_bare_string || (api_key.is_object() && api_key.get("default").is_some());
+    let has_value =
+        api_key.is_object() && api_key.get("value").is_some() && !api_key["value"].is_null();
     let is_set = has_default || has_value;
     assert!(
         !is_set,
@@ -178,8 +175,7 @@ fn frontend_config_status(decl: &serde_json::Value) -> (bool, bool) {
         // bare string/number/bool → acts as default
         decl.is_string() || decl.is_number() || decl.is_boolean()
     };
-    let has_value = is_object
-        && decl.get("value").map_or(false, |v| !v.is_null());
+    let has_value = is_object && decl.get("value").map_or(false, |v| !v.is_null());
     let is_set = has_default || has_value;
     (is_required, is_set)
 }
@@ -210,9 +206,7 @@ fn config_status_all_keys_have_deterministic_status() {
         // Every key should resolve to exactly one of: required+set, required+missing,
         // optional+set, optional+missing. This test ensures the logic doesn't panic
         // or produce undefined states.
-        let label = format!(
-            "{key}: required={is_required}, set={is_set}",
-        );
+        let label = format!("{key}: required={is_required}, set={is_set}",);
         assert!(
             label.contains("required=") && label.contains("set="),
             "config key '{key}' should have deterministic status"

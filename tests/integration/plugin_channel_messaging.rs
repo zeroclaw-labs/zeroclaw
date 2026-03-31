@@ -46,10 +46,7 @@ impl Channel for TrackingChannel {
         Ok(())
     }
 
-    async fn listen(
-        &self,
-        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -106,8 +103,7 @@ fn make_registry_with_channels(
     }
 
     let memory = Arc::new(NoneMemory::new());
-    let registry =
-        HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
+    let registry = HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
 
     (registry, trackers)
 }
@@ -194,10 +190,7 @@ async fn messages_route_to_their_respective_channels() {
 
     let t = trackers["telegram"].lock();
     assert_eq!(t.len(), 1);
-    assert_eq!(
-        t[0],
-        ("chat123".to_string(), "tg notification".to_string())
-    );
+    assert_eq!(t[0], ("chat123".to_string(), "tg notification".to_string()));
 }
 
 /// A channel that does not exist in the registry cannot be dispatched to.

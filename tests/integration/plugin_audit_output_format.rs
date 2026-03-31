@@ -117,7 +117,10 @@ fn full_plugin_risk_levels_section() {
     assert!(mutate_line.contains("(requires approval in supervised mode)"));
 
     // destroy → high, requires approval
-    let destroy_line = risk_section.lines().find(|l| l.contains("destroy")).unwrap();
+    let destroy_line = risk_section
+        .lines()
+        .find(|l| l.contains("destroy"))
+        .unwrap();
     assert!(destroy_line.contains("→ high"));
     assert!(destroy_line.contains("(requires approval in supervised mode)"));
 }
@@ -183,7 +186,10 @@ fn minimal_plugin_shows_none_for_filesystem() {
 
     let fs_section = output.split("Filesystem access:").nth(1).unwrap();
     let until_blank = fs_section.split("\n\n").next().unwrap();
-    assert!(until_blank.contains("(none)"), "filesystem should show (none)");
+    assert!(
+        until_blank.contains("(none)"),
+        "filesystem should show (none)"
+    );
 }
 
 #[test]
@@ -193,7 +199,10 @@ fn minimal_plugin_shows_none_for_capabilities() {
 
     let cap_section = output.split("Host capabilities:").nth(1).unwrap();
     let until_blank = cap_section.split("\n\n").next().unwrap();
-    assert!(until_blank.contains("(none)"), "capabilities should show (none)");
+    assert!(
+        until_blank.contains("(none)"),
+        "capabilities should show (none)"
+    );
 }
 
 #[test]
@@ -201,7 +210,10 @@ fn minimal_plugin_has_no_description_or_author() {
     let manifest = PluginManifest::parse(minimal_plugin_toml()).expect("parse");
     let output = format_audit_summary(&manifest);
 
-    assert!(!output.contains("Description:"), "minimal plugin has no description");
+    assert!(
+        !output.contains("Description:"),
+        "minimal plugin has no description"
+    );
     assert!(!output.contains("Author:"), "minimal plugin has no author");
 }
 
@@ -209,7 +221,10 @@ fn minimal_plugin_has_no_description_or_author() {
 fn minimal_plugin_no_trailing_newline() {
     let manifest = PluginManifest::parse(minimal_plugin_toml()).expect("parse");
     let output = format_audit_summary(&manifest);
-    assert!(!output.ends_with('\n'), "output should not end with newline");
+    assert!(
+        !output.ends_with('\n'),
+        "output should not end with newline"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -241,8 +256,14 @@ fn wildcard_hosts_displayed_with_check_marks() {
     let manifest = PluginManifest::parse(wildcard_plugin_toml()).expect("parse");
     let output = format_audit_summary(&manifest);
 
-    assert!(output.contains("  ✓ *.example.com"), "wildcard *.example.com missing");
-    assert!(output.contains("  ✓ *.internal.io"), "wildcard *.internal.io missing");
+    assert!(
+        output.contains("  ✓ *.example.com"),
+        "wildcard *.example.com missing"
+    );
+    assert!(
+        output.contains("  ✓ *.internal.io"),
+        "wildcard *.internal.io missing"
+    );
     assert!(output.contains("  ✓ exact-host.dev"), "exact host missing");
 }
 

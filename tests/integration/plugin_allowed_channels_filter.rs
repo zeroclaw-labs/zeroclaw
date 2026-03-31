@@ -49,10 +49,7 @@ impl Channel for TrackingChannel {
         Ok(())
     }
 
-    async fn listen(
-        &self,
-        _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -77,7 +74,10 @@ fn make_manifest_with_messaging(allowed_channels: Vec<String>) -> PluginManifest
     "#;
     let mut m: PluginManifest = toml::from_str(toml_str).expect("valid manifest");
     m.host_capabilities = PluginCapabilities {
-        messaging: Some(MessagingCapability { allowed_channels, ..Default::default() }),
+        messaging: Some(MessagingCapability {
+            allowed_channels,
+            ..Default::default()
+        }),
         ..Default::default()
     };
     m
@@ -93,10 +93,8 @@ fn make_registry_with_three_channels() -> (
     let calls_email = Arc::new(Mutex::new(Vec::new()));
     let calls_telegram = Arc::new(Mutex::new(Vec::new()));
 
-    let ch_slack: Arc<dyn Channel> =
-        Arc::new(TrackingChannel::new("slack", calls_slack.clone()));
-    let ch_email: Arc<dyn Channel> =
-        Arc::new(TrackingChannel::new("email", calls_email.clone()));
+    let ch_slack: Arc<dyn Channel> = Arc::new(TrackingChannel::new("slack", calls_slack.clone()));
+    let ch_email: Arc<dyn Channel> = Arc::new(TrackingChannel::new("email", calls_email.clone()));
     let ch_telegram: Arc<dyn Channel> =
         Arc::new(TrackingChannel::new("telegram", calls_telegram.clone()));
 
@@ -106,8 +104,7 @@ fn make_registry_with_three_channels() -> (
     channels.insert("telegram".to_string(), ch_telegram);
 
     let memory = Arc::new(NoneMemory::new());
-    let registry =
-        HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
+    let registry = HostFunctionRegistry::new(memory, vec![], make_audit()).with_channels(channels);
 
     (registry, calls_slack, calls_email, calls_telegram)
 }
@@ -156,8 +153,7 @@ async fn allowed_channel_can_be_messaged() {
 
 #[tokio::test]
 async fn multiple_allowed_channels_can_be_messaged() {
-    let (registry, calls_slack, calls_email, _calls_telegram) =
-        make_registry_with_three_channels();
+    let (registry, calls_slack, calls_email, _calls_telegram) = make_registry_with_three_channels();
 
     let manifest = make_manifest_with_messaging(vec!["slack".into(), "email".into()]);
     let allowed = &manifest
@@ -172,10 +168,22 @@ async fn multiple_allowed_channels_can_be_messaged() {
 
     // Both allowed channels can be messaged
     let msg1 = SendMessage::new("slack msg", "chan1");
-    registry.channels.get("slack").unwrap().send(&msg1).await.unwrap();
+    registry
+        .channels
+        .get("slack")
+        .unwrap()
+        .send(&msg1)
+        .await
+        .unwrap();
 
     let msg2 = SendMessage::new("email msg", "alice@example.com");
-    registry.channels.get("email").unwrap().send(&msg2).await.unwrap();
+    registry
+        .channels
+        .get("email")
+        .unwrap()
+        .send(&msg2)
+        .await
+        .unwrap();
 
     assert_eq!(calls_slack.lock().len(), 1);
     assert_eq!(calls_email.lock().len(), 1);
@@ -237,8 +245,7 @@ fn only_specified_channels_pass_filter() {
 
 #[tokio::test]
 async fn wildcard_allows_all_registered_channels() {
-    let (registry, calls_slack, calls_email, calls_telegram) =
-        make_registry_with_three_channels();
+    let (registry, calls_slack, calls_email, calls_telegram) = make_registry_with_three_channels();
 
     let manifest = make_manifest_with_messaging(vec!["*".into()]);
     let allowed = &manifest
@@ -257,9 +264,27 @@ async fn wildcard_allows_all_registered_channels() {
 
     // All registered channels can be messaged
     let msg = SendMessage::new("broadcast", "all");
-    registry.channels.get("slack").unwrap().send(&msg).await.unwrap();
-    registry.channels.get("email").unwrap().send(&msg).await.unwrap();
-    registry.channels.get("telegram").unwrap().send(&msg).await.unwrap();
+    registry
+        .channels
+        .get("slack")
+        .unwrap()
+        .send(&msg)
+        .await
+        .unwrap();
+    registry
+        .channels
+        .get("email")
+        .unwrap()
+        .send(&msg)
+        .await
+        .unwrap();
+    registry
+        .channels
+        .get("telegram")
+        .unwrap()
+        .send(&msg)
+        .await
+        .unwrap();
 
     assert_eq!(calls_slack.lock().len(), 1);
     assert_eq!(calls_email.lock().len(), 1);
@@ -268,11 +293,7 @@ async fn wildcard_allows_all_registered_channels() {
 
 #[test]
 fn wildcard_mixed_with_named_channels_still_allows_all() {
-    let manifest = make_manifest_with_messaging(vec![
-        "slack".into(),
-        "*".into(),
-        "email".into(),
-    ]);
+    let manifest = make_manifest_with_messaging(vec!["slack".into(), "*".into(), "email".into()]);
     let allowed = &manifest
         .host_capabilities
         .messaging

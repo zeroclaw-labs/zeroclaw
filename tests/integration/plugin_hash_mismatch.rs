@@ -30,7 +30,9 @@ capabilities = ["tool"]
     let host = PluginHost::new(dir.path()).unwrap();
 
     // Sanity: plugin was discovered and hash was recorded.
-    let info = host.get_plugin("tampered").expect("plugin should be discovered");
+    let info = host
+        .get_plugin("tampered")
+        .expect("plugin should be discovered");
     assert!(
         info.wasm_sha256.is_some(),
         "SHA-256 hash must be recorded at discovery time"
@@ -94,7 +96,9 @@ capabilities = ["tool"]
     // Deliberately do NOT create plugin.wasm
 
     let host = PluginHost::new(dir.path()).unwrap();
-    let info = host.get_plugin("no-wasm").expect("plugin should be discovered");
+    let info = host
+        .get_plugin("no-wasm")
+        .expect("plugin should be discovered");
     assert!(
         info.wasm_sha256.is_none(),
         "no hash should be recorded when WASM file is absent"

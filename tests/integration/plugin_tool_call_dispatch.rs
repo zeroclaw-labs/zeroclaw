@@ -213,7 +213,11 @@ async fn dispatch_passes_complex_arguments() {
         "options": {"timeout": 30, "retry": false}
     });
 
-    let found = registry.tools.iter().find(|t| t.name() == "process").unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "process")
+        .unwrap();
     let result = found.execute(complex_args.clone()).await.unwrap();
     assert!(result.success);
 
@@ -228,18 +232,22 @@ async fn dispatch_passes_complex_arguments() {
 #[tokio::test]
 async fn successful_tool_result_is_preserved() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let tool: Arc<dyn Tool> = Arc::new(
-        TrackingTool::new("calculator", calls).with_response(ToolResult {
+    let tool: Arc<dyn Tool> = Arc::new(TrackingTool::new("calculator", calls).with_response(
+        ToolResult {
             success: true,
             output: "42".into(),
             error: None,
-        }),
-    );
+        },
+    ));
 
     let memory = Arc::new(NoneMemory::new());
     let registry = HostFunctionRegistry::new(memory, vec![tool], make_audit());
 
-    let found = registry.tools.iter().find(|t| t.name() == "calculator").unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "calculator")
+        .unwrap();
     let result = found.execute(json!({})).await.unwrap();
 
     assert!(result.success);
@@ -250,18 +258,22 @@ async fn successful_tool_result_is_preserved() {
 #[tokio::test]
 async fn failed_tool_result_preserves_error() {
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let tool: Arc<dyn Tool> = Arc::new(
-        TrackingTool::new("risky_op", calls).with_response(ToolResult {
+    let tool: Arc<dyn Tool> = Arc::new(TrackingTool::new("risky_op", calls).with_response(
+        ToolResult {
             success: false,
             output: "operation failed".into(),
             error: Some("permission denied".into()),
-        }),
-    );
+        },
+    ));
 
     let memory = Arc::new(NoneMemory::new());
     let registry = HostFunctionRegistry::new(memory, vec![tool], make_audit());
 
-    let found = registry.tools.iter().find(|t| t.name() == "risky_op").unwrap();
+    let found = registry
+        .tools
+        .iter()
+        .find(|t| t.name() == "risky_op")
+        .unwrap();
     let result = found.execute(json!({})).await.unwrap();
 
     assert!(!result.success);
@@ -327,13 +339,13 @@ async fn dispatch_selects_correct_tool_among_multiple() {
             error: None,
         }),
     );
-    let tool_b: Arc<dyn Tool> = Arc::new(
-        TrackingTool::new("beta", calls_b.clone()).with_response(ToolResult {
+    let tool_b: Arc<dyn Tool> = Arc::new(TrackingTool::new("beta", calls_b.clone()).with_response(
+        ToolResult {
             success: true,
             output: "beta response".into(),
             error: None,
-        }),
-    );
+        },
+    ));
 
     let memory = Arc::new(NoneMemory::new());
     let registry = HostFunctionRegistry::new(memory, vec![tool_a, tool_b], make_audit());
@@ -345,6 +357,9 @@ async fn dispatch_selects_correct_tool_among_multiple() {
     assert_eq!(result.output, "beta response");
 
     // Only beta should have been called
-    assert!(calls_a.lock().is_empty(), "alpha should not have been called");
+    assert!(
+        calls_a.lock().is_empty(),
+        "alpha should not have been called"
+    );
     assert_eq!(calls_b.lock().len(), 1, "beta should have been called once");
 }

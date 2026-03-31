@@ -29,10 +29,8 @@ fn audit_parses_plugin_toml_from_directory() {
     );
 
     // Replicate the CLI handler logic: read and parse, no install.
-    let content = std::fs::read_to_string(&manifest_path)
-        .expect("should read plugin.toml");
-    let manifest = PluginManifest::parse(&content)
-        .expect("should parse plugin.toml without error");
+    let content = std::fs::read_to_string(&manifest_path).expect("should read plugin.toml");
+    let manifest = PluginManifest::parse(&content).expect("should parse plugin.toml without error");
 
     assert_eq!(manifest.name, "echo-plugin");
     assert_eq!(manifest.version, "0.1.0");
@@ -40,7 +38,10 @@ fn audit_parses_plugin_toml_from_directory() {
         manifest.description.as_deref(),
         Some("Echoes JSON input back as output — used for round-trip integration tests.")
     );
-    assert!(!manifest.tools.is_empty(), "echo-plugin should declare at least one tool");
+    assert!(
+        !manifest.tools.is_empty(),
+        "echo-plugin should declare at least one tool"
+    );
     assert_eq!(manifest.tools[0].name, "tool_echo");
 }
 
@@ -49,10 +50,10 @@ fn audit_parses_plugin_toml_from_directory() {
 fn audit_parses_plugin_toml_by_file_path() {
     let manifest_path = test_plugins_dir().join("echo-plugin/plugin.toml");
 
-    let content = std::fs::read_to_string(&manifest_path)
-        .expect("should read plugin.toml by file path");
-    let manifest = PluginManifest::parse(&content)
-        .expect("should parse plugin.toml from direct file path");
+    let content =
+        std::fs::read_to_string(&manifest_path).expect("should read plugin.toml by file path");
+    let manifest =
+        PluginManifest::parse(&content).expect("should parse plugin.toml from direct file path");
 
     assert_eq!(manifest.name, "echo-plugin");
 }
@@ -80,8 +81,8 @@ parameters_schema = { type = "object" }
 
     // Parsing must succeed even though the WASM binary doesn't exist,
     // proving that audit only reads the manifest — it does not install.
-    let manifest = PluginManifest::parse(toml_str)
-        .expect("parse should succeed without loading WASM");
+    let manifest =
+        PluginManifest::parse(toml_str).expect("parse should succeed without loading WASM");
 
     assert_eq!(manifest.name, "phantom-plugin");
     assert_eq!(manifest.wasm_path, "nonexistent_phantom_plugin.wasm");

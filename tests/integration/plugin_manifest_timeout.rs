@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use zeroclaw::plugins::PluginManifest;
 use zeroclaw::plugins::loader::build_extism_manifest;
+use zeroclaw::plugins::PluginManifest;
 
 fn project_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
@@ -57,8 +57,8 @@ risk_level = "high"
 parameters_schema = { type = "object" }
 "#;
 
-    let manifest = PluginManifest::parse(toml_str)
-        .expect("failed to parse manifest with timeout_ms");
+    let manifest =
+        PluginManifest::parse(toml_str).expect("failed to parse manifest with timeout_ms");
 
     assert_eq!(
         manifest.timeout_ms, 2_000,
@@ -76,8 +76,8 @@ wasm_path = "plugin.wasm"
 capabilities = ["tool"]
 "#;
 
-    let manifest = PluginManifest::parse(toml_str)
-        .expect("failed to parse manifest without timeout_ms");
+    let manifest =
+        PluginManifest::parse(toml_str).expect("failed to parse manifest without timeout_ms");
 
     assert_eq!(
         manifest.timeout_ms, 30_000,

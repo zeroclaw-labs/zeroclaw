@@ -14,8 +14,7 @@ fn load_manifest() -> PluginManifest {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(MANIFEST_PATH);
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
-    PluginManifest::parse(&content)
-        .unwrap_or_else(|e| panic!("failed to parse manifest: {e}"))
+    PluginManifest::parse(&content).unwrap_or_else(|e| panic!("failed to parse manifest: {e}"))
 }
 
 #[test]
@@ -77,20 +76,37 @@ fn multi_tool_exports_match_names() {
 #[test]
 fn tool_add_has_correct_parameter_schema() {
     let manifest = load_manifest();
-    let tool = manifest.tools.iter().find(|t| t.name == "tool_add")
+    let tool = manifest
+        .tools
+        .iter()
+        .find(|t| t.name == "tool_add")
         .expect("tool_add not found");
 
-    let schema = tool.parameters_schema.as_ref().expect("tool_add should have a parameters_schema");
+    let schema = tool
+        .parameters_schema
+        .as_ref()
+        .expect("tool_add should have a parameters_schema");
     assert_eq!(schema["type"], "object");
 
-    let props = schema["properties"].as_object()
+    let props = schema["properties"]
+        .as_object()
         .expect("schema should have properties");
-    assert!(props.contains_key("a"), "tool_add should have parameter 'a'");
-    assert!(props.contains_key("b"), "tool_add should have parameter 'b'");
+    assert!(
+        props.contains_key("a"),
+        "tool_add should have parameter 'a'"
+    );
+    assert!(
+        props.contains_key("b"),
+        "tool_add should have parameter 'b'"
+    );
 
-    let required = schema["required"].as_array()
+    let required = schema["required"]
+        .as_array()
         .expect("schema should have required array");
-    let req_strs: Vec<&str> = required.iter().filter_map(serde_json::Value::as_str).collect();
+    let req_strs: Vec<&str> = required
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
     assert!(req_strs.contains(&"a"), "parameter 'a' should be required");
     assert!(req_strs.contains(&"b"), "parameter 'b' should be required");
 }
@@ -98,24 +114,41 @@ fn tool_add_has_correct_parameter_schema() {
 #[test]
 fn tool_reverse_string_has_correct_parameter_schema() {
     let manifest = load_manifest();
-    let tool = manifest.tools.iter().find(|t| t.name == "tool_reverse_string")
+    let tool = manifest
+        .tools
+        .iter()
+        .find(|t| t.name == "tool_reverse_string")
         .expect("tool_reverse_string not found");
 
     let schema = tool.parameters_schema.as_ref().expect("should have schema");
-    let props = schema["properties"].as_object()
+    let props = schema["properties"]
+        .as_object()
         .expect("schema should have properties");
-    assert!(props.contains_key("text"), "tool_reverse_string should have parameter 'text'");
+    assert!(
+        props.contains_key("text"),
+        "tool_reverse_string should have parameter 'text'"
+    );
 
-    let required = schema["required"].as_array()
+    let required = schema["required"]
+        .as_array()
         .expect("schema should have required array");
-    let req_strs: Vec<&str> = required.iter().filter_map(serde_json::Value::as_str).collect();
-    assert!(req_strs.contains(&"text"), "parameter 'text' should be required");
+    let req_strs: Vec<&str> = required
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        req_strs.contains(&"text"),
+        "parameter 'text' should be required"
+    );
 }
 
 #[test]
 fn tool_lookup_config_has_minimal_schema() {
     let manifest = load_manifest();
-    let tool = manifest.tools.iter().find(|t| t.name == "tool_lookup_config")
+    let tool = manifest
+        .tools
+        .iter()
+        .find(|t| t.name == "tool_lookup_config")
         .expect("tool_lookup_config not found");
 
     let schema = tool.parameters_schema.as_ref().expect("should have schema");
@@ -125,35 +158,63 @@ fn tool_lookup_config_has_minimal_schema() {
 #[test]
 fn tool_http_get_has_url_parameter() {
     let manifest = load_manifest();
-    let tool = manifest.tools.iter().find(|t| t.name == "tool_http_get")
+    let tool = manifest
+        .tools
+        .iter()
+        .find(|t| t.name == "tool_http_get")
         .expect("tool_http_get not found");
 
     let schema = tool.parameters_schema.as_ref().expect("should have schema");
-    let props = schema["properties"].as_object()
+    let props = schema["properties"]
+        .as_object()
         .expect("schema should have properties");
-    assert!(props.contains_key("url"), "tool_http_get should have parameter 'url'");
+    assert!(
+        props.contains_key("url"),
+        "tool_http_get should have parameter 'url'"
+    );
 
-    let required = schema["required"].as_array()
+    let required = schema["required"]
+        .as_array()
         .expect("schema should have required array");
-    let req_strs: Vec<&str> = required.iter().filter_map(serde_json::Value::as_str).collect();
-    assert!(req_strs.contains(&"url"), "parameter 'url' should be required");
+    let req_strs: Vec<&str> = required
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        req_strs.contains(&"url"),
+        "parameter 'url' should be required"
+    );
 }
 
 #[test]
 fn tool_read_file_has_path_parameter() {
     let manifest = load_manifest();
-    let tool = manifest.tools.iter().find(|t| t.name == "tool_read_file")
+    let tool = manifest
+        .tools
+        .iter()
+        .find(|t| t.name == "tool_read_file")
         .expect("tool_read_file not found");
 
     let schema = tool.parameters_schema.as_ref().expect("should have schema");
-    let props = schema["properties"].as_object()
+    let props = schema["properties"]
+        .as_object()
         .expect("schema should have properties");
-    assert!(props.contains_key("path"), "tool_read_file should have parameter 'path'");
+    assert!(
+        props.contains_key("path"),
+        "tool_read_file should have parameter 'path'"
+    );
 
-    let required = schema["required"].as_array()
+    let required = schema["required"]
+        .as_array()
         .expect("schema should have required array");
-    let req_strs: Vec<&str> = required.iter().filter_map(serde_json::Value::as_str).collect();
-    assert!(req_strs.contains(&"path"), "parameter 'path' should be required");
+    let req_strs: Vec<&str> = required
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert!(
+        req_strs.contains(&"path"),
+        "parameter 'path' should be required"
+    );
 }
 
 #[test]

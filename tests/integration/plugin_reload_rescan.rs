@@ -19,9 +19,7 @@ fn reload_rescans_directory_and_reinstantiates_plugins() {
 
     // 2. reload() clears the loaded registry before re-scanning
     //    (ensures stale plugins don't survive a reload)
-    let reload_pos = source
-        .find("fn reload(")
-        .expect("reload method must exist");
+    let reload_pos = source.find("fn reload(").expect("reload method must exist");
     let reload_body = &source[reload_pos..];
 
     // Find the closing of reload (next `pub fn` or end of impl)

@@ -124,10 +124,19 @@ fn session_context_serializes_to_valid_json() {
 fn session_context_default_has_empty_fields() {
     let registry = make_registry();
     let ctx = registry.session_context.lock();
-    assert!(ctx.channel_name.is_empty(), "default channel_name should be empty");
-    assert!(ctx.conversation_id.is_empty(), "default conversation_id should be empty");
+    assert!(
+        ctx.channel_name.is_empty(),
+        "default channel_name should be empty"
+    );
+    assert!(
+        ctx.conversation_id.is_empty(),
+        "default conversation_id should be empty"
+    );
     // timestamp has a default but should be a valid string
-    assert!(!ctx.timestamp.is_empty(), "default timestamp should not be empty");
+    assert!(
+        !ctx.timestamp.is_empty(),
+        "default timestamp should not be empty"
+    );
 }
 
 #[test]
@@ -144,7 +153,10 @@ fn session_context_function_registered_for_enabled_capability() {
 
     let fns = registry.build_functions(&manifest);
     let names: Vec<&str> = fns.iter().map(|f| f.name()).collect();
-    assert!(names.contains(&"context_session"), "session function must be registered");
+    assert!(
+        names.contains(&"context_session"),
+        "session function must be registered"
+    );
     assert_eq!(fns.len(), 1, "only one function for session-only");
 }
 
@@ -221,7 +233,10 @@ fn user_identity_function_registered_for_enabled_capability() {
 
     let fns = registry.build_functions(&manifest);
     let names: Vec<&str> = fns.iter().map(|f| f.name()).collect();
-    assert!(names.contains(&"context_user_identity"), "user_identity function must be registered");
+    assert!(
+        names.contains(&"context_user_identity"),
+        "user_identity function must be registered"
+    );
     assert_eq!(fns.len(), 1, "only one function for user_identity-only");
 }
 
@@ -278,7 +293,10 @@ fn paranoid_denies_all_context_even_when_all_enabled() {
 
     let fns = registry.build_functions_for_level(&manifest, NetworkSecurityLevel::Paranoid);
 
-    assert!(fns.is_empty(), "paranoid mode must register zero context functions");
+    assert!(
+        fns.is_empty(),
+        "paranoid mode must register zero context functions"
+    );
 }
 
 #[test]
@@ -387,7 +405,10 @@ fn no_context_capability_yields_no_context_functions() {
     let manifest = manifest_with_caps(PluginCapabilities::default());
 
     let fns = registry.build_functions(&manifest);
-    assert!(fns.is_empty(), "default capabilities should yield no functions");
+    assert!(
+        fns.is_empty(),
+        "default capabilities should yield no functions"
+    );
 }
 
 #[test]

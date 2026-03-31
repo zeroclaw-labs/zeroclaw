@@ -249,7 +249,11 @@ async fn recall_preserves_entry_categories() {
     let entries = vec![
         make_entry("k1", "core content", MemoryCategory::Core),
         make_entry("k2", "daily content", MemoryCategory::Daily),
-        make_entry("k3", "custom content", MemoryCategory::Custom("plugin_data".into())),
+        make_entry(
+            "k3",
+            "custom content",
+            MemoryCategory::Custom("plugin_data".into()),
+        ),
     ];
     let memory = Arc::new(TrackingMemory::with_results(entries));
     let registry = HostFunctionRegistry::new(memory.clone(), vec![], make_audit());
@@ -354,8 +358,5 @@ fn no_memory_functions_when_no_memory_capability() {
     let manifest: PluginManifest = toml::from_str(toml_str).expect("valid manifest TOML");
 
     let fns = registry.build_functions(&manifest);
-    assert!(
-        fns.is_empty(),
-        "no memory capability => no host functions"
-    );
+    assert!(fns.is_empty(), "no memory capability => no host functions");
 }

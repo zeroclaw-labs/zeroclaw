@@ -68,10 +68,9 @@ fn resolve_with_captured_logs(
         .with_writer(writer.clone())
         .finish();
 
-    let result =
-        tracing::subscriber::with_default(subscriber, || {
-            resolve_plugin_config(plugin_name, manifest_config, config_values)
-        });
+    let result = tracing::subscriber::with_default(subscriber, || {
+        resolve_plugin_config(plugin_name, manifest_config, config_values)
+    });
 
     (result, writer.contents())
 }
@@ -84,17 +83,15 @@ fn sensitive_config_value_is_redacted_in_logs() {
         "api_key".to_string(),
         serde_json::json!({"required": true, "sensitive": true}),
     );
-    manifest_config.insert(
-        "region".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("region".to_string(), serde_json::json!({"required": true}));
 
     let secret = "sk-live-super-secret-key-abc123";
     let mut config_values: HashMap<String, String> = HashMap::new();
     config_values.insert("api_key".to_string(), secret.to_string());
     config_values.insert("region".to_string(), "us-east-1".to_string());
 
-    let (result, logs) = resolve_with_captured_logs("test-plugin", &manifest_config, Some(&config_values));
+    let (result, logs) =
+        resolve_with_captured_logs("test-plugin", &manifest_config, Some(&config_values));
     assert!(result.is_ok(), "config resolution should succeed");
 
     // The raw secret must NOT appear anywhere in the logs.
@@ -146,10 +143,7 @@ fn sensitive_default_value_is_redacted_in_logs() {
 #[test]
 fn non_sensitive_config_value_appears_in_logs() {
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "model".to_string(),
-        serde_json::json!({"default": "gpt-4"}),
-    );
+    manifest_config.insert("model".to_string(), serde_json::json!({"default": "gpt-4"}));
 
     let (result, logs) = resolve_with_captured_logs("plain-plugin", &manifest_config, None);
     assert!(result.is_ok(), "config resolution should succeed");
@@ -164,8 +158,12 @@ fn non_sensitive_config_value_appears_in_logs() {
 #[test]
 fn is_sensitive_key_recognizes_sensitive_flag() {
     assert!(is_sensitive_key(&serde_json::json!({"sensitive": true})));
-    assert!(is_sensitive_key(&serde_json::json!({"required": true, "sensitive": true})));
-    assert!(is_sensitive_key(&serde_json::json!({"default": "x", "sensitive": true})));
+    assert!(is_sensitive_key(
+        &serde_json::json!({"required": true, "sensitive": true})
+    ));
+    assert!(is_sensitive_key(
+        &serde_json::json!({"default": "x", "sensitive": true})
+    ));
 
     assert!(!is_sensitive_key(&serde_json::json!({"required": true})));
     assert!(!is_sensitive_key(&serde_json::json!({"sensitive": false})));

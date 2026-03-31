@@ -23,21 +23,12 @@ fn each_plugin_has_cargo_toml_and_lib_rs_and_plugin_toml() {
         );
 
         let cargo_toml = plugin_dir.join("Cargo.toml");
-        assert!(
-            cargo_toml.is_file(),
-            "{plugin}/Cargo.toml is missing"
-        );
+        assert!(cargo_toml.is_file(), "{plugin}/Cargo.toml is missing");
 
         let lib_rs = plugin_dir.join("src/lib.rs");
-        assert!(
-            lib_rs.is_file(),
-            "{plugin}/src/lib.rs is missing"
-        );
+        assert!(lib_rs.is_file(), "{plugin}/src/lib.rs is missing");
 
         let plugin_toml = plugin_dir.join("plugin.toml");
-        assert!(
-            plugin_toml.is_file(),
-            "{plugin}/plugin.toml is missing"
-        );
+        assert!(plugin_toml.is_file(), "{plugin}/plugin.toml is missing");
     }
 }

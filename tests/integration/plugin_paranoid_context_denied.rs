@@ -150,7 +150,11 @@ fn default_level_allows_context() {
     let fns = registry.build_functions_for_level(&manifest, NetworkSecurityLevel::Default);
     let names: Vec<&str> = fns.iter().map(|f| f.name()).collect();
 
-    assert_eq!(fns.len(), 3, "default mode should yield 3 context functions");
+    assert_eq!(
+        fns.len(),
+        3,
+        "default mode should yield 3 context functions"
+    );
     assert!(names.contains(&"context_session"));
     assert!(names.contains(&"context_user_identity"));
     assert!(names.contains(&"context_agent_config"));
@@ -178,7 +182,11 @@ fn relaxed_level_allows_context() {
     let fns = registry.build_functions_for_level(&manifest, NetworkSecurityLevel::Relaxed);
     let names: Vec<&str> = fns.iter().map(|f| f.name()).collect();
 
-    assert_eq!(fns.len(), 3, "relaxed mode should yield 3 context functions");
+    assert_eq!(
+        fns.len(),
+        3,
+        "relaxed mode should yield 3 context functions"
+    );
     assert!(names.contains(&"context_session"));
     assert!(names.contains(&"context_user_identity"));
     assert!(names.contains(&"context_agent_config"));

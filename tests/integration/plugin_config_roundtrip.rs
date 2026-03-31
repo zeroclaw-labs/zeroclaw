@@ -22,25 +22,26 @@ fn wasm_path() -> std::path::PathBuf {
 #[test]
 fn tool_lookup_config_returns_injected_values() {
     let wasm_path = wasm_path();
-    assert!(wasm_path.is_file(), "multi_tool_plugin.wasm not found at {}", wasm_path.display());
+    assert!(
+        wasm_path.is_file(),
+        "multi_tool_plugin.wasm not found at {}",
+        wasm_path.display()
+    );
 
-    let config = [
-        ("api_key", "test-key"),
-        ("model", "test-model"),
-    ];
+    let config = [("api_key", "test-key"), ("model", "test-model")];
 
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5))
         .with_config(config.into_iter());
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate multi-tool plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate multi-tool plugin");
 
-    let output = plugin.call::<&str, &str>("tool_lookup_config", "{}")
+    let output = plugin
+        .call::<&str, &str>("tool_lookup_config", "{}")
         .expect("tool_lookup_config call failed");
 
-    let parsed: serde_json::Value = serde_json::from_str(output)
-        .expect("output is not valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(output).expect("output is not valid JSON");
 
     assert_eq!(
         parsed["api_key"].as_str(),
@@ -60,14 +61,14 @@ fn tool_lookup_config_without_config_returns_nulls() {
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate multi-tool plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate multi-tool plugin");
 
-    let output = plugin.call::<&str, &str>("tool_lookup_config", "{}")
+    let output = plugin
+        .call::<&str, &str>("tool_lookup_config", "{}")
         .expect("tool_lookup_config call failed");
 
-    let parsed: serde_json::Value = serde_json::from_str(output)
-        .expect("output is not valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(output).expect("output is not valid JSON");
 
     assert!(
         parsed["api_key"].is_null(),
@@ -96,10 +97,7 @@ fn config_toml_values_mapped_through_full_pipeline() {
     // --- Manifest config: what the plugin declares it expects ---
     // api_key is required; model has a default of "gpt-4".
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
     manifest_config.insert("model".to_string(), serde_json::json!("gpt-4"));
 
     // --- Operator config: simulates [plugins.multi-tool] in config.toml ---
@@ -108,14 +106,13 @@ fn config_toml_values_mapped_through_full_pipeline() {
     config_values.insert("model".to_string(), "claude-3".to_string());
 
     // Step 1: resolve config (as the runtime would)
-    let resolved = resolve_plugin_config(
-        "multi-tool",
-        &manifest_config,
-        Some(&config_values),
-    )
-    .expect("config resolution should succeed");
+    let resolved = resolve_plugin_config("multi-tool", &manifest_config, Some(&config_values))
+        .expect("config resolution should succeed");
 
-    assert_eq!(resolved.get("api_key").map(String::as_str), Some("sk-from-config-toml"));
+    assert_eq!(
+        resolved.get("api_key").map(String::as_str),
+        Some("sk-from-config-toml")
+    );
     assert_eq!(resolved.get("model").map(String::as_str), Some("claude-3"));
 
     // Step 2: build extism manifest with resolved config
@@ -151,8 +148,7 @@ fn config_toml_values_mapped_through_full_pipeline() {
         .call::<&str, &str>("tool_lookup_config", "{}")
         .expect("tool_lookup_config call failed");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(output).expect("output is not valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(output).expect("output is not valid JSON");
 
     assert_eq!(
         parsed["api_key"].as_str(),
@@ -174,22 +170,15 @@ fn config_toml_defaults_reach_wasm_when_key_omitted() {
 
     // Manifest declares api_key (required) and model (default "gpt-4")
     let mut manifest_config: HashMap<String, serde_json::Value> = HashMap::new();
-    manifest_config.insert(
-        "api_key".to_string(),
-        serde_json::json!({"required": true}),
-    );
+    manifest_config.insert("api_key".to_string(), serde_json::json!({"required": true}));
     manifest_config.insert("model".to_string(), serde_json::json!("gpt-4"));
 
     // Operator supplies only api_key — model should fall back to manifest default
     let mut config_values: HashMap<String, String> = HashMap::new();
     config_values.insert("api_key".to_string(), "sk-only-key".to_string());
 
-    let resolved = resolve_plugin_config(
-        "multi-tool",
-        &manifest_config,
-        Some(&config_values),
-    )
-    .expect("config resolution should succeed");
+    let resolved = resolve_plugin_config("multi-tool", &manifest_config, Some(&config_values))
+        .expect("config resolution should succeed");
 
     let plugin_manifest = PluginManifest {
         name: "multi-tool".to_string(),
@@ -220,8 +209,7 @@ fn config_toml_defaults_reach_wasm_when_key_omitted() {
         .call::<&str, &str>("tool_lookup_config", "{}")
         .expect("tool_lookup_config call failed");
 
-    let parsed: serde_json::Value =
-        serde_json::from_str(output).expect("output is not valid JSON");
+    let parsed: serde_json::Value = serde_json::from_str(output).expect("output is not valid JSON");
 
     assert_eq!(
         parsed["api_key"].as_str(),

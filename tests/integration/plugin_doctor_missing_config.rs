@@ -75,7 +75,9 @@ fn diagnose_plugin_has_unit_test_for_missing_config() {
 
     // The test module must verify config-related diagnostics with key names
     assert!(
-        tests.contains("missing_config") || tests.contains("config_check") || tests.contains("\"config\""),
+        tests.contains("missing_config")
+            || tests.contains("config_check")
+            || tests.contains("\"config\""),
         "host.rs tests must verify config-related diagnostics"
     );
 

@@ -65,8 +65,8 @@ fn http_request_denied_when_allowed_hosts_empty() {
     // Notably: no .with_allowed_hosts() — mirrors build_extism_manifest
     // behaviour when allowed_hosts is empty.
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate bad-actor plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate bad-actor plugin");
 
     // tool_http_blocked tries to reach https://evil.example.com — should fail.
     let result = plugin.call::<&str, &str>("tool_http_blocked", "{}");
@@ -110,7 +110,10 @@ fn build_extism_manifest_with_empty_hosts_blocks_http() {
     );
 
     let pm = PluginManifest::parse(&toml_str).expect("should parse");
-    assert!(pm.allowed_hosts.is_empty(), "precondition: allowed_hosts must be empty");
+    assert!(
+        pm.allowed_hosts.is_empty(),
+        "precondition: allowed_hosts must be empty"
+    );
 
     // Build through the loader — this is the code path used in production.
     // plugin_dir is "/" so the absolute wasm_path resolves correctly.

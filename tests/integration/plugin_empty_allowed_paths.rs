@@ -24,8 +24,8 @@ fn read_file_fails_with_no_allowed_paths() {
     let manifest = extism::Manifest::new([extism::Wasm::file(&wasm_path)])
         .with_timeout(std::time::Duration::from_secs(5));
 
-    let mut plugin = extism::Plugin::new(&manifest, [], true)
-        .expect("failed to instantiate multi-tool plugin");
+    let mut plugin =
+        extism::Plugin::new(&manifest, [], true).expect("failed to instantiate multi-tool plugin");
 
     let input = r#"{"path": "/fixtures/sample.txt"}"#;
     let result = plugin.call::<&str, &str>("tool_read_file", input);

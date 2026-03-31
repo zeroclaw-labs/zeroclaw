@@ -164,7 +164,9 @@ async fn store_with_tagged_key_records_plugin_name_in_backend() {
     let entries = memory.stored_entries();
     assert_eq!(entries.len(), 1);
     assert!(
-        entries[0].key.starts_with(&format!("plugin:{plugin_name}:")),
+        entries[0]
+            .key
+            .starts_with(&format!("plugin:{plugin_name}:")),
         "stored key must start with plugin author prefix, got: {}",
         entries[0].key,
     );
