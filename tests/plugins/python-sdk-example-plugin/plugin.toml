@@ -1,0 +1,16 @@
+[plugin]
+name = "python-sdk-example-plugin"
+version = "0.1.0"
+description = "Example plugin demonstrating all four SDK modules (context, memory, tools, messaging) — Python version of the Smart Greeter pattern."
+wasm_path = "python_sdk_example_plugin.wasm"
+capabilities = ["tool"]
+
+[[tools]]
+name = "tool_greet"
+description = "Greets the user with session context, memory-based first-visit detection, and fun-fact tool delegation."
+export = "tool_greet"
+risk_level = "low"
+
+[tools.parameters_schema]
+type = "object"
+properties.name = { type = "string", description = "Name of the person to greet" }

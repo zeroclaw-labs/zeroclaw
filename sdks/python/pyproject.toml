@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zeroclaw-plugin-sdk"
+version = "0.1.0"
+description = "Python SDK for building ZeroClaw WASM plugins with Extism PDK"
+readme = "README.md"
+license = { text = "MIT OR Apache-2.0" }
+requires-python = ">=3.10"
+authors = [
+    { name = "ZeroClaw Community" }
+]
+keywords = [
+    "zeroclaw",
+    "plugin",
+    "wasm",
+    "extism",
+    "sdk",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "extism-pdk>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zeroclaw-labs/zeroclaw"
+Documentation = "https://github.com/zeroclaw-labs/zeroclaw/tree/master/sdks/python"
+Repository = "https://github.com/zeroclaw-labs/zeroclaw"
+Issues = "https://github.com/zeroclaw-labs/zeroclaw/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zeroclaw_plugin_sdk"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

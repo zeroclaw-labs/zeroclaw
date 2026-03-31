@@ -1,0 +1,15 @@
+[plugin]
+name = "python-echo-plugin"
+version = "0.1.0"
+description = "Echoes JSON input back as output — Python SDK version of echo-plugin for round-trip integration tests."
+wasm_path = "python_echo_plugin.wasm"
+capabilities = ["tool"]
+
+[[tools]]
+name = "tool_echo"
+description = "Accepts any JSON object and returns it unchanged."
+export = "tool_echo"
+risk_level = "low"
+
+[tools.parameters_schema]
+type = "object"
