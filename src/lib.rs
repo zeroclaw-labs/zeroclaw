@@ -35,6 +35,7 @@
     dead_code
 )]
 
+#[cfg(feature = "desktop")]
 use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +50,7 @@ pub(crate) mod cost;
 pub mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
+#[cfg(feature = "desktop")]
 pub mod gateway;
 pub mod hands;
 pub(crate) mod hardware;
@@ -85,6 +87,7 @@ pub mod plugins;
 pub use config::Config;
 
 /// Gateway management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum GatewayCommands {
     /// Start the gateway server (default if no subcommand specified)
@@ -151,6 +154,7 @@ Examples:
 }
 
 /// Service management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ServiceCommands {
     /// Install daemon service unit for auto-start and restart
@@ -177,6 +181,7 @@ pub enum ServiceCommands {
 }
 
 /// Channel management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ChannelCommands {
     /// List all configured channels
@@ -251,6 +256,7 @@ Examples:
 }
 
 /// Skills management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillCommands {
     /// List all installed skills
@@ -281,6 +287,7 @@ pub enum SkillCommands {
 }
 
 /// Migration subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MigrateCommands {
     /// Import memory from an `OpenClaw` workspace into this `Hrafn` workspace
@@ -296,6 +303,7 @@ pub enum MigrateCommands {
 }
 
 /// Cron subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CronCommands {
     /// List all scheduled tasks
@@ -439,6 +447,7 @@ Examples:
 }
 
 /// Memory management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MemoryCommands {
     /// List memory entries with optional filters
@@ -478,6 +487,7 @@ pub enum MemoryCommands {
 }
 
 /// Integration subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IntegrationCommands {
     /// Show details about a specific integration
@@ -488,6 +498,7 @@ pub enum IntegrationCommands {
 }
 
 /// Hardware discovery subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HardwareCommands {
     /// Enumerate USB devices (VID/PID) and show known boards
@@ -532,6 +543,7 @@ Examples:
 }
 
 /// Peripheral (hardware) management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PeripheralCommands {
     /// List configured peripherals
@@ -583,6 +595,7 @@ Examples:
 }
 
 /// SOP management subcommands
+#[cfg(feature = "desktop")]
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SopCommands {
     /// List loaded SOPs

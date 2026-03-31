@@ -1,8 +1,12 @@
 pub mod docker;
+#[cfg(feature = "target-esp32")]
+pub mod esp32;
 pub mod native;
 pub mod traits;
 
 pub use docker::DockerRuntime;
+#[cfg(feature = "target-esp32")]
+pub use esp32::Esp32Runtime;
 pub use native::NativeRuntime;
 pub use traits::RuntimeAdapter;
 
