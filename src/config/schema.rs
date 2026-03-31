@@ -3660,7 +3660,7 @@ impl Default for ClaudeCodeRunnerConfig {
 
 /// Codex CLI tool configuration (`[codex_cli]` section).
 ///
-/// Delegates coding tasks to the `codex -q` CLI. Authentication uses the
+/// Delegates coding tasks to the `codex exec` CLI. Authentication uses the
 /// binary's own session by default — no API key needed unless
 /// `env_passthrough` includes `OPENAI_API_KEY`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
