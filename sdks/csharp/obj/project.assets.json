@@ -1,0 +1,292 @@
+{
+  "version": 4,
+  "targets": {
+    "net8.0": {
+      "Extism.Pdk/1.1.1": {
+        "type": "package",
+        "dependencies": {
+          "Extism.runtime.all": "1.9.1",
+          "Extism.runtime.win-x64": "1.9.1"
+        },
+        "compile": {
+          "lib/net8.0/Extism.Pdk.dll": {
+            "related": ".runtimeconfig.json"
+          }
+        },
+        "runtime": {
+          "lib/net8.0/Extism.Pdk.dll": {
+            "related": ".runtimeconfig.json"
+          }
+        },
+        "build": {
+          "build/Extism.Pdk.targets": {}
+        }
+      },
+      "Extism.runtime.all/1.9.1": {
+        "type": "package",
+        "dependencies": {
+          "Extism.runtime.linux-arm64": "1.9.1",
+          "Extism.runtime.linux-musl-arm64": "1.9.1",
+          "Extism.runtime.linux-x64": "1.9.1",
+          "Extism.runtime.osx-arm64": "1.9.1",
+          "Extism.runtime.osx-x64": "1.9.1",
+          "Extism.runtime.win-x64": "1.9.1"
+        }
+      },
+      "Extism.runtime.linux-arm64/1.9.1": {
+        "type": "package",
+        "runtimeTargets": {
+          "runtimes/linux-arm64/native/libextism.so": {
+            "assetType": "native",
+            "rid": "linux-arm64"
+          }
+        }
+      },
+      "Extism.runtime.linux-musl-arm64/1.9.1": {
+        "type": "package",
+        "runtimeTargets": {
+          "runtimes/linux-musl-arm64/native/libextism.so": {
+            "assetType": "native",
+            "rid": "linux-musl-arm64"
+          }
+        }
+      },
+      "Extism.runtime.linux-x64/1.9.1": {
+        "type": "package",
+        "runtimeTargets": {
+          "runtimes/linux-x64/native/libextism.so": {
+            "assetType": "native",
+            "rid": "linux-x64"
+          }
+        }
+      },
+      "Extism.runtime.osx-arm64/1.9.1": {
+        "type": "package",
+        "runtimeTargets": {
+          "runtimes/osx-arm64/native/libextism.dylib": {
+            "assetType": "native",
+            "rid": "osx-arm64"
+          }
+        }
+      },
+      "Extism.runtime.osx-x64/1.9.1": {
+        "type": "package",
+        "runtimeTargets": {
+          "runtimes/osx-x64/native/libextism.dylib": {
+            "assetType": "native",
+            "rid": "osx-x64"
+          }
+        }
+      },
+      "Extism.runtime.win-x64/1.9.1": {
+        "type": "package",
+        "runtimeTargets": {
+          "runtimes/win-x64/native/extism.dll": {
+            "assetType": "native",
+            "rid": "win-x64"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "Extism.Pdk/1.1.1": {
+      "sha512": "DIuFH/VLreQLZfDUJ4QN8n3CLx4YoM6rJrWaHh3PtCqpbtrXfoKFFZRG6PRp6hI093Wm7hQNdXv7j35Z+njwRQ==",
+      "type": "package",
+      "path": "extism.pdk/1.1.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "build/Extism.Pdk.MSBuild.deps.json",
+        "build/Extism.Pdk.MSBuild.dll",
+        "build/Extism.Pdk.MSBuild.pdb",
+        "build/Extism.Pdk.targets",
+        "build/Mono.Cecil.Mdb.dll",
+        "build/Mono.Cecil.Pdb.dll",
+        "build/Mono.Cecil.Rocks.dll",
+        "build/Mono.Cecil.dll",
+        "extism.pdk.1.1.1.nupkg.sha512",
+        "extism.pdk.nuspec",
+        "lib/net8.0/Extism.Pdk.dll",
+        "lib/net8.0/Extism.Pdk.runtimeconfig.json",
+        "native/extism.c"
+      ]
+    },
+    "Extism.runtime.all/1.9.1": {
+      "sha512": "Jc/svyPG6XvVwpBlAmNUVn9q+TRJ+UWwUXqVM6Ka/gKqq9SFRhJfUEol9dH7YGCprPZB7o2EmzfPHU6SG/7tNg==",
+      "type": "package",
+      "path": "extism.runtime.all/1.9.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "README.md",
+        "extism.runtime.all.1.9.1.nupkg.sha512",
+        "extism.runtime.all.nuspec"
+      ]
+    },
+    "Extism.runtime.linux-arm64/1.9.1": {
+      "sha512": "8R6PAAPXYrn3XE21Vxl2iCwQUYqD/eNk7xhEn0csDGe7KP28vKcUpHGApXmr/0ZiVOdvZ2CQKy8v+bJG+i47IA==",
+      "type": "package",
+      "path": "extism.runtime.linux-arm64/1.9.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "README.md",
+        "extism.runtime.linux-arm64.1.9.1.nupkg.sha512",
+        "extism.runtime.linux-arm64.nuspec",
+        "runtimes/linux-arm64/native/libextism.so"
+      ]
+    },
+    "Extism.runtime.linux-musl-arm64/1.9.1": {
+      "sha512": "o5NkUNuipNGVKj3QDP49ofKgLssFGBfiQRFfPPIjqWWcPp0jgiD3a9EWtIWIU+D6lku/hxwLSC+kz3hi51odyA==",
+      "type": "package",
+      "path": "extism.runtime.linux-musl-arm64/1.9.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "README.md",
+        "extism.runtime.linux-musl-arm64.1.9.1.nupkg.sha512",
+        "extism.runtime.linux-musl-arm64.nuspec",
+        "runtimes/linux-musl-arm64/native/libextism.so"
+      ]
+    },
+    "Extism.runtime.linux-x64/1.9.1": {
+      "sha512": "Gi2it1u1RYyZCCtBcFlFJRXztbWEoaL7FpZmioT8FhxQHqBGVoLpH/mlyIbTSX3FAwpUUAHIkJZ7erQhXWHJEw==",
+      "type": "package",
+      "path": "extism.runtime.linux-x64/1.9.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "README.md",
+        "extism.runtime.linux-x64.1.9.1.nupkg.sha512",
+        "extism.runtime.linux-x64.nuspec",
+        "runtimes/linux-x64/native/libextism.so"
+      ]
+    },
+    "Extism.runtime.osx-arm64/1.9.1": {
+      "sha512": "adDKJZFV8qivF0VktIm6xDT+L2rxiOzaOs7UJFdC0SOpRyI+dSiKnhf7kjwwAyZxbB8U6D08WX1W05wMpl+rZw==",
+      "type": "package",
+      "path": "extism.runtime.osx-arm64/1.9.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "README.md",
+        "extism.runtime.osx-arm64.1.9.1.nupkg.sha512",
+        "extism.runtime.osx-arm64.nuspec",
+        "runtimes/osx-arm64/native/libextism.dylib"
+      ]
+    },
+    "Extism.runtime.osx-x64/1.9.1": {
+      "sha512": "5S7CiOPUhBGwi4hlI0TXdC8cHEKCEOGf3pRvsXMLA4PdV4qOlZBfhUZ1iLvfMxS74zaaRSI1g2iTQ145/dZfcg==",
+      "type": "package",
+      "path": "extism.runtime.osx-x64/1.9.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "README.md",
+        "extism.runtime.osx-x64.1.9.1.nupkg.sha512",
+        "extism.runtime.osx-x64.nuspec",
+        "runtimes/osx-x64/native/libextism.dylib"
+      ]
+    },
+    "Extism.runtime.win-x64/1.9.1": {
+      "sha512": "Hru/S6wzo90ag1Is9joHGY691lj3X+YAGI0vjVXjRls87G99WtSoy0ARRNwuYj2MILFFZSVoCSMFkb4LYlUQIg==",
+      "type": "package",
+      "path": "extism.runtime.win-x64/1.9.1",
+      "files": [
+        ".nupkg.metadata",
+        ".signature.p7s",
+        "README.md",
+        "extism.runtime.win-x64.1.9.1.nupkg.sha512",
+        "extism.runtime.win-x64.nuspec",
+        "runtimes/win-x64/native/extism.dll"
+      ]
+    }
+  },
+  "projectFileDependencyGroups": {
+    "net8.0": [
+      "Extism.Pdk >= 1.*"
+    ]
+  },
+  "packageFolders": {
+    "/home/runner/.nuget/packages/": {}
+  },
+  "project": {
+    "version": "1.0.0",
+    "restore": {
+      "projectUniqueName": "/p/zeroclaw-biz/sdks/csharp/ZeroClaw.PluginSdk.csproj",
+      "projectName": "ZeroClaw.PluginSdk",
+      "projectPath": "/p/zeroclaw-biz/sdks/csharp/ZeroClaw.PluginSdk.csproj",
+      "packagesPath": "/home/runner/.nuget/packages/",
+      "outputPath": "/p/zeroclaw-biz/sdks/csharp/obj/",
+      "projectStyle": "PackageReference",
+      "configFilePaths": [
+        "/home/runner/.nuget/NuGet/NuGet.Config"
+      ],
+      "originalTargetFrameworks": [
+        "net8.0"
+      ],
+      "sources": {
+        "/tmp/nupkg-validate": {},
+        "https://api.nuget.org/v3/index.json": {}
+      },
+      "frameworks": {
+        "net8.0": {
+          "framework": "net8.0",
+          "targetAlias": "net8.0",
+          "projectReferences": {}
+        }
+      },
+      "warningProperties": {
+        "warnAsError": [
+          "NU1605"
+        ]
+      },
+      "restoreAuditProperties": {
+        "enableAudit": "true",
+        "auditLevel": "low",
+        "auditMode": "direct"
+      },
+      "SdkAnalysisLevel": "11.0.100"
+    },
+    "frameworks": {
+      "net8.0": {
+        "framework": "net8.0",
+        "targetAlias": "net8.0",
+        "dependencies": {
+          "Extism.Pdk": {
+            "target": "Package",
+            "version": "[1.*, )"
+          }
+        },
+        "imports": [
+          "net461",
+          "net462",
+          "net47",
+          "net471",
+          "net472",
+          "net48",
+          "net481"
+        ],
+        "assetTargetFallback": true,
+        "warn": true,
+        "downloadDependencies": [
+          {
+            "name": "Microsoft.AspNetCore.App.Ref",
+            "version": "[8.0.24, 8.0.24]"
+          },
+          {
+            "name": "Microsoft.NETCore.App.Ref",
+            "version": "[8.0.24, 8.0.24]"
+          }
+        ],
+        "frameworkReferences": {
+          "Microsoft.NETCore.App": {
+            "privateAssets": "all"
+          }
+        },
+        "runtimeIdentifierGraphPath": "/usr/share/dotnet/sdk/11.0.100-preview.2.26159.112/PortableRuntimeIdentifierGraph.json"
+      }
+    }
+  }
+}

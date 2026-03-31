@@ -1,0 +1,19 @@
+{
+  "version": 2,
+  "dgSpecHash": "vFyn3DvVwLE=",
+  "success": true,
+  "projectFilePath": "/p/zeroclaw-biz/sdks/csharp/ZeroClaw.PluginSdk.csproj",
+  "expectedPackageFiles": [
+    "/home/runner/.nuget/packages/extism.pdk/1.1.1/extism.pdk.1.1.1.nupkg.sha512",
+    "/home/runner/.nuget/packages/extism.runtime.all/1.9.1/extism.runtime.all.1.9.1.nupkg.sha512",
+    "/home/runner/.nuget/packages/extism.runtime.linux-arm64/1.9.1/extism.runtime.linux-arm64.1.9.1.nupkg.sha512",
+    "/home/runner/.nuget/packages/extism.runtime.linux-musl-arm64/1.9.1/extism.runtime.linux-musl-arm64.1.9.1.nupkg.sha512",
+    "/home/runner/.nuget/packages/extism.runtime.linux-x64/1.9.1/extism.runtime.linux-x64.1.9.1.nupkg.sha512",
+    "/home/runner/.nuget/packages/extism.runtime.osx-arm64/1.9.1/extism.runtime.osx-arm64.1.9.1.nupkg.sha512",
+    "/home/runner/.nuget/packages/extism.runtime.osx-x64/1.9.1/extism.runtime.osx-x64.1.9.1.nupkg.sha512",
+    "/home/runner/.nuget/packages/extism.runtime.win-x64/1.9.1/extism.runtime.win-x64.1.9.1.nupkg.sha512",
+    "/home/runner/.nuget/packages/microsoft.netcore.app.ref/8.0.24/microsoft.netcore.app.ref.8.0.24.nupkg.sha512",
+    "/home/runner/.nuget/packages/microsoft.aspnetcore.app.ref/8.0.24/microsoft.aspnetcore.app.ref.8.0.24.nupkg.sha512"
+  ],
+  "logs": []
+}

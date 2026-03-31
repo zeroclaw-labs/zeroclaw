@@ -1,0 +1,176 @@
+{
+  "format": 1,
+  "restore": {
+    "/p/zeroclaw-biz/sdks/csharp/tests/ZeroClaw.PluginSdk.Tests.csproj": {}
+  },
+  "projects": {
+    "/p/zeroclaw-biz/sdks/csharp/ZeroClaw.PluginSdk.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/p/zeroclaw-biz/sdks/csharp/ZeroClaw.PluginSdk.csproj",
+        "projectName": "ZeroClaw.PluginSdk",
+        "projectPath": "/p/zeroclaw-biz/sdks/csharp/ZeroClaw.PluginSdk.csproj",
+        "packagesPath": "/home/runner/.nuget/packages/",
+        "outputPath": "/p/zeroclaw-biz/sdks/csharp/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/home/runner/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0"
+        ],
+        "sources": {
+          "/tmp/nupkg-validate": {},
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0": {
+            "framework": "net8.0",
+            "targetAlias": "net8.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "11.0.100"
+      },
+      "frameworks": {
+        "net8.0": {
+          "framework": "net8.0",
+          "targetAlias": "net8.0",
+          "dependencies": {
+            "Extism.Pdk": {
+              "target": "Package",
+              "version": "[1.*, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "downloadDependencies": [
+            {
+              "name": "Microsoft.AspNetCore.App.Ref",
+              "version": "[8.0.24, 8.0.24]"
+            },
+            {
+              "name": "Microsoft.NETCore.App.Ref",
+              "version": "[8.0.24, 8.0.24]"
+            }
+          ],
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/usr/share/dotnet/sdk/11.0.100-preview.2.26159.112/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "/p/zeroclaw-biz/sdks/csharp/tests/ZeroClaw.PluginSdk.Tests.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "/p/zeroclaw-biz/sdks/csharp/tests/ZeroClaw.PluginSdk.Tests.csproj",
+        "projectName": "ZeroClaw.PluginSdk.Tests",
+        "projectPath": "/p/zeroclaw-biz/sdks/csharp/tests/ZeroClaw.PluginSdk.Tests.csproj",
+        "packagesPath": "/home/runner/.nuget/packages/",
+        "outputPath": "/p/zeroclaw-biz/sdks/csharp/tests/obj/",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "/home/runner/.nuget/NuGet/NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net9.0"
+        ],
+        "sources": {
+          "/tmp/nupkg-validate": {},
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net9.0": {
+            "framework": "net9.0",
+            "targetAlias": "net9.0",
+            "projectReferences": {
+              "/p/zeroclaw-biz/sdks/csharp/ZeroClaw.PluginSdk.csproj": {
+                "projectPath": "/p/zeroclaw-biz/sdks/csharp/ZeroClaw.PluginSdk.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "11.0.100"
+      },
+      "frameworks": {
+        "net9.0": {
+          "framework": "net9.0",
+          "targetAlias": "net9.0",
+          "dependencies": {
+            "Microsoft.NET.Test.Sdk": {
+              "target": "Package",
+              "version": "[17.*, )"
+            },
+            "xunit": {
+              "target": "Package",
+              "version": "[2.*, )"
+            },
+            "xunit.runner.visualstudio": {
+              "target": "Package",
+              "version": "[2.*, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "downloadDependencies": [
+            {
+              "name": "Microsoft.AspNetCore.App.Ref",
+              "version": "[9.0.13, 9.0.13]"
+            },
+            {
+              "name": "Microsoft.NETCore.App.Ref",
+              "version": "[9.0.13, 9.0.13]"
+            }
+          ],
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "/usr/share/dotnet/sdk/11.0.100-preview.2.26159.112/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

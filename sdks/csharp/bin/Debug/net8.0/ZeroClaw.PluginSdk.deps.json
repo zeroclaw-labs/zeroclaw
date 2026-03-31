@@ -1,0 +1,158 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "ZeroClaw.PluginSdk/1.0.0": {
+        "dependencies": {
+          "Extism.Pdk": "1.1.1"
+        },
+        "runtime": {
+          "ZeroClaw.PluginSdk.dll": {}
+        }
+      },
+      "Extism.Pdk/1.1.1": {
+        "dependencies": {
+          "Extism.runtime.all": "1.9.1",
+          "Extism.runtime.win-x64": "1.9.1"
+        },
+        "runtime": {
+          "lib/net8.0/Extism.Pdk.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.1.1.0"
+          }
+        }
+      },
+      "Extism.runtime.all/1.9.1": {
+        "dependencies": {
+          "Extism.runtime.linux-arm64": "1.9.1",
+          "Extism.runtime.linux-musl-arm64": "1.9.1",
+          "Extism.runtime.linux-x64": "1.9.1",
+          "Extism.runtime.osx-arm64": "1.9.1",
+          "Extism.runtime.osx-x64": "1.9.1",
+          "Extism.runtime.win-x64": "1.9.1"
+        }
+      },
+      "Extism.runtime.linux-arm64/1.9.1": {
+        "runtimeTargets": {
+          "runtimes/linux-arm64/native/libextism.so": {
+            "rid": "linux-arm64",
+            "assetType": "native",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "Extism.runtime.linux-musl-arm64/1.9.1": {
+        "runtimeTargets": {
+          "runtimes/linux-musl-arm64/native/libextism.so": {
+            "rid": "linux-musl-arm64",
+            "assetType": "native",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "Extism.runtime.linux-x64/1.9.1": {
+        "runtimeTargets": {
+          "runtimes/linux-x64/native/libextism.so": {
+            "rid": "linux-x64",
+            "assetType": "native",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "Extism.runtime.osx-arm64/1.9.1": {
+        "runtimeTargets": {
+          "runtimes/osx-arm64/native/libextism.dylib": {
+            "rid": "osx-arm64",
+            "assetType": "native",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "Extism.runtime.osx-x64/1.9.1": {
+        "runtimeTargets": {
+          "runtimes/osx-x64/native/libextism.dylib": {
+            "rid": "osx-x64",
+            "assetType": "native",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      },
+      "Extism.runtime.win-x64/1.9.1": {
+        "runtimeTargets": {
+          "runtimes/win-x64/native/extism.dll": {
+            "rid": "win-x64",
+            "assetType": "native",
+            "fileVersion": "0.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "ZeroClaw.PluginSdk/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Extism.Pdk/1.1.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-DIuFH/VLreQLZfDUJ4QN8n3CLx4YoM6rJrWaHh3PtCqpbtrXfoKFFZRG6PRp6hI093Wm7hQNdXv7j35Z+njwRQ==",
+      "path": "extism.pdk/1.1.1",
+      "hashPath": "extism.pdk.1.1.1.nupkg.sha512"
+    },
+    "Extism.runtime.all/1.9.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-Jc/svyPG6XvVwpBlAmNUVn9q+TRJ+UWwUXqVM6Ka/gKqq9SFRhJfUEol9dH7YGCprPZB7o2EmzfPHU6SG/7tNg==",
+      "path": "extism.runtime.all/1.9.1",
+      "hashPath": "extism.runtime.all.1.9.1.nupkg.sha512"
+    },
+    "Extism.runtime.linux-arm64/1.9.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-8R6PAAPXYrn3XE21Vxl2iCwQUYqD/eNk7xhEn0csDGe7KP28vKcUpHGApXmr/0ZiVOdvZ2CQKy8v+bJG+i47IA==",
+      "path": "extism.runtime.linux-arm64/1.9.1",
+      "hashPath": "extism.runtime.linux-arm64.1.9.1.nupkg.sha512"
+    },
+    "Extism.runtime.linux-musl-arm64/1.9.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-o5NkUNuipNGVKj3QDP49ofKgLssFGBfiQRFfPPIjqWWcPp0jgiD3a9EWtIWIU+D6lku/hxwLSC+kz3hi51odyA==",
+      "path": "extism.runtime.linux-musl-arm64/1.9.1",
+      "hashPath": "extism.runtime.linux-musl-arm64.1.9.1.nupkg.sha512"
+    },
+    "Extism.runtime.linux-x64/1.9.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-Gi2it1u1RYyZCCtBcFlFJRXztbWEoaL7FpZmioT8FhxQHqBGVoLpH/mlyIbTSX3FAwpUUAHIkJZ7erQhXWHJEw==",
+      "path": "extism.runtime.linux-x64/1.9.1",
+      "hashPath": "extism.runtime.linux-x64.1.9.1.nupkg.sha512"
+    },
+    "Extism.runtime.osx-arm64/1.9.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-adDKJZFV8qivF0VktIm6xDT+L2rxiOzaOs7UJFdC0SOpRyI+dSiKnhf7kjwwAyZxbB8U6D08WX1W05wMpl+rZw==",
+      "path": "extism.runtime.osx-arm64/1.9.1",
+      "hashPath": "extism.runtime.osx-arm64.1.9.1.nupkg.sha512"
+    },
+    "Extism.runtime.osx-x64/1.9.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-5S7CiOPUhBGwi4hlI0TXdC8cHEKCEOGf3pRvsXMLA4PdV4qOlZBfhUZ1iLvfMxS74zaaRSI1g2iTQ145/dZfcg==",
+      "path": "extism.runtime.osx-x64/1.9.1",
+      "hashPath": "extism.runtime.osx-x64.1.9.1.nupkg.sha512"
+    },
+    "Extism.runtime.win-x64/1.9.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-Hru/S6wzo90ag1Is9joHGY691lj3X+YAGI0vjVXjRls87G99WtSoy0ARRNwuYj2MILFFZSVoCSMFkb4LYlUQIg==",
+      "path": "extism.runtime.win-x64/1.9.1",
+      "hashPath": "extism.runtime.win-x64.1.9.1.nupkg.sha512"
+    }
+  }
+}

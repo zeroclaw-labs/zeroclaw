@@ -1,0 +1,42 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0/wasi-wasm",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {},
+    ".NETCoreApp,Version=v8.0/wasi-wasm": {
+      "ZeroClaw.PluginSdk/1.0.0": {
+        "dependencies": {
+          "Extism.Pdk": "1.1.1"
+        },
+        "runtime": {
+          "ZeroClaw.PluginSdk.dll": {}
+        }
+      },
+      "Extism.Pdk/1.1.1": {
+        "runtime": {
+          "lib/net8.0/Extism.Pdk.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.1.1.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "ZeroClaw.PluginSdk/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Extism.Pdk/1.1.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-DIuFH/VLreQLZfDUJ4QN8n3CLx4YoM6rJrWaHh3PtCqpbtrXfoKFFZRG6PRp6hI093Wm7hQNdXv7j35Z+njwRQ==",
+      "path": "extism.pdk/1.1.1",
+      "hashPath": "extism.pdk.1.1.1.nupkg.sha512"
+    }
+  }
+}

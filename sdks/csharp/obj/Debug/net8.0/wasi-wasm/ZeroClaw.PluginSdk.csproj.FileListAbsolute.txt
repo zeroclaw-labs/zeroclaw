@@ -1,0 +1,13 @@
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.csproj.AssemblyReference.cache
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.GeneratedMSBuildEditorConfig.editorconfig
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.AssemblyInfoInputs.cache
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.AssemblyInfo.cs
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.csproj.CoreCompileInputs.cache
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.sourcelink.json
+/p/zeroclaw-biz/sdks/csharp/bin/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.deps.json
+/p/zeroclaw-biz/sdks/csharp/bin/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.dll
+/p/zeroclaw-biz/sdks/csharp/bin/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.pdb
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.dll
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/refint/ZeroClaw.PluginSdk.dll
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/ZeroClaw.PluginSdk.pdb
+/p/zeroclaw-biz/sdks/csharp/obj/Debug/net8.0/wasi-wasm/ref/ZeroClaw.PluginSdk.dll
