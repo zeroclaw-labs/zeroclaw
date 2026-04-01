@@ -79,7 +79,7 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "moonshot" => "kimi-k2.5",
         "hunyuan" => "hunyuan-t1-latest",
         "glm" | "zai" => "glm-5",
-        "minimax" => "MiniMax-M2.5",
+        "minimax" => "MiniMax-M2.7",
         "qwen" => "qwen-plus",
         "volcengine" => "doubao-1-5-pro-32k-250115",
         "siliconflow" => "Pro/zai-org/GLM-4.7",
