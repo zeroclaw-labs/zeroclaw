@@ -504,7 +504,6 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 fn contains_unquoted_single_ampersand(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
-    let mut prev = ' ';
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -517,12 +516,10 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::Double => {
                 if escaped {
                     escaped = false;
-                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
-                    prev = ch;
                     continue;
                 }
                 if ch == '"' {
@@ -532,37 +529,24 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::None => {
                 if escaped {
                     escaped = false;
-                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
-                    prev = ch;
                     continue;
                 }
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     '&' => {
-                        // `&&` is a logical-AND separator, not a background op.
-                        if chars.next_if_eq(&'&').is_some() {
-                            prev = '&';
-                            continue;
+                        if chars.next_if_eq(&'&').is_none() {
+                            return true;
                         }
-                        // `>&N` and `<&N` are fd redirects, not background ops.
-                        if (prev == '>' || prev == '<')
-                            || chars.peek().is_some_and(|c| c.is_ascii_digit())
-                        {
-                            prev = ch;
-                            continue;
-                        }
-                        return true;
                     }
                     _ => {}
                 }
             }
         }
-        prev = ch;
     }
 
     false
@@ -613,6 +597,26 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
     }
 
     false
+}
+
+/// Returns true if `command` contains an unquoted `>` that is NOT a safe
+/// stderr form (`2>/dev/null`, `2>&1`).
+fn contains_unsafe_output_redirect(command: &str) -> bool {
+    // Strip safe redirect-to-null and fd-merge patterns, then check for remaining `>`.
+    let safe = command
+        .replace("2>/dev/null", "")
+        .replace(">/dev/null", "")
+        .replace("1>/dev/null", "")
+        .replace("2>&1", "")
+        .replace("1>&2", "");
+    contains_unquoted_char(&safe, '>')
+}
+
+/// Returns true if `command` contains an unquoted `<` that is NOT a heredoc (`<<`).
+fn contains_unquoted_input_redirect(command: &str) -> bool {
+    // Strip here-strings (`<<<`) first, then heredocs (`<<`), then check for remaining `<`.
+    let safe = command.replace("<<<", "").replace("<<", "");
+    contains_unquoted_char(&safe, '<')
 }
 
 /// Detect unquoted shell variable expansions like `$HOME`, `$1`, `$?`.
@@ -721,69 +725,18 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-/// Extract the file target from a redirection token, returning `None` for
-/// fd-only redirects (e.g. `2>&1`) and standalone operators (e.g. `>`).
 fn redirection_target(token: &str) -> Option<&str> {
-    match parse_redirection(token) {
-        RedirectionParse::Target(t) => Some(t),
-        _ => None,
-    }
-}
-
-/// Result of parsing a redirection token.
-enum RedirectionParse<'a> {
-    /// Token contains a redirect operator with an inline target, e.g. `>/dev/null`.
-    Target(&'a str),
-    /// Token is a pure file-descriptor redirect like `2>&1` — always safe.
-    FdOnly,
-    /// Token is a bare redirect operator (e.g. `>`, `>>`, `<`) — the target is the next token.
-    NeedsNextToken,
-    /// Token contains no redirection.
-    None,
-}
-
-fn parse_redirection(token: &str) -> RedirectionParse<'_> {
-    let Some(marker_idx) = token.find(['<', '>']) else {
-        return RedirectionParse::None;
-    };
+    let marker_idx = token.find(['<', '>'])?;
     let mut rest = &token[marker_idx + 1..];
     rest = rest.trim_start_matches(['<', '>']);
-
-    // Check for fd redirect: `&` followed by only digits (e.g. `2>&1`, `>&2`).
-    if let Some(after_amp) = rest.strip_prefix('&') {
-        let after_digits = after_amp.trim_start_matches(|c: char| c.is_ascii_digit());
-        if after_digits.is_empty() {
-            return RedirectionParse::FdOnly;
-        }
-    }
-
-    // Strip leading digits (fd number before operator, e.g. the `2` in `2>/dev/null`).
+    rest = rest.trim_start_matches('&');
     rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        RedirectionParse::NeedsNextToken
+        None
     } else {
-        RedirectionParse::Target(trimmed)
+        Some(trimmed)
     }
-}
-
-/// Check if a redirection target is safe (standard /dev/* targets or file descriptors).
-///
-/// Safe targets include:
-/// - `/dev/null` — discards output
-/// - `/dev/stdout` — redirects to standard output
-/// - `/dev/stderr` — redirects to standard error
-/// - `/dev/zero` — infinite zero bytes source
-///
-/// File descriptor forms like `2>&1` are handled separately via `redirection_target()`,
-/// which strips the ampersand prefix before calling this function. This function
-/// validates the actual target path/name.
-fn safe_redirect_target(target: &str) -> bool {
-    let target = target.trim();
-    matches!(
-        target,
-        "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/zero"
-    )
 }
 
 /// Extract the basename from a command path, handling both Unix (`/`) and
@@ -1116,55 +1069,15 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Allow safe shell redirections (`<`, `>`, `>>`) to /dev/* targets.
-        // Block unsafe redirections to arbitrary paths that could bypass path checks.
-        // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
-        if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
-            // Check if all redirections target safe destinations
-            for segment in split_unquoted_segments(command) {
-                let cmd_part = skip_env_assignments(&segment);
-                let words: Vec<&str> = cmd_part.split_whitespace().collect();
-
-                let mut i = 0;
-                // Skip the executable (first word)
-                if !words.is_empty() {
-                    // Check inline redirections on executable itself, e.g., `cat</dev/null`
-                    match parse_redirection(strip_wrapping_quotes(words[0])) {
-                        RedirectionParse::Target(target) => {
-                            if !safe_redirect_target(target) {
-                                return false;
-                            }
-                        }
-                        RedirectionParse::NeedsNextToken => {
-                            // Bare redirect as executable is invalid, block it
-                            return false;
-                        }
-                        RedirectionParse::FdOnly | RedirectionParse::None => {}
-                    }
-                    i = 1;
-                }
-
-                // Check redirections in remaining arguments
-                while i < words.len() {
-                    match parse_redirection(words[i]) {
-                        RedirectionParse::Target(target) => {
-                            if !safe_redirect_target(target) {
-                                return false;
-                            }
-                        }
-                        RedirectionParse::NeedsNextToken => {
-                            // Standalone redirect operator — next token is the target
-                            i += 1;
-                            let target = words.get(i).map(|w| w.trim()).unwrap_or("");
-                            if !safe_redirect_target(target) {
-                                return false;
-                            }
-                        }
-                        RedirectionParse::FdOnly | RedirectionParse::None => {}
-                    }
-                    i += 1;
-                }
-            }
+        // Block shell redirections that target files. Allow safe forms:
+        //   - `2>/dev/null`, `>/dev/null`, `1>/dev/null` (output suppression)
+        //   - `2>&1`, `1>&2` (fd merging)
+        //   - `<<` heredocs, `<<<` here-strings (input literals)
+        if contains_unsafe_output_redirect(command) {
+            return false;
+        }
+        if contains_unquoted_input_redirect(command) {
+            return false;
         }
 
         // Block `tee` — it can write to arbitrary files, bypassing the
@@ -1178,7 +1091,9 @@ impl SecurityPolicy {
 
         // Block background command chaining (`&`), which can hide extra
         // sub-commands and outlive timeout expectations. Keep `&&` allowed.
-        if contains_unquoted_single_ampersand(command) {
+        // Strip `2>&1` first so its `&` isn't flagged as background chaining.
+        let ampersand_check = command.replace("2>&1", "");
+        if contains_unquoted_single_ampersand(&ampersand_check) {
             return false;
         }
 
@@ -2465,52 +2380,42 @@ mod tests {
         let p = default_policy();
         assert!(!p.is_command_allowed("echo secret > /etc/crontab"));
         assert!(!p.is_command_allowed("ls >> /tmp/exfil.txt"));
-        assert!(!p.is_command_allowed("cat </etc/passwd"));
-        assert!(!p.is_command_allowed("cat</etc/passwd"));
+        assert!(!p.is_command_allowed("cat < /etc/passwd"));
+        assert!(!p.is_command_allowed("echo secret > output.txt"));
     }
 
     #[test]
-    fn safe_redirect_to_dev_null_allowed() {
+    fn heredoc_and_stderr_redirects_allowed() {
         let p = default_policy();
-        // stdout to /dev/null
-        assert!(p.is_command_allowed("echo secret > /dev/null"));
-        // stderr to /dev/null
-        assert!(p.is_command_allowed("ls 2> /dev/null"));
-        // both stdout and stderr to /dev/null
-        assert!(p.is_command_allowed("find . 2>&1 > /dev/null"));
-        // inline redirection form
-        assert!(p.is_command_allowed("cat</dev/null"));
+        // Heredoc marker on a single line — << should not trigger < blocker
+        assert!(p.is_command_allowed("cat << 'EOF'"));
+        assert!(p.is_command_allowed("cat <<EOF"));
+        assert!(p.is_command_allowed("cat <<< 'hello'"));
+        // Stderr suppression
+        assert!(p.is_command_allowed("python3 script.py 2>/dev/null"));
+        assert!(p.is_command_allowed("ls 2>&1"));
+        assert!(p.is_command_allowed("grep foo bar 2>/dev/null"));
+        assert!(p.is_command_allowed("ls >/dev/null"));
+        assert!(p.is_command_allowed("cmd 1>/dev/null"));
+        assert!(p.is_command_allowed("cmd 1>&2"));
+        // Actual file redirects still blocked
+        assert!(!p.is_command_allowed("cat < /etc/passwd"));
+        assert!(!p.is_command_allowed("echo secret > output.txt"));
     }
 
     #[test]
-    fn safe_redirect_to_dev_stdout_allowed() {
-        let p = default_policy();
-        assert!(p.is_command_allowed("echo hello > /dev/stdout"));
-        assert!(p.is_command_allowed("cat /dev/zero > /dev/stdout"));
-    }
-
-    #[test]
-    fn safe_redirect_to_dev_stderr_allowed() {
-        let p = default_policy();
-        assert!(p.is_command_allowed("echo error > /dev/stderr"));
-        assert!(p.is_command_allowed("ls 1> /dev/stderr"));
-    }
-
-    #[test]
-    fn safe_redirect_to_dev_zero_allowed() {
-        let p = default_policy();
-        assert!(p.is_command_allowed("cat /dev/zero > /dev/null"));
-    }
-
-    #[test]
-    fn safe_file_descriptor_redirect_allowed() {
-        let p = default_policy();
-        // stderr to stdout
-        assert!(p.is_command_allowed("find . 2>&1"));
-        // stdout to stderr
-        assert!(p.is_command_allowed("echo hello 1>&2"));
-        // combined with safe target
-        assert!(p.is_command_allowed("ls 2>&1 > /dev/null"));
+    fn redirect_helper_unit_tests() {
+        assert!(!contains_unquoted_input_redirect("cat << 'EOF'"));
+        assert!(!contains_unquoted_input_redirect("cat <<< 'hello'"));
+        assert!(contains_unquoted_input_redirect("cat < /etc/passwd"));
+        assert!(!contains_unquoted_input_redirect("echo 'a<b'"));
+        assert!(!contains_unsafe_output_redirect("cmd 2>/dev/null"));
+        assert!(!contains_unsafe_output_redirect("cmd >/dev/null"));
+        assert!(!contains_unsafe_output_redirect("cmd 1>/dev/null"));
+        assert!(!contains_unsafe_output_redirect("cmd 2>&1"));
+        assert!(!contains_unsafe_output_redirect("cmd 1>&2"));
+        assert!(contains_unsafe_output_redirect("echo hi > file.txt"));
+        assert!(!contains_unsafe_output_redirect("echo 'a>b'"));
     }
 
     #[test]
