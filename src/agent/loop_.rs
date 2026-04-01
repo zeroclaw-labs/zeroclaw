@@ -1796,7 +1796,11 @@ pub(crate) async fn run_tool_call_loop(
                     let _ = tx.send(chunk).await;
                 }
             }
-            history.push(ChatMessage::assistant(response_text.clone()));
+            // Layer 1: Per-turn attachment detection — replace embedded documents,
+            // code blocks, search results with structured memos to save tokens.
+            let history_content = history::memo_substitute_attachments(&response_text)
+                .unwrap_or_else(|| response_text.clone());
+            history.push(ChatMessage::assistant(history_content));
             return Ok(display_text);
         }
 
@@ -2171,6 +2175,9 @@ pub(crate) async fn run_tool_call_loop(
         // Native mode: use JSON-structured messages so convert_messages() can
         // reconstruct proper OpenAI-format tool_calls and tool result messages.
         // Prompt mode: use XML-based text format as before.
+        // Layer 1: compress embedded attachments in tool results to save tokens.
+        let assistant_history_content = history::memo_substitute_attachments(&assistant_history_content)
+            .unwrap_or(assistant_history_content);
         history.push(ChatMessage::assistant(assistant_history_content));
         if native_tool_calls.is_empty() {
             let all_results_have_ids = use_native_tools
