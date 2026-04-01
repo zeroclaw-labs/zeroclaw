@@ -64,13 +64,13 @@ When uncertain, classify as higher risk.
 
 - Min supported Rust: 1.87. Edition 2024. Do not use unstable features.
 - Feature flags are additive. Never enable a flag in `default` without discussion.
-- Hardware features (`stm32`, `rpi-gpio`, `usb-periph`) require physical devices — skip those tests locally.
+- Hardware features (`hardware`, `peripheral-rpi`) require physical devices — skip those tests locally.
 
 ## Gotchas
 
 - `./dev/ci.sh` runs in Docker Compose — it is not a plain shell script. Don't inline its logic.
 - Matrix SDK E2EE state is persistent. Avoid tests that create real Matrix sessions.
-- The `browser` feature pulls in Fantoccini (WebDriver) — only enable when needed, it adds significant compile time.
+- The `browser-native` feature pulls in Fantoccini (WebDriver) — only enable when needed, it adds significant compile time.
 
 ## CI / Automation
 
