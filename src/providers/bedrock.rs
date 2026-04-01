@@ -1,10 +1,13 @@
 //! AWS Bedrock provider using the Converse API.
 //!
-//! Authentication: supports two methods:
+//! Authentication: supports three methods (in priority order):
 //! - **Bearer token**: set `BEDROCK_API_KEY` env var (takes precedence).
 //! - **SigV4 signing**: AWS AKSK (Access Key ID + Secret Access Key)
 //!   via environment variables or EC2 IMDSv2. SigV4 signing is implemented
 //!   manually using hmac/sha2 crates — no AWS SDK dependency.
+//! - **Web Identity (IRSA/OIDC)**: set `AWS_WEB_IDENTITY_TOKEN_FILE` and
+//!   `AWS_ROLE_ARN` to assume a role via STS `AssumeRoleWithWebIdentity`.
+//!   Common in EKS (IRSA), GitHub Actions OIDC, and similar environments.
 
 use crate::providers::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -35,6 +38,7 @@ enum BedrockAuth {
 // ── AWS Credentials ─────────────────────────────────────────────
 
 /// Resolved AWS credentials for SigV4 signing.
+#[derive(Debug)]
 struct AwsCredentials {
     access_key_id: String,
     secret_access_key: String,
@@ -142,9 +146,100 @@ impl AwsCredentials {
         })
     }
 
-    /// Resolve credentials: env vars first, then EC2 IMDS.
+    /// Fetch credentials by assuming an IAM role via STS `AssumeRoleWithWebIdentity`.
+    ///
+    /// Requires `AWS_WEB_IDENTITY_TOKEN_FILE` (path to an OIDC/JWT token file)
+    /// and `AWS_ROLE_ARN`. Optionally reads `AWS_ROLE_SESSION_NAME`.
+    /// This is the standard auth path for EKS pods using IRSA, GitHub Actions
+    /// OIDC, and similar federated identity setups.
+    async fn from_web_identity() -> anyhow::Result<Self> {
+        let token_file = env_required("AWS_WEB_IDENTITY_TOKEN_FILE")?;
+        let role_arn = env_required("AWS_ROLE_ARN")?;
+        let session_name = env_optional("AWS_ROLE_SESSION_NAME")
+            .unwrap_or_else(|| "zeroclaw-bedrock-session".to_string());
+
+        let region = env_optional("AWS_REGION")
+            .or_else(|| env_optional("AWS_DEFAULT_REGION"))
+            .unwrap_or_else(|| DEFAULT_REGION.to_string());
+
+        let web_identity_token = tokio::fs::read_to_string(&token_file)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read web identity token file '{}': {}",
+                    token_file,
+                    e
+                )
+            })?;
+        let web_identity_token = web_identity_token.trim().to_string();
+        anyhow::ensure!(
+            !web_identity_token.is_empty(),
+            "Web identity token file '{}' is empty",
+            token_file
+        );
+
+        let sts_endpoint = env_optional("AWS_STS_REGIONAL_ENDPOINTS")
+            .filter(|v| v == "regional")
+            .map(|_| format!("https://sts.{region}.amazonaws.com/"))
+            .unwrap_or_else(|| "https://sts.amazonaws.com/".to_string());
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
+
+        let params = [
+            ("Action", "AssumeRoleWithWebIdentity"),
+            ("Version", "2011-06-15"),
+            ("RoleArn", &role_arn),
+            ("RoleSessionName", &session_name),
+            ("WebIdentityToken", &web_identity_token),
+        ];
+
+        let resp = client
+            .post(&sts_endpoint)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("STS AssumeRoleWithWebIdentity request failed: {}", e))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "STS AssumeRoleWithWebIdentity returned {}: {}",
+                status,
+                body
+            );
+        }
+
+        let body = resp.text().await?;
+
+        // Parse the XML response from STS.
+        let access_key_id = extract_xml_element(&body, "AccessKeyId")
+            .ok_or_else(|| anyhow::anyhow!("Missing AccessKeyId in STS response"))?;
+        let secret_access_key = extract_xml_element(&body, "SecretAccessKey")
+            .ok_or_else(|| anyhow::anyhow!("Missing SecretAccessKey in STS response"))?;
+        let session_token = extract_xml_element(&body, "SessionToken");
+
+        tracing::info!(
+            "Loaded AWS credentials via AssumeRoleWithWebIdentity (role: {})",
+            role_arn
+        );
+
+        Ok(Self {
+            access_key_id,
+            secret_access_key,
+            session_token,
+            region,
+        })
+    }
+
+    /// Resolve credentials: env vars first, then web identity (IRSA/OIDC), then EC2 IMDS.
     async fn resolve() -> anyhow::Result<Self> {
         if let Ok(creds) = Self::from_env() {
+            return Ok(creds);
+        }
+        if let Ok(creds) = Self::from_web_identity().await {
             return Ok(creds);
         }
         Self::from_imds().await
@@ -168,6 +263,16 @@ fn env_optional(name: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Extract the text content of an XML element by tag name.
+/// Simple parser sufficient for STS responses — no external XML crate needed.
+fn extract_xml_element(xml: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
 }
 
 // ── AWS SigV4 Signing ───────────────────────────────────────────
@@ -546,7 +651,9 @@ impl BedrockProvider {
             anyhow::anyhow!(
                 "AWS Bedrock credentials not set. Set BEDROCK_API_KEY for Bearer \
                  token auth, or AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY for \
-                 SigV4 auth, or run on an EC2 instance with an IAM role attached."
+                 SigV4 auth, or AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN for \
+                 web identity (IRSA/OIDC) auth, or run on an EC2 instance with \
+                 an IAM role attached."
             )
         })
     }
@@ -568,8 +675,11 @@ impl BedrockProvider {
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Ok(BedrockAuth::BearerToken(token));
         }
-        // Fall back to SigV4.
+        // Fall back to SigV4: env vars → web identity → IMDS.
         if let Ok(creds) = AwsCredentials::from_env() {
+            return Ok(BedrockAuth::SigV4(creds));
+        }
+        if let Ok(creds) = AwsCredentials::from_web_identity().await {
             return Ok(BedrockAuth::SigV4(creds));
         }
         Ok(BedrockAuth::SigV4(AwsCredentials::from_imds().await?))
@@ -1808,6 +1918,91 @@ mod tests {
             BedrockProvider::extract_tool_call_id("not json at all"),
             None
         );
+    }
+
+    // ── XML parsing tests ─────────────────────────────────────────
+
+    #[test]
+    fn extract_xml_element_finds_tag() {
+        let xml = "<Root><AccessKeyId>AKIAEXAMPLE</AccessKeyId><Other>x</Other></Root>";
+        assert_eq!(
+            extract_xml_element(xml, "AccessKeyId"),
+            Some("AKIAEXAMPLE".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_xml_element_returns_none_for_missing_tag() {
+        let xml = "<Root><Other>x</Other></Root>";
+        assert_eq!(extract_xml_element(xml, "AccessKeyId"), None);
+    }
+
+    #[test]
+    fn extract_xml_element_handles_sts_response() {
+        let xml = r#"<AssumeRoleWithWebIdentityResponse>
+            <AssumeRoleWithWebIdentityResult>
+                <Credentials>
+                    <AccessKeyId>ASIATESTACCESSKEY</AccessKeyId>
+                    <SecretAccessKey>testsecretkey123</SecretAccessKey>
+                    <SessionToken>FwoGZX...longtoken</SessionToken>
+                    <Expiration>2026-04-01T12:00:00Z</Expiration>
+                </Credentials>
+            </AssumeRoleWithWebIdentityResult>
+        </AssumeRoleWithWebIdentityResponse>"#;
+        assert_eq!(
+            extract_xml_element(xml, "AccessKeyId"),
+            Some("ASIATESTACCESSKEY".to_string())
+        );
+        assert_eq!(
+            extract_xml_element(xml, "SecretAccessKey"),
+            Some("testsecretkey123".to_string())
+        );
+        assert_eq!(
+            extract_xml_element(xml, "SessionToken"),
+            Some("FwoGZX...longtoken".to_string())
+        );
+    }
+
+    // ── Web identity credential tests ────────────────────────────
+
+    #[tokio::test]
+    async fn web_identity_fails_without_env_vars() {
+        let _token_guard = EnvGuard::set("AWS_WEB_IDENTITY_TOKEN_FILE", None);
+        let _role_guard = EnvGuard::set("AWS_ROLE_ARN", None);
+        let result = AwsCredentials::from_web_identity().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn web_identity_fails_with_missing_token_file() {
+        let _token_guard = EnvGuard::set(
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            Some("/tmp/nonexistent-token-file-zeroclaw-test"),
+        );
+        let _role_guard = EnvGuard::set("AWS_ROLE_ARN", Some("arn:aws:iam::123456789012:role/test"));
+        let result = AwsCredentials::from_web_identity().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to read web identity token file"),
+            "Expected file-read error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_identity_fails_with_empty_token_file() {
+        let tmp_file = "/tmp/zeroclaw-test-empty-token";
+        tokio::fs::write(tmp_file, "").await.unwrap();
+        let _token_guard = EnvGuard::set("AWS_WEB_IDENTITY_TOKEN_FILE", Some(tmp_file));
+        let _role_guard = EnvGuard::set("AWS_ROLE_ARN", Some("arn:aws:iam::123456789012:role/test"));
+        let result = AwsCredentials::from_web_identity().await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("empty"),
+            "Expected empty-file error, got: {err}"
+        );
+        let _ = tokio::fs::remove_file(tmp_file).await;
     }
 
     #[test]
