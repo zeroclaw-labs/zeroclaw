@@ -668,6 +668,38 @@ impl PromptSection for ToolUsageStrategySection {
             );
         }
 
+        // ── Memory hygiene (기억 위생 관리) ──
+        let has_memory_store = tool_names.contains(&"memory_store");
+        let has_memory_forget = tool_names.contains(&"memory_forget");
+        if has_memory_store || has_memory_forget {
+            out.push_str(
+                "### Memory Hygiene (기억 위생 관리)\n\n\
+                 You manage the user's personal memories. Follow these rules:\n\n\
+                 **1. 정보 변경 감지 (Conflict Detection):**\n\
+                 When the user mentions information that contradicts stored memories \
+                 (address change, job change, phone number change, relationship change), \
+                 ALWAYS ask for confirmation before updating:\n\
+                 ```\n\
+                 기존 정보: [이전 내용]\n\
+                 새 정보: [새로운 내용]\n\
+                 업데이트할까요?\n\
+                 ```\n\
+                 After confirmation, delete the old entry and store the new one.\n\n\
+                 **2. 망각 요청 (Forget Request):**\n\
+                 When the user says \"지워줘\", \"잊어줘\", \"삭제해줘\" about a topic/person, \
+                 ALWAYS confirm before deleting:\n\
+                 ```\n\
+                 [관련 기억 N건]이 저장되어 있습니다.\n\
+                 정말 삭제할까요? 삭제하면 복구할 수 없습니다.\n\
+                 ```\n\
+                 After explicit confirmation, use memory_forget to delete all related entries.\n\n\
+                 **3. 중요도 인식:**\n\
+                 Frequently referenced memories (user profile, work info, family info) are \
+                 automatically prioritized in search results. When you notice a memory is \
+                 being referenced repeatedly, it's a sign of high importance — preserve it carefully.\n\n",
+            );
+        }
+
         // ── 3-tier web search strategy ──
         let has_web_search = tool_names.contains(&"web_search");
         let has_perplexity_search = tool_names.contains(&"perplexity_search");

@@ -233,6 +233,8 @@ impl LucidMemory {
                 timestamp: now.clone(),
                 session_id: None,
                 score: Some((1.0 - rank as f64 * 0.05).max(0.1)),
+                recall_count: 0,
+                last_recalled: None,
             });
         }
 

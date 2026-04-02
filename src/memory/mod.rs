@@ -18,6 +18,7 @@ pub mod sync;
 pub mod synced;
 pub mod traits;
 pub mod vector;
+pub mod hot_cache;
 
 #[allow(unused_imports)]
 pub use backend::{

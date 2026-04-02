@@ -11,6 +11,14 @@ pub struct MemoryEntry {
     pub timestamp: String,
     pub session_id: Option<String>,
     pub score: Option<f64>,
+    /// Number of times this entry has been recalled/searched.
+    /// Higher count = more frequently referenced = higher priority in RAG results.
+    #[serde(default)]
+    pub recall_count: u32,
+    /// Last time this entry was recalled (ISO 8601).
+    /// Used for hot cache eviction and decay scoring.
+    #[serde(default)]
+    pub last_recalled: Option<String>,
 }
 
 impl std::fmt::Debug for MemoryEntry {
@@ -252,10 +260,6 @@ pub trait Memory: Send + Sync {
     async fn health_check(&self) -> bool;
 
     /// Rebuild embeddings for all memories using the current embedding provider.
-    /// Returns the number of memories reindexed, or an error if not supported.
-    ///
-    /// Use this after changing the embedding model to ensure vector search
-    /// works correctly with the new embeddings.
     async fn reindex(
         &self,
         progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
@@ -263,6 +267,58 @@ pub trait Memory: Send + Sync {
         let _ = progress_callback;
         anyhow::bail!("Reindex not supported by {} backend", self.name())
     }
+
+    /// Increment the recall count for a memory entry.
+    /// Called automatically when a memory is retrieved via recall().
+    /// Entries with higher recall_count get priority in RAG search results.
+    async fn track_recall(&self, _key: &str) -> anyhow::Result<()> {
+        Ok(()) // default no-op; SQLite backend overrides this
+    }
+
+    /// Get the most frequently recalled memories (hot memories).
+    /// Used for the hot memory cache — these are pre-loaded at session start
+    /// and kept in-memory for instant access without SQLite queries.
+    async fn hot_memories(&self, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+        Ok(vec![]) // default empty; SQLite backend overrides this
+    }
+
+    /// Detect conflicts between a new value and existing memory.
+    /// Returns the existing entry if a conflict is detected (e.g., address changed).
+    async fn detect_conflict(
+        &self,
+        key: &str,
+        new_content: &str,
+    ) -> anyhow::Result<Option<MemoryConflict>> {
+        let existing = self.get(key).await?;
+        if let Some(entry) = existing {
+            if entry.content != new_content && !new_content.is_empty() {
+                return Ok(Some(MemoryConflict {
+                    key: key.to_string(),
+                    old_content: entry.content,
+                    new_content: new_content.to_string(),
+                    old_timestamp: entry.timestamp,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Bulk forget: remove all memories matching a keyword pattern.
+    /// Used for "망각 요청" — deleting all memories related to a topic/person.
+    /// Returns the number of entries deleted.
+    async fn forget_matching(&self, _pattern: &str) -> anyhow::Result<usize> {
+        Ok(0) // default no-op; SQLite backend overrides this
+    }
+}
+
+/// Detected conflict between existing and new memory content.
+/// Used to prompt the user: "이 정보가 변경된 것 같습니다. 업데이트할까요?"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConflict {
+    pub key: String,
+    pub old_content: String,
+    pub new_content: String,
+    pub old_timestamp: String,
 }
 
 #[cfg(test)]
