@@ -1103,7 +1103,7 @@ impl SecurityPolicy {
         // Block background command chaining (`&`), which can hide extra
         // sub-commands and outlive timeout expectations. Keep `&&` allowed.
         // Strip `2>&1` first so its `&` isn't flagged as background chaining.
-        let ampersand_check = command.replace("2>&1", "");
+        let ampersand_check = command.replace("2>&1", "").replace("1>&2", "");
         if contains_unquoted_single_ampersand(&ampersand_check) {
             return false;
         }
