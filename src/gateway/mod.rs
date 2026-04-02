@@ -44,7 +44,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -1009,10 +1009,27 @@ pub async fn run_gateway(
 
     // ── Plugin management API (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
-    let inner = inner.route(
-        "/api/plugins",
-        get(api_plugins::plugin_routes::list_plugins),
-    );
+    let inner = inner
+        .route(
+            "/api/plugins",
+            get(api_plugins::plugin_routes::list_plugins),
+        )
+        .route(
+            "/api/plugins/{name}",
+            get(api_plugins::plugin_routes::get_plugin_detail),
+        )
+        .route(
+            "/api/plugins/{name}/enable",
+            post(api_plugins::plugin_routes::enable_plugin),
+        )
+        .route(
+            "/api/plugins/{name}/disable",
+            post(api_plugins::plugin_routes::disable_plugin),
+        )
+        .route(
+            "/api/plugins/{name}/config",
+            patch(api_plugins::plugin_routes::patch_plugin_config),
+        );
 
     let inner = inner
         // ── SSE event stream ──

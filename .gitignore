@@ -58,3 +58,6 @@ playground/
 
 # Temporary rustc output
 rust_out
+
+# Test plugin build artifacts
+tests/plugins/target/

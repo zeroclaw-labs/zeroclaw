@@ -1235,6 +1235,10 @@ impl Tool for ToolArcRef {
         self.inner.parameters_schema()
     }
 
+    fn risk_level(&self) -> crate::tools::traits::RiskLevel {
+        self.inner.risk_level()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }

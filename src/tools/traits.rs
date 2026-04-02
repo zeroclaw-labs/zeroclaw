@@ -1,6 +1,18 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Risk level for a tool, used to enforce security ceilings on delegation.
+///
+/// Variants are ordered Low < Medium < High so that `PartialOrd` / `Ord`
+/// comparisons enforce ceiling checks naturally.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum RiskLevel {
+    Low,
+    Medium,
+    High,
+}
+
 /// Result of a tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
@@ -31,6 +43,11 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
+
+    /// Risk level for this tool (defaults to Low for backward compatibility).
+    fn risk_level(&self) -> RiskLevel {
+        RiskLevel::Low
+    }
 
     /// Get the full spec for LLM registration
     fn spec(&self) -> ToolSpec {

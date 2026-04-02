@@ -28,6 +28,7 @@ pub enum AuditEventType {
     AuthFailure,
     PolicyViolation,
     SecurityEvent,
+    PluginExecution,
 }
 
 /// Actor information (who performed the action)
@@ -38,6 +39,13 @@ pub struct Actor {
     pub username: Option<String>,
 }
 
+/// A single HTTP request observed during plugin execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpRequestEntry {
+    pub method: String,
+    pub url: String,
+}
+
 /// Action information (what was done)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Action {
@@ -45,6 +53,15 @@ pub struct Action {
     pub risk_level: Option<String>,
     pub approved: bool,
     pub allowed: bool,
+    /// Redacted input parameters (present only for plugin execution events).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub redacted_input: Option<String>,
+    /// HTTP requests made during plugin execution (URL and method only).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub http_requests: Option<Vec<HttpRequestEntry>>,
+    /// WASM export name invoked (present only for plugin execution events).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub export_name: Option<String>,
 }
 
 /// Execution result
@@ -140,6 +157,9 @@ impl AuditEvent {
             risk_level: Some(risk_level),
             approved,
             allowed,
+            redacted_input: None,
+            http_requests: None,
+            export_name: None,
         });
         self
     }
@@ -218,6 +238,23 @@ pub struct CommandExecutionLog<'a> {
     pub allowed: bool,
     pub success: bool,
     pub duration_ms: u64,
+}
+
+/// Structured plugin execution details for audit logging.
+#[derive(Debug, Clone)]
+pub struct PluginExecutionLog<'a> {
+    pub plugin_name: &'a str,
+    pub plugin_version: &'a str,
+    pub tool_name: &'a str,
+    /// WASM export function name invoked by the plugin.
+    pub export_name: &'a str,
+    pub success: bool,
+    pub duration_ms: u64,
+    pub error: Option<&'a str>,
+    /// Redacted JSON representation of the input parameters.
+    pub redacted_input: Option<String>,
+    /// HTTP requests observed during execution (URL and method only).
+    pub http_requests: Option<Vec<HttpRequestEntry>>,
 }
 
 impl AuditLogger {
@@ -350,6 +387,45 @@ impl AuditLogger {
             success,
             duration_ms,
         })
+    }
+
+    /// Log a plugin tool execution event.
+    pub fn log_plugin_execution(&self, entry: PluginExecutionLog<'_>) -> Result<()> {
+        let mut event = AuditEvent::new(AuditEventType::PluginExecution)
+            .with_action(
+                format!(
+                    "{}@{}:{}",
+                    entry.plugin_name, entry.plugin_version, entry.tool_name
+                ),
+                "low".to_string(),
+                true,
+                true,
+            )
+            .with_result(
+                entry.success,
+                None,
+                entry.duration_ms,
+                entry.error.map(|s| s.to_string()),
+            );
+
+        // Attach export name to the action.
+        if let Some(action) = &mut event.action {
+            action.export_name = Some(entry.export_name.to_string());
+        }
+
+        // Attach redacted input parameters if provided.
+        if let (Some(action), Some(redacted)) = (&mut event.action, entry.redacted_input) {
+            action.redacted_input = Some(redacted);
+        }
+
+        // Attach HTTP request log if provided.
+        if let (Some(action), Some(requests)) = (&mut event.action, entry.http_requests) {
+            if !requests.is_empty() {
+                action.http_requests = Some(requests);
+            }
+        }
+
+        self.log(&event)
     }
 
     /// Rotate log if it exceeds max size

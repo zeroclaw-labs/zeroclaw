@@ -205,7 +205,7 @@ pub use text_browser::TextBrowserTool;
 pub use tool_search::ToolSearchTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
-pub use traits::{ToolResult, ToolSpec};
+pub use traits::{RiskLevel, ToolResult, ToolSpec};
 pub use verifiable_intent::VerifiableIntentTool;
 pub use weather_tool::WeatherTool;
 pub use web_fetch::WebFetchTool;
@@ -243,6 +243,10 @@ impl Tool for ArcToolRef {
         self.0.parameters_schema()
     }
 
+    fn risk_level(&self) -> RiskLevel {
+        self.0.risk_level()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -271,6 +275,10 @@ impl Tool for ArcDelegatingTool {
 
     fn parameters_schema(&self) -> serde_json::Value {
         self.inner.parameters_schema()
+    }
+
+    fn risk_level(&self) -> RiskLevel {
+        self.inner.risk_level()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -1002,42 +1010,267 @@ pub fn all_tools_with_runtime(
     // ── WASM plugin tools (requires plugins-wasm feature) ──
     #[cfg(feature = "plugins-wasm")]
     {
-        let plugin_dir = config.plugins.plugins_dir.clone();
-        let plugin_path = if plugin_dir.starts_with("~/") {
-            let home = directories::UserDirs::new()
-                .map(|u| u.home_dir().to_path_buf())
-                .unwrap_or_else(|| std::path::PathBuf::from("."));
-            home.join(&plugin_dir[2..])
-        } else {
-            std::path::PathBuf::from(&plugin_dir)
-        };
+        if config.plugins.enabled {
+            let loader = crate::plugins::loader::PluginLoader::new(root_config, security);
 
-        if plugin_path.exists() && config.plugins.enabled {
-            match crate::plugins::host::PluginHost::new(
-                plugin_path.parent().unwrap_or(&plugin_path),
-            ) {
-                Ok(host) => {
-                    let tool_manifests = host.tool_plugins();
-                    let count = tool_manifests.len();
-                    for manifest in tool_manifests {
-                        tool_arcs.push(Arc::new(crate::plugins::wasm_tool::WasmTool::new(
-                            manifest.name.clone(),
-                            manifest.description.clone().unwrap_or_default(),
-                            manifest.name.clone(),
-                            "call".to_string(),
-                            serde_json::json!({
-                                "type": "object",
-                                "properties": {
-                                    "input": {
-                                        "type": "string",
-                                        "description": "Input for the plugin"
-                                    }
-                                },
-                                "required": ["input"]
-                            }),
-                        )));
+            // In strict/paranoid mode, force audit logging for all plugin calls
+            // even if audit is globally disabled.
+            let net_level_for_audit = crate::plugins::loader::NetworkSecurityLevel::from_config(
+                &root_config.plugins.security.network_security_level,
+            );
+            let forced_audit_logger: Option<std::sync::Arc<crate::security::AuditLogger>> =
+                if net_level_for_audit.requires_forced_audit() {
+                    let mut audit_config = root_config.security.audit.clone();
+                    audit_config.enabled = true;
+                    let zeroclaw_dir = root_config
+                        .config_path
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf();
+                    match crate::security::AuditLogger::new(audit_config, zeroclaw_dir) {
+                        Ok(logger) => {
+                            tracing::info!(
+                                security_level = ?net_level_for_audit,
+                                "audit logging forced for all plugin calls"
+                            );
+                            Some(std::sync::Arc::new(logger))
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "failed to create forced audit logger for strict mode; \
+                                 plugin audit logging will be skipped"
+                            );
+                            None
+                        }
                     }
-                    tracing::info!("Loaded {count} WASM plugin tools");
+                } else {
+                    None
+                };
+
+            match loader.load_all() {
+                Ok(descriptors) => {
+                    let mut tool_count = 0usize;
+                    for descriptor in &descriptors {
+                        let manifest = &descriptor.manifest;
+
+                        // Resolve per-plugin config; skip this plugin if
+                        // required config keys are missing.
+                        // Decrypt any encrypted values before resolution.
+                        let per_plugin_values =
+                            match root_config.plugins.per_plugin.get(&manifest.name).cloned() {
+                                Some(mut vals) => {
+                                    let config_dir = root_config
+                                        .config_path
+                                        .parent()
+                                        .unwrap_or(std::path::Path::new("."));
+                                    let store = crate::security::SecretStore::new(
+                                        config_dir,
+                                        root_config.secrets.encrypt,
+                                    );
+                                    if let Err(e) = crate::plugins::decrypt_plugin_config_values(
+                                        &mut vals, &store,
+                                    ) {
+                                        tracing::warn!(
+                                            plugin = manifest.name,
+                                            error = %e,
+                                            "Skipping plugin with undecryptable config"
+                                        );
+                                        continue;
+                                    }
+                                    Some(vals)
+                                }
+                                None => None,
+                            };
+                        let resolved_config = match crate::plugins::resolve_plugin_config(
+                            &manifest.name,
+                            &manifest.config,
+                            per_plugin_values.as_ref(),
+                        ) {
+                            Ok(cfg) => cfg,
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = manifest.name,
+                                    error = %e,
+                                    "Skipping plugin with missing config"
+                                );
+                                continue;
+                            }
+                        };
+
+                        // Validate allowed_hosts against the network security
+                        // policy BEFORE building or instantiating the plugin.
+                        let net_level = crate::plugins::loader::NetworkSecurityLevel::from_config(
+                            &root_config.plugins.security.network_security_level,
+                        );
+
+                        // In paranoid mode, reject plugins not on the allowlist.
+                        if let Err(e) = crate::plugins::loader::validate_plugin_allowlist(
+                            &manifest.name,
+                            &root_config.plugins.security.allowed_plugins,
+                            net_level,
+                        ) {
+                            tracing::warn!(
+                                plugin = manifest.name,
+                                error = %e,
+                                "Skipping plugin not allowlisted in paranoid mode"
+                            );
+                            continue;
+                        }
+
+                        if let Err(e) = crate::plugins::loader::validate_allowed_hosts(
+                            &manifest.name,
+                            &manifest.allowed_hosts,
+                            net_level,
+                        ) {
+                            tracing::warn!(
+                                plugin = manifest.name,
+                                error = %e,
+                                "Skipping plugin that violates network security policy"
+                            );
+                            continue;
+                        }
+
+                        // Validate allowed_paths against forbidden paths
+                        // BEFORE building or instantiating the plugin.
+                        let forbidden: Vec<String> = crate::plugins::loader::FORBIDDEN_PATHS
+                            .iter()
+                            .map(|s| (*s).to_string())
+                            .collect();
+                        if let Err(e) = crate::plugins::loader::validate_allowed_paths(
+                            &manifest.name,
+                            &manifest.allowed_paths,
+                            &forbidden,
+                        ) {
+                            tracing::warn!(
+                                plugin = manifest.name,
+                                error = %e,
+                                "Skipping plugin that declares a forbidden path"
+                            );
+                            continue;
+                        }
+
+                        // In strict or paranoid mode, enforce that all
+                        // allowed_paths resolve inside the workspace subtree.
+                        if matches!(
+                            net_level,
+                            crate::plugins::loader::NetworkSecurityLevel::Strict
+                                | crate::plugins::loader::NetworkSecurityLevel::Paranoid
+                        ) {
+                            if let Err(e) = crate::plugins::loader::validate_workspace_paths(
+                                &manifest.name,
+                                &manifest.allowed_paths,
+                                &root_config.workspace_dir,
+                            ) {
+                                tracing::warn!(
+                                    plugin = manifest.name,
+                                    error = %e,
+                                    "Skipping plugin with path outside workspace (strict mode)"
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Verify WASM binary integrity before instantiation.
+                        let wasm_path = descriptor.plugin_dir.join(&manifest.wasm_path);
+                        if let Err(e) = crate::plugins::loader::verify_wasm_integrity(
+                            &manifest.name,
+                            &wasm_path,
+                        ) {
+                            tracing::warn!(
+                                plugin = manifest.name,
+                                error = %e,
+                                "Skipping plugin that failed WASM integrity check"
+                            );
+                            continue;
+                        }
+
+                        // Build extism manifest via the loader for consistent
+                        // timeout, allowed-hosts, and allowed-paths handling,
+                        // injecting the resolved config values.
+                        let loader_manifest =
+                            crate::plugins::loader::build_extism_manifest_with_config(
+                                manifest,
+                                &descriptor.plugin_dir,
+                                resolved_config,
+                                Some(&root_config.workspace_dir),
+                            );
+
+                        match extism::Plugin::new(
+                            &loader_manifest.manifest,
+                            [],
+                            loader_manifest.wasi,
+                        ) {
+                            Ok(plugin) => {
+                                // One Arc<Mutex<Plugin>> shared across all
+                                // WasmTool instances from this plugin.
+                                let shared_plugin =
+                                    std::sync::Arc::new(std::sync::Mutex::new(plugin));
+
+                                if manifest.tools.is_empty() {
+                                    // Legacy fallback: plugin declares no
+                                    // [[tools]], expose a single "call" export.
+                                    let mut wasm_tool = crate::plugins::wasm_tool::WasmTool::new(
+                                        manifest.name.clone(),
+                                        manifest.description.clone().unwrap_or_default(),
+                                        manifest.name.clone(),
+                                        manifest.version.clone(),
+                                        "call".to_string(),
+                                        serde_json::json!({
+                                            "type": "object",
+                                            "properties": {
+                                                "input": {
+                                                    "type": "string",
+                                                    "description": "Input for the plugin"
+                                                }
+                                            },
+                                            "required": ["input"]
+                                        }),
+                                        std::sync::Arc::clone(&shared_plugin),
+                                    );
+                                    if let Some(ref logger) = forced_audit_logger {
+                                        wasm_tool = wasm_tool
+                                            .with_audit_logger(std::sync::Arc::clone(logger));
+                                    }
+                                    tool_arcs.push(Arc::new(wasm_tool));
+                                    tool_count += 1;
+                                } else {
+                                    // Each [[tools]] entry becomes a WasmTool
+                                    // sharing the same Extism instance.
+                                    for tool_def in &manifest.tools {
+                                        let schema =
+                                            tool_def.parameters_schema.clone().unwrap_or_else(
+                                                || serde_json::json!({ "type": "object" }),
+                                            );
+                                        let mut wasm_tool =
+                                            crate::plugins::wasm_tool::WasmTool::new(
+                                                tool_def.name.clone(),
+                                                tool_def.description.clone(),
+                                                manifest.name.clone(),
+                                                manifest.version.clone(),
+                                                tool_def.export.clone(),
+                                                schema,
+                                                std::sync::Arc::clone(&shared_plugin),
+                                            );
+                                        if let Some(ref logger) = forced_audit_logger {
+                                            wasm_tool = wasm_tool
+                                                .with_audit_logger(std::sync::Arc::clone(logger));
+                                        }
+                                        tool_arcs.push(Arc::new(wasm_tool));
+                                        tool_count += 1;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    plugin = manifest.name,
+                                    error = %e,
+                                    "Failed to instantiate WASM plugin"
+                                );
+                            }
+                        }
+                    }
+                    tracing::info!("Loaded {tool_count} WASM plugin tools");
                 }
                 Err(e) => {
                     tracing::warn!("Failed to load WASM plugins: {e}");
@@ -1425,5 +1658,596 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"read_skill"));
+    }
+
+    /// US-ZCL-4-1: Plugin tools appear in the tool registry alongside built-in tools.
+    ///
+    /// Sets up a temporary plugin directory with a valid manifest and minimal
+    /// WASM module, enables the plugins-wasm feature, and verifies the resulting
+    /// tool list contains both built-in tools (e.g. `shell`, `file_read`) and
+    /// the plugin-provided tool.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn all_tools_includes_plugin_tools_alongside_builtins() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create plugins/<plugin_name>/ structure with manifest + minimal wasm
+        let plugin_dir = tmp.path().join("plugins");
+        let plugin_sub = plugin_dir.join("test_plugin");
+        std::fs::create_dir_all(&plugin_sub).unwrap();
+
+        // Minimal valid WASM module (header only, no exports)
+        let wasm_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        std::fs::write(plugin_sub.join("plugin.wasm"), wasm_bytes).unwrap();
+
+        let manifest_toml = r#"
+[plugin]
+name = "test_plugin"
+version = "0.1.0"
+description = "A test plugin for registry integration"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+wasi = false
+timeout_ms = 5000
+
+[[tools]]
+name = "test_plugin_tool"
+description = "A tool from the test plugin"
+export = "call"
+risk_level = "low"
+"#;
+        std::fs::write(plugin_sub.join("manifest.toml"), manifest_toml).unwrap();
+
+        // Build config with plugins enabled, pointing at the temp plugins dir
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.plugins.enabled = true;
+        cfg.plugins.plugins_dir = plugin_dir.to_string_lossy().to_string();
+
+        let arc_cfg = Arc::new(cfg.clone());
+        // Override plugins config in the Arc<Config> passed as first arg
+        let (tools, _, _, _, _, _) = all_tools(
+            arc_cfg,
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        // Plugin tool should be registered (name comes from [[tools]] name field)
+        assert!(
+            names.contains(&"test_plugin_tool"),
+            "plugin tool 'test_plugin_tool' should appear in the registry, got: {:?}",
+            names
+        );
+
+        // Built-in tools should still be present alongside plugin tools
+        assert!(
+            names.contains(&"shell"),
+            "built-in tool 'shell' should still be in the registry"
+        );
+        assert!(
+            names.contains(&"file_read"),
+            "built-in tool 'file_read' should still be in the registry"
+        );
+        assert!(
+            names.contains(&"content_search"),
+            "built-in tool 'content_search' should still be in the registry"
+        );
+    }
+
+    /// US-ZCL-4-2: Each [[tools]] entry creates one WasmTool instance.
+    ///
+    /// Sets up a plugin manifest with three `[[tools]]` entries, loads the
+    /// tool registry, and verifies exactly three distinct WasmTool instances
+    /// appear — one per `[[tools]]` entry.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn each_tools_entry_creates_one_wasm_tool_instance() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create plugins/<plugin_name>/ structure with manifest + minimal wasm
+        let plugin_dir = tmp.path().join("plugins");
+        let plugin_sub = plugin_dir.join("multi_tool_plugin");
+        std::fs::create_dir_all(&plugin_sub).unwrap();
+
+        // Minimal valid WASM module (header only, no exports)
+        let wasm_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        std::fs::write(plugin_sub.join("plugin.wasm"), wasm_bytes).unwrap();
+
+        let manifest_toml = r#"
+[plugin]
+name = "multi_tool_plugin"
+version = "0.1.0"
+description = "A plugin declaring multiple tools"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+wasi = false
+timeout_ms = 5000
+
+[[tools]]
+name = "alpha_tool"
+description = "First tool"
+export = "alpha"
+risk_level = "low"
+
+[[tools]]
+name = "beta_tool"
+description = "Second tool"
+export = "beta"
+risk_level = "medium"
+
+[[tools]]
+name = "gamma_tool"
+description = "Third tool"
+export = "gamma"
+risk_level = "high"
+"#;
+        std::fs::write(plugin_sub.join("manifest.toml"), manifest_toml).unwrap();
+
+        // Build config with plugins enabled, pointing at the temp plugins dir
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.plugins.enabled = true;
+        cfg.plugins.plugins_dir = plugin_dir.to_string_lossy().to_string();
+
+        let arc_cfg = Arc::new(cfg.clone());
+        let (tools, _, _, _, _, _) = all_tools(
+            arc_cfg,
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        // Each [[tools]] entry must produce exactly one WasmTool in the registry
+        assert!(
+            names.contains(&"alpha_tool"),
+            "tool 'alpha_tool' should be registered, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"beta_tool"),
+            "tool 'beta_tool' should be registered, got: {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"gamma_tool"),
+            "tool 'gamma_tool' should be registered, got: {:?}",
+            names
+        );
+
+        // Count occurrences — each name must appear exactly once (1:1 mapping)
+        let alpha_count = names.iter().filter(|&&n| n == "alpha_tool").count();
+        let beta_count = names.iter().filter(|&&n| n == "beta_tool").count();
+        let gamma_count = names.iter().filter(|&&n| n == "gamma_tool").count();
+        assert_eq!(alpha_count, 1, "alpha_tool should appear exactly once");
+        assert_eq!(beta_count, 1, "beta_tool should appear exactly once");
+        assert_eq!(gamma_count, 1, "gamma_tool should appear exactly once");
+    }
+
+    /// US-ZCL-4-3: Plugin tools show in zeroclaw tools list output.
+    ///
+    /// Verifies that WASM plugin tools produce valid `ToolSpec` entries that
+    /// serialize correctly for the `GET /api/tools` response — the same data
+    /// rendered by `zeroclaw tools list`. Each plugin tool must include its
+    /// name, description, and parameters schema in the spec.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_tools_appear_in_tools_list_output() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create plugins/<plugin_name>/ structure with manifest + minimal wasm
+        let plugin_dir = tmp.path().join("plugins");
+        let plugin_sub = plugin_dir.join("list_test_plugin");
+        std::fs::create_dir_all(&plugin_sub).unwrap();
+
+        // Minimal valid WASM module (header only, no exports)
+        let wasm_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        std::fs::write(plugin_sub.join("plugin.wasm"), wasm_bytes).unwrap();
+
+        let manifest_toml = r#"
+[plugin]
+name = "list_test_plugin"
+version = "0.1.0"
+description = "Plugin for tools-list output test"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+wasi = false
+timeout_ms = 5000
+
+[[tools]]
+name = "list_test_tool"
+description = "A tool that should show in tools list"
+export = "run"
+risk_level = "low"
+"#;
+        std::fs::write(plugin_sub.join("manifest.toml"), manifest_toml).unwrap();
+
+        // Build config with plugins enabled
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.plugins.enabled = true;
+        cfg.plugins.plugins_dir = plugin_dir.to_string_lossy().to_string();
+
+        let arc_cfg = Arc::new(cfg.clone());
+        let (tools, _, _, _, _, _) = all_tools(
+            arc_cfg,
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+
+        // Convert to ToolSpec — the same path used by the gateway's /api/tools
+        let specs: Vec<crate::tools::traits::ToolSpec> = tools.iter().map(|t| t.spec()).collect();
+
+        // Verify the plugin tool appears in the spec list
+        let plugin_spec = specs
+            .iter()
+            .find(|s| s.name == "list_test_tool")
+            .expect("plugin tool 'list_test_tool' must appear in ToolSpec list");
+
+        // Verify the spec contains the correct metadata for display
+        assert_eq!(
+            plugin_spec.description, "A tool that should show in tools list",
+            "spec description must match the [[tools]] manifest entry"
+        );
+
+        // Verify the spec serializes to valid JSON (as /api/tools would)
+        let json = serde_json::json!({
+            "name": plugin_spec.name,
+            "description": plugin_spec.description,
+            "parameters": plugin_spec.parameters,
+        });
+        assert_eq!(json["name"], "list_test_tool");
+        assert_eq!(json["description"], "A tool that should show in tools list");
+        assert!(
+            json["parameters"].is_object(),
+            "parameters should be a JSON object, got: {}",
+            json["parameters"]
+        );
+
+        // Built-in tools must also have valid specs alongside the plugin tool
+        let builtin_spec = specs
+            .iter()
+            .find(|s| s.name == "shell")
+            .expect("built-in 'shell' tool must still appear in spec list");
+        assert!(
+            !builtin_spec.description.is_empty(),
+            "built-in tool spec must have a description"
+        );
+    }
+
+    /// US-ZCL-4-5: Disabled plugins do not register tools.
+    ///
+    /// Sets up a valid plugin directory with a manifest and WASM module but
+    /// leaves `config.plugins.enabled` as `false`.  Verifies the plugin tool
+    /// does **not** appear in the tool registry while built-in tools still do.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn disabled_plugins_do_not_register_tools() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create plugins/<plugin_name>/ structure with manifest + minimal wasm
+        let plugin_dir = tmp.path().join("plugins");
+        let plugin_sub = plugin_dir.join("disabled_plugin");
+        std::fs::create_dir_all(&plugin_sub).unwrap();
+
+        // Minimal valid WASM module (header only, no exports)
+        let wasm_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        std::fs::write(plugin_sub.join("plugin.wasm"), wasm_bytes).unwrap();
+
+        let manifest_toml = r#"
+[plugin]
+name = "disabled_plugin"
+version = "0.1.0"
+description = "A plugin that should NOT load when disabled"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+wasi = false
+timeout_ms = 5000
+
+[[tools]]
+name = "disabled_tool"
+description = "This tool must not appear in the registry"
+export = "run"
+risk_level = "low"
+"#;
+        std::fs::write(plugin_sub.join("manifest.toml"), manifest_toml).unwrap();
+
+        // Build config with plugins DISABLED
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.plugins.enabled = false;
+        cfg.plugins.plugins_dir = plugin_dir.to_string_lossy().to_string();
+
+        let arc_cfg = Arc::new(cfg.clone());
+        let (tools, _, _, _, _, _) = all_tools(
+            arc_cfg,
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        // The disabled plugin's tool must NOT appear in the registry
+        assert!(
+            !names.contains(&"disabled_tool"),
+            "disabled plugin tool 'disabled_tool' must not appear in registry, got: {:?}",
+            names
+        );
+
+        // Built-in tools should still be present
+        assert!(
+            names.contains(&"shell"),
+            "built-in tool 'shell' should still be in the registry"
+        );
+        assert!(
+            names.contains(&"file_read"),
+            "built-in tool 'file_read' should still be in the registry"
+        );
+    }
+
+    /// US-ZCL-4-8: Integration test for tool registry with plugins.
+    ///
+    /// Sets up a plugin directory with an "echo" plugin declaring two tools
+    /// (each with explicit parameters_schema), loads the full tool registry via
+    /// `all_tools()`, and verifies:
+    /// - Both echo plugin tools appear alongside built-in tools.
+    /// - Tool name, description, and parameters_schema match the manifest.
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn integration_plugin_tools_match_manifest_metadata() {
+        let tmp = TempDir::new().unwrap();
+
+        // ── Set up echo plugin directory ──
+        let plugin_dir = tmp.path().join("plugins");
+        let echo_dir = plugin_dir.join("echo");
+        std::fs::create_dir_all(&echo_dir).unwrap();
+
+        // Minimal valid WASM module (magic + version header, no exports)
+        let wasm_bytes: &[u8] = &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        std::fs::write(echo_dir.join("plugin.wasm"), wasm_bytes).unwrap();
+
+        let manifest_toml = r#"
+[plugin]
+name = "echo"
+version = "1.0.0"
+description = "Echo plugin for integration testing"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+wasi = false
+timeout_ms = 5000
+
+[[tools]]
+name = "echo_message"
+description = "Echo a message back to the caller"
+export = "echo_call"
+risk_level = "low"
+
+[tools.parameters_schema]
+type = "object"
+required = ["message"]
+
+[tools.parameters_schema.properties.message]
+type = "string"
+description = "The message to echo"
+
+[[tools]]
+name = "echo_json"
+description = "Echo structured JSON data"
+export = "echo_json_call"
+risk_level = "low"
+
+[tools.parameters_schema]
+type = "object"
+required = ["data"]
+
+[tools.parameters_schema.properties.data]
+type = "object"
+description = "Arbitrary JSON payload to echo"
+"#;
+        std::fs::write(echo_dir.join("plugin.toml"), manifest_toml).unwrap();
+
+        // ── Build config with plugins enabled ──
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let browser = BrowserConfig::default();
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.plugins.enabled = true;
+        cfg.plugins.plugins_dir = plugin_dir.to_string_lossy().to_string();
+
+        let arc_cfg = Arc::new(cfg.clone());
+        let (tools, _, _, _, _, _) = all_tools(
+            arc_cfg,
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        // ── Verify built-in tools are still present ──
+        assert!(
+            names.contains(&"shell"),
+            "built-in 'shell' must be present alongside plugin tools"
+        );
+        assert!(
+            names.contains(&"file_read"),
+            "built-in 'file_read' must be present alongside plugin tools"
+        );
+        assert!(
+            names.contains(&"file_write"),
+            "built-in 'file_write' must be present alongside plugin tools"
+        );
+
+        // ── Verify echo_message tool ──
+        let echo_msg = tools
+            .iter()
+            .find(|t| t.name() == "echo_message")
+            .expect("echo_message tool must appear in registry");
+
+        assert_eq!(
+            echo_msg.description(),
+            "Echo a message back to the caller",
+            "echo_message description must match manifest"
+        );
+
+        let msg_schema = echo_msg.parameters_schema();
+        assert_eq!(
+            msg_schema["type"], "object",
+            "echo_message schema type must be 'object'"
+        );
+        assert_eq!(
+            msg_schema["required"],
+            serde_json::json!(["message"]),
+            "echo_message schema required must be ['message']"
+        );
+        assert_eq!(
+            msg_schema["properties"]["message"]["type"], "string",
+            "echo_message 'message' param must be string type"
+        );
+        assert_eq!(
+            msg_schema["properties"]["message"]["description"], "The message to echo",
+            "echo_message 'message' param description must match manifest"
+        );
+
+        // ── Verify echo_json tool ──
+        let echo_json = tools
+            .iter()
+            .find(|t| t.name() == "echo_json")
+            .expect("echo_json tool must appear in registry");
+
+        assert_eq!(
+            echo_json.description(),
+            "Echo structured JSON data",
+            "echo_json description must match manifest"
+        );
+
+        let json_schema = echo_json.parameters_schema();
+        assert_eq!(
+            json_schema["type"], "object",
+            "echo_json schema type must be 'object'"
+        );
+        assert_eq!(
+            json_schema["required"],
+            serde_json::json!(["data"]),
+            "echo_json schema required must be ['data']"
+        );
+        assert_eq!(
+            json_schema["properties"]["data"]["type"], "object",
+            "echo_json 'data' param must be object type"
+        );
+
+        // ── Verify each plugin tool appears exactly once ──
+        let echo_msg_count = names.iter().filter(|&&n| n == "echo_message").count();
+        let echo_json_count = names.iter().filter(|&&n| n == "echo_json").count();
+        assert_eq!(echo_msg_count, 1, "echo_message must appear exactly once");
+        assert_eq!(echo_json_count, 1, "echo_json must appear exactly once");
+
+        // ── Verify ToolSpec round-trip (same path as `zeroclaw tools list`) ──
+        let specs: Vec<crate::tools::traits::ToolSpec> = tools.iter().map(|t| t.spec()).collect();
+
+        let msg_spec = specs
+            .iter()
+            .find(|s| s.name == "echo_message")
+            .expect("echo_message must appear in ToolSpec list");
+        assert_eq!(msg_spec.description, "Echo a message back to the caller");
+        assert!(msg_spec.parameters["properties"]["message"].is_object());
+
+        let json_spec = specs
+            .iter()
+            .find(|s| s.name == "echo_json")
+            .expect("echo_json must appear in ToolSpec list");
+        assert_eq!(json_spec.description, "Echo structured JSON data");
+        assert!(json_spec.parameters["properties"]["data"].is_object());
     }
 }

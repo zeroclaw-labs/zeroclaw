@@ -12,6 +12,9 @@ import type {
   Session,
   ChannelDetail,
   SessionMessagesResponse,
+  Plugin,
+  PluginDetail,
+  PluginsResponse,
 } from '../types/api';
 import { clearToken, getToken, setToken } from './auth';
 import { apiOrigin, basePath } from './basePath';
@@ -234,6 +237,47 @@ export function patchCronSettings(
     method: 'PATCH',
     body: JSON.stringify(patch),
   });
+}
+
+// ---------------------------------------------------------------------------
+// Plugins
+// ---------------------------------------------------------------------------
+
+export function getPlugins(): Promise<PluginsResponse> {
+  return apiFetch<PluginsResponse>('/api/plugins');
+}
+
+export async function getPlugin(name: string): Promise<PluginDetail | null> {
+  try {
+    return await apiFetch<PluginDetail>(`/api/plugins/${encodeURIComponent(name)}`);
+  } catch {
+    return null;
+  }
+}
+
+export function enablePlugin(name: string): Promise<PluginDetail> {
+  return apiFetch<PluginDetail>(`/api/plugins/${encodeURIComponent(name)}/enable`, {
+    method: 'POST',
+  });
+}
+
+export function disablePlugin(name: string): Promise<PluginDetail> {
+  return apiFetch<PluginDetail>(`/api/plugins/${encodeURIComponent(name)}/disable`, {
+    method: 'POST',
+  });
+}
+
+export function patchPluginConfig(
+  name: string,
+  config: Record<string, string>,
+): Promise<{ status: string }> {
+  return apiFetch<{ status: string }>(
+    `/api/plugins/${encodeURIComponent(name)}/config`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(config),
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------

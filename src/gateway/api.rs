@@ -623,15 +623,21 @@ pub async fn handle_api_doctor(
         .filter(|r| r.severity == crate::doctor::Severity::Error)
         .count();
 
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "results": results,
         "summary": {
             "ok": ok_count,
             "warnings": warn_count,
             "errors": error_count,
         }
-    }))
-    .into_response()
+    });
+
+    // Additive: include structured plugin diagnostics when available
+    if let Some(plugins) = crate::doctor::diagnose_plugins(&config) {
+        body["plugins"] = plugins;
+    }
+
+    Json(body).into_response()
 }
 
 /// GET /api/memory — list or search memory entries
