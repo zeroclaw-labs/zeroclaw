@@ -6,14 +6,17 @@ use crate::security::traits::Sandbox;
 use std::process::Command;
 
 /// Firejail sandbox backend for Linux
-#[derive(Debug, Clone, Default)]
-pub struct FirejailSandbox;
+#[derive(Debug, Clone)]
+pub struct FirejailSandbox {
+    /// Custom firejail arguments (e.g., --env=KEY=VALUE)
+    extra_args: Vec<String>,
+}
 
 impl FirejailSandbox {
-    /// Create a new Firejail sandbox
-    pub fn new() -> std::io::Result<Self> {
+    /// Create a new Firejail sandbox with custom arguments
+    pub fn new(extra_args: Vec<String>) -> std::io::Result<Self> {
         if Self::is_installed() {
-            Ok(Self)
+            Ok(Self { extra_args })
         } else {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -22,9 +25,14 @@ impl FirejailSandbox {
         }
     }
 
+    /// Create a new Firejail sandbox without extra arguments (backward compatible)
+    pub fn new_default() -> std::io::Result<Self> {
+        Self::new(Vec::new())
+    }
+
     /// Probe if Firejail is available (for auto-detection)
     pub fn probe() -> std::io::Result<Self> {
-        Self::new()
+        Self::new(Vec::new())
     }
 
     /// Check if firejail is installed
@@ -34,6 +42,14 @@ impl FirejailSandbox {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+}
+
+impl Default for FirejailSandbox {
+    fn default() -> Self {
+        Self {
+            extra_args: Vec::new(),
+        }
     }
 }
 
@@ -59,6 +75,11 @@ impl Sandbox for FirejailSandbox {
             "--noprofile",    // Skip profile loading
             "--quiet",        // Suppress warnings
         ]);
+
+        // Add custom firejail arguments (e.g., --env=KEY=VALUE)
+        for arg in &self.extra_args {
+            firejail_cmd.arg(arg);
+        }
 
         // Add the original command
         firejail_cmd.arg(&program);
@@ -88,19 +109,21 @@ mod tests {
 
     #[test]
     fn firejail_sandbox_name() {
-        assert_eq!(FirejailSandbox.name(), "firejail");
+        let sandbox = FirejailSandbox::default();
+        assert_eq!(sandbox.name(), "firejail");
     }
 
     #[test]
     fn firejail_description_mentions_dependency() {
-        let desc = FirejailSandbox.description();
+        let sandbox = FirejailSandbox::default();
+        let desc = sandbox.description();
         assert!(desc.contains("firejail"));
     }
 
     #[test]
     fn firejail_new_fails_if_not_installed() {
         // This will fail unless firejail is actually installed
-        let result = FirejailSandbox::new();
+        let result = FirejailSandbox::new_default();
         match result {
             Ok(_) => println!("Firejail is installed"),
             Err(e) => assert!(
@@ -112,7 +135,7 @@ mod tests {
 
     #[test]
     fn firejail_wrap_command_prepends_firejail() {
-        let sandbox = FirejailSandbox;
+        let sandbox = FirejailSandbox::default();
         let mut cmd = Command::new("echo");
         cmd.arg("test");
 
@@ -130,7 +153,7 @@ mod tests {
 
     #[test]
     fn firejail_wrap_command_includes_all_security_flags() {
-        let sandbox = FirejailSandbox;
+        let sandbox = FirejailSandbox::default();
         let mut cmd = Command::new("echo");
         cmd.arg("test");
         sandbox.wrap_command(&mut cmd).unwrap();
@@ -168,7 +191,7 @@ mod tests {
 
     #[test]
     fn firejail_wrap_command_preserves_original_command() {
-        let sandbox = FirejailSandbox;
+        let sandbox = FirejailSandbox::default();
         let mut cmd = Command::new("ls");
         cmd.arg("-la");
         cmd.arg("/workspace");
@@ -191,5 +214,39 @@ mod tests {
             args.contains(&"/workspace".to_string()),
             "original args must be preserved"
         );
+    }
+
+    #[test]
+    fn firejail_wrap_command_includes_custom_args() {
+        let custom_args = vec![
+            "--env=MY_VAR=TEST_VALUE".to_string(),
+            "--hostname=testbox".to_string(),
+        ];
+        let sandbox = FirejailSandbox::new(custom_args.clone()).unwrap_or_default();
+        let mut cmd = Command::new("echo");
+        cmd.arg("test");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        for arg in &custom_args {
+            assert!(
+                args.contains(arg),
+                "custom firejail arg must be present: {arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn firejail_new_with_empty_args_works() {
+        let sandbox = FirejailSandbox::new(Vec::new());
+        // Should either succeed (if firejail installed) or fail with NotFound
+        match sandbox {
+            Ok(_) => println!("Firejail is installed"),
+            Err(e) => assert!(e.kind() == std::io::ErrorKind::NotFound),
+        }
     }
 }

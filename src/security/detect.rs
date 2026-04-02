@@ -33,7 +33,9 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
         SandboxBackend::Firejail => {
             #[cfg(target_os = "linux")]
             {
-                if let Ok(sandbox) = super::firejail::FirejailSandbox::new() {
+                if let Ok(sandbox) =
+                    super::firejail::FirejailSandbox::new(config.sandbox.firejail_args.clone())
+                {
                     return Arc::new(sandbox);
                 }
             }
@@ -84,6 +86,9 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
 }
 
 /// Auto-detect the best available sandbox
+///
+/// Note: For auto-detection, we use default configurations. To use custom
+/// firejail_args, explicitly configure the sandbox backend in settings.
 fn detect_best_sandbox() -> Arc<dyn Sandbox> {
     #[cfg(target_os = "linux")]
     {
@@ -96,7 +101,7 @@ fn detect_best_sandbox() -> Arc<dyn Sandbox> {
             }
         }
 
-        // Try Firejail second (user-space tool)
+        // Try Firejail second (user-space tool) - no custom args in auto mode
         if let Ok(sandbox) = super::firejail::FirejailSandbox::probe() {
             tracing::info!("Firejail sandbox enabled");
             return Arc::new(sandbox);
