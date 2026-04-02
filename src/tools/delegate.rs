@@ -1043,12 +1043,24 @@ impl DelegateTool {
         };
 
         // Build structured operational context using SystemPromptBuilder sections.
+        // Respect global skills prompt injection mode configuration from environment.
+        // This allows delegate agents to follow the same prompt injection mode as the main agent.
+        let skills_prompt_mode = std::env::var("ZEROCLAW_SKILLS_PROMPT_MODE")
+            .ok()
+            .and_then(|mode| match mode.to_ascii_lowercase().as_str() {
+                "full" => Some(crate::config::SkillsPromptInjectionMode::Full),
+                "compact" => Some(crate::config::SkillsPromptInjectionMode::Compact),
+                "minimal" => Some(crate::config::SkillsPromptInjectionMode::Minimal),
+                "none" => Some(crate::config::SkillsPromptInjectionMode::None),
+                _ => None,
+            })
+            .unwrap_or(crate::config::SkillsPromptInjectionMode::Full);
         let ctx = PromptContext {
             workspace_dir,
             model_name: &agent_config.model,
             tools: sub_tools,
             skills: &skills,
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode,
             identity_config: None,
             dispatcher_instructions: "",
             tool_descriptions: None,
