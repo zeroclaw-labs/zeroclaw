@@ -815,6 +815,13 @@ fn validate_heartbeat_channel_config(config: &Config, channel: &str) -> Result<(
                 );
             }
         }
+        "matrix" => {
+            if config.channels_config.matrix.is_none() {
+                anyhow::bail!(
+                    "heartbeat.target is set to matrix but channels_config.matrix is not configured"
+                );
+            }
+        }
         other => anyhow::bail!("unsupported heartbeat.target channel: {other}"),
     }
 
@@ -1059,6 +1066,33 @@ mod tests {
 
         let target = resolve_heartbeat_delivery(&config).unwrap();
         assert_eq!(target, Some(("telegram".to_string(), "123456".to_string())));
+    }
+
+    #[test]
+    fn resolve_delivery_accepts_matrix_configuration() {
+        let mut config = Config::default();
+        config.heartbeat.target = Some("matrix".into());
+        config.heartbeat.to = Some("!room:matrix.example.com".into());
+        config.channels_config.matrix = Some(crate::config::schema::MatrixConfig {
+            homeserver: "https://matrix.example.com".into(),
+            access_token: "token".into(),
+            user_id: None,
+            device_id: None,
+            room_id: "!room:matrix.example.com".into(),
+            allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 500,
+            multi_message_delay_ms: 500,
+            recovery_key: None,
+        });
+
+        let target = resolve_heartbeat_delivery(&config).unwrap();
+        assert_eq!(
+            target,
+            Some(("matrix".to_string(), "!room:matrix.example.com".to_string()))
+        );
     }
 
     #[test]
