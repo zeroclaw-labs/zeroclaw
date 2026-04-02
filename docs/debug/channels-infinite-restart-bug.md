@@ -5,14 +5,208 @@
 **涉及 commits**: `09164e40`, `7029b7a8`
 **状态**: 已修复（待验证）
 
+> 存在两个独立的无限重启 Bug，由不同操作触发，但最终都表现为 `Daemon component 'channels' exited unexpectedly` 持续滚动。
+
 ---
 
-## 一、问题表现
+## 一、Bug 概述
 
-zeroclaw daemon 启动后，`channels` 组件出现概率性无限重启，间隔约 2 秒（即 `channel_initial_backoff_secs` 默认值），日志持续滚动：
+| | Bug 1 | Bug 2 |
+|---|---|---|
+| **触发条件** | PUT /api/config 更新渠道配置（渠道仍存在） | PUT /api/config **删除**所有渠道配置 |
+| **日志特征** | `channels closure invoked: token is_cancelled=true` | `No channels configured. Run zeroclaw onboard` |
+| **循环间隔** | `channel_initial_backoff_secs`（约 2 秒） | 同上 |
+| **根因** | 旧 supervisor closure 持有已取消的 token | 新 supervisor 无限重试立即返回 `Ok(())` 的 `start_channels` |
+| **修复方式** | `restart_channels` abort 旧 supervisor | `restart_channels` 无渠道时不 spawn supervisor |
 
+---
+
+## 二、整体架构背景
+
+```mermaid
+graph TD
+    A[daemon::run] -->|spawn| GW[gateway supervisor]
+    A -->|spawn| CH[channels supervisor<br/>JoinHandle → local handles vec]
+    A -->|Arc| DR[DaemonReloader<br/>channel_cancel: ArcSwap&lt;T&gt;<br/>channels_abort: Mutex&lt;AbortHandle&gt;]
+
+    GW --> API[PUT /api/config<br/>handle_api_config_put]
+    API -->|channels_config 有变化| RC[restart_channels]
+
+    RC -->|abort| CH
+    RC -->|cancel| CT[old CancellationToken]
+    RC -->|spawn| CH2[新 channels supervisor]
+
+    subgraph start_channels
+        SC1{有渠道?}
+        SC1 -->|No| RET["return Ok(()) 立即"]
+        SC1 -->|Yes| SEL[tokio::select!<br/>dispatch_loop / cancel.cancelled]
+    end
+
+    CH2 --> SC1
 ```
-INFO  zeroclaw::daemon: [DIAG] channels closure invoked: token is_cancelled=true
+
+---
+
+## 三、Bug 1 — 旧 supervisor 被 token 毒化后死循环
+
+### 触发场景
+PUT /api/config 更新渠道配置（如修改 feishu 的参数），但保留渠道。
+
+### 调用链
+
+```mermaid
+sequenceDiagram
+    participant RC as restart_channels
+    participant S0 as 初始 Supervisor<br/>(closure 持有 Arc→T1)
+    participant SC as start_channels
+
+    Note over S0,SC: 正常运行中，start_channels 阻塞在 select!
+
+    RC->>RC: 创建 T2，swap ArcSwap
+    RC->>T1: old_cancel.cancel() ← T1 被永久取消
+    RC->>S1: spawn 新 supervisor（持有 T2）
+    Note over RC: ❌ 旧 S0 的 JoinHandle 不在 reloader 里，无法 abort
+
+    T1-->>SC: cancel.cancelled() 触发
+    SC-->>S0: return Ok(())
+
+    loop 每 ~2 秒
+        S0->>S0: Ok(()) → "exited unexpectedly" → 重置 backoff → 休眠
+        S0->>SC: 重新调用 start_channels(config, T1.clone(), ...)
+        Note over SC: T1.is_cancelled() == true
+        SC-->>SC: tokio::select! 立即触发 cancel 分支
+        SC-->>S0: return Ok(())
+    end
+```
+
+### 证据（日志）
+```
+[DIAG] restart_channels called — old_is_cancelled_before=false   ← 一次
+[DIAG] channels closure invoked: token is_cancelled=true          ← 无限重复
+[DIAG] entering tokio::select — cancel.is_cancelled=true          ← 无限重复
+Daemon component 'channels' exited unexpectedly                   ← 无限重复
+```
+
+### 根因代码（修复前）
+
+`daemon/mod.rs` `run()` 第 160–181 行：
+```rust
+// 初始 supervisor 的 JoinHandle 只存到局部 handles Vec
+// DaemonReloader 没有引用，restart_channels 无法 abort 它
+let cancel = reloader.channel_cancel.load().clone();  // 捕获 Arc→T1
+handles.push(spawn_component_supervisor("channels", ..., move || {
+    let c = (*cancel).clone();  // 每次重试都 clone T1（已取消状态）
+    ...
+}));
+```
+
+### 修复
+在 `DaemonReloader` 增加 `channels_abort: Mutex<Option<AbortHandle>>`，`restart_channels` 调用前先 abort 旧 supervisor。
+
+---
+
+## 四、Bug 2 — 热删除渠道后新 supervisor 死循环
+
+### 触发场景
+PUT /api/config **删除**飞书渠道配置（`channels_config` 中无任何真实渠道）。
+
+### 调用链
+
+```mermaid
+sequenceDiagram
+    participant WB as workbot
+    participant API as handle_api_config_put
+    participant RC as restart_channels
+    participant S1 as 新 Supervisor
+    participant SC as start_channels
+
+    WB->>API: PUT /api/config (无渠道配置)
+    API->>API: channels_config 有变化
+    API->>RC: restart_channels(new_config，无渠道)
+
+    Note over RC: ❌ 未检查 new_config 是否有渠道，直接 spawn
+    RC->>S1: spawn_component_supervisor("channels", ...)
+
+    loop 每 ~2 秒
+        S1->>SC: start_channels(无渠道 config, T2, ...)
+        SC->>SC: channels.is_empty() == true
+        SC-->>SC: println!("No channels configured")
+        SC-->>S1: return Ok(())  ← 不是错误，是正常返回
+        S1->>S1: Ok(()) → "exited unexpectedly"<br/>backoff 重置为最小值 → 休眠 → 重试
+    end
+```
+
+### 证据（日志）
+```
+No sandbox backend available, using application-layer security
+No channels configured. Run `zeroclaw onboard` to set up channels.
+WARN zeroclaw::daemon: Daemon component 'channels' exited unexpectedly
+（以上无限重复，无 token is_cancelled 字样）
+```
+
+### 根因代码（修复前）
+
+`daemon/mod.rs` `restart_channels`：
+```rust
+// ❌ 无论 config 是否有渠道，都无条件 spawn supervisor
+let handle = spawn_component_supervisor("channels", initial, max, move || {
+    // start_channels 立即 Ok(()) → supervisor 无限重试
+    ...
+});
+```
+
+`daemon/mod.rs` `spawn_component_supervisor`：
+```rust
+// Ok(()) 被视为"意外退出"并以最小 backoff 无限重试
+// 没有"组件表示自己不该运行"的退出机制
+Ok(()) => {
+    tracing::warn!("Daemon component '{name}' exited unexpectedly");
+    backoff = initial_backoff_secs.max(1);  // 重置 backoff！
+}
+```
+
+### 修复
+`restart_channels` 中检查 `has_supervised_channels(&config)`，若无渠道则只 abort 旧 supervisor，不 spawn 新的：
+
+```rust
+if !has_supervised_channels(&config) {
+    tracing::info!("[DIAG] restart_channels: no supervised channels in new config, skipping supervisor spawn");
+    crate::health::mark_component_ok("channels");
+    return;
+}
+```
+
+---
+
+## 五、验证方法
+
+### Bug 1 验证（热更新渠道参数，保留渠道）
+
+修复后预期：
+```
+[DIAG] restart_channels called — old_is_cancelled_before=false
+channel supervisor cancelled, shutting down channels        ← 一次
+Daemon component 'channels' exited unexpectedly             ← 一次
+[DIAG] channels closure invoked: token is_cancelled=false   ← 新 supervisor 正常
+[DIAG] entering tokio::select — cancel.is_cancelled=false
+Listening for messages...
+```
+
+**不应再出现**：`channels closure invoked: token is_cancelled=true` 持续滚动
+
+### Bug 2 验证（热删除所有渠道配置）
+
+修复后预期：
+```
+[DIAG] restart_channels called — old_is_cancelled_before=false
+channel supervisor cancelled, shutting down channels        ← 一次
+[DIAG] restart_channels: no supervised channels in new config, skipping supervisor spawn
+Daemon component 'channels' exited unexpectedly             ← 一次（旧 supervisor 退出）
+（之后静默，不再出现 channels 相关日志）
+```
+
+**不应再出现**：`No channels configured` 持续滚动
+
 INFO  zeroclaw::channels: [DIAG] entering tokio::select — cancel.is_cancelled=true
 INFO  zeroclaw::channels: channel supervisor cancelled, shutting down channels
 WARN  zeroclaw::daemon: Daemon component 'channels' exited unexpectedly

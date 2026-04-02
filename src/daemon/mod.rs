@@ -91,6 +91,16 @@ impl ConfigReloader for DaemonReloader {
         let old_cancel = self.channel_cancel.swap(new_cancel.clone());
         old_cancel.cancel();
 
+        // If the new config has no supervised channels, do not spawn a new
+        // supervisor. start_channels returns Ok(()) immediately when there are
+        // no channels, which the supervisor treats as an unexpected exit and
+        // retries at minimum backoff — causing an infinite restart loop.
+        if !has_supervised_channels(&config) {
+            tracing::info!("[DIAG] restart_channels: no supervised channels in new config, skipping supervisor spawn");
+            crate::health::mark_component_ok("channels");
+            return;
+        }
+
         let cancel = self.channel_cancel.load().clone();
         let security = self.security.clone();
         let initial = self.initial_backoff;
