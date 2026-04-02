@@ -285,6 +285,8 @@ ci-all = [
 
 [profile.dev]
 incremental = true
+
+[profile.dev.package."*"]
 opt-level = 1
 
 [profile.release]
@@ -321,20 +323,8 @@ scopeguard = "1.2"
 rcgen = "0.13"
 
 [[test]]
-name = "component"
-path = "tests/test_component.rs"
-
-[[test]]
-name = "integration"
-path = "tests/test_integration.rs"
-
-[[test]]
-name = "system"
-path = "tests/test_system.rs"
-
-[[test]]
-name = "live"
-path = "tests/test_live.rs"
+name = "all"
+path = "tests/test_all.rs"
 
 [[bench]]
 name = "agent_benchmarks"

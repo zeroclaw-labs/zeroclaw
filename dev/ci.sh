@@ -96,19 +96,19 @@ case "$1" in
     ;;
 
   test-component)
-    run_in_ci "cargo test --test component --locked --verbose"
+    run_in_ci "cargo test --test all component:: --locked --verbose"
     ;;
 
   test-integration)
-    run_in_ci "cargo test --test integration --locked --verbose"
+    run_in_ci "cargo test --test all integration:: --locked --verbose"
     ;;
 
   test-system)
-    run_in_ci "cargo test --test system --locked --verbose"
+    run_in_ci "cargo test --test all system:: --locked --verbose"
     ;;
 
   test-live)
-    run_in_ci "cargo test --test live -- --ignored --verbose"
+    run_in_ci "cargo test --test all live:: -- --ignored --verbose"
     ;;
 
   test-manual)
