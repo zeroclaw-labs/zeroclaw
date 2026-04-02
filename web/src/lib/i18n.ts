@@ -60,6 +60,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': '复制消息',
     'agent.connected_status': '已连接',
     'agent.disconnected_status': '已断开',
+    'agent.clear_session': '清理会话',
+    'agent.clear_session_confirm': '确定要清理当前会话的所有消息吗？此操作不可恢复。',
+    'agent.clear_session_error': '清理会话失败，请重试。',
 
     // Tools
     'tools.title': '可用工具',
@@ -417,6 +420,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Copy message',
     'agent.connected_status': 'Connected',
     'agent.disconnected_status': 'Disconnected',
+    'agent.clear_session': 'Clear Session',
+    'agent.clear_session_confirm': 'Are you sure you want to clear all messages in the current session? This action cannot be undone.',
+    'agent.clear_session_error': 'Failed to clear session. Please try again.',
 
     // Tools
     'tools.title': 'Available Tools',
@@ -822,6 +828,9 @@ const translations: Record<Locale, Record<string, string>> = {
     'agent.copy_message': 'Mesajı kopyala',
     'agent.connected_status': 'Bağlandı',
     'agent.disconnected_status': 'Bağlantı kesildi',
+    'agent.clear_session': 'Oturumu Temizle',
+    'agent.clear_session_confirm': 'Mevcut oturumdaki tüm mesajları temizlemek istediğinizden emin misiniz? Bu işlem geri alınamaz.',
+    'agent.clear_session_error': 'Oturum temizlenemedi. Lütfen tekrar deneyin.',
 
     // Tools
     'tools.title': 'Mevcut Araçlar',

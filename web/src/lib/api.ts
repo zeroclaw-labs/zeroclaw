@@ -322,6 +322,14 @@ export function getSessionMessages(id: string): Promise<SessionMessagesResponse>
   );
 }
 
+/** Clear persisted gateway WebSocket chat transcript for the dashboard Agent Chat. */
+export function clearSessionMessages(id: string): Promise<void> {
+  return apiFetch<void>(
+    `/api/sessions/${encodeURIComponent(id)}/messages`,
+    { method: 'DELETE' },
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Channels (detailed)
 // ---------------------------------------------------------------------------

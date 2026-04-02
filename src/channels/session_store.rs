@@ -120,6 +120,17 @@ impl SessionStore {
         Ok(true)
     }
 
+    /// Clear all messages for a session while keeping the session entry. Returns `true` if the session existed.
+    pub fn clear_session_messages(&self, session_key: &str) -> std::io::Result<bool> {
+        let path = self.session_path(session_key);
+        if !path.exists() {
+            return Ok(false);
+        }
+        // Rewrite with empty messages to clear content while keeping the file
+        self.rewrite(session_key, &[])?;
+        Ok(true)
+    }
+
     /// Return the modification time of a session's JSONL file.
     pub fn session_mtime(&self, session_key: &str) -> Option<std::time::SystemTime> {
         std::fs::metadata(self.session_path(session_key))
@@ -167,6 +178,10 @@ impl SessionBackend for SessionStore {
 
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         self.delete_session(session_key)
+    }
+
+    fn clear_session_messages(&self, session_key: &str) -> std::io::Result<bool> {
+        self.clear_session_messages(session_key)
     }
 }
 

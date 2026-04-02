@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, Bot, User, AlertCircle, Copy, Check } from 'lucide-react';
+import { Send, Bot, User, AlertCircle, Copy, Check, Trash2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { WsMessage } from '@/types/api';
@@ -7,7 +7,7 @@ import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { useDraft } from '@/hooks/useDraft';
 import { t } from '@/lib/i18n';
-import { getSessionMessages } from '@/lib/api';
+import { getSessionMessages, clearSessionMessages } from '@/lib/api';
 import ToolCallCard from '@/components/ToolCallCard';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import {
@@ -326,6 +326,22 @@ export default function AgentChat() {
     }
   }, []);
 
+  const handleClearSession = useCallback(async () => {
+    if (!window.confirm(t('agent.clear_session_confirm'))) return;
+    try {
+      await clearSessionMessages(sessionIdRef.current);
+      setMessages([]);
+      pendingContentRef.current = '';
+      pendingThinkingRef.current = '';
+      capturedThinkingRef.current = '';
+      setStreamingContent('');
+      setStreamingThinking('');
+      setTyping(false);
+    } catch {
+      setError(t('agent.clear_session_error'));
+    }
+  }, []);
+
   /**
    * Fallback copy using a temporary textarea for HTTP contexts
    * where navigator.clipboard is unavailable.
@@ -487,17 +503,30 @@ export default function AgentChat() {
             <Send className="h-5 w-5" />
           </button>
         </div>
-        <div className="flex items-center justify-center mt-2 gap-2">
-          <span
-            className="status-dot"
-            style={connected
-              ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
-              : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
-            }
-          />
-          <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
-            {connected ? t('agent.connected_status') : t('agent.disconnected_status')}
-          </span>
+        <div className="flex items-center justify-between max-w-4xl mx-auto mt-2">
+          <div className="flex items-center gap-2">
+            <span
+              className="status-dot"
+              style={connected
+                ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' }
+                : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
+              }
+            />
+            <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
+              {connected ? t('agent.connected_status') : t('agent.disconnected_status')}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={handleClearSession}
+            disabled={!connected || messages.length === 0}
+            className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[10px] transition-all disabled:opacity-40 hover:opacity-80"
+            style={{ color: 'var(--color-status-error)', border: '1px solid var(--color-status-error)' }}
+            title={t('agent.clear_session')}
+          >
+            <Trash2 className="h-3 w-3" />
+            {t('agent.clear_session')}
+          </button>
         </div>
       </div>
     </div>
