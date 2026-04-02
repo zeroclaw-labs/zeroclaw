@@ -1,7 +1,7 @@
 use crate::cli_input::Input;
 use crate::config::schema::{
-    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, NextcloudTalkConfig, QQConfig,
-    SignalConfig, StreamMode, WhatsAppConfig,
+    DingTalkConfig, IrcConfig, LarkReceiveMode, LineConfig, LineReplyMode, LinqConfig,
+    NextcloudTalkConfig, QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
 };
 #[cfg(feature = "channel-nostr")]
 use crate::config::schema::{NostrConfig, default_nostr_relays};
@@ -3565,6 +3565,7 @@ enum ChannelMenuChoice {
     QqOfficial,
     Lark,
     Feishu,
+    Line,
     #[cfg(feature = "channel-nostr")]
     Nostr,
     Done,
@@ -3586,6 +3587,7 @@ const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
     ChannelMenuChoice::QqOfficial,
     ChannelMenuChoice::Lark,
     ChannelMenuChoice::Feishu,
+    ChannelMenuChoice::Line,
     #[cfg(feature = "channel-nostr")]
     ChannelMenuChoice::Nostr,
     ChannelMenuChoice::Done,
@@ -3728,6 +3730,14 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         "✅ connected"
                     } else {
                         "— Feishu Bot"
+                    }
+                ),
+                ChannelMenuChoice::Line => format!(
+                    "LINE       {}",
+                    if config.line.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— Messaging API"
                     }
                 ),
                 #[cfg(feature = "channel-nostr")]
@@ -5499,6 +5509,177 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     style("✅").green().bold(),
                     style(relays.len()).cyan()
                 );
+            }
+            ChannelMenuChoice::Line => {
+                // ── LINE ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("LINE Setup").white().bold(),
+                    style("— talk to ZeroClaw from LINE").dim()
+                );
+                print_bullet(
+                    "1. Go to https://developers.line.biz and create a Messaging API channel",
+                );
+                print_bullet("2. Copy the Channel Secret from Basic settings");
+                print_bullet("3. Issue a Channel Access Token from Messaging API settings");
+                print_bullet("4. Set your webhook URL to https://<your-domain>/line");
+                println!();
+
+                let has_existing = config.line.is_some();
+
+                let secret_prompt = if has_existing {
+                    "  Channel Secret (Enter to keep existing)"
+                } else {
+                    "  Channel Secret"
+                };
+                let secret_input: String = Input::new()
+                    .with_prompt(secret_prompt)
+                    .allow_empty(has_existing)
+                    .interact_text()?;
+                let channel_secret = if secret_input.trim().is_empty() && has_existing {
+                    config.line.as_ref().unwrap().channel_secret.clone()
+                } else {
+                    secret_input
+                };
+
+                if channel_secret.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                let token_prompt = if has_existing {
+                    "  Channel Access Token (Enter to keep existing)"
+                } else {
+                    "  Channel Access Token"
+                };
+                let token_input: String = Input::new()
+                    .with_prompt(token_prompt)
+                    .allow_empty(has_existing)
+                    .interact_text()?;
+                let channel_access_token = if token_input.trim().is_empty() && has_existing {
+                    config.line.as_ref().unwrap().channel_access_token.clone()
+                } else {
+                    token_input
+                };
+
+                if channel_access_token.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                // Test connection via GET /v2/bot/info
+                print!("  {} Testing connection... ", style("⏳").dim());
+                let token_clone = channel_access_token.clone();
+                let thread_result = std::thread::spawn(move || {
+                    let client = reqwest::blocking::Client::new();
+                    let resp = client
+                        .get("https://api.line.me/v2/bot/info")
+                        .bearer_auth(&token_clone)
+                        .send()?;
+                    let ok = resp.status().is_success();
+                    let data: serde_json::Value = resp.json().unwrap_or_default();
+                    let bot_name = data
+                        .get("displayName")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    Ok::<_, reqwest::Error>((ok, bot_name))
+                })
+                .join();
+                let bot_name_from_api = match thread_result {
+                    Ok(Ok((true, name))) => {
+                        println!(
+                            "\r  {} Connected as {name}        ",
+                            style("✅").green().bold()
+                        );
+                        Some(name)
+                    }
+                    _ => {
+                        println!(
+                            "\r  {} Connection failed — check your token and try again",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                };
+
+                print_bullet("Use your LINE user ID (Uxxxxxxxxxx) to allowlist yourself.");
+                print_bullet("Use '*' only for temporary open testing.");
+
+                let users_default = config
+                    .line
+                    .as_ref()
+                    .map(|c| c.allowed_users.join(", "))
+                    .unwrap_or_default();
+                let users_str: String = Input::new()
+                    .with_prompt("  Allowed LINE user IDs (comma-separated, '*' for all)")
+                    .default(users_default)
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users = if users_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    users_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                if allowed_users.is_empty() {
+                    println!(
+                        "  {} No users allowlisted — LINE inbound messages will be denied until you add a user ID or '*'.",
+                        style("⚠").yellow().bold()
+                    );
+                }
+
+                let mention_only_default = config
+                    .line
+                    .as_ref()
+                    .map(|c| c.mention_only)
+                    .unwrap_or(false);
+                let mention_only = dialoguer::Confirm::new()
+                    .with_prompt("  Only respond in groups when @mentioned?")
+                    .default(mention_only_default)
+                    .interact()?;
+
+                let bot_display_name = if mention_only {
+                    let default_name = config
+                        .line
+                        .as_ref()
+                        .and_then(|c| c.bot_display_name.clone())
+                        .or(bot_name_from_api)
+                        .unwrap_or_default();
+                    let name_input: String = Input::new()
+                        .with_prompt("  Bot display name (used to detect @mentions in groups)")
+                        .default(default_name)
+                        .allow_empty(true)
+                        .interact_text()?;
+                    if name_input.trim().is_empty() {
+                        None
+                    } else {
+                        Some(name_input)
+                    }
+                } else {
+                    None
+                };
+
+                config.line = Some(LineConfig {
+                    channel_secret,
+                    channel_access_token,
+                    allowed_users,
+                    reply_mode: config
+                        .line
+                        .as_ref()
+                        .map(|c| c.reply_mode)
+                        .unwrap_or(LineReplyMode::ReplyFirst),
+                    mention_only,
+                    bot_display_name,
+                });
+
+                println!("  {} LINE configured", style("✅").green().bold());
             }
             ChannelMenuChoice::Done => break,
         }

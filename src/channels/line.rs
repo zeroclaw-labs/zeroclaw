@@ -377,16 +377,25 @@ impl LineChannel {
         matches!(source.source_type.as_str(), "group" | "room")
     }
 
-    /// If `text` contains `@<bot_name>`, strips the tag (and surrounding
-    /// whitespace) and returns the cleaned text.  Returns `None` if not found.
+    /// If `text` contains `@<bot_name>` followed by whitespace or end-of-string,
+    /// strips the tag (and surrounding whitespace) and returns the cleaned text.
+    /// Returns `None` if not found.
     fn strip_mention(text: &str, bot_name: &str) -> Option<String> {
         let tag = format!("@{bot_name}");
-        if text.contains(&tag) {
-            let cleaned = text.replace(&tag, "");
-            Some(cleaned.trim().to_string())
-        } else {
-            None
+        if let Some(pos) = text.find(&tag) {
+            let end = pos + tag.len();
+            // Require whitespace or end-of-string after the tag to avoid
+            // matching mid-word (e.g. @BotNet when bot name is @Bot).
+            let is_boundary = text[end..]
+                .chars()
+                .next()
+                .map_or(true, |c| c.is_whitespace());
+            if is_boundary {
+                let cleaned = format!("{}{}", &text[..pos], &text[end..]);
+                return Some(cleaned.trim().to_string());
+            }
         }
+        None
     }
 
     // ── Parse webhook into channel messages ───────────────────────────────────
@@ -577,8 +586,10 @@ impl LineChannel {
     async fn send_via_reply(&self, reply_token: &str, text: &str) -> Result<()> {
         let chunks = Self::split_message(text);
         // Reply API accepts up to 5 messages per call — send all at once.
+        // LINE Reply API accepts at most 5 messages per call.
         let messages: Vec<LineTextMsg> = chunks
             .into_iter()
+            .take(5)
             .map(|t| LineTextMsg {
                 msg_type: "text",
                 text: t,
@@ -937,6 +948,13 @@ mod tests {
     fn strip_mention_not_found_returns_none() {
         let result = LineChannel::strip_mention("just a normal message", "ZeroClaw");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn strip_mention_mid_word_returns_none() {
+        // @ZeroClawBot must not match when bot name is ZeroClaw
+        let result = LineChannel::strip_mention("@ZeroClawBot ช่วยหน่อย", "ZeroClaw");
+        assert!(result.is_none(), "mid-word match must be rejected");
     }
 
     #[test]

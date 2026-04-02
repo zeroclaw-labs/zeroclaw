@@ -383,6 +383,8 @@ channel_secret = "your-channel-secret"
 channel_access_token = "your-channel-access-token"
 allowed_users = ["Uxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"]  # LINE user IDs, or ["*"] for all
 reply_mode = "reply_first"  # reply_first (default) | push_only | reply_only
+mention_only = false         # true = respond in groups only when @mentioned
+bot_display_name = "ZeroClaw"  # required when mention_only = true
 ```
 
 ### Tunnel configuration
