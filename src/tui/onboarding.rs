@@ -15,6 +15,11 @@ use ratatui::{
 use std::io;
 
 use crate::config::Config;
+use crate::config::schema::{
+    DiscordConfig, FeishuConfig, IMessageConfig, IrcConfig, LarkConfig, LarkReceiveMode,
+    MatrixConfig, MattermostConfig, NextcloudTalkConfig, SignalConfig, SlackConfig, StreamMode,
+    TelegramConfig, WhatsAppChatPolicy, WhatsAppConfig, WhatsAppWebMode,
+};
 
 use super::theme;
 use super::widgets::{
@@ -42,7 +47,6 @@ enum Screen {
     QuickStartSummary,
     ProviderTier,
     ProviderSelect,
-    AuthMethod,
     ApiKeyInput,
     ProviderNotes,
     ModelConfigured,
@@ -190,8 +194,6 @@ const TIER_PROVIDERS: &[&[(&str, &str, &str)]] = &[
     )],
 ];
 
-const AUTH_METHODS: &[&str] = &["API key", "OAuth", "Browser login"];
-
 const CHANNELS: &[(&str, &str, bool)] = &[
     ("Telegram", "Bot API", false),
     ("WhatsApp", "QR link", true),
@@ -289,9 +291,6 @@ struct App {
     provider_idx: usize,
     provider_scroll: usize,
 
-    // Auth method
-    auth_method_idx: usize,
-
     // API key
     api_key_input: String,
 
@@ -342,7 +341,6 @@ impl App {
             provider_tier_idx: 0,
             provider_idx: 0,
             provider_scroll: 0,
-            auth_method_idx: 0,
             api_key_input: String::new(),
             model_idx: 0,
             channel_idx: 0,
@@ -596,21 +594,48 @@ pub async fn run_tui_onboarding() -> Result<()> {
         #[allow(clippy::large_futures)]
         match save_tui_config(&app).await {
             Ok(()) => {
+                let skill = SKILLS
+                    .get(app.skills_idx)
+                    .map(|(name, _)| *name)
+                    .unwrap_or("Skip for now");
+                let hooks_label = if app.hooks_idx == 0 {
+                    "enabled"
+                } else {
+                    "disabled"
+                };
+
                 println!();
                 println!("  \u{1f980} ZeroClaw {VERSION} configured successfully!");
                 println!(
-                    "     Provider: {} ({})",
+                    "     Provider:   {} ({})",
                     app.selected_provider(),
                     app.selected_provider_id()
                 );
-                println!("     Model: {}", app.selected_model());
-                println!("     Channel: {}", app.selected_channel());
+                println!("     Model:      {}", app.selected_model());
+                println!("     Channel:    {}", app.selected_channel());
                 println!("     Web search: {}", app.selected_search_provider());
-                println!("     Dashboard: {}", app.gateway_base_url());
+                println!("     Skills:     {skill}");
+                println!("     Hooks:      {hooks_label}");
+                println!("     Gateway:    {}:{}", app.gateway_host, app.gateway_port);
+                println!(
+                    "     Pairing:    {}",
+                    if app.pairing_required {
+                        "required"
+                    } else {
+                        "disabled"
+                    }
+                );
+                println!("     Dashboard:  {}", app.gateway_base_url());
                 if app.pairing_required && app.pairing_code != "------" {
-                    println!("     Pairing code: {}", app.pairing_code);
+                    println!("     Pair code:  {}", app.pairing_code);
                 }
                 println!();
+                let channel = app.selected_channel();
+                if channel != "Skip for now" {
+                    println!("  Next: edit config.toml to add your {channel} credentials.");
+                    println!("        zeroclaw config edit");
+                    println!();
+                }
                 println!("  Run `zeroclaw daemon` to start your agent.");
                 println!();
             }
@@ -629,11 +654,27 @@ pub async fn run_tui_onboarding() -> Result<()> {
 // ── Config persistence ──────────────────────────────────────────────
 
 /// Save the TUI selections to the real config.toml.
+///
+/// This persists every field the wizard collects so the config is complete
+/// across CLI, dashboard, macOS app, and Docker deployments.
 #[allow(clippy::large_futures)]
 async fn save_tui_config(app: &App) -> Result<()> {
     let mut config = Config::load_or_init().await?;
+    apply_tui_selections_to_config(app, &mut config);
+    config.save().await?;
 
-    // Provider
+    // Also push config to Docker container if running
+    push_config_to_docker(app).await;
+
+    Ok(())
+}
+
+/// Apply all TUI wizard selections to a Config struct (pure logic, no I/O).
+///
+/// Separated from `save_tui_config` so it can be tested without touching
+/// the filesystem or network.
+fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
+    // ── Provider ────────────────────────────────────────────────────
     let provider_id = app.selected_provider_id();
     config.default_provider = Some(provider_id.to_string());
 
@@ -647,7 +688,7 @@ async fn save_tui_config(app: &App) -> Result<()> {
         config.api_key = Some(app.api_key_input.clone());
     }
 
-    // Model
+    // ── Model ───────────────────────────────────────────────────────
     let model = app.selected_model();
     if model == "Auto (recommended)" {
         config.default_model = None; // Let provider pick default
@@ -655,7 +696,197 @@ async fn save_tui_config(app: &App) -> Result<()> {
         config.default_model = Some(model.to_string());
     }
 
-    // Web search provider
+    // ── Channel ─────────────────────────────────────────────────────
+    // Create a stub config for the selected channel with placeholder
+    // values so the section appears in config.toml. The user fills in
+    // real tokens via `zeroclaw config edit` or the dashboard.
+    let channel = app.selected_channel();
+    match channel {
+        "Telegram" => {
+            if config.channels_config.telegram.is_none() {
+                config.channels_config.telegram = Some(TelegramConfig {
+                    bot_token: String::from("YOUR_TELEGRAM_BOT_TOKEN"),
+                    allowed_users: vec![],
+                    stream_mode: StreamMode::default(),
+                    draft_update_interval_ms: 1000,
+                    interrupt_on_new_message: false,
+                    mention_only: false,
+                    ack_reactions: None,
+                    proxy_url: None,
+                });
+            }
+        }
+        "Discord" => {
+            if config.channels_config.discord.is_none() {
+                config.channels_config.discord = Some(DiscordConfig {
+                    bot_token: String::from("YOUR_DISCORD_BOT_TOKEN"),
+                    guild_id: None,
+                    allowed_users: vec![],
+                    listen_to_bots: false,
+                    interrupt_on_new_message: false,
+                    mention_only: false,
+                    proxy_url: None,
+                    stream_mode: StreamMode::default(),
+                    draft_update_interval_ms: 1000,
+                    multi_message_delay_ms: 800,
+                    stall_timeout_secs: 0,
+                });
+            }
+        }
+        "Slack" => {
+            if config.channels_config.slack.is_none() {
+                config.channels_config.slack = Some(SlackConfig {
+                    bot_token: String::from("xoxb-YOUR_SLACK_BOT_TOKEN"),
+                    app_token: Some(String::from("xapp-YOUR_SLACK_APP_TOKEN")),
+                    channel_id: None,
+                    channel_ids: vec![],
+                    allowed_users: vec![],
+                    interrupt_on_new_message: false,
+                    thread_replies: None,
+                    mention_only: false,
+                    use_markdown_blocks: false,
+                    proxy_url: None,
+                    stream_drafts: false,
+                    draft_update_interval_ms: 1200,
+                    cancel_reaction: None,
+                });
+            }
+        }
+        "WhatsApp" => {
+            if config.channels_config.whatsapp.is_none() {
+                config.channels_config.whatsapp = Some(WhatsAppConfig {
+                    access_token: Some(String::from("YOUR_WHATSAPP_ACCESS_TOKEN")),
+                    phone_number_id: Some(String::from("YOUR_PHONE_NUMBER_ID")),
+                    verify_token: Some(String::from("YOUR_VERIFY_TOKEN")),
+                    app_secret: None,
+                    session_path: None,
+                    pair_phone: None,
+                    pair_code: None,
+                    allowed_numbers: vec![],
+                    mention_only: false,
+                    mode: WhatsAppWebMode::default(),
+                    dm_policy: WhatsAppChatPolicy::default(),
+                    group_policy: WhatsAppChatPolicy::default(),
+                    self_chat_mode: false,
+                    dm_mention_patterns: vec![],
+                    group_mention_patterns: vec![],
+                    proxy_url: None,
+                });
+            }
+        }
+        "Signal" => {
+            if config.channels_config.signal.is_none() {
+                config.channels_config.signal = Some(SignalConfig {
+                    http_url: String::from("http://127.0.0.1:8080"),
+                    account: String::from("YOUR_SIGNAL_PHONE_NUMBER"),
+                    group_id: None,
+                    allowed_from: vec![],
+                    ignore_attachments: false,
+                    ignore_stories: true,
+                    proxy_url: None,
+                });
+            }
+        }
+        "IRC" => {
+            if config.channels_config.irc.is_none() {
+                config.channels_config.irc = Some(IrcConfig {
+                    server: String::from("irc.libera.chat"),
+                    port: 6697,
+                    nickname: String::from("zeroclaw-bot"),
+                    username: None,
+                    channels: vec![String::from("#your-channel")],
+                    allowed_users: vec![],
+                    server_password: None,
+                    nickserv_password: None,
+                    sasl_password: None,
+                    verify_tls: None,
+                });
+            }
+        }
+        "iMessage" => {
+            if config.channels_config.imessage.is_none() {
+                config.channels_config.imessage = Some(IMessageConfig {
+                    allowed_contacts: vec![],
+                });
+            }
+        }
+        "Matrix" => {
+            if config.channels_config.matrix.is_none() {
+                config.channels_config.matrix = Some(MatrixConfig {
+                    homeserver: String::from("https://matrix.org"),
+                    access_token: String::from("YOUR_MATRIX_ACCESS_TOKEN"),
+                    user_id: None,
+                    device_id: None,
+                    room_id: String::from("!YOUR_ROOM_ID:matrix.org"),
+                    allowed_users: vec![],
+                    allowed_rooms: vec![],
+                    interrupt_on_new_message: false,
+                    stream_mode: StreamMode::default(),
+                    draft_update_interval_ms: 500,
+                    multi_message_delay_ms: 800,
+                    recovery_key: None,
+                });
+            }
+        }
+        "Mattermost" => {
+            if config.channels_config.mattermost.is_none() {
+                config.channels_config.mattermost = Some(MattermostConfig {
+                    url: String::from("https://mattermost.example.com"),
+                    bot_token: String::from("YOUR_MATTERMOST_BOT_TOKEN"),
+                    channel_id: None,
+                    allowed_users: vec![],
+                    thread_replies: None,
+                    mention_only: None,
+                    interrupt_on_new_message: false,
+                    proxy_url: None,
+                });
+            }
+        }
+        "Nextcloud Talk" => {
+            if config.channels_config.nextcloud_talk.is_none() {
+                config.channels_config.nextcloud_talk = Some(NextcloudTalkConfig {
+                    base_url: String::from("https://cloud.example.com"),
+                    app_token: String::from("YOUR_NEXTCLOUD_APP_TOKEN"),
+                    webhook_secret: None,
+                    allowed_users: vec![],
+                    proxy_url: None,
+                    bot_name: None,
+                });
+            }
+        }
+        "Feishu/Lark" => {
+            if config.channels_config.feishu.is_none() {
+                config.channels_config.feishu = Some(FeishuConfig {
+                    app_id: String::from("YOUR_FEISHU_APP_ID"),
+                    app_secret: String::from("YOUR_FEISHU_APP_SECRET"),
+                    encrypt_key: None,
+                    verification_token: None,
+                    allowed_users: vec![],
+                    receive_mode: LarkReceiveMode::default(),
+                    port: None,
+                    proxy_url: None,
+                });
+            }
+            if config.channels_config.lark.is_none() {
+                config.channels_config.lark = Some(LarkConfig {
+                    app_id: String::from("YOUR_LARK_APP_ID"),
+                    app_secret: String::from("YOUR_LARK_APP_SECRET"),
+                    encrypt_key: None,
+                    verification_token: None,
+                    allowed_users: vec![],
+                    mention_only: false,
+                    use_feishu: false,
+                    receive_mode: LarkReceiveMode::default(),
+                    port: None,
+                    proxy_url: None,
+                });
+            }
+        }
+        // Channels without config structs yet — skip silently
+        _ => {}
+    }
+
+    // ── Web search ──────────────────────────────────────────────────
     let search = app.selected_search_provider();
     if search != "Skip for now" && search != "None" {
         let search_id = match search {
@@ -667,20 +898,43 @@ async fn save_tui_config(app: &App) -> Result<()> {
         };
         config.web_search.enabled = true;
         config.web_search.provider = search_id.to_string();
-        if !app.search_api_key_input.is_empty() && search_id == "brave" {
-            config.web_search.brave_api_key = Some(app.search_api_key_input.clone());
+
+        if !app.search_api_key_input.is_empty() {
+            match search_id {
+                "brave" => {
+                    config.web_search.brave_api_key = Some(app.search_api_key_input.clone());
+                }
+                "searxng" => {
+                    // For SearXNG the "API key" input is actually the instance URL
+                    config.web_search.searxng_instance_url = Some(app.search_api_key_input.clone());
+                }
+                _ => {}
+            }
         }
     }
 
-    // Gateway port
+    // ── Skills ──────────────────────────────────────────────────────
+    let skill = SKILLS
+        .get(app.skills_idx)
+        .map(|(name, _)| *name)
+        .unwrap_or("Skip for now");
+    if skill != "Skip for now" {
+        config.skills.open_skills_enabled = true;
+    }
+
+    // ── Hooks ───────────────────────────────────────────────────────
+    // hooks_idx: 0 = "Enable hooks", 1 = "Skip for now"
+    config.hooks.enabled = app.hooks_idx == 0;
+    if app.hooks_idx == 0 {
+        config.hooks.builtin.command_logger = true;
+    }
+
+    // ── Gateway ─────────────────────────────────────────────────────
     config.gateway.port = app.gateway_port;
+    config.gateway.host = app.gateway_host.clone();
 
-    config.save().await?;
-
-    // Also push config to Docker container if running
-    push_config_to_docker(app).await;
-
-    Ok(())
+    // ── Pairing / security ──────────────────────────────────────────
+    config.gateway.require_pairing = app.pairing_required;
 }
 
 /// If a ZeroClaw Docker container is running, reconfigure it via `docker exec`.
@@ -882,18 +1136,8 @@ fn handle_input(app: &mut App, key: KeyCode) {
                 nav_down(&mut app.provider_idx, max);
                 scroll_into_view(&mut app.provider_scroll, app.provider_idx, 16);
             }
-            KeyCode::Enter => app.screen = Screen::AuthMethod,
-            KeyCode::Esc => app.screen = Screen::ProviderTier,
-            _ => {}
-        },
-
-        Screen::AuthMethod => match key {
-            KeyCode::Up | KeyCode::Char('k') => nav_up(&mut app.auth_method_idx),
-            KeyCode::Down | KeyCode::Char('j') => {
-                nav_down(&mut app.auth_method_idx, AUTH_METHODS.len() - 1);
-            }
             KeyCode::Enter => app.screen = Screen::ApiKeyInput,
-            KeyCode::Esc => app.screen = Screen::ProviderSelect,
+            KeyCode::Esc => app.screen = Screen::ProviderTier,
             _ => {}
         },
 
@@ -907,7 +1151,7 @@ fn handle_input(app: &mut App, key: KeyCode) {
             }
             KeyCode::Esc => {
                 app.api_key_input.clear();
-                app.screen = Screen::AuthMethod;
+                app.screen = Screen::ProviderSelect;
             }
             _ => {}
         },
@@ -1199,7 +1443,6 @@ fn render(frame: &mut Frame, app: &App) {
         Screen::QuickStartSummary => render_quickstart_summary(frame, content, app),
         Screen::ProviderTier => render_provider_tier(frame, content, app),
         Screen::ProviderSelect => render_provider_select(frame, content, app),
-        Screen::AuthMethod => render_auth_method(frame, content, app),
         Screen::ApiKeyInput => render_api_key(frame, content, app),
         Screen::ProviderNotes => render_provider_notes(frame, content, app),
         Screen::ModelConfigured => render_model_configured(frame, content, app),
@@ -1710,52 +1953,10 @@ fn render_provider_select(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-// ── Screen: Auth method ─────────────────────────────────────────────
-
-fn render_auth_method(frame: &mut Frame, area: Rect, app: &App) {
-    let layout = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(2),
-        Constraint::Min(6),
-    ])
-    .split(area);
-
-    frame.render_widget(setup_title(), layout[0]);
-    frame.render_widget(
-        ConfirmedLine {
-            label: "Provider",
-            value: app.selected_provider(),
-        },
-        layout[1],
-    );
-
-    let items: Vec<SelectableItem> = AUTH_METHODS
-        .iter()
-        .enumerate()
-        .map(|(i, method)| SelectableItem {
-            label: format!("{} {method}", app.selected_provider()),
-            hint: String::new(),
-            is_active: i == app.auth_method_idx,
-            installed: false,
-        })
-        .collect();
-
-    frame.render_widget(
-        SelectableList {
-            title: &format!("{} auth method", app.selected_provider()),
-            items: &items,
-            selected: app.auth_method_idx,
-            scroll_offset: 0,
-        },
-        layout[2],
-    );
-}
-
 // ── Screen: API key input ───────────────────────────────────────────
 
 fn render_api_key(frame: &mut Frame, area: Rect, app: &App) {
     let layout = Layout::vertical([
-        Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Length(2),
         Constraint::Length(3),
@@ -1772,19 +1973,12 @@ fn render_api_key(frame: &mut Frame, area: Rect, app: &App) {
         layout[1],
     );
     frame.render_widget(
-        ConfirmedLine {
-            label: "Auth method",
-            value: AUTH_METHODS[app.auth_method_idx],
-        },
-        layout[2],
-    );
-    frame.render_widget(
         InputPrompt {
             label: &format!("Enter {} API key", app.selected_provider()),
             input: &app.api_key_input,
             masked: true,
         },
-        layout[3],
+        layout[2],
     );
 }
 
@@ -2856,4 +3050,660 @@ fn render_complete(frame: &mut Frame, area: Rect, app: &App) {
         theme::dim_style(),
     ));
     frame.render_widget(Paragraph::new(cont), layout[2]);
+}
+
+// ── Tests ──────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an App with sensible defaults for testing.
+    fn test_app() -> App {
+        App {
+            screen: Screen::Complete,
+            should_quit: false,
+            security_accepted: true,
+            setup_mode_idx: 0,
+            config_handling_idx: 0,
+            provider_tier_idx: 0,
+            provider_idx: 0,
+            provider_scroll: 0,
+            api_key_input: String::new(),
+            model_idx: 0,
+            channel_idx: 0,
+            channel_scroll: 0,
+            search_provider_idx: 0,
+            search_api_key_input: String::new(),
+            skills_idx: 0,
+            skills_scroll: 0,
+            hooks_idx: 0,
+            gateway_port: 42617,
+            gateway_host: "127.0.0.1".to_string(),
+            pairing_code: "123456".to_string(),
+            pairing_required: true,
+        }
+    }
+
+    // ── Provider persistence ────────────────────────────────────────
+
+    #[test]
+    fn save_provider_openrouter() {
+        let app = test_app(); // tier 0, provider 0 = OpenRouter
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+    }
+
+    #[test]
+    fn save_provider_anthropic() {
+        let mut app = test_app();
+        app.provider_tier_idx = 0;
+        app.provider_idx = 2; // Anthropic
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn save_provider_ollama_local() {
+        let mut app = test_app();
+        app.provider_tier_idx = 4; // Local / private
+        app.provider_idx = 0; // Ollama
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.default_provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn save_provider_custom_clears_api_url() {
+        let mut app = test_app();
+        app.provider_tier_idx = 0;
+        app.provider_idx = 0; // OpenRouter (non-custom)
+        let mut config = Config::default();
+        config.api_url = Some("http://old-custom-url.com".to_string());
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(
+            config.api_url.is_none(),
+            "api_url should be cleared for non-custom providers"
+        );
+    }
+
+    // ── API key persistence ─────────────────────────────────────────
+
+    #[test]
+    fn save_api_key_when_provided() {
+        let mut app = test_app();
+        app.api_key_input = "sk-test-key-12345".to_string();
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.api_key.as_deref(), Some("sk-test-key-12345"));
+    }
+
+    #[test]
+    fn save_no_api_key_when_empty() {
+        let app = test_app(); // api_key_input is empty
+        let mut config = Config::default();
+        config.api_key = Some("existing-key".to_string());
+        apply_tui_selections_to_config(&app, &mut config);
+        // Should preserve existing key, not overwrite with empty
+        assert_eq!(config.api_key.as_deref(), Some("existing-key"));
+    }
+
+    // ── Model persistence ───────────────────────────────────────────
+
+    #[test]
+    fn save_model_auto_clears_default() {
+        let app = test_app(); // model_idx 0 = "Auto (recommended)"
+        let mut config = Config::default();
+        config.default_model = Some("old-model".to_string());
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(
+            config.default_model.is_none(),
+            "Auto should clear default_model"
+        );
+    }
+
+    #[test]
+    fn save_model_specific() {
+        let mut app = test_app();
+        app.model_idx = 1; // "claude-sonnet-4-20250514"
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("claude-sonnet-4-20250514")
+        );
+    }
+
+    #[test]
+    fn save_model_gpt4o() {
+        let mut app = test_app();
+        app.model_idx = 3; // "gpt-4o"
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
+    }
+
+    // ── Channel persistence ─────────────────────────────────────────
+
+    #[test]
+    fn save_channel_telegram() {
+        let mut app = test_app();
+        app.channel_idx = 0; // Telegram
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        let tg = config
+            .channels_config
+            .telegram
+            .as_ref()
+            .expect("telegram should be Some");
+        assert_eq!(tg.bot_token, "YOUR_TELEGRAM_BOT_TOKEN");
+    }
+
+    #[test]
+    fn save_channel_discord() {
+        let mut app = test_app();
+        app.channel_idx = 2; // Discord
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        let dc = config
+            .channels_config
+            .discord
+            .as_ref()
+            .expect("discord should be Some");
+        assert_eq!(dc.bot_token, "YOUR_DISCORD_BOT_TOKEN");
+        assert!(dc.guild_id.is_none());
+    }
+
+    #[test]
+    fn save_channel_slack() {
+        let mut app = test_app();
+        app.channel_idx = 5; // Slack
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        let sl = config
+            .channels_config
+            .slack
+            .as_ref()
+            .expect("slack should be Some");
+        assert!(sl.bot_token.starts_with("xoxb-"));
+        assert!(sl.app_token.as_ref().unwrap().starts_with("xapp-"));
+    }
+
+    #[test]
+    fn save_channel_whatsapp() {
+        let mut app = test_app();
+        app.channel_idx = 1; // WhatsApp
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        let wa = config
+            .channels_config
+            .whatsapp
+            .as_ref()
+            .expect("whatsapp should be Some");
+        assert!(wa.access_token.is_some());
+        assert!(wa.phone_number_id.is_some());
+        assert!(wa.verify_token.is_some());
+    }
+
+    #[test]
+    fn save_channel_signal() {
+        let mut app = test_app();
+        app.channel_idx = 6; // Signal
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        let sig = config
+            .channels_config
+            .signal
+            .as_ref()
+            .expect("signal should be Some");
+        assert_eq!(sig.http_url, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn save_channel_irc() {
+        let mut app = test_app();
+        app.channel_idx = 3; // IRC
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        let irc = config
+            .channels_config
+            .irc
+            .as_ref()
+            .expect("irc should be Some");
+        assert_eq!(irc.server, "irc.libera.chat");
+        assert_eq!(irc.port, 6697);
+        assert_eq!(irc.nickname, "zeroclaw-bot");
+    }
+
+    #[test]
+    fn save_channel_imessage() {
+        let mut app = test_app();
+        app.channel_idx = 7; // iMessage
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(config.channels_config.imessage.is_some());
+    }
+
+    #[test]
+    fn save_channel_matrix() {
+        let mut app = test_app();
+        // Find Matrix index in CHANNELS
+        let matrix_idx = CHANNELS.iter().position(|c| c.0 == "Matrix").unwrap();
+        app.channel_idx = matrix_idx;
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        let mx = config
+            .channels_config
+            .matrix
+            .as_ref()
+            .expect("matrix should be Some");
+        assert_eq!(mx.homeserver, "https://matrix.org");
+    }
+
+    #[test]
+    fn save_channel_mattermost() {
+        let mut app = test_app();
+        app.channel_idx = 9; // Mattermost
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        let mm = config
+            .channels_config
+            .mattermost
+            .as_ref()
+            .expect("mattermost should be Some");
+        assert_eq!(mm.url, "https://mattermost.example.com");
+    }
+
+    #[test]
+    fn save_channel_nextcloud_talk() {
+        let mut app = test_app();
+        let idx = CHANNELS
+            .iter()
+            .position(|c| c.0 == "Nextcloud Talk")
+            .unwrap();
+        app.channel_idx = idx;
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        let nc = config
+            .channels_config
+            .nextcloud_talk
+            .as_ref()
+            .expect("nextcloud should be Some");
+        assert_eq!(nc.base_url, "https://cloud.example.com");
+    }
+
+    #[test]
+    fn save_channel_feishu_lark() {
+        let mut app = test_app();
+        let idx = CHANNELS.iter().position(|c| c.0 == "Feishu/Lark").unwrap();
+        app.channel_idx = idx;
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(
+            config.channels_config.feishu.is_some(),
+            "feishu should be set"
+        );
+        assert!(config.channels_config.lark.is_some(), "lark should be set");
+    }
+
+    #[test]
+    fn save_channel_skip_does_not_create_stubs() {
+        let mut app = test_app();
+        let idx = CHANNELS.iter().position(|c| c.0 == "Skip for now").unwrap();
+        app.channel_idx = idx;
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(config.channels_config.telegram.is_none());
+        assert!(config.channels_config.discord.is_none());
+        assert!(config.channels_config.slack.is_none());
+    }
+
+    #[test]
+    fn save_channel_does_not_overwrite_existing() {
+        let mut app = test_app();
+        app.channel_idx = 0; // Telegram
+        let mut config = Config::default();
+        // Pre-set a Telegram config with a real token
+        config.channels_config.telegram = Some(TelegramConfig {
+            bot_token: "REAL_TOKEN_123".to_string(),
+            allowed_users: vec!["alice".to_string()],
+            stream_mode: StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
+        });
+        apply_tui_selections_to_config(&app, &mut config);
+        let tg = config.channels_config.telegram.as_ref().unwrap();
+        assert_eq!(
+            tg.bot_token, "REAL_TOKEN_123",
+            "should NOT overwrite existing config"
+        );
+        assert_eq!(tg.allowed_users, vec!["alice"]);
+    }
+
+    // ── Web search persistence ──────────────────────────────────────
+
+    #[test]
+    fn save_web_search_brave() {
+        let mut app = test_app();
+        app.search_provider_idx = 0; // Brave Search
+        app.search_api_key_input = "brv-key-abc".to_string();
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(config.web_search.enabled);
+        assert_eq!(config.web_search.provider, "brave");
+        assert_eq!(
+            config.web_search.brave_api_key.as_deref(),
+            Some("brv-key-abc")
+        );
+    }
+
+    #[test]
+    fn save_web_search_searxng() {
+        let mut app = test_app();
+        app.search_provider_idx = 1; // SearxNG
+        app.search_api_key_input = "https://searx.example.com".to_string();
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(config.web_search.enabled);
+        assert_eq!(config.web_search.provider, "searxng");
+        assert_eq!(
+            config.web_search.searxng_instance_url.as_deref(),
+            Some("https://searx.example.com")
+        );
+    }
+
+    #[test]
+    fn save_web_search_duckduckgo() {
+        let mut app = test_app();
+        app.search_provider_idx = 4; // DuckDuckGo
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(config.web_search.enabled);
+        assert_eq!(config.web_search.provider, "duckduckgo");
+    }
+
+    #[test]
+    fn save_web_search_tavily_maps_to_tavily() {
+        let mut app = test_app();
+        app.search_provider_idx = 2; // Tavily
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.web_search.provider, "tavily");
+    }
+
+    #[test]
+    fn save_web_search_skip() {
+        let mut app = test_app();
+        app.search_provider_idx = 5; // Skip for now
+        let mut config = Config::default();
+        let old_enabled = config.web_search.enabled;
+        apply_tui_selections_to_config(&app, &mut config);
+        // Should not change web_search settings
+        assert_eq!(config.web_search.enabled, old_enabled);
+    }
+
+    // ── Skills persistence ──────────────────────────────────────────
+
+    #[test]
+    fn save_skills_enabled() {
+        let mut app = test_app();
+        app.skills_idx = 1; // First real skill (1password)
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(config.skills.open_skills_enabled);
+    }
+
+    #[test]
+    fn save_skills_skip() {
+        let app = test_app(); // skills_idx 0 = "Skip for now"
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(!config.skills.open_skills_enabled);
+    }
+
+    // ── Hooks persistence ───────────────────────────────────────────
+
+    #[test]
+    fn save_hooks_enabled() {
+        let mut app = test_app();
+        app.hooks_idx = 0; // Enable hooks
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(config.hooks.enabled);
+        assert!(config.hooks.builtin.command_logger);
+    }
+
+    #[test]
+    fn save_hooks_disabled() {
+        let mut app = test_app();
+        app.hooks_idx = 1; // Skip for now
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(!config.hooks.enabled);
+    }
+
+    // ── Gateway persistence ─────────────────────────────────────────
+
+    #[test]
+    fn save_gateway_port_and_host() {
+        let mut app = test_app();
+        app.gateway_port = 9999;
+        app.gateway_host = "0.0.0.0".to_string();
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.gateway.port, 9999);
+        assert_eq!(config.gateway.host, "0.0.0.0");
+    }
+
+    #[test]
+    fn save_gateway_default_values() {
+        let app = test_app();
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert_eq!(config.gateway.port, 42617);
+        assert_eq!(config.gateway.host, "127.0.0.1");
+    }
+
+    // ── Pairing persistence ─────────────────────────────────────────
+
+    #[test]
+    fn save_pairing_required() {
+        let mut app = test_app();
+        app.pairing_required = true;
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(config.gateway.require_pairing);
+    }
+
+    #[test]
+    fn save_pairing_not_required() {
+        let mut app = test_app();
+        app.pairing_required = false;
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+        assert!(!config.gateway.require_pairing);
+    }
+
+    // ── End-to-end: full wizard flow ────────────────────────────────
+
+    #[test]
+    fn e2e_full_setup_anthropic_telegram_brave() {
+        let mut app = test_app();
+        // Provider: Anthropic (tier 0, idx 2)
+        app.provider_tier_idx = 0;
+        app.provider_idx = 2;
+        app.api_key_input = "sk-ant-api-key".to_string();
+        // Model: Claude Opus
+        app.model_idx = 2; // claude-opus-4-20250514
+        // Channel: Telegram
+        app.channel_idx = 0;
+        // Web search: Brave
+        app.search_provider_idx = 0;
+        app.search_api_key_input = "brave-key-123".to_string();
+        // Skills: obsidian (idx 12)
+        app.skills_idx = 12;
+        // Hooks: enabled
+        app.hooks_idx = 0;
+        // Gateway
+        app.gateway_port = 8080;
+        app.gateway_host = "192.168.1.100".to_string();
+        app.pairing_required = true;
+
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+
+        // Verify everything was persisted
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-ant-api-key"));
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("claude-opus-4-20250514")
+        );
+        assert!(config.channels_config.telegram.is_some());
+        assert!(config.web_search.enabled);
+        assert_eq!(config.web_search.provider, "brave");
+        assert_eq!(
+            config.web_search.brave_api_key.as_deref(),
+            Some("brave-key-123")
+        );
+        assert!(config.skills.open_skills_enabled);
+        assert!(config.hooks.enabled);
+        assert!(config.hooks.builtin.command_logger);
+        assert_eq!(config.gateway.port, 8080);
+        assert_eq!(config.gateway.host, "192.168.1.100");
+        assert!(config.gateway.require_pairing);
+    }
+
+    #[test]
+    fn e2e_minimal_setup_ollama_skip_everything() {
+        let mut app = test_app();
+        // Provider: Ollama (tier 4, idx 0)
+        app.provider_tier_idx = 4;
+        app.provider_idx = 0;
+        // No API key needed for local
+        app.api_key_input = String::new();
+        // Model: Auto
+        app.model_idx = 0;
+        // Channel: Skip
+        let skip_idx = CHANNELS.iter().position(|c| c.0 == "Skip for now").unwrap();
+        app.channel_idx = skip_idx;
+        // Web search: Skip
+        app.search_provider_idx = 5;
+        // Skills: Skip
+        app.skills_idx = 0;
+        // Hooks: Skip
+        app.hooks_idx = 1;
+        // Pairing: not required
+        app.pairing_required = false;
+
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+
+        assert_eq!(config.default_provider.as_deref(), Some("ollama"));
+        assert!(config.api_key.is_none());
+        assert!(config.default_model.is_none());
+        assert!(config.channels_config.telegram.is_none());
+        assert!(config.channels_config.discord.is_none());
+        assert!(!config.skills.open_skills_enabled);
+        assert!(!config.hooks.enabled);
+        assert!(!config.gateway.require_pairing);
+    }
+
+    #[test]
+    fn e2e_discord_searxng_with_hooks() {
+        let mut app = test_app();
+        // Provider: OpenAI (tier 0, idx 3)
+        app.provider_tier_idx = 0;
+        app.provider_idx = 3;
+        app.api_key_input = "sk-openai-key".to_string();
+        // Model: gpt-4o
+        app.model_idx = 3;
+        // Channel: Discord (idx 2)
+        app.channel_idx = 2;
+        // Web search: SearxNG (idx 1) with instance URL
+        app.search_provider_idx = 1;
+        app.search_api_key_input = "https://search.local".to_string();
+        // Skills: Skip
+        app.skills_idx = 0;
+        // Hooks: enabled
+        app.hooks_idx = 0;
+        app.gateway_host = "0.0.0.0".to_string();
+
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+
+        assert_eq!(config.default_provider.as_deref(), Some("openai"));
+        assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
+        let dc = config.channels_config.discord.as_ref().unwrap();
+        assert_eq!(dc.bot_token, "YOUR_DISCORD_BOT_TOKEN");
+        assert_eq!(config.web_search.provider, "searxng");
+        assert_eq!(
+            config.web_search.searxng_instance_url.as_deref(),
+            Some("https://search.local")
+        );
+        assert!(config.hooks.enabled);
+        assert_eq!(config.gateway.host, "0.0.0.0");
+    }
+
+    // ── TOML round-trip: verify serialization ───────────────────────
+
+    #[test]
+    fn config_serializes_to_valid_toml() {
+        let mut app = test_app();
+        app.provider_tier_idx = 0;
+        app.provider_idx = 0;
+        app.channel_idx = 0; // Telegram
+        app.hooks_idx = 0;
+        app.search_provider_idx = 0;
+        app.search_api_key_input = "brave-key".to_string();
+
+        let mut config = Config::default();
+        apply_tui_selections_to_config(&app, &mut config);
+
+        // Serialize to TOML and parse back
+        let toml_str = toml::to_string(&config).expect("config should serialize to TOML");
+        assert!(toml_str.contains("YOUR_TELEGRAM_BOT_TOKEN"));
+        assert!(toml_str.contains("openrouter"));
+
+        // Verify it parses back
+        let _: Config = toml::from_str(&toml_str).expect("serialized TOML should parse back");
+    }
+
+    #[test]
+    fn config_with_all_channels_serializes() {
+        // Test that every channel stub serializes cleanly
+        let channels_to_test = [
+            "Telegram",
+            "WhatsApp",
+            "Discord",
+            "IRC",
+            "Slack",
+            "Signal",
+            "iMessage",
+            "Mattermost",
+            "Nextcloud Talk",
+            "Feishu/Lark",
+        ];
+        for channel_name in &channels_to_test {
+            let mut app = test_app();
+            let idx = CHANNELS
+                .iter()
+                .position(|c| c.0 == *channel_name)
+                .unwrap_or_else(|| panic!("channel {channel_name} not found in CHANNELS"));
+            app.channel_idx = idx;
+
+            let mut config = Config::default();
+            apply_tui_selections_to_config(&app, &mut config);
+
+            let toml_str = toml::to_string(&config)
+                .unwrap_or_else(|e| panic!("failed to serialize config for {channel_name}: {e}"));
+            let _: Config = toml::from_str(&toml_str)
+                .unwrap_or_else(|e| panic!("failed to deserialize config for {channel_name}: {e}"));
+        }
+    }
 }
