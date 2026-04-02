@@ -45,6 +45,12 @@ impl Sandbox for BubblewrapSandbox {
             "--ro-bind",
             "/usr",
             "/usr",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
             "--dev",
             "/dev",
             "--proc",
@@ -178,6 +184,36 @@ mod tests {
         assert!(
             args.contains(&"--proc".to_string()),
             "must include /proc mount"
+        );
+    }
+
+    #[test]
+    fn bubblewrap_wrap_command_includes_lib_symlinks() {
+        let sandbox = BubblewrapSandbox;
+        let mut cmd = Command::new("echo");
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|s| s.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            args.contains(&"--symlink".to_string()),
+            "must include --symlink for /lib and /lib64"
+        );
+
+        // Find the index of usr/lib symlink target and verify the pattern
+        let lib_idx = args.iter().position(|a| a == "usr/lib").unwrap();
+        assert_eq!(
+            args[lib_idx + 1], "/lib",
+            "usr/lib should be symlinked to /lib"
+        );
+
+        let lib64_idx = args.iter().position(|a| a == "usr/lib64").unwrap();
+        assert_eq!(
+            args[lib64_idx + 1], "/lib64",
+            "usr/lib64 should be symlinked to /lib64"
         );
     }
 }
