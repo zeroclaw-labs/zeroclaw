@@ -4418,7 +4418,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     multi_message_delay_ms: existing_mx
                         .map(|m| m.multi_message_delay_ms)
                         .unwrap_or(800),
+                    mention_only: existing_mx.map(|m| m.mention_only).unwrap_or(false),
                     recovery_key,
+                    password: existing_mx.and_then(|m| m.password.clone()),
                 });
             }
             ChannelMenuChoice::Signal => {

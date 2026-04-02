@@ -866,7 +866,9 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     stream_mode: StreamMode::default(),
                     draft_update_interval_ms: 500,
                     multi_message_delay_ms: 800,
+                    mention_only: false,
                     recovery_key: None,
+                    password: None,
                 });
             }
         }
