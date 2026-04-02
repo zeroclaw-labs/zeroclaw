@@ -5,7 +5,8 @@
   "license": "(MIT OR Apache-2.0)",
   "type": "module",
   "scripts": {
-    "build": "tsc -b && vite build"
+    "build": "tsc -b && vite build",
+    "dev": "vite"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
@@ -13,7 +14,8 @@
     "react-dom": "^19.0.0",
     "react-markdown": "^10.1.0",
     "react-router-dom": "^7.1.1",
-    "remark-gfm": "^4.0.1"
+    "remark-gfm": "^4.0.1",
+    "smol-toml": "^1.6.1"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.0.0",
