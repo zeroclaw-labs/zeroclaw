@@ -140,7 +140,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   const setTheme = useCallback((t: ThemeMode) => {
     setThemeState(t);
-    const next: ThemeSettings = { theme: t, accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize };
+    // Sync colorTheme to match the new mode when switching between light/dark/oled
+    let newColorTheme = colorTheme;
+    if (t !== 'system') {
+      const ct = colorThemeMap[colorTheme];
+      const modeScheme = t === 'oled' ? 'dark' : t;
+      if (t === 'oled') {
+        newColorTheme = 'oled-black';
+      } else if (!ct || ct.scheme !== modeScheme) {
+        newColorTheme = t === 'light' ? DEFAULT_LIGHT_THEME : DEFAULT_DARK_THEME;
+      }
+      if (newColorTheme !== colorTheme) setColorThemeState(newColorTheme);
+    }
+    const next: ThemeSettings = { theme: t, accent, colorTheme: newColorTheme, uiFont, monoFont, uiFontSize, monoFontSize };
     applyAll(next);
     persist(next);
   }, [accent, colorTheme, uiFont, monoFont, uiFontSize, monoFontSize, applyAll, persist]);

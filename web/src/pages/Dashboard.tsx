@@ -480,7 +480,7 @@ function SessionsTab() {
     return (
       <div
         className="rounded-2xl border p-4"
-        style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171" }}
+        style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}
       >
         {t("dashboard.load_sessions_error")}: {error}
       </div>
@@ -543,12 +543,12 @@ function SessionsTab() {
                       className="text-sm font-medium font-mono truncate"
                       style={{ color: "var(--pc-text-primary)" }}
                     >
-                      {session.id.slice(0, 8)}...
+                      {session.id ? `${session.id.slice(0, 8)}...` : '—'}
                     </span>
                     <span
                       className="text-[10px] uppercase font-medium px-2 py-0.5 rounded-full"
                       style={{
-                        background: `${sessionStatusColor(session.status)}15`,
+                        background: `color-mix(in srgb, ${sessionStatusColor(session.status)} 10%, transparent)`,
                         color: sessionStatusColor(session.status),
                       }}
                     >
@@ -698,7 +698,7 @@ function ChannelsTab() {
     return (
       <div
         className="rounded-2xl border p-4"
-        style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171" }}
+        style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}
       >
         {t("dashboard.load_channels_error")}: {error}
       </div>
@@ -849,7 +849,7 @@ export default function Dashboard() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-2xl border p-4" style={{ background: "rgba(239, 68, 68, 0.08)", borderColor: "rgba(239, 68, 68, 0.2)", color: "#f87171", }}>
+        <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
           {t("dashboard.load_error")}: {error}
         </div>
       </div>

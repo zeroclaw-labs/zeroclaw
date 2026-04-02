@@ -102,21 +102,27 @@ export default function Canvas() {
     if (!doc) return;
 
     let html = currentFrame.content;
+    const cs = getComputedStyle(document.documentElement);
+    const bgBase = cs.getPropertyValue('--pc-bg-base').trim() || '#1e1e24';
+    const textPrimary = cs.getPropertyValue('--pc-text-primary').trim() || '#d4d4d8';
+    const textSecondary = cs.getPropertyValue('--pc-text-secondary').trim() || '#a1a1aa';
+    const fontMono = cs.getPropertyValue('--pc-font-mono').trim() || 'monospace';
+    const fontUi = cs.getPropertyValue('--pc-font-ui').trim() || 'system-ui,sans-serif';
+
     if (currentFrame.content_type === 'svg') {
-      html = `<!DOCTYPE html><html><head><style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#1a1a2e;}</style></head><body>${currentFrame.content}</body></html>`;
+      html = `<!DOCTYPE html><html><head><style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:${bgBase};}</style></head><body>${currentFrame.content}</body></html>`;
     } else if (currentFrame.content_type === 'markdown') {
-      // Simple markdown-to-HTML: render as preformatted text with basic styling
       const escaped = currentFrame.content
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
-      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:system-ui,sans-serif;color:#e0e0e0;background:#1a1a2e;line-height:1.6;}pre{white-space:pre-wrap;word-wrap:break-word;}</style></head><body><pre>${escaped}</pre></body></html>`;
+      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:${fontUi};color:${textSecondary};background:${bgBase};line-height:1.6;}pre{white-space:pre-wrap;word-wrap:break-word;}</style></head><body><pre>${escaped}</pre></body></html>`;
     } else if (currentFrame.content_type === 'text') {
       const escaped = currentFrame.content
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
-      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:monospace;color:#e0e0e0;background:#1a1a2e;white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
+      html = `<!DOCTYPE html><html><head><style>body{margin:1rem;font-family:${fontMono};color:${textPrimary};background:${bgBase};white-space:pre-wrap;}</style></head><body>${escaped}</body></html>`;
     }
 
     doc.open();
@@ -248,7 +254,7 @@ export default function Canvas() {
         {/* Canvas viewer */}
         <div
           className="flex-1 rounded-lg border overflow-hidden"
-          style={{ borderColor: 'var(--pc-border)', background: '#1a1a2e' }}
+          style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-base)' }}
         >
           {currentFrame ? (
             <iframe
@@ -256,7 +262,7 @@ export default function Canvas() {
               sandbox="allow-scripts"
               className="w-full h-full border-0"
               title={`Canvas: ${canvasId}`}
-              style={{ background: '#1a1a2e' }}
+              style={{ background: 'var(--pc-bg-base)' }}
             />
           ) : (
             <div className="flex items-center justify-center h-full">

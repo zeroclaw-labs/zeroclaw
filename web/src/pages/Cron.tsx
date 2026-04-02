@@ -277,7 +277,7 @@ export default function Cron() {
   if (error) {
     return (
       <div className="p-6 animate-fade-in">
-        <div className="rounded-2xl border p-4" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+        <div className="rounded-2xl border p-4" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
           {t('cron.load_error')}: {error}
         </div>
       </div>
@@ -324,11 +324,11 @@ export default function Cron() {
           <button
             onClick={toggleCatchUp}
             disabled={togglingCatchUp}
-            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-300 focus:outline-none ${
-              settings.catch_up_on_startup
-                ? 'bg-[#0080ff]'
-                : 'bg-[#1a1a3e]'
-            }`}
+            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-300 focus:outline-none`}
+            style={settings.catch_up_on_startup
+              ? { background: 'var(--color-status-info)' }
+              : { background: 'var(--pc-bg-elevated)', border: '1px solid var(--pc-border)' }
+            }
           >
             <span
               className={`inline-block h-4 w-4 rounded-full bg-white transition-transform duration-300 ${
@@ -357,7 +357,7 @@ export default function Cron() {
               </button>
             </div>
             {formError && (
-              <div className="mb-4 rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'rgba(239, 68, 68, 0.08)', borderColor: 'rgba(239, 68, 68, 0.2)', color: '#f87171' }}>
+              <div className="mb-4 rounded-xl border p-3 text-sm animate-fade-in" style={{ background: 'var(--color-status-error-alpha-08)', borderColor: 'var(--color-status-error-alpha-20)', color: 'var(--color-status-error)' }}>
                 {formError}
               </div>
             )}

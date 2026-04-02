@@ -18,25 +18,25 @@ function formatTimestamp(ts?: string): string {
 function eventTypeStyle(type: string): { color: string; bg: string; border: string } {
   switch (type.toLowerCase()) {
     case 'error':
-      return { color: 'var(--color-status-error)', bg: 'rgba(239, 68, 68, 0.06)', border: 'rgba(239, 68, 68, 0.2)' };
+      return { color: 'var(--color-status-error)', bg: 'var(--color-status-error-alpha-08)', border: 'var(--color-status-error-alpha-20)' };
     case 'warn':
     case 'warning':
-      return { color: 'var(--color-status-warning)', bg: 'rgba(255, 170, 0, 0.06)', border: 'rgba(255, 170, 0, 0.2)' };
+      return { color: 'var(--color-status-warning)', bg: 'var(--color-status-warning-alpha-05)', border: 'var(--color-status-warning-alpha-20)' };
     case 'tool_call':
     case 'tool_result':
     case 'tool_call_start':
-      return { color: '#a78bfa', bg: 'rgba(167, 139, 250, 0.06)', border: 'rgba(167, 139, 250, 0.2)' };
+      return { color: 'var(--pc-accent)', bg: 'var(--pc-accent-glow)', border: 'var(--pc-accent-dim)' };
     case 'llm_request':
-      return { color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.06)', border: 'rgba(56, 189, 248, 0.2)' };
+      return { color: 'var(--color-status-info)', bg: 'color-mix(in srgb, var(--color-status-info) 6%, transparent)', border: 'color-mix(in srgb, var(--color-status-info) 20%, transparent)' };
     case 'agent_start':
     case 'agent_end':
-      return { color: '#34d399', bg: 'rgba(52, 211, 153, 0.06)', border: 'rgba(52, 211, 153, 0.2)' };
+      return { color: 'var(--color-status-success)', bg: 'var(--color-status-success-alpha-08)', border: 'var(--color-status-success-alpha-20)' };
     case 'message':
     case 'chat':
       return { color: 'var(--pc-accent)', bg: 'var(--pc-accent-glow)', border: 'var(--pc-accent-dim)' };
     case 'health':
     case 'status':
-      return { color: 'var(--color-status-success)', bg: 'rgba(0, 230, 138, 0.06)', border: 'rgba(0, 230, 138, 0.2)' };
+      return { color: 'var(--color-status-success)', bg: 'var(--color-status-success-alpha-08)', border: 'var(--color-status-success-alpha-20)' };
     default:
       return { color: 'var(--pc-text-muted)', bg: 'var(--pc-hover)', border: 'var(--pc-border)' };
   }

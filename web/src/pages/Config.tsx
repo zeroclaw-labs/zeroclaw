@@ -27,13 +27,13 @@ function highlightToml(raw: string): string {
 
     // Section header  [section] or [[array]]
     if (/^\s*\[/.test(escaped)) {
-      result.push(`<span style="color:#67e8f9;font-weight:600">${escaped}</span>`);
+      result.push(`<span style="color:var(--pc-accent-light);font-weight:600">${escaped}</span>`);
       continue;
     }
 
     // Comment line
     if (/^\s*#/.test(escaped)) {
-      result.push(`<span style="color:#52525b;font-style:italic">${escaped}</span>`);
+      result.push(`<span style="color:var(--pc-text-faint);font-style:italic">${escaped}</span>`);
       continue;
     }
 
@@ -43,8 +43,8 @@ function highlightToml(raw: string): string {
       const [, indent, key, eq, rawValue] = kvMatch;
       const value = colorValue(rawValue ?? '');
       result.push(
-        `${indent}<span style="color:#a78bfa">${key}</span>`
-        + `<span style="color:#71717a">${eq}</span>${value}`
+        `${indent}<span style="color:var(--pc-accent)">${key}</span>`
+        + `<span style="color:var(--pc-text-muted)">${eq}</span>${value}`
       );
       continue;
     }
@@ -60,7 +60,7 @@ function colorValue(v: string): string {
   const commentIdx = findUnquotedHash(trimmed);
   if (commentIdx !== -1) {
     const valueCore = trimmed.slice(0, commentIdx).trimEnd();
-    const comment = `<span style="color:#52525b;font-style:italic">${trimmed.slice(commentIdx)}</span>`;
+    const comment = `<span style="color:var(--pc-text-faint);font-style:italic">${trimmed.slice(commentIdx)}</span>`;
     const leading = v.slice(0, v.indexOf(trimmed));
     return leading + colorScalar(valueCore) + ' ' + comment;
   }
@@ -82,15 +82,15 @@ function findUnquotedHash(s: string): number {
 function colorScalar(v: string): string {
   const t = v.trim();
   if (t === 'true' || t === 'false')
-    return `<span style="color:#34d399">${v}</span>`;
+    return `<span style="color:var(--color-status-success)">${v}</span>`;
   if (/^-?\d[\d_]*(\.[\d_]*)?([eE][+-]?\d+)?$/.test(t))
-    return `<span style="color:#fbbf24">${v}</span>`;
+    return `<span style="color:var(--color-status-warning)">${v}</span>`;
   if (t.startsWith('"') || t.startsWith("'"))
-    return `<span style="color:#86efac">${v}</span>`;
+    return `<span style="color:var(--pc-text-secondary)">${v}</span>`;
   if (t.startsWith('[') || t.startsWith('{'))
-    return `<span style="color:#e2e8f0">${v}</span>`;
+    return `<span style="color:var(--pc-text-primary)">${v}</span>`;
   if (/^\d{4}-\d{2}-\d{2}/.test(t))
-    return `<span style="color:#fb923c">${v}</span>`;
+    return `<span style="color:var(--color-status-info)">${v}</span>`;
   return v;
 }
 
@@ -161,13 +161,13 @@ export default function Config() {
       </div>
 
       {/* Sensitive fields note */}
-      <div className="flex items-start gap-3 rounded-2xl p-4 border" style={{ borderColor: 'rgba(255, 170, 0, 0.2)', background: 'rgba(255, 170, 0, 0.05)' }}>
+      <div className="flex items-start gap-3 rounded-2xl p-4 border" style={{ borderColor: 'var(--color-status-warning-alpha-20)', background: 'var(--color-status-warning-alpha-05)' }}>
         <ShieldAlert className="h-5 w-5 flex-shrink-0 mt-0.5" style={{ color: 'var(--color-status-warning)' }} />
         <div>
           <p className="text-sm font-medium" style={{ color: 'var(--color-status-warning)' }}>
             {t('config.sensitive_title')}
           </p>
-          <p className="text-sm mt-0.5" style={{ color: 'rgba(255, 170, 0, 0.7)' }}>
+          <p className="text-sm mt-0.5" style={{ color: 'var(--color-status-warning)', opacity: 0.7 }}>
             {t('config.sensitive_hint')}
           </p>
         </div>
@@ -175,7 +175,7 @@ export default function Config() {
 
       {/* Success message */}
       {success && (
-        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in" style={{ borderColor: 'rgba(0, 230, 138, 0.2)', background: 'rgba(0, 230, 138, 0.06)' }}>
+        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in" style={{ borderColor: 'var(--color-status-success-alpha-20)', background: 'var(--color-status-success-alpha-08)' }}>
           <CheckCircle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-success)' }} />
           <span className="text-sm" style={{ color: 'var(--color-status-success)' }}>{success}</span>
         </div>
@@ -183,7 +183,7 @@ export default function Config() {
 
       {/* Error message */}
       {error && (
-        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in" style={{ borderColor: 'rgba(239, 68, 68, 0.2)', background: 'rgba(239, 68, 68, 0.06)' }}>
+        <div className="flex items-center gap-2 rounded-xl p-3 border animate-fade-in" style={{ borderColor: 'var(--color-status-error-alpha-20)', background: 'var(--color-status-error-alpha-08)' }}>
           <AlertTriangle className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--color-status-error)' }} />
           <span className="text-sm" style={{ color: 'var(--color-status-error)' }}>{error}</span>
         </div>
