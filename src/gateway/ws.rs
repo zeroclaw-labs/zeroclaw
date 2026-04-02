@@ -384,6 +384,35 @@ async fn process_chat_message(
 ) {
     use crate::agent::TurnEvent;
 
+    let trimmed = content.trim();
+    println!("{}", trimmed);
+    if trimmed == "/new" || trimmed == "/clear" {
+        agent.clear_history();
+        let msg = "New session started. Memory refreshed";
+        let _ = sender
+            .send(Message::Text(
+                serde_json::json!({ "type": "chunk", "content": msg })
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        let _ = sender
+            .send(Message::Text(
+                serde_json::json!({ "type": "chunk_reset" })
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        let _ = sender
+            .send(Message::Text(
+                serde_json::json!({ "type": "done", "full_response": msg })
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        return;
+    }
+
     let provider_label = state
         .config
         .lock()
