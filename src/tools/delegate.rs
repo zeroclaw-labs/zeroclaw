@@ -73,6 +73,8 @@ pub struct DelegateTool {
     cancellation_token: CancellationToken,
     /// Optional memory instance for namespace isolation on delegate agents.
     memory: Option<Arc<dyn Memory>>,
+    /// Global skills prompt injection mode (from config.skills.prompt_injection_mode)
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
 }
 
 impl DelegateTool {
@@ -107,6 +109,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
         }
     }
 
@@ -147,6 +150,7 @@ impl DelegateTool {
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
         }
     }
 
@@ -195,6 +199,15 @@ impl DelegateTool {
     /// Attach memory for namespace isolation on delegate agents.
     pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Attach skills prompt injection mode from global config.
+    pub fn with_skills_prompt_mode(
+        mut self,
+        mode: crate::config::SkillsPromptInjectionMode,
+    ) -> Self {
+        self.skills_prompt_mode = mode;
         self
     }
 
@@ -636,6 +649,7 @@ impl DelegateTool {
         let workspace_dir = self.workspace_dir.clone();
         let child_token = self.cancellation_token.child_token();
         let task_id_clone = task_id.clone();
+        let skills_prompt_mode = self.skills_prompt_mode;
 
         tokio::spawn(async move {
             // Build an inner DelegateTool for the spawned context
@@ -651,6 +665,7 @@ impl DelegateTool {
                 workspace_dir: workspace_dir.clone(),
                 cancellation_token: child_token.clone(),
                 memory: None,
+                skills_prompt_mode,
             };
 
             let args_inner = json!({
@@ -781,6 +796,7 @@ impl DelegateTool {
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
+        let skills_prompt_mode = self.skills_prompt_mode;
         for agent_name in &agent_names {
             let agents = Arc::clone(&self.agents);
             let security = Arc::clone(&self.security);
@@ -809,6 +825,7 @@ impl DelegateTool {
                     workspace_dir,
                     cancellation_token,
                     memory: None,
+                    skills_prompt_mode,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
                 (agent_name, result)
@@ -1048,7 +1065,7 @@ impl DelegateTool {
             model_name: &agent_config.model,
             tools: sub_tools,
             skills: &skills,
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode: self.skills_prompt_mode,
             identity_config: None,
             dispatcher_instructions: "",
             tool_descriptions: None,
