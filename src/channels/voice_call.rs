@@ -14,6 +14,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, info, warn};
+use zeroclaw_macros::Configurable;
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
 
@@ -40,7 +41,8 @@ impl fmt::Display for VoiceProvider {
 }
 
 /// Configuration for the voice call channel.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "channels.voice-call"]
 pub struct VoiceCallConfig {
     /// Telephony provider: `twilio`, `telnyx`, or `plivo`.
     #[serde(default)]
@@ -82,6 +84,23 @@ fn default_true() -> bool {
 
 fn default_max_call_duration() -> u64 {
     3600
+}
+
+impl Default for VoiceCallConfig {
+    fn default() -> Self {
+        Self {
+            provider: VoiceProvider::default(),
+            account_id: String::new(),
+            auth_token: String::new(),
+            from_number: String::new(),
+            webhook_port: default_webhook_port(),
+            require_outbound_approval: default_true(),
+            transcription_logging: default_true(),
+            tts_voice: None,
+            max_call_duration_secs: default_max_call_duration(),
+            webhook_base_url: None,
+        }
+    }
 }
 
 // ── Call state ────────────────────────────────────────────────────

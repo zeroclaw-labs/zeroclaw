@@ -457,18 +457,22 @@ impl Channel for YourChannel {
 
 ## How to Mark Config Fields as Secrets
 
-ZeroClaw uses a `#[derive(HasSecrets)]` proc macro to automatically handle secret
+ZeroClaw uses a `#[derive(Configurable)]` proc macro to automatically handle secret
 field discovery, encryption, decryption, and CLI management. When adding a new
 channel, provider, or integration with sensitive fields (API keys, tokens, passwords):
 
-1. Add `HasSecrets` to the derive list and `#[secret_prefix]` on the struct:
+1. Add `Configurable` and `Default` to the derive list, `#[prefix]` on the struct,
+   and an `enabled` field:
 
 ```rust
-use zeroclaw_macros::HasSecrets;
+use zeroclaw_macros::Configurable;
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, HasSecrets)]
-#[secret_prefix = "channels.your_channel"]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "channels.your-channel"]
 pub struct YourChannelConfig {
+    /// Whether this channel is active (must be explicitly enabled). Default: false.
+    #[serde(default)]
+    pub enabled: bool,
     #[secret]
     pub bot_token: String,
     #[secret]
@@ -478,24 +482,24 @@ pub struct YourChannelConfig {
 }
 ```
 
-2. If your struct is nested inside a parent (e.g., `ChannelsConfig`), add `#[has_secrets]`
+2. If your struct is nested inside a parent (e.g., `ChannelsConfig`), add `#[nested]`
    on the parent's field so the tree traversal finds it:
 
 ```rust
 pub struct ChannelsConfig {
-    #[has_secrets]
+    #[nested]
     pub your_channel: Option<YourChannelConfig>,
 }
 ```
 
 That's it. The `#[secret]` annotation automatically:
-- Includes the field in `zeroclaw secret list`
-- Makes it settable via `zeroclaw secret set channels.your-channel.bot-token`
+- Includes the field in `zeroclaw props list --secrets`
+- Makes it settable via `zeroclaw props set channels.your-channel.bot-token`
 - Encrypts it on config save and decrypts on load
 - Converts the field name from `snake_case` to `kebab-case` in the CLI
 
 Field names are derived automatically: `bot_token` on a struct with
-`#[secret_prefix = "channels.your_channel"]` becomes `channels.your-channel.bot-token`.
+`#[prefix = "channels.your_channel"]` becomes `channels.your-channel.bot-token`.
 
 ## How to Add a New Observer
 

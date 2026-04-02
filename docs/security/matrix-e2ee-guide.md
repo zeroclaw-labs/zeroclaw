@@ -105,7 +105,7 @@ curl -sS -H "Authorization: Bearer $MATRIX_TOKEN" \
 - If `device_id` is missing, set `channels_config.matrix.device_id` manually.
 - To update the access token without re-running onboard:
   ```bash
-  zeroclaw secret set channels.matrix.access-token
+  zeroclaw props set channels.matrix.access-token
   ```
 
 ### D. E2EE-specific checks
@@ -250,7 +250,7 @@ Paste the recovery key (input is masked). It will be encrypted and stored in `co
 Option B — via the secret CLI (recommended for existing installs):
 
 ```bash
-zeroclaw secret set channels.matrix.recovery-key
+zeroclaw props set channels.matrix.recovery-key
 ```
 
 Input is masked. The value is encrypted at rest immediately.

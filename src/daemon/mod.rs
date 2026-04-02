@@ -95,18 +95,23 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         }
     }
 
-    // Wire up MQTT SOP listener if configured
+    // Wire up MQTT SOP listener if configured and enabled
     if let Some(ref mqtt_config) = config.channels_config.mqtt {
-        let mqtt_cfg = mqtt_config.clone();
-        handles.push(spawn_component_supervisor(
-            "mqtt",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = mqtt_cfg.clone();
-                async move { Box::pin(run_mqtt_sop_listener(&cfg)).await }
-            },
-        ));
+        if mqtt_config.enabled {
+            let mqtt_cfg = mqtt_config.clone();
+            handles.push(spawn_component_supervisor(
+                "mqtt",
+                initial_backoff,
+                max_backoff,
+                move || {
+                    let cfg = mqtt_cfg.clone();
+                    async move { Box::pin(run_mqtt_sop_listener(&cfg)).await }
+                },
+            ));
+        } else {
+            tracing::info!("MQTT channel configured but disabled (enabled = false)");
+            crate::health::mark_component_ok("mqtt");
+        }
     } else {
         crate::health::mark_component_ok("mqtt");
     }
@@ -922,6 +927,7 @@ mod tests {
     fn detects_supervised_channels_present() {
         let mut config = Config::default();
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            enabled: true,
             bot_token: "token".into(),
             allowed_users: vec![],
             stream_mode: crate::config::StreamMode::default(),
@@ -938,6 +944,7 @@ mod tests {
     fn detects_dingtalk_as_supervised_channel() {
         let mut config = Config::default();
         config.channels_config.dingtalk = Some(crate::config::schema::DingTalkConfig {
+            enabled: true,
             client_id: "client_id".into(),
             client_secret: "client_secret".into(),
             allowed_users: vec!["*".into()],
@@ -950,6 +957,7 @@ mod tests {
     fn detects_mattermost_as_supervised_channel() {
         let mut config = Config::default();
         config.channels_config.mattermost = Some(crate::config::schema::MattermostConfig {
+            enabled: true,
             url: "https://mattermost.example.com".into(),
             bot_token: "token".into(),
             channel_id: Some("channel-id".into()),
@@ -966,6 +974,7 @@ mod tests {
     fn detects_qq_as_supervised_channel() {
         let mut config = Config::default();
         config.channels_config.qq = Some(crate::config::schema::QQConfig {
+            enabled: true,
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
             allowed_users: vec!["*".into()],
@@ -978,6 +987,7 @@ mod tests {
     fn detects_nextcloud_talk_as_supervised_channel() {
         let mut config = Config::default();
         config.channels_config.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
+            enabled: true,
             base_url: "https://cloud.example.com".into(),
             app_token: "app-token".into(),
             webhook_secret: None,
@@ -1047,6 +1057,7 @@ mod tests {
         config.heartbeat.target = Some("telegram".into());
         config.heartbeat.to = Some("123456".into());
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            enabled: true,
             bot_token: "bot-token".into(),
             allowed_users: vec![],
             stream_mode: crate::config::StreamMode::default(),
@@ -1065,6 +1076,7 @@ mod tests {
     fn auto_detect_telegram_when_configured() {
         let mut config = Config::default();
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            enabled: true,
             bot_token: "bot-token".into(),
             allowed_users: vec!["user123".into()],
             stream_mode: crate::config::StreamMode::default(),

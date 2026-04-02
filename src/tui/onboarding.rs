@@ -705,6 +705,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Telegram" => {
             if config.channels_config.telegram.is_none() {
                 config.channels_config.telegram = Some(TelegramConfig {
+                    enabled: true,
                     bot_token: String::from("YOUR_TELEGRAM_BOT_TOKEN"),
                     allowed_users: vec![],
                     stream_mode: StreamMode::default(),
@@ -719,6 +720,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Discord" => {
             if config.channels_config.discord.is_none() {
                 config.channels_config.discord = Some(DiscordConfig {
+                    enabled: true,
                     bot_token: String::from("YOUR_DISCORD_BOT_TOKEN"),
                     guild_id: None,
                     allowed_users: vec![],
@@ -736,6 +738,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Slack" => {
             if config.channels_config.slack.is_none() {
                 config.channels_config.slack = Some(SlackConfig {
+                    enabled: true,
                     bot_token: String::from("xoxb-YOUR_SLACK_BOT_TOKEN"),
                     app_token: Some(String::from("xapp-YOUR_SLACK_APP_TOKEN")),
                     channel_id: None,
@@ -755,6 +758,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "WhatsApp" => {
             if config.channels_config.whatsapp.is_none() {
                 config.channels_config.whatsapp = Some(WhatsAppConfig {
+                    enabled: true,
                     access_token: Some(String::from("YOUR_WHATSAPP_ACCESS_TOKEN")),
                     phone_number_id: Some(String::from("YOUR_PHONE_NUMBER_ID")),
                     verify_token: Some(String::from("YOUR_VERIFY_TOKEN")),
@@ -777,6 +781,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Signal" => {
             if config.channels_config.signal.is_none() {
                 config.channels_config.signal = Some(SignalConfig {
+                    enabled: true,
                     http_url: String::from("http://127.0.0.1:8080"),
                     account: String::from("YOUR_SIGNAL_PHONE_NUMBER"),
                     group_id: None,
@@ -790,6 +795,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "IRC" => {
             if config.channels_config.irc.is_none() {
                 config.channels_config.irc = Some(IrcConfig {
+                    enabled: true,
                     server: String::from("irc.libera.chat"),
                     port: 6697,
                     nickname: String::from("zeroclaw-bot"),
@@ -806,6 +812,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "iMessage" => {
             if config.channels_config.imessage.is_none() {
                 config.channels_config.imessage = Some(IMessageConfig {
+                    enabled: true,
                     allowed_contacts: vec![],
                 });
             }
@@ -813,6 +820,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Matrix" => {
             if config.channels_config.matrix.is_none() {
                 config.channels_config.matrix = Some(MatrixConfig {
+                    enabled: true,
                     homeserver: String::from("https://matrix.org"),
                     access_token: String::from("YOUR_MATRIX_ACCESS_TOKEN"),
                     user_id: None,
@@ -831,6 +839,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Mattermost" => {
             if config.channels_config.mattermost.is_none() {
                 config.channels_config.mattermost = Some(MattermostConfig {
+                    enabled: true,
                     url: String::from("https://mattermost.example.com"),
                     bot_token: String::from("YOUR_MATTERMOST_BOT_TOKEN"),
                     channel_id: None,
@@ -845,6 +854,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Nextcloud Talk" => {
             if config.channels_config.nextcloud_talk.is_none() {
                 config.channels_config.nextcloud_talk = Some(NextcloudTalkConfig {
+                    enabled: true,
                     base_url: String::from("https://cloud.example.com"),
                     app_token: String::from("YOUR_NEXTCLOUD_APP_TOKEN"),
                     webhook_secret: None,
@@ -857,6 +867,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
         "Feishu/Lark" => {
             if config.channels_config.feishu.is_none() {
                 config.channels_config.feishu = Some(FeishuConfig {
+                    enabled: true,
                     app_id: String::from("YOUR_FEISHU_APP_ID"),
                     app_secret: String::from("YOUR_FEISHU_APP_SECRET"),
                     encrypt_key: None,
@@ -869,6 +880,7 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
             }
             if config.channels_config.lark.is_none() {
                 config.channels_config.lark = Some(LarkConfig {
+                    enabled: true,
                     app_id: String::from("YOUR_LARK_APP_ID"),
                     app_secret: String::from("YOUR_LARK_APP_SECRET"),
                     encrypt_key: None,
@@ -3367,6 +3379,7 @@ mod tests {
         let mut config = Config::default();
         // Pre-set a Telegram config with a real token
         config.channels_config.telegram = Some(TelegramConfig {
+            enabled: true,
             bot_token: "REAL_TOKEN_123".to_string(),
             allowed_users: vec!["alice".to_string()],
             stream_mode: StreamMode::default(),

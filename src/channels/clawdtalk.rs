@@ -29,9 +29,15 @@ pub struct ClawdTalkChannel {
 }
 
 /// Configuration for ClawdTalk channel from config.toml
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, zeroclaw_macros::HasSecrets)]
-#[secret_prefix = "channels.clawdtalk"]
+#[derive(
+    Debug, Clone, Default, Serialize, Deserialize, JsonSchema, zeroclaw_macros::Configurable,
+)]
+#[prefix = "channels.clawdtalk"]
 pub struct ClawdTalkConfig {
+    /// Whether this channel is active. Default: false.
+    /// Channels must be explicitly enabled after configuring required fields.
+    #[serde(default)]
+    pub enabled: bool,
     /// Telnyx API key
     #[secret]
     pub api_key: String,
@@ -371,6 +377,7 @@ mod tests {
 
     fn test_config() -> ClawdTalkConfig {
         ClawdTalkConfig {
+            enabled: true,
             api_key: "test-key".to_string(),
             connection_id: "test-connection".to_string(),
             from_number: "+15551234567".to_string(),

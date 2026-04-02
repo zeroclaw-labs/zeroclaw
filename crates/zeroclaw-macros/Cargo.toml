@@ -1,9 +1,9 @@
 [package]
 name = "zeroclaw-macros"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
-description = "Proc macros for ZeroClaw (secret field derivation)"
+description = "Proc macros for ZeroClaw (config field derivation)"
 
 [lib]
 proc-macro = true

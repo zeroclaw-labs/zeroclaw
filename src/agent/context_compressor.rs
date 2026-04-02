@@ -4,6 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use zeroclaw_macros::Configurable;
 
 use std::sync::Arc;
 
@@ -45,7 +46,8 @@ fn default_tool_result_retrim_chars() -> usize {
     2_000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
+#[prefix = "agent.context-compression"]
 pub struct ContextCompressionConfig {
     /// Enable automatic context compression. Default: `true`.
     #[serde(default = "default_enabled")]

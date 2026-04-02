@@ -34,8 +34,8 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 // ── Configuration ────────────────────────────────────────────────
 
 /// Gmail Pub/Sub push notification channel configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, zeroclaw_macros::HasSecrets)]
-#[secret_prefix = "channels.gmail"]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, zeroclaw_macros::Configurable)]
+#[prefix = "channels.gmail"]
 pub struct GmailPushConfig {
     /// Enable the Gmail push channel. Default: `false`.
     #[serde(default)]
