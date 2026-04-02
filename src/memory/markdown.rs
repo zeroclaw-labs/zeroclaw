@@ -251,10 +251,68 @@ impl Memory for MarkdownMemory {
         }
     }
 
-    async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
-        // Markdown memory is append-only by design (audit trail)
-        // Return false to indicate the entry wasn't removed
-        Ok(false)
+    async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+        // Parse key format: "filename:line_number" (e.g., "MEMORY:0" or "2025-01-01:5")
+        let (filename, line_num) = match key.rsplit_once(':') {
+            Some((f, n)) => match n.parse::<usize>() {
+                Ok(num) => (f, num),
+                Err(_) => return Ok(false),
+            },
+            None => return Ok(false),
+        };
+
+        // Determine the file path
+        let path = if filename == "MEMORY" {
+            self.core_path()
+        } else {
+            self.memory_dir().join(format!("{filename}.md"))
+        };
+
+        if !path.exists() {
+            return Ok(false);
+        }
+
+        // Read file content
+        let content = fs::read_to_string(&path).await?;
+        let lines: Vec<&str> = content.lines().collect();
+
+        // Find non-header lines (lines that don't start with #)
+        let content_lines: Vec<(usize, &str)> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with('#')
+            })
+            .map(|(i, line)| (i, *line))
+            .collect();
+
+        // Check if line_num is valid
+        if line_num >= content_lines.len() {
+            return Ok(false);
+        }
+
+        // Get the actual line index to remove
+        let (line_idx_to_remove, _) = content_lines[line_num];
+
+        // Create new content without the line
+        let new_lines: Vec<&str> = lines
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != line_idx_to_remove)
+            .map(|(_, line)| *line)
+            .collect();
+
+        // Check if anything was removed
+        if new_lines.len() == lines.len() {
+            return Ok(false);
+        }
+
+        // Write updated content back
+        let new_content = new_lines.join("\n");
+        fs::write(&path, new_content).await?;
+
+        Ok(true)
     }
 
     async fn count(&self) -> anyhow::Result<usize> {
@@ -377,13 +435,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn markdown_forget_is_noop() {
+    async fn markdown_forget_removes_entry() {
         let (_tmp, mem) = temp_workspace();
-        mem.store("a", "permanent", MemoryCategory::Core, None)
+        mem.store("a", "to be deleted", MemoryCategory::Core, None)
             .await
             .unwrap();
-        let removed = mem.forget("a").await.unwrap();
-        assert!(!removed, "Markdown memory is append-only");
+
+        // Get the entry key
+        let entries = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        let key = &entries[0].key;
+
+        // Delete the entry
+        let removed = mem.forget(key).await.unwrap();
+        assert!(removed, "Entry should be deleted");
+
+        // Verify entry is gone
+        let entries_after = mem.list(Some(&MemoryCategory::Core), None).await.unwrap();
+        assert!(entries_after.is_empty(), "Entry should be removed");
+
+        // Deleting again should return false
+        let removed_again = mem.forget(key).await.unwrap();
+        assert!(
+            !removed_again,
+            "Deleting non-existent entry should return false"
+        );
+    }
+
+    #[tokio::test]
+    async fn markdown_forget_invalid_key_returns_false() {
+        let (_tmp, mem) = temp_workspace();
+
+        // Invalid key format (no colon)
+        let removed = mem.forget("invalid_key").await.unwrap();
+        assert!(!removed, "Invalid key format should return false");
+
+        // Non-existent file
+        let removed = mem.forget("NONEXISTENT:0").await.unwrap();
+        assert!(!removed, "Non-existent file should return false");
+
+        // Invalid line number
+        let removed = mem.forget("MEMORY:999").await.unwrap();
+        assert!(!removed, "Invalid line number should return false");
     }
 
     #[tokio::test]
