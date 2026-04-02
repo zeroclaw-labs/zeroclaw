@@ -37,7 +37,8 @@ use uuid::Uuid;
 use super::traits::{Channel, ChannelMessage, SendMessage};
 
 /// Email channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, zeroclaw_macros::HasSecrets)]
+#[secret_prefix = "channels.email"]
 pub struct EmailConfig {
     /// IMAP server hostname
     pub imap_host: String,
@@ -58,6 +59,7 @@ pub struct EmailConfig {
     /// Email username for authentication
     pub username: String,
     /// Email password for authentication
+    #[secret]
     pub password: String,
     /// From address for outgoing emails
     pub from_address: String,

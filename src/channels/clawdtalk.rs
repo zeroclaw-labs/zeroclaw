@@ -29,9 +29,11 @@ pub struct ClawdTalkChannel {
 }
 
 /// Configuration for ClawdTalk channel from config.toml
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, zeroclaw_macros::HasSecrets)]
+#[secret_prefix = "channels.clawdtalk"]
 pub struct ClawdTalkConfig {
     /// Telnyx API key
+    #[secret]
     pub api_key: String,
     /// Telnyx connection ID for SIP
     pub connection_id: String,
@@ -42,6 +44,7 @@ pub struct ClawdTalkConfig {
     pub allowed_destinations: Vec<String>,
     /// Webhook secret for signature verification
     #[serde(default)]
+    #[secret]
     pub webhook_secret: Option<String>,
 }
 

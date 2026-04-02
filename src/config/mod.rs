@@ -36,6 +36,8 @@ pub use schema::{
     set_runtime_proxy_config, ws_connect_with_proxy,
 };
 
+pub use traits::SecretFieldInfo;
+
 pub fn name_and_presence<T: traits::ChannelConfig>(channel: Option<&T>) -> (&'static str, bool) {
     (T::name(), channel.is_some())
 }

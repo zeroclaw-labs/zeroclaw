@@ -1,0 +1,14 @@
+[package]
+name = "zeroclaw-macros"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Proc macros for ZeroClaw (secret field derivation)"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits"] }
+quote = "1"
+proc-macro2 = "1"

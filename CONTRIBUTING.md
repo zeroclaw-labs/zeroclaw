@@ -455,6 +455,48 @@ impl Channel for YourChannel {
 }
 ```
 
+## How to Mark Config Fields as Secrets
+
+ZeroClaw uses a `#[derive(HasSecrets)]` proc macro to automatically handle secret
+field discovery, encryption, decryption, and CLI management. When adding a new
+channel, provider, or integration with sensitive fields (API keys, tokens, passwords):
+
+1. Add `HasSecrets` to the derive list and `#[secret_prefix]` on the struct:
+
+```rust
+use zeroclaw_macros::HasSecrets;
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, HasSecrets)]
+#[secret_prefix = "channels.your_channel"]
+pub struct YourChannelConfig {
+    #[secret]
+    pub bot_token: String,
+    #[secret]
+    pub webhook_secret: Option<String>,
+    // Non-secret fields — no annotation needed
+    pub room_id: String,
+}
+```
+
+2. If your struct is nested inside a parent (e.g., `ChannelsConfig`), add `#[has_secrets]`
+   on the parent's field so the tree traversal finds it:
+
+```rust
+pub struct ChannelsConfig {
+    #[has_secrets]
+    pub your_channel: Option<YourChannelConfig>,
+}
+```
+
+That's it. The `#[secret]` annotation automatically:
+- Includes the field in `zeroclaw secret list`
+- Makes it settable via `zeroclaw secret set channels.your-channel.bot-token`
+- Encrypts it on config save and decrypts on load
+- Converts the field name from `snake_case` to `kebab-case` in the CLI
+
+Field names are derived automatically: `bot_token` on a struct with
+`#[secret_prefix = "channels.your_channel"]` becomes `channels.your-channel.bot-token`.
+
 ## How to Add a New Observer
 
 Create `src/observability/your_observer.rs`:

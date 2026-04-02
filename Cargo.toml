@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/robot-kit", "crates/aardvark-sys", "apps/tauri"]
+members = [".", "crates/robot-kit", "crates/aardvark-sys", "crates/zeroclaw-macros", "apps/tauri"]
 resolver = "2"
 
 [package]
@@ -34,6 +34,8 @@ name = "zeroclaw"
 path = "src/lib.rs"
 
 [dependencies]
+# Internal proc macros
+zeroclaw-macros = { path = "crates/zeroclaw-macros" }
 # CLI - minimal and fast
 clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"

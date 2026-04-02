@@ -587,12 +587,43 @@ Examples:
         install: bool,
     },
 
+    /// Manage encrypted secrets in config
+    #[command(long_about = "\
+Manage encrypted secrets stored in config.toml.
+
+Set or list sensitive values (API keys, bot tokens, recovery keys) \
+that are encrypted at rest using the local secret key.
+
+Secret names are auto-derived from config field paths:
+  channels.matrix.access-token, channels.discord.bot-token, api-key, etc.
+
+Examples:
+  zeroclaw secret list                            # show all secrets and status
+  zeroclaw secret set channels.matrix.access-token
+  zeroclaw secret set channels.discord.bot-token
+  zeroclaw secret set api-key")]
+    Secret {
+        #[command(subcommand)]
+        secret_command: SecretCommands,
+    },
+
     /// Manage WASM plugins
     #[cfg(feature = "plugins-wasm")]
     Plugin {
         #[command(subcommand)]
         plugin_command: PluginCommands,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SecretCommands {
+    /// Set an encrypted secret value (prompted with masked input)
+    Set {
+        /// Secret name (e.g. channels.matrix.access-token, api-key)
+        name: String,
+    },
+    /// List all supported secrets and whether they are currently set
+    List,
 }
 
 #[cfg(feature = "plugins-wasm")]
@@ -1617,6 +1648,50 @@ async fn main() -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
+                Ok(())
+            }
+        },
+
+        Commands::Secret { secret_command } => match secret_command {
+            SecretCommands::Set { name } => {
+                let entries = config.secret_fields();
+                if !entries.iter().any(|e| e.name == name) {
+                    anyhow::bail!(
+                        "Unknown secret '{name}'.\n\nRun `zeroclaw secret list` to see available secrets."
+                    );
+                }
+
+                let value = dialoguer::Password::new()
+                    .with_prompt(format!("Enter value for {name}"))
+                    .allow_empty_password(false)
+                    .interact()?;
+
+                let value = value.trim().to_string();
+                if value.is_empty() {
+                    anyhow::bail!("Value cannot be empty.");
+                }
+
+                config.set_secret(&name, value)?;
+                config.save().await?;
+                println!("{name} saved and encrypted.");
+                Ok(())
+            }
+            SecretCommands::List => {
+                let entries = config.secret_fields();
+                let mut current_category = "";
+
+                for entry in &entries {
+                    if entry.category != current_category {
+                        if !current_category.is_empty() {
+                            println!();
+                        }
+                        println!("{}:", entry.category);
+                        current_category = entry.category;
+                    }
+
+                    let status = if entry.is_set { "set" } else { "not set" };
+                    println!("  {:<45} [{}]", entry.name, status);
+                }
                 Ok(())
             }
         },
