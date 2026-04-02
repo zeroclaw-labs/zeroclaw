@@ -328,7 +328,17 @@ impl OpenAiProvider {
             .unwrap_or_default()
             .into_iter()
             .map(|tc| ProviderToolCall {
-                id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                id: tc.id.unwrap_or_else(|| {
+                    // Generate Mistral-compatible tool call ID (call_ + 9 alphanumeric chars)
+                    use rand::Rng;
+                    const CHARSET: &[u8] =
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+                    let mut rng = rand::thread_rng();
+                    let suffix: String = (0..9)
+                        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+                        .collect();
+                    format!("call_{}", suffix)
+                }),
                 name: tc.function.name,
                 arguments: tc.function.arguments,
             })
