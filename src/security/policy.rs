@@ -1589,8 +1589,12 @@ impl SecurityPolicy {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
-            allowed_commands: Arc::new(ArcSwap::from_pointee(autonomy_config.allowed_commands.clone())),
-            forbidden_paths: Arc::new(ArcSwap::from_pointee(autonomy_config.forbidden_paths.clone())),
+            allowed_commands: Arc::new(ArcSwap::from_pointee(
+                autonomy_config.allowed_commands.clone(),
+            )),
+            forbidden_paths: Arc::new(ArcSwap::from_pointee(
+                autonomy_config.forbidden_paths.clone(),
+            )),
             allowed_roots: autonomy_config
                 .allowed_roots
                 .iter()
@@ -1904,7 +1908,10 @@ mod tests {
     #[test]
     fn custom_allowlist() {
         let p = SecurityPolicy {
-            allowed_commands: Arc::new(ArcSwap::from_pointee(vec!["docker".into(), "kubectl".into()])),
+            allowed_commands: Arc::new(ArcSwap::from_pointee(vec![
+                "docker".into(),
+                "kubectl".into(),
+            ])),
             ..SecurityPolicy::default()
         };
         assert!(p.is_command_allowed("docker ps"));

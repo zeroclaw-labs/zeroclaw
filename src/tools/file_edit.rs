@@ -236,8 +236,8 @@ impl Tool for FileEditTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arc_swap::ArcSwap;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use arc_swap::ArcSwap;
 
     fn test_security(workspace: std::path::PathBuf) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {

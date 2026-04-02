@@ -231,8 +231,8 @@ impl Tool for ImageInfoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arc_swap::ArcSwap;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use arc_swap::ArcSwap;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {

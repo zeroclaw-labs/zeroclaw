@@ -1,6 +1,6 @@
-use arc_swap::ArcSwap;
 use crate::config::Config;
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use chrono::Utc;
 use std::future::Future;
 use std::path::PathBuf;
