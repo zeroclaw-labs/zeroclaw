@@ -110,13 +110,20 @@ pub async fn handle_api_status(
         channels.insert(channel.name().to_string(), serde_json::Value::Bool(present));
     }
 
+    let locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(crate::i18n::detect_locale);
+
     let body = serde_json::json!({
         "provider": config.default_provider,
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,
         "gateway_port": config.gateway.port,
-        "locale": "en",
+        "locale": locale,
         "memory_backend": state.mem.name(),
         "paired": state.pairing.is_paired(),
         "channels": channels,
