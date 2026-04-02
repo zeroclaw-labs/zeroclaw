@@ -97,6 +97,16 @@ fn base64url_no_pad(data: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(data)
 }
 
+/// Generate a tool call ID that is compatible with all providers including Mistral.
+/// Mistral requires tool_call_id to be a-z, A-Z, 0-9 with exactly 9 characters.
+fn generate_tool_call_id() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const CHARSET_LEN: u32 = 62;
+    (0..9)
+        .map(|_| CHARSET[(rand::random::<u32>() % CHARSET_LEN) as usize] as char)
+        .collect()
+}
+
 /// Apply auth to a request builder (usable from spawned tasks without `&self`).
 fn apply_auth_to_request(
     req: reqwest::RequestBuilder,
@@ -885,7 +895,7 @@ impl StreamToolCallAccumulator {
         };
 
         Some(ProviderToolCall {
-            id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            id: self.id.unwrap_or_else(generate_tool_call_id),
             name,
             arguments: normalized_arguments,
         })
@@ -1573,7 +1583,7 @@ impl OpenAiCompatibleProvider {
                         "{}".to_string()
                     };
                 Some(ProviderToolCall {
-                    id: tc.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                    id: tc.id.unwrap_or_else(generate_tool_call_id),
                     name,
                     arguments: normalized_arguments,
                 })
@@ -1968,8 +1978,11 @@ impl Provider for OpenAiCompatibleProvider {
                 let function = tc.function?;
                 let name = function.name?;
                 let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
+                // Use the ID from the API response if available, otherwise generate one.
+                // Mistral requires exactly 9 alphanumeric characters.
+                let id = tc.id.unwrap_or_else(generate_tool_call_id);
                 Some(ProviderToolCall {
-                    id: uuid::Uuid::new_v4().to_string(),
+                    id,
                     name,
                     arguments,
                 })
