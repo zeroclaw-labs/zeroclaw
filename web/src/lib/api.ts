@@ -305,38 +305,9 @@ export function getCost(): Promise<CostSummary> {
 // Sessions
 // ---------------------------------------------------------------------------
 
-/** Gateway session row shape returned by GET /api/sessions */
-interface GatewaySessionRow {
-  session_id?: string;
-  id?: string;
-  created_at?: string;
-  last_activity?: string;
-  message_count?: number;
-  name?: string;
-  channel?: string;
-  status?: 'active' | 'idle' | 'closed';
-}
-
 export function getSessions(): Promise<Session[]> {
-  return apiFetch<GatewaySessionRow[] | { sessions: GatewaySessionRow[] }>('/api/sessions').then(
-    (data) => {
-      const rows = unwrapField(data, 'sessions');
-      if (!Array.isArray(rows)) return [];
-      return rows
-        .map((row): Session | null => {
-          const id = row.session_id ?? row.id;
-          if (!id) return null;
-          return {
-            id,
-            channel: row.channel ?? row.name ?? 'gateway',
-            started_at: row.created_at ?? new Date().toISOString(),
-            last_activity: row.last_activity ?? row.created_at ?? new Date().toISOString(),
-            status: row.status ?? 'active',
-            message_count: row.message_count ?? 0,
-          };
-        })
-        .filter((s): s is Session => s !== null);
-    },
+  return apiFetch<Session[] | { sessions: Session[] }>('/api/sessions').then((data) =>
+    unwrapField(data, 'sessions'),
   );
 }
 
