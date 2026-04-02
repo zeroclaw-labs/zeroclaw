@@ -4249,10 +4249,26 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .slack
                 .as_ref()
                 .context("Slack channel is not configured")?;
+
+            // Support environment variables for Slack tokens
+            // Priority: config file value > SLACK_BOT_TOKEN env var
+            let bot_token = if sl.bot_token.is_empty() {
+                std::env::var("SLACK_BOT_TOKEN")
+                    .context("Slack bot_token is empty and SLACK_BOT_TOKEN env var is not set")?
+            } else {
+                sl.bot_token.clone()
+            };
+
+            let app_token = sl.app_token.clone().or_else(|| {
+                std::env::var("SLACK_APP_TOKEN")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            });
+
             Ok(Arc::new(
                 SlackChannel::new(
-                    sl.bot_token.clone(),
-                    sl.app_token.clone(),
+                    bot_token,
+                    app_token,
                     sl.channel_id.clone(),
                     sl.channel_ids.clone(),
                     sl.allowed_users.clone(),
