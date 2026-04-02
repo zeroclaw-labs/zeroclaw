@@ -1,3 +1,9 @@
+use crate::config::Config;
+use crate::config::schema::{
+    DiscordConfig, FeishuConfig, IMessageConfig, IrcConfig, LarkConfig, LarkReceiveMode,
+    MatrixConfig, MattermostConfig, NextcloudTalkConfig, SignalConfig, SlackConfig, StreamMode,
+    TelegramConfig, WhatsAppChatPolicy, WhatsAppConfig, WhatsAppWebMode,
+};
 use anyhow::{Context, Result};
 use crossterm::{
     ExecutableCommand,
@@ -12,14 +18,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
-use std::io;
-
-use crate::config::Config;
-use crate::config::schema::{
-    DiscordConfig, FeishuConfig, IMessageConfig, IrcConfig, LarkConfig, LarkReceiveMode,
-    MatrixConfig, MattermostConfig, NextcloudTalkConfig, SignalConfig, SlackConfig, StreamMode,
-    TelegramConfig, WhatsAppChatPolicy, WhatsAppConfig, WhatsAppWebMode,
-};
+use std::io::{self, IsTerminal};
 
 use super::theme;
 use super::widgets::{
