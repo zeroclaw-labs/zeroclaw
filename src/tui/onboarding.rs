@@ -14,7 +14,6 @@ use ratatui::{
 };
 use std::io::{self, IsTerminal};
 
-
 use crate::config::Config;
 use crate::config::schema::{
     DiscordConfig, FeishuConfig, IMessageConfig, IrcConfig, LarkConfig, LarkReceiveMode,
