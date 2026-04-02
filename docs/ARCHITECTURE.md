@@ -1861,91 +1861,134 @@ MoA: "쿠팡 저장된 계정이 있습니다.
 
 ---
 
-### Conversation Context Token Optimization — Memo Substitution
+### ACE — Adaptive Context Engine (MoA 핵심 특허 기술)
 
-MoA uses a **human-inspired memo substitution** strategy to maintain
-conversation continuity while minimizing token waste.
+MoA는 기존의 단순한 대화 이력 전달 방식을 완전히 대체하는 **4-Layer
+적응형 컨텍스트 엔진(ACE)**을 사용한다. 이 엔진은 토큰 비용을 최소화
+하면서도 과거 대화의 맥락을 최대한 풍부하게 유지한다.
 
-#### Core Insight
-
-Normal human conversation turns rarely exceed 2,000 characters.
-When a turn is longer, it's almost always:
-- Attached documents or reports
-- Search results or RAG output
-- Code blocks or technical analysis
-- Copy-pasted external content
-
-These are **reference material**, not conversational flow. Humans don't
-memorize entire documents mid-conversation — they take notes and refer
-back when needed. MoA does the same.
-
-#### How It Works
+#### 기존 방식의 근본적 문제
 
 ```
-Storage: Always stores FULL verbatim text (no data loss)
-Recall:  Smart context injection based on turn length
-
-Turn < 2,000 chars → Verbatim (natural conversation)
-Turn ≥ 2,000 chars → Memo substitution:
-
-  ┌─────────────────────────────────────────────────┐
-  │ Opening 300 chars  (대화 도입부 — 주제/맥락)      │
-  │ ─────────────────────────────────────────────── │
-  │ 📋 MEMO (10% of original):                      │
-  │   [콘텐츠 유형: 코드, URL, 검색결과]               │
-  │   섹션별 6W 요약:                                 │
-  │   - 주제1: 누가/무엇을/언제/어디서/왜/어떻게       │
-  │   - 주제2: ...                                   │
-  │   ▸ 질문/요청: 마지막 질문이나 제안                │
-  │ ─────────────────────────────────────────────── │
-  │ Closing 300 chars  (추가 질문, 대화 전환점)       │
-  └─────────────────────────────────────────────────┘
+기존: 최근 N개 메시지를 통째로 LLM에 전송
+  → 관련 없는 대화도 포함 (토큰 낭비)
+  → 오래된 관련 대화는 누락 (맥락 손실)
+  → 첨부문서가 매 턴 반복 전송 (비용 폭발)
 ```
 
-#### Proportional Memo Size (10% Rule)
-
-| Original | Memo Size | Rationale |
-|----------|-----------|-----------|
-| 2,000자 | ~200자 | Short professional content |
-| 10,000자 | ~1,000자 | Multi-topic analysis |
-| 50,000자 | ~5,000자 | Large document with many sections |
-| 100,000자 | ~10,000자 (cap) | Full report — section-level summaries |
-
-#### Memo Structure
-
-For multi-topic content, each section is summarized separately:
+#### ACE 4-Layer Architecture
 
 ```
-[코드, URL]
-§1. 대법원 2026다12345 — 임대차보호법 제3조 위반 | 원고 승소
-§2. 대법원 2026다67890 — 상가임대차 갱신권 | 기각, 임대인 정당사유 인정
-§3. 관련 하급심 — 서울고법 2025나45678 | 항소 기각
-▸ 질문: 두번째 판례 자세히 알려드릴까요?
+┌─────────────────────────────────────────────────────────────────┐
+│  MoA Adaptive Context Engine (ACE)                              │
+│                                                                 │
+│  Layer 0: Immediate Context (직전 10턴 원문 보존)               │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                     │
+│  • 직전 10턴(user+assistant) 원문 그대로 유지                   │
+│  • "방금 말한 거", "아까 그거" 즉시 참조 보장                   │
+│  • 절대 압축하지 않음, 절대 제거하지 않음                       │
+│  • Layer 1 첨부메모는 이 범위 내에서도 적용                     │
+│                                                                 │
+│  Layer 1: Attachment Memo (매 턴 즉시, 비용 제로)               │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                     │
+│  • 모든 대화 턴에서 첨부문서/코드/검색결과 콘텐츠 패턴 감지     │
+│  • 감지된 첨부(500자+) → 구조화된 YAML 메모로 대체              │
+│    ┌──────────────────────────────────────┐                     │
+│    │ 📋 첨부 메모 (코드, 원문 1400자):     │                     │
+│    │ 제목: Python 데이터 처리 스크립트       │                     │
+│    │ 키워드: pandas, DataFrame, merge       │                     │
+│    │ 요약: 데이터 로드 후 merge...          │                     │
+│    │ 원문접근: memory_recall로 검색 가능     │                     │
+│    └──────────────────────────────────────┘                     │
+│  • 일반 대화 텍스트는 길이에 관계없이 절대 건드리지 않음        │
+│  • 순수 규칙 기반 문자열 처리 — LLM 호출 없음, 비용 제로       │
+│                                                                 │
+│  Layer 2: RAG Context Enrichment (매 턴, 비용 제로)             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                     │
+│  ★ MoA 핵심 차별점 — 로컬 장기기억 기반 과거 대화 검색         │
+│                                                                 │
+│  2a. 장기기억 벡터+키워드 복합검색                               │
+│      → 현재 질문과 관련된 과거 대화만 선별                       │
+│      → 3일 전, 1주 전, 1달 전 대화도 관련 있으면 포함           │
+│      → 타임스탬프 포함, 시간순 정렬                              │
+│                                                                 │
+│  2b. 온톨로지 그래프 검색 (인물/사건/장소 관계)                  │
+│      → "김변호사" 언급 → 김변호사 관련 모든 관계 자동 검색      │
+│                                                                 │
+│  2c. 상호 교차검색 (기억 ↔ 온톨로지)                            │
+│      → 기억 키워드 → 온톨로지 검색                              │
+│      → 온톨로지 키워드 → 기억 검색                              │
+│                                                                 │
+│  • 로컬 SQLite-vec + FTS5 → ms 단위 검색 (비용 제로)           │
+│  • E2E 암호화 동기화로 모든 디바이스에서 동일 검색 결과         │
+│                                                                 │
+│  Layer 3: Budget Guard (예산 초과 시)                            │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                     │
+│  • 총 컨텍스트 예산: 모델 컨텍스트 윈도우 100% (기본 200만자)   │
+│  • 예산 초과 시: 교차검색 → RAG → 온톨로지 순으로 제거          │
+│  • Layer 0 (직전 10턴) + 프로필 + 지시사항은 절대 제거 안 함    │
+│  • ★ 제거된 기억을 이용자에게 안내:                             │
+│    "💡 아래 기억이 저장되어 있는데 검색해드릴까요?"              │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-#### On-Demand Deep Retrieval
+#### 기존 대비 차이
 
-When the memo is insufficient and the user needs full detail:
-1. LLM recognizes the topic from the memo
-2. Calls `memory_recall` with specific keywords
-3. Full original text is retrieved via vector/keyword search
-4. Injected as additional context for that specific question
+| | Claude Code | ChatGPT | MoA ACE |
+|---|-----------|---------|---------|
+| 과거 대화 | 세션 내에서만 | 요약만 보존 | **전체 이력 RAG 검색** |
+| 첨부문서 | 원문 반복 전송 | 원문 반복 전송 | **메모로 대체 (비용 제로)** |
+| 관련성 판단 | 시간순 전체 포함 | 없음 | **벡터+온톨로지 교차검색** |
+| 멀티디바이스 | 미지원 | 클라우드 한정 | **E2E 암호화 로컬 동기화** |
+| 예산 초과 | 강제 삭제 | 요약 | **이용자에게 숨겨진 기억 안내** |
 
+#### Memory Hygiene (기억 위생 시스템)
+
+MoA는 저장만 하는 정적 기억이 아닌 **살아있는 기억 관리 시스템**을 구현한다.
+
+**1. 정보 변경 감지 (Conflict Detection)**
 ```
-User: "아까 두번째 판례 원문 보여줘"
-  → LLM sees memo: "§2. 대법원 2026다67890 — 상가임대차 갱신권"
-  → memory_recall("대법원 2026다67890 상가임대차")
-  → Full 5,000 char analysis retrieved and provided
+이용자: "이사했어. 새 주소는 서초구 반포동이야"
+MoA: "기존 주소가 강남구 역삼동으로 저장되어 있는데,
+     서초구 반포동으로 업데이트할까요?"
+→ 확인 시 기존 정보 삭제, 새 정보로 대체
 ```
 
-#### Token Savings
+**2. 망각 요청 (Selective Forget)**
+```
+이용자: "전남편 관련 기억 다 지워줘"
+MoA: "관련 기억 47건이 저장되어 있습니다.
+     삭제하면 복구할 수 없습니다. 삭제할까요?"
+→ 명시적 확인 후 일괄 삭제
+```
 
-| Scenario | Without Memo | With Memo | Savings |
-|----------|-------------|-----------|---------|
-| 10-turn chat (3 long) | ~17,000자 | ~5,000자 | **70%** |
-| 20-turn coding session | ~40,000자 | ~8,000자 | **80%** |
-| Normal short chat | ~2,000자 | ~2,000자 | 0% |
-| 100K doc discussion | ~100,000자 | ~12,000자 | **88%** |
+**3. 빈도 기반 우선순위 (Recall Tracking)**
+- 자주 검색되는 기억 → `recall_count` 증가 → RAG 검색 우선순위 상승
+- 업무/가족 관련 기억이 자연스럽게 상위 노출
+
+**4. 핫 메모리 캐시 (Hot Cache)**
+- 프로필(7개) + 지시사항(5개 접두어) + 빈도 상위 50개 → 인메모리 캐시
+- 검색 속도: SQLite ~5ms → 캐시 ~0.01ms (500배 향상)
+- 캐시 무효화: 기억 변경 시 즉시, 5분마다 리프레시
+
+**항상 캐시되는 데이터:**
+```
+이용자 프로필           이용자 지시사항
+├── identity           ├── user_instruction_*
+├── family             ├── user_standing_order_*
+├── work               ├── user_cron_*
+├── lifestyle          ├── user_reminder_*
+├── communication      └── user_schedule_*
+├── routine
+└── moa_preferences
+```
+
+**구현 파일:**
+- `src/agent/loop_/context.rs` — `build_ace_context()`: Layer 0~3 통합 빌더
+- `src/agent/loop_/history.rs` — `memo_substitute_attachments()`: Layer 1 첨부 감지
+- `src/memory/traits.rs` — `MemoryConflict`, `track_recall()`, `forget_matching()`
+- `src/memory/hot_cache.rs` — `HotMemoryCache`: 인메모리 캐시
+- `src/config/schema.rs` — `AgentSessionConfig`: ACE 설정값
 
 ---
 

@@ -668,6 +668,49 @@ impl PromptSection for ToolUsageStrategySection {
             );
         }
 
+        // ── Memory hygiene (기억 위생 관리) ──
+        let has_memory_store = tool_names.contains(&"memory_store");
+        let has_memory_forget = tool_names.contains(&"memory_forget");
+        if has_memory_store || has_memory_forget {
+            out.push_str(
+                "### Memory Hygiene (기억 위생 관리)\n\n\
+                 You manage the user's personal memories. Follow these rules:\n\n\
+                 **1. 정보 변경 감지 (Conflict Detection):**\n\
+                 When the user mentions information that contradicts stored memories \
+                 (address change, job change, phone number change, relationship change), \
+                 ALWAYS ask for confirmation before updating:\n\
+                 ```\n\
+                 기존 정보: [이전 내용]\n\
+                 새 정보: [새로운 내용]\n\
+                 업데이트할까요?\n\
+                 ```\n\
+                 After confirmation, delete the old entry and store the new one.\n\n\
+                 **2. 망각 요청 (Forget Request):**\n\
+                 When the user says \"지워줘\", \"잊어줘\", \"삭제해줘\" about a topic/person, \
+                 ALWAYS confirm before deleting:\n\
+                 ```\n\
+                 [관련 기억 N건]이 저장되어 있습니다.\n\
+                 정말 삭제할까요? 삭제하면 복구할 수 없습니다.\n\
+                 ```\n\
+                 After explicit confirmation, use memory_forget to delete all related entries.\n\n\
+                 **3. 중요도 인식:**\n\
+                 Frequently referenced memories (user profile, work info, family info) are \
+                 automatically prioritized in search results. When you notice a memory is \
+                 being referenced repeatedly, it's a sign of high importance — preserve it carefully.\n\n\
+                 **4. 이용자 지시사항 저장 (Standing Orders):**\n\
+                 When the user gives a STANDING INSTRUCTION (recurring task, preference, directive), \
+                 ALWAYS save it with the appropriate key prefix:\n\
+                 - `user_instruction_<topic>`: 일반 지시 (\"항상 존칭 사용해줘\")\n\
+                 - `user_standing_order_<topic>`: 상시 지시 (\"모든 문서는 HWPX로 만들어줘\")\n\
+                 - `user_cron_<job_name>`: cron 작업 지시 (\"매일 9시에 날씨 알려줘\")\n\
+                 - `user_reminder_<topic>`: 리마인더 (\"매주 금요일 퇴근 전에 주간보고 리마인드\")\n\
+                 - `user_schedule_<topic>`: 일정 관련 (\"매월 15일 카드값 알림\")\n\n\
+                 These instructions are ALWAYS loaded into context and cached in memory. \
+                 MoA must never forget a user's standing order. They take priority over \
+                 general conversation in cron/heartbeat processing.\n\n",
+            );
+        }
+
         // ── 3-tier web search strategy ──
         let has_web_search = tool_names.contains(&"web_search");
         let has_perplexity_search = tool_names.contains(&"perplexity_search");

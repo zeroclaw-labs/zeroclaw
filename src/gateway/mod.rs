@@ -57,6 +57,9 @@ use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
+/// Extended body size for chat/LLM endpoints — conversation history with 50+
+/// messages can easily exceed 64KB. 2MB supports ~15K tokens of context.
+pub const CHAT_MAX_BODY_SIZE: usize = 2_097_152;
 /// Global request timeout (300s) — matches the chat endpoint timeout so the
 /// global `TimeoutLayer` does not override per-route extended timeouts.
 /// Slow-loris protection is better handled at the reverse-proxy level.
@@ -1107,10 +1110,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS),
         ));
 
-    // Chat endpoint needs extended timeout for agent loop with tool execution
-    // (web search, composio, etc.) — the default 30s global timeout is too short.
+    // Chat endpoint needs extended timeout and body limit for agent loop with
+    // tool execution and long conversation histories (15+ messages > 64KB).
     let chat_routes = Router::new()
         .route("/api/chat", post(openclaw_compat::handle_api_chat))
+        .layer(RequestBodyLimitLayer::new(CHAT_MAX_BODY_SIZE))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             Duration::from_secs(CHAT_REQUEST_TIMEOUT_SECS),
@@ -1231,7 +1235,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/health", get(api::handle_api_health))
         .route("/api/node-control", post(handle_node_control))
         // ── LLM proxy (hybrid architecture: keys stay on server) ──
-        .route("/api/llm/proxy", post(llm_proxy::handle_llm_proxy))
+        // Needs extended body limit — conversation history can exceed 64KB.
+        .nest("/api/llm", Router::new()
+            .route("/proxy", post(llm_proxy::handle_llm_proxy))
+            .layer(RequestBodyLimitLayer::new(CHAT_MAX_BODY_SIZE))
+        )
         // ── Document processing ──
         .route(
             "/api/document/process",

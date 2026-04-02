@@ -175,7 +175,16 @@ async fn run_agent_job(
     let name = job.name.clone().unwrap_or_else(|| "cron-job".to_string());
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
-    let model_override = job.model.clone();
+
+    // Economy tier: use MiniMax M2.7 for cron jobs when no explicit model is set.
+    // This saves ~88% vs Opus 4.6 for routine tasks (weather alerts, schedule reminders).
+    let model_override = job.model.clone().or_else(|| {
+        let (_, economy_model) =
+            crate::billing::llm_router::default_model_for_task(
+                crate::billing::llm_router::TaskCategory::CronRoutine,
+            );
+        Some(economy_model.to_string())
+    });
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {

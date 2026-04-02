@@ -363,10 +363,19 @@ pub(super) fn build_cross_session_context(
     }
 
     const HEADER: &str = "[Recent conversation history — verbatim, continue this conversation naturally]\n";
-    // Threshold for memo substitution: turns shorter than this are verbatim.
-    // Typical human conversation turns are well under 2000 chars.
-    // Longer turns are almost always documents, code, search results, or RAG output.
-    let memo_threshold = turn_max_chars.min(2000);
+
+    // ── 3-tier progressive compression thresholds ──
+    // Tier 1: 0~999 chars     → verbatim (normal conversation)
+    // Tier 2: 1000~1499 chars → keep first 70% verbatim, summarize last 30%
+    // Tier 3: 1500~1999 chars → keep first 50% verbatim, summarize last 50%
+    // Tier 4: 2000+ chars     → 10% proportional memo (existing logic)
+    //
+    // This is pure string processing — no LLM call, zero cost.
+    // Prevents gradual token bloat from medium-length turns that individually
+    // seem acceptable but collectively consume excessive context.
+    let memo_threshold_full = turn_max_chars.min(2000); // Tier 4 (full memo)
+    let memo_threshold_heavy = 1500; // Tier 3 (50% tail compression)
+    let memo_threshold_light = 1000; // Tier 2 (30% tail compression)
 
     let estimated = HEADER.len() + take_count.min(600) * 120;
     let mut ctx = String::with_capacity(estimated.min(max_bytes + 512));
@@ -378,12 +387,31 @@ pub(super) fn build_cross_session_context(
         let content = &turn.content;
         let char_count = content.chars().count();
 
-        let formatted = if char_count <= memo_threshold {
-            // ── Short turn: verbatim (natural conversation) ──
+        let formatted = if char_count < memo_threshold_light {
+            // ── Tier 1: Short turn (< 1000 chars) — verbatim ──
             format!("{label}: {content}\n")
+        } else if char_count < memo_threshold_heavy {
+            // ── Tier 2: Medium turn (1000~1499 chars) — keep 70%, compress tail 30% ──
+            let keep_chars = (char_count * 70) / 100;
+            let kept: String = content.chars().take(keep_chars).collect();
+            let tail: String = content.chars().skip(keep_chars).collect();
+            let tail_summary = summarize_section(&tail, (char_count * 5) / 100); // 5% summary
+            format!(
+                "{label}: {kept}\n  [📋 이하 {tail_len}자 축약: {tail_summary}]\n",
+                tail_len = char_count - keep_chars,
+            )
+        } else if char_count < memo_threshold_full {
+            // ── Tier 3: Long turn (1500~1999 chars) — keep 50%, compress tail 50% ──
+            let keep_chars = char_count / 2;
+            let kept: String = content.chars().take(keep_chars).collect();
+            let tail: String = content.chars().skip(keep_chars).collect();
+            let tail_summary = summarize_section(&tail, (char_count * 8) / 100); // 8% summary
+            format!(
+                "{label}: {kept}\n  [📋 이하 {tail_len}자 축약: {tail_summary}]\n",
+                tail_len = char_count - keep_chars,
+            )
         } else {
-            // ── Long turn: memo substitution ──
-            // Preserve: opening (~300 chars), closing (~300 chars), generate memo for middle
+            // ── Tier 4: Very long turn (2000+ chars) — 10% proportional memo ──
             let opening_chars = 300;
             let closing_chars = 300;
 
@@ -397,7 +425,6 @@ pub(super) fn build_cross_session_context(
                 .rev()
                 .collect();
 
-            // Generate a compact memo from the middle content
             let memo = generate_turn_memo(content, char_count);
 
             format!(
@@ -600,6 +627,355 @@ fn summarize_section(section: &str, budget: usize) -> String {
     topic
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// ACE (Adaptive Context Engine) — 4-Layer Context Builder
+// ═══════════════════════════════════════════════════════════════════
+
+/// Result from the ACE context builder, including any trimmed memories
+/// that the user should be notified about.
+pub(super) struct AceContextResult {
+    /// The constructed context string to prepend to the user message.
+    pub context: String,
+    /// If Layer 3 trimmed RAG results, this contains a notification
+    /// for the user about available but hidden memories.
+    pub trimmed_memories_notice: Option<String>,
+}
+
+/// Build context using the 4-layer ACE architecture.
+///
+/// - **Layer 0**: Immediate context — last `immediate_turns` of conversation (verbatim)
+/// - **Layer 1**: Attachment memo — already applied to history[] entries (no work here)
+/// - **Layer 2**: RAG enrichment — search long-term memory + ontology for related past conversations
+/// - **Layer 3**: Budget guard — trim oldest RAG results if total exceeds budget
+pub(super) async fn build_ace_context(
+    mem: &dyn Memory,
+    user_msg: &str,
+    min_relevance_score: f64,
+    session_id: Option<&str>,
+    ontology: Option<&OntologyRepo>,
+    _recent_turns: &[ChatMessage], // Layer 0 is managed by caller via history[]
+    config: &AceConfig,
+) -> AceContextResult {
+    let mut sections: Vec<ContextSection> = Vec::new();
+    let mut total_chars: usize = 0;
+
+    // ── Layer 0: Immediate context (직전 N턴 원문, 절대 제거 안 함) ──
+    // This is the "방금 말한 거", "아까 그거" reference window.
+    // Already in history[], so we don't add it to context preamble.
+    // Layer 0 is managed by the caller (loop_.rs) keeping history[] intact.
+
+    // ── Phase: Essential profile recall (항상 로드) ──
+    let profile_block = build_profile_context(mem).await;
+    if !profile_block.is_empty() {
+        let chars = profile_block.chars().count();
+        total_chars += chars;
+        sections.push(ContextSection {
+            content: profile_block,
+            chars,
+            priority: SectionPriority::Essential, // never trimmed
+            timestamp: None,
+        });
+    }
+
+    // ── Layer 2a: RAG memory search (관련 과거 대화 검색) ──
+    let mut seen_keys = HashSet::new();
+    if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
+        let relevant: Vec<_> = entries
+            .iter()
+            .filter(|e| {
+                e.score.map_or(true, |s| s >= min_relevance_score)
+                    && !memory::is_assistant_autosave_key(&e.key)
+            })
+            .collect();
+
+        if !relevant.is_empty() {
+            let mut block = String::from("[관련 과거 대화 및 기억 (RAG 검색)]\n");
+            for entry in &relevant {
+                seen_keys.insert(entry.key.clone());
+                let ts = if entry.timestamp.is_empty() {
+                    String::new()
+                } else {
+                    let short = if entry.timestamp.len() > 19 {
+                        &entry.timestamp[..19]
+                    } else {
+                        &entry.timestamp
+                    };
+                    format!(" [{}]", short)
+                };
+                let _ = writeln!(block, "- {}:{} {}", entry.key, ts, entry.content);
+            }
+            let chars = block.chars().count();
+            total_chars += chars;
+            // Use the most recent timestamp from entries for sorting
+            let latest_ts = relevant
+                .iter()
+                .filter_map(|e| {
+                    if e.timestamp.is_empty() { None } else { Some(e.timestamp.as_str()) }
+                })
+                .max()
+                .map(String::from);
+            sections.push(ContextSection {
+                content: block,
+                chars,
+                priority: SectionPriority::RagMemory,
+                timestamp: latest_ts,
+            });
+        }
+    }
+
+    // ── Layer 2b: Ontology graph search (인물/사건/장소 관계) ──
+    if let Some(repo) = ontology {
+        let owner = session_id.unwrap_or("cli_interactive");
+        if let Ok(objects) = repo.search_objects(owner, None, user_msg, MAX_ONTOLOGY_ENTRIES) {
+            if !objects.is_empty() {
+                let mut block = String::from("[관련 관계 정보 (온톨로지)]\n");
+                let mut cross_keywords = Vec::new();
+                for obj in &objects {
+                    let title = obj.title.as_deref().unwrap_or("(untitled)");
+                    let props = if obj.properties.is_null()
+                        || obj.properties.as_object().is_some_and(|m| m.is_empty())
+                    {
+                        String::new()
+                    } else {
+                        obj.properties.to_string()
+                    };
+                    if props.is_empty() {
+                        let _ = writeln!(block, "- {title}");
+                    } else {
+                        let _ = writeln!(block, "- {title}: {props}");
+                    }
+                    if let Some(t) = obj.title.as_deref() {
+                        cross_keywords.push(t.to_string());
+                    }
+                }
+
+                let chars = block.chars().count();
+                total_chars += chars;
+                sections.push(ContextSection {
+                    content: block,
+                    chars,
+                    priority: SectionPriority::Ontology,
+                    timestamp: None,
+                });
+
+                // ── Layer 2c: Cross-search (온톨로지 → 메모리 교차검색) ──
+                if !cross_keywords.is_empty() {
+                    let cross_query = cross_keywords.iter().take(5).cloned().collect::<Vec<_>>().join(" ");
+                    if let Ok(enriched) = mem.recall(&cross_query, MAX_CROSS_SEARCH_ENTRIES, session_id).await {
+                        let new_entries: Vec<_> = enriched
+                            .iter()
+                            .filter(|e| {
+                                e.score.unwrap_or(1.0) >= min_relevance_score
+                                    && !memory::is_assistant_autosave_key(&e.key)
+                                    && !seen_keys.contains(&e.key)
+                            })
+                            .collect();
+                        if !new_entries.is_empty() {
+                            let mut block = String::from("[교차검색 — 관련 추가 기억]\n");
+                            for entry in &new_entries {
+                                seen_keys.insert(entry.key.clone());
+                                let _ = writeln!(block, "- {}: {}", entry.key, entry.content);
+                            }
+                            let chars = block.chars().count();
+                            total_chars += chars;
+                            sections.push(ContextSection {
+                                content: block,
+                                chars,
+                                priority: SectionPriority::CrossSearch,
+                                timestamp: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Layer 3: Budget guard — trim oldest RAG results if over budget ──
+    let budget = config.total_budget_chars;
+    let mut trimmed_notice: Option<String> = None;
+
+    if total_chars > budget {
+        // Sort trimmable sections by priority (lowest first), then by age (oldest first)
+        let mut trimmable_indices: Vec<usize> = sections
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.priority.is_trimmable())
+            .map(|(i, _)| i)
+            .collect();
+
+        // Trim from lowest priority first (CrossSearch → RagMemory → Ontology)
+        trimmable_indices.sort_by(|&a, &b| {
+            sections[a].priority.rank().cmp(&sections[b].priority.rank())
+        });
+
+        let mut trimmed_summaries: Vec<String> = Vec::new();
+        let mut removed_indices = Vec::new();
+
+        for &idx in &trimmable_indices {
+            if total_chars <= budget {
+                break;
+            }
+            total_chars -= sections[idx].chars;
+            // Build a short summary of what was trimmed
+            let first_line = sections[idx]
+                .content
+                .lines()
+                .skip(1) // skip the header
+                .find(|l| l.trim().len() > 5)
+                .unwrap_or("(내용)")
+                .trim()
+                .chars()
+                .take(60)
+                .collect::<String>();
+            let ts = sections[idx].timestamp.as_deref().unwrap_or("날짜 미상");
+            trimmed_summaries.push(format!("  • [{ts}] {first_line}"));
+            removed_indices.push(idx);
+        }
+
+        // Remove trimmed sections (in reverse order to preserve indices)
+        removed_indices.sort_unstable();
+        for idx in removed_indices.into_iter().rev() {
+            sections.remove(idx);
+        }
+
+        // Build user notification about hidden memories
+        if !trimmed_summaries.is_empty() {
+            let notice = format!(
+                "\n---\n💡 아래 과거 기억이 저장되어 있지만 컨텍스트 예산 초과로 \
+                 이번 대화에는 포함되지 않았습니다:\n{}\n\
+                 추가로 검색해드릴까요? (\"기억 검색해줘\" 라고 말씀해주세요)\n---",
+                trimmed_summaries.join("\n")
+            );
+            trimmed_notice = Some(notice);
+        }
+    }
+
+    // Assemble final context
+    let mut context = String::with_capacity(total_chars + 512);
+    for section in &sections {
+        context.push_str(&section.content);
+        context.push('\n');
+    }
+
+    AceContextResult {
+        context,
+        trimmed_memories_notice: trimmed_notice,
+    }
+}
+
+/// ACE configuration passed to the context builder.
+pub(super) struct AceConfig {
+    pub total_budget_chars: usize,
+    pub rag_max_chars: usize,
+}
+
+struct ContextSection {
+    content: String,
+    chars: usize,
+    priority: SectionPriority,
+    timestamp: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SectionPriority {
+    Essential,   // user profile — never trimmed
+    Ontology,    // relationship graph — trimmed last
+    RagMemory,   // past conversation RAG — trimmed second
+    CrossSearch, // cross-referenced enrichment — trimmed first
+}
+
+impl SectionPriority {
+    fn is_trimmable(&self) -> bool {
+        !matches!(self, Self::Essential)
+    }
+
+    /// Lower rank = trimmed first
+    fn rank(&self) -> u8 {
+        match self {
+            Self::CrossSearch => 0,
+            Self::RagMemory => 1,
+            Self::Ontology => 2,
+            Self::Essential => 3,
+        }
+    }
+}
+
+/// Build profile + standing instructions context block (essential, always loaded).
+async fn build_profile_context(mem: &dyn Memory) -> String {
+    const ESSENTIAL_PROFILE_KEYS: &[&str] = &[
+        "user_profile_identity",
+        "user_profile_family",
+        "user_profile_work",
+        "user_profile_lifestyle",
+        "user_profile_communication",
+        "user_profile_routine",
+        "user_moa_preferences",
+    ];
+
+    /// Key prefixes for user instructions that must always be in context.
+    /// These are standing orders, cron directives, recurring reminders —
+    /// the user's "지시사항" that MoA must never forget.
+    const INSTRUCTION_PREFIXES: &[&str] = &[
+        "user_instruction_",
+        "user_standing_order_",
+        "user_cron_",
+        "user_reminder_",
+        "user_schedule_",
+    ];
+
+    let mut context = String::new();
+    let mut loaded = false;
+
+    // 1. User profile (항상 로드)
+    for key in ESSENTIAL_PROFILE_KEYS {
+        if let Ok(Some(entry)) = mem.get(key).await {
+            if !loaded {
+                context.push_str("[이용자 프로필 — 항상 로드]\n");
+                loaded = true;
+            }
+            let ts = format_short_timestamp(&entry.timestamp);
+            let _ = writeln!(context, "- {}:{} {}", entry.key, ts, entry.content);
+        }
+    }
+    if loaded {
+        context.push('\n');
+    }
+
+    // 2. User instructions & standing orders (항상 로드)
+    // "매일 9시에 날씨 알려줘", "항상 존칭 사용해줘" 등
+    if let Ok(all_entries) = mem.list(None, None).await {
+        let instructions: Vec<_> = all_entries
+            .iter()
+            .filter(|e| INSTRUCTION_PREFIXES.iter().any(|p| e.key.starts_with(p)))
+            .collect();
+
+        if !instructions.is_empty() {
+            context.push_str("[이용자 지시사항 — 항상 이행]\n");
+            for entry in &instructions {
+                let ts = format_short_timestamp(&entry.timestamp);
+                let _ = writeln!(context, "- {}:{} {}", entry.key, ts, entry.content);
+            }
+            context.push('\n');
+        }
+    }
+
+    context
+}
+
+fn format_short_timestamp(timestamp: &str) -> String {
+    if timestamp.is_empty() {
+        String::new()
+    } else {
+        let short = if timestamp.len() > 19 {
+            &timestamp[..19]
+        } else {
+            timestamp
+        };
+        format!(" [{}]", short)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,8 +1048,41 @@ mod tests {
             ChatMessage { role: "assistant".into(), content: "네, 변호사님! 무엇을 도와드릴까요?".into() },
         ];
         let ctx = build_cross_session_context(&turns, 0, 16000, 2000);
-        // Short turns should be verbatim
         assert!(ctx.contains("User: 안녕하세요 변호사님"));
         assert!(ctx.contains("Assistant: 네, 변호사님! 무엇을 도와드릴까요?"));
+    }
+
+    #[test]
+    fn build_cross_session_tier2_medium_turn_partial_compress() {
+        // 1000~1499 chars: keep 70%, compress tail 30%
+        let content = "가".repeat(1200);
+        let turns = vec![ChatMessage { role: "assistant".into(), content }];
+        let ctx = build_cross_session_context(&turns, 0, 32000, 2000);
+        // Should contain the 축약 marker
+        assert!(ctx.contains("축약"));
+        // Should NOT be fully verbatim (would be 1200 chars + label)
+        assert!(ctx.len() < 1200 * 3 + 100); // Korean chars are 3 bytes each
+    }
+
+    #[test]
+    fn build_cross_session_tier3_long_turn_half_compress() {
+        // 1500~1999 chars: keep 50%, compress tail 50%
+        let content = "나".repeat(1700);
+        let turns = vec![ChatMessage { role: "assistant".into(), content }];
+        let ctx = build_cross_session_context(&turns, 0, 32000, 2000);
+        assert!(ctx.contains("축약"));
+        // Should be significantly shorter than verbatim
+        assert!(ctx.len() < 1700 * 3);
+    }
+
+    #[test]
+    fn build_cross_session_under_1000_verbatim() {
+        // Under 1000 chars: fully verbatim
+        let content = "다".repeat(999);
+        let turns = vec![ChatMessage { role: "user".into(), content: content.clone() }];
+        let ctx = build_cross_session_context(&turns, 0, 32000, 2000);
+        assert!(!ctx.contains("축약"));
+        assert!(!ctx.contains("MEMO"));
+        assert!(ctx.contains(&content));
     }
 }

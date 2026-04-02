@@ -79,7 +79,7 @@ pub fn default_model_fallback_for_provider(provider_name: Option<&str>) -> &'sta
         "moonshot" => "kimi-k2.5",
         "hunyuan" => "hunyuan-t1-latest",
         "glm" | "zai" => "glm-5",
-        "minimax" => "MiniMax-M2.5",
+        "minimax" => "MiniMax-M2.7",
         "qwen" => "qwen-plus",
         "volcengine" => "doubao-1-5-pro-32k-250115",
         "siliconflow" => "Pro/zai-org/GLM-4.7",
@@ -1472,32 +1472,22 @@ pub enum AgentSessionStrategy {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentSessionConfig {
     /// Session backend to use. Options: "memory", "sqlite", "none".
-    /// Default: "sqlite" (persists conversation history across restarts).
-    /// Set to "none" to disable session persistence entirely.
     #[serde(default = "default_agent_session_backend")]
     pub backend: AgentSessionBackend,
 
     /// Strategy for resolving session IDs. Options: "per-sender", "per-channel", "main".
-    /// Default: "per-sender" (each user gets a unique session per channel).
     #[serde(default = "default_agent_session_strategy")]
     pub strategy: AgentSessionStrategy,
 
-    /// Time-to-live for sessions in seconds.
-    /// Default: 3600 (1 hour).
+    /// Time-to-live for sessions in seconds. Default: 3600 (1 hour).
     #[serde(default = "default_agent_session_ttl_seconds")]
     pub ttl_seconds: u64,
 
-    /// Maximum number of messages to retain per session.
-    /// Default: 50.
+    /// Maximum number of messages to retain per session. Default: 50.
     #[serde(default = "default_agent_session_max_messages")]
     pub max_messages: usize,
 
     /// Maximum recent conversation turns to load for cross-session context.
-    /// These turns are injected as `[Recent conversation history]` to maintain
-    /// conversational continuity across reconnections and page reloads.
-    /// Default: 600 (approximately 300 user-assistant exchanges).
-    /// Large coding sessions or deep topic discussions can easily reach 300+
-    /// exchanges; losing context mid-task is costly, so the limit is generous.
     #[serde(default = "default_cross_session_max_turns")]
     pub cross_session_max_turns: usize,
 
@@ -1507,15 +1497,38 @@ pub struct AgentSessionConfig {
     pub cross_session_max_age_secs: i64,
 
     /// Maximum total bytes for the cross-session conversation context block.
-    /// Default: 2400000 (~2.4 MB, sufficient for 600 turns at ~4 KB average).
     #[serde(default = "default_cross_session_max_bytes")]
     pub cross_session_max_bytes: usize,
 
     /// Maximum characters per individual turn in cross-session context.
-    /// Longer turns are truncated with "…".
-    /// Default: 2000 (generous for coding sessions with code blocks).
     #[serde(default = "default_cross_session_turn_max_chars")]
     pub cross_session_turn_max_chars: usize,
+
+    // ── ACE (Adaptive Context Engine) settings ──
+
+    /// Layer 0: Number of most-recent turns to always preserve verbatim.
+    /// These turns are never compressed or removed. Default: 10.
+    #[serde(default = "default_ace_layer0_immediate_turns")]
+    pub ace_immediate_turns: usize,
+
+    /// Layer 0: Time window (seconds) for "short-term memory".
+    /// Conversations within this window are included verbatim (subject to
+    /// Layer 1 attachment compression). Default: 259200 (72 hours / 3 days).
+    #[serde(default = "default_ace_shortterm_window_secs")]
+    pub ace_shortterm_window_secs: i64,
+
+    /// Layer 2 (RAG): Maximum characters for RAG-retrieved past conversations.
+    /// Relevant past conversations are searched via vector+keyword and included
+    /// up to this limit. Default: 60000 (~30K tokens Korean, ~15K tokens English).
+    #[serde(default = "default_ace_rag_max_chars")]
+    pub ace_rag_max_chars: usize,
+
+    /// Layer 3: Total context character budget (all layers combined).
+    /// When exceeded, oldest RAG results are trimmed first, and the user is
+    /// notified about available but hidden memories.
+    /// Default: 120000 (~60K-80K tokens depending on language).
+    #[serde(default = "default_ace_total_budget_chars")]
+    pub ace_total_budget_chars: usize,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1560,6 +1573,27 @@ fn default_cross_session_max_bytes() -> usize {
 
 fn default_cross_session_turn_max_chars() -> usize {
     6_000 // Full conversation turns — do NOT summarize, preserve exact wording and nuance
+}
+
+fn default_ace_layer0_immediate_turns() -> usize {
+    10 // 직전 10턴 원문 절대 보존
+}
+
+fn default_ace_shortterm_window_secs() -> i64 {
+    259_200 // 72시간 (3일) — "어제", "그제" 대화 맥락 유지
+}
+
+fn default_ace_rag_max_chars() -> usize {
+    1_200_000 // 컨텍스트 윈도우 100만 토큰의 약 60% (한국어 기준 ~120만자)
+    // 실제 RAG 검색 결과는 관련 대화만 선별하므로 이 한계에 도달할 일은 거의 없음.
+    // Layer 1 첨부메모가 이미 대용량 콘텐츠를 압축하므로 안전.
+}
+
+fn default_ace_total_budget_chars() -> usize {
+    2_000_000 // 컨텍스트 윈도우 100만 토큰 전체 (한영 혼합 평균 ~200만자)
+    // 실제 사용량은 Layer 0(~20K) + Layer 2 RAG(관련 대화만) ≈ 총 ~80K~150K자가 일반적.
+    // 최대치를 넓게 잡아도 Layer 0~2의 효율적 관리로 불필요한 낭비 없음.
+    // 소형 모델(128K 윈도우)에서는 config에서 축소 가능.
 }
 
 fn default_loop_detection_no_progress_threshold() -> usize {
@@ -1612,6 +1646,10 @@ impl Default for AgentSessionConfig {
             cross_session_max_age_secs: default_cross_session_max_age_secs(),
             cross_session_max_bytes: default_cross_session_max_bytes(),
             cross_session_turn_max_chars: default_cross_session_turn_max_chars(),
+            ace_immediate_turns: default_ace_layer0_immediate_turns(),
+            ace_shortterm_window_secs: default_ace_shortterm_window_secs(),
+            ace_rag_max_chars: default_ace_rag_max_chars(),
+            ace_total_budget_chars: default_ace_total_budget_chars(),
         }
     }
 }

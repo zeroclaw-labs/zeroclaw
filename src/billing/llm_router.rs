@@ -51,11 +51,16 @@ pub fn determine_access_mode(user_has_key: bool, user_selected_model: bool) -> P
 }
 
 /// Task category for default model routing.
+///
+/// MoA uses a 3-tier model strategy to optimize cost:
+/// - **Economy** (MiniMax M2.7): cron jobs, compaction, simple tasks — 1/8 of Opus cost
+/// - **Standard** (Gemini Flash Lite): general chat, search, media — 1/15 of Opus cost
+/// - **Premium** (Opus 4.6 / Gemini Pro): coding, legal docs, reasoning — highest quality
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskCategory {
     /// 일반 채팅 (General chat / web search)
     GeneralChat,
-    /// 추론/문서 (Reasoning / document analysis)
+    /// 추론/문서 (Reasoning / document analysis / legal writing)
     ReasoningDocument,
     /// 코딩 (Coding)
     Coding,
@@ -69,6 +74,12 @@ pub enum TaskCategory {
     Video,
     /// 통역 (Voice interpretation)
     Interpretation,
+    /// Cron 작업 / 반복 알림 (Economy tier — routine scheduled tasks)
+    CronRoutine,
+    /// 히스토리 요약 (Economy tier — compaction summarization)
+    Compaction,
+    /// 메모리 정리/분류 (Economy tier — memory housekeeping)
+    MemoryHousekeeping,
 }
 
 /// Default model assignment for each task category (Platform Default mode).
@@ -76,14 +87,29 @@ pub enum TaskCategory {
 /// These are used when the user has no API key and has not selected a model.
 pub fn default_model_for_task(task: TaskCategory) -> (&'static str, &'static str) {
     // Returns (provider, model_id)
+    //
+    // 3-Tier cost optimization:
+    //   Economy  (MiniMax M2.7):       cron, compaction, memory — ~$0.07/M input
+    //   Standard (Gemini Flash Lite):  chat, search, media     — ~$0.05/M input
+    //   Premium  (Opus 4.6 / Pro):     coding, legal, reasoning — ~$0.60/M input
     match task {
+        // ── Economy tier (MiniMax M2.7 — 1/8 of Opus cost) ──
+        // Text-only, no vision. MUST enforce user's language in system prompt
+        // to prevent multi-language mixing (Russian, Chinese, Arabic).
+        TaskCategory::CronRoutine => ("minimax", "MiniMax-M2.7"),
+        TaskCategory::Compaction => ("minimax", "MiniMax-M2.7"),
+        TaskCategory::MemoryHousekeeping => ("minimax", "MiniMax-M2.7"),
+
+        // ── Standard tier (Gemini Flash Lite — 1/15 of Opus cost) ──
         TaskCategory::GeneralChat => ("gemini", "gemini-3.1-flash-lite-preview"),
-        TaskCategory::ReasoningDocument => ("gemini", "gemini-3.1-pro-preview"),
-        TaskCategory::Coding => ("anthropic", "claude-opus-4-6"),
-        TaskCategory::CodeReview => ("gemini", "gemini-3.1-pro-preview"),
         TaskCategory::Image => ("gemini", "gemini-3.1-flash-lite-preview"),
         TaskCategory::Music => ("gemini", "gemini-3.1-flash-lite-preview"),
         TaskCategory::Video => ("gemini", "gemini-3.1-flash-lite-preview"),
+
+        // ── Premium tier (highest quality) ──
+        TaskCategory::ReasoningDocument => ("gemini", "gemini-3.1-pro-preview"),
+        TaskCategory::Coding => ("anthropic", "claude-opus-4-6"),
+        TaskCategory::CodeReview => ("gemini", "gemini-3.1-pro-preview"),
         TaskCategory::Interpretation => ("gemini", "gemini-2.5-flash"),
     }
 }
