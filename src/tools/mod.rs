@@ -282,6 +282,7 @@ pub fn all_tools_with_runtime(
             security.clone(),
             web_fetch_config.allowed_domains.clone(),
             web_fetch_config.blocked_domains.clone(),
+            web_fetch_config.allowed_private_hosts.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
         )));

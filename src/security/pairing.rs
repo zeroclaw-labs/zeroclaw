@@ -55,7 +55,9 @@ impl PairingGuard {
     /// Create a new pairing guard.
     ///
     /// If `require_pairing` is true and no tokens exist yet, a fresh
-    /// pairing code is generated and returned via `pairing_code()`.
+    /// pairing code is generated and printed to the terminal. Once
+    /// paired, no code is generated on restart — operators can use
+    /// `generate_new_pairing_code()` or the CLI to create one on demand.
     ///
     /// Existing tokens are accepted in both forms:
     /// - Plaintext (`zc_...`): hashed on load for backward compatibility
@@ -84,7 +86,7 @@ impl PairingGuard {
         }
     }
 
-    /// The one-time pairing code (only set when no tokens exist yet).
+    /// The one-time pairing code (generated only on first startup when no tokens exist).
     pub fn pairing_code(&self) -> Option<String> {
         self.pairing_code.lock().clone()
     }
@@ -216,6 +218,34 @@ impl PairingGuard {
         let tokens = self.paired_tokens.lock();
         tokens.iter().cloned().collect()
     }
+
+    /// Generate a new pairing code, even if already paired.
+    ///
+    /// This allows adding additional clients without restarting the gateway.
+    /// The new code can be used exactly once to pair a new client.
+    pub fn generate_new_pairing_code(&self) -> Option<String> {
+        if !self.require_pairing {
+            return None;
+        }
+        let new_code = generate_code();
+        *self.pairing_code.lock() = Some(new_code.clone());
+        Some(new_code)
+    }
+
+    /// Get the token hash for a given plaintext token (for device registry lookup).
+    pub fn token_hash(token: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(token.as_bytes()))
+    }
+
+    /// Check if a token is paired and return its hash.
+    pub fn authenticate_and_hash(&self, token: &str) -> Option<String> {
+        if self.is_authenticated(token) {
+            Some(Self::token_hash(token))
+        } else {
+            None
+        }
+    }
 }
 
 /// Normalize a client identifier: trim whitespace, map empty to `"unknown"`.
@@ -283,8 +313,21 @@ fn is_token_hash(value: &str) -> bool {
 
 /// Constant-time string comparison to prevent timing attacks.
 ///
-/// Does not short-circuit on length mismatch — always iterates over the
-/// longer input to avoid leaking length information via timing.
+/// This function is critical to the security of the pairing mechanism:
+/// when verifying the one-time pairing code, timing side-channels could
+/// allow an attacker to deduce the correct code character-by-character.
+///
+/// Implementation details that ensure constant-time execution:
+/// 1. Does not short-circuit on length mismatch — always iterates over
+///    the longer input to avoid leaking length information via timing.
+/// 2. Uses bitwise AND (&) instead of logical AND (&&) to ensure both
+///    comparisons always execute, preventing timing variations that could
+///    reveal whether the length check or byte comparison failed first.
+///
+/// SECURITY NOTE: The use of `&` instead of `&&` is intentional and
+/// required for constant-time behavior. Do not change to `&&` or clippy
+/// suggestions that would reintroduce short-circuit evaluation.
+#[allow(clippy::needless_bitwise_bool)]
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
@@ -301,6 +344,8 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
         let y = *b.get(i).unwrap_or(&0);
         byte_diff |= x ^ y;
     }
+    // Intentional use of bitwise & (not &&) to ensure constant-time execution
+    // and prevent timing side-channel attacks. Both comparisons must execute.
     (len_diff == 0) & (byte_diff == 0)
 }
 

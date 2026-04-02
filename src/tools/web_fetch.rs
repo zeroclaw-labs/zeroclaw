@@ -18,6 +18,7 @@ pub struct WebFetchTool {
     security: Arc<SecurityPolicy>,
     allowed_domains: Vec<String>,
     blocked_domains: Vec<String>,
+    allowed_private_hosts: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
 }
@@ -27,6 +28,7 @@ impl WebFetchTool {
         security: Arc<SecurityPolicy>,
         allowed_domains: Vec<String>,
         blocked_domains: Vec<String>,
+        allowed_private_hosts: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
     ) -> Self {
@@ -34,6 +36,7 @@ impl WebFetchTool {
             security,
             allowed_domains: normalize_allowed_domains(allowed_domains),
             blocked_domains: normalize_allowed_domains(blocked_domains),
+            allowed_private_hosts: normalize_allowed_domains(allowed_private_hosts),
             max_response_size,
             timeout_secs,
         }
@@ -44,6 +47,7 @@ impl WebFetchTool {
             raw_url,
             &self.allowed_domains,
             &self.blocked_domains,
+            &self.allowed_private_hosts,
             "web_fetch",
         )
     }
@@ -270,6 +274,7 @@ fn validate_target_url(
     raw_url: &str,
     allowed_domains: &[String],
     blocked_domains: &[String],
+    allowed_private_hosts: &[String],
     tool_name: &str,
 ) -> anyhow::Result<String> {
     let url = raw_url.trim();
@@ -295,8 +300,13 @@ fn validate_target_url(
 
     let host = extract_host(url)?;
 
-    if is_private_or_local_host(&host) {
-        anyhow::bail!("Blocked local/private host: {host}");
+    // Check if host is explicitly allowed as a private host
+    let private_host_allowed = host_matches_allowlist(&host, allowed_private_hosts);
+
+    if !private_host_allowed {
+        if is_private_or_local_host(&host) {
+            anyhow::bail!("Blocked local/private host: {host}");
+        }
     }
 
     if host_matches_allowlist(&host, blocked_domains) {
@@ -307,7 +317,10 @@ fn validate_target_url(
         anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
     }
 
-    validate_resolved_host_is_public(&host)?;
+    // Skip DNS resolution check for explicitly allowed private hosts
+    if !private_host_allowed {
+        validate_resolved_host_is_public(&host)?;
+    }
 
     Ok(url.to_string())
 }
@@ -527,6 +540,26 @@ mod tests {
             security,
             allowed_domains.into_iter().map(String::from).collect(),
             blocked_domains.into_iter().map(String::from).collect(),
+            vec![], // allowed_private_hosts
+            500_000,
+            30,
+        )
+    }
+
+    fn test_tool_with_private_hosts(
+        allowed_domains: Vec<&str>,
+        blocked_domains: Vec<&str>,
+        allowed_private_hosts: Vec<&str>,
+    ) -> WebFetchTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
+        WebFetchTool::new(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            blocked_domains.into_iter().map(String::from).collect(),
+            allowed_private_hosts.into_iter().map(String::from).collect(),
             500_000,
             30,
         )
@@ -620,7 +653,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = WebFetchTool::new(security, vec![], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(security, vec![], vec![], vec![], 500_000, 30);
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -677,10 +710,12 @@ mod tests {
     fn redirect_target_validation_allows_permitted_host() {
         let allowed = vec!["example.com".to_string()];
         let blocked = vec![];
+        let allowed_private: Vec<String> = vec![];
         assert!(validate_target_url(
             "https://docs.example.com/page",
             &allowed,
             &blocked,
+            &allowed_private,
             "web_fetch"
         )
         .is_ok());
@@ -690,7 +725,8 @@ mod tests {
     fn redirect_target_validation_blocks_private_host() {
         let allowed = vec!["example.com".to_string()];
         let blocked = vec![];
-        let err = validate_target_url("https://127.0.0.1/admin", &allowed, &blocked, "web_fetch")
+        let allowed_private: Vec<String> = vec![];
+        let err = validate_target_url("https://127.0.0.1/admin", &allowed, &blocked, &allowed_private, "web_fetch")
             .unwrap_err()
             .to_string();
         assert!(err.contains("local/private"));
@@ -700,10 +736,50 @@ mod tests {
     fn redirect_target_validation_blocks_blocklisted_host() {
         let allowed = vec!["*".to_string()];
         let blocked = vec!["evil.com".to_string()];
-        let err = validate_target_url("https://evil.com/phish", &allowed, &blocked, "web_fetch")
+        let allowed_private: Vec<String> = vec![];
+        let err = validate_target_url("https://evil.com/phish", &allowed, &blocked, &allowed_private, "web_fetch")
             .unwrap_err()
             .to_string();
         assert!(err.contains("blocked_domains"));
+    }
+
+    // ── Allowed private hosts ────────────────────────────────────
+
+    #[test]
+    fn allowed_private_host_bypasses_private_check() {
+        let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["home.local:8123"]);
+        // This should not fail with "local/private" error because home.local:8123 is in allowed_private_hosts
+        // Note: It will still fail because home.local is not in allowed_domains (unless * is there)
+        let result = tool.validate_url("https://home.local:8123/api");
+        // Should be OK because * is in allowed_domains and home.local:8123 is in allowed_private_hosts
+        assert!(result.is_ok(), "Allowed private host should bypass private check");
+    }
+
+    #[test]
+    fn allowed_private_host_without_port() {
+        let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["internal.example.com"]);
+        let result = tool.validate_url("https://internal.example.com/api");
+        assert!(result.is_ok(), "Allowed private host without port should work");
+    }
+
+    #[test]
+    fn unallowed_private_host_still_blocked() {
+        let tool = test_tool(vec!["*"]);
+        let err = tool
+            .validate_url("https://192.168.1.100:8080")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("local/private"), "Unallowed private host should still be blocked");
+    }
+
+    #[test]
+    fn blocklist_overrides_allowed_private_host() {
+        let tool = test_tool_with_private_hosts(vec!["*"], vec!["evil.local"], vec!["evil.local:8080"]);
+        let err = tool
+            .validate_url("https://evil.local:8080")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("blocked_domains"), "Blocklist should override allowed_private_hosts");
     }
 
     // ── Security policy ──────────────────────────────────────────
@@ -714,7 +790,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], vec![], 500_000, 30);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -729,7 +805,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], 500_000, 30);
+        let tool = WebFetchTool::new(security, vec!["example.com".into()], vec![], vec![], 500_000, 30);
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -752,6 +828,7 @@ mod tests {
         let tool = WebFetchTool::new(
             Arc::new(SecurityPolicy::default()),
             vec!["example.com".into()],
+            vec![],
             vec![],
             10,
             30,

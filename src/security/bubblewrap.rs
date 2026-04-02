@@ -206,13 +206,15 @@ mod tests {
         // Find the index of usr/lib symlink target and verify the pattern
         let lib_idx = args.iter().position(|a| a == "usr/lib").unwrap();
         assert_eq!(
-            args[lib_idx + 1], "/lib",
+            args[lib_idx + 1],
+            "/lib",
             "usr/lib should be symlinked to /lib"
         );
 
         let lib64_idx = args.iter().position(|a| a == "usr/lib64").unwrap();
         assert_eq!(
-            args[lib64_idx + 1], "/lib64",
+            args[lib64_idx + 1],
+            "/lib64",
             "usr/lib64 should be symlinked to /lib64"
         );
     }
