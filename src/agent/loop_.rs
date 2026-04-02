@@ -2299,9 +2299,9 @@ pub(crate) async fn run_tool_call_loop(
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
-    /// When `true`, native tool calling is disabled regardless of provider capability.
-    /// This respects `[agent] tool_dispatcher = "xml"` in config.toml, forcing the
-    /// model to use `<tool_call>` XML format injected via the system prompt instead.
+    // When true, native tool calling is disabled regardless of provider capability.
+    // Respects `[agent] tool_dispatcher = "xml"` in config.toml, forcing the model
+    // to use `<tool_call>` XML format injected via the system prompt instead.
     force_xml_tools: bool,
 ) -> Result<String> {
     let max_iterations = if max_tool_iterations == 0 {
