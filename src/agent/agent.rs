@@ -35,6 +35,18 @@ pub enum TurnEvent {
     },
     /// A tool has returned a result.
     ToolResult { name: String, output: String },
+    /// Runtime trace event for observability (not forwarded to WebSocket clients).
+    ///
+    /// This variant is used internally to emit audit events that are recorded
+    /// by the runtime_trace system but not sent to end users.
+    Trace {
+        event_type: String,
+        turn_id: String,
+        provider: String,
+        model: String,
+        success: Option<bool>,
+        payload: serde_json::Value,
+    },
 }
 
 pub struct Agent {
@@ -908,6 +920,7 @@ impl Agent {
         &mut self,
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        provider_name: &str,
     ) -> Result<String> {
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
@@ -952,8 +965,11 @@ impl Agent {
 
         let effective_model = self.classify_model(user_message);
 
+        // Generate turn_id for runtime_trace correlation
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
         // ── Turn loop ──────────────────────────────────────────────────
-        for _ in 0..self.config.max_tool_iterations {
+        for iteration in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
 
             // Response cache check (same as turn)
@@ -996,11 +1012,27 @@ impl Agent {
                 });
             }
 
+            // ── Trace: LLM request ────────────────────────────────────
+            let _ = event_tx
+                .send(TurnEvent::Trace {
+                    event_type: "llm_request".to_string(),
+                    turn_id: turn_id.clone(),
+                    provider: provider_name.to_string(),
+                    model: effective_model.clone(),
+                    success: None,
+                    payload: serde_json::json!({
+                        "iteration": iteration + 1,
+                        "messages_count": messages.len(),
+                    }),
+                })
+                .await;
+
             // ── Streaming LLM call ────────────────────────────────────
             // Try streaming first; if the provider returns content we
             // forward deltas.  Otherwise fall back to non-streaming chat.
             use futures_util::StreamExt;
 
+            let llm_started_at = std::time::Instant::now();
             let stream_opts = crate::providers::traits::StreamOptions::new(true);
             let mut stream = self.provider.stream_chat(
                 crate::providers::ChatRequest {
@@ -1103,9 +1135,48 @@ impl Agent {
                     .await
                 {
                     Ok(resp) => resp,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        // ── Trace: LLM response (error) ──────────────────
+                        let safe_error = crate::providers::sanitize_api_error(&err.to_string());
+                        let _ = event_tx
+                            .send(TurnEvent::Trace {
+                                event_type: "llm_response".to_string(),
+                                turn_id: turn_id.clone(),
+                                provider: provider_name.to_string(),
+                                model: effective_model.clone(),
+                                success: Some(false),
+                                payload: serde_json::json!({
+                                    "iteration": iteration + 1,
+                                    "duration_ms": llm_started_at.elapsed().as_millis(),
+                                    "error": safe_error,
+                                }),
+                            })
+                            .await;
+                        return Err(err);
+                    }
                 }
             };
+
+            // ── Trace: LLM response (success) ────────────────────────
+            let _ = event_tx
+                .send(TurnEvent::Trace {
+                    event_type: "llm_response".to_string(),
+                    turn_id: turn_id.clone(),
+                    provider: provider_name.to_string(),
+                    model: effective_model.clone(),
+                    success: Some(true),
+                    payload: serde_json::json!({
+                        "iteration": iteration + 1,
+                        "duration_ms": llm_started_at.elapsed().as_millis(),
+                        "input_tokens": response.usage.as_ref().and_then(|u| u.input_tokens),
+                        "output_tokens": response.usage.as_ref().and_then(|u| u.output_tokens),
+                        "raw_response": crate::agent::loop_::scrub_credentials(
+                            response.text.as_deref().unwrap_or("")
+                        ),
+                        "tool_calls": response.tool_calls.len(),
+                    }),
+                })
+                .await;
 
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
@@ -1114,6 +1185,21 @@ impl Agent {
                 } else {
                     text
                 };
+
+                // ── Trace: turn final response ───────────────────────
+                let _ = event_tx
+                    .send(TurnEvent::Trace {
+                        event_type: "turn_final_response".to_string(),
+                        turn_id: turn_id.clone(),
+                        provider: provider_name.to_string(),
+                        model: effective_model.clone(),
+                        success: Some(true),
+                        payload: serde_json::json!({
+                            "iteration": iteration + 1,
+                            "text": crate::agent::loop_::scrub_credentials(&final_text),
+                        }),
+                    })
+                    .await;
 
                 // Store in response cache
                 if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
@@ -1160,6 +1246,22 @@ impl Agent {
 
             // Notify about each tool call
             for call in &calls {
+                // ── Trace: tool call start ───────────────────────────
+                let _ = event_tx
+                    .send(TurnEvent::Trace {
+                        event_type: "tool_call_start".to_string(),
+                        turn_id: turn_id.clone(),
+                        provider: provider_name.to_string(),
+                        model: effective_model.clone(),
+                        success: None,
+                        payload: serde_json::json!({
+                            "iteration": iteration + 1,
+                            "tool": call.name.clone(),
+                            "arguments": crate::agent::loop_::scrub_credentials(&call.arguments.to_string()),
+                        }),
+                    })
+                    .await;
+
                 let _ = event_tx
                     .send(TurnEvent::ToolCall {
                         name: call.name.clone(),
@@ -1172,6 +1274,23 @@ impl Agent {
 
             // Notify about each tool result
             for result in &results {
+                // ── Trace: tool call result ──────────────────────────
+                let _ = event_tx
+                    .send(TurnEvent::Trace {
+                        event_type: "tool_call_result".to_string(),
+                        turn_id: turn_id.clone(),
+                        provider: provider_name.to_string(),
+                        model: effective_model.clone(),
+                        success: Some(result.success),
+                        payload: serde_json::json!({
+                            "iteration": iteration + 1,
+                            "tool": result.name.clone(),
+                            "duration_ms": 0, // turn_streamed doesn't track tool execution time
+                            "output": crate::agent::loop_::scrub_credentials(&result.output),
+                        }),
+                    })
+                    .await;
+
                 let _ = event_tx
                     .send(TurnEvent::ToolResult {
                         name: result.name.clone(),
@@ -1184,6 +1303,20 @@ impl Agent {
             self.history.push(formatted);
             self.trim_history();
         }
+
+        // ── Trace: tool loop exhausted ────────────────────────────
+        let _ = event_tx
+            .send(TurnEvent::Trace {
+                event_type: "tool_loop_exhausted".to_string(),
+                turn_id,
+                provider: provider_name.to_string(),
+                model: effective_model,
+                success: Some(false),
+                payload: serde_json::json!({
+                    "iterations": self.config.max_tool_iterations,
+                }),
+            })
+            .await;
 
         anyhow::bail!(
             "Agent exceeded maximum tool iterations ({})",
@@ -1847,7 +1980,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
         let response = agent
-            .turn_streamed("use the echo tool", event_tx)
+            .turn_streamed("use the echo tool", event_tx, "test-provider")
             .await
             .unwrap();
         assert_eq!(response, "stream-done");
