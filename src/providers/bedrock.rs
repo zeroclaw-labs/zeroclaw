@@ -675,10 +675,39 @@ impl BedrockProvider {
             }
         }
 
+        // ── Sanitize: remove empty text blocks ──────────────────
+        // Bedrock rejects ContentBlock objects with blank text fields
+        // (400: "The text field in the ContentBlock object is blank").
+        // This can happen when the daemon is restarted mid-response and
+        // a partially-received assistant message is persisted with empty
+        // content, or from bot/attachment-only messages in history.
+        for msg in &mut converse_messages {
+            msg.content.retain(|block| match block {
+                ContentBlock::Text(tb) => !tb.text.is_empty(),
+                _ => true,
+            });
+        }
+
+        // Drop messages that ended up with no content blocks (Bedrock
+        // also rejects messages with an empty content array).
+        converse_messages.retain(|msg| !msg.content.is_empty());
+
         let system = if system_blocks.is_empty() {
             None
         } else {
-            Some(system_blocks)
+            // Filter empty system blocks too
+            let system_blocks: Vec<_> = system_blocks
+                .into_iter()
+                .filter(|sb| match sb {
+                    SystemBlock::Text(tb) => !tb.text.is_empty(),
+                    _ => true,
+                })
+                .collect();
+            if system_blocks.is_empty() {
+                None
+            } else {
+                Some(system_blocks)
+            }
         };
         (system, converse_messages)
     }
@@ -1820,5 +1849,68 @@ mod tests {
         } else {
             panic!("Expected ToolResult");
         }
+    }
+
+    // ── Empty content block sanitization tests ─────────────────
+
+    #[test]
+    fn convert_messages_strips_empty_assistant_text() {
+        // Simulates a truncated assistant response saved with empty content
+        // (e.g., daemon restarted mid-response). Must not produce a blank
+        // text ContentBlock that Bedrock would reject.
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant(""),
+            ChatMessage::user("Are you there?"),
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        // The empty assistant message should be dropped entirely
+        assert_eq!(msgs.len(), 2, "Empty assistant message should be dropped");
+        assert_eq!(msgs[0].role, "user");
+        assert_eq!(msgs[1].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_strips_whitespace_only_assistant_text() {
+        // Whitespace-only content should also be filtered (Bedrock rejects it)
+        // Note: the current code creates TextBlock { text: "  " } which is
+        // non-empty, so it survives the filter. This is intentional — Bedrock
+        // accepts whitespace-only text, just not empty string.
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("  "),
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        // Whitespace-only is NOT empty, so it should survive
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn convert_messages_keeps_tool_use_when_empty_text_stripped() {
+        // Assistant message with tool calls but empty text content.
+        // The tool_use blocks must survive even after empty text is stripped.
+        let tool_call_json = r#"{"content": "", "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
+        let messages = vec![
+            ChatMessage::user("Run ls"),
+            ChatMessage::assistant(tool_call_json),
+        ];
+        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].role, "assistant");
+        // Should have only the tool_use block, no empty text block
+        assert_eq!(msgs[1].content.len(), 1);
+        assert!(matches!(msgs[1].content[0], ContentBlock::ToolUse(_)));
+    }
+
+    #[test]
+    fn convert_messages_empty_system_filtered() {
+        let messages = vec![
+            ChatMessage::system(""),
+            ChatMessage::user("Hello"),
+        ];
+        let (system, msgs) = BedrockProvider::convert_messages(&messages);
+        // Empty system block should be filtered out
+        assert!(system.is_none(), "Empty system block should be filtered");
+        assert_eq!(msgs.len(), 1);
     }
 }
