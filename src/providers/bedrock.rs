@@ -700,7 +700,7 @@ impl BedrockProvider {
                 .into_iter()
                 .filter(|sb| match sb {
                     SystemBlock::Text(tb) => !tb.text.is_empty(),
-                    _ => true,
+                    SystemBlock::CachePoint(_) => true,
                 })
                 .collect();
             if system_blocks.is_empty() {
@@ -1876,10 +1876,7 @@ mod tests {
         // Note: the current code creates TextBlock { text: "  " } which is
         // non-empty, so it survives the filter. This is intentional — Bedrock
         // accepts whitespace-only text, just not empty string.
-        let messages = vec![
-            ChatMessage::user("Hello"),
-            ChatMessage::assistant("  "),
-        ];
+        let messages = vec![ChatMessage::user("Hello"), ChatMessage::assistant("  ")];
         let (_, msgs) = BedrockProvider::convert_messages(&messages);
         // Whitespace-only is NOT empty, so it should survive
         assert_eq!(msgs.len(), 2);
@@ -1904,10 +1901,7 @@ mod tests {
 
     #[test]
     fn convert_messages_empty_system_filtered() {
-        let messages = vec![
-            ChatMessage::system(""),
-            ChatMessage::user("Hello"),
-        ];
+        let messages = vec![ChatMessage::system(""), ChatMessage::user("Hello")];
         let (system, msgs) = BedrockProvider::convert_messages(&messages);
         // Empty system block should be filtered out
         assert!(system.is_none(), "Empty system block should be filtered");
