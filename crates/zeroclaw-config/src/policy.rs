@@ -605,9 +605,13 @@ fn contains_unsafe_output_redirect(command: &str) -> bool {
     // Strip safe redirect-to-dev and fd-merge patterns, then check for remaining `>`.
     // Order matters: longer patterns first to avoid partial matches.
     let safe = command
+        .replace("> /dev/stdout", "")
         .replace(">/dev/stdout", "")
+        .replace("> /dev/stderr", "")
         .replace(">/dev/stderr", "")
+        .replace("> /dev/null", "")
         .replace(">/dev/null", "")
+        .replace("> /dev/zero", "")
         .replace(">/dev/zero", "")
         .replace("2>&1", "")
         .replace("1>&2", "");
