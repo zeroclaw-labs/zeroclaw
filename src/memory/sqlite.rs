@@ -616,6 +616,14 @@ impl Memory for SqliteMemory {
                 .await;
         }
 
+        // Wildcard query: return all memories (up to limit)
+        // This handles the case where query is "*" which fails FTS5 and LIKE searches
+        if query.trim() == "*" {
+            let mut all = self.list(None, session_id).await?;
+            all.truncate(limit);
+            return Ok(all);
+        }
+
         // Compute query embedding only when needed (skip for BM25-only mode)
         let query_embedding = if self.search_mode == SearchMode::Bm25 {
             None
@@ -1731,6 +1739,33 @@ mod tests {
             .unwrap();
         let results = mem.recall("wild*", 10, None, None, None).await.unwrap();
         assert!(results.len() <= 10);
+    }
+
+    #[tokio::test]
+    async fn recall_with_asterisk_only_returns_all_memories() {
+        let (_tmp, mem) = temp_sqlite();
+        // Store multiple memories
+        mem.store("m1", "first memory content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("m2", "second memory content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        mem.store("m3", "third memory content", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+
+        // Query with "*" should return all memories
+        let results = mem.recall("*", 10, None, None, None).await.unwrap();
+        assert_eq!(
+            results.len(),
+            3,
+            "wildcard query should return all memories"
+        );
+
+        // Verify limit is respected
+        let limited_results = mem.recall("*", 2, None, None, None).await.unwrap();
+        assert_eq!(limited_results.len(), 2, "limit should be respected");
     }
 
     #[tokio::test]
