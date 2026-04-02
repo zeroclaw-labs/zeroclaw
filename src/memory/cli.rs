@@ -203,17 +203,32 @@ async fn handle_clear(
     }
 
     let mut deleted = 0usize;
+    let mut failed = 0usize;
     for entry in &entries {
-        if mem.forget(&entry.key).await? {
-            deleted += 1;
+        match mem.forget(&entry.key).await {
+            Ok(true) => deleted += 1,
+            Ok(false) => failed += 1,
+            Err(e) => {
+                tracing::warn!(key = %entry.key, error = %e, "Failed to delete memory entry");
+                failed += 1;
+            }
         }
     }
 
-    println!(
-        "{} Cleared {deleted}/{} entries.",
-        style("✓").green().bold(),
-        entries.len(),
-    );
+    if failed > 0 {
+        println!(
+            "{} Cleared {deleted}/{} entries. {} failed.",
+            style("✓").green().bold(),
+            entries.len(),
+            failed
+        );
+    } else {
+        println!(
+            "{} Cleared {deleted}/{} entries.",
+            style("✓").green().bold(),
+            entries.len(),
+        );
+    }
 
     Ok(())
 }
