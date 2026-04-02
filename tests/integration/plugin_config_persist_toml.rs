@@ -14,8 +14,10 @@ use zeroclaw::config::Config;
 /// Creates a minimal Config pointed at a temp directory so `save()` writes there.
 fn config_in_temp_dir(dir: &std::path::Path) -> Config {
     let config_path = dir.join("config.toml");
-    let mut config = Config::default();
-    config.config_path = config_path;
+    let mut config = Config {
+        config_path,
+        ..Default::default()
+    };
     config.plugins.enabled = true;
     // Disable secret encryption so we don't need a real key store for this test.
     config.secrets.encrypt = false;
