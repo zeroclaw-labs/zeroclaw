@@ -162,15 +162,13 @@ impl AwsCredentials {
             .or_else(|| env_optional("AWS_DEFAULT_REGION"))
             .unwrap_or_else(|| DEFAULT_REGION.to_string());
 
-        let web_identity_token = tokio::fs::read_to_string(&token_file)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to read web identity token file '{}': {}",
-                    token_file,
-                    e
-                )
-            })?;
+        let web_identity_token = tokio::fs::read_to_string(&token_file).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read web identity token file '{}': {}",
+                token_file,
+                e
+            )
+        })?;
         let web_identity_token = web_identity_token.trim().to_string();
         anyhow::ensure!(
             !web_identity_token.is_empty(),
@@ -1979,7 +1977,8 @@ mod tests {
             "AWS_WEB_IDENTITY_TOKEN_FILE",
             Some("/tmp/nonexistent-token-file-zeroclaw-test"),
         );
-        let _role_guard = EnvGuard::set("AWS_ROLE_ARN", Some("arn:aws:iam::123456789012:role/test"));
+        let _role_guard =
+            EnvGuard::set("AWS_ROLE_ARN", Some("arn:aws:iam::123456789012:role/test"));
         let result = AwsCredentials::from_web_identity().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1994,7 +1993,8 @@ mod tests {
         let tmp_file = "/tmp/zeroclaw-test-empty-token";
         tokio::fs::write(tmp_file, "").await.unwrap();
         let _token_guard = EnvGuard::set("AWS_WEB_IDENTITY_TOKEN_FILE", Some(tmp_file));
-        let _role_guard = EnvGuard::set("AWS_ROLE_ARN", Some("arn:aws:iam::123456789012:role/test"));
+        let _role_guard =
+            EnvGuard::set("AWS_ROLE_ARN", Some("arn:aws:iam::123456789012:role/test"));
         let result = AwsCredentials::from_web_identity().await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
