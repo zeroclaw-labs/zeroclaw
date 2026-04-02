@@ -7,10 +7,12 @@
 # Flash: probe-rs run --chip STM32F401RETx target/thumbv7em-none-eabihf/release/nucleo
 # Or: zeroclaw peripheral flash-nucleo
 
+[workspace]
+
 [package]
 name = "nucleo"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "ZeroClaw Nucleo-F401RE peripheral firmware — GPIO over JSON serial"
 
@@ -18,12 +20,14 @@ description = "ZeroClaw Nucleo-F401RE peripheral firmware — GPIO over JSON ser
 embassy-executor = { version = "0.9", features = ["arch-cortex-m", "executor-thread", "defmt"] }
 embassy-stm32 = { version = "0.5", features = ["defmt", "stm32f401re", "unstable-pac", "memory-x", "time-driver-tim4", "exti"] }
 embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
 defmt = "1.0"
 defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }
 heapless = { version = "0.9", default-features = false }
 critical-section = "1.1"
-cortex-m-rt = "0.7"
+zeroclaw-fw-protocol = { path = "../zeroclaw-fw-protocol" }
 
 [package.metadata.embassy]
 build = [
@@ -34,6 +38,5 @@ build = [
 opt-level = "s"
 lto = true
 codegen-units = 1
-strip = true
 panic = "abort"
-debug = 1
+debug = 2

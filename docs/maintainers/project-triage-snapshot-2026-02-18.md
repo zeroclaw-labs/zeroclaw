@@ -19,7 +19,7 @@ Collected via GitHub CLI against `zeroclaw-labs/zeroclaw`:
 - Open Issues: **24**
 - Stars: **11,220**
 - Forks: **1,123**
-- Default branch: `main`
+- Default branch: `master`
 - License metadata on GitHub API: `Other` (not MIT-detected)
 
 ## PR Label Pressure (Open PRs)

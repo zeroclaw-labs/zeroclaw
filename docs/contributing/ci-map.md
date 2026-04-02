@@ -13,7 +13,7 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/ci-run.yml` (`CI`)
     - Purpose: Rust validation (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D clippy::correctness`, strict delta lint gate on changed Rust lines, `test`, release build smoke) + docs quality checks when docs change (`markdownlint` blocks only issues on changed lines; link check scans only links added on changed lines)
     - Additional behavior: for Rust-impacting PRs and pushes, `CI Required Gate` requires `lint` + `test` + `build` (no PR build-only bypass)
-    - Additional behavior: PRs that change `.github/workflows/**` require at least one approving review from a login in `WORKFLOW_OWNER_LOGINS` (repository variable fallback: `theonlyhennygod,jordanthejet`)
+    - Additional behavior: PRs that change `.github/workflows/**` require at least one approving review from a login in `WORKFLOW_OWNER_LOGINS` (repository variable fallback: `theonlyhennygod,JordanTheJet,SimianAstronaut7`)
     - Additional behavior: lint gates run before `test`/`build`; when lint/docs gates fail on PRs, CI posts an actionable feedback comment with failing gate names and local fix commands
     - Merge gate: `CI Required Gate`
 - `.github/workflows/workflow-sanity.yml` (`Workflow Sanity`)
@@ -37,6 +37,12 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `.github/workflows/pub-homebrew-core.yml` (`Pub Homebrew Core`)
     - Purpose: manual, bot-owned Homebrew core formula bump PR flow for tagged releases
     - Guardrail: release tag must match `Cargo.toml` version
+- `.github/workflows/pub-scoop.yml` (`Pub Scoop Manifest`)
+    - Purpose: Scoop bucket manifest update for Windows; auto-called by stable release, also manual dispatch
+    - Guardrail: release tag must be `vX.Y.Z` format; Windows binary hash extracted from `SHA256SUMS`
+- `.github/workflows/pub-aur.yml` (`Pub AUR Package`)
+    - Purpose: AUR PKGBUILD push for Arch Linux; auto-called by stable release, also manual dispatch
+    - Guardrail: release tag must be `vX.Y.Z` format; source tarball SHA256 computed at publish time
 - `.github/workflows/pr-label-policy-check.yml` (`Label Policy Sanity`)
     - Purpose: validate shared contributor-tier policy in `.github/label-policy.json` and ensure label workflows consume that policy
 - `.github/workflows/test-rust-build.yml` (`Rust Reusable Job`)
@@ -75,6 +81,8 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - `Docker`: tag push (`v*`) for publish, matching PRs to `master` for smoke build, manual dispatch for smoke only
 - `Release`: tag push (`v*`), weekly schedule (verification-only), manual dispatch (verification or publish)
 - `Pub Homebrew Core`: manual dispatch only
+- `Pub Scoop Manifest`: auto-called by stable release, also manual dispatch
+- `Pub AUR Package`: auto-called by stable release, also manual dispatch
 - `Security Audit`: push to `master`, PRs to `master`, weekly schedule
 - `Sec Vorpal Reviewdog`: manual dispatch only
 - `Workflow Sanity`: PR/push when `.github/workflows/**`, `.github/*.yml`, or `.github/*.yaml` change
@@ -92,12 +100,14 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 2. Docker failures on PRs: inspect `.github/workflows/pub-docker-img.yml` `pr-smoke` job.
 3. Release failures (tag/manual/scheduled): inspect `.github/workflows/pub-release.yml` and the `prepare` job outputs.
 4. Homebrew formula publish failures: inspect `.github/workflows/pub-homebrew-core.yml` summary output and bot token/fork variables.
-5. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
-6. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
-7. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
-8. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
-9. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
-10. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
+5. Scoop manifest publish failures: inspect `.github/workflows/pub-scoop.yml` summary output and `SCOOP_BUCKET_REPO`/`SCOOP_BUCKET_TOKEN` settings.
+6. AUR package publish failures: inspect `.github/workflows/pub-aur.yml` summary output and `AUR_SSH_KEY` secret.
+7. Security failures: inspect `.github/workflows/sec-audit.yml` and `deny.toml`.
+8. Workflow syntax/lint failures: inspect `.github/workflows/workflow-sanity.yml`.
+9. PR intake failures: inspect `.github/workflows/pr-intake-checks.yml` sticky comment and run logs.
+10. Label policy parity failures: inspect `.github/workflows/pr-label-policy-check.yml`.
+11. Docs failures in CI: inspect `docs-quality` job logs in `.github/workflows/ci-run.yml`.
+12. Strict delta lint failures in CI: inspect `lint-strict-delta` job logs and compare with `BASE_SHA` diff scope.
 
 ## Maintenance Rules
 
@@ -114,6 +124,8 @@ Merge-blocking checks should stay small and deterministic. Optional checks are u
 - Keep docs quality checks low-noise (incremental markdown + incremental added-link checks).
 - Keep dependency update volume controlled (grouping + PR limits).
 - Avoid mixing onboarding/community automation with merge-gating logic.
+- Test levels: `cargo test --test component`, `cargo test --test integration`, `cargo test --test system`.
+- Live tests (manual only): `cargo test --test live -- --ignored`.
 
 ## Automation Side-Effect Controls
 

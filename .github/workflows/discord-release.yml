@@ -1,0 +1,145 @@
+name: Discord Release
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Stable release tag (e.g. v0.6.7)"
+        required: true
+        type: string
+      release_url:
+        description: "GitHub Release URL"
+        required: true
+        type: string
+    secrets:
+      DISCORD_WEBHOOK_URL:
+        required: false
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v0.6.7)"
+        required: true
+        type: string
+      release_url:
+        description: "GitHub Release URL"
+        required: true
+        type: string
+
+jobs:
+  discord:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Build Discord message
+        id: msg
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_URL: ${{ inputs.release_url }}
+        run: |
+          set -euo pipefail
+
+          # Find previous stable tag
+          PREV_STABLE=$(git tag --sort=-creatordate \
+            | grep -v "^${RELEASE_TAG}$" \
+            | grep -vE '\-beta\.' \
+            | head -1 || echo "")
+
+          RANGE="${PREV_STABLE:+${PREV_STABLE}..}${RELEASE_TAG}"
+
+          # Extract features
+          FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+            | grep -iE '^feat(\(|:)' \
+            | sed 's/^feat(\([^)]*\)): /\1: /' \
+            | sed 's/^feat: //' \
+            | sed 's/ (#[0-9]*)$//' \
+            | sort -uf || true)
+
+          # Extract fixes
+          FIXES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+            | grep -iE '^fix(\(|:)' \
+            | sed 's/^fix(\([^)]*\)): /\1: /' \
+            | sed 's/^fix: //' \
+            | sed 's/ (#[0-9]*)$//' \
+            | sort -uf || true)
+
+          FEAT_LIST=""
+          if [ -n "$FEATURES" ]; then
+            FEAT_LIST=$(echo "$FEATURES" | head -8 | while IFS= read -r line; do echo "🚀 ${line}"; done)
+          fi
+
+          FIX_LIST=""
+          if [ -n "$FIXES" ]; then
+            FIX_LIST=$(echo "$FIXES" | head -5 | while IFS= read -r line; do echo "🔧 ${line}"; done)
+          fi
+
+          BODY=""
+          if [ -n "$FEAT_LIST" ]; then
+            BODY="${FEAT_LIST}"
+          fi
+          if [ -n "$FIX_LIST" ]; then
+            [ -n "$BODY" ] && BODY="${BODY}\n"
+            BODY="${BODY}${FIX_LIST}"
+          fi
+          if [ -z "$BODY" ]; then
+            BODY="🚀 Incremental improvements and polish"
+          fi
+
+          {
+            echo "body<<MSG_EOF"
+            echo -e "$BODY"
+            echo "MSG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post to Discord
+        shell: bash
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_URL: ${{ inputs.release_url }}
+          MSG_BODY: ${{ steps.msg.outputs.body }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+            echo "::warning::DISCORD_WEBHOOK_URL secret not configured — skipping"
+            exit 0
+          fi
+
+          # Build Discord embed payload
+          PAYLOAD=$(python3 -c "
+          import json, os
+          tag = os.environ['RELEASE_TAG']
+          url = os.environ['RELEASE_URL']
+          body = os.environ['MSG_BODY']
+
+          embed = {
+              'title': f'ZeroClaw {tag} Released',
+              'description': body + '\n\nZero overhead. Zero compromise. 100% Rust.',
+              'url': url,
+              'color': 0xF97316,
+              'footer': {'text': 'ZeroClaw Release Bot'},
+          }
+
+          payload = {
+              'username': 'ZeroClaw Releases',
+              'embeds': [embed],
+          }
+          print(json.dumps(payload))
+          ")
+
+          HTTP_CODE=$(curl -s -o /tmp/discord_response.txt -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$DISCORD_WEBHOOK_URL")
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Discord notification sent (HTTP $HTTP_CODE)"
+          else
+            echo "::error::Discord webhook failed (HTTP $HTTP_CODE)"
+            cat /tmp/discord_response.txt
+            exit 1
+          fi

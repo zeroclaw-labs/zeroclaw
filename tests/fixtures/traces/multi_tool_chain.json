@@ -1,0 +1,66 @@
+{
+  "model_name": "test-multi-tool-chain",
+  "turns": [
+    {
+      "user_input": "Echo three messages in sequence",
+      "steps": [
+        {
+          "response": {
+            "type": "tool_calls",
+            "tool_calls": [
+              {
+                "id": "call_1",
+                "name": "echo",
+                "arguments": {"message": "first"}
+              }
+            ],
+            "input_tokens": 30,
+            "output_tokens": 15
+          }
+        },
+        {
+          "response": {
+            "type": "tool_calls",
+            "tool_calls": [
+              {
+                "id": "call_2",
+                "name": "echo",
+                "arguments": {"message": "second"}
+              }
+            ],
+            "input_tokens": 60,
+            "output_tokens": 15
+          }
+        },
+        {
+          "response": {
+            "type": "tool_calls",
+            "tool_calls": [
+              {
+                "id": "call_3",
+                "name": "echo",
+                "arguments": {"message": "third"}
+              }
+            ],
+            "input_tokens": 90,
+            "output_tokens": 15
+          }
+        },
+        {
+          "response": {
+            "type": "text",
+            "content": "I echoed three messages: first, second, and third.",
+            "input_tokens": 120,
+            "output_tokens": 20
+          }
+        }
+      ]
+    }
+  ],
+  "expects": {
+    "response_contains": ["first", "second", "third"],
+    "tools_used": ["echo"],
+    "max_tool_calls": 3,
+    "all_tools_succeeded": true
+  }
+}

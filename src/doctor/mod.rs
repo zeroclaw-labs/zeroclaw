@@ -1260,10 +1260,12 @@ mod tests {
         let second = workspace_probe_path(tmp.path());
 
         assert_ne!(first, second);
-        assert!(first
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_")));
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_"))
+        );
     }
 
     #[test]
@@ -1281,6 +1283,10 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
+                memory_namespace: None,
             },
         );
         config.agents.insert(
@@ -1295,6 +1301,10 @@ mod tests {
                 agentic: false,
                 allowed_tools: Vec::new(),
                 max_iterations: 10,
+                timeout_secs: None,
+                agentic_timeout_secs: None,
+                skills_directory: None,
+                memory_namespace: None,
             },
         );
 

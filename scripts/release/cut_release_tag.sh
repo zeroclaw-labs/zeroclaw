@@ -10,7 +10,7 @@ Create an annotated release tag from the current checkout.
 Requirements:
 - tag must match vX.Y.Z (optional suffix like -rc.1)
 - working tree must be clean
-- HEAD must match origin/main
+- HEAD must match origin/master
 - tag must not already exist locally or on origin
 
 Options:
@@ -49,14 +49,24 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
-echo "Fetching origin/main and tags..."
-git fetch --quiet origin main --tags
+# Auto-sync all version references before tagging
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+RELEASE_VERSION="${TAG#v}"
+bash "$SCRIPT_DIR/bump-version.sh" "$RELEASE_VERSION"
+if ! git diff --quiet; then
+  git add -A
+  git commit -m "chore: sync version references to $TAG"
+  echo "Auto-committed version sync for $TAG"
+fi
+
+echo "Fetching origin/master and tags..."
+git fetch --quiet origin master --tags
 
 HEAD_SHA="$(git rev-parse HEAD)"
-MAIN_SHA="$(git rev-parse origin/main)"
-if [[ "$HEAD_SHA" != "$MAIN_SHA" ]]; then
-  echo "error: HEAD ($HEAD_SHA) is not origin/main ($MAIN_SHA)." >&2
-  echo "hint: checkout/update main before cutting a release tag." >&2
+MASTER_SHA="$(git rev-parse origin/master)"
+if [[ "$HEAD_SHA" != "$MASTER_SHA" ]]; then
+  echo "error: HEAD ($HEAD_SHA) is not origin/master ($MASTER_SHA)." >&2
+  echo "hint: checkout/update master before cutting a release tag." >&2
   exit 1
 fi
 
@@ -77,7 +87,9 @@ echo "Created annotated tag: $TAG"
 if [[ "$PUSH_TAG" == "true" ]]; then
   git push origin "$TAG"
   echo "Pushed tag to origin: $TAG"
-  echo "GitHub release pipeline will run via .github/workflows/pub-release.yml"
+  echo "Release Stable workflow will auto-trigger via tag push."
+  echo "Monitor: gh workflow view 'Release Stable' --web"
 else
   echo "Next step: git push origin $TAG"
+  echo "This will auto-trigger the Release Stable workflow (builds, Docker, crates.io, website, Scoop, AUR, Homebrew, tweet)."
 fi

@@ -5,8 +5,7 @@
 > Tài liệu này mô tả các hướng tiếp cận đề xuất và có thể bao gồm các lệnh hoặc cấu hình giả định.
 > Để biết hành vi runtime hiện tại, xem [config-reference.md](config-reference.md), [operations-runbook.md](operations-runbook.md), và [troubleshooting.md](troubleshooting.md).
 
-## Câu hỏi cốt lõi: liệu các tính năng bảo mật có làm hỏng
-
+## Câu hỏi cốt lõi: liệu các tính năng bảo mật có làm hỏng...
 1. ❓ Quá trình cross-compilation nhanh?
 2. ❓ Kiến trúc pluggable (hoán đổi bất kỳ thành phần nào)?
 3. ❓ Tính agnostic phần cứng (ARM, x86, RISC-V)?
@@ -296,7 +295,6 @@ backend = "docker"
 ## 6. Tác động phụ thuộc: thêm tối thiểu
 
 ### Phụ thuộc hiện tại (để tham khảo)
-
 ```
 reqwest, tokio, serde, anyhow, uuid, chrono, rusqlite,
 axum, tracing, opentelemetry, ...

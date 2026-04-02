@@ -10,8 +10,15 @@
 services:
   zeroclaw:
     image: ghcr.io/zeroclaw-labs/zeroclaw:latest
-    # Or build locally:
+    # For ARM64 environments where the distroless image exits immediately,
+    # switch to the Debian compatibility image instead:
+    # image: ghcr.io/zeroclaw-labs/zeroclaw:debian
+    # Or build locally (distroless, no shell):
     # build: .
+    # Or build the Debian variant (includes bash, git, curl):
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile.debian
     container_name: zeroclaw
     restart: unless-stopped
     
@@ -46,15 +53,15 @@ services:
       resources:
         limits:
           cpus: '2'
-          memory: 2G
+          memory: 512M
         reservations:
           cpus: '0.5'
-          memory: 512M
+          memory: 32M
 
     # Health check — uses lightweight status instead of full diagnostics.
     # For images with curl, prefer: curl -f http://localhost:42617/health
     healthcheck:
-      test: ["CMD", "zeroclaw", "status"]
+      test: ["CMD", "zeroclaw", "status", "--format=exit-code"]
       interval: 60s
       timeout: 10s
       retries: 3

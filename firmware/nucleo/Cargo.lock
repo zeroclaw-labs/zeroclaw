@@ -88,6 +88,7 @@ checksum = "8ec610d8f49840a5b376c69663b6369e71f4b34484b9b2eb29fb918d92516cb9"
 dependencies = [
  "bare-metal",
  "bitfield",
+ "critical-section",
  "embedded-hal 0.2.7",
  "volatile-register",
 ]
@@ -609,6 +610,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d5439c4ad607c3c23abf66de8c8bf57ba8adcd1f129e699851a6e43935d339d"
 
 [[package]]
+name = "nucleo"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "critical-section",
+ "defmt 1.0.1",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-stm32",
+ "embassy-time",
+ "heapless 0.9.2",
+ "panic-probe",
+ "zeroclaw-fw-protocol",
+]
+
+[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -834,16 +852,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "nucleo"
+name = "zeroclaw-fw-protocol"
 version = "0.1.0"
 dependencies = [
- "cortex-m-rt",
- "critical-section",
- "defmt 1.0.1",
- "defmt-rtt",
- "embassy-executor",
- "embassy-stm32",
- "embassy-time",
  "heapless 0.9.2",
- "panic-probe",
 ]

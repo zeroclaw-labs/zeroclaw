@@ -1,33 +1,61 @@
-# Normalize all text files
+# Git attributes for ZeroClaw
+# https://git-scm.com/docs/gitattributes
+
+# Auto detect text files and perform LF normalization
 * text=auto
 
-# Force LF for scripts and build-critical files
-*.sh text eol=lf
-Dockerfile* text eol=lf
-*.rs text eol=lf
-*.toml text eol=lf
-*.yml text eol=lf
-*.yaml text eol=lf
+# Source code
+*.rs text eol=lf linguist-language=Rust
+*.toml text eol=lf linguist-language=TOML
+*.py text eol=lf linguist-language=Python
+*.js text eol=lf linguist-language=JavaScript
+*.ts text eol=lf linguist-language=TypeScript
+*.html text eol=lf linguist-language=HTML
+*.css text eol=lf linguist-language=CSS
+*.scss text eol=lf linguist-language=SCSS
+*.json text eol=lf linguist-language=JSON
+*.yaml text eol=lf linguist-language=YAML
+*.yml text eol=lf linguist-language=YAML
+*.md text eol=lf linguist-language=Markdown
+*.sh text eol=lf linguist-language=Shell
+*.bash text eol=lf linguist-language=Shell
+*.ps1 text eol=crlf linguist-language=PowerShell
 
-# CI
-.github/**/* text eol=lf
+# Documentation
+*.txt text eol=lf
+LICENSE* text eol=lf
 
-# Images
+# Configuration files
+.editorconfig text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+.dockerignore text eol=lf
+
+# Rust-specific
+Cargo.lock text eol=lf linguist-generated
+Cargo.toml text eol=lf
+
+# Declare files that will always have CRLF line endings on checkout
+*.sln text eol=crlf
+
+# Denote all files that are truly binary and should not be modified
 *.png binary
 *.jpg binary
 *.jpeg binary
 *.gif binary
 *.ico binary
-
-# Archives
+*.svg text
+*.wasm binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.mp3 binary
+*.mp4 binary
+*.webm binary
 *.zip binary
 *.tar binary
-*.tgz binary
 *.gz binary
+*.bz2 binary
 *.7z binary
-
-# Compiled artifacts
-*.so binary
-*.dll binary
-*.exe binary
-*.a binary
+*.db binary

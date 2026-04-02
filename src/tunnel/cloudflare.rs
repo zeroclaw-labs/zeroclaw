@@ -1,7 +1,35 @@
-use super::{kill_shared, new_shared_process, SharedProcess, Tunnel, TunnelProcess};
-use anyhow::{bail, Result};
+use super::{SharedProcess, Tunnel, TunnelProcess, kill_shared, new_shared_process};
+use anyhow::{Result, bail};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Command;
+
+/// Try to extract a real tunnel URL from a cloudflared log line.
+///
+/// Returns `Some(url)` when the line contains a genuine tunnel endpoint,
+/// skipping documentation and warning URLs (quic-go GitHub links,
+/// Cloudflare docs pages, etc.).
+fn extract_tunnel_url(line: &str) -> Option<String> {
+    let idx = line.find("https://")?;
+    let url_part = &line[idx..];
+    let end = url_part
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(url_part.len());
+    let candidate = &url_part[..end];
+
+    let is_tunnel_line = line.contains("Visit it at")
+        || line.contains("Route at")
+        || line.contains("Registered tunnel connection");
+    let is_tunnel_domain = candidate.contains(".trycloudflare.com");
+    let is_docs_url = candidate.contains("github.com")
+        || candidate.contains("cloudflare.com/docs")
+        || candidate.contains("developers.cloudflare.com");
+
+    if is_tunnel_line || is_tunnel_domain || !is_docs_url {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
 
 /// Cloudflare Tunnel — wraps the `cloudflared` binary.
 ///
@@ -62,13 +90,8 @@ impl Tunnel for CloudflareTunnel {
             match line {
                 Ok(Ok(Some(l))) => {
                     tracing::debug!("cloudflared: {l}");
-                    // Look for the URL pattern in cloudflared output
-                    if let Some(idx) = l.find("https://") {
-                        let url_part = &l[idx..];
-                        let end = url_part
-                            .find(|c: char| c.is_whitespace())
-                            .unwrap_or(url_part.len());
-                        public_url = url_part[..end].to_string();
+                    if let Some(url) = extract_tunnel_url(&l) {
+                        public_url = url;
                         break;
                     }
                 }
@@ -137,5 +160,56 @@ mod tests {
     async fn health_check_is_false_before_start() {
         let tunnel = CloudflareTunnel::new("cf-token".into());
         assert!(!tunnel.health_check().await);
+    }
+
+    #[test]
+    fn extract_skips_quic_go_github_url() {
+        let line = "2024-01-01T00:00:00Z WRN failed to sufficiently increase receive buffer size. See https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes for details.";
+        assert_eq!(extract_tunnel_url(line), None);
+    }
+
+    #[test]
+    fn extract_skips_cloudflare_docs_url() {
+        let line = "2024-01-01T00:00:00Z INF For more info see https://cloudflare.com/docs/tunnels";
+        assert_eq!(extract_tunnel_url(line), None);
+    }
+
+    #[test]
+    fn extract_skips_developers_cloudflare_url() {
+        let line = "2024-01-01T00:00:00Z INF See https://developers.cloudflare.com/cloudflare-one/connections/connect-apps";
+        assert_eq!(extract_tunnel_url(line), None);
+    }
+
+    #[test]
+    fn extract_captures_trycloudflare_url() {
+        let line = "2024-01-01T00:00:00Z INF Visit it at https://my-tunnel-abc.trycloudflare.com";
+        assert_eq!(
+            extract_tunnel_url(line),
+            Some("https://my-tunnel-abc.trycloudflare.com".into())
+        );
+    }
+
+    #[test]
+    fn extract_captures_url_on_visit_it_at_line() {
+        let line = "2024-01-01T00:00:00Z INF Visit it at https://some-custom-domain.example.com";
+        assert_eq!(
+            extract_tunnel_url(line),
+            Some("https://some-custom-domain.example.com".into())
+        );
+    }
+
+    #[test]
+    fn extract_captures_url_on_route_at_line() {
+        let line = "2024-01-01T00:00:00Z INF Route at https://tunnel.example.com/path";
+        assert_eq!(
+            extract_tunnel_url(line),
+            Some("https://tunnel.example.com/path".into())
+        );
+    }
+
+    #[test]
+    fn extract_returns_none_for_line_without_url() {
+        let line = "2024-01-01T00:00:00Z INF Starting tunnel";
+        assert_eq!(extract_tunnel_url(line), None);
     }
 }

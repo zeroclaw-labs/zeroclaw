@@ -33,7 +33,7 @@ impl Observer for VerboseObserver {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 eprintln!("< Receive (success={success}, duration_ms={ms})");
             }
-            ObserverEvent::ToolCallStart { tool } => {
+            ObserverEvent::ToolCallStart { tool, .. } => {
                 eprintln!("> Tool {tool}");
             }
             ObserverEvent::ToolCall {
@@ -92,6 +92,7 @@ mod tests {
         });
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
+            arguments: None,
         });
         obs.record_event(&ObserverEvent::ToolCall {
             tool: "shell".into(),
@@ -99,5 +100,23 @@ mod tests {
             success: true,
         });
         obs.record_event(&ObserverEvent::TurnComplete);
+    }
+
+    #[test]
+    fn verbose_hand_events_do_not_panic() {
+        let obs = VerboseObserver::new();
+        obs.record_event(&ObserverEvent::HandStarted {
+            hand_name: "review".into(),
+        });
+        obs.record_event(&ObserverEvent::HandCompleted {
+            hand_name: "review".into(),
+            duration_ms: 1500,
+            findings_count: 3,
+        });
+        obs.record_event(&ObserverEvent::HandFailed {
+            hand_name: "review".into(),
+            error: "timeout".into(),
+            duration_ms: 5000,
+        });
     }
 }

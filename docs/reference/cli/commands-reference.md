@@ -2,7 +2,7 @@
 
 This reference is derived from the current CLI surface (`zeroclaw --help`).
 
-Last verified: **February 21, 2026**.
+Last verified: **March 26, 2026**.
 
 ## Top-Level Commands
 
@@ -11,6 +11,7 @@ Last verified: **February 21, 2026**.
 | `onboard` | Initialize workspace/config quickly or interactively |
 | `agent` | Run interactive chat or single-message mode |
 | `gateway` | Start webhook and WhatsApp HTTP gateway |
+| `acp` | Start ACP (Agent Control Protocol) server over stdio |
 | `daemon` | Start supervised runtime (gateway + channels + optional heartbeat/scheduler) |
 | `service` | Manage user-level OS service lifecycle |
 | `doctor` | Run diagnostics and freshness checks |
@@ -33,20 +34,21 @@ Last verified: **February 21, 2026**.
 ### `onboard`
 
 - `zeroclaw onboard`
-- `zeroclaw onboard --interactive`
 - `zeroclaw onboard --channels-only`
 - `zeroclaw onboard --force`
+- `zeroclaw onboard --reinit`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --memory <sqlite|lucid|markdown|none>`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none>`
 - `zeroclaw onboard --api-key <KEY> --provider <ID> --model <MODEL_ID> --memory <sqlite|lucid|markdown|none> --force`
 
 `onboard` safety behavior:
 
-- If `config.toml` already exists and you run `--interactive`, onboarding now offers two modes:
+- If `config.toml` already exists, onboarding offers two modes:
   - Full onboarding (overwrite `config.toml`)
   - Provider-only update (update provider/model/API key while preserving existing channels, tunnel, memory, hooks, and other settings)
 - In non-interactive environments, existing `config.toml` causes a safe refusal unless `--force` is passed.
 - Use `zeroclaw onboard --channels-only` when you only need to rotate channel tokens/allowlists.
+- Use `zeroclaw onboard --reinit` to start fresh. This backs up your existing config directory with a timestamp suffix and creates a new configuration from scratch.
 
 ### `agent`
 
@@ -58,6 +60,20 @@ Last verified: **February 21, 2026**.
 Tip:
 
 - In interactive chat, you can ask for route changes in natural language (for example “conversation uses kimi, coding uses gpt-5.3-codex”); the assistant can persist this via tool `model_routing_config`.
+
+### `acp`
+
+- `zeroclaw acp`
+- `zeroclaw acp --max-sessions <N>`
+- `zeroclaw acp --session-timeout <SECONDS>`
+
+Start the ACP (Agent Control Protocol) server for IDE and tool integration.
+
+- Uses JSON-RPC 2.0 over stdin/stdout
+- Supports methods: `initialize`, `session/new`, `session/prompt`, `session/stop`
+- Streams agent reasoning, tool calls, and content in real-time as notifications
+- Default max sessions: 10
+- Default session timeout: 3600 seconds (1 hour)
 
 ### `gateway` / `daemon`
 

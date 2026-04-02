@@ -1,7 +1,7 @@
 [package]
 name = "zeroclaw-robot-kit"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["theonlyhennygod"]
 license = "MIT OR Apache-2.0"
 description = "Robot control toolkit for ZeroClaw - drive, vision, speech, sensors, safety"
@@ -25,7 +25,7 @@ vision = []           # Camera + vision model
 # zeroclaw = { path = "../..", optional = true }
 
 # Async runtime
-tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time", "sync", "process", "fs", "io-util"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -51,6 +51,9 @@ tracing = "0.1"
 # Time handling
 chrono = { version = "0.4", features = ["clock", "std"] }
 
+# Portable atomics for 32-bit targets
+portable-atomic = "1"
+
 # User directories
 directories = "6.0"
 
@@ -61,7 +64,7 @@ rppal = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3.14"
+tempfile = "3.26"
 
 [package.metadata.docs.rs]
 all-features = true

@@ -2,6 +2,8 @@
 
 Step-by-step guides for common extension and modification patterns in ZeroClaw.
 
+For complete code examples of each extension trait, see [extension-examples.md](./extension-examples.md).
+
 ## Adding a Provider
 
 - Implement `Provider` in `src/providers/`.
@@ -42,6 +44,15 @@ Step-by-step guides for common extension and modification patterns in ZeroClaw.
 - When runtime surfaces change, update related references in `docs/reference/`.
 - Keep multilingual entry-point parity for all supported locales (`en`, `zh-CN`, `ja`, `ru`, `fr`, `vi`) when nav or key wording changes.
 - When shared docs wording changes, sync corresponding localized docs in the same PR (or explicitly document deferral and follow-up PR).
+
+## Tool Shared State
+
+- Follow the `Arc<RwLock<T>>` handle pattern for any tool that owns long-lived shared state.
+- Accept handles at construction; do not create global/static mutable state.
+- Use `ClientId` (provided by the daemon) to namespace per-client state — never construct identity keys inside the tool.
+- Isolate security-sensitive state (credentials, quotas) per client; broadcast/display state may be shared with optional namespace prefixing.
+- Cached validation is invalidated on config change — tools must re-validate before the next execution when signaled.
+- See [ADR-004: Tool Shared State Ownership](../architecture/adr-004-tool-shared-state-ownership.md) for the full contract.
 
 ## Architecture Boundary Rules
 

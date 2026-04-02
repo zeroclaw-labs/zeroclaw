@@ -365,6 +365,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             },
         },
         IntegrationEntry {
+            name: "OpenCode Go",
+            description: "Subsidized Code-focused AI models",
+            category: IntegrationCategory::AiModel,
+            status_fn: |c| {
+                if c.default_provider.as_deref() == Some("opencode-go") {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
             name: "Z.AI",
             description: "Z.AI inference",
             category: IntegrationCategory::AiModel,
@@ -498,6 +510,18 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
         },
         // ── Productivity ────────────────────────────────────────
         IntegrationEntry {
+            name: "Google Workspace",
+            description: "Drive, Gmail, Calendar, Sheets, Docs via gws CLI",
+            category: IntegrationCategory::Productivity,
+            status_fn: |c| {
+                if c.google_workspace.enabled {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
+        },
+        IntegrationEntry {
             name: "GitHub",
             description: "Code, issues, PRs",
             category: IntegrationCategory::Productivity,
@@ -594,7 +618,13 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Browser",
             description: "Chrome/Chromium control",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::Available,
+            status_fn: |c| {
+                if c.browser.enabled {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Shell",
@@ -612,7 +642,13 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Cron",
             description: "Scheduled tasks",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::Available,
+            status_fn: |c| {
+                if c.cron.enabled {
+                    IntegrationStatus::Active
+                } else {
+                    IntegrationStatus::Available
+                }
+            },
         },
         IntegrationEntry {
             name: "Voice",
@@ -636,7 +672,7 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
             name: "Weather",
             description: "Forecasts & conditions",
             category: IntegrationCategory::ToolsAutomation,
-            status_fn: |_| IntegrationStatus::ComingSoon,
+            status_fn: |_| IntegrationStatus::Active,
         },
         IntegrationEntry {
             name: "Canvas",
@@ -737,8 +773,8 @@ pub fn all_integrations() -> Vec<IntegrationEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
     use crate::config::Config;
+    use crate::config::schema::{IMessageConfig, MatrixConfig, StreamMode, TelegramConfig};
 
     #[test]
     fn registry_has_entries() {
@@ -804,6 +840,8 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            ack_reactions: None,
+            proxy_url: None,
         });
         let entries = all_integrations();
         let tg = entries.iter().find(|e| e.name == "Telegram").unwrap();
@@ -853,6 +891,12 @@ mod tests {
             device_id: None,
             room_id: "!r:m".into(),
             allowed_users: vec![],
+            allowed_rooms: vec![],
+            interrupt_on_new_message: false,
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1500,
+            multi_message_delay_ms: 800,
+            recovery_key: None,
         });
         let entries = all_integrations();
         let mx = entries.iter().find(|e| e.name == "Matrix").unwrap();
@@ -906,10 +950,58 @@ mod tests {
     }
 
     #[test]
+    fn cron_active_when_enabled() {
+        let mut config = Config::default();
+        config.cron.enabled = true;
+        let entries = all_integrations();
+        let cron = entries.iter().find(|e| e.name == "Cron").unwrap();
+        assert!(matches!(
+            (cron.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn cron_available_when_disabled() {
+        let mut config = Config::default();
+        config.cron.enabled = false;
+        let entries = all_integrations();
+        let cron = entries.iter().find(|e| e.name == "Cron").unwrap();
+        assert!(matches!(
+            (cron.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
+    fn browser_active_when_enabled() {
+        let mut config = Config::default();
+        config.browser.enabled = true;
+        let entries = all_integrations();
+        let browser = entries.iter().find(|e| e.name == "Browser").unwrap();
+        assert!(matches!(
+            (browser.status_fn)(&config),
+            IntegrationStatus::Active
+        ));
+    }
+
+    #[test]
+    fn browser_available_when_disabled() {
+        let mut config = Config::default();
+        config.browser.enabled = false;
+        let entries = all_integrations();
+        let browser = entries.iter().find(|e| e.name == "Browser").unwrap();
+        assert!(matches!(
+            (browser.status_fn)(&config),
+            IntegrationStatus::Available
+        ));
+    }
+
+    #[test]
     fn shell_and_filesystem_always_active() {
         let config = Config::default();
         let entries = all_integrations();
-        for name in ["Shell", "File System"] {
+        for name in ["Shell", "File System", "Weather"] {
             let entry = entries.iter().find(|e| e.name == name).unwrap();
             assert!(
                 matches!((entry.status_fn)(&config), IntegrationStatus::Active),

@@ -12,7 +12,7 @@ Use this with:
 
 ZeroClaw uses a single default branch: `master`. All contributor PRs target `master` directly. There is no `dev` or promotion branch.
 
-Current maintainers with PR approval authority: `theonlyhennygod` and `jordanthejet`.
+Current maintainers with PR approval authority: `theonlyhennygod`, `JordanTheJet`, and `SimianAstronaut7`.
 
 ## Active Workflows
 
@@ -43,7 +43,7 @@ Current maintainers with PR approval authority: `theonlyhennygod` and `jordanthe
    - `security` job: runs `cargo audit` and `cargo deny check licenses sources`.
    - Concurrency group cancels in-progress runs for the same PR on new pushes.
 3. All jobs must pass before merge.
-4. Maintainer (`theonlyhennygod` or `jordanthejet`) merges PR once checks and review policy are satisfied.
+4. Maintainer (`theonlyhennygod`, `JordanTheJet`, or `SimianAstronaut7`) merges PR once checks and review policy are satisfied.
 5. Merge emits a `push` event on `master` (see section 2).
 
 ### 2) Push to `master` (including after merge)
@@ -51,7 +51,7 @@ Current maintainers with PR approval authority: `theonlyhennygod` and `jordanthe
 1. Commit reaches `master`.
 2. `release-beta-on-push.yml` (Release Beta) starts:
    - `version` job: computes beta tag as `v{cargo_version}-beta.{run_number}`.
-   - `build` job (matrix, 4 targets): `x86_64-linux`, `aarch64-linux`, `aarch64-darwin`, `x86_64-windows`.
+   - `build` job (matrix, 6 targets): `x86_64-linux`, `aarch64-linux`, `armv7-linux`, `aarch64-darwin`, `aarch64-android`, `x86_64-windows`.
    - `publish` job: generates `SHA256SUMS`, creates a GitHub pre-release with all artifacts. Artifact retention: 7 days.
    - `docker` job: builds multi-platform image (`linux/amd64,linux/arm64`) and pushes to `ghcr.io` with `:beta` and the versioned beta tag.
 3. This runs on every push to `master` without filtering. Every merged PR produces a beta pre-release.
@@ -63,7 +63,7 @@ Current maintainers with PR approval authority: `theonlyhennygod` and `jordanthe
    - Input matches semver `X.Y.Z` format.
    - `Cargo.toml` version matches input exactly.
    - Tag `vX.Y.Z` does not already exist on the remote.
-3. `build` job (matrix, same 4 targets as beta): compiles release binary.
+3. `build` job (matrix, 7 targets): `x86_64-linux`, `aarch64-linux`, `armv7-linux`, `arm-unknown-linux-gnueabihf (ARMv6)`, `aarch64-darwin`, `aarch64-android`, `x86_64-windows`.
 4. `publish` job: generates `SHA256SUMS`, creates a stable GitHub Release (not pre-release). Artifact retention: 14 days.
 5. `docker` job: pushes to `ghcr.io` with `:latest` and `:vX.Y.Z`.
 
@@ -79,9 +79,12 @@ Current maintainers with PR approval authority: `theonlyhennygod` and `jordanthe
 | --- | :---: | :---: | :---: | :---: |
 | `x86_64-unknown-linux-gnu` | ✓ | | ✓ | ✓ |
 | `aarch64-unknown-linux-gnu` | | ✓ | ✓ | ✓ |
+| `armv7-unknown-linux-gnueabihf` | | | ✓ | ✓ |
+| `arm-unknown-linux-gnueabihf` | | | | ✓ |
 | `aarch64-apple-darwin` | ✓ | | ✓ | ✓ |
+| `aarch64-linux-android` | | | ✓ | ✓ |
 | `x86_64-apple-darwin` | | ✓ | | |
-| `x86_64-pc-windows-msvc` | | ✓ | ✓ | ✓ |
+| `x86_64-pc-windows-msvc` | ✓ | ✓ | ✓ | ✓ |
 
 ## Mermaid Diagrams
 
@@ -106,7 +109,7 @@ flowchart TD
 flowchart TD
   A["Push to master"] --> B["release-beta-on-push.yml"]
   B --> B1["version: compute v{x.y.z}-beta.{N}"]
-  B1 --> B2["build: 4 targets"]
+  B1 --> B2["build: 6 targets"]
   B2 --> B3["publish: GitHub pre-release + SHA256SUMS"]
   B2 --> B4["docker: push ghcr.io :beta + versioned tag"]
 ```
@@ -117,7 +120,7 @@ flowchart TD
 flowchart TD
   A["workflow_dispatch: version=X.Y.Z"] --> B["release-stable-manual.yml"]
   B --> B1["validate: semver + Cargo.toml + tag uniqueness"]
-  B1 --> B2["build: 4 targets"]
+  B1 --> B2["build: 7 targets"]
   B2 --> B3["publish: GitHub stable release + SHA256SUMS"]
   B2 --> B4["docker: push ghcr.io :latest + :vX.Y.Z"]
 ```

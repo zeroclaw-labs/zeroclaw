@@ -8,13 +8,14 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::unnecessary_map_or)]
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
+use async_imap::Session;
 use async_imap::extensions::idle::IdleResponse;
 use async_imap::types::Fetch;
-use async_imap::Session;
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
-use lettre::message::SinglePart;
+use lettre::message::header::ContentType;
+use lettre::message::{Attachment, MultiPart, SinglePart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{Message, SmtpTransport, Transport};
 use mail_parser::{MessageParser, MimeHeaders};
@@ -26,10 +27,10 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{sleep, timeout};
-use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
+use tokio_rustls::client::TlsStream;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -67,6 +68,13 @@ pub struct EmailConfig {
     /// Allowed sender addresses/domains (empty = deny all, ["*"] = allow all)
     #[serde(default)]
     pub allowed_senders: Vec<String>,
+    /// Default subject line for outgoing emails (default: "ZeroClaw Message")
+    #[serde(default = "default_subject")]
+    pub default_subject: String,
+    /// Maximum total attachment size in bytes (default: 25 MB).
+    /// Attachments exceeding this limit are dropped with a warning.
+    #[serde(default = "default_max_attachment_bytes")]
+    pub max_attachment_bytes: usize,
 }
 
 impl crate::config::traits::ChannelConfig for EmailConfig {
@@ -93,6 +101,12 @@ fn default_idle_timeout() -> u64 {
 fn default_true() -> bool {
     true
 }
+fn default_subject() -> String {
+    "ZeroClaw Message".into()
+}
+fn default_max_attachment_bytes() -> usize {
+    25 * 1024 * 1024
+}
 
 impl Default for EmailConfig {
     fn default() -> Self {
@@ -108,6 +122,8 @@ impl Default for EmailConfig {
             from_address: String::new(),
             idle_timeout_secs: default_idle_timeout(),
             allowed_senders: Vec::new(),
+            default_subject: default_subject(),
+            max_attachment_bytes: default_max_attachment_bytes(),
         }
     }
 }
@@ -205,6 +221,55 @@ impl EmailChannel {
         "(no readable content)".to_string()
     }
 
+    /// Extract binary attachments from a parsed email as MediaAttachment entries.
+    fn extract_attachments(
+        &self,
+        parsed: &mail_parser::Message,
+    ) -> Vec<super::media_pipeline::MediaAttachment> {
+        let mut attachments = Vec::new();
+        let mut total_size = 0;
+
+        for part in parsed.attachments() {
+            let part: &mail_parser::MessagePart = part;
+            let ct = MimeHeaders::content_type(part);
+            let mime_str =
+                ct.map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("octet-stream")));
+
+            // Skip text parts — already handled by extract_text()
+            if let Some(ref m) = mime_str {
+                if m.starts_with("text/") {
+                    continue;
+                }
+            }
+
+            let data = part.contents().to_vec();
+            if data.is_empty() {
+                continue;
+            }
+
+            // Check size limit
+            total_size += data.len();
+            if total_size > self.config.max_attachment_bytes {
+                warn!(
+                    "Attachment size limit exceeded ({} bytes), dropping remaining attachments",
+                    self.config.max_attachment_bytes
+                );
+                break;
+            }
+
+            let file_name = MimeHeaders::attachment_name(part)
+                .unwrap_or("attachment")
+                .to_string();
+
+            attachments.push(super::media_pipeline::MediaAttachment {
+                file_name,
+                data,
+                mime_type: mime_str,
+            });
+        }
+        attachments
+    }
+
     /// Connect to IMAP server with TLS and authenticate
     async fn connect_imap(&self) -> Result<ImapSession> {
         let addr = format!("{}:{}", self.config.imap_host, self.config.imap_port);
@@ -237,7 +302,16 @@ impl EmailChannel {
         Ok(session)
     }
 
-    /// Fetch and process unseen messages from the selected mailbox
+    /// Maximum number of messages fetched per IMAP round-trip.
+    /// Bounds peak memory when the mailbox has a large unseen backlog.
+    const MAX_FETCH_BATCH: usize = 10;
+
+    /// Fetch and process unseen messages from the selected mailbox.
+    ///
+    /// UIDs are fetched in chunks of [`Self::MAX_FETCH_BATCH`] to bound the
+    /// number of message bodies (and any audio attachments) held in memory at
+    /// once. Each chunk is marked `\Seen` immediately after fetch so that
+    /// successfully retrieved messages are not re-fetched if a later chunk fails.
     async fn fetch_unseen(&self, session: &mut ImapSession) -> Result<Vec<ParsedEmail>> {
         // Search for unseen messages
         let uids = session.uid_search("UNSEEN").await?;
@@ -247,68 +321,73 @@ impl EmailChannel {
 
         debug!("Found {} unseen messages", uids.len());
 
+        let uid_list: Vec<u32> = uids.into_iter().collect();
         let mut results = Vec::new();
-        let uid_set: String = uids
-            .iter()
-            .map(|u| u.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
 
-        // Fetch message bodies
-        let messages = session.uid_fetch(&uid_set, "RFC822").await?;
-        let messages: Vec<Fetch> = messages.try_collect().await?;
+        for chunk in uid_list.chunks(Self::MAX_FETCH_BATCH) {
+            let uid_set: String = chunk
+                .iter()
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
 
-        for msg in messages {
-            let uid = msg.uid.unwrap_or(0);
-            if let Some(body) = msg.body() {
-                if let Some(parsed) = MessageParser::default().parse(body) {
-                    let sender = Self::extract_sender(&parsed);
-                    let subject = parsed.subject().unwrap_or("(no subject)").to_string();
-                    let body_text = Self::extract_text(&parsed);
-                    let content = format!("Subject: {}\n\n{}", subject, body_text);
-                    let msg_id = parsed
-                        .message_id()
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+            // Fetch message bodies for this chunk
+            let messages = session.uid_fetch(&uid_set, "RFC822").await?;
+            let messages: Vec<Fetch> = messages.try_collect().await?;
 
-                    #[allow(clippy::cast_sign_loss)]
-                    let ts = parsed
-                        .date()
-                        .map(|d| {
-                            let naive = chrono::NaiveDate::from_ymd_opt(
-                                d.year as i32,
-                                u32::from(d.month),
-                                u32::from(d.day),
-                            )
-                            .and_then(|date| {
-                                date.and_hms_opt(
-                                    u32::from(d.hour),
-                                    u32::from(d.minute),
-                                    u32::from(d.second),
+            for msg in messages {
+                let uid = msg.uid.unwrap_or(0);
+                if let Some(body) = msg.body() {
+                    if let Some(parsed) = MessageParser::default().parse(body) {
+                        let sender = Self::extract_sender(&parsed);
+                        let subject = parsed.subject().unwrap_or("(no subject)").to_string();
+                        let body_text = Self::extract_text(&parsed);
+                        let content = format!("Subject: {}\n\n{}", subject, body_text);
+                        let msg_id = parsed
+                            .message_id()
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("gen-{}", Uuid::new_v4()));
+
+                        #[allow(clippy::cast_sign_loss)]
+                        let ts = parsed
+                            .date()
+                            .map(|d| {
+                                let naive = chrono::NaiveDate::from_ymd_opt(
+                                    d.year as i32,
+                                    u32::from(d.month),
+                                    u32::from(d.day),
                                 )
+                                .and_then(|date| {
+                                    date.and_hms_opt(
+                                        u32::from(d.hour),
+                                        u32::from(d.minute),
+                                        u32::from(d.second),
+                                    )
+                                });
+                                naive.map_or(0, |n| n.and_utc().timestamp() as u64)
+                            })
+                            .unwrap_or_else(|| {
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0)
                             });
-                            naive.map_or(0, |n| n.and_utc().timestamp() as u64)
-                        })
-                        .unwrap_or_else(|| {
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_secs())
-                                .unwrap_or(0)
-                        });
 
-                    results.push(ParsedEmail {
-                        _uid: uid,
-                        msg_id,
-                        sender,
-                        content,
-                        timestamp: ts,
-                    });
+                        let attachments = self.extract_attachments(&parsed);
+
+                        results.push(ParsedEmail {
+                            _uid: uid,
+                            msg_id,
+                            sender,
+                            content,
+                            timestamp: ts,
+                            attachments,
+                        });
+                    }
                 }
             }
-        }
 
-        // Mark fetched messages as seen
-        if !results.is_empty() {
+            // Mark this chunk as seen before fetching the next
             let _ = session
                 .uid_store(&uid_set, "+FLAGS (\\Seen)")
                 .await?
@@ -460,6 +539,8 @@ impl EmailChannel {
                 channel: "email".to_string(),
                 timestamp: email.timestamp,
                 thread_ts: None,
+                interruption_scope_id: None,
+                attachments: email.attachments,
             };
 
             if tx.send(msg).await.is_err() {
@@ -495,6 +576,7 @@ struct ParsedEmail {
     sender: String,
     content: String,
     timestamp: u64,
+    attachments: Vec<super::media_pipeline::MediaAttachment>,
 }
 
 /// Result from waiting on IDLE
@@ -512,27 +594,59 @@ impl Channel for EmailChannel {
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
         // Use explicit subject if provided, otherwise fall back to legacy parsing or default
+        let default_subject = self.config.default_subject.as_str();
         let (subject, body) = if let Some(ref subj) = message.subject {
             (subj.as_str(), message.content.as_str())
         } else if message.content.starts_with("Subject: ") {
             if let Some(pos) = message.content.find('\n') {
                 (&message.content[9..pos], message.content[pos + 1..].trim())
             } else {
-                ("ZeroClaw Message", message.content.as_str())
+                (default_subject, message.content.as_str())
             }
         } else {
-            ("ZeroClaw Message", message.content.as_str())
+            (default_subject, message.content.as_str())
         };
 
-        let email = Message::builder()
-            .from(self.config.from_address.parse()?)
-            .to(message.recipient.parse()?)
-            .subject(subject)
-            .singlepart(SinglePart::plain(body.to_string()))?;
+        let email = if message.attachments.is_empty() {
+            // Existing plain-text path
+            Message::builder()
+                .from(self.config.from_address.parse()?)
+                .to(message.recipient.parse()?)
+                .subject(subject)
+                .singlepart(SinglePart::plain(body.to_string()))?
+        } else {
+            // Multipart with attachments
+            let mut multipart = MultiPart::mixed().singlepart(SinglePart::plain(body.to_string()));
+
+            for att in &message.attachments {
+                let content_type = att
+                    .mime_type
+                    .as_deref()
+                    .and_then(|m| ContentType::parse(m).ok())
+                    .unwrap_or_else(|| {
+                        ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
+                    });
+
+                let attachment =
+                    Attachment::new(att.file_name.clone()).body(att.data.clone(), content_type);
+
+                multipart = multipart.singlepart(attachment);
+            }
+
+            Message::builder()
+                .from(self.config.from_address.parse()?)
+                .to(message.recipient.parse()?)
+                .subject(subject)
+                .multipart(multipart)?
+        };
 
         let transport = self.create_smtp_transport()?;
         transport.send(&email)?;
-        info!("Email sent to {}", message.recipient);
+        info!(
+            "Email sent to {} ({} attachments)",
+            message.recipient,
+            message.attachments.len()
+        );
         Ok(())
     }
 
@@ -585,6 +699,31 @@ mod tests {
         assert_eq!(default_idle_timeout(), 1740);
     }
 
+    #[test]
+    fn max_fetch_batch_bounds_chunk_size() {
+        let cap = EmailChannel::MAX_FETCH_BATCH;
+        assert_eq!(cap, 10);
+
+        // Under cap: single chunk
+        let uids: Vec<u32> = (1..=3).collect();
+        let chunks: Vec<&[u32]> = uids.chunks(cap).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 3);
+
+        // Exactly at cap: single chunk
+        let uids: Vec<u32> = (1..=10).collect();
+        let chunks: Vec<&[u32]> = uids.chunks(cap).collect();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 10);
+
+        // Over cap: two chunks
+        let uids: Vec<u32> = (1..=15).collect();
+        let chunks: Vec<&[u32]> = uids.chunks(cap).collect();
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 10);
+        assert_eq!(chunks[1].len(), 5);
+    }
+
     #[tokio::test]
     async fn seen_messages_starts_empty() {
         let channel = EmailChannel::new(EmailConfig::default());
@@ -635,10 +774,13 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1200,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            default_subject: "Custom Subject".to_string(),
+            max_attachment_bytes: default_max_attachment_bytes(),
         };
         assert_eq!(config.imap_host, "imap.example.com");
         assert_eq!(config.imap_folder, "Archive");
         assert_eq!(config.idle_timeout_secs, 1200);
+        assert_eq!(config.default_subject, "Custom Subject");
     }
 
     #[test]
@@ -655,11 +797,14 @@ mod tests {
             from_address: "bot@test.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
+            default_subject: "Test Subject".to_string(),
+            max_attachment_bytes: default_max_attachment_bytes(),
         };
         let cloned = config.clone();
         assert_eq!(cloned.imap_host, config.imap_host);
         assert_eq!(cloned.smtp_port, config.smtp_port);
         assert_eq!(cloned.allowed_senders, config.allowed_senders);
+        assert_eq!(cloned.default_subject, config.default_subject);
     }
 
     // EmailChannel tests
@@ -900,6 +1045,8 @@ mod tests {
             from_address: "bot@example.com".to_string(),
             idle_timeout_secs: 1740,
             allowed_senders: vec!["allowed@example.com".to_string()],
+            default_subject: "Serialization Test".to_string(),
+            max_attachment_bytes: default_max_attachment_bytes(),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -908,6 +1055,7 @@ mod tests {
         assert_eq!(deserialized.imap_host, config.imap_host);
         assert_eq!(deserialized.smtp_port, config.smtp_port);
         assert_eq!(deserialized.allowed_senders, config.allowed_senders);
+        assert_eq!(deserialized.default_subject, config.default_subject);
     }
 
     #[test]
@@ -925,6 +1073,7 @@ mod tests {
         assert_eq!(config.smtp_port, 465); // default
         assert!(config.smtp_tls); // default
         assert_eq!(config.idle_timeout_secs, 1740); // default
+        assert_eq!(config.default_subject, "ZeroClaw Message"); // default
     }
 
     #[test]

@@ -212,7 +212,7 @@ journalctl --user -u zeroclaw.service -f
 ## URL cài đặt
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh | bash
 ```
 
 ## Vẫn chưa giải quyết được?

@@ -44,11 +44,18 @@ pub struct ApprovalLogEntry {
 
 // ── ApprovalManager ──────────────────────────────────────────────
 
-/// Manages the interactive approval workflow.
+/// Manages the approval workflow for tool calls.
 ///
 /// - Checks config-level `auto_approve` / `always_ask` lists
 /// - Maintains a session-scoped "always" allowlist
 /// - Records an audit trail of all decisions
+///
+/// Two modes:
+/// - **Interactive** (CLI): tools needing approval trigger a stdin prompt.
+/// - **Non-interactive** (channels): tools needing approval are auto-denied
+///   because there is no interactive operator to approve them. `auto_approve`
+///   policy is still enforced, and `always_ask` / supervised-default tools are
+///   denied rather than silently allowed.
 pub struct ApprovalManager {
     /// Tools that never need approval (from config).
     auto_approve: HashSet<String>,
@@ -56,6 +63,9 @@ pub struct ApprovalManager {
     always_ask: HashSet<String>,
     /// Autonomy level from config.
     autonomy_level: AutonomyLevel,
+    /// When `true`, tools that would require interactive approval are
+    /// auto-denied instead. Used for channel-driven (non-CLI) runs.
+    non_interactive: bool,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
@@ -63,15 +73,38 @@ pub struct ApprovalManager {
 }
 
 impl ApprovalManager {
-    /// Create from autonomy config.
+    /// Create an interactive (CLI) approval manager from autonomy config.
     pub fn from_config(config: &AutonomyConfig) -> Self {
         Self {
             auto_approve: config.auto_approve.iter().cloned().collect(),
             always_ask: config.always_ask.iter().cloned().collect(),
             autonomy_level: config.level,
+            non_interactive: false,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Create a non-interactive approval manager for channel-driven runs.
+    ///
+    /// Enforces the same `auto_approve` / `always_ask` / supervised policies
+    /// as the CLI manager, but tools that would require interactive approval
+    /// are auto-denied instead of prompting (since there is no operator).
+    pub fn for_non_interactive(config: &AutonomyConfig) -> Self {
+        Self {
+            auto_approve: config.auto_approve.iter().cloned().collect(),
+            always_ask: config.always_ask.iter().cloned().collect(),
+            autonomy_level: config.level,
+            non_interactive: true,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Returns `true` when this manager operates in non-interactive mode
+    /// (i.e. for channel-driven runs where no operator can approve).
+    pub fn is_non_interactive(&self) -> bool {
+        self.non_interactive
     }
 
     /// Check whether a tool call requires interactive approval.
@@ -89,12 +122,21 @@ impl ApprovalManager {
         }
 
         // always_ask overrides everything.
-        if self.always_ask.contains(tool_name) {
+        if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
             return true;
         }
 
+        // Channel-driven shell execution is still guarded by the shell tool's
+        // own command allowlist and risk policy. Skipping the outer approval
+        // gate here lets low-risk allowlisted commands (e.g. `ls`) work in
+        // non-interactive channels without silently allowing medium/high-risk
+        // commands.
+        if self.non_interactive && tool_name == "shell" {
+            return false;
+        }
+
         // auto_approve skips the prompt.
-        if self.auto_approve.contains(tool_name) {
+        if self.auto_approve.contains("*") || self.auto_approve.contains(tool_name) {
             return false;
         }
 
@@ -147,8 +189,8 @@ impl ApprovalManager {
 
     /// Prompt the user on the CLI and return their decision.
     ///
-    /// For non-CLI channels, returns `Yes` automatically (interactive
-    /// approval is only supported on CLI for now).
+    /// Only called for interactive (CLI) managers. Non-interactive managers
+    /// auto-deny in the tool-call loop before reaching this point.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
         prompt_cli_interactive(request)
     }
@@ -401,6 +443,103 @@ mod tests {
         assert!(summary.contains("just a string"));
     }
 
+    // ── non-interactive (channel) mode ────────────────────────
+
+    #[test]
+    fn non_interactive_manager_reports_non_interactive() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        assert!(mgr.is_non_interactive());
+    }
+
+    #[test]
+    fn interactive_manager_reports_interactive() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        assert!(!mgr.is_non_interactive());
+    }
+
+    #[test]
+    fn non_interactive_auto_approve_tools_skip_approval() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        // auto_approve tools (file_read, memory_recall) should not need approval.
+        assert!(!mgr.needs_approval("file_read"));
+        assert!(!mgr.needs_approval("memory_recall"));
+    }
+
+    #[test]
+    fn non_interactive_shell_skips_outer_approval_by_default() {
+        let mgr = ApprovalManager::for_non_interactive(&AutonomyConfig::default());
+        assert!(!mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn non_interactive_always_ask_tools_need_approval() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        // always_ask tools (shell) still report as needing approval,
+        // so the tool-call loop will auto-deny them in non-interactive mode.
+        assert!(mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn non_interactive_unknown_tools_need_approval_in_supervised() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        // Unknown tools in supervised mode need approval (will be auto-denied
+        // by the tool-call loop for non-interactive managers).
+        assert!(mgr.needs_approval("file_write"));
+        assert!(mgr.needs_approval("http_request"));
+    }
+
+    #[test]
+    fn non_interactive_full_autonomy_never_needs_approval() {
+        let mgr = ApprovalManager::for_non_interactive(&full_config());
+        // Full autonomy means no approval needed, even in non-interactive mode.
+        assert!(!mgr.needs_approval("shell"));
+        assert!(!mgr.needs_approval("file_write"));
+        assert!(!mgr.needs_approval("anything"));
+    }
+
+    #[test]
+    fn non_interactive_readonly_never_needs_approval() {
+        let config = AutonomyConfig {
+            level: AutonomyLevel::ReadOnly,
+            ..AutonomyConfig::default()
+        };
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        // ReadOnly blocks execution elsewhere; approval manager does not prompt.
+        assert!(!mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn non_interactive_session_allowlist_still_works() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+        assert!(mgr.needs_approval("file_write"));
+
+        // Simulate an "Always" decision (would come from a prior channel run
+        // if the tool was auto-approved somehow, e.g. via config change).
+        mgr.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "test.txt"}),
+            ApprovalResponse::Always,
+            "telegram",
+        );
+
+        assert!(!mgr.needs_approval("file_write"));
+    }
+
+    #[test]
+    fn non_interactive_always_ask_overrides_session_allowlist() {
+        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
+
+        mgr.record_decision(
+            "shell",
+            &serde_json::json!({"command": "ls"}),
+            ApprovalResponse::Always,
+            "telegram",
+        );
+
+        // shell is in always_ask, so it still needs approval even after "Always".
+        assert!(mgr.needs_approval("shell"));
+    }
+
     // ── ApprovalResponse serde ───────────────────────────────
 
     #[test]
@@ -422,5 +561,51 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
+    }
+
+    // ── Regression: #4247 default approved tools in channels ──
+
+    #[test]
+    fn non_interactive_allows_default_auto_approve_tools() {
+        let config = AutonomyConfig::default();
+        let mgr = ApprovalManager::for_non_interactive(&config);
+
+        for tool in &config.auto_approve {
+            assert!(
+                !mgr.needs_approval(tool),
+                "default auto_approve tool '{tool}' should not need approval in non-interactive mode"
+            );
+        }
+    }
+
+    #[test]
+    fn non_interactive_denies_unknown_tools() {
+        let config = AutonomyConfig::default();
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert!(
+            mgr.needs_approval("some_unknown_tool"),
+            "unknown tool should need approval"
+        );
+    }
+
+    #[test]
+    fn non_interactive_weather_is_auto_approved() {
+        let config = AutonomyConfig::default();
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert!(
+            !mgr.needs_approval("weather"),
+            "weather tool must not need approval — it is in the default auto_approve list"
+        );
+    }
+
+    #[test]
+    fn always_ask_overrides_auto_approve() {
+        let mut config = AutonomyConfig::default();
+        config.always_ask = vec!["weather".into()];
+        let mgr = ApprovalManager::for_non_interactive(&config);
+        assert!(
+            mgr.needs_approval("weather"),
+            "always_ask must override auto_approve"
+        );
     }
 }

@@ -18,6 +18,10 @@ Largest source files in `src/`, ranked by severity. Each does multiple jobs in a
 - `security/policy.rs` (2,338 lines) mixes policy definition, action tracking, and validation — could split by concern.
 - `providers/compatible.rs` (2,892 lines) and `providers/gemini.rs` (2,142 lines) are large for single provider implementations — likely mixing HTTP client logic, response parsing, and tool conversion.
 
+### Misplaced module: `channels/tts.rs` → `tools/`
+
+`channels/tts.rs` (642 lines, merged in PR #2994) is a multi-provider TTS synthesis system. It is not a channel — it does not implement `Channel` or provide a bidirectional messaging interface. TTS is a capability the agent invokes to produce audio output, which fits the `Tool` trait (`src/tools/traits.rs`). It should be moved to `src/tools/tts.rs` with a corresponding `Tool` implementation, and its config types extracted from the `channels` section of `schema.rs` into a `[tools.tts]` config namespace. As of merge, the module is not integrated into any calling code (re-exports are `#[allow(unused_imports)]`), so this move has zero runtime impact.
+
 ---
 
 ## Best Practices Audit Findings
@@ -94,13 +98,19 @@ The project claims size optimization as a goal (`opt-level = "z"`, `lto = "fat"`
 
 Two instances in `src/service/mod.rs` for `libc::getuid()` — no `// SAFETY:` comment. Could use the `nix` crate's safe wrapper instead.
 
-### Low: Python code quality
-
-The `python/` subtree has minimal type hints, no docstrings on key functions, and no parametrized tests. Inconsistent with the Rust side's rigor.
-
 ### Low: Minimal `rustfmt.toml`
 
 Only sets `edition = "2021"`. For a project this size, configuring `max_width`, `imports_granularity`, `group_imports` would enforce consistency as contributor count grows.
+
+### Resolved: CI/CD security hardening (P1/P2)
+
+~~Third-party actions pinned to mutable tags; release workflows granted overly broad write permissions; no composite gate job for branch protection; security tools compiled from source on every PR.~~
+
+**Fixed in** `cicd-best-practices` **branch:**
+- All third-party actions SHA-pinned (P1)
+- Release workflow permissions scoped per-job (P1)
+- Composite `Gate` job added to PR checks (P2)
+- Security tools installed via pre-built binaries (P2)
 
 ## Priority Recommendations
 
@@ -161,6 +171,39 @@ Changes deferred from the project-cleanup pass. Each entry includes rationale an
 - Set up scheduled CI fuzzing (nightly/weekly) — OSS-Fuzz is free for open-source projects
 - Use `cargo fuzz coverage <target>` to generate lcov reports from corpus runs and track which code paths the fuzzer actually reaches
 - Track crash artifacts (`fuzz/artifacts/<target>/`) as issues
+
+### TODO: Test infrastructure follow-ups from `e2e-testing` branch
+
+Issues identified during quality review of the test restructuring work.
+
+**1. ~~`#[path]` attribute pattern in runner files~~ (resolved)**
+
+~~Runner files used `#[path]` attributes as a workaround for E0761.~~ Fixed: runner files renamed to `test_component.rs` etc., directories use standard `mod.rs` files. `Cargo.toml` `[[test]]` entries updated to match. `cargo test --test component` commands unchanged.
+
+**2. Dead infrastructure: `TestChannel`, `TraceLlmProvider`, trace fixtures, `verify_expects()`**
+
+These were built as scaffolding but have no consumers:
+- `tests/support/mock_channel.rs` (`TestChannel`) — planned for channel-driven system tests, but the agent has no public channel-driven loop API, so system tests use `agent.turn()` directly.
+- `tests/support/mock_provider.rs` (`TraceLlmProvider`) — replays JSON fixture traces, but no test loads or runs a fixture.
+- `tests/fixtures/traces/*.json` (3 files) — never loaded by any test.
+- `tests/support/assertions.rs` (`verify_expects()`) — never called.
+
+Either write tests that exercise this infrastructure or remove it to avoid dead code confusion.
+
+**3. Gateway component tests overlap with existing `whatsapp_webhook_security.rs`**
+
+`tests/component/gateway.rs` has 6 HMAC signature verification tests for `verify_whatsapp_signature()` — the same function tested by 8 tests in `tests/component/whatsapp_webhook_security.rs`. Only the 3 gateway constants tests (`MAX_BODY_SIZE`, `REQUEST_TIMEOUT_SECS`, `RATE_LIMIT_WINDOW_SECS`) provide genuinely new coverage. Consider consolidating the signature tests into one file or removing the duplicates from `gateway.rs`.
+
+**4. Security component tests are config-only — no behavioral coverage**
+
+The 10 security tests validate config defaults and TOML serialization only (`AutonomyConfig::default()`, `SecretsConfig`, round-trips). They don't test security *behavior* (policy enforcement, credential scrubbing, action rate limiting) because `src/security/` is `pub(crate)`. The `security_config_debug_does_not_leak_api_key` test is a no-op — it checks for a leak but has no assertion on failure (just a comment). To get real behavioral coverage, either:
+- Make targeted security functions `pub` for testing (e.g. `scrub_credentials`, `SecurityPolicy::evaluate`)
+- Add `#[cfg(test)] pub` escape hatches in `src/security/`
+- Write in-crate unit tests in `src/security/tests.rs` instead
+
+**5. `pub(crate)` visibility blocks integration testing of critical subsystems**
+
+The `security` and `gateway` modules use `pub(crate)` visibility, preventing integration tests from exercising core logic like `SecurityPolicy`, `GatewayRateLimiter`, and `IdempotencyStore`. This forced the new component tests to test only through the narrow public API surface (config structs, one signature function, constants). Consider whether key security types should expose a test-only public interface or whether these tests belong as in-crate unit tests.
 
 ### TODO: Automated release announcements — Twitter/X integration
 

@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -12,6 +13,15 @@ pub struct ChannelMessage {
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
+    /// Thread scope identifier for interruption/cancellation grouping.
+    /// Distinct from `thread_ts` (reply anchor): this is `Some` only when the message
+    /// is genuinely inside a reply thread and should be isolated from other threads.
+    /// `None` means top-level — scope is sender+channel only.
+    pub interruption_scope_id: Option<String>,
+    /// Media attachments (audio, images, video) for the media pipeline.
+    /// Channels populate this when they receive media alongside a text message.
+    /// Defaults to empty — existing channels are unaffected.
+    pub attachments: Vec<super::media_pipeline::MediaAttachment>,
 }
 
 /// Message to send through a channel
@@ -22,6 +32,11 @@ pub struct SendMessage {
     pub subject: Option<String>,
     /// Platform thread identifier for threaded replies (e.g. Slack `thread_ts`).
     pub thread_ts: Option<String>,
+    /// Optional cancellation token for interruptible delivery (e.g. multi-message mode).
+    pub cancellation_token: Option<CancellationToken>,
+    /// File attachments to send with the message.
+    /// Channels that don't support attachments ignore this field.
+    pub attachments: Vec<super::media_pipeline::MediaAttachment>,
 }
 
 impl SendMessage {
@@ -32,6 +47,8 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: None,
             thread_ts: None,
+            cancellation_token: None,
+            attachments: vec![],
         }
     }
 
@@ -46,12 +63,29 @@ impl SendMessage {
             recipient: recipient.into(),
             subject: Some(subject.into()),
             thread_ts: None,
+            cancellation_token: None,
+            attachments: vec![],
         }
     }
 
     /// Set the thread identifier for threaded replies.
     pub fn in_thread(mut self, thread_ts: Option<String>) -> Self {
         self.thread_ts = thread_ts;
+        self
+    }
+
+    /// Attach a cancellation token for interruptible delivery.
+    pub fn with_cancellation(mut self, token: CancellationToken) -> Self {
+        self.cancellation_token = Some(token);
+        self
+    }
+
+    /// Attach files to this message.
+    pub fn with_attachments(
+        mut self,
+        attachments: Vec<super::media_pipeline::MediaAttachment>,
+    ) -> Self {
+        self.attachments = attachments;
         self
     }
 }
@@ -89,6 +123,19 @@ pub trait Channel: Send + Sync {
         false
     }
 
+    /// Whether this channel supports multi-message streaming delivery, where
+    /// the response is sent as multiple separate messages at paragraph
+    /// boundaries as tokens arrive from the provider.
+    fn supports_multi_message_streaming(&self) -> bool {
+        false
+    }
+
+    /// Minimum delay (ms) between sending each paragraph in multi-message mode.
+    /// Channels should override this to avoid platform rate limits.
+    fn multi_message_delay_ms(&self) -> u64 {
+        800
+    }
+
     /// Send an initial draft message. Returns a platform-specific message ID for later edits.
     async fn send_draft(&self, _message: &SendMessage) -> anyhow::Result<Option<String>> {
         Ok(None)
@@ -96,6 +143,18 @@ pub trait Channel: Send + Sync {
 
     /// Update a previously sent draft message with new accumulated content.
     async fn update_draft(
+        &self,
+        _recipient: &str,
+        _message_id: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Show a progress/status update (e.g. tool execution status).
+    /// Channels can display this in a status bar rather than in the message body.
+    /// Default: no-op (progress is ignored).
+    async fn update_draft_progress(
         &self,
         _recipient: &str,
         _message_id: &str,
@@ -142,6 +201,30 @@ pub trait Channel: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+
+    /// Pin a message in the channel.
+    async fn pin_message(&self, _channel_id: &str, _message_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Unpin a previously pinned message.
+    async fn unpin_message(&self, _channel_id: &str, _message_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Redact (delete) a message from the channel.
+    ///
+    /// `channel_id` is the platform channel/conversation identifier.
+    /// `message_id` is the platform-scoped message identifier.
+    /// `reason` is an optional reason for the redaction (may be visible in audit logs).
+    async fn redact_message(
+        &self,
+        _channel_id: &str,
+        _message_id: &str,
+        _reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -172,6 +255,8 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -188,6 +273,8 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
         };
 
         let cloned = message.clone();
@@ -206,24 +293,30 @@ mod tests {
         assert!(channel.health_check().await);
         assert!(channel.start_typing("bob").await.is_ok());
         assert!(channel.stop_typing("bob").await.is_ok());
-        assert!(channel
-            .send(&SendMessage::new("hello", "bob"))
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .send(&SendMessage::new("hello", "bob"))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn default_reaction_methods_return_success() {
         let channel = DummyChannel;
 
-        assert!(channel
-            .add_reaction("chan_1", "msg_1", "\u{1F440}")
-            .await
-            .is_ok());
-        assert!(channel
-            .remove_reaction("chan_1", "msg_1", "\u{1F440}")
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .add_reaction("chan_1", "msg_1", "\u{1F440}")
+                .await
+                .is_ok()
+        );
+        assert!(
+            channel
+                .remove_reaction("chan_1", "msg_1", "\u{1F440}")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -231,16 +324,20 @@ mod tests {
         let channel = DummyChannel;
 
         assert!(!channel.supports_draft_updates());
-        assert!(channel
-            .send_draft(&SendMessage::new("draft", "bob"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            channel
+                .send_draft(&SendMessage::new("draft", "bob"))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(channel.update_draft("bob", "msg_1", "text").await.is_ok());
-        assert!(channel
-            .finalize_draft("bob", "msg_1", "final text")
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .finalize_draft("bob", "msg_1", "final text")
+                .await
+                .is_ok()
+        );
         assert!(channel.cancel_draft("bob", "msg_1").await.is_ok());
     }
 
@@ -255,5 +352,23 @@ mod tests {
         assert_eq!(received.sender, "tester");
         assert_eq!(received.content, "hello");
         assert_eq!(received.channel, "dummy");
+    }
+
+    #[tokio::test]
+    async fn default_redact_message_returns_success() {
+        let channel = DummyChannel;
+
+        assert!(
+            channel
+                .redact_message("chan_1", "msg_1", Some("spam".to_string()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            channel
+                .redact_message("chan_1", "msg_2", None)
+                .await
+                .is_ok()
+        );
     }
 }

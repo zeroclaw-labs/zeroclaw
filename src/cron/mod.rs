@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::security::SecurityPolicy;
-use anyhow::{bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 mod schedule;
 mod store;
@@ -14,10 +14,143 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_job, add_shell_job, due_jobs, get_job, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_agent_job, all_overdue_jobs, due_jobs, get_job, list_jobs, list_runs, record_last_run,
+    record_run, remove_job, reschedule_after_run, sync_declarative_jobs, update_job,
 };
-pub use types::{CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget};
+pub use types::{
+    CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    deserialize_maybe_stringified,
+};
+
+/// Validate a shell command against the full security policy (allowlist + risk gate).
+///
+/// Returns `Ok(())` if the command passes all checks, or an error describing
+/// why it was blocked.
+pub fn validate_shell_command(config: &Config, command: &str, approved: bool) -> Result<()> {
+    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    validate_shell_command_with_security(&security, command, approved)
+}
+
+/// Validate a shell command using an existing `SecurityPolicy` instance.
+///
+/// Preferred when the caller already holds a `SecurityPolicy` (e.g. scheduler).
+pub(crate) fn validate_shell_command_with_security(
+    security: &SecurityPolicy,
+    command: &str,
+    approved: bool,
+) -> Result<()> {
+    security
+        .validate_command_execution(command, approved)
+        .map(|_| ())
+        .map_err(|reason| anyhow!("blocked by security policy: {reason}"))
+}
+
+pub(crate) fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()> {
+    let Some(delivery) = delivery else {
+        return Ok(());
+    };
+
+    if delivery.mode.eq_ignore_ascii_case("none") {
+        return Ok(());
+    }
+    if !delivery.mode.eq_ignore_ascii_case("announce") {
+        bail!("unsupported delivery mode: {}", delivery.mode);
+    }
+
+    let channel = delivery.channel.as_deref().map(str::trim);
+    let Some(channel) = channel.filter(|value| !value.is_empty()) else {
+        bail!("delivery.channel is required for announce mode");
+    };
+    match channel.to_ascii_lowercase().as_str() {
+        "telegram" | "discord" | "slack" | "mattermost" | "signal" | "matrix" | "qq" => {}
+        other => bail!("unsupported delivery channel: {other}"),
+    }
+
+    let has_target = delivery
+        .to
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_target {
+        bail!("delivery.to is required for announce mode");
+    }
+
+    Ok(())
+}
+
+/// Create a validated shell job, enforcing security policy before persistence.
+///
+/// All entrypoints that create shell cron jobs should route through this
+/// function to guarantee consistent policy enforcement.
+pub fn add_shell_job_with_approval(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+) -> Result<CronJob> {
+    validate_shell_command(config, command, approved)?;
+    validate_delivery_config(delivery.as_ref())?;
+    store::add_shell_job(config, name, schedule, command, delivery)
+}
+
+/// Update a shell job's command with security validation.
+///
+/// Validates the new command (if changed) before persisting.
+pub fn update_shell_job_with_approval(
+    config: &Config,
+    job_id: &str,
+    patch: CronJobPatch,
+    approved: bool,
+) -> Result<CronJob> {
+    if let Some(command) = patch.command.as_deref() {
+        validate_shell_command(config, command, approved)?;
+    }
+    update_job(config, job_id, patch)
+}
+
+/// Create a one-shot validated shell job from a delay string (e.g. "30m").
+pub fn add_once_validated(
+    config: &Config,
+    delay: &str,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
+    let duration = parse_delay(delay)?;
+    let at = chrono::Utc::now() + duration;
+    add_once_at_validated(config, at, command, approved)
+}
+
+/// Create a one-shot validated shell job at an absolute timestamp.
+pub fn add_once_at_validated(
+    config: &Config,
+    at: chrono::DateTime<chrono::Utc>,
+    command: &str,
+    approved: bool,
+) -> Result<CronJob> {
+    let schedule = Schedule::At { at };
+    add_shell_job_with_approval(config, None, schedule, command, None, approved)
+}
+
+// Convenience wrappers for CLI paths (default approved=false).
+
+pub(crate) fn add_shell_job(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+) -> Result<CronJob> {
+    add_shell_job_with_approval(config, name, schedule, command, None, false)
+}
+
+pub(crate) fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
+    let schedule = Schedule::Cron {
+        expr: expression.to_string(),
+        tz: None,
+    };
+    add_shell_job(config, None, schedule, command)
+}
 
 #[allow(clippy::needless_pass_by_value)]
 pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<()> {
@@ -57,44 +190,162 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
         crate::CronCommands::Add {
             expression,
             tz,
+            agent,
+            allowed_tools,
             command,
         } => {
             let schedule = Schedule::Cron {
                 expr: expression,
                 tz,
             };
-            let job = add_shell_job(config, None, schedule, &command)?;
-            println!("✅ Added cron job {}", job.id);
-            println!("  Expr: {}", job.expression);
-            println!("  Next: {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            if agent {
+                let job = add_agent_job(
+                    config,
+                    None,
+                    schedule,
+                    &command,
+                    SessionTarget::Isolated,
+                    None,
+                    None,
+                    false,
+                    if allowed_tools.is_empty() {
+                        None
+                    } else {
+                        Some(allowed_tools)
+                    },
+                )?;
+                println!("✅ Added agent cron job {}", job.id);
+                println!("  Expr  : {}", job.expression);
+                println!("  Next  : {}", job.next_run.to_rfc3339());
+                println!("  Prompt: {}", job.prompt.as_deref().unwrap_or_default());
+            } else {
+                if !allowed_tools.is_empty() {
+                    bail!("--allowed-tool is only supported with --agent cron jobs");
+                }
+                let job = add_shell_job(config, None, schedule, &command)?;
+                println!("✅ Added cron job {}", job.id);
+                println!("  Expr: {}", job.expression);
+                println!("  Next: {}", job.next_run.to_rfc3339());
+                println!("  Cmd : {}", job.command);
+            }
             Ok(())
         }
-        crate::CronCommands::AddAt { at, command } => {
+        crate::CronCommands::AddAt {
+            at,
+            agent,
+            allowed_tools,
+            command,
+        } => {
             let at = chrono::DateTime::parse_from_rfc3339(&at)
                 .map_err(|e| anyhow::anyhow!("Invalid RFC3339 timestamp for --at: {e}"))?
                 .with_timezone(&chrono::Utc);
             let schedule = Schedule::At { at };
-            let job = add_shell_job(config, None, schedule, &command)?;
-            println!("✅ Added one-shot cron job {}", job.id);
-            println!("  At  : {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+            if agent {
+                let job = add_agent_job(
+                    config,
+                    None,
+                    schedule,
+                    &command,
+                    SessionTarget::Isolated,
+                    None,
+                    None,
+                    true,
+                    if allowed_tools.is_empty() {
+                        None
+                    } else {
+                        Some(allowed_tools)
+                    },
+                )?;
+                println!("✅ Added one-shot agent cron job {}", job.id);
+                println!("  At    : {}", job.next_run.to_rfc3339());
+                println!("  Prompt: {}", job.prompt.as_deref().unwrap_or_default());
+            } else {
+                if !allowed_tools.is_empty() {
+                    bail!("--allowed-tool is only supported with --agent cron jobs");
+                }
+                let job = add_shell_job(config, None, schedule, &command)?;
+                println!("✅ Added one-shot cron job {}", job.id);
+                println!("  At  : {}", job.next_run.to_rfc3339());
+                println!("  Cmd : {}", job.command);
+            }
             Ok(())
         }
-        crate::CronCommands::AddEvery { every_ms, command } => {
+        crate::CronCommands::AddEvery {
+            every_ms,
+            agent,
+            allowed_tools,
+            command,
+        } => {
             let schedule = Schedule::Every { every_ms };
-            let job = add_shell_job(config, None, schedule, &command)?;
-            println!("✅ Added interval cron job {}", job.id);
-            println!("  Every(ms): {every_ms}");
-            println!("  Next     : {}", job.next_run.to_rfc3339());
-            println!("  Cmd      : {}", job.command);
+            if agent {
+                let job = add_agent_job(
+                    config,
+                    None,
+                    schedule,
+                    &command,
+                    SessionTarget::Isolated,
+                    None,
+                    None,
+                    false,
+                    if allowed_tools.is_empty() {
+                        None
+                    } else {
+                        Some(allowed_tools)
+                    },
+                )?;
+                println!("✅ Added interval agent cron job {}", job.id);
+                println!("  Every(ms): {every_ms}");
+                println!("  Next     : {}", job.next_run.to_rfc3339());
+                println!("  Prompt   : {}", job.prompt.as_deref().unwrap_or_default());
+            } else {
+                if !allowed_tools.is_empty() {
+                    bail!("--allowed-tool is only supported with --agent cron jobs");
+                }
+                let job = add_shell_job(config, None, schedule, &command)?;
+                println!("✅ Added interval cron job {}", job.id);
+                println!("  Every(ms): {every_ms}");
+                println!("  Next     : {}", job.next_run.to_rfc3339());
+                println!("  Cmd      : {}", job.command);
+            }
             Ok(())
         }
-        crate::CronCommands::Once { delay, command } => {
-            let job = add_once(config, &delay, &command)?;
-            println!("✅ Added one-shot cron job {}", job.id);
-            println!("  At  : {}", job.next_run.to_rfc3339());
-            println!("  Cmd : {}", job.command);
+        crate::CronCommands::Once {
+            delay,
+            agent,
+            allowed_tools,
+            command,
+        } => {
+            if agent {
+                let duration = parse_delay(&delay)?;
+                let at = chrono::Utc::now() + duration;
+                let schedule = Schedule::At { at };
+                let job = add_agent_job(
+                    config,
+                    None,
+                    schedule,
+                    &command,
+                    SessionTarget::Isolated,
+                    None,
+                    None,
+                    true,
+                    if allowed_tools.is_empty() {
+                        None
+                    } else {
+                        Some(allowed_tools)
+                    },
+                )?;
+                println!("✅ Added one-shot agent cron job {}", job.id);
+                println!("  At    : {}", job.next_run.to_rfc3339());
+                println!("  Prompt: {}", job.prompt.as_deref().unwrap_or_default());
+            } else {
+                if !allowed_tools.is_empty() {
+                    bail!("--allowed-tool is only supported with --agent cron jobs");
+                }
+                let job = add_once(config, &delay, &command)?;
+                println!("✅ Added one-shot cron job {}", job.id);
+                println!("  At  : {}", job.next_run.to_rfc3339());
+                println!("  Cmd : {}", job.command);
+            }
             Ok(())
         }
         crate::CronCommands::Update {
@@ -103,21 +354,37 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             tz,
             command,
             name,
+            allowed_tools,
         } => {
-            if expression.is_none() && tz.is_none() && command.is_none() && name.is_none() {
-                bail!("At least one of --expression, --tz, --command, or --name must be provided");
+            if expression.is_none()
+                && tz.is_none()
+                && command.is_none()
+                && name.is_none()
+                && allowed_tools.is_empty()
+            {
+                bail!(
+                    "At least one of --expression, --tz, --command, --name, or --allowed-tool must be provided"
+                );
             }
+
+            let existing = if expression.is_some() || tz.is_some() || !allowed_tools.is_empty() {
+                Some(get_job(config, &id)?)
+            } else {
+                None
+            };
 
             // Merge expression/tz with the existing schedule so that
             // --tz alone updates the timezone and --expression alone
             // preserves the existing timezone.
             let schedule = if expression.is_some() || tz.is_some() {
-                let existing = get_job(config, &id)?;
-                let (existing_expr, existing_tz) = match existing.schedule {
+                let existing = existing
+                    .as_ref()
+                    .expect("existing job must be loaded when updating schedule");
+                let (existing_expr, existing_tz) = match &existing.schedule {
                     Schedule::Cron {
                         expr,
                         tz: existing_tz,
-                    } => (expr, existing_tz),
+                    } => (expr.clone(), existing_tz.clone()),
                     _ => bail!("Cannot update expression/tz on a non-cron schedule"),
                 };
                 Some(Schedule::Cron {
@@ -128,10 +395,12 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 None
             };
 
-            if let Some(ref cmd) = command {
-                let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-                if !security.is_command_allowed(cmd) {
-                    bail!("Command blocked by security policy: {cmd}");
+            if !allowed_tools.is_empty() {
+                let existing = existing
+                    .as_ref()
+                    .expect("existing job must be loaded when updating allowed tools");
+                if existing.job_type != JobType::Agent {
+                    bail!("--allowed-tool is only supported for agent cron jobs");
                 }
             }
 
@@ -139,10 +408,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 schedule,
                 command,
                 name,
+                allowed_tools: if allowed_tools.is_empty() {
+                    None
+                } else {
+                    Some(allowed_tools)
+                },
                 ..CronJobPatch::default()
             };
 
-            let job = update_job(config, &id, patch)?;
+            let job = update_shell_job_with_approval(config, &id, patch, false)?;
             println!("\u{2705} Updated cron job {}", job.id);
             println!("  Expr: {}", job.expression);
             println!("  Next: {}", job.next_run.to_rfc3339());
@@ -163,19 +437,16 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
     }
 }
 
-pub fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
-    let duration = parse_delay(delay)?;
-    let at = chrono::Utc::now() + duration;
-    add_once_at(config, at, command)
+pub(crate) fn add_once(config: &Config, delay: &str, command: &str) -> Result<CronJob> {
+    add_once_validated(config, delay, command, false)
 }
 
-pub fn add_once_at(
+pub(crate) fn add_once_at(
     config: &Config,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
 ) -> Result<CronJob> {
-    let schedule = Schedule::At { at };
-    add_shell_job(config, None, schedule, command)
+    add_once_at_validated(config, at, command, false)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -264,6 +535,7 @@ mod tests {
                 tz: tz.map(Into::into),
                 command: command.map(Into::into),
                 name: name.map(Into::into),
+                allowed_tools: vec![],
             },
             config,
         )
@@ -412,5 +684,347 @@ mod tests {
 
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         assert!(security.is_command_allowed("echo safe"));
+    }
+
+    #[test]
+    fn add_shell_job_requires_explicit_approval_for_medium_risk() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+
+        let denied = add_shell_job(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "touch cron-medium-risk",
+        );
+        assert!(denied.is_err());
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("explicit approval")
+        );
+
+        let approved = add_shell_job_with_approval(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "touch cron-medium-risk",
+            None,
+            true,
+        );
+        assert!(approved.is_ok(), "{approved:?}");
+    }
+
+    #[test]
+    fn update_requires_explicit_approval_for_medium_risk() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        let job = make_job(&config, "*/5 * * * *", None, "echo original");
+
+        let denied = update_shell_job_with_approval(
+            &config,
+            &job.id,
+            CronJobPatch {
+                command: Some("touch cron-medium-risk-update".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        );
+        assert!(denied.is_err());
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("explicit approval")
+        );
+
+        let approved = update_shell_job_with_approval(
+            &config,
+            &job.id,
+            CronJobPatch {
+                command: Some("touch cron-medium-risk-update".into()),
+                ..CronJobPatch::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(approved.command, "touch cron-medium-risk-update");
+    }
+
+    #[test]
+    fn cli_update_requires_explicit_approval_for_medium_risk() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        let job = make_job(&config, "*/5 * * * *", None, "echo original");
+
+        let result = run_update(
+            &config,
+            &job.id,
+            None,
+            None,
+            Some("touch cron-cli-medium-risk"),
+            None,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("explicit approval")
+        );
+    }
+
+    #[test]
+    fn add_once_validated_creates_one_shot_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let job = add_once_validated(&config, "1h", "echo one-shot", false).unwrap();
+        assert_eq!(job.command, "echo one-shot");
+        assert!(matches!(job.schedule, Schedule::At { .. }));
+    }
+
+    #[test]
+    fn add_once_validated_blocks_disallowed_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+
+        let result = add_once_validated(&config, "1h", "curl https://example.com", false);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blocked by security policy")
+        );
+    }
+
+    #[test]
+    fn add_once_at_validated_creates_one_shot_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let at = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let job = add_once_at_validated(&config, at, "echo at-shot", false).unwrap();
+        assert_eq!(job.command, "echo at-shot");
+        assert!(matches!(job.schedule, Schedule::At { .. }));
+    }
+
+    #[test]
+    fn add_once_at_validated_blocks_medium_risk_without_approval() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
+        let at = chrono::Utc::now() + chrono::Duration::hours(1);
+
+        let denied = add_once_at_validated(&config, at, "touch at-medium", false);
+        assert!(denied.is_err());
+        assert!(
+            denied
+                .unwrap_err()
+                .to_string()
+                .contains("explicit approval")
+        );
+
+        let approved = add_once_at_validated(&config, at, "touch at-medium", true);
+        assert!(approved.is_ok(), "{approved:?}");
+    }
+
+    #[test]
+    fn gateway_api_path_validates_shell_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+
+        // Simulate gateway API path: add_shell_job_with_approval(approved=false)
+        let result = add_shell_job_with_approval(
+            &config,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "curl https://example.com",
+            None,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blocked by security policy")
+        );
+    }
+
+    #[test]
+    fn scheduler_path_validates_shell_command() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        // Simulate scheduler validation path
+        let result =
+            validate_shell_command_with_security(&security, "curl https://example.com", false);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blocked by security policy")
+        );
+    }
+
+    #[test]
+    fn cli_agent_flag_creates_agent_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/15 * * * *".into(),
+                tz: None,
+                agent: true,
+                allowed_tools: vec![],
+                command: "Check server health: disk space, memory, CPU load".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, JobType::Agent);
+        assert_eq!(
+            jobs[0].prompt.as_deref(),
+            Some("Check server health: disk space, memory, CPU load")
+        );
+    }
+
+    #[test]
+    fn cli_agent_flag_bypasses_shell_security_validation() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.allowed_commands = vec!["echo".into()];
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+
+        // Without --agent, a natural language string would be blocked by shell
+        // security policy. With --agent, it routes to agent job and skips
+        // shell validation entirely.
+        let result = handle_command(
+            crate::CronCommands::Add {
+                expression: "*/15 * * * *".into(),
+                tz: None,
+                agent: true,
+                allowed_tools: vec![],
+                command: "Check server health: disk space, memory, CPU load".into(),
+            },
+            &config,
+        );
+        assert!(result.is_ok());
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, JobType::Agent);
+    }
+
+    #[test]
+    fn cli_agent_allowed_tools_persist() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/15 * * * *".into(),
+                tz: None,
+                agent: true,
+                allowed_tools: vec!["file_read".into(), "web_search".into()],
+                command: "Check server health".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].allowed_tools,
+            Some(vec!["file_read".into(), "web_search".into()])
+        );
+    }
+
+    #[test]
+    fn cli_update_agent_allowed_tools_persist() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            Some("agent".into()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "original prompt",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        handle_command(
+            crate::CronCommands::Update {
+                id: job.id.clone(),
+                expression: None,
+                tz: None,
+                command: None,
+                name: None,
+                allowed_tools: vec!["shell".into()],
+            },
+            &config,
+        )
+        .unwrap();
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.allowed_tools, Some(vec!["shell".into()]));
+    }
+
+    #[test]
+    fn cli_without_agent_flag_defaults_to_shell_job() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        handle_command(
+            crate::CronCommands::Add {
+                expression: "*/5 * * * *".into(),
+                tz: None,
+                agent: false,
+                allowed_tools: vec![],
+                command: "echo ok".into(),
+            },
+            &config,
+        )
+        .unwrap();
+
+        let jobs = list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_type, JobType::Shell);
+        assert_eq!(jobs[0].command, "echo ok");
     }
 }

@@ -152,10 +152,12 @@ mod tests {
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Missing 'job_id'"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Missing 'job_id'")
+        );
     }
 
     #[tokio::test]
@@ -166,10 +168,10 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.level = AutonomyLevel::ReadOnly;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let job = cron::add_job(&config, "*/5 * * * *", "echo ok").unwrap();
+        config.autonomy.level = AutonomyLevel::ReadOnly;
         let cfg = Arc::new(config);
-        let job = cron::add_job(&cfg, "*/5 * * * *", "echo ok").unwrap();
         let tool = CronRemoveTool::new(cfg.clone(), test_security(&cfg));
 
         let result = tool.execute(json!({"job_id": job.id})).await.unwrap();
@@ -194,10 +196,12 @@ mod tests {
 
         let result = tool.execute(json!({"job_id": job.id})).await.unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .unwrap_or_default()
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("Rate limit exceeded")
+        );
         assert_eq!(cron::list_jobs(&cfg).unwrap().len(), 1);
     }
 }

@@ -1,6 +1,9 @@
 name: Release Stable
 
 on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"   # stable tags only (no -beta suffix)
   workflow_dispatch:
     inputs:
       version:
@@ -20,6 +23,7 @@ env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
+  RELEASE_CARGO_FEATURES: channel-matrix,channel-lark,whatsapp-web
 
 jobs:
   validate:
@@ -28,14 +32,25 @@ jobs:
     outputs:
       tag: ${{ steps.check.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Validate semver and Cargo.toml match
         id: check
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version || '' }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          input_version="${{ inputs.version }}"
           cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+
+          # Resolve version from tag push or manual input
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            # Tag push: extract version from tag name (v0.5.9 -> 0.5.9)
+            input_version="${REF_NAME#v}"
+          else
+            input_version="$INPUT_VERSION"
+          fi
 
           if [[ ! "$input_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Version must be semver (X.Y.Z). Got: ${input_version}"
@@ -48,9 +63,13 @@ jobs:
           fi
 
           tag="v${input_version}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "::error::Tag ${tag} already exists."
-            exit 1
+
+          # Only check tag existence for manual dispatch (tag push means it already exists)
+          if [[ "$EVENT_NAME" != "push" ]]; then
+            if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
+              echo "::error::Tag ${tag} already exists."
+              exit 1
+            fi
           fi
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
@@ -74,6 +93,86 @@ jobs:
           path: web/dist/
           retention-days: 1
 
+  release-notes:
+    name: Generate Release Notes
+    runs-on: ubuntu-latest
+    outputs:
+      notes: ${{ steps.notes.outputs.body }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - name: Build release notes
+        id: notes
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version || '' }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          # Resolve version from tag push or manual input
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            INPUT_VERSION="${REF_NAME#v}"
+          fi
+
+          # Find the previous stable tag (exclude beta tags)
+          PREV_TAG=$(git tag --sort=-creatordate | grep -vE '\-beta\.' | grep -v "^v${INPUT_VERSION}$" | head -1 || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          # Extract features only — skip bug fixes for clean release notes
+          FEATURES=$(git log "$RANGE" --pretty=format:"%s" --no-merges \
+            | grep -iE '^feat(\(|:)' \
+            | sed 's/^feat(\([^)]*\)): /\1: /' \
+            | sed 's/^feat: //' \
+            | sed 's/ (#[0-9]*)$//' \
+            | sort -uf \
+            | while IFS= read -r line; do echo "- ${line}"; done || true)
+
+          if [ -z "$FEATURES" ]; then
+            FEATURES="- Incremental improvements and polish"
+          fi
+
+          # Collect ALL unique contributors: git authors + Co-Authored-By
+          GIT_AUTHORS=$(git log "$RANGE" --pretty=format:"%an" --no-merges | sort -uf || true)
+          CO_AUTHORS=$(git log "$RANGE" --pretty=format:"%b" --no-merges \
+            | grep -ioE 'Co-Authored-By: *[^<]+' \
+            | sed 's/Co-Authored-By: *//i' \
+            | sed 's/ *$//' \
+            | sort -uf || true)
+
+          # Merge, deduplicate, and filter out bots
+          ALL_CONTRIBUTORS=$(printf "%s\n%s" "$GIT_AUTHORS" "$CO_AUTHORS" \
+            | sort -uf \
+            | grep -v '^$' \
+            | grep -viE '\[bot\]$|^dependabot|^github-actions|^copilot|^ZeroClaw Bot|^ZeroClaw Runner|^ZeroClaw Agent|^blacksmith' \
+            | while IFS= read -r name; do echo "- ${name}"; done || true)
+
+          BODY=$(cat <<NOTES_EOF
+          ## What's New
+
+          ${FEATURES}
+
+          ## Contributors
+
+          ${ALL_CONTRIBUTORS}
+
+          ---
+          *Full changelog: ${PREV_TAG}...v${INPUT_VERSION}*
+          NOTES_EOF
+          )
+
+          {
+            echo "body<<BODY_EOF"
+            echo "$BODY"
+            echo "BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
   build:
     name: Build ${{ matrix.target }}
     needs: [validate, web]
@@ -83,33 +182,62 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          # Use ubuntu-22.04 for Linux builds to link against glibc 2.35,
+          # ensuring compatibility with Ubuntu 22.04+ (#3573).
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: aarch64-unknown-linux-gnu
             artifact: zeroclaw
             ext: tar.gz
             cross_compiler: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             linker: aarch64-linux-gnu-gcc
+          - os: ubuntu-22.04
+            target: armv7-unknown-linux-gnueabihf
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
+            skip_prometheus: true
+          - os: ubuntu-22.04
+            target: arm-unknown-linux-gnueabihf
+            artifact: zeroclaw
+            ext: tar.gz
+            cross_compiler: gcc-arm-linux-gnueabihf
+            linker_env: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            linker: arm-linux-gnueabihf-gcc
+            skip_prometheus: true
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: zeroclaw
             ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            artifact: zeroclaw
+            ext: tar.gz
+            ndk: true
+            experimental: true
+            # wa-rs crates don't compile for Android; exclude whatsapp-web
+            cargo_features: "channel-matrix,channel-lark"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: zeroclaw.exe
             ext: zip
+    continue-on-error: ${{ matrix.experimental || false }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.92.0
+          toolchain: 1.93.0
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         if: runner.os != 'Windows'
+        with:
+          prefix-key: ${{ matrix.os }}-${{ matrix.target }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -122,13 +250,36 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+      - name: Setup Android NDK
+        if: matrix.ndk
+        run: echo "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+
       - name: Build release
         shell: bash
         run: |
           if [ -n "${{ matrix.linker_env || '' }}" ] && [ -n "${{ matrix.linker || '' }}" ]; then
             export "${{ matrix.linker_env }}=${{ matrix.linker }}"
           fi
-          cargo build --release --locked --target ${{ matrix.target }}
+          # Force ARMv6 codegen for arm-unknown-linux-gnueabihf (#4556)
+          # Ubuntu 22.04's gcc-arm-linux-gnueabihf defaults to ARMv7+NEON,
+          # which segfaults on ARMv6 devices (e.g. Raspberry Pi Zero W).
+          if [ "${{ matrix.target }}" = "arm-unknown-linux-gnueabihf" ]; then
+            export CFLAGS_arm_unknown_linux_gnueabihf="-march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            export CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS="-C target-feature=-neon"
+          fi
+          # Use matrix-level feature override if set, otherwise use global RELEASE_CARGO_FEATURES
+          FEATURES="${{ matrix.cargo_features || env.RELEASE_CARGO_FEATURES }}"
+          if [ "${{ matrix.skip_prometheus || 'false' }}" = "true" ]; then
+            cargo build --release --locked --no-default-features --features "${FEATURES},channel-nostr,skill-creation" --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --features "${FEATURES}" --target ${{ matrix.target }}
+          fi
+
+      - name: Check binary size
+        shell: bash
+        run: bash scripts/ci/check_binary_size.sh "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "${{ matrix.target }}"
+        env:
+          BINARY_SIZE_HARD_LIMIT: "52428800"  # 50MB — release builds include all optional features
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
@@ -142,65 +293,363 @@ jobs:
           cd target/${{ matrix.target }}/release
           7z a ../../../zeroclaw-${{ matrix.target }}.${{ matrix.ext }} ${{ matrix.artifact }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: zeroclaw-${{ matrix.target }}
           path: zeroclaw-${{ matrix.target }}.${{ matrix.ext }}
           retention-days: 14
 
+  build-desktop:
+    name: Build Desktop App (macOS Universal)
+    needs: [validate]
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.93.0
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          prefix-key: macos-tauri
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked
+
+      - name: Sync Tauri version with Cargo.toml
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          cd apps/tauri
+          if command -v jq >/dev/null 2>&1; then
+            jq --arg v "$VERSION" '.version = $v' tauri.conf.json > tmp.json && mv tmp.json tauri.conf.json
+          else
+            sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" tauri.conf.json
+          fi
+          echo "Tauri version set to: $VERSION"
+
+      - name: Build Tauri app (universal binary)
+        working-directory: apps/tauri
+        run: cargo tauri build --target universal-apple-darwin
+
+      - name: Prepare desktop release assets
+        run: |
+          mkdir -p desktop-assets
+          find target -name '*.dmg' -exec cp {} desktop-assets/ZeroClaw.dmg \; 2>/dev/null || true
+          find target -name '*.app.tar.gz' -exec cp {} desktop-assets/ZeroClaw-macos.app.tar.gz \; 2>/dev/null || true
+          find target -name '*.app.tar.gz.sig' -exec cp {} desktop-assets/ZeroClaw-macos.app.tar.gz.sig \; 2>/dev/null || true
+          echo "--- Desktop assets ---"
+          ls -lh desktop-assets/
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: desktop-macos
+          path: desktop-assets/*
+          retention-days: 14
+
   publish:
     name: Publish Stable Release
-    needs: [validate, build]
+    needs: [validate, release-notes, build, build-desktop]
     runs-on: ubuntu-latest
+    environment:
+      name: github-releases
+      url: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.validate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: zeroclaw-*
           path: artifacts
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: desktop-macos
+          path: artifacts/desktop-macos
+
+      - name: Verify required release assets
+        shell: bash
+        run: |
+          required_assets=(
+            "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
+            "zeroclaw-aarch64-unknown-linux-gnu.tar.gz"
+            "zeroclaw-armv7-unknown-linux-gnueabihf.tar.gz"
+            "zeroclaw-arm-unknown-linux-gnueabihf.tar.gz"
+            "zeroclaw-aarch64-apple-darwin.tar.gz"
+            "zeroclaw-aarch64-linux-android.tar.gz"
+            "zeroclaw-x86_64-pc-windows-msvc.zip"
+            "ZeroClaw.dmg"
+          )
+          missing=0
+          for asset in "${required_assets[@]}"; do
+            if ! find artifacts -type f -name "$asset" -print -quit | grep -q .; then
+              echo "::error::Missing required release asset: ${asset}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "Collected files:"
+            find artifacts -type f | sort
+            exit 1
+          fi
 
       - name: Generate checksums
         run: |
           cd artifacts
-          find . -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
+          find . -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' \) -exec sha256sum {} + | sed 's|  \./[^/]*/|  |' > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.validate.outputs.tag }}
-          name: ${{ needs.validate.outputs.tag }}
-          prerelease: false
-          generate_release_notes: true
-          files: |
-            artifacts/**/*
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.dmg' -o -name 'SHA256SUMS' \) -exec cp {} release-assets/ \;
+          cp install.sh release-assets/
+          echo "--- Assets ---"
+          ls -lh release-assets/
+
+      - name: Write release notes
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NOTES: ${{ needs.release-notes.outputs.notes }}
+        run: printf '%s\n' "$NOTES" > release-notes.md
+
+      - name: Create tag if manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "zeroclaw $TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release create "$TAG" release-assets/* \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --notes-file release-notes.md \
+            --latest
+
+  crates-io:
+    name: Publish to crates.io
+    needs: [validate, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/zeroclawlabs/${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+
+      - name: Clean web build artifacts
+        run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
+
+      - name: Publish aardvark-sys to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify -p aardvark-sys 2>&1) && exit 0
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q 'already exists'; then
+            echo "::notice::aardvark-sys already on crates.io — skipping"
+            exit 0
+          fi
+          exit 1
+
+      - name: Wait for aardvark-sys to index
+        run: sleep 15
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Publish to crates.io; treat "already exists" as success
+          # (auto-publish workflow may have already published this version)
+          CRATE_NAME=$(sed -n 's/^name = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify 2>&1) && exit 0
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q 'already exists'; then
+            echo "::notice::${CRATE_NAME}@${VERSION} already on crates.io — skipping"
+            exit 0
+          fi
+          exit 1
+
+  redeploy-website:
+    name: Trigger Website Redeploy
+    needs: [publish]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger website redeploy
+        env:
+          PAT: ${{ secrets.WEBSITE_REPO_PAT }}
+        run: |
+          curl -fsSL -X POST \
+            -H "Authorization: token $PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/zeroclaw-labs/zeroclaw-website/dispatches \
+            -d '{"event_type":"new-release","client_payload":{"install_script_url":"https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/install.sh"}}'
 
   docker:
     name: Push Docker Image
     needs: [validate, build]
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
+    environment:
+      name: docker
+      url: https://github.com/${{ github.repository }}/pkgs/container/zeroclaw
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-x86_64-unknown-linux-gnu
+          path: artifacts/
 
-      - uses: docker/login-action@v3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: zeroclaw-aarch64-unknown-linux-gnu
+          path: artifacts/
+
+      - name: Prepare Docker context with pre-built binaries
+        run: |
+          mkdir -p docker-ctx/bin/amd64 docker-ctx/bin/arm64
+          tar xzf artifacts/zeroclaw-x86_64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/amd64
+          tar xzf artifacts/zeroclaw-aarch64-unknown-linux-gnu.tar.gz -C docker-ctx/bin/arm64
+
+          mkdir -p docker-ctx/zeroclaw-data/.zeroclaw docker-ctx/zeroclaw-data/workspace
+          printf '%s\n' \
+            'workspace_dir = "/zeroclaw-data/workspace"' \
+            'config_path = "/zeroclaw-data/.zeroclaw/config.toml"' \
+            'api_key = ""' \
+            'default_provider = "openrouter"' \
+            'default_model = "anthropic/claude-sonnet-4-20250514"' \
+            'default_temperature = 0.7' \
+            '' \
+            '[gateway]' \
+            'port = 42617' \
+            'host = "[::]"' \
+            'allow_public_bind = true' \
+            > docker-ctx/zeroclaw-data/.zeroclaw/config.toml
+
+          cp Dockerfile.ci docker-ctx/Dockerfile
+          cp Dockerfile.debian.ci docker-ctx/Dockerfile.debian
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: .
+          context: docker-ctx
           push: true
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+      - name: Build and push Debian compatibility image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: docker-ctx
+          file: docker-ctx/Dockerfile.debian
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.validate.outputs.tag }}-debian
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:debian
+          platforms: linux/amd64,linux/arm64
+
+  # ── Post-publish: package manager auto-sync ─────────────────────────
+  scoop:
+    name: Update Scoop Manifest
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-scoop.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      dry_run: false
+    secrets: inherit
+
+  aur:
+    name: Update AUR Package
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-aur.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      dry_run: false
+    secrets: inherit
+
+  homebrew:
+    name: Update Homebrew Core
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-homebrew-core.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      dry_run: false
+    secrets: inherit
+
+  # ── Post-publish: sync marketplace templates (Coolify, Dokploy, EasyPanel) ──
+  marketplace:
+    name: Sync Marketplace Templates
+    needs: [validate, docker]
+    if: ${{ !cancelled() && needs.docker.result == 'success' }}
+    uses: ./.github/workflows/sync-marketplace-templates.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+    secrets: inherit
+
+  # ── Post-publish: announce after release + website are live ───────────
+  # Docker push can be slow; don't let it block announcements.
+  tweet:
+    name: Tweet Release
+    needs: [validate, publish, redeploy-website]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/tweet-release.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
+    secrets: inherit
+
+  discord:
+    name: Discord Announcement
+    needs: [validate, publish, redeploy-website]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/discord-release.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      release_url: https://github.com/zeroclaw-labs/zeroclaw/releases/tag/${{ needs.validate.outputs.tag }}
+    secrets: inherit

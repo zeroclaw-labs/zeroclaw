@@ -1,0 +1,111 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.2.0) — must match Cargo.toml"
+        required: true
+        type: string
+      dry_run:
+        description: "Dry run (validate without publishing)"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check version matches Cargo.toml
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          if [[ "$cargo_version" != "$INPUT_VERSION" ]]; then
+            echo "::error::Cargo.toml version (${cargo_version}) does not match input (${INPUT_VERSION})"
+            exit 1
+          fi
+
+  publish:
+    name: Publish to crates.io
+    needs: [validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/zeroclawlabs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build web dashboard
+        run: cd web && npm ci && npm run build
+
+      - name: Clean web build artifacts
+        run: rm -rf web/node_modules web/src web/package.json web/package-lock.json web/tsconfig*.json web/vite.config.ts web/index.html
+
+      - name: Publish aardvark-sys to crates.io
+        if: "!inputs.dry_run"
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify -p aardvark-sys 2>&1) && exit 0
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q 'already exists'; then
+            echo "::notice::aardvark-sys already on crates.io — skipping"
+            exit 0
+          fi
+          exit 1
+
+      - name: Wait for aardvark-sys to index
+        if: "!inputs.dry_run"
+        run: sleep 15
+
+      - name: Publish (dry run)
+        if: inputs.dry_run
+        run: cargo publish --dry-run --locked --allow-dirty --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish to crates.io
+        if: "!inputs.dry_run"
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          # Publish to crates.io; treat "already exists" as success
+          OUTPUT=$(cargo publish --locked --allow-dirty --no-verify 2>&1) && exit 0
+          echo "$OUTPUT"
+          if echo "$OUTPUT" | grep -q 'already exists'; then
+            echo "::notice::zeroclawlabs@${VERSION} already on crates.io — skipping"
+            exit 0
+          fi
+          exit 1

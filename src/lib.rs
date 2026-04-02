@@ -42,35 +42,114 @@ pub mod agent;
 pub(crate) mod approval;
 pub(crate) mod auth;
 pub mod channels;
+pub(crate) mod cli_input;
+pub mod commands;
 pub mod config;
 pub(crate) mod cost;
-pub(crate) mod cron;
+pub mod cron;
 pub(crate) mod daemon;
 pub(crate) mod doctor;
 pub mod gateway;
+pub mod hands;
 pub(crate) mod hardware;
 pub(crate) mod health;
 pub(crate) mod heartbeat;
 pub mod hooks;
+pub mod i18n;
 pub(crate) mod identity;
 pub(crate) mod integrations;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;
+pub mod nodes;
 pub mod observability;
 pub(crate) mod onboard;
 pub mod peripherals;
 pub mod providers;
 pub mod rag;
+pub mod routines;
 pub mod runtime;
 pub(crate) mod security;
 pub(crate) mod service;
 pub(crate) mod skills;
+pub mod sop;
 pub mod tools;
+pub(crate) mod trust;
+pub mod tui;
 pub(crate) mod tunnel;
 pub(crate) mod util;
+pub mod verifiable_intent;
+
+#[cfg(feature = "plugins-wasm")]
+pub mod plugins;
 
 pub use config::Config;
+
+/// Gateway management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum GatewayCommands {
+    /// Start the gateway server (default if no subcommand specified)
+    #[command(long_about = "\
+Start the gateway server (webhooks, websockets).
+
+Runs the HTTP/WebSocket gateway that accepts incoming webhook events \
+and WebSocket connections. Bind address defaults to the values in \
+your config file (gateway.host / gateway.port).
+
+Examples:
+  zeroclaw gateway start              # use config defaults
+  zeroclaw gateway start -p 8080      # listen on port 8080
+  zeroclaw gateway start --host 0.0.0.0   # requires [gateway].allow_public_bind=true or a tunnel
+  zeroclaw gateway start -p 0         # random available port")]
+    Start {
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host to bind to; defaults to config gateway.host
+        /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Restart the gateway server
+    #[command(long_about = "\
+Restart the gateway server.
+
+Stops the running gateway if present, then starts a new instance \
+with the current configuration.
+
+Examples:
+  zeroclaw gateway restart            # restart with config defaults
+  zeroclaw gateway restart -p 8080    # restart on port 8080")]
+    Restart {
+        /// Port to listen on (use 0 for random available port); defaults to config gateway.port
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Host to bind to; defaults to config gateway.host
+        /// Note: Binding to 0.0.0.0 requires `gateway.allow_public_bind = true` in config
+        #[arg(long)]
+        host: Option<String>,
+    },
+    /// Show or generate the pairing code without restarting
+    #[command(long_about = "\
+Show or generate the gateway pairing code.
+
+Displays the pairing code for connecting new clients without \
+restarting the gateway. Requires the gateway to be running.
+
+With --new, generates a fresh pairing code even if the gateway \
+was previously paired (useful for adding additional clients).
+
+Examples:
+  zeroclaw gateway get-paircode       # show current pairing code
+  zeroclaw gateway get-paircode --new # generate a new pairing code")]
+    GetPaircode {
+        /// Generate a new pairing code (even if already paired)
+        #[arg(long)]
+        new: bool,
+    },
+}
 
 /// Service management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +166,15 @@ pub enum ServiceCommands {
     Status,
     /// Uninstall daemon service unit
     Uninstall,
+    /// Tail daemon service logs
+    Logs {
+        /// Number of lines to show (default: 50)
+        #[arg(short = 'n', long, default_value = "50")]
+        lines: usize,
+        /// Follow log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 /// Channel management subcommands
@@ -136,6 +224,31 @@ Examples:
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
     },
+    /// Send a message to a configured channel
+    #[command(long_about = "\
+Send a one-off message to a configured channel.
+
+Sends a text message through the specified channel without starting \
+the full agent loop. Useful for scripted notifications, hardware \
+sensor alerts, and automation pipelines.
+
+The --channel-id selects the channel by its config section name \
+(e.g. 'telegram', 'discord', 'slack'). The --recipient is the \
+platform-specific destination (e.g. a Telegram chat ID).
+
+Examples:
+  zeroclaw channel send 'Someone is near your device.' --channel-id telegram --recipient 123456789
+  zeroclaw channel send 'Build succeeded!' --channel-id discord --recipient 987654321")]
+    Send {
+        /// Message text to send
+        message: String,
+        /// Channel config name (e.g. telegram, discord, slack)
+        #[arg(long)]
+        channel_id: String,
+        /// Recipient identifier (platform-specific, e.g. Telegram chat ID)
+        #[arg(long)]
+        recipient: String,
+    },
 }
 
 /// Skills management subcommands
@@ -157,6 +270,14 @@ pub enum SkillCommands {
     Remove {
         /// Skill name to remove
         name: String,
+    },
+    /// Run TEST.sh validation for a skill (or all skills)
+    Test {
+        /// Skill name to test; omit for all skills
+        name: Option<String>,
+        /// Show verbose output
+        #[arg(long)]
+        verbose: bool,
     },
 }
 
@@ -189,15 +310,22 @@ Times are evaluated in UTC by default; use --tz with an IANA \
 timezone name to override.
 
 Examples:
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  zeroclaw cron add '*/30 * * * *' 'Check system health'")]
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
+  zeroclaw cron add '*/5 * * * *' 'echo ok'")]
     Add {
         /// Cron expression
         expression: String,
         /// Optional IANA timezone (e.g. America/Los_Angeles)
         #[arg(long)]
         tz: Option<String>,
-        /// Command to run
+        /// Treat the argument as an agent prompt instead of a shell command
+        #[arg(long)]
+        agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
+        /// Command (shell) or prompt (agent) to run
         command: String,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp
@@ -212,7 +340,13 @@ Examples:
     AddAt {
         /// One-shot timestamp in RFC3339 format
         at: String,
-        /// Command to run
+        /// Treat the argument as an agent prompt instead of a shell command
+        #[arg(long)]
+        agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
+        /// Command (shell) or prompt (agent) to run
         command: String,
     },
     /// Add a fixed-interval scheduled task
@@ -227,7 +361,13 @@ Examples:
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
-        /// Command to run
+        /// Treat the argument as an agent prompt instead of a shell command
+        #[arg(long)]
+        agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
+        /// Command (shell) or prompt (agent) to run
         command: String,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
@@ -244,7 +384,13 @@ Examples:
     Once {
         /// Delay duration
         delay: String,
-        /// Command to run
+        /// Treat the argument as an agent prompt instead of a shell command
+        #[arg(long)]
+        agent: bool,
+        /// Restrict agent cron jobs to the specified tool names (repeatable, agent-only)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
+        /// Command (shell) or prompt (agent) to run
         command: String,
     },
     /// Remove a scheduled task
@@ -277,6 +423,9 @@ Examples:
         /// New job name
         #[arg(long)]
         name: Option<String>,
+        /// Replace the agent job allowlist with the specified tool names (repeatable)
+        #[arg(long = "allowed-tool")]
+        allowed_tools: Vec<String>,
     },
     /// Pause a scheduled task
     Pause {
@@ -432,4 +581,21 @@ Examples:
     },
     /// Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)
     FlashNucleo,
+}
+
+/// SOP management subcommands
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SopCommands {
+    /// List loaded SOPs
+    List,
+    /// Validate SOP definitions
+    Validate {
+        /// SOP name to validate (all if omitted)
+        name: Option<String>,
+    },
+    /// Show details of an SOP
+    Show {
+        /// Name of the SOP to show
+        name: String,
+    },
 }

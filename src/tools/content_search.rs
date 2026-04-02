@@ -171,7 +171,10 @@ impl Tool for ContentSearchTool {
         }
 
         // --- Path security checks ---
-        if std::path::Path::new(search_path).is_absolute() {
+        // Reject absolute paths unless they fall under an explicit allowed root.
+        if std::path::Path::new(search_path).is_absolute()
+            && !self.security.is_under_allowed_root(search_path)
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -207,8 +210,7 @@ impl Tool for ContentSearchTool {
         }
 
         // --- Resolve search directory ---
-        let workspace = &self.security.workspace_dir;
-        let resolved_path = workspace.join(search_path);
+        let resolved_path = self.security.resolve_tool_path(search_path);
 
         let resolved_canon = match std::fs::canonicalize(&resolved_path) {
             Ok(p) => p,
@@ -314,6 +316,7 @@ impl Tool for ContentSearchTool {
         let raw_stdout = String::from_utf8_lossy(&output.stdout);
 
         // --- Parse and format output ---
+        let workspace = &self.security.workspace_dir;
         let workspace_canon =
             std::fs::canonicalize(workspace).unwrap_or_else(|_| workspace.clone());
 
@@ -702,10 +705,12 @@ mod tests {
         assert!(schema["properties"]["pattern"].is_object());
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["output_mode"].is_object());
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("pattern")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("pattern"))
+        );
     }
 
     #[tokio::test]
@@ -852,11 +857,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_ref()
-            .unwrap()
-            .contains("Invalid output_mode"));
+        assert!(
+            result
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Invalid output_mode")
+        );
     }
 
     #[tokio::test]

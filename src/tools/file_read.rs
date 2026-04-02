@@ -82,7 +82,7 @@ impl Tool for FileReadTool {
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        let full_path = self.security.resolve_tool_path(path);
 
         // Resolve path before reading to block symlink escapes.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
@@ -272,15 +272,19 @@ mod tests {
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["offset"].is_object());
         assert!(schema["properties"]["limit"].is_object());
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("path")));
+        assert!(
+            schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("path"))
+        );
         // offset and limit are optional
-        assert!(!schema["required"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("offset")));
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("offset"))
+        );
     }
 
     #[tokio::test]
@@ -358,11 +362,13 @@ mod tests {
         let result = tool.execute(json!({"path": "test.txt"})).await.unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Rate limit exceeded")
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -452,11 +458,13 @@ mod tests {
         let result = tool.execute(json!({"path": "escape.txt"})).await.unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("escapes workspace"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("escapes workspace")
+        );
 
         let _ = tokio::fs::remove_dir_all(&root).await;
     }
@@ -597,9 +605,11 @@ mod tests {
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result
-            .output
-            .contains("[No lines in range, file has 2 lines]"));
+        assert!(
+            result
+                .output
+                .contains("[No lines in range, file has 2 lines]")
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
@@ -1033,5 +1043,51 @@ mod tests {
         assert!(result.error.as_ref().unwrap().contains("not allowed"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_allowed_root_with_workspace_only() {
+        let root = std::env::temp_dir().join("zeroclaw_test_file_read_allowed_root");
+        let workspace = root.join("workspace");
+        let allowed = root.join("allowed_dir");
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::create_dir_all(&allowed).await.unwrap();
+        tokio::fs::write(allowed.join("data.txt"), "allowed content")
+            .await
+            .unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            allowed_roots: vec![allowed.clone()],
+            ..SecurityPolicy::default()
+        });
+        let tool = FileReadTool::new(security);
+
+        // Absolute path under allowed_root should succeed
+        let abs_path = allowed.join("data.txt").to_string_lossy().to_string();
+        let result = tool.execute(json!({"path": &abs_path})).await.unwrap();
+
+        assert!(
+            result.success,
+            "file_read with allowed_root path should succeed, error: {:?}",
+            result.error
+        );
+        assert!(result.output.contains("allowed content"));
+
+        // Path outside both workspace and allowed_roots should still fail
+        let outside = root.join("outside");
+        tokio::fs::create_dir_all(&outside).await.unwrap();
+        tokio::fs::write(outside.join("secret.txt"), "secret")
+            .await
+            .unwrap();
+        let outside_path = outside.join("secret.txt").to_string_lossy().to_string();
+        let result = tool.execute(json!({"path": &outside_path})).await.unwrap();
+        assert!(!result.success);
+
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 }

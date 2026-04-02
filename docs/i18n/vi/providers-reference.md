@@ -2,7 +2,7 @@
 
 Tài liệu này liệt kê các provider ID, alias và biến môi trường chứa thông tin xác thực.
 
-Cập nhật lần cuối: **2026-02-19**.
+Cập nhật lần cuối: **2026-03-10**.
 
 ## Cách liệt kê các Provider
 
@@ -36,6 +36,7 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 | `kimi-code` | `kimi_coding`, `kimi_for_coding` | Không | `KIMI_CODE_API_KEY`, `MOONSHOT_API_KEY` |
 | `synthetic` | — | Không | `SYNTHETIC_API_KEY` |
 | `opencode` | `opencode-zen` | Không | `OPENCODE_API_KEY` |
+| `opencode-go` | — | Không | `OPENCODE_GO_API_KEY` |
 | `zai` | `z.ai` | Không | `ZAI_API_KEY` |
 | `glm` | `zhipu` | Không | `GLM_API_KEY` |
 | `minimax` | `minimax-intl`, `minimax-io`, `minimax-global`, `minimax-cn`, `minimaxi`, `minimax-oauth`, `minimax-oauth-cn`, `minimax-portal`, `minimax-portal-cn` | Không | `MINIMAX_OAUTH_TOKEN`, `MINIMAX_API_KEY` |
@@ -53,6 +54,7 @@ Với chuỗi provider dự phòng (`reliability.fallback_providers`), mỗi pro
 | `copilot` | `github-copilot` | Không | (dùng config/`API_KEY` fallback với GitHub token) |
 | `lmstudio` | `lm-studio` | Có | (tùy chọn; mặc định là cục bộ) |
 | `nvidia` | `nvidia-nim`, `build.nvidia.com` | Không | `NVIDIA_API_KEY` |
+| `avian` | — | Không | `AVIAN_API_KEY` |
 
 ### Ghi chú về Gemini
 

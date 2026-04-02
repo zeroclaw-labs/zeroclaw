@@ -8,54 +8,56 @@ import {
 } from 'lucide-react';
 import type { SSEEvent } from '@/types/api';
 import { SSEClient } from '@/lib/sse';
+import { t } from '@/lib/i18n';
 
 function formatTimestamp(ts?: string): string {
   if (!ts) return new Date().toLocaleTimeString();
   return new Date(ts).toLocaleTimeString();
 }
 
-function eventTypeBadgeColor(type: string): string {
+function eventTypeStyle(type: string): { color: string; bg: string; border: string } {
   switch (type.toLowerCase()) {
     case 'error':
-      return 'bg-red-900/50 text-red-400 border-red-700/50';
+      return { color: 'var(--color-status-error)', bg: 'rgba(239, 68, 68, 0.06)', border: 'rgba(239, 68, 68, 0.2)' };
     case 'warn':
     case 'warning':
-      return 'bg-yellow-900/50 text-yellow-400 border-yellow-700/50';
+      return { color: 'var(--color-status-warning)', bg: 'rgba(255, 170, 0, 0.06)', border: 'rgba(255, 170, 0, 0.2)' };
     case 'tool_call':
     case 'tool_result':
-      return 'bg-purple-900/50 text-purple-400 border-purple-700/50';
+    case 'tool_call_start':
+      return { color: '#a78bfa', bg: 'rgba(167, 139, 250, 0.06)', border: 'rgba(167, 139, 250, 0.2)' };
+    case 'llm_request':
+      return { color: '#38bdf8', bg: 'rgba(56, 189, 248, 0.06)', border: 'rgba(56, 189, 248, 0.2)' };
+    case 'agent_start':
+    case 'agent_end':
+      return { color: '#34d399', bg: 'rgba(52, 211, 153, 0.06)', border: 'rgba(52, 211, 153, 0.2)' };
     case 'message':
     case 'chat':
-      return 'bg-blue-900/50 text-blue-400 border-blue-700/50';
+      return { color: 'var(--pc-accent)', bg: 'var(--pc-accent-glow)', border: 'var(--pc-accent-dim)' };
     case 'health':
     case 'status':
-      return 'bg-green-900/50 text-green-400 border-green-700/50';
+      return { color: 'var(--color-status-success)', bg: 'rgba(0, 230, 138, 0.06)', border: 'rgba(0, 230, 138, 0.2)' };
     default:
-      return 'bg-gray-800 text-gray-400 border-gray-700';
+      return { color: 'var(--pc-text-muted)', bg: 'var(--pc-hover)', border: 'var(--pc-border)' };
   }
 }
 
-interface LogEntry {
-  id: string;
-  event: SSEEvent;
-}
+interface LogEntry { id: string; event: SSEEvent; }
 
 export default function Logs() {
   const [entries, setEntries] = useState<LogEntry[]>([]);
   const [paused, setPaused] = useState(false);
   const [connected, setConnected] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
+  const [infoDismissed, setInfoDismissed] = useState(false);
   const [typeFilters, setTypeFilters] = useState<Set<string>>(new Set());
-
   const containerRef = useRef<HTMLDivElement>(null);
   const sseRef = useRef<SSEClient | null>(null);
   const pausedRef = useRef(false);
   const entryIdRef = useRef(0);
 
   // Keep pausedRef in sync
-  useEffect(() => {
-    pausedRef.current = paused;
-  }, [paused]);
+  useEffect(() => { pausedRef.current = paused; }, [paused]);
 
   useEffect(() => {
     const client = new SSEClient();
@@ -76,15 +78,12 @@ export default function Logs() {
         event,
       };
       setEntries((prev) => {
-        // Cap at 500 entries for performance
         const next = [...prev, entry];
         return next.length > 500 ? next.slice(-500) : next;
       });
     };
-
     client.connect();
     sseRef.current = client;
-
     return () => {
       client.disconnect();
     };
@@ -112,7 +111,6 @@ export default function Logs() {
     setAutoScroll(true);
   };
 
-  // Collect all event types for filter checkboxes
   const allTypes = Array.from(new Set(entries.map((e) => e.event.type))).sort();
 
   const toggleTypeFilter = (type: string) => {
@@ -127,62 +125,41 @@ export default function Logs() {
     });
   };
 
-  const filteredEntries =
-    typeFilters.size === 0
-      ? entries
-      : entries.filter((e) => typeFilters.has(e.event.type));
+  const filteredEntries = typeFilters.size === 0 ? entries : entries.filter((e) => typeFilters.has(e.event.type));
 
   return (
-    <div className="flex flex-col h-[calc(100vh-3.5rem)]">
+    <div className="flex flex-col h-full">
       {/* Toolbar */}
-      <div className="flex items-center justify-between px-6 py-3 border-b border-gray-800 bg-gray-900">
+      <div className="flex items-center justify-between px-6 py-3 border-b animate-fade-in" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
         <div className="flex items-center gap-3">
-          <Activity className="h-5 w-5 text-blue-400" />
-          <h2 className="text-base font-semibold text-white">Live Logs</h2>
-          <div className="flex items-center gap-2 ml-2">
-            <span
-              className={`inline-block h-2 w-2 rounded-full ${
-                connected ? 'bg-green-500' : 'bg-red-500'
-              }`}
-            />
-            <span className="text-xs text-gray-500">
-              {connected ? 'Connected' : 'Disconnected'}
-            </span>
-          </div>
-          <span className="text-xs text-gray-500 ml-2">
-            {filteredEntries.length} events
+          <Activity className="h-5 w-5" style={{ color: 'var(--pc-accent)' }} />
+          <h2 className="text-sm font-semibold uppercase tracking-wider" style={{ color: 'var(--pc-text-primary)' }}>{t('logs.live_logs')}</h2>
+          <span className="text-[10px] font-mono ml-2" style={{ color: 'var(--pc-text-faint)' }}>
+            {filteredEntries.length} {t('logs.events')}
           </span>
         </div>
-
         <div className="flex items-center gap-2">
           {/* Pause/Resume */}
           <button
             onClick={() => setPaused(!paused)}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
-              paused
-                ? 'bg-green-600 hover:bg-green-700 text-white'
-                : 'bg-yellow-600 hover:bg-yellow-700 text-white'
-            }`}
+            className="btn-electric flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold"
+            style={{ background: paused ? 'var(--color-status-success)' : 'var(--color-status-warning)', color: 'white' }}
           >
             {paused ? (
               <>
-                <Play className="h-3.5 w-3.5" /> Resume
+                <Play className="h-3.5 w-3.5" /> {t('logs.resume')}
               </>
             ) : (
               <>
-                <Pause className="h-3.5 w-3.5" /> Pause
+                <Pause className="h-3.5 w-3.5" /> {t('logs.pause')}
               </>
             )}
           </button>
 
           {/* Jump to Bottom */}
           {!autoScroll && (
-            <button
-              onClick={jumpToBottom}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors"
-            >
-              <ArrowDown className="h-3.5 w-3.5" />
-              Jump to bottom
+            <button onClick={jumpToBottom} className="btn-electric flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold">
+              <ArrowDown className="h-3.5 w-3.5" />{t('logs.jump_to_bottom')}
             </button>
           )}
         </div>
@@ -190,31 +167,50 @@ export default function Logs() {
 
       {/* Event type filters */}
       {allTypes.length > 0 && (
-        <div className="flex items-center gap-2 px-6 py-2 border-b border-gray-800 bg-gray-900/80 overflow-x-auto">
-          <Filter className="h-4 w-4 text-gray-500 flex-shrink-0" />
-          <span className="text-xs text-gray-500 flex-shrink-0">Filter:</span>
+        <div className="flex items-center gap-2 px-6 py-2 border-b overflow-x-auto" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-base)' }}>
+          <Filter className="h-3.5 w-3.5 flex-shrink-0" style={{ color: 'var(--pc-text-faint)' }} />
+          <span className="text-[10px] uppercase tracking-wider flex-shrink-0" style={{ color: 'var(--pc-text-faint)' }}>{t('logs.filter_label')}:</span>
           {allTypes.map((type) => (
-            <label
-              key={type}
-              className="flex items-center gap-1.5 cursor-pointer flex-shrink-0"
-            >
+            <label key={type} className="flex items-center gap-1.5 cursor-pointer flex-shrink-0">
               <input
                 type="checkbox"
                 checked={typeFilters.has(type)}
                 onChange={() => toggleTypeFilter(type)}
-                className="rounded bg-gray-800 border-gray-600 text-blue-500 focus:ring-blue-500 focus:ring-offset-0 h-3.5 w-3.5"
+                className="rounded"
+                style={{ accentColor: 'var(--pc-accent)' }}
               />
-              <span className="text-xs text-gray-400 capitalize">{type}</span>
+              <span className="text-[10px] capitalize" style={{ color: 'var(--pc-text-muted)' }}>{type}</span>
             </label>
           ))}
           {typeFilters.size > 0 && (
             <button
               onClick={() => setTypeFilters(new Set())}
-              className="text-xs text-blue-400 hover:text-blue-300 flex-shrink-0 ml-1"
-            >
-              Clear
+              className="text-[10px] flex-shrink-0 ml-1 transition-colors"
+              style={{ color: 'var(--pc-accent)' }}>
+              {t('logs.clear')}
             </button>
           )}
+        </div>
+      )}
+
+      {/* Informational banner — what appears here and what does not */}
+      {!infoDismissed && (
+        <div className="flex items-start gap-3 px-6 py-3 border-b flex-shrink-0" style={{ borderColor: 'rgba(56, 189, 248, 0.2)', background: 'rgba(56, 189, 248, 0.05)' }}>
+          <div className="flex-1 text-xs" style={{ color: 'var(--pc-text-secondary)' }}>
+            <span className="font-semibold" style={{ color: '#38bdf8' }}>What appears here: </span>
+            agent activity over SSE — LLM requests, tool calls, agent start/end, and errors.
+            {' '}<span className="font-semibold" style={{ color: 'var(--pc-text-muted)' }}>What does not: </span>
+            daemon stdout and <code>RUST_LOG</code> tracing output go to the terminal or log file, not this stream.
+            {' '}To see tracing logs, run the daemon with <code>RUST_LOG=info zeroclaw</code> and check your terminal.
+          </div>
+          <button
+            onClick={() => setInfoDismissed(true)}
+            className="flex-shrink-0 text-[10px] btn-icon"
+            aria-label="Dismiss"
+            style={{ color: 'var(--pc-text-faint)' }}
+          >
+            ✕
+          </button>
         </div>
       )}
 
@@ -222,20 +218,21 @@ export default function Logs() {
       <div
         ref={containerRef}
         onScroll={handleScroll}
-        className="flex-1 overflow-y-auto p-4 space-y-2"
+        className="flex-1 overflow-y-auto p-4 space-y-2 min-h-0"
       >
         {filteredEntries.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full text-gray-500">
-            <Activity className="h-10 w-10 text-gray-600 mb-3" />
+          <div className="flex flex-col items-center justify-center h-full animate-fade-in" style={{ color: 'var(--pc-text-muted)' }}>
+            <Activity className="h-10 w-10 mb-3" style={{ color: 'var(--pc-text-faint)' }} />
             <p className="text-sm">
               {paused
-                ? 'Log streaming is paused.'
-                : 'Waiting for events...'}
+                ? t('logs.paused_hint')
+                : t('logs.waiting_hint')}
             </p>
           </div>
         ) : (
           filteredEntries.map((entry) => {
             const { event } = entry;
+            const style = eventTypeStyle(event.type);
             const detail =
               event.message ??
               event.content ??
@@ -247,31 +244,38 @@ export default function Logs() {
                   ),
                 ),
               );
-
             return (
               <div
                 key={entry.id}
-                className="bg-gray-900 border border-gray-800 rounded-lg p-3 hover:border-gray-700 transition-colors"
+                className="card rounded-xl p-3"
               >
                 <div className="flex items-start gap-3">
-                  <span className="text-xs text-gray-500 font-mono whitespace-nowrap mt-0.5">
+                  <span className="text-[10px] font-mono whitespace-nowrap mt-0.5" style={{ color: 'var(--pc-text-faint)' }}>
                     {formatTimestamp(event.timestamp)}
                   </span>
                   <span
-                    className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium border capitalize flex-shrink-0 ${eventTypeBadgeColor(
-                      event.type,
-                    )}`}
+                    className="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-semibold border capitalize flex-shrink-0"
+                    style={style}
                   >
                     {event.type}
                   </span>
-                  <p className="text-sm text-gray-300 break-all min-w-0">
+                  <p className="text-sm break-all min-w-0" style={{ color: 'var(--pc-text-secondary)' }}>
                     {typeof detail === 'string' ? detail : JSON.stringify(detail)}
                   </p>
                 </div>
               </div>
             );
           })
-        )}
+          )}
+      </div>
+      {/* Footer: connection status */}
+      <div className="flex items-center justify-center gap-2 px-6 py-2 border-t flex-shrink-0" style={{ borderColor: 'var(--pc-border)', background: 'var(--pc-bg-surface)' }}>
+        <span className="status-dot" style={
+          connected ? { background: 'var(--color-status-success)', boxShadow: '0 0 6px var(--color-status-success)' } : { background: 'var(--color-status-error)', boxShadow: '0 0 6px var(--color-status-error)' }
+        } />
+        <span className="text-[10px]" style={{ color: 'var(--pc-text-faint)' }}>
+          {connected ? t('logs.connected') : t('logs.disconnected')}
+        </span>
       </div>
     </div>
   );
