@@ -45,6 +45,12 @@ impl Sandbox for BubblewrapSandbox {
             "--ro-bind",
             "/usr",
             "/usr",
+            "--ro-bind",
+            "/lib",
+            "/lib",
+            "--ro-bind",
+            "/lib64",
+            "/lib64",
             "--dev",
             "/dev",
             "--proc",
@@ -169,7 +175,19 @@ mod tests {
 
         assert!(
             args.contains(&"--ro-bind".to_string()),
-            "must include read-only bind for /usr"
+            "must include read-only bind for system libraries"
+        );
+        assert!(
+            args.contains(&"/usr".to_string()),
+            "must include /usr for system binaries and libraries"
+        );
+        assert!(
+            args.contains(&"/lib".to_string()),
+            "must include /lib for dynamic linker and base libraries"
+        );
+        assert!(
+            args.contains(&"/lib64".to_string()),
+            "must include /lib64 for 64-bit dynamic linker and libraries"
         );
         assert!(
             args.contains(&"--dev".to_string()),
