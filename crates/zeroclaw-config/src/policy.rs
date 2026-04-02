@@ -2396,8 +2396,8 @@ mod tests {
         assert!(p.is_command_allowed("ls 2>&1"));
         assert!(p.is_command_allowed("grep foo bar 2>/dev/null"));
         assert!(p.is_command_allowed("ls >/dev/null"));
-        assert!(p.is_command_allowed("cmd 1>/dev/null"));
-        assert!(p.is_command_allowed("cmd 1>&2"));
+        assert!(p.is_command_allowed("ls 1>/dev/null"));
+        assert!(p.is_command_allowed("ls 1>&2"));
         // Actual file redirects still blocked
         assert!(!p.is_command_allowed("cat < /etc/passwd"));
         assert!(!p.is_command_allowed("echo secret > output.txt"));
