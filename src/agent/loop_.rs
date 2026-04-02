@@ -5173,7 +5173,6 @@ mod tests {
             Some(&activated),
             &observer,
             None,
-            false, // force_xml_tools
         )
         .await
         .expect("suffix alias should execute the unique activated tool");
@@ -9442,6 +9441,7 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    false, // force_xml_tools
                 ),
             )
             .await
@@ -9524,6 +9524,7 @@ Let me check the result."#;
                     0,
                     0,
                     None,
+                    false, // force_xml_tools
                 ),
             )
             .await
