@@ -176,8 +176,8 @@ async fn run_agent_job(
     let prompt = job.prompt.clone().unwrap_or_default();
     let prefixed_prompt = format!("[cron:{} {name}] {prompt}", job.id);
 
-    // Economy tier: use MiniMax M2.7 for cron jobs when no explicit model is set.
-    // This saves ~88% vs Opus 4.6 for routine tasks (weather alerts, schedule reminders).
+    // Economy tier: use Gemini Flash Lite for cron jobs when no explicit model is set.
+    // Cost-effective for routine tasks (weather alerts, schedule reminders).
     let model_override = job.model.clone().or_else(|| {
         let (_, economy_model) =
             crate::billing::llm_router::default_model_for_task(

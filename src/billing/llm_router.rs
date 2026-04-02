@@ -53,7 +53,7 @@ pub fn determine_access_mode(user_has_key: bool, user_selected_model: bool) -> P
 /// Task category for default model routing.
 ///
 /// MoA uses a 3-tier model strategy to optimize cost:
-/// - **Economy** (MiniMax M2.7): cron jobs, compaction, simple tasks — 1/8 of Opus cost
+/// - **Economy** (Gemini Flash Lite): cron jobs, compaction, simple tasks — cost-effective
 /// - **Standard** (Gemini Flash Lite): general chat, search, media — 1/15 of Opus cost
 /// - **Premium** (Opus 4.6 / Gemini Pro): coding, legal docs, reasoning — highest quality
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,18 +89,17 @@ pub fn default_model_for_task(task: TaskCategory) -> (&'static str, &'static str
     // Returns (provider, model_id)
     //
     // 3-Tier cost optimization:
-    //   Economy  (MiniMax M2.7):       cron, compaction, memory — ~$0.07/M input
+    //   Economy  (Gemini Flash Lite):   cron, compaction, memory — cost-effective
     //   Standard (Gemini Flash Lite):  chat, search, media     — ~$0.05/M input
     //   Premium  (Opus 4.6 / Pro):     coding, legal, reasoning — ~$0.60/M input
     match task {
-        // ── Economy tier (MiniMax M2.7 — 1/8 of Opus cost) ──
-        // Text-only, no vision. MUST enforce user's language in system prompt
-        // to prevent multi-language mixing (Russian, Chinese, Arabic).
-        TaskCategory::CronRoutine => ("minimax", "MiniMax-M2.7"),
-        TaskCategory::Compaction => ("minimax", "MiniMax-M2.7"),
-        TaskCategory::MemoryHousekeeping => ("minimax", "MiniMax-M2.7"),
+        // ── Economy tier (Gemini 3.1 Flash Lite — cost-effective for routine tasks) ──
+        // Replaces MiniMax M2.7 which had multi-language mixing issues.
+        TaskCategory::CronRoutine => ("gemini", "gemini-3.1-flash-lite-preview"),
+        TaskCategory::Compaction => ("gemini", "gemini-3.1-flash-lite-preview"),
+        TaskCategory::MemoryHousekeeping => ("gemini", "gemini-3.1-flash-lite-preview"),
 
-        // ── Standard tier (Gemini Flash Lite — 1/15 of Opus cost) ──
+        // ── Standard tier (Gemini Flash Lite — same model, general tasks) ──
         TaskCategory::GeneralChat => ("gemini", "gemini-3.1-flash-lite-preview"),
         TaskCategory::Image => ("gemini", "gemini-3.1-flash-lite-preview"),
         TaskCategory::Music => ("gemini", "gemini-3.1-flash-lite-preview"),

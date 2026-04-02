@@ -251,12 +251,9 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
-/// ACE Layer 0 safety net: history compaction threshold.
-/// With ACE, Layer 1 (attachment memo) keeps individual messages small,
-/// and Layer 2 (RAG) handles older context. This threshold is a safety net
-/// that only fires if the conversation somehow exceeds 30 messages
-/// (e.g., long coding sessions with many tool calls).
-/// Layer 0 preserves 10 most recent turns (20 messages) verbatim.
+/// Legacy fallback: max history messages (no longer the primary trigger).
+/// ACE uses character budget (ace_total_budget_chars) instead.
+/// This constant is only used when ACE config is not available.
 const DEFAULT_MAX_HISTORY_MESSAGES: usize = 30;
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
@@ -3161,23 +3158,36 @@ pub async fn run(
             }
             observer.record_event(&ObserverEvent::TurnComplete);
 
-            // Auto-compaction before hard trimming to preserve long-context signal.
-            if let Ok(compacted) = auto_compact_history(
-                &mut history,
-                provider.as_ref(),
-                &model_name,
-                config.agent.max_history_messages,
-                effective_hooks,
-            )
-            .await
-            {
-                if compacted {
-                    println!("🧹 Auto-compaction complete");
+            // ACE Layer 3 safety net: auto-compaction based on total character budget.
+            // Instead of fixed message count, we measure the total chars in history
+            // and compact when it exceeds the ACE budget. This preserves more recent
+            // context while still preventing unbounded growth.
+            let total_history_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
+            let ace_budget = config.agent.session.ace_total_budget_chars;
+
+            if total_history_chars > ace_budget {
+                // Try LLM-based compaction first (summarizes old messages)
+                if let Ok(compacted) = auto_compact_history(
+                    &mut history,
+                    provider.as_ref(),
+                    &model_name,
+                    config.agent.session.ace_immediate_turns * 2, // keep N turns = 2N messages
+                    effective_hooks,
+                )
+                .await
+                {
+                    if compacted {
+                        tracing::info!(
+                            total_chars = total_history_chars,
+                            budget = ace_budget,
+                            "🧹 ACE auto-compaction: history exceeded budget"
+                        );
+                    }
                 }
             }
 
-            // Hard cap as a safety net.
-            trim_history(&mut history, config.agent.max_history_messages);
+            // Hard cap as ultimate safety net (prevents runaway in edge cases).
+            trim_history(&mut history, config.agent.session.ace_immediate_turns * 3);
         }
     }
 
