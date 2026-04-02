@@ -9,6 +9,7 @@ ignore = [
     "RUSTSEC-2026-0021",  # WASI http fields panic
     # instant crate unmaintained — transitive dep via nostr; no upstream fix
     "RUSTSEC-2024-0384",
-    # rustls-webpki CRL matching — via rumqttc 0.24; no upstream fix (even 0.25.1 uses ^0.102.8)
+    # rustls-webpki CRL matching logic — rumqttc 0.25.1 still pins rustls-webpki 0.102.8;
+    # no upstream rumqttc release pins >=0.103.10 yet; MQTT channel does not use CRL distribution points
     "RUSTSEC-2026-0049",
 ]

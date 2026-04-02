@@ -8,15 +8,17 @@
 //! 3. [`flash_uf2`] — copy the UF2 to the mount point; the Pico reboots automatically.
 //!
 //! # Embedded assets
-//! The UF2 firmware is compiled into the binary with `include_bytes!` so
-//! users never need to download it separately.
+//! The UF2 is compiled into the binary with `include_bytes!` so users never need
+//! to download it separately. The firmware is self-contained Rust (embassy-rp) —
+//! no MicroPython or `main.py` deployment step is required.
 
 use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 // ── Embedded firmware ─────────────────────────────────────────────────────────
 
-/// MicroPython UF2 binary — copied to RPI-RP2 to install the base runtime.
+/// ZeroClaw Pico firmware UF2 — self-contained Rust binary (embassy-rp).
+/// Copied to the RPI-RP2 drive; the Pico reboots directly into the firmware.
 const PICO_UF2: &[u8] = include_bytes!("../../firmware/pico/zeroclaw-pico.uf2");
 
 /// UF2 magic word 1 (little-endian bytes at offset 0 of every UF2 block).
@@ -53,9 +55,9 @@ pub fn find_rpi_rp2_mount() -> Option<PathBuf> {
 
 // ── Firmware directory management ─────────────────────────────────────────────
 
-/// Ensure `~/.zeroclaw/firmware/pico/` exists and contains the bundled assets.
+/// Ensure `~/.zeroclaw/firmware/pico/` exists and contains the bundled UF2.
 ///
-/// Files are only written if they are absent — existing files are never overwritten
+/// The UF2 is only written if absent — existing files are never overwritten
 /// so users can substitute their own firmware.
 ///
 /// Returns the firmware directory path.
@@ -76,9 +78,9 @@ pub fn ensure_firmware_dir() -> Result<PathBuf> {
     if !uf2_path.exists() {
         if PICO_UF2.len() < 8 || PICO_UF2[..4] != UF2_MAGIC1 {
             bail!(
-                "Bundled UF2 is a placeholder — download the real MicroPython UF2 from \
-                 https://micropython.org/download/RPI_PICO/ and place it at \
-                 src/firmware/pico/zeroclaw-pico.uf2, then rebuild ZeroClaw."
+                "Bundled UF2 is a placeholder — rebuild ZeroClaw with a valid \
+                 firmware/pico/zeroclaw-pico.uf2 produced by `cargo build --release` \
+                 in the firmware/pico workspace."
             );
         }
         std::fs::write(&uf2_path, PICO_UF2)?;
@@ -239,6 +241,7 @@ pub async fn wait_for_serial_port(
         tokio::time::sleep(interval).await;
     }
 }
+
 
 #[cfg(test)]
 mod tests {

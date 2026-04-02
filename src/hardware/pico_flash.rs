@@ -4,10 +4,9 @@
 //! 1. User holds BOOTSEL while plugging in Pico → RPI-RP2 drive appears.
 //! 2. User asks "flash my pico".
 //! 3. LLM calls `pico_flash(confirm=true)`.
-//! 4. Tool copies UF2 to RPI-RP2 drive; Pico reboots into the firmware.
+//! 4. Tool copies UF2 to RPI-RP2 drive; Pico reboots into the Rust firmware.
 //! 5. Tool waits up to 20 s for `/dev/cu.usbmodem*` to appear.
-//! 6. Tool reconnects the serial transport in the DeviceRegistry.
-//! 7. Tool returns success; user restarts ZeroClaw to get `pico0`.
+//! 6. Tool reconnects the serial transport; user can use `gpio_write` immediately.
 
 use super::device::DeviceRegistry;
 use super::uf2;
@@ -50,7 +49,7 @@ impl Tool for PicoFlashTool {
     fn description(&self) -> &str {
         "Flash ZeroClaw firmware to a Raspberry Pi Pico in BOOTSEL mode. \
          The Pico must be connected with the BOOTSEL button held (shows as RPI-RP2 drive in Finder). \
-         After flashing the Pico reboots and the serial \
+         After flashing the Pico reboots into the Rust firmware and the serial \
          connection is refreshed automatically — no restart needed."
     }
 
@@ -143,7 +142,7 @@ impl Tool for PicoFlashTool {
                     output: String::new(),
                     error: Some(format!(
                         "UF2 copied to {} but serial port did not appear within {PORT_WAIT_SECS}s. \
-                         Unplug and replug the Pico, then restart ZeroClaw.",
+                         Unplug and replug the Pico, then restart ZeroClaw to connect as pico0.",
                         mount.display()
                     )),
                 });
@@ -195,8 +194,7 @@ impl Tool for PicoFlashTool {
                 Ok(ToolResult {
                     success: true,
                     output: format!(
-                        "Pico flashed successfully. \
-                         Firmware is online at {port_str}. {suffix}"
+                        "Pico flashed successfully. Firmware is online at {port_str}. {suffix}"
                     ),
                     error: None,
                 })
@@ -204,9 +202,8 @@ impl Tool for PicoFlashTool {
             None => Ok(ToolResult {
                 success: true,
                 output: format!(
-                    "Pico flashed successfully. \
-                         Serial port did not reappear within {PORT_WAIT_SECS}s — \
-                         unplug and replug the Pico, then restart ZeroClaw to connect as pico0."
+                    "Pico flashed. Serial port did not appear within {PORT_WAIT_SECS}s — \
+                     unplug and replug the Pico, then restart ZeroClaw to connect as pico0."
                 ),
                 error: None,
             }),
