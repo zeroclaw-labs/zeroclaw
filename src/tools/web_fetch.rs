@@ -435,29 +435,29 @@ fn validate_target_url(
         anyhow::bail!("Host '{host}' is in {tool_name}.blocked_domains");
     }
 
-    let private_host_allowed =
-        is_private_or_local_host(&host) && host_matches_allowlist(&host, allowed_private_hosts);
+    // Check if host is explicitly allowed in allowed_private_hosts
+    // This takes precedence over DNS resolution checks (Fixes #5122)
+    if host_matches_allowlist(&host, allowed_private_hosts) {
+        tracing::warn!(
+            "{tool_name}: allowing private/local host '{host}' via allowed_private_hosts"
+        );
+        return Ok(url.to_string());
+    }
 
-    if is_private_or_local_host(&host) && !private_host_allowed {
+    let is_private_or_local = is_private_or_local_host(&host);
+
+    if is_private_or_local {
         anyhow::bail!(
             "Blocked local/private host: {host}. \
              To allow this host, add it to {tool_name}.allowed_private_hosts in config.toml"
         );
     }
 
-    if private_host_allowed {
-        tracing::warn!(
-            "{tool_name}: allowing private/local host '{host}' via allowed_private_hosts"
-        );
-    }
-
-    if !private_host_allowed && !host_matches_allowlist(&host, allowed_domains) {
+    if !host_matches_allowlist(&host, allowed_domains) {
         anyhow::bail!("Host '{host}' is not in {tool_name}.allowed_domains");
     }
 
-    if !private_host_allowed {
-        validate_resolved_host_is_public(&host)?;
-    }
+    validate_resolved_host_is_public(&host)?;
 
     Ok(url.to_string())
 }
@@ -1504,5 +1504,29 @@ mod tests {
     fn allowed_private_host_with_port() {
         let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["192.168.1.5"]);
         assert!(tool.validate_url("https://192.168.1.5:8080/api").is_ok());
+    }
+
+    #[test]
+    fn allowed_private_host_domain_bypasses_dns_check() {
+        // Issue #5122: Domain names in allowed_private_hosts should be allowed
+        // even if they are not literal IPs, localhost, or .local domains.
+        // This test verifies that DNS resolution check is skipped for explicitly
+        // allowed hosts.
+        let tool = test_tool_with_private_hosts(
+            vec!["*"],
+            vec![],
+            vec!["example.localdomain", "home.localdomain:8123"],
+        );
+
+        // Domain names that don't match is_private_or_local_host() patterns
+        // should still be allowed if explicitly in allowed_private_hosts
+        assert!(
+            tool.validate_url("https://example.localdomain/api").is_ok(),
+            "Domain in allowed_private_hosts should be allowed"
+        );
+        assert!(
+            tool.validate_url("https://home.localdomain:8123/status").is_ok(),
+            "Domain with port in allowed_private_hosts should be allowed"
+        );
     }
 }
