@@ -435,8 +435,7 @@ fn validate_target_url(
         anyhow::bail!("Host '{host}' is in {tool_name}.blocked_domains");
     }
 
-    let private_host_allowed =
-        is_private_or_local_host(&host) && host_matches_allowlist(&host, allowed_private_hosts);
+    let private_host_allowed = host_matches_allowlist(&host, allowed_private_hosts);
 
     if is_private_or_local_host(&host) && !private_host_allowed {
         anyhow::bail!(
@@ -447,7 +446,7 @@ fn validate_target_url(
 
     if private_host_allowed {
         tracing::warn!(
-            "{tool_name}: allowing private/local host '{host}' via allowed_private_hosts"
+            "{tool_name}: allowing host '{host}' via allowed_private_hosts"
         );
     }
 
@@ -919,6 +918,25 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("blocked_domains"));
+    }
+
+    #[test]
+    fn ssrf_allows_explicit_private_domain() {
+        let allowed = vec!["example.com".to_string()];
+        let private_allowed = vec!["local.internal".to_string()];
+        let blocked = vec![];
+
+        // This should pass if local.internal is in private_allowed, bypassing DNS check
+        assert!(
+            validate_target_url(
+                "https://local.internal/api",
+                &allowed,
+                &blocked,
+                &private_allowed,
+                "web_fetch"
+            )
+            .is_ok()
+        );
     }
 
     // ── Security policy ──────────────────────────────────────────
