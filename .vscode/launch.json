@@ -14,46 +14,71 @@
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Agent",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "cargo": {
+        "args": ["build"],
+        "filter": {
+          "name": "zeroclaw",
+          "kind": "bin"
+        }
+      },
       "args": ["agent"],
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "Build: Debug"
+      "cwd": "${workspaceFolder}"
     },
     {
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Gateway",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "cargo": {
+        "args": ["build"],
+        "filter": {
+          "name": "zeroclaw",
+          "kind": "bin"
+        }
+      },
       "args": ["gateway"],
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "Build: Debug"
+      "cwd": "${workspaceFolder}"
     },
     {
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Daemon",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "cargo": {
+        "args": ["build"],
+        "filter": {
+          "name": "zeroclaw",
+          "kind": "bin"
+        }
+      },
       "args": ["daemon"],
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "Build: Debug"
+      "cwd": "${workspaceFolder}"
     },
     {
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Status",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "cargo": {
+        "args": ["build"],
+        "filter": {
+          "name": "zeroclaw",
+          "kind": "bin"
+        }
+      },
       "args": ["status"],
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "Build: Debug"
+      "cwd": "${workspaceFolder}"
     },
     {
       "type": "lldb",
       "request": "launch",
       "name": "Debug: Onboard",
-      "program": "${workspaceFolder}/target/debug/zeroclaw",
+      "cargo": {
+        "args": ["build"],
+        "filter": {
+          "name": "zeroclaw",
+          "kind": "bin"
+        }
+      },
       "args": ["onboard"],
-      "cwd": "${workspaceFolder}",
-      "preLaunchTask": "Build: Debug"
+      "cwd": "${workspaceFolder}"
     },
     // ── Test ──────────────────────────────────────────────
     {
