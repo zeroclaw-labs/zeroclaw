@@ -2024,6 +2024,44 @@ async fn execute_one_tool(
         });
     };
 
+    // Pre-flight: validate all required fields declared in the tool's JSON-Schema
+    // are present before dispatching. This turns a cryptic Err("Missing 'path'
+    // parameter") into a structured soft-error the model can immediately retry.
+    if let Some(required) = tool
+        .parameters_schema()
+        .get("required")
+        .and_then(|r| r.as_array())
+    {
+        let missing: Vec<&str> = required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter(|field| call_arguments.get(field).is_none())
+            .collect();
+
+        if !missing.is_empty() {
+            let schema = tool.parameters_schema();
+            let reason = format!(
+                "Tool '{}' called with missing required parameter(s): {}. \
+                 Full schema: {}",
+                call_name,
+                missing.join(", "),
+                schema
+            );
+            let duration = start.elapsed();
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call_name.to_string(),
+                duration,
+                success: false,
+            });
+            return Ok(ToolExecutionOutcome {
+                output: format!("Error: {reason}"),
+                success: false,
+                error_reason: Some(scrub_credentials(&reason)),
+                duration,
+            });
+        }
+    }
+
     let tool_future = tool.execute(call_arguments);
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
@@ -2198,6 +2236,10 @@ pub(crate) async fn run_tool_call_loop(
     let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
     let turn_id = Uuid::new_v4().to_string();
     let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
+    // Counts how many consecutive iterations had zero real tool executions
+    // (every call was deduplicated or otherwise skipped before dispatch).
+    // When this reaches 2 the agent is stuck in a dedup loop and we bail early.
+    let mut consecutive_all_deduped: u32 = 0;
 
     for iteration in 0..max_iterations {
         if cancellation_token
@@ -2595,7 +2637,10 @@ pub(crate) async fn run_tool_call_loop(
             let dedup_exempt = dedup_exempt_tools.iter().any(|e| e == &tool_name);
             if !dedup_exempt && !seen_tool_signatures.insert(signature) {
                 let duplicate = format!(
-                    "Skipped duplicate tool call '{tool_name}' with identical arguments in this turn."
+                    "Skipped duplicate tool call '{tool_name}' with identical arguments — \
+                     this exact call was already made earlier in this turn and will not be \
+                     repeated. Do not call this tool again with the same arguments. \
+                     Produce your final answer now."
                 );
                 runtime_trace::record_event(
                     "tool_call_result",
@@ -2658,6 +2703,41 @@ pub(crate) async fn run_tool_call_loop(
                 arguments: tool_args,
                 tool_call_id: call.tool_call_id.clone(),
             });
+        }
+
+        // ── Dedup-loop guard ──────────────────────────────────────────────────
+        // If every tool call in this iteration was deduplicated or skipped before
+        // dispatch (executable_calls is empty but there were tool calls), the model
+        // is stuck replaying the same calls. Bail after 2 consecutive such iterations
+        // to prevent an infinite loop.
+        if !tool_calls.is_empty() && executable_calls.is_empty() {
+            consecutive_all_deduped += 1;
+            if consecutive_all_deduped >= 2 {
+                runtime_trace::record_event(
+                    "tool_loop_exhausted",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(false),
+                    Some("agent stuck in dedup loop"),
+                    serde_json::json!({
+                        "consecutive_all_deduped": consecutive_all_deduped,
+                        "iteration": iteration + 1,
+                    }),
+                );
+                anyhow::bail!(
+                    "Agent stuck: {consecutive_all_deduped} consecutive iterations with \
+                     only deduplicated tool calls (all calls were repeats of earlier calls \
+                     in this turn). Last tool attempted: '{}'.",
+                    tool_calls
+                        .first()
+                        .map(|c| c.name.as_str())
+                        .unwrap_or("unknown")
+                );
+            }
+        } else {
+            consecutive_all_deduped = 0;
         }
 
         let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
@@ -4183,6 +4263,63 @@ mod tests {
         assert!(
             !tool_results.content.contains("Skipped duplicate tool call"),
             "exempt tool calls should not be suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_bails_after_consecutive_all_dedup_iterations() {
+        // Scenario: the model keeps replaying the same tool call every iteration.
+        // Iteration 1: real execution (adds to signatures).
+        // Iteration 2: all deduped → consecutive_all_deduped = 1.
+        // Iteration 3: all deduped → consecutive_all_deduped = 2 → bail.
+        let same_call = r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"A"}}
+</tool_call>"#;
+        let provider = ScriptedProvider::from_text_responses(vec![
+            same_call, same_call, same_call, "should not reach",
+        ]);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> =
+            vec![Box::new(CountingTool::new("count_tool", Arc::clone(&invocations)))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("run tool"),
+        ];
+        let observer = NoopObserver;
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "feishu",
+            &crate::config::MultimodalConfig::default(),
+            10, // high limit — bail guard should fire first
+            None,
+            None,
+            None,
+            &[],
+            &[],
+        )
+        .await;
+
+        assert!(result.is_err(), "loop must bail on consecutive dedup");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("stuck") || err.contains("dedup"),
+            "error should mention dedup/stuck: {err}"
+        );
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            1,
+            "tool should execute exactly once (on iteration 1)"
         );
     }
 
@@ -6007,5 +6144,101 @@ Let me check the result."#;
         let parsed: serde_json::Value = serde_json::from_str(result.as_deref().unwrap()).unwrap();
         assert_eq!(parsed["content"].as_str(), Some("answer"));
         assert!(parsed.get("reasoning_content").is_none());
+    }
+
+    // ── Required-field pre-flight validation ──────────────────────────────────
+
+    /// A minimal tool with two required parameters for testing schema validation.
+    struct RequiredParamsTool;
+
+    #[async_trait]
+    impl Tool for RequiredParamsTool {
+        fn name(&self) -> &str {
+            "req_tool"
+        }
+        fn description(&self) -> &str {
+            "tool with required params"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path":    { "type": "string" },
+                    "content": { "type": "string" }
+                },
+                "required": ["path", "content"]
+            })
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_rejects_empty_args_with_soft_error() {
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(RequiredParamsTool)];
+        let observer = crate::observability::NoopObserver;
+
+        let outcome = execute_one_tool(
+            "req_tool",
+            serde_json::json!({}),
+            &registry,
+            &observer,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.success);
+        assert!(outcome.output.contains("missing required parameter"));
+        assert!(outcome.output.contains("path"));
+        assert!(outcome.output.contains("content"));
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_rejects_partial_args_with_soft_error() {
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(RequiredParamsTool)];
+        let observer = crate::observability::NoopObserver;
+
+        // Only "path" is provided, "content" is missing
+        let outcome = execute_one_tool(
+            "req_tool",
+            serde_json::json!({"path": "file.txt"}),
+            &registry,
+            &observer,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.success);
+        assert!(outcome.output.contains("content"));
+        assert!(!outcome.output.contains("path,"), "path should not be flagged");
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_passes_when_all_required_args_present() {
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(RequiredParamsTool)];
+        let observer = crate::observability::NoopObserver;
+
+        let outcome = execute_one_tool(
+            "req_tool",
+            serde_json::json!({"path": "a.txt", "content": "hello"}),
+            &registry,
+            &observer,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.success);
+        assert_eq!(outcome.output, "ok");
     }
 }

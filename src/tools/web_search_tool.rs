@@ -6,16 +6,18 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Web search tool for searching the internet.
-/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key).
+/// Supports multiple providers: DuckDuckGo (free), Brave (requires API key), Tavily (requires API key).
 ///
-/// The Brave API key is resolved lazily at execution time: if the boot-time key
-/// is missing or still encrypted, the tool re-reads `config.toml`, decrypts the
-/// `[web_search] brave_api_key` field, and uses the result. This ensures that
-/// keys set or rotated after boot, and encrypted keys, are correctly picked up.
+/// API keys are resolved lazily at execution time: if the boot-time key is missing or still
+/// encrypted, the tool re-reads `config.toml`, decrypts the relevant key field, and uses the
+/// result. This ensures that keys set or rotated after boot, and encrypted keys, are correctly
+/// picked up.
 pub struct WebSearchTool {
     provider: String,
     /// Boot-time key snapshot (may be `None` if not yet configured at startup).
     boot_brave_api_key: Option<String>,
+    /// Boot-time Tavily key snapshot (may be `None` if not yet configured at startup).
+    boot_tavily_api_key: Option<String>,
     max_results: usize,
     timeout_secs: u64,
     /// Path to `config.toml` for lazy re-read of keys at execution time.
@@ -28,12 +30,14 @@ impl WebSearchTool {
     pub fn new(
         provider: String,
         brave_api_key: Option<String>,
+        tavily_api_key: Option<String>,
         max_results: usize,
         timeout_secs: u64,
     ) -> Self {
         Self {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
+            boot_tavily_api_key: tavily_api_key,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path: PathBuf::new(),
@@ -43,12 +47,13 @@ impl WebSearchTool {
 
     /// Create a `WebSearchTool` with config-reload and decryption support.
     ///
-    /// `config_path` is the path to `config.toml` so the tool can re-read the
-    /// Brave API key at execution time. `secrets_encrypt` controls whether the
-    /// key is decrypted via `SecretStore`.
+    /// `config_path` is the path to `config.toml` so the tool can re-read API
+    /// keys at execution time. `secrets_encrypt` controls whether keys are
+    /// decrypted via `SecretStore`.
     pub fn new_with_config(
         provider: String,
         brave_api_key: Option<String>,
+        tavily_api_key: Option<String>,
         max_results: usize,
         timeout_secs: u64,
         config_path: PathBuf,
@@ -57,6 +62,7 @@ impl WebSearchTool {
         Self {
             provider: provider.trim().to_lowercase(),
             boot_brave_api_key: brave_api_key,
+            boot_tavily_api_key: tavily_api_key,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
@@ -113,6 +119,113 @@ impl WebSearchTool {
         } else {
             Ok(raw_key)
         }
+    }
+
+    /// Resolve the Tavily API key, preferring the boot-time value but falling
+    /// back to a fresh config read + decryption when the boot-time value is absent.
+    fn resolve_tavily_api_key(&self) -> anyhow::Result<String> {
+        if let Some(ref key) = self.boot_tavily_api_key {
+            if !key.is_empty() && !crate::security::SecretStore::is_encrypted(key) {
+                return Ok(key.clone());
+            }
+        }
+        self.reload_tavily_api_key()
+    }
+
+    fn reload_tavily_api_key(&self) -> anyhow::Result<String> {
+        let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read config file {} for Tavily API key: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        let config: crate::config::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse config file {} for Tavily API key: {e}",
+                self.config_path.display()
+            )
+        })?;
+
+        let raw_key = config
+            .web_search
+            .tavily_api_key
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Tavily API key not configured"))?;
+
+        if crate::security::SecretStore::is_encrypted(&raw_key) {
+            let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
+            let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets_encrypt);
+            let plaintext = store.decrypt(&raw_key)?;
+            if plaintext.is_empty() {
+                anyhow::bail!("Tavily API key not configured (decrypted value is empty)");
+            }
+            Ok(plaintext)
+        } else {
+            Ok(raw_key)
+        }
+    }
+
+    async fn search_tavily(&self, query: &str) -> anyhow::Result<String> {
+        let api_key = self.resolve_tavily_api_key()?;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(self.timeout_secs))
+            .build()?;
+
+        let body = serde_json::json!({
+            "api_key": api_key,
+            "query": query,
+            "max_results": self.max_results,
+            "search_depth": "basic",
+        });
+
+        let response = client
+            .post("https://api.tavily.com/search")
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("Tavily search failed with status: {}", response.status());
+        }
+
+        let json: serde_json::Value = response.json().await?;
+        self.parse_tavily_results(&json, query)
+    }
+
+    fn parse_tavily_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
+        let results = json
+            .get("results")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow::anyhow!("Invalid Tavily API response"))?;
+
+        if results.is_empty() {
+            return Ok(format!("No results found for: {}", query));
+        }
+
+        let mut lines = vec![format!("Search results for: {} (via Tavily)", query)];
+
+        for (i, result) in results.iter().take(self.max_results).enumerate() {
+            let title = result
+                .get("title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("No title");
+            let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            let content = result
+                .get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("");
+
+            lines.push(format!("{}. {}", i + 1, title));
+            lines.push(format!("   {}", url));
+            if !content.is_empty() {
+                lines.push(format!("   {}", content));
+            }
+        }
+
+        Ok(lines.join("\n"))
     }
 
     async fn search_duckduckgo(&self, query: &str) -> anyhow::Result<String> {
@@ -303,8 +416,9 @@ impl Tool for WebSearchTool {
         let result = match self.provider.as_str() {
             "duckduckgo" | "ddg" => self.search_duckduckgo(query).await?,
             "brave" => self.search_brave(query).await?,
+            "tavily" => self.search_tavily(query).await?,
             _ => anyhow::bail!(
-                "Unknown search provider: '{}'. Set tools.web_search.provider to 'duckduckgo' or 'brave' in config.toml",
+                "Unknown search provider: '{}'. Set web_search.provider to 'duckduckgo', 'brave', or 'tavily' in config.toml",
                 self.provider
             ),
         };
@@ -323,19 +437,19 @@ mod tests {
 
     #[test]
     fn test_tool_name() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
         assert_eq!(tool.name(), "web_search_tool");
     }
 
     #[test]
     fn test_tool_description() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
         assert!(tool.description().contains("Search the web"));
     }
 
     #[test]
     fn test_parameters_schema() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
         let schema = tool.parameters_schema();
         assert_eq!(schema["type"], "object");
         assert!(schema["properties"]["query"].is_object());
@@ -349,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_empty() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
         let result = tool
             .parse_duckduckgo_results("<html>No results here</html>", "test")
             .unwrap();
@@ -358,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_with_data() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -370,7 +484,7 @@ mod tests {
 
     #[test]
     fn test_parse_duckduckgo_results_decodes_redirect_url() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
         let html = r#"
             <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fpath%3Fa%3D1&amp;rut=test">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -382,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_constructor_clamps_web_search_limits() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 0, 0);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 0, 0);
         let html = r#"
             <a class="result__a" href="https://example.com">Example Title</a>
             <a class="result__snippet">This is a description</a>
@@ -393,21 +507,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_missing_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
         let result = tool.execute(json!({})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_empty_query() {
-        let tool = WebSearchTool::new("duckduckgo".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("duckduckgo".to_string(), None, None, 5, 15);
         let result = tool.execute(json!({"query": ""})).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_execute_brave_without_api_key() {
-        let tool = WebSearchTool::new("brave".to_string(), None, 5, 15);
+        let tool = WebSearchTool::new("brave".to_string(), None, None, 5, 15);
         let result = tool.execute(json!({"query": "test"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("API key"));
@@ -418,6 +532,7 @@ mod tests {
         let tool = WebSearchTool::new(
             "brave".to_string(),
             Some("sk-plaintext-key".to_string()),
+            None,
             5,
             15,
         );
@@ -437,7 +552,7 @@ mod tests {
 
         // No boot key -- forces reload from config
         let tool =
-            WebSearchTool::new_with_config("brave".to_string(), None, 5, 15, config_path, false);
+            WebSearchTool::new_with_config("brave".to_string(), None, None, 5, 15, config_path, false);
         let key = tool.resolve_brave_api_key().unwrap();
         assert_eq!(key, "fresh-key-from-disk");
     }
@@ -459,6 +574,7 @@ mod tests {
         let tool = WebSearchTool::new_with_config(
             "brave".to_string(),
             Some(encrypted),
+            None,
             5,
             15,
             config_path,
@@ -478,6 +594,7 @@ mod tests {
 
         let tool = WebSearchTool::new_with_config(
             "brave".to_string(),
+            None,
             None,
             5,
             15,
