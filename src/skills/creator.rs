@@ -340,9 +340,17 @@ pub fn extract_tool_calls_from_history(
                         let inner = &content[abs_start + end + 1..abs_start + end + 1 + close_pos];
                         let args: serde_json::Value =
                             serde_json::from_str(inner.trim()).unwrap_or_default();
-                        // Only add if it looks like a tool call (not HTML/formatting tags).
+                        // Only add if it looks like a tool call (not HTML/formatting tags
+                        // or tool call protocol tags like <tool_call>, <tool_result>, etc.).
                         if tag_name != "tool_result"
                             && tag_name != "tool_results"
+                            && tag_name != "tool_call"
+                            && tag_name != "toolcall"
+                            && tag_name != "tool-call"
+                            && tag_name != "tool"
+                            && tag_name != "invoke"
+                            && tag_name != "function_calls"
+                            && tag_name != "function_call"
                             && !tag_name.contains(':')
                             && args.is_object()
                             && !args.as_object().map_or(true, |o| o.is_empty())
@@ -834,6 +842,60 @@ tags = ["auto-generated"]
         let history = vec![ChatMessage::user("hello"), ChatMessage::user("world")];
         let records = extract_tool_calls_from_history(&history);
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn extract_ignores_tool_call_meta_tags() {
+        use crate::providers::ChatMessage;
+        // Tool call metadata tags should NOT be extracted as tool records.
+        let history = vec![
+            ChatMessage::assistant(
+                r#"<tool_call>{"name": "shell", "arguments": {"command": "ls"}}</tool_call>"#,
+            ),
+            ChatMessage::assistant(
+                r#"<toolcall>{"name": "shell", "arguments": {"command": "pwd"}}</toolcall>"#,
+            ),
+            ChatMessage::assistant(
+                r#"<tool-call>{"name": "shell", "arguments": {"command": "echo"}}</tool-call>"#,
+            ),
+            ChatMessage::assistant(
+                r#"<tool>{"name": "shell", "arguments": {"command": "cat"}}</tool>"#,
+            ),
+            ChatMessage::assistant(
+                r#"<invoke>{"name": "shell", "arguments": {"command": "ls"}}</invoke>"#,
+            ),
+            ChatMessage::assistant(
+                r#"<function_call>{"name": "shell", "arguments": {"command": "ls"}}</function_call>"#,
+            ),
+            ChatMessage::assistant(
+                r#"<function_calls>{"name": "shell", "arguments": {"command": "ls"}}</function_calls>"#,
+            ),
+            ChatMessage::assistant(r#"<tool_result>{"result": "ok"}</tool_result>"#),
+            ChatMessage::assistant(r#"<tool_results>{"result": "ok"}</tool_results>"#),
+        ];
+        let records = extract_tool_calls_from_history(&history);
+        // All tool call meta tags should be ignored - no records should be extracted.
+        assert!(
+            records.is_empty(),
+            "Tool call meta tags should not be extracted as tools, but got: {:?}",
+            records
+        );
+    }
+
+    #[test]
+    fn extract_preserves_actual_tool_calls() {
+        use crate::providers::ChatMessage;
+        // Actual tool calls (like <shell>, <memory_store>) should still be extracted.
+        let history = vec![
+            ChatMessage::assistant(r#"<shell>{"command": "cargo build"}</shell>"#),
+            ChatMessage::assistant(
+                r#"<memory_store>{"key": "foo", "value": "bar"}</memory_store>"#,
+            ),
+        ];
+        let records = extract_tool_calls_from_history(&history);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].name, "shell");
+        assert_eq!(records[1].name, "memory_store");
     }
 
     // ── Fuzz-like tests for slug ─────────────────────────────────
