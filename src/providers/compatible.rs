@@ -15,6 +15,7 @@ use reqwest::{
     header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// A provider that speaks the OpenAI-compatible chat completions API.
 /// Used by: Venice, Vercel AI Gateway, Cloudflare AI Gateway, Moonshot,
@@ -1383,11 +1384,53 @@ impl OpenAiCompatibleProvider {
             .ok_or_else(|| anyhow::anyhow!("No response from {} Responses API", self.name))
     }
 
+    fn should_sanitize_tool_schema_for_llamacpp_gemma4(&self, model: &str) -> bool {
+        if !self.name.eq_ignore_ascii_case("llama.cpp") {
+            return false;
+        }
+
+        let lower = model.to_ascii_lowercase();
+        lower.contains("gemma-4") || lower.contains("gemma4")
+    }
+
+    fn sanitize_tool_payload_for_model(&self, tools: &[Value], model: &str) -> Vec<Value> {
+        if !self.should_sanitize_tool_schema_for_llamacpp_gemma4(model) {
+            return tools.to_vec();
+        }
+
+        tools
+            .iter()
+            .map(|tool| {
+                let mut cleaned_tool = tool.clone();
+                let Some(raw_parameters) = tool.get("function").and_then(|v| v.get("parameters"))
+                else {
+                    return cleaned_tool;
+                };
+
+                let cleaned_parameters = crate::tools::SchemaCleanr::clean(
+                    raw_parameters.clone(),
+                    crate::tools::CleaningStrategy::Conservative,
+                );
+
+                if let Some(function_obj) = cleaned_tool
+                    .get_mut("function")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    function_obj.insert("parameters".to_string(), cleaned_parameters);
+                }
+
+                cleaned_tool
+            })
+            .collect()
+    }
+
     fn convert_tool_specs(
+        &self,
         tools: Option<&[crate::tools::ToolSpec]>,
+        model: &str,
     ) -> Option<Vec<serde_json::Value>> {
         tools.map(|items| {
-            items
+            let converted = items
                 .iter()
                 .map(|tool| {
                     serde_json::json!({
@@ -1399,7 +1442,9 @@ impl OpenAiCompatibleProvider {
                         }
                     })
                 })
-                .collect()
+                .collect::<Vec<_>>();
+
+            self.sanitize_tool_payload_for_model(&converted, model)
         })
     }
 
@@ -1898,6 +1943,7 @@ impl Provider for OpenAiCompatibleProvider {
             })
             .collect();
 
+        let sanitized_tools = self.sanitize_tool_payload_for_model(tools, model);
         let request = ApiChatRequest {
             model: model.to_string(),
             messages: api_messages,
@@ -1905,10 +1951,10 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             reasoning_effort: self.reasoning_effort_for_model(model),
             tool_stream: self.tool_stream_for_tools(!tools.is_empty()),
-            tools: if tools.is_empty() {
+            tools: if sanitized_tools.is_empty() {
                 None
             } else {
-                Some(tools.to_vec())
+                Some(sanitized_tools)
             },
             tool_choice: if tools.is_empty() {
                 None
@@ -1997,7 +2043,7 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
-        let tools = Self::convert_tool_specs(request.tools);
+        let tools = self.convert_tool_specs(request.tools, model);
         let effective_messages = if self.merge_system_into_user {
             Self::flatten_system_messages(request.messages)
         } else {
@@ -3356,6 +3402,70 @@ mod tests {
         assert_eq!(tools[0]["function"]["name"], "shell");
         assert_eq!(tools[0]["function"]["description"], "Run shell command");
         assert_eq!(tools[0]["function"]["parameters"]["required"][0], "command");
+    }
+
+    #[test]
+    fn llamacpp_gemma4_sanitizes_native_tool_schema() {
+        let p = make_provider("llama.cpp", "http://localhost:8080/v1", Some("k"));
+        let specs = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "$ref": "#/$defs/Cmd" }
+                },
+                "required": ["command"],
+                "additionalProperties": false,
+                "$defs": {
+                    "Cmd": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
+            }),
+        }];
+
+        let tools = p
+            .convert_tool_specs(Some(&specs), "gemma-4-27b-it")
+            .expect("tools should be present");
+        let params = &tools[0]["function"]["parameters"];
+
+        assert!(params.get("$defs").is_none());
+        assert!(params.get("additionalProperties").is_none());
+        assert_eq!(params["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn non_gemma_models_keep_original_tool_schema_for_llamacpp() {
+        let p = make_provider("llama.cpp", "http://localhost:8080/v1", Some("k"));
+        let specs = vec![crate::tools::ToolSpec {
+            name: "shell".to_string(),
+            description: "Run shell command".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "$ref": "#/$defs/Cmd" }
+                },
+                "required": ["command"],
+                "additionalProperties": false,
+                "$defs": {
+                    "Cmd": {
+                        "type": "string",
+                        "minLength": 1
+                    }
+                }
+            }),
+        }];
+
+        let tools = p
+            .convert_tool_specs(Some(&specs), "llama-3.3-70b")
+            .expect("tools should be present");
+        let params = &tools[0]["function"]["parameters"];
+
+        assert_eq!(params["properties"]["command"]["$ref"], "#/$defs/Cmd");
+        assert_eq!(params["additionalProperties"], serde_json::json!(false));
+        assert!(params.get("$defs").is_some());
     }
 
     #[test]
