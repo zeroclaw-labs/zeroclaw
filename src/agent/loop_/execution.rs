@@ -7,6 +7,15 @@ use anyhow::Result;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// Harness: Maximum tool output size in characters.
+/// Outputs exceeding this are truncated with a notice to the LLM.
+/// Prevents context pollution from tools that return megabytes of data.
+const TOOL_OUTPUT_MAX_CHARS: usize = 50_000;
+
+/// Harness: Tool execution timeout warning threshold.
+/// If a tool takes longer than this, a performance warning is logged.
+const TOOL_SLOW_THRESHOLD: Duration = Duration::from_secs(30);
+
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
@@ -51,14 +60,38 @@ async fn execute_one_tool(
     match tool_result {
         Ok(r) => {
             let duration = start.elapsed();
+
+            // Harness: warn on slow tools
+            if duration > TOOL_SLOW_THRESHOLD {
+                tracing::warn!(
+                    tool = call_name,
+                    duration_secs = duration.as_secs(),
+                    "Harness: slow tool execution (>{} secs)",
+                    TOOL_SLOW_THRESHOLD.as_secs()
+                );
+            }
+
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration,
                 success: r.success,
             });
             if r.success {
+                // Harness: truncate oversized tool output to prevent context pollution
+                let output = scrub_credentials(&r.output);
+                let output = if output.chars().count() > TOOL_OUTPUT_MAX_CHARS {
+                    let truncated: String = output.chars().take(TOOL_OUTPUT_MAX_CHARS).collect();
+                    format!(
+                        "{truncated}\n\n[Harness: output truncated from {} to {} chars. \
+                         Use memory_recall to search for full content if needed.]",
+                        output.chars().count(),
+                        TOOL_OUTPUT_MAX_CHARS
+                    )
+                } else {
+                    output
+                };
                 Ok(ToolExecutionOutcome {
-                    output: scrub_credentials(&r.output),
+                    output,
                     success: true,
                     error_reason: None,
                     duration,
