@@ -599,7 +599,7 @@ To require binary-only install with no source fallback:
 
 - **Docker** — required only if using the [Docker sandboxed runtime](#runtime-support-current) (`runtime.kind = "docker"`). Install via your package manager or [docker.com](https://docs.docker.com/engine/install/).
 
-> **Note:** The default `cargo build --release` uses `codegen-units=1` to lower peak compile pressure. For faster builds on powerful machines, use `cargo build --profile release-fast`.
+> **Note:** The default `cargo build --release` is tuned for fast compilation (thin LTO, parallel codegen). For size-optimized distribution builds, use `cargo build --profile dist`.
 
 </details>
 

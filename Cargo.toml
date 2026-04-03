@@ -290,17 +290,11 @@ incremental = true
 opt-level = 1
 
 [profile.release]
-opt-level = "z"      # Optimize for size
-lto = "fat"          # Maximum cross-crate optimization for smaller binaries
-codegen-units = 1    # Serialized codegen for low-memory devices (e.g., Raspberry Pi 3 with 1GB RAM)
-                     # Higher values (e.g., 8) compile faster but require more RAM during compilation
-strip = true          # Remove debug symbols
-panic = "abort"      # Reduce binary size
-
-[profile.release-fast]
-inherits = "release"
-codegen-units = 8    # Parallel codegen for faster builds on powerful machines (16GB+ RAM recommended)
-                     # Use: cargo build --profile release-fast
+opt-level = 3        # Max runtime perf; fastest LLVM pipeline (no size-shrink passes)
+lto = "thin"         # Cross-crate optimization without the fat-LTO merge bottleneck
+codegen-units = 16   # Full parallel codegen
+strip = true
+panic = "abort"
 
 [profile.ci]
 inherits = "release"

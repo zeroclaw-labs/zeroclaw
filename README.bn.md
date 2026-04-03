@@ -601,7 +601,7 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 
 - **Docker** — শুধুমাত্র [Docker স্যান্ডবক্সড রানটাইম](#রানটাইম-সাপোর্ট-বর্তমান) (`runtime.kind = "docker"`) ব্যবহার করলে প্রয়োজন। আপনার প্যাকেজ ম্যানেজার বা [docker.com](https://docs.docker.com/engine/install/) থেকে ইনস্টল করুন।
 
-> **নোট:** ডিফল্ট `cargo build --release` পিক কম্পাইল প্রেশার কমাতে `codegen-units=1` ব্যবহার করে। শক্তিশালী মেশিনে দ্রুত বিল্ডের জন্য, `cargo build --profile release-fast` ব্যবহার করুন।
+> **নোট:** ডিফল্ট `cargo build --release` দ্রুত কম্পাইলেশনের জন্য টিউন করা হয়েছে (thin LTO, parallel codegen)। সাইজ-অপ্টিমাইজড ডিস্ট্রিবিউশন বিল্ডের জন্য, `cargo build --profile dist` ব্যবহার করুন।
 
 </details>
 

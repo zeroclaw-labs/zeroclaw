@@ -601,7 +601,7 @@ curl -LsSf https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/master/insta
 
 - **Docker** — مطلوب فقط إذا كنت تستخدم [وقت تشغيل Docker المعزول](#دعم-وقت-التشغيل-الحالي) (`runtime.kind = "docker"`). ثبّت عبر مدير الحزم أو [docker.com](https://docs.docker.com/engine/install/).
 
-> **ملاحظة:** الأمر الافتراضي `cargo build --release` يستخدم `codegen-units=1` لتقليل ضغط التجميع الذروة. للبناء الأسرع على أجهزة قوية، استخدم `cargo build --profile release-fast`.
+> **ملاحظة:** الأمر الافتراضي `cargo build --release` مُهيَّأ للتجميع السريع (LTO رفيع، codegen متوازٍ). للبناء الموزَّع المُحسَّن للحجم، استخدم `cargo build --profile dist`.
 
 </details>
 
