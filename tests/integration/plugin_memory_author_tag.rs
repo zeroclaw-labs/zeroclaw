@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that all memory writes are tagged with the plugin name as author.
 //!
 //! Acceptance criterion for US-ZCL-23:

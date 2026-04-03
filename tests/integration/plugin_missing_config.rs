@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: missing required config keys produce actionable error messages.
 //!
 //! Acceptance criterion for US-ZCL-7:

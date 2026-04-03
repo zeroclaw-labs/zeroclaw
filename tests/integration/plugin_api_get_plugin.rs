@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: GET /api/plugins/{name} response shape.
 //!
 //! Verifies the acceptance criterion for US-ZCL-18:
@@ -9,8 +11,8 @@
 
 use std::path::Path;
 
-use zeroclaw::plugins::host::PluginHost;
 use zeroclaw::plugins::PluginInfo;
+use zeroclaw::plugins::host::PluginHost;
 
 /// Set up a PluginHost pointed at the test plugins directory.
 fn setup_host() -> PluginHost {

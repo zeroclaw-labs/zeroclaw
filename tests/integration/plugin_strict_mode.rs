@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Security test: strict mode rejects wildcard hosts and limits filesystem
 //! access to the workspace subtree.
 //!
@@ -11,7 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use zeroclaw::plugins::loader::{
-    validate_allowed_hosts, validate_workspace_paths, NetworkSecurityLevel,
+    NetworkSecurityLevel, validate_allowed_hosts, validate_workspace_paths,
 };
 
 // ── Wildcard host rejection ────────────────────────────────────────────

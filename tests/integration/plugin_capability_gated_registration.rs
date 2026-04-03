@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that host functions are only registered for plugins that declare
 //! the corresponding capability.
 //!

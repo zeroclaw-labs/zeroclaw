@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify the host function ABI: JSON parameter encoding and error protocol.
 //!
 //! Acceptance criterion for US-ZCL-22:

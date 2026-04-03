@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Security test: relaxed mode allows all declared capabilities.
 //!
 //! Verifies that `validate_allowed_hosts` allows wildcard hosts at the Relaxed
@@ -5,7 +7,7 @@
 //! not enforce the plugin allowlist or workspace path restrictions.
 
 use zeroclaw::plugins::loader::{
-    validate_allowed_hosts, validate_plugin_allowlist, NetworkSecurityLevel,
+    NetworkSecurityLevel, validate_allowed_hosts, validate_plugin_allowlist,
 };
 
 // ── Relaxed mode allows wildcard hosts ──────────────────────────────

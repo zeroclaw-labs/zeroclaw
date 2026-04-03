@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test for delegation security limits (combined).
 //!
 //! Task US-ZCL-24-10: Verify security boundaries for tool delegation:
@@ -7,20 +9,20 @@
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
-use zeroclaw::config::schema::DelegateAgentConfig;
 use zeroclaw::config::AuditConfig;
+use zeroclaw::config::schema::DelegateAgentConfig;
 use zeroclaw::memory::none::NoneMemory;
 use zeroclaw::plugins::host_functions::HostFunctionRegistry;
 use zeroclaw::plugins::{
     PluginCapabilities, PluginManifest, RiskLevel, ToolDefinition, ToolDelegationCapability,
 };
-use zeroclaw::security::audit::AuditLogger;
 use zeroclaw::security::SecurityPolicy;
-use zeroclaw::tools::traits::{Tool, ToolResult};
+use zeroclaw::security::audit::AuditLogger;
 use zeroclaw::tools::DelegateTool;
+use zeroclaw::tools::traits::{Tool, ToolResult};
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -130,6 +132,7 @@ fn agent_with_max_depth(max_depth: u32) -> HashMap<String, DelegateAgentConfig> 
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         },
     );
     agents

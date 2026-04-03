@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: empty `allowed_hosts` means no network access.
 //!
 //! Acceptance criterion for US-ZCL-6:
@@ -9,8 +11,8 @@
 
 use std::path::Path;
 
-use zeroclaw::plugins::loader::build_extism_manifest;
 use zeroclaw::plugins::PluginManifest;
+use zeroclaw::plugins::loader::build_extism_manifest;
 
 const BAD_ACTOR_WASM: &str = "tests/plugins/artifacts/bad_actor_plugin.wasm";
 

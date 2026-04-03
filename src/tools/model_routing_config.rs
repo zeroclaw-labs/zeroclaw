@@ -3,7 +3,7 @@ use crate::config::{ClassificationRule, Config, DelegateAgentConfig, ModelRouteC
 use crate::security::SecurityPolicy;
 use crate::util::MaybeSet;
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
@@ -708,6 +708,7 @@ impl ModelRoutingConfigTool {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             });
 
         next_agent.provider = provider;
@@ -933,10 +934,7 @@ impl Tool for ModelRoutingConfigTool {
         let result = match action.as_str() {
             "get" => self.handle_get(),
             "list_hints" => self.handle_list_hints(),
-            "set_default"
-            | "upsert_scenario"
-            | "remove_scenario"
-            | "upsert_agent"
+            "set_default" | "upsert_scenario" | "remove_scenario" | "upsert_agent"
             | "remove_agent" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);

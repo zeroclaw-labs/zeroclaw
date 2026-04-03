@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test for channel messaging end-to-end flow.
 //!
 //! Task US-ZCL-25-9: Create a test plugin that sends a message via

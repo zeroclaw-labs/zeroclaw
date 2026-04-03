@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: rate limit exceeded produces clear error and rejects further calls.
 //!
 //! Verifies the acceptance criterion for US-ZCL-17:

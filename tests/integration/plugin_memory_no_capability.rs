@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that a plugin without memory capability cannot access memory functions.
 //!
 //! Acceptance criterion for US-ZCL-23:
@@ -13,8 +15,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw::config::AuditConfig;
 use zeroclaw::memory::traits::{Memory, MemoryCategory, MemoryEntry};
-use zeroclaw::plugins::host_functions::HostFunctionRegistry;
 use zeroclaw::plugins::PluginManifest;
+use zeroclaw::plugins::host_functions::HostFunctionRegistry;
 use zeroclaw::security::audit::AuditLogger;
 
 /// Minimal no-op memory backend for tests.

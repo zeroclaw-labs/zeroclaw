@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Security test: default mode allows capabilities but warns on wildcards.
 //!
 //! Verifies that `validate_allowed_hosts` allows wildcard hosts at the Default
@@ -6,7 +8,7 @@
 //! restrictions.
 
 use zeroclaw::plugins::loader::{
-    validate_allowed_hosts, validate_plugin_allowlist, NetworkSecurityLevel,
+    NetworkSecurityLevel, validate_allowed_hosts, validate_plugin_allowlist,
 };
 
 // ── Default mode allows wildcard hosts ─────────────────────────────

@@ -46,15 +46,15 @@ fn doctor_hint_guarded_by_plugin_warn_or_error() {
 
     // The conditional variable must be checked before the hint is printed
     assert!(
-        before_hint.contains("has_plugin_issues")
-            || before_hint.contains("if "),
+        before_hint.contains("has_plugin_issues") || before_hint.contains("if "),
         "the hint must be guarded by a conditional check for plugin issues"
     );
 
     // 3. Verify the pattern: compute a bool from the severity check, then use it in an if
     assert!(
         run_body.contains("if has_plugin_issues")
-            || (run_body.contains(".any(|") && run_body.contains("Severity::Warn | Severity::Error")),
+            || (run_body.contains(".any(|")
+                && run_body.contains("Severity::Warn | Severity::Error")),
         "the hint must only display when plugin diagnostics include warn or error items"
     );
 }

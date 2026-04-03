@@ -142,7 +142,7 @@ impl Tool for WasmTool {
         };
 
         // Emit audit log entry for every plugin tool execution
-        if let (Some(logger), Ok(ref tool_result)) = (&self.audit_logger, &result) {
+        if let (Some(logger), Ok(tool_result)) = (&self.audit_logger, &result) {
             let duration_ms = start.elapsed().as_millis() as u64;
             let redacted = redact_sensitive_params(&args);
             let http_requests = extract_http_requests(&self.function_name, &args, tool_result);

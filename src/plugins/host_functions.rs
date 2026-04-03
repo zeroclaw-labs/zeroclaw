@@ -806,7 +806,10 @@ impl HostFunctionRegistry {
                 if tool.risk_level() > data.caller_max_risk {
                     let err = HostFunctionError::new(format!(
                         "[plugin:{}/zeroclaw_tool_call] risk level exceeded: tool '{}' is {:?} but caller ceiling is {:?}",
-                        data.plugin_name, request.tool_name, tool.risk_level(), data.caller_max_risk
+                        data.plugin_name,
+                        request.tool_name,
+                        tool.risk_level(),
+                        data.caller_max_risk
                     ));
                     let handle = plugin.memory_new(&err.to_json_bytes())?;
                     outputs[0] = plugin.memory_to_val(handle);

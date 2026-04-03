@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: HTTP requests made by plugin are logged (URL and method only).
 //!
 //! Verifies acceptance criterion for US-ZCL-14:

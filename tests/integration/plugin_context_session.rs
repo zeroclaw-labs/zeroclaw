@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Test: zeroclaw_get_session_context returns current session info.
 //!
 //! Task US-ZCL-26-1: verify that the `context_session` host function is

@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: tool_lookup_config reads injected config values.
 //!
 //! Loads `multi_tool_plugin.wasm` with config `{api_key: "test-key", model: "test-model"}`,
@@ -11,7 +13,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use zeroclaw::plugins::loader::build_extism_manifest_with_config;
-use zeroclaw::plugins::{resolve_plugin_config, PluginManifest};
+use zeroclaw::plugins::{PluginManifest, resolve_plugin_config};
 
 const MULTI_TOOL_WASM: &str = "tests/plugins/artifacts/multi_tool_plugin.wasm";
 

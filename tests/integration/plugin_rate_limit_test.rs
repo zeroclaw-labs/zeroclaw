@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: rate limiting end-to-end scenario (US-ZCL-17-8).
 //!
 //! Configure a low rate limit (5 calls per hour). Call a plugin 6 times rapidly.

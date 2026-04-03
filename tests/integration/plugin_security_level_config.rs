@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Security test: security level is read from SecurityPolicy configuration.
 //!
 //! Verifies that `NetworkSecurityLevel::from_config` correctly maps configuration

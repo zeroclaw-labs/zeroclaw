@@ -46,20 +46,26 @@ pub enum PluginError {
     #[error("plugin '{plugin}' is missing required config keys: {keys}")]
     MissingConfig { plugin: String, keys: String },
 
-    #[error("plugin '{plugin}' declares wildcard host '{host}' which is forbidden at {level} security level")]
+    #[error(
+        "plugin '{plugin}' declares wildcard host '{host}' which is forbidden at {level} security level"
+    )]
     WildcardHostRejected {
         plugin: String,
         host: String,
         level: String,
     },
 
-    #[error("plugin '{plugin}' declares wildcard tool delegation which is forbidden at {level} security level")]
+    #[error(
+        "plugin '{plugin}' declares wildcard tool delegation which is forbidden at {level} security level"
+    )]
     WildcardDelegationRejected { plugin: String, level: String },
 
     #[error("plugin '{plugin}' declares forbidden path '{path}' in allowed_paths")]
     ForbiddenPath { plugin: String, path: String },
 
-    #[error("plugin '{plugin}' declares path '{path}' outside workspace root '{workspace}' (strict mode)")]
+    #[error(
+        "plugin '{plugin}' declares path '{path}' outside workspace root '{workspace}' (strict mode)"
+    )]
     PathOutsideWorkspace {
         plugin: String,
         path: String,
@@ -72,7 +78,9 @@ pub enum PluginError {
     #[error("failed to decrypt config key '{key}': {source}")]
     ConfigDecrypt { key: String, source: anyhow::Error },
 
-    #[error("WASM binary integrity check failed for plugin '{plugin}': expected hash {expected}, got {actual}")]
+    #[error(
+        "WASM binary integrity check failed for plugin '{plugin}': expected hash {expected}, got {actual}"
+    )]
     HashMismatch {
         plugin: String,
         expected: String,

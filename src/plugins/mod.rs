@@ -1558,9 +1558,11 @@ parameters_schema = { type = "object", properties = { target = { type = "string"
 
         // Network
         assert_eq!(manifest.allowed_hosts.len(), 3);
-        assert!(manifest
-            .allowed_hosts
-            .contains(&"*.internal.io".to_string()));
+        assert!(
+            manifest
+                .allowed_hosts
+                .contains(&"*.internal.io".to_string())
+        );
 
         // Filesystem
         assert_eq!(manifest.allowed_paths.len(), 3);

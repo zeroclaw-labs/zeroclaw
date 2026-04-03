@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: POST /api/plugins/{name}/disable behaviour.
 //!
 //! Verifies the acceptance criterion for US-ZCL-18:

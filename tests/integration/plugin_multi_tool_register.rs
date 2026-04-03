@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: multi-tool plugin registers 5 distinct tools from one module.
 //!
 //! Parses the real `multi-tool-plugin/plugin.toml` manifest and verifies that

@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Security test: memory capability denial.
 //!
 //! Task US-ZCL-23-10: Load a plugin WITHOUT memory capability declared.

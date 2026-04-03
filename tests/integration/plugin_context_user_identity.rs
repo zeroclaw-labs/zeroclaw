@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Test: zeroclaw_get_user_identity returns requesting user info.
 //!
 //! Task US-ZCL-26-2: verify that the `context_user_identity` host function is

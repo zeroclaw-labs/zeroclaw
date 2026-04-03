@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that plugins without capability declarations see no host function imports.
 //!
 //! Acceptance criterion for US-ZCL-22:

@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use super::error::PluginError;
 use super::PluginManifest;
+use super::error::PluginError;
 use crate::config::schema::Config;
 use crate::security::SecurityPolicy;
 

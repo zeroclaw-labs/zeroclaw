@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test for memory host functions: store-then-recall round-trip.
 //!
 //! Task US-ZCL-23-9: Create a test plugin that calls memory_store then
@@ -17,8 +19,8 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use zeroclaw::config::AuditConfig;
 use zeroclaw::memory::traits::{Memory, MemoryCategory, MemoryEntry};
-use zeroclaw::plugins::host_functions::HostFunctionRegistry;
 use zeroclaw::plugins::PluginManifest;
+use zeroclaw::plugins::host_functions::HostFunctionRegistry;
 use zeroclaw::security::audit::AuditLogger;
 
 /// An in-memory backend that supports both store and recall so we can verify

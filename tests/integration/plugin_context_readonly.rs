@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Test: Context is read-only with no mutation capability.
 //!
 //! Task US-ZCL-26-4: verify that the context capability exposes only read-only

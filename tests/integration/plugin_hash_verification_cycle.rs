@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Full-cycle hash verification test (US-ZCL-16-7):
 //! install (hash recorded) -> load succeeds (hash matches) -> tamper binary
 //! -> load fails (hash mismatch) -> reinstall -> load succeeds (hash recalculated).

@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that SHA-256 hash is recorded at install time in plugin metadata
 //! (acceptance criterion for US-ZCL-16).
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: non-sensitive manifest defaults are used as fallbacks.
 //!
 //! Acceptance criterion for US-ZCL-7:

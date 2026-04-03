@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: Output format matches spec example.
 //!
 //! Verifies the acceptance criterion for story US-ZCL-12:
@@ -6,7 +8,7 @@
 //! Asserts that `format_audit_summary` produces output with the correct section
 //! order, separators, headings, and formatting when all sections are populated.
 
-use zeroclaw::plugins::{format_audit_summary, PluginManifest};
+use zeroclaw::plugins::{PluginManifest, format_audit_summary};
 
 /// Build a fully-populated manifest that exercises every section of the audit output.
 fn full_manifest_toml() -> &'static str {

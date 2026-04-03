@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: WasmChannel bridge send/listen round-trip through Extism.
 //!
 //! Loads `channel_plugin.wasm`, wires it through `WasmChannel`, and validates

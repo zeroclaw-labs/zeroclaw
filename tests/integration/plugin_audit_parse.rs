@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: `zeroclaw plugin audit <path>` parses plugin.toml without installing.
 //!
 //! Verifies the acceptance criterion:

@@ -1,6 +1,7 @@
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -77,6 +78,97 @@ impl Clone for ActionTracker {
     }
 }
 
+/// Per-sender sliding-window rate limiter.
+///
+/// Each unique sender key (Telegram thread ID, Discord channel, etc.) gets
+/// its own independent [`ActionTracker`] bucket. When no sender is in scope
+/// (cron jobs, CLI), the [`GLOBAL_KEY`] bucket is used.
+///
+/// Note: sender buckets accumulate for the daemon lifetime with no eviction.
+/// This is acceptable for bounded sets of chat IDs; in high-cardinality deployments,
+/// consider periodic cleanup.
+#[derive(Debug)]
+pub struct PerSenderTracker {
+    buckets: parking_lot::Mutex<HashMap<String, ActionTracker>>,
+}
+
+impl PerSenderTracker {
+    /// Bucket key used when no per-sender context is available (cron, CLI).
+    pub const GLOBAL_KEY: &'static str = "__global__";
+
+    /// Create an empty tracker with no sender buckets.
+    pub fn new() -> Self {
+        Self {
+            buckets: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Resolve the current sender key from the task-local, falling back to GLOBAL_KEY.
+    fn current_key() -> String {
+        crate::agent::loop_::TOOL_LOOP_THREAD_ID
+            .try_with(|v| v.clone())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Self::GLOBAL_KEY.to_string())
+    }
+
+    /// Record one action for the current sender. Returns `true` if allowed
+    /// (count after recording <= max), `false` if budget exhausted.
+    pub fn record_for_current(&self, max: u32) -> bool {
+        let key = Self::current_key();
+        self.record_within(&key, max)
+    }
+
+    /// Record one action for `key`. Allows the action when count == max (≤ max);
+    /// blocks and returns false when count > max.
+    pub fn record_within(&self, key: &str, max: u32) -> bool {
+        let mut buckets = self.buckets.lock();
+        let tracker = buckets
+            .entry(key.to_string())
+            .or_insert_with(ActionTracker::new);
+        let count = tracker.record();
+        count <= max as usize
+    }
+
+    /// Check if the current sender is at or over the limit (without recording).
+    pub fn is_limited_for_current(&self, max: u32) -> bool {
+        let key = Self::current_key();
+        self.is_exhausted(&key, max)
+    }
+
+    /// Check if `key` is at or over `max` (without recording).
+    /// Does NOT insert a bucket for unseen keys.
+    /// A max of 0 is always exhausted (zero budget means no actions allowed).
+    /// Returns true when count has reached or exceeded max. Note: acquires write lock
+    /// because ActionTracker::count prunes stale entries internally. Also note: returns
+    /// true one count earlier than record_within would block.
+    pub fn is_exhausted(&self, key: &str, max: u32) -> bool {
+        if max == 0 {
+            return true;
+        }
+        let mut buckets = self.buckets.lock();
+        match buckets.get_mut(key) {
+            Some(tracker) => tracker.count() >= max as usize,
+            None => false,
+        }
+    }
+}
+
+impl Clone for PerSenderTracker {
+    fn clone(&self) -> Self {
+        let buckets = self.buckets.lock();
+        Self {
+            buckets: parking_lot::Mutex::new(buckets.clone()),
+        }
+    }
+}
+
+impl Default for PerSenderTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Security policy enforced on all tool executions
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
@@ -91,7 +183,8 @@ pub struct SecurityPolicy {
     pub require_approval_for_medium_risk: bool,
     pub block_high_risk_commands: bool,
     pub shell_env_passthrough: Vec<String>,
-    pub tracker: ActionTracker,
+    pub shell_timeout_secs: u64,
+    pub tracker: PerSenderTracker,
 }
 
 /// Default allowed commands for Unix platforms.
@@ -223,7 +316,8 @@ impl Default for SecurityPolicy {
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
             shell_env_passthrough: vec![],
-            tracker: ActionTracker::new(),
+            shell_timeout_secs: 60,
+            tracker: PerSenderTracker::new(),
         }
     }
 }
@@ -418,6 +512,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 fn contains_unquoted_single_ampersand(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let mut prev = ' ';
     let mut chars = command.chars().peekable();
 
     while let Some(ch) = chars.next() {
@@ -430,10 +525,12 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::Double => {
                 if escaped {
                     escaped = false;
+                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    prev = ch;
                     continue;
                 }
                 if ch == '"' {
@@ -443,24 +540,37 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
             QuoteState::None => {
                 if escaped {
                     escaped = false;
+                    prev = ch;
                     continue;
                 }
                 if ch == '\\' {
                     escaped = true;
+                    prev = ch;
                     continue;
                 }
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
                     '&' => {
-                        if chars.next_if_eq(&'&').is_none() {
-                            return true;
+                        // `&&` is a logical-AND separator, not a background op.
+                        if chars.next_if_eq(&'&').is_some() {
+                            prev = '&';
+                            continue;
                         }
+                        // `>&N` and `<&N` are fd redirects, not background ops.
+                        if (prev == '>' || prev == '<')
+                            || chars.peek().is_some_and(|c| c.is_ascii_digit())
+                        {
+                            prev = ch;
+                            continue;
+                        }
+                        return true;
                     }
                     _ => {}
                 }
             }
         }
+        prev = ch;
     }
 
     false
@@ -616,25 +726,72 @@ fn attached_short_option_value(token: &str) -> Option<&str> {
         return None;
     }
     let value = body[1..].trim_start_matches('=').trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
+    if value.is_empty() { None } else { Some(value) }
+}
+
+/// Extract the file target from a redirection token, returning `None` for
+/// fd-only redirects (e.g. `2>&1`) and standalone operators (e.g. `>`).
+fn redirection_target(token: &str) -> Option<&str> {
+    match parse_redirection(token) {
+        RedirectionParse::Target(t) => Some(t),
+        _ => None,
     }
 }
 
-fn redirection_target(token: &str) -> Option<&str> {
-    let marker_idx = token.find(['<', '>'])?;
+/// Result of parsing a redirection token.
+enum RedirectionParse<'a> {
+    /// Token contains a redirect operator with an inline target, e.g. `>/dev/null`.
+    Target(&'a str),
+    /// Token is a pure file-descriptor redirect like `2>&1` — always safe.
+    FdOnly,
+    /// Token is a bare redirect operator (e.g. `>`, `>>`, `<`) — the target is the next token.
+    NeedsNextToken,
+    /// Token contains no redirection.
+    None,
+}
+
+fn parse_redirection(token: &str) -> RedirectionParse<'_> {
+    let Some(marker_idx) = token.find(['<', '>']) else {
+        return RedirectionParse::None;
+    };
     let mut rest = &token[marker_idx + 1..];
     rest = rest.trim_start_matches(['<', '>']);
-    rest = rest.trim_start_matches('&');
+
+    // Check for fd redirect: `&` followed by only digits (e.g. `2>&1`, `>&2`).
+    if let Some(after_amp) = rest.strip_prefix('&') {
+        let after_digits = after_amp.trim_start_matches(|c: char| c.is_ascii_digit());
+        if after_digits.is_empty() {
+            return RedirectionParse::FdOnly;
+        }
+    }
+
+    // Strip leading digits (fd number before operator, e.g. the `2` in `2>/dev/null`).
     rest = rest.trim_start_matches(|c: char| c.is_ascii_digit());
     let trimmed = rest.trim();
     if trimmed.is_empty() {
-        None
+        RedirectionParse::NeedsNextToken
     } else {
-        Some(trimmed)
+        RedirectionParse::Target(trimmed)
     }
+}
+
+/// Check if a redirection target is safe (standard /dev/* targets or file descriptors).
+///
+/// Safe targets include:
+/// - `/dev/null` — discards output
+/// - `/dev/stdout` — redirects to standard output
+/// - `/dev/stderr` — redirects to standard error
+/// - `/dev/zero` — infinite zero bytes source
+///
+/// File descriptor forms like `2>&1` are handled separately via `redirection_target()`,
+/// which strips the ampersand prefix before calling this function. This function
+/// validates the actual target path/name.
+fn safe_redirect_target(target: &str) -> bool {
+    let target = target.trim();
+    matches!(
+        target,
+        "/dev/null" | "/dev/stdout" | "/dev/stderr" | "/dev/zero"
+    )
 }
 
 /// Extract the basename from a command path, handling both Unix (`/`) and
@@ -901,7 +1058,12 @@ impl SecurityPolicy {
         for segment in &segments {
             let cmd_part = skip_env_assignments(segment);
             let mut words = cmd_part.split_whitespace();
-            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
+                &raw_executable[..idx]
+            } else {
+                raw_executable
+            };
             let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
             let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
 
@@ -962,11 +1124,55 @@ impl SecurityPolicy {
             return false;
         }
 
-        // Block shell redirections (`<`, `>`, `>>`) — they can read/write
-        // arbitrary paths and bypass path checks.
+        // Allow safe shell redirections (`<`, `>`, `>>`) to /dev/* targets.
+        // Block unsafe redirections to arbitrary paths that could bypass path checks.
         // Ignore quoted literals, e.g. `echo "a>b"` and `echo "a<b"`.
         if contains_unquoted_char(command, '>') || contains_unquoted_char(command, '<') {
-            return false;
+            // Check if all redirections target safe destinations
+            for segment in split_unquoted_segments(command) {
+                let cmd_part = skip_env_assignments(&segment);
+                let words: Vec<&str> = cmd_part.split_whitespace().collect();
+
+                let mut i = 0;
+                // Skip the executable (first word)
+                if !words.is_empty() {
+                    // Check inline redirections on executable itself, e.g., `cat</dev/null`
+                    match parse_redirection(strip_wrapping_quotes(words[0])) {
+                        RedirectionParse::Target(target) => {
+                            if !safe_redirect_target(target) {
+                                return false;
+                            }
+                        }
+                        RedirectionParse::NeedsNextToken => {
+                            // Bare redirect as executable is invalid, block it
+                            return false;
+                        }
+                        RedirectionParse::FdOnly | RedirectionParse::None => {}
+                    }
+                    i = 1;
+                }
+
+                // Check redirections in remaining arguments
+                while i < words.len() {
+                    match parse_redirection(words[i]) {
+                        RedirectionParse::Target(target) => {
+                            if !safe_redirect_target(target) {
+                                return false;
+                            }
+                        }
+                        RedirectionParse::NeedsNextToken => {
+                            // Standalone redirect operator — next token is the target
+                            i += 1;
+                            let target = words.get(i).map(|w| w.trim()).unwrap_or("");
+                            if !safe_redirect_target(target) {
+                                return false;
+                            }
+                        }
+                        RedirectionParse::FdOnly | RedirectionParse::None => {}
+                    }
+                    i += 1;
+                }
+            }
         }
 
         // Block `tee` — it can write to arbitrary files, bypassing the
@@ -991,7 +1197,15 @@ impl SecurityPolicy {
             let cmd_part = skip_env_assignments(segment);
 
             let mut words = cmd_part.split_whitespace();
-            let executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            // Strip inline redirections from the executable token, e.g.
+            // `cat</dev/null` -> `cat`, so the allowlist check sees the real
+            // command name rather than the redirect target path.
+            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
+                &raw_executable[..idx]
+            } else {
+                raw_executable
+            };
             let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
             let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
 
@@ -1015,12 +1229,10 @@ impl SecurityPolicy {
         }
 
         // At least one command must be present
-        let has_cmd = segments.iter().any(|s| {
+        segments.iter().any(|s| {
             let s = skip_env_assignments(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
-        });
-
-        has_cmd
+        })
     }
 
     /// Check for dangerous arguments that allow sub-command execution.
@@ -1314,16 +1526,16 @@ impl SecurityPolicy {
         }
     }
 
-    /// Record an action and check if the rate limit has been exceeded.
-    /// Returns `true` if the action is allowed, `false` if rate-limited.
+    /// Record an action for the current sender and check if rate-limited.
+    /// Returns `true` if allowed, `false` if budget exhausted.
     pub fn record_action(&self) -> bool {
-        let count = self.tracker.record();
-        count <= self.max_actions_per_hour as usize
+        self.tracker.record_for_current(self.max_actions_per_hour)
     }
 
-    /// Check if the rate limit would be exceeded without recording.
+    /// Check if the current sender would be rate-limited without recording.
     pub fn is_rate_limited(&self) -> bool {
-        self.tracker.count() >= self.max_actions_per_hour as usize
+        self.tracker
+            .is_limited_for_current(self.max_actions_per_hour)
     }
 
     /// Resolve a user-provided path for tool use.
@@ -1393,7 +1605,8 @@ impl SecurityPolicy {
             require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
             block_high_risk_commands: autonomy_config.block_high_risk_commands,
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
-            tracker: ActionTracker::new(),
+            shell_timeout_secs: autonomy_config.shell_timeout_secs,
+            tracker: PerSenderTracker::new(),
         }
     }
 
@@ -1477,7 +1690,7 @@ impl SecurityPolicy {
         // Rate limit
         let _ = writeln!(
             out,
-            "**Rate limit**: max {} actions per hour.",
+            "**Rate limit**: max {} actions per hour per chat (each conversation has its own independent budget).",
             self.max_actions_per_hour
         );
 
@@ -1542,9 +1755,10 @@ mod tests {
     #[test]
     fn enforce_tool_operation_read_allowed_in_readonly_mode() {
         let p = readonly_policy();
-        assert!(p
-            .enforce_tool_operation(ToolOperation::Read, "memory_recall")
-            .is_ok());
+        assert!(
+            p.enforce_tool_operation(ToolOperation::Read, "memory_recall")
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2221,6 +2435,50 @@ mod tests {
     }
 
     #[test]
+    fn safe_redirect_to_dev_null_allowed() {
+        let p = default_policy();
+        // stdout to /dev/null
+        assert!(p.is_command_allowed("echo secret > /dev/null"));
+        // stderr to /dev/null
+        assert!(p.is_command_allowed("ls 2> /dev/null"));
+        // both stdout and stderr to /dev/null
+        assert!(p.is_command_allowed("find . 2>&1 > /dev/null"));
+        // inline redirection form
+        assert!(p.is_command_allowed("cat</dev/null"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_stdout_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo hello > /dev/stdout"));
+        assert!(p.is_command_allowed("cat /dev/zero > /dev/stdout"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_stderr_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("echo error > /dev/stderr"));
+        assert!(p.is_command_allowed("ls 1> /dev/stderr"));
+    }
+
+    #[test]
+    fn safe_redirect_to_dev_zero_allowed() {
+        let p = default_policy();
+        assert!(p.is_command_allowed("cat /dev/zero > /dev/null"));
+    }
+
+    #[test]
+    fn safe_file_descriptor_redirect_allowed() {
+        let p = default_policy();
+        // stderr to stdout
+        assert!(p.is_command_allowed("find . 2>&1"));
+        // stdout to stderr
+        assert!(p.is_command_allowed("echo hello 1>&2"));
+        // combined with safe target
+        assert!(p.is_command_allowed("ls 2>&1 > /dev/null"));
+    }
+
+    #[test]
     fn quoted_ampersand_and_redirect_literals_are_not_treated_as_operators() {
         let p = default_policy();
         assert!(p.is_command_allowed("echo \"A&B\""));
@@ -2592,7 +2850,6 @@ mod tests {
         };
         let workspace = PathBuf::from("/tmp/test");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
-        assert_eq!(policy.tracker.count(), 0);
         assert!(!policy.is_rate_limited());
     }
 
@@ -3101,13 +3358,15 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        assert!(p
-            .validate_command_execution("rm -rf /tmp/test", true)
-            .is_ok());
+        assert!(
+            p.validate_command_execution("rm -rf /tmp/test", true)
+                .is_ok()
+        );
         assert!(p.validate_command_execution("nohup firefox", true).is_ok());
-        assert!(p
-            .validate_command_execution("ls /usr/bin/firefox", true)
-            .is_ok());
+        assert!(
+            p.validate_command_execution("ls /usr/bin/firefox", true)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -3123,5 +3382,34 @@ mod tests {
         let result = p.validate_command_execution("rm -rf /tmp/test", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    #[test]
+    fn per_sender_tracker_isolates_counts() {
+        let t = PerSenderTracker::new();
+        // sender A hits limit=2 on 3rd call
+        assert!(t.record_within("chat_a", 2)); // count=1 ≤ 2 → ok
+        assert!(t.record_within("chat_a", 2)); // count=2 ≤ 2 → ok
+        assert!(!t.record_within("chat_a", 2)); // count=3 > 2 → blocked
+        // sender B is unaffected — its bucket is empty
+        assert!(t.record_within("chat_b", 2)); // count=1 ≤ 2 → ok
+        assert!(t.record_within("chat_b", 2)); // count=2 ≤ 2 → ok
+        assert!(!t.record_within("chat_b", 2)); // count=3 > 2 → blocked
+    }
+
+    #[test]
+    fn per_sender_tracker_global_key_fallback() {
+        let t = PerSenderTracker::new();
+        assert!(!t.is_exhausted(PerSenderTracker::GLOBAL_KEY, 1));
+        t.record_within(PerSenderTracker::GLOBAL_KEY, u32::MAX);
+        // after 1 action, count=1 ≥ 1 → exhausted at max=1
+        assert!(t.is_exhausted(PerSenderTracker::GLOBAL_KEY, 1));
+    }
+
+    #[test]
+    fn per_sender_tracker_is_exhausted_reads_without_spurious_insert() {
+        let t = PerSenderTracker::new();
+        // Key "ghost" has never been recorded — should not be exhausted at max=1
+        assert!(!t.is_exhausted("ghost", 1));
     }
 }

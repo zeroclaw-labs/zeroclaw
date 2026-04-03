@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that `[plugin.capabilities]` is parsed from plugin.toml.
 //!
 //! Acceptance criterion for US-ZCL-22:

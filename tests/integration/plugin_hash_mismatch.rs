@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that a tampered WASM binary produces a clear HashMismatch error
 //! and the plugin is effectively rejected (acceptance criterion for US-ZCL-16).
 

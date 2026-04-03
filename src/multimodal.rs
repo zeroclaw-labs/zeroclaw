@@ -1,6 +1,6 @@
-use crate::config::{build_runtime_proxy_client_with_timeouts, MultimodalConfig};
+use crate::config::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 use crate::providers::ChatMessage;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use std::path::Path;
 
@@ -24,7 +24,9 @@ pub enum MultimodalError {
     #[error("multimodal image limit exceeded: max_images={max_images}, found={found}")]
     TooManyImages { max_images: usize, found: usize },
 
-    #[error("multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes")]
+    #[error(
+        "multimodal image size limit exceeded for '{input}': {size_bytes} bytes > {max_bytes} bytes"
+    )]
     ImageTooLarge {
         input: String,
         size_bytes: usize,
@@ -119,26 +121,29 @@ pub async fn prepare_messages_for_provider(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let found_images = count_image_markers(messages);
-    if found_images > max_images {
-        return Err(MultimodalError::TooManyImages {
-            max_images,
-            found: found_images,
-        }
-        .into());
-    }
+    let total_images = count_image_markers(messages);
 
-    if found_images == 0 {
+    if total_images == 0 {
         return Ok(PreparedMessages {
             messages: messages.to_vec(),
             contains_images: false,
         });
     }
 
+    // When image count exceeds the limit, strip markers from oldest messages
+    // first so that the most recent (most relevant) images survive. This
+    // prevents conversations from becoming permanently stuck once the
+    // cumulative image count crosses the threshold.
+    let trimmed = if total_images > max_images {
+        trim_old_images(messages, max_images)
+    } else {
+        messages.to_vec()
+    };
+
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
 
-    let mut normalized_messages = Vec::with_capacity(messages.len());
-    for message in messages {
+    let mut normalized_messages = Vec::with_capacity(trimmed.len());
+    for message in &trimmed {
         if message.role != "user" {
             normalized_messages.push(message.clone());
             continue;
@@ -168,6 +173,56 @@ pub async fn prepare_messages_for_provider(
         messages: normalized_messages,
         contains_images: true,
     })
+}
+
+/// Strip image markers from older messages (oldest first) until total image
+/// count is within `max_images`. Keeps the text content of each message.
+fn trim_old_images(messages: &[ChatMessage], max_images: usize) -> Vec<ChatMessage> {
+    // Find which messages (by index) contain images, oldest first.
+    let image_positions: Vec<(usize, usize)> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == "user")
+        .filter_map(|(i, m)| {
+            let count = parse_image_markers(&m.content).1.len();
+            if count > 0 { Some((i, count)) } else { None }
+        })
+        .collect();
+
+    // Determine how many images to drop (from the oldest messages).
+    let total: usize = image_positions.iter().map(|(_, c)| c).sum();
+    let mut to_drop = total.saturating_sub(max_images);
+
+    // Collect indices of messages whose images should be stripped.
+    let mut strip_indices = std::collections::HashSet::new();
+    for &(idx, count) in &image_positions {
+        if to_drop == 0 {
+            break;
+        }
+        strip_indices.insert(idx);
+        to_drop = to_drop.saturating_sub(count);
+    }
+
+    messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if strip_indices.contains(&i) {
+                let (cleaned, _) = parse_image_markers(&m.content);
+                let text = if cleaned.trim().is_empty() {
+                    "[image removed from history]".to_string()
+                } else {
+                    cleaned
+                };
+                ChatMessage {
+                    role: m.role.clone(),
+                    content: text,
+                }
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
 }
 
 fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
@@ -401,11 +456,7 @@ fn detect_mime(
 
 fn normalize_content_type(content_type: &str) -> Option<String> {
     let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
-    if mime.is_empty() {
-        None
-    } else {
-        Some(mime)
-    }
+    if mime.is_empty() { None } else { Some(mime) }
 }
 
 fn mime_from_extension(ext: &str) -> Option<&'static str> {
@@ -498,25 +549,228 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_messages_rejects_too_many_images() {
-        let messages = vec![ChatMessage::user(
-            "[IMAGE:/tmp/1.png]\n[IMAGE:/tmp/2.png]".to_string(),
-        )];
+    async fn prepare_messages_trims_excess_images_from_older_messages() {
+        // 3 messages, each with 1 image — max is 2.
+        // The oldest message's image should be stripped.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/old.png]\nOld caption".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/mid.png]\nMid caption".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/new.png]\nNew caption".to_string()),
+        ];
+
+        // Should not error — instead trims oldest.
+        // (Will error on normalize_image_reference for the surviving images
+        //  since /tmp/mid.png and /tmp/new.png don't exist, but the trimming
+        //  itself should succeed.)
+        let trimmed = trim_old_images(&messages, 2);
+        assert_eq!(trimmed.len(), 3);
+
+        // Oldest message should have image stripped
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert!(refs0.is_empty(), "oldest image should be stripped");
+        assert!(trimmed[0].content.contains("Old caption"));
+
+        // Newer messages keep their images
+        let (_, refs1) = parse_image_markers(&trimmed[1].content);
+        assert_eq!(refs1.len(), 1);
+        let (_, refs2) = parse_image_markers(&trimmed[2].content);
+        assert_eq!(refs2.len(), 1);
+    }
+
+    #[test]
+    fn trim_old_images_replaces_image_only_message() {
+        // A message with only an image and no text should get a placeholder.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/old.png]".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/new.png]\nKeep this".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 1);
+        assert_eq!(trimmed[0].content, "[image removed from history]");
+        assert!(trimmed[1].content.contains("[IMAGE:/tmp/new.png]"));
+    }
+
+    #[test]
+    fn trim_old_images_multi_image_message_stripped_as_unit() {
+        // A single message has 3 images. We need to drop 2 to reach max=1.
+        // But trimming works at message granularity — the entire message gets
+        // stripped (all 3 images removed), which over-trims to 0. The newest
+        // message (text-only) is untouched.
+        let messages = vec![
+            ChatMessage::user(
+                "[IMAGE:/tmp/a.png]\n[IMAGE:/tmp/b.png]\n[IMAGE:/tmp/c.png]\nThree pics"
+                    .to_string(),
+            ),
+            ChatMessage::user("Just text, no images".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 1);
+        assert_eq!(trimmed.len(), 2);
+        // All images in the first message are gone, but text remains
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert!(refs0.is_empty());
+        assert!(trimmed[0].content.contains("Three pics"));
+        // Second message unchanged
+        assert_eq!(trimmed[1].content, "Just text, no images");
+    }
+
+    #[test]
+    fn trim_old_images_skips_assistant_messages() {
+        // Assistant messages with image markers should not be counted or stripped.
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "[IMAGE:/tmp/assistant.png]\nAssistant generated".to_string(),
+            },
+            ChatMessage::user("[IMAGE:/tmp/user1.png]\nFirst".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/user2.png]\nSecond".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 1);
+        // Assistant message untouched (not counted toward limit)
+        assert!(trimmed[0].content.contains("[IMAGE:/tmp/assistant.png]"));
+        // Oldest user image stripped
+        let (_, refs1) = parse_image_markers(&trimmed[1].content);
+        assert!(refs1.is_empty());
+        assert!(trimmed[1].content.contains("First"));
+        // Newest user image kept
+        let (_, refs2) = parse_image_markers(&trimmed[2].content);
+        assert_eq!(refs2.len(), 1);
+    }
+
+    #[test]
+    fn trim_old_images_no_trimming_when_under_limit() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png]\nCaption A".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/b.png]\nCaption B".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 5);
+        // Nothing should change — both images are under the limit
+        assert_eq!(trimmed[0].content, messages[0].content);
+        assert_eq!(trimmed[1].content, messages[1].content);
+    }
+
+    #[test]
+    fn trim_old_images_no_trimming_when_exactly_at_limit() {
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/a.png]\nA".to_string()),
+            ChatMessage::user("[IMAGE:/tmp/b.png]\nB".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 2);
+        assert_eq!(trimmed[0].content, messages[0].content);
+        assert_eq!(trimmed[1].content, messages[1].content);
+    }
+
+    #[test]
+    fn trim_old_images_empty_messages() {
+        let trimmed = trim_old_images(&[], 4);
+        assert!(trimmed.is_empty());
+    }
+
+    #[test]
+    fn trim_old_images_interleaved_roles() {
+        // Realistic conversation: user sends image, assistant replies, user sends
+        // another image, etc. Only user messages should be candidates for trimming.
+        let messages = vec![
+            ChatMessage::user("[IMAGE:/tmp/1.png]\nLook at this".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "I see a photo.".to_string(),
+            },
+            ChatMessage::user("[IMAGE:/tmp/2.png]\nWhat about this?".to_string()),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: "That's a chart.".to_string(),
+            },
+            ChatMessage::user("[IMAGE:/tmp/3.png]\nAnd this one".to_string()),
+        ];
+
+        let trimmed = trim_old_images(&messages, 2);
+        assert_eq!(trimmed.len(), 5);
+        // Oldest user image stripped
+        let (_, refs0) = parse_image_markers(&trimmed[0].content);
+        assert!(refs0.is_empty());
+        assert!(trimmed[0].content.contains("Look at this"));
+        // Assistant messages untouched
+        assert_eq!(trimmed[1].content, "I see a photo.");
+        assert_eq!(trimmed[3].content, "That's a chart.");
+        // Two newest user images kept
+        let (_, refs2) = parse_image_markers(&trimmed[2].content);
+        assert_eq!(refs2.len(), 1);
+        let (_, refs4) = parse_image_markers(&trimmed[4].content);
+        assert_eq!(refs4.len(), 1);
+    }
+
+    #[test]
+    fn trim_old_images_strips_multiple_oldest_messages() {
+        // 5 user images, max 1 — should strip the first 4 messages' images.
+        let messages: Vec<ChatMessage> = (1..=5)
+            .map(|i| ChatMessage::user(format!("[IMAGE:/tmp/{i}.png]\nCaption {i}")))
+            .collect();
+
+        let trimmed = trim_old_images(&messages, 1);
+        assert_eq!(trimmed.len(), 5);
+        for (i, msg) in trimmed.iter().enumerate().take(4) {
+            let (_, refs) = parse_image_markers(&msg.content);
+            assert!(refs.is_empty(), "message {i} should have images stripped");
+            assert!(msg.content.contains(&format!("Caption {}", i + 1)));
+        }
+        // Only the last message keeps its image
+        let (_, refs_last) = parse_image_markers(&trimmed[4].content);
+        assert_eq!(refs_last.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_trims_then_normalizes_surviving_images() {
+        // End-to-end: 3 images, max 2. After trimming the oldest, the two
+        // surviving images should be normalized (base64-encoded) successfully.
+        let temp = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for name in ["old.png", "mid.png", "new.png"] {
+            let p = temp.path().join(name);
+            // Minimal valid PNG (1x1 white pixel)
+            let png_data = [
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+                0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90,
+                0x77, 0x53, 0xDE, // 1x1 RGB
+                0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, // IDAT chunk
+                0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE2, 0x21,
+                0xBC, 0x33, // IDAT data + CRC
+                0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND chunk
+                0xAE, 0x42, 0x60, 0x82,
+            ];
+            std::fs::write(&p, png_data).unwrap();
+            paths.push(p);
+        }
+
+        let messages = vec![
+            ChatMessage::user(format!("[IMAGE:{}]\nOld", paths[0].display())),
+            ChatMessage::user(format!("[IMAGE:{}]\nMid", paths[1].display())),
+            ChatMessage::user(format!("[IMAGE:{}]\nNew", paths[2].display())),
+        ];
 
         let config = MultimodalConfig {
-            max_images: 1,
+            max_images: 2,
             max_image_size_mb: 5,
             allow_remote_fetch: false,
             ..Default::default()
         };
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let result = prepare_messages_for_provider(&messages, &config)
             .await
-            .expect_err("should reject image count overflow");
+            .expect("should succeed after trimming");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal image limit exceeded"));
+        assert!(result.contains_images);
+        assert_eq!(result.messages.len(), 3);
+        // First message should have image stripped, text preserved
+        assert!(!result.messages[0].content.contains("data:image"));
+        assert!(result.messages[0].content.contains("Old"));
+        // Second and third should have base64-encoded images
+        assert!(result.messages[1].content.contains("data:image"));
+        assert!(result.messages[2].content.contains("data:image"));
     }
 
     #[tokio::test]
@@ -529,9 +783,11 @@ mod tests {
             .await
             .expect_err("should reject remote image URL when fetch is disabled");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal remote image fetch is disabled"));
+        assert!(
+            error
+                .to_string()
+                .contains("multimodal remote image fetch is disabled")
+        );
     }
 
     #[tokio::test]
@@ -557,9 +813,11 @@ mod tests {
             .await
             .expect_err("should reject oversized local image");
 
-        assert!(error
-            .to_string()
-            .contains("multimodal image size limit exceeded"));
+        assert!(
+            error
+                .to_string()
+                .contains("multimodal image size limit exceeded")
+        );
     }
 
     #[test]

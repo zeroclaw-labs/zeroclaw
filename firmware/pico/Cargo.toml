@@ -1,0 +1,36 @@
+# ZeroClaw Pico firmware — JSON-over-serial peripheral.
+#
+# Listens for newline-delimited JSON on UART0 (GP0=TX, GP1=RX).
+# Protocol: same as Nucleo/Arduino/ESP32 — ping, capabilities, gpio_read, gpio_write.
+#
+# Build: cargo build --release
+# Flash: probe-rs run --chip RP2040 target/thumbv6m-none-eabi/release/pico
+# Or copy UF2: elf2uf2-rs target/thumbv6m-none-eabi/release/pico pico.uf2
+
+[workspace]
+
+[package]
+name = "pico"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "ZeroClaw Pico peripheral firmware — GPIO over JSON serial"
+
+[dependencies]
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "defmt"] }
+embassy-rp = { version = "0.4", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl"] }
+embassy-time = { version = "0.4", features = ["defmt", "defmt-timestamp-uptime"] }
+cortex-m = { version = "0.7", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt = "0.3"
+defmt-rtt = "0.4"
+panic-probe = { version = "0.3", features = ["print-defmt"] }
+heapless = { version = "0.9", default-features = false }
+zeroclaw-fw-protocol = { path = "../zeroclaw-fw-protocol" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = 2

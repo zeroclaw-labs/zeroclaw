@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that HostFunctionRegistry accepts references to ZeroClaw subsystems.
 //!
 //! Acceptance criterion for US-ZCL-22:

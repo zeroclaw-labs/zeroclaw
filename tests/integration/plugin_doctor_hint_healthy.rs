@@ -48,9 +48,9 @@ fn doctor_hint_absent_when_all_plugins_healthy() {
 
     // Confirm the hint is inside the if-block, not at top level
     let hint_pos = run_body.find(hint_text).unwrap();
-    let guard_pos = run_body.find("if has_plugin_issues").expect(
-        "hint must be guarded by `if has_plugin_issues`"
-    );
+    let guard_pos = run_body
+        .find("if has_plugin_issues")
+        .expect("hint must be guarded by `if has_plugin_issues`");
     assert!(
         guard_pos < hint_pos,
         "the `if has_plugin_issues` guard must appear before the hint text, \

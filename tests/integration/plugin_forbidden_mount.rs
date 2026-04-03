@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Security test: mounting /etc/passwd is rejected at load time.
 //!
 //! Verifies that `validate_allowed_paths` rejects a plugin manifest that
@@ -7,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use zeroclaw::plugins::loader::{validate_allowed_paths, FORBIDDEN_PATHS};
+use zeroclaw::plugins::loader::{FORBIDDEN_PATHS, validate_allowed_paths};
 
 /// Build the forbidden list the same way the real loader does.
 fn forbidden_list() -> Vec<String> {

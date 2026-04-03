@@ -4,7 +4,7 @@
 //! This makes the trail tamper-evident — modifying any entry invalidates all subsequent hashes.
 
 use crate::config::AuditConfig;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -939,15 +939,18 @@ mod tests {
         let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
         defer! {
             if let Some(key) = old_key {
-                std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
             } else {
-                std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
             }
         }
 
         let tmp = TempDir::new()?;
         let test_key = "a".repeat(64); // 64 hex chars = 32 bytes
-        std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
 
         let config = AuditConfig {
             enabled: true,
@@ -1004,15 +1007,18 @@ mod tests {
         let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
         defer! {
             if let Some(key) = old_key {
-                std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
             } else {
-                std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
             }
         }
 
         let tmp = TempDir::new()?;
         let test_key = "b".repeat(64);
-        std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
 
         let config = AuditConfig {
             enabled: true,
@@ -1048,13 +1054,16 @@ mod tests {
         defer! {
             // Only restore if it was a valid 64-char key
             if let Some(key) = old_key.as_ref().filter(|k| k.len() == 64) {
-                std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
             } else {
-                std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
             }
         }
 
-        std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
 
         let tmp = TempDir::new()?;
         let config = AuditConfig {
@@ -1084,13 +1093,16 @@ mod tests {
         defer! {
             // Only restore if it was a valid 64-char key
             if let Some(key) = old_key.as_ref().filter(|k| k.len() == 64) {
-                std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
             } else {
-                std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
             }
         }
 
-        std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", "not-valid-hex");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", "not-valid-hex") };
 
         let tmp = TempDir::new()?;
         let config = AuditConfig {
@@ -1120,15 +1132,18 @@ mod tests {
         defer! {
             // Only restore if it was a valid 64-char key
             if let Some(key) = old_key.as_ref().filter(|k| k.len() == 64) {
-                std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
             } else {
-                std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
             }
         }
 
         // 30 bytes = 60 hex chars (not 32 bytes)
         let short_key = "c".repeat(60);
-        std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &short_key);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &short_key) };
         let tmp = TempDir::new()?;
         let config = AuditConfig {
             enabled: true,
@@ -1152,9 +1167,11 @@ mod tests {
         let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
         defer! {
             if let Some(key) = old_key {
-                std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
             } else {
-                std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
             }
         }
 
@@ -1196,15 +1213,18 @@ mod tests {
         let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
         defer! {
             if let Some(key) = old_key {
-                std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
             } else {
-                std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
             }
         }
 
         let tmp = TempDir::new()?;
         let test_key = "f".repeat(64);
-        std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
 
         let config = AuditConfig {
             enabled: true,
@@ -1252,9 +1272,11 @@ mod tests {
         let old_key = std::env::var("ZEROCLAW_AUDIT_SIGNING_KEY").ok();
         defer! {
             if let Some(key) = old_key.as_ref().filter(|k| k.len() == 64) {
-                std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", key) };
             } else {
-                std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
             }
         }
 
@@ -1264,7 +1286,8 @@ mod tests {
 
         // First logger with sign_events=false (unsigned records)
         {
-            std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY");
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("ZEROCLAW_AUDIT_SIGNING_KEY") };
             let config = AuditConfig {
                 enabled: true,
                 sign_events: false,
@@ -1284,7 +1307,8 @@ mod tests {
 
         // Second logger with sign_events=true (signed records)
         {
-            std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
             let config = AuditConfig {
                 enabled: true,
                 sign_events: true,
@@ -1304,7 +1328,8 @@ mod tests {
 
         // Verify the full chain (4 records: 2 unsigned + 2 signed)
         // Set the key in env so verify_chain can check signatures
-        std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key);
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_AUDIT_SIGNING_KEY", &test_key) };
         let count = verify_chain(&log_path)?;
         assert_eq!(count, 4, "should verify all 4 records");
 

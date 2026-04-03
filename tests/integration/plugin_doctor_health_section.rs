@@ -100,8 +100,7 @@ fn check_plugin_health_uses_plugins_category() {
     let fn_body = &fn_body[..body_end];
 
     assert!(
-        fn_body.contains(r#"let cat = "plugins""#)
-            || fn_body.contains(r#""plugins""#),
+        fn_body.contains(r#"let cat = "plugins""#) || fn_body.contains(r#""plugins""#),
         "check_plugin_health must use \"plugins\" as the category, \
          which maps to \"Plugin Health\" in the rendered output"
     );

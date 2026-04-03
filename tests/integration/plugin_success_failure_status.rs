@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: success and failure status is recorded in audit entries.
 //!
 //! Verifies acceptance criterion for US-ZCL-14:

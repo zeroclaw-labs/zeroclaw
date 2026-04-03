@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: Displays filesystem access (allowed paths) with check/cross marks.
 //!
 //! Verifies the acceptance criterion for story US-ZCL-12:
@@ -7,7 +9,7 @@
 //! "Filesystem access:" heading with a ✓ prefix and an arrow mapping, and that an
 //! empty path list renders "(none)" instead.
 
-use zeroclaw::plugins::{format_audit_summary, PluginManifest};
+use zeroclaw::plugins::{PluginManifest, format_audit_summary};
 
 /// When a manifest declares allowed paths, the audit output should list each path
 /// with a ✓ check mark under the "Filesystem access:" heading.

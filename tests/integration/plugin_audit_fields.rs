@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: audit entry includes plugin name, version, tool name, and duration.
 //!
 //! Verifies acceptance criterion for US-ZCL-14:

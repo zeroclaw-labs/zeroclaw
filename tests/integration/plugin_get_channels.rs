@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test for zeroclaw_get_channels host function.
 //!
 //! Task US-ZCL-25-2: Verify acceptance criterion for story US-ZCL-25:

@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test for zeroclaw_tool_call host function routing.
 //!
 //! Task US-ZCL-24-1: Verify acceptance criterion for story US-ZCL-24:
@@ -13,7 +15,7 @@
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use zeroclaw::config::AuditConfig;
 use zeroclaw::memory::none::NoneMemory;

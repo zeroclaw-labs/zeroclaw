@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       release_tag:
-        description: "Stable release tag (e.g. v0.6.2)"
+        description: "Stable release tag (e.g. v0.6.7)"
         required: true
         type: string
       release_url:
@@ -17,7 +17,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Release tag (e.g. v0.6.2)"
+        description: "Release tag (e.g. v0.6.7)"
         required: true
         type: string
       release_url:

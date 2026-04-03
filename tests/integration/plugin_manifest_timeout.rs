@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: timeout_ms from plugin manifest is enforced on Extism calls.
 //!
 //! Verifies three things:
@@ -9,8 +11,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use zeroclaw::plugins::loader::build_extism_manifest;
 use zeroclaw::plugins::PluginManifest;
+use zeroclaw::plugins::loader::build_extism_manifest;
 
 fn project_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()

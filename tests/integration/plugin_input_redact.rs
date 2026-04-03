@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: input parameters are redacted for sensitive values.
 //!
 //! Verifies acceptance criterion for US-ZCL-14:

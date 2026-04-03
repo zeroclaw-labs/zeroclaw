@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: Security audit summary displays network and filesystem capabilities.
 //!
 //! Verifies the acceptance criterion for US-ZCL-21:
@@ -9,8 +11,8 @@
 
 use std::path::Path;
 
-use zeroclaw::plugins::host::PluginHost;
 use zeroclaw::plugins::PluginInfo;
+use zeroclaw::plugins::host::PluginHost;
 
 /// Set up a PluginHost pointed at the test plugins directory.
 fn setup_host() -> PluginHost {

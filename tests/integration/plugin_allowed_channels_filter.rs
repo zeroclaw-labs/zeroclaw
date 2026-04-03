@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test for allowed_channels enforcement on messaging.
 //!
 //! Task US-ZCL-25-3: Verify acceptance criterion for story US-ZCL-25:

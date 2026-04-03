@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that zeroclaw_memory_forget host function removes memory entries.
 //!
 //! Acceptance criterion for US-ZCL-23:

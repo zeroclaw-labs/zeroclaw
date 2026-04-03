@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: validate_security_policy enforces all four security levels
 //! through the PluginLoader entry point with mock Config and SecurityPolicy.
 //!
@@ -9,8 +11,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use zeroclaw::config::schema::{Config, PluginSecurityConfig};
-use zeroclaw::plugins::loader::PluginLoader;
 use zeroclaw::plugins::PluginManifest;
+use zeroclaw::plugins::loader::PluginLoader;
 use zeroclaw::security::SecurityPolicy;
 
 // ── Helpers ────────────────────────────────────────────────────────────

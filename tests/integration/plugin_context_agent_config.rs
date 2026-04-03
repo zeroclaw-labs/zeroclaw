@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Test: zeroclaw_get_agent_config returns agent personality/identity config.
 //!
 //! Task US-ZCL-26-3: verify that the `context_agent_config` host function is

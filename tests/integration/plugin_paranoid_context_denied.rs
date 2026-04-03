@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Test: Paranoid mode denies all context access.
 //!
 //! Task US-ZCL-26-5: verify that when the security level is `Paranoid`, no

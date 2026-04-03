@@ -104,7 +104,9 @@ fn diagnose_plugins_returns_structured_json() {
 
     // The inner implementation must produce structured JSON with required fields
     assert!(
-        source.contains(r#""loaded""#) && source.contains(r#""failed""#) && source.contains(r#""disabled""#),
+        source.contains(r#""loaded""#)
+            && source.contains(r#""failed""#)
+            && source.contains(r#""disabled""#),
         "diagnose_plugins JSON must include loaded, failed, and disabled counts"
     );
     assert!(

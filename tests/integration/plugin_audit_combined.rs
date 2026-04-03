@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: audit log entries on plugin calls contain correct fields and redact sensitive input.
 //!
 //! Verifies task US-ZCL-14-8:

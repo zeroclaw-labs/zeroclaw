@@ -98,8 +98,10 @@ fn check_plugin_health_cli_summary_includes_all_counts() {
 
     // The CLI summary line must mention all four counts
     assert!(
-        fn_body.contains("total") && fn_body.contains("loaded")
-            && fn_body.contains("failed") && fn_body.contains("disabled"),
+        fn_body.contains("total")
+            && fn_body.contains("loaded")
+            && fn_body.contains("failed")
+            && fn_body.contains("disabled"),
         "check_plugin_health summary line must include total, loaded, failed, and disabled counts"
     );
 

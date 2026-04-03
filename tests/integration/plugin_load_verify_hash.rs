@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Verify that hash is checked on every plugin load via `load_plugin`
 //! (acceptance criterion #2 for US-ZCL-16).
 

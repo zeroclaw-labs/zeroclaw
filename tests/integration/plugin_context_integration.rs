@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration and security tests for context access host functions.
 //!
 //! Task US-ZCL-26-9: comprehensive integration tests verifying:

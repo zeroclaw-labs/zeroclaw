@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use zeroclaw::config::schema::DelegateAgentConfig;
 use zeroclaw::security::SecurityPolicy;
-use zeroclaw::tools::traits::Tool;
 use zeroclaw::tools::DelegateTool;
+use zeroclaw::tools::traits::Tool;
 
 fn test_security() -> Arc<SecurityPolicy> {
     Arc::new(SecurityPolicy::default())
@@ -40,6 +40,7 @@ fn agent_with_max_depth(max_depth: u32) -> HashMap<String, DelegateAgentConfig> 
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         },
     );
     agents

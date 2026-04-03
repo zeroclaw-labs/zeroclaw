@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: every plugin tool execution creates an audit log entry.
 //!
 //! Verifies acceptance criterion for US-ZCL-14:

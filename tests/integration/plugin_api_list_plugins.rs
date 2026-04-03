@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: GET /api/plugins response shape.
 //!
 //! Verifies the acceptance criterion for US-ZCL-18:

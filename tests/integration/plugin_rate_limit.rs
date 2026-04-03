@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: plugin tool calls count against max_actions_per_hour rate limit.
 //!
 //! Verifies the acceptance criterion for US-ZCL-17:

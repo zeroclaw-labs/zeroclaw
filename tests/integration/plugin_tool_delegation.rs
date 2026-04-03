@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test for tool delegation end-to-end flow.
 //!
 //! Task US-ZCL-24-9: Verify that a plugin can delegate to a built-in tool,
@@ -15,7 +17,7 @@
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use zeroclaw::config::AuditConfig;
 use zeroclaw::memory::none::NoneMemory;

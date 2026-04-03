@@ -20,10 +20,10 @@
 use super::AppState;
 use axum::{
     extract::{
-        ws::{Message, WebSocket},
         Query, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
-    http::{header, HeaderMap},
+    http::{HeaderMap, header},
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -302,58 +302,89 @@ async fn handle_socket(
         }
     }
 
-    while let Some(msg) = receiver.next().await {
-        let msg = match msg {
-            Ok(Message::Text(text)) => text,
-            Ok(Message::Close(_)) | Err(_) => break,
-            _ => continue,
-        };
+    // Subscribe to the shared broadcast channel so cron/heartbeat events
+    // are forwarded to this WebSocket client.
+    let mut broadcast_rx = state.event_tx.subscribe();
 
-        // Parse incoming message
-        let parsed: serde_json::Value = match serde_json::from_str(&msg) {
-            Ok(v) => v,
-            Err(e) => {
-                let err = serde_json::json!({
-                    "type": "error",
-                    "message": format!("Invalid JSON: {}", e),
-                    "code": "INVALID_JSON"
-                });
-                let _ = sender.send(Message::Text(err.to_string().into())).await;
-                continue;
+    loop {
+        tokio::select! {
+            // ── Client message ────────────────────────────────────────
+            client_msg = receiver.next() => {
+                let Some(msg) = client_msg else { break };
+                let msg = match msg {
+                    Ok(Message::Text(text)) => text,
+                    Ok(Message::Close(_)) | Err(_) => break,
+                    _ => continue,
+                };
+
+                // Parse incoming message
+                let parsed: serde_json::Value = match serde_json::from_str(&msg) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": format!("Invalid JSON: {}", e),
+                            "code": "INVALID_JSON"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                };
+
+                let msg_type = parsed["type"].as_str().unwrap_or("");
+                if msg_type != "message" {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": format!(
+                            "Unsupported message type \"{msg_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
+                        ),
+                        "code": "UNKNOWN_MESSAGE_TYPE"
+                    });
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
+
+                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                if content.is_empty() {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": "Message content cannot be empty",
+                        "code": "EMPTY_CONTENT"
+                    });
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
+
+                // Acquire session lock to serialize concurrent turns
+                let _session_guard = match state.session_queue.acquire(&session_key).await {
+                    Ok(guard) => guard,
+                    Err(e) => {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": e.to_string(),
+                            "code": "SESSION_BUSY"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        continue;
+                    }
+                };
+
+                // Persist user message
+                if let Some(ref backend) = state.session_backend {
+                    let user_msg = crate::providers::ChatMessage::user(&content);
+                    let _ = backend.append(&session_key, &user_msg);
+                }
+
+                process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
             }
-        };
 
-        let msg_type = parsed["type"].as_str().unwrap_or("");
-        if msg_type != "message" {
-            let err = serde_json::json!({
-                "type": "error",
-                "message": format!(
-                    "Unsupported message type \"{msg_type}\". Send {{\"type\":\"message\",\"content\":\"your text\"}}"
-                ),
-                "code": "UNKNOWN_MESSAGE_TYPE"
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            continue;
+            // ── Broadcast event (cron/heartbeat results) ──────────────
+            event = broadcast_rx.recv() => {
+                if let Ok(event) = event {
+                    let _ = sender.send(Message::Text(event.to_string().into())).await;
+                }
+            }
         }
-
-        let content = parsed["content"].as_str().unwrap_or("").to_string();
-        if content.is_empty() {
-            let err = serde_json::json!({
-                "type": "error",
-                "message": "Message content cannot be empty",
-                "code": "EMPTY_CONTENT"
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
-            continue;
-        }
-
-        // Persist user message
-        if let Some(ref backend) = state.session_backend {
-            let user_msg = crate::providers::ChatMessage::user(&content);
-            let _ = backend.append(&session_key, &user_msg);
-        }
-
-        process_chat_message(&state, &mut agent, &mut sender, &content, &session_key).await;
     }
 }
 
@@ -383,6 +414,12 @@ async fn process_chat_message(
         "provider": provider_label,
         "model": state.model,
     }));
+
+    // Set session state to running
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    if let Some(ref backend) = state.session_backend {
+        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
+    }
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -427,6 +464,29 @@ async fn process_chat_message(
                 let _ = backend.append(session_key, &assistant_msg);
             }
 
+            // Fire-and-forget memory consolidation so facts from WS sessions
+            // are extracted to long-term memory (Daily + Core categories).
+            if state.auto_save {
+                let mem = state.mem.clone();
+                let provider = state.provider.clone();
+                let model = state.model.clone();
+                let user_msg = content.to_string();
+                let assistant_resp = response.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::memory::consolidation::consolidate_turn(
+                        provider.as_ref(),
+                        &model,
+                        mem.as_ref(),
+                        &user_msg,
+                        &assistant_resp,
+                    )
+                    .await
+                    {
+                        tracing::debug!("WS memory consolidation skipped: {e}");
+                    }
+                });
+            }
+
             // Send chunk_reset so the client clears any accumulated draft
             // before the authoritative done message.
             let reset = serde_json::json!({ "type": "chunk_reset" });
@@ -438,6 +498,11 @@ async fn process_chat_message(
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
+            // Set session state to idle
+            if let Some(ref backend) = state.session_backend {
+                let _ = backend.set_session_state(session_key, "idle", None);
+            }
+
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
@@ -446,6 +511,11 @@ async fn process_chat_message(
             }));
         }
         Err(e) => {
+            // Set session state to error
+            if let Some(ref backend) = state.session_backend {
+                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
+            }
+
             tracing::error!(error = %e, "Agent turn failed");
             let sanitized = crate::providers::sanitize_api_error(&e.to_string());
             let error_code = if sanitized.to_lowercase().contains("api key")

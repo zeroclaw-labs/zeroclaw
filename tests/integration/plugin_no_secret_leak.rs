@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: sensitive values are never logged or included in diagnostics.
 //!
 //! Acceptance criterion for US-ZCL-7:

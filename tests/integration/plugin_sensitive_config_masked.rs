@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: Sensitive config keys show as masked with no edit capability.
 //!
 //! Verifies the acceptance criterion for US-ZCL-21:
@@ -12,7 +14,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use zeroclaw::plugins::host::PluginHost;
-use zeroclaw::plugins::{is_sensitive_key, PluginInfo};
+use zeroclaw::plugins::{PluginInfo, is_sensitive_key};
 
 /// Set up a PluginHost pointed at the test plugins directory.
 fn setup_host() -> PluginHost {

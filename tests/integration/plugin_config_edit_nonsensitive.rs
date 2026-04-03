@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: Non-sensitive config values can be edited from the web UI.
 //!
 //! Verifies the acceptance criterion for US-ZCL-21:
@@ -10,8 +12,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use zeroclaw::plugins::host::PluginHost;
 use zeroclaw::plugins::PluginInfo;
+use zeroclaw::plugins::host::PluginHost;
 
 /// Set up a PluginHost pointed at the test plugins directory.
 fn setup_host() -> PluginHost {

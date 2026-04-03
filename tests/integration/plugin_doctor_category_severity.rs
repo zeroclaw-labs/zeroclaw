@@ -165,7 +165,8 @@ fn diagnose_plugins_api_passes_only_on_healthy_plugins() {
 
     // DiagStatus::Pass should not produce an entry (healthy plugins are not listed)
     assert!(
-        fn_body.contains("DiagStatus::Pass => {}") || fn_body.contains("DiagStatus::Pass => {}")
+        fn_body.contains("DiagStatus::Pass => {}")
+            || fn_body.contains("DiagStatus::Pass => {}")
             || fn_body.contains("Pass => {}"),
         "DiagStatus::Pass should produce no JSON entry — only failures and warnings are reported"
     );

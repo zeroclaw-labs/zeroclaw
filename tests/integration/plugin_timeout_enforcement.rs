@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: timeout enforcement with a short (100ms) timeout.
 //!
 //! Task US-ZCL-17-7: Create or use a test plugin with an intentional infinite
@@ -11,9 +13,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use zeroclaw::plugins::PluginManifest;
 use zeroclaw::plugins::loader::build_extism_manifest;
 use zeroclaw::plugins::wasm_tool::WasmTool;
-use zeroclaw::plugins::PluginManifest;
 use zeroclaw::tools::traits::Tool;
 
 fn project_root() -> std::path::PathBuf {

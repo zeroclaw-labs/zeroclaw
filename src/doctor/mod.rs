@@ -116,12 +116,14 @@ fn diagnose_plugins_inner(config: &Config) -> Option<serde_json::Value> {
 
     let host = match PluginHost::new(&config.workspace_dir) {
         Ok(h) => h,
-        Err(_) => return Some(serde_json::json!({
-            "loaded": 0,
-            "failed": 0,
-            "disabled": 0,
-            "entries": []
-        })),
+        Err(_) => {
+            return Some(serde_json::json!({
+                "loaded": 0,
+                "failed": 0,
+                "disabled": 0,
+                "entries": []
+            }));
+        }
     };
 
     let diagnostics = host.doctor();
@@ -207,15 +209,12 @@ pub fn run(config: &Config) -> Result<()> {
     }
 
     // Hint: cross-reference plugin doctor when plugin issues exist
-    let has_plugin_issues = results.iter().any(|i| {
-        i.category == "plugins"
-            && matches!(i.severity, Severity::Warn | Severity::Error)
-    });
+    let has_plugin_issues = results
+        .iter()
+        .any(|i| i.category == "plugins" && matches!(i.severity, Severity::Warn | Severity::Error));
     if has_plugin_issues {
         println!();
-        println!(
-            "  💡 Run `zeroclaw plugin doctor` for detailed per-plugin diagnostics."
-        );
+        println!("  💡 Run `zeroclaw plugin doctor` for detailed per-plugin diagnostics.");
     }
 
     let errors = results
@@ -1442,10 +1441,305 @@ mod tests {
         let second = workspace_probe_path(tmp.path());
 
         assert_ne!(first, second);
-        assert!(first
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_")));
+        assert!(
+            first
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".zeroclaw_doctor_probe_"))
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_health_shows_total_loaded_failed_disabled_counts() {
+        let dir = TempDir::new().unwrap();
+        let plugins_base = dir.path().join("plugins");
+
+        // Plugin A — valid manifest + WASM file (will load successfully)
+        let plugin_a = plugins_base.join("alpha");
+        std::fs::create_dir_all(&plugin_a).unwrap();
+        std::fs::write(
+            plugin_a.join("manifest.toml"),
+            r#"
+name = "alpha"
+version = "1.0.0"
+wasm_path = "alpha.wasm"
+capabilities = ["tool"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(plugin_a.join("alpha.wasm"), b"wasm-alpha").unwrap();
+
+        // Plugin B — valid manifest but missing WASM (will fail)
+        let plugin_b = plugins_base.join("beta");
+        std::fs::create_dir_all(&plugin_b).unwrap();
+        std::fs::write(
+            plugin_b.join("manifest.toml"),
+            r#"
+name = "beta"
+version = "0.1.0"
+wasm_path = "beta.wasm"
+capabilities = ["channel"]
+"#,
+        )
+        .unwrap();
+
+        // Plugin C — invalid manifest (will fail)
+        let plugin_c = plugins_base.join("gamma");
+        std::fs::create_dir_all(&plugin_c).unwrap();
+        std::fs::write(plugin_c.join("manifest.toml"), "not valid toml {{{").unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.path().to_path_buf();
+
+        let mut items = Vec::new();
+        check_plugin_health(&config, &mut items);
+
+        // Find the summary line with counts
+        let summary = items
+            .iter()
+            .find(|i| i.message.contains("total") && i.message.contains("loaded"))
+            .expect("should have a summary line with plugin counts");
+
+        assert!(
+            summary.message.contains("3 total"),
+            "expected 3 total plugins, got: {}",
+            summary.message
+        );
+        assert!(
+            summary.message.contains("failed"),
+            "summary should include failed count: {}",
+            summary.message
+        );
+        assert!(
+            summary.message.contains("disabled"),
+            "summary should include disabled count: {}",
+            summary.message
+        );
+        assert!(
+            summary.message.contains("loaded"),
+            "summary should include loaded count: {}",
+            summary.message
+        );
+        assert_eq!(summary.severity, Severity::Ok);
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_health_lists_failed_plugins_with_name_and_reason_at_error_severity() {
+        let dir = TempDir::new().unwrap();
+        let plugins_base = dir.path().join("plugins");
+
+        // Plugin with valid manifest but missing WASM file — will fail
+        let plugin_a = plugins_base.join("broken-plugin");
+        std::fs::create_dir_all(&plugin_a).unwrap();
+        std::fs::write(
+            plugin_a.join("manifest.toml"),
+            r#"
+name = "broken-plugin"
+version = "1.0.0"
+wasm_path = "missing.wasm"
+capabilities = ["tool"]
+"#,
+        )
+        .unwrap();
+
+        // Plugin with invalid manifest — will also fail
+        let plugin_b = plugins_base.join("bad-manifest");
+        std::fs::create_dir_all(&plugin_b).unwrap();
+        std::fs::write(plugin_b.join("manifest.toml"), "not valid toml {{{").unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.path().to_path_buf();
+
+        let mut items = Vec::new();
+        check_plugin_health(&config, &mut items);
+
+        // Collect all error-severity items in the plugins category
+        let error_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.severity == Severity::Error && i.category == "plugins")
+            .collect();
+
+        // There should be at least two error items (one per failed plugin)
+        assert!(
+            error_items.len() >= 2,
+            "expected at least 2 error items for failed plugins, got {}: {:?}",
+            error_items.len(),
+            error_items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+
+        // Each error item should contain the plugin name and a reason (non-empty after the colon)
+        for err in &error_items {
+            assert!(
+                err.message.contains(':'),
+                "error diagnostic should contain 'name: reason' format, got: {}",
+                err.message
+            );
+            let parts: Vec<&str> = err.message.splitn(2, ':').collect();
+            let name = parts[0].trim();
+            let reason = parts[1].trim();
+            assert!(
+                !name.is_empty(),
+                "plugin name should not be empty in error: {}",
+                err.message
+            );
+            assert!(
+                !reason.is_empty(),
+                "failure reason should not be empty in error: {}",
+                err.message
+            );
+        }
+
+        // Verify the specific plugin names appear in error messages
+        let all_error_text: String = error_items
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_error_text.contains("broken-plugin"),
+            "expected 'broken-plugin' in error diagnostics, got: {all_error_text}"
+        );
+        assert!(
+            all_error_text.contains("bad-manifest"),
+            "expected 'bad-manifest' in error diagnostics, got: {all_error_text}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_health_surfaces_warn_level_issues_as_warnings() {
+        let dir = TempDir::new().unwrap();
+        let plugins_base = dir.path().join("plugins");
+
+        // Plugin with a valid manifest and WASM file, but wildcard hosts → Warn
+        let plugin_a = plugins_base.join("wildcard-host-plugin");
+        std::fs::create_dir_all(&plugin_a).unwrap();
+        std::fs::write(
+            plugin_a.join("manifest.toml"),
+            r#"
+name = "wildcard-host-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+allowed_hosts = ["*.example.com"]
+"#,
+        )
+        .unwrap();
+        // Create a dummy WASM file so the wasm_file check passes
+        std::fs::write(plugin_a.join("plugin.wasm"), b"\0asm\x01\0\0\0").unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.path().to_path_buf();
+
+        let mut items = Vec::new();
+        check_plugin_health(&config, &mut items);
+
+        // Collect all warn-severity items in the plugins category
+        let warn_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.severity == Severity::Warn && i.category == "plugins")
+            .collect();
+
+        // There should be at least one warning item for the wildcard-host plugin
+        assert!(
+            !warn_items.is_empty(),
+            "expected at least 1 warn-level diagnostic for plugins, got none. All items: {:?}",
+            items
+                .iter()
+                .map(|i| (&i.severity, &i.message))
+                .collect::<Vec<_>>()
+        );
+
+        // The warning should reference the plugin name
+        let all_warn_text: String = warn_items
+            .iter()
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_warn_text.contains("wildcard-host-plugin"),
+            "expected 'wildcard-host-plugin' in warn diagnostics, got: {all_warn_text}"
+        );
+
+        // There should be no error-severity items (only warn)
+        let error_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.severity == Severity::Error && i.category == "plugins")
+            .collect();
+        assert!(
+            error_items.is_empty(),
+            "expected no error items, but got: {:?}",
+            error_items.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_health_zero_plugins_shows_ok_no_plugins_installed() {
+        let dir = TempDir::new().unwrap();
+        // Create an empty plugins directory — no plugins at all
+        let plugins_base = dir.path().join("plugins");
+        std::fs::create_dir_all(&plugins_base).unwrap();
+
+        let mut config = Config::default();
+        config.workspace_dir = dir.path().to_path_buf();
+
+        let mut items = Vec::new();
+        check_plugin_health(&config, &mut items);
+
+        // Should produce exactly one item: Ok severity, "No plugins installed"
+        let plugin_items: Vec<_> = items.iter().filter(|i| i.category == "plugins").collect();
+
+        assert_eq!(
+            plugin_items.len(),
+            1,
+            "expected exactly 1 plugin diagnostic item for zero plugins, got {}: {:?}",
+            plugin_items.len(),
+            plugin_items
+                .iter()
+                .map(|i| (&i.severity, &i.message))
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(plugin_items[0].severity, Severity::Ok);
+        assert!(
+            plugin_items[0].message.contains("No plugins installed"),
+            "expected 'No plugins installed' message, got: {}",
+            plugin_items[0].message
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "plugins-wasm")]
+    fn plugin_health_no_plugins_dir_shows_ok_no_plugins_installed() {
+        let dir = TempDir::new().unwrap();
+        // Don't create a plugins directory at all
+        let mut config = Config::default();
+        config.workspace_dir = dir.path().to_path_buf();
+
+        let mut items = Vec::new();
+        check_plugin_health(&config, &mut items);
+
+        // Should handle missing plugins dir gracefully
+        let plugin_items: Vec<_> = items.iter().filter(|i| i.category == "plugins").collect();
+
+        assert!(
+            !plugin_items.is_empty(),
+            "expected at least 1 plugin diagnostic item when plugins dir is missing"
+        );
+
+        // Should not produce any error-severity items — missing dir is not a failure
+        let errors: Vec<_> = plugin_items
+            .iter()
+            .filter(|i| i.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "missing plugins directory should not produce errors, got: {:?}",
+            errors.iter().map(|i| &i.message).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -1759,6 +2053,7 @@ allowed_hosts = ["*.example.com"]
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         config.agents.insert(
@@ -1776,6 +2071,7 @@ allowed_hosts = ["*.example.com"]
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Unit tests for capability parsing and host function registration.
 //!
 //! Task US-ZCL-22-9: verify that `HostFunctionRegistry::build_functions` returns

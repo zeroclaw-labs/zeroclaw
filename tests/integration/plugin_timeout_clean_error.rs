@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: plugin exceeding timeout is terminated cleanly with error response.
 //!
 //! Verifies the acceptance criterion for US-ZCL-17:
@@ -14,9 +16,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use zeroclaw::plugins::PluginManifest;
 use zeroclaw::plugins::loader::build_extism_manifest;
 use zeroclaw::plugins::wasm_tool::WasmTool;
-use zeroclaw::plugins::PluginManifest;
 use zeroclaw::tools::traits::Tool;
 
 fn project_root() -> std::path::PathBuf {

@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Integration test: sensitive config values are redacted in log output.
 //!
 //! Task US-ZCL-7-9: Ensure sensitive values are never logged.

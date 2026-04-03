@@ -1,3 +1,5 @@
+#![cfg(feature = "plugins-wasm")]
+
 //! Security test for messaging restrictions.
 //!
 //! Task US-ZCL-25-10: Consolidated security test covering three messaging
