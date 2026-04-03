@@ -1,4 +1,4 @@
-use crate::config::traits::ChannelConfig;
+use crate::config::traits::{ChannelConfig, HasPropKind, PropKind};
 use crate::providers::{is_glm_alias, is_zai_alias};
 use crate::security::{AutonomyLevel, DomainMatcher};
 use anyhow::{Context, Result};
@@ -10778,6 +10778,33 @@ impl Default for SopConfig {
         }
     }
 }
+
+// ── HasPropKind impls for config enums ──
+// Scalars (bool, String, integers, floats) are covered by impl_prop_kind! in traits.rs.
+// Config enums serialize as TOML strings and are classified as PropKind::Enum.
+macro_rules! impl_enum_prop_kind {
+    ($($ty:ty),+ $(,)?) => {
+        $(impl HasPropKind for $ty { const PROP_KIND: PropKind = PropKind::Enum; })+
+    };
+}
+impl_enum_prop_kind!(
+    SwarmStrategy,
+    HardwareTransport,
+    McpTransport,
+    ToolFilterGroupMode,
+    SkillsPromptInjectionMode,
+    FirecrawlMode,
+    ProxyScope,
+    SearchMode,
+    CronScheduleDecl,
+    StreamMode,
+    WhatsAppWebMode,
+    WhatsAppChatPolicy,
+    LarkReceiveMode,
+    OtpMethod,
+    SandboxBackend,
+    AutonomyLevel,
+);
 
 #[cfg(test)]
 mod tests {

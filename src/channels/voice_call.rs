@@ -30,6 +30,10 @@ pub enum VoiceProvider {
     Plivo,
 }
 
+impl crate::config::HasPropKind for VoiceProvider {
+    const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+}
+
 impl fmt::Display for VoiceProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

@@ -20,16 +20,35 @@ pub enum PropKind {
     Enum,
 }
 
-impl PropKind {
-    /// Display-friendly type name for CLI output.
-    pub fn display_name(self, raw_type: &str) -> &str {
-        match self {
-            Self::String => "String",
-            Self::Bool => "bool",
-            Self::Integer | Self::Float | Self::Enum => raw_type,
-        }
-    }
+/// Maps Rust types to PropKind at compile time.
+/// Scalars have explicit impls; the blanket impl catches everything
+/// else as `PropKind::Enum`.
+pub trait HasPropKind {
+    const PROP_KIND: PropKind;
 }
+
+macro_rules! impl_prop_kind {
+    ($kind:expr, $($ty:ty),+) => {
+        $(impl HasPropKind for $ty { const PROP_KIND: PropKind = $kind; })+
+    };
+}
+
+impl_prop_kind!(PropKind::Bool, bool);
+impl_prop_kind!(PropKind::String, String);
+impl_prop_kind!(PropKind::Float, f64, f32);
+impl_prop_kind!(
+    PropKind::Integer,
+    u8,
+    u16,
+    u32,
+    u64,
+    usize,
+    i8,
+    i16,
+    i32,
+    i64,
+    isize
+);
 
 /// Describes a single property field discovered via `#[derive(Configurable)]`.
 #[derive(Clone)]

@@ -4,6 +4,18 @@ use syn::{
     Data, DeriveInput, Fields, GenericArgument, Lit, Meta, PathArguments, parse_macro_input,
 };
 
+/// Check if a type is a known compound container (Vec, HashMap, etc.)
+/// that should be skipped from property enumeration.
+fn is_compound_type(ty: &syn::Type) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+    let Some(ident) = type_path.path.segments.last().map(|s| &s.ident) else {
+        return false;
+    };
+    ident == "Vec" || ident == "HashMap" || ident == "PathBuf"
+}
+
 /// Check if any `#[serde(...)]` attribute on the field contains `skip`.
 fn has_serde_skip(field: &syn::Field) -> bool {
     for attr in &field.attrs {
@@ -353,13 +365,12 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             continue;
         }
 
-        let type_str = field.ty.to_token_stream().to_string().replace(' ', "");
+        // Unwrap Option<T> → T for type inspection
+        let is_option = is_option_type(&field.ty);
+        let inner_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
 
-        // Skip compound types (Vec, HashMap, PathBuf) — not addressable as scalar props
-        if type_str.contains("Vec<")
-            || type_str.contains("HashMap<")
-            || type_str.contains("PathBuf")
-        {
+        // Skip compound types (Vec, HashMap, PathBuf)
+        if is_compound_type(inner_ty) {
             continue;
         }
 
@@ -373,33 +384,23 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
         let full_name_lit = &full_name;
         let serde_name_lit = &serde_name;
         let category_lit = &category;
+        let type_str = field.ty.to_token_stream().to_string().replace(' ', "");
         let type_hint_lit = &type_str;
 
-        // Classify the inner type (unwrapping Option) into PropKind
-        let inner_type_str = type_str
-            .strip_prefix("Option<")
-            .and_then(|s: &str| s.strip_suffix('>'))
-            .unwrap_or(&type_str);
-        let is_option = type_str.starts_with("Option<");
-
-        let (kind_token, enum_variants_expr) = match inner_type_str {
-            "bool" => (quote! { crate::config::PropKind::Bool }, quote! { None }),
-            "String" => (quote! { crate::config::PropKind::String }, quote! { None }),
-            "f64" => (quote! { crate::config::PropKind::Float }, quote! { None }),
-            "u8" | "u16" | "u32" | "u64" | "usize" | "i8" | "i16" | "i32" | "i64" | "isize" => {
-                (quote! { crate::config::PropKind::Integer }, quote! { None })
-            }
-            _ => {
-                let inner_ty = extract_option_inner(&field.ty).unwrap_or(&field.ty);
-                let variants = quote! {
-                    Some(|| {
-                        crate::config::enum_variants::<#inner_ty>()
-                            .split(", ")
-                            .map(|s| s.to_string())
-                            .collect()
-                    })
-                };
-                (quote! { crate::config::PropKind::Enum }, variants)
+        // PropKind resolved at compile time via HasPropKind trait.
+        // All field types must implement HasPropKind — scalars in traits.rs,
+        // config enums in schema.rs via impl_enum_prop_kind!.
+        let kind_token = quote! { <#inner_ty as crate::config::HasPropKind>::PROP_KIND };
+        let enum_variants_expr = quote! {
+            if <#inner_ty as crate::config::HasPropKind>::PROP_KIND == crate::config::PropKind::Enum {
+                Some(|| {
+                    crate::config::enum_variants::<#inner_ty>()
+                        .split(", ")
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+            } else {
+                None
             }
         };
 

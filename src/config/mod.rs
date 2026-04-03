@@ -36,6 +36,7 @@ pub use schema::{
     set_runtime_proxy_config, ws_connect_with_proxy,
 };
 
+pub use traits::HasPropKind;
 pub use traits::PropFieldInfo;
 pub use traits::PropKind;
 pub use traits::SecretFieldInfo;

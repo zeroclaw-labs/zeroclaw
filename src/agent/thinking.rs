@@ -37,6 +37,10 @@ pub enum ThinkingLevel {
     Max,
 }
 
+impl crate::config::HasPropKind for ThinkingLevel {
+    const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+}
+
 impl ThinkingLevel {
     /// Parse a thinking level from a string (case-insensitive).
     pub fn from_str_insensitive(s: &str) -> Option<Self> {
