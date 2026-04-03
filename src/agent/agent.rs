@@ -729,7 +729,12 @@ impl Agent {
         self.model_name.clone()
     }
 
-    pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+    /// Execute a single agent turn.
+    ///
+    /// If `model` is provided, it overrides the model that would otherwise be
+    /// determined by [`classify_model`](Self::classify_model) — allowing
+    /// per-request model selection (e.g. when a user switches models in the UI).
+    pub async fn turn(&mut self, user_message: &str, model: Option<&str>) -> Result<String> {
         if self.history.is_empty() {
             let system_prompt = self.build_system_prompt()?;
             self.history
@@ -776,7 +781,7 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let effective_model = model.map(String::from).unwrap_or_else(|| self.classify_model(user_message));
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -904,10 +909,15 @@ impl Agent {
     ///
     /// The returned `String` is the final, complete assistant response — the
     /// same value that `turn` would return.
+    ///
+    /// If `model` is provided, it overrides the model that would otherwise be
+    /// determined by [`classify_model`](Self::classify_model) — allowing
+    /// per-request model selection (e.g. when a user switches models in the UI).
     pub async fn turn_streamed(
         &mut self,
         user_message: &str,
         event_tx: tokio::sync::mpsc::Sender<TurnEvent>,
+        model: Option<&str>,
     ) -> Result<String> {
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
@@ -950,7 +960,7 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let effective_model = model.map(String::from).unwrap_or_else(|| self.classify_model(user_message));
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
@@ -1192,7 +1202,7 @@ impl Agent {
     }
 
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
-        self.turn(message).await
+        self.turn(message, None).await
     }
 
     pub async fn run_interactive(&mut self) -> Result<()> {
@@ -1207,7 +1217,7 @@ impl Agent {
         });
 
         while let Some(msg) = rx.recv().await {
-            let response = match self.turn(&msg.content).await {
+            let response = match self.turn(&msg.content, None).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     eprintln!("\nError: {e}\n");
@@ -1411,7 +1421,7 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let response = agent.turn("hi").await.unwrap();
+        let response = agent.turn("hi", None).await.unwrap();
         assert_eq!(response, "hello");
     }
 
@@ -1458,7 +1468,7 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let response = agent.turn("hi").await.unwrap();
+        let response = agent.turn("hi", None).await.unwrap();
         assert_eq!(response, "done");
         assert!(
             agent
@@ -1516,7 +1526,7 @@ mod tests {
             .build()
             .expect("agent builder should succeed with valid config");
 
-        let response = agent.turn("quick summary please").await.unwrap();
+        let response = agent.turn("quick summary please", None).await.unwrap();
         assert_eq!(response, "classified");
         let seen = seen_models.lock();
         assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
@@ -1589,7 +1599,7 @@ mod tests {
         let mut agent = Agent::from_config(&config)
             .await
             .expect("agent from config");
-        let response = agent.turn("hello").await.expect("agent turn");
+        let response = agent.turn("hello", None).await.expect("agent turn");
 
         assert_eq!(response, "hello from mock");
 
@@ -1847,7 +1857,7 @@ mod tests {
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
         let response = agent
-            .turn_streamed("use the echo tool", event_tx)
+            .turn_streamed("use the echo tool", event_tx, None)
             .await
             .unwrap();
         assert_eq!(response, "stream-done");

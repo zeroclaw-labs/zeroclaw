@@ -334,7 +334,7 @@ impl AcpServer {
         // the whole Session and returns it alongside the result so we can
         // put the session back into the map afterwards.
         let turn_handle = tokio::spawn(async move {
-            let result = session.agent.turn_streamed(&prompt, event_tx).await;
+            let result = session.agent.turn_streamed(&prompt, event_tx, None).await;
             (session, result)
         });
 

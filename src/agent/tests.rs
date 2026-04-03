@@ -370,7 +370,7 @@ async fn turn_returns_text_when_no_tools_called() {
         Box::new(NativeToolDispatcher),
     );
 
-    let response = agent.turn("hi").await.unwrap();
+    let response = agent.turn("hi", None).await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty text response from provider"
@@ -398,7 +398,7 @@ async fn turn_executes_single_tool_then_returns() {
         Box::new(NativeToolDispatcher),
     );
 
-    let response = agent.turn("run echo").await.unwrap();
+    let response = agent.turn("run echo", None).await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty response after tool execution"
@@ -438,7 +438,7 @@ async fn turn_handles_multi_step_tool_chain() {
         Box::new(NativeToolDispatcher),
     );
 
-    let response = agent.turn("count 3 times").await.unwrap();
+    let response = agent.turn("count 3 times", None).await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty response after multi-step chain"
@@ -472,7 +472,7 @@ async fn turn_bails_out_at_max_iterations() {
 
     let mut agent = build_agent_with_config(provider, vec![Box::new(EchoTool)], config);
 
-    let result = agent.turn("infinite loop").await;
+    let result = agent.turn("infinite loop", None).await;
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
@@ -502,7 +502,7 @@ async fn turn_handles_unknown_tool_gracefully() {
         Box::new(NativeToolDispatcher),
     );
 
-    let response = agent.turn("use nonexistent").await.unwrap();
+    let response = agent.turn("use nonexistent", None).await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty response after unknown tool recovery"
@@ -542,7 +542,7 @@ async fn turn_recovers_from_tool_failure() {
         Box::new(NativeToolDispatcher),
     );
 
-    let response = agent.turn("try failing tool").await.unwrap();
+    let response = agent.turn("try failing tool", None).await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty response after tool failure recovery"
@@ -566,7 +566,7 @@ async fn turn_recovers_from_tool_error() {
         Box::new(NativeToolDispatcher),
     );
 
-    let response = agent.turn("try panicking").await.unwrap();
+    let response = agent.turn("try panicking", None).await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty response after tool error recovery"
@@ -585,7 +585,7 @@ async fn turn_propagates_provider_error() {
         Box::new(NativeToolDispatcher),
     );
 
-    let result = agent.turn("hello").await;
+    let result = agent.turn("hello", None).await;
     assert!(result.is_err(), "Expected provider error to propagate");
 }
 
@@ -610,7 +610,7 @@ async fn history_trims_after_max_messages() {
     let mut agent = build_agent_with_config(provider, vec![], config);
 
     for i in 0..max_history + 5 {
-        let _ = agent.turn(&format!("msg {i}")).await.unwrap();
+        let _ = agent.turn(&format!("msg {i}"), None).await.unwrap();
     }
 
     // System prompt (1) + trimmed messages
@@ -645,7 +645,7 @@ async fn auto_save_stores_only_user_messages_in_memory() {
         true, // auto_save enabled
     );
 
-    let _ = agent.turn("Remember this fact").await.unwrap();
+    let _ = agent.turn("Remember this fact", None).await.unwrap();
 
     // Auto-save only persists user-stated input, never assistant-generated summaries.
     let count = mem.count().await.unwrap();
@@ -681,7 +681,7 @@ async fn auto_save_disabled_does_not_store() {
         false, // auto_save disabled
     );
 
-    let _ = agent.turn("test message").await.unwrap();
+    let _ = agent.turn("test message", None).await.unwrap();
 
     let count = mem.count().await.unwrap();
     assert_eq!(count, 0, "Expected 0 memory entries with auto_save off");
@@ -704,7 +704,7 @@ async fn xml_dispatcher_parses_and_loops() {
         Box::new(XmlToolDispatcher),
     );
 
-    let response = agent.turn("test xml").await.unwrap();
+    let response = agent.turn("test xml", None).await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty response from XML dispatcher"
@@ -720,7 +720,7 @@ async fn native_dispatcher_sends_tool_specs() {
         Box::new(NativeToolDispatcher),
     );
 
-    let _ = agent.turn("hi").await.unwrap();
+    let _ = agent.turn("hi", None).await.unwrap();
 
     // NativeToolDispatcher.should_send_tool_specs() returns true
     let dispatcher = NativeToolDispatcher;
@@ -748,7 +748,7 @@ async fn turn_handles_empty_text_response() {
 
     let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
 
-    let response = agent.turn("hi").await.unwrap();
+    let response = agent.turn("hi", None).await.unwrap();
     assert!(response.is_empty());
 }
 
@@ -764,7 +764,7 @@ async fn turn_handles_none_text_response() {
     let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
 
     // Should not panic — falls back to empty string
-    let response = agent.turn("hi").await.unwrap();
+    let response = agent.turn("hi", None).await.unwrap();
     assert!(response.is_empty());
 }
 
@@ -794,7 +794,7 @@ async fn turn_preserves_text_alongside_tool_calls() {
         Box::new(NativeToolDispatcher),
     );
 
-    let response = agent.turn("check something").await.unwrap();
+    let response = agent.turn("check something", None).await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty final response after mixed text+tool"
@@ -843,7 +843,7 @@ async fn turn_handles_multiple_tools_in_one_response() {
         Box::new(NativeToolDispatcher),
     );
 
-    let response = agent.turn("batch").await.unwrap();
+    let response = agent.turn("batch", None).await.unwrap();
     assert!(
         !response.is_empty(),
         "Expected non-empty response after multi-tool batch"
@@ -870,7 +870,7 @@ async fn system_prompt_injected_on_first_turn() {
 
     assert!(agent.history().is_empty(), "History should start empty");
 
-    let _ = agent.turn("hi").await.unwrap();
+    let _ = agent.turn("hi", None).await.unwrap();
 
     // First message should be the system prompt
     let first = &agent.history()[0];
@@ -892,8 +892,8 @@ async fn system_prompt_not_duplicated_on_second_turn() {
         Box::new(NativeToolDispatcher),
     );
 
-    let _ = agent.turn("hi").await.unwrap();
-    let _ = agent.turn("hello again").await.unwrap();
+    let _ = agent.turn("hi", None).await.unwrap();
+    let _ = agent.turn("hello again", None).await.unwrap();
 
     let system_count = agent
         .history()
@@ -924,7 +924,7 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
         Box::new(NativeToolDispatcher),
     );
 
-    let _ = agent.turn("test").await.unwrap();
+    let _ = agent.turn("test", None).await.unwrap();
 
     // Expected history entries:
     //   0: system prompt
@@ -982,13 +982,13 @@ async fn multi_turn_maintains_growing_history() {
 
     let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
 
-    let r1 = agent.turn("msg 1").await.unwrap();
+    let r1 = agent.turn("msg 1", None).await.unwrap();
     let len_after_1 = agent.history().len();
 
-    let r2 = agent.turn("msg 2").await.unwrap();
+    let r2 = agent.turn("msg 2", None).await.unwrap();
     let len_after_2 = agent.history().len();
 
-    let r3 = agent.turn("msg 3").await.unwrap();
+    let r3 = agent.turn("msg 3", None).await.unwrap();
     let len_after_3 = agent.history().len();
 
     assert_eq!(r1, "response 1");
@@ -1311,14 +1311,14 @@ async fn clear_history_resets_conversation() {
 
     let mut agent = build_agent_with(provider, vec![], Box::new(NativeToolDispatcher));
 
-    let _ = agent.turn("hi").await.unwrap();
+    let _ = agent.turn("hi", None).await.unwrap();
     assert!(!agent.history().is_empty());
 
     agent.clear_history();
     assert!(agent.history().is_empty());
 
     // Next turn should re-inject system prompt
-    let _ = agent.turn("hello again").await.unwrap();
+    let _ = agent.turn("hello again", None).await.unwrap();
     assert!(matches!(
         &agent.history()[0],
         ConversationMessage::Chat(c) if c.role == "system"

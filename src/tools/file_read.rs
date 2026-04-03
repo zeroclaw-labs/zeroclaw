@@ -836,7 +836,7 @@ mod tests {
 
         // ── Execute ──
         let response = agent
-            .turn("Read report.pdf and tell me what it says")
+            .turn("Read report.pdf and tell me what it says", None)
             .await
             .unwrap();
 
@@ -926,7 +926,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let response = agent.turn("Read data.bin").await.unwrap();
+        let response = agent.turn("Read data.bin", None).await.unwrap();
 
         assert!(
             response.contains("binary"),
@@ -1012,7 +1012,7 @@ mod tests {
 
         // ── Execute ──
         let response = agent
-            .turn("Use the file_read tool to read report.pdf, then tell me what text it contains. Be concise.")
+            .turn("Use the file_read tool to read report.pdf, then tell me what text it contains. Be concise.", None)
             .await
             .unwrap();
 
