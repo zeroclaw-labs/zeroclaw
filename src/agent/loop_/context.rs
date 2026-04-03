@@ -16,65 +16,38 @@ const MAX_CROSS_SEARCH_ENTRIES: usize = 20;
 /// Build context preamble by searching both long-term memory and ontology
 /// for relevant entries, with **bidirectional cross-referencing**.
 ///
-/// Cross-search protocol:
-/// 1. Search memory (vector+keyword) → extract time/place/person keywords
-/// 2. Search ontology (FTS5) → extract time/place/person keywords
-/// 3. Use ontology keywords to enrich memory search → find related conversations
-/// 4. Use memory keywords to enrich ontology search → find related relationships
-/// 5. Combine all results with deduplication
+/// This is the unified ACE Layer 2 implementation:
+/// - Phase 0: Essential profile + user instructions (always loaded)
+/// - Phase 1: Primary memory recall (RAG vector+keyword search)
+/// - Phase 2: Primary ontology search (graph relationships)
+/// - Phase 3: Cross-search ontology → memory enrichment
+/// - Phase 4: Cross-search memory → ontology enrichment
+/// - Layer 3: Budget guard (trim if total > budget)
+///
+/// Returns `AceContextResult` with context string and optional trimmed notice.
 pub(super) async fn build_context(
     mem: &dyn Memory,
     user_msg: &str,
     min_relevance_score: f64,
     session_id: Option<&str>,
     ontology: Option<&OntologyRepo>,
-) -> String {
+    ace_budget_chars: usize,
+) -> AceContextResult {
     let mut context = String::with_capacity(8192);
     let mut seen_memory_keys = HashSet::new();
     let mut cross_search_keywords = Vec::new();
+    let mut section_boundaries: Vec<(usize, SectionPriority)> = Vec::new();
 
-    // ── Phase 0: Essential profile recall (ALWAYS loaded) ──────
-    // These keys are loaded regardless of the user's message content.
-    // Without this, greeting messages like "안녕" would not retrieve
-    // the user's name, occupation, or preferred form of address.
-    const ESSENTIAL_PROFILE_KEYS: &[&str] = &[
-        "user_profile_identity",
-        "user_profile_family",
-        "user_profile_work",
-        "user_profile_lifestyle",
-        "user_profile_communication",
-        "user_profile_routine",
-        "user_moa_preferences",
-    ];
-
-    let mut essential_loaded = false;
-    for key in ESSENTIAL_PROFILE_KEYS {
-        if let Ok(Some(entry)) = mem.get(key).await {
-            if !essential_loaded {
-                context.push_str("[User profile — always loaded]\n");
-                essential_loaded = true;
-            }
-            seen_memory_keys.insert(entry.key.clone());
-            let ts_hint = if entry.timestamp.is_empty() {
-                String::new()
-            } else {
-                let short_ts = if entry.timestamp.len() > 19 {
-                    &entry.timestamp[..19]
-                } else {
-                    &entry.timestamp
-                };
-                format!(" [{}]", short_ts)
-            };
-            let line = format!("- {}:{} {}\n", entry.key, ts_hint, entry.content);
-            context.push_str(&line);
-            extract_cross_search_keywords(&entry.content, &mut cross_search_keywords);
-        }
-    }
-    if essential_loaded {
+    // ── Phase 0: Essential profile + instructions (ALWAYS loaded) ──
+    let profile_block = build_profile_context(mem).await;
+    if !profile_block.is_empty() {
+        let start = context.len();
+        context.push_str(&profile_block);
         context.push('\n');
+        section_boundaries.push((start, SectionPriority::Essential));
     }
 
-    // ── Phase 1: Primary memory recall ──────────────────────────
+    // ── Phase 1 (ACE Layer 2a): Primary memory recall ──
     if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
         let relevant: Vec<_> = entries
             .iter()
@@ -85,40 +58,29 @@ pub(super) async fn build_context(
             .collect();
 
         if !relevant.is_empty() {
+            let start = context.len();
             context.push_str("[Memory context]\n");
+            let header_only_len = context.len();
             for entry in &relevant {
                 if memory::is_assistant_autosave_key(&entry.key) {
                     continue;
                 }
                 seen_memory_keys.insert(entry.key.clone());
-                // Include timestamp so the LLM knows WHEN this memory was recorded
-                let ts_hint = if entry.timestamp.is_empty() {
-                    String::new()
-                } else {
-                    // Truncate to date+time (no timezone suffix) for readability
-                    let short_ts = if entry.timestamp.len() > 19 {
-                        &entry.timestamp[..19]
-                    } else {
-                        &entry.timestamp
-                    };
-                    format!(" [{}]", short_ts)
-                };
-                let line = format!("- {}:{} {}\n", entry.key, ts_hint, entry.content);
-                context.push_str(&line);
-
-                // Extract time/place/person keywords from memory content
-                // for cross-searching into ontology.
+                let ts_hint = format_short_timestamp(&entry.timestamp);
+                let _ = writeln!(context, "- {}:{} {}", entry.key, ts_hint, entry.content);
                 extract_cross_search_keywords(&entry.content, &mut cross_search_keywords);
             }
-            if context == "[Memory context]\n" {
-                context.clear();
+            if context.len() == header_only_len {
+                // All entries were autosave — remove the header
+                context.truncate(start);
             } else {
                 context.push('\n');
+                section_boundaries.push((start, SectionPriority::RagMemory));
             }
         }
     }
 
-    // ── Phase 2: Primary ontology search ────────────────────────
+    // ── Phase 2 (ACE Layer 2b): Primary ontology search ──
     let mut ontology_cross_keywords = Vec::new();
     if let Some(repo) = ontology {
         let owner = session_id.unwrap_or("cli_interactive");
@@ -126,6 +88,7 @@ pub(super) async fn build_context(
             repo.search_objects(owner, None, user_msg, MAX_ONTOLOGY_ENTRIES)
         {
             if !objects.is_empty() {
+                let start = context.len();
                 context.push_str("[Ontology context]\n");
                 for obj in &objects {
                     let title = obj.title.as_deref().unwrap_or("(untitled)");
@@ -139,23 +102,21 @@ pub(super) async fn build_context(
                     } else {
                         let _ = writeln!(context, "- {title}: {props}");
                     }
-
-                    // Extract keywords from ontology objects for cross-searching memory
                     if let Some(t) = obj.title.as_deref() {
                         ontology_cross_keywords.push(t.to_string());
                     }
                     extract_cross_search_keywords_from_json(&obj.properties, &mut ontology_cross_keywords);
                 }
                 context.push('\n');
+                section_boundaries.push((start, SectionPriority::Ontology));
             }
         }
 
-        // ── Phase 3: Cross-search — ontology → memory enrichment ──
-        // Use keywords from ontology results to find related conversations in memory
+        // ── Phase 3 (ACE Layer 2c): Cross-search — ontology → memory ──
         if !ontology_cross_keywords.is_empty() {
             let cross_query = ontology_cross_keywords
                 .iter()
-                .take(5) // Limit to top 5 keywords
+                .take(5)
                 .cloned()
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -171,18 +132,19 @@ pub(super) async fn build_context(
                     .collect();
 
                 if !new_entries.is_empty() {
+                    let start = context.len();
                     context.push_str("[Cross-referenced memories (from ontology context)]\n");
                     for entry in &new_entries {
                         seen_memory_keys.insert(entry.key.clone());
                         let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
                     }
                     context.push('\n');
+                    section_boundaries.push((start, SectionPriority::CrossSearch));
                 }
             }
         }
 
-        // ── Phase 4: Cross-search — memory → ontology enrichment ──
-        // Use keywords from memory results to find related relationships in ontology
+        // ── Phase 4: Cross-search — memory → ontology ──
         if !cross_search_keywords.is_empty() {
             let cross_query = cross_search_keywords
                 .iter()
@@ -194,7 +156,6 @@ pub(super) async fn build_context(
             if let Ok(enriched_objects) =
                 repo.search_objects(owner, None, &cross_query, MAX_CROSS_SEARCH_ENTRIES)
             {
-                // Filter out objects already shown in primary ontology results
                 let new_objects: Vec<_> = enriched_objects
                     .iter()
                     .filter(|o| {
@@ -204,6 +165,7 @@ pub(super) async fn build_context(
                     .collect();
 
                 if !new_objects.is_empty() {
+                    let start = context.len();
                     context.push_str("[Cross-referenced relationships (from memory context)]\n");
                     for obj in &new_objects {
                         let title = obj.title.as_deref().unwrap_or("(untitled)");
@@ -219,12 +181,80 @@ pub(super) async fn build_context(
                         }
                     }
                     context.push('\n');
+                    section_boundaries.push((start, SectionPriority::CrossSearch));
                 }
             }
         }
     }
 
-    context
+    // ── ACE Layer 3: Budget guard ──
+    let total_chars = context.chars().count();
+    let trimmed_notice = if ace_budget_chars > 0 && total_chars > ace_budget_chars {
+        // Trim from lowest priority sections first
+        let mut trimmed_summaries = Vec::new();
+        let mut new_context = context.clone();
+
+        // Sort by priority (lowest first = trim first)
+        let mut boundaries_sorted: Vec<_> = section_boundaries
+            .iter()
+            .filter(|(_, p)| p.is_trimmable())
+            .collect();
+        boundaries_sorted.sort_by_key(|(_, p)| p.rank());
+
+        for (_, priority) in &boundaries_sorted {
+            if new_context.chars().count() <= ace_budget_chars {
+                break;
+            }
+            // Find and summarize the section to trim
+            let label = match priority {
+                SectionPriority::CrossSearch => "[Cross-referenced",
+                SectionPriority::RagMemory => "[Memory context",
+                SectionPriority::Ontology => "[Ontology context",
+                SectionPriority::Essential => continue,
+            };
+            if let Some(pos) = new_context.find(label) {
+                // Extract first content line for the notice
+                let section_text = &new_context[pos..];
+                let first_content = section_text
+                    .lines()
+                    .skip(1)
+                    .find(|l| l.trim().len() > 5)
+                    .unwrap_or("(내용)")
+                    .trim();
+                let summary: String = first_content.chars().take(60).collect();
+                trimmed_summaries.push(format!("  • {summary}..."));
+
+                // Remove the section
+                if let Some(end) = section_text.find("\n\n") {
+                    let end_pos = pos + end + 2;
+                    new_context = format!(
+                        "{}{}",
+                        &new_context[..pos],
+                        &new_context[end_pos..]
+                    );
+                }
+            }
+        }
+
+        if !trimmed_summaries.is_empty() {
+            context = new_context;
+            Some(format!(
+                "\n💡 아래 과거 기억이 저장되어 있지만 컨텍스트 예산 초과로 \
+                 이번 대화에는 포함되지 않았습니다:\n{}\n\
+                 추가로 검색해드릴까요? (\"기억 검색해줘\"라고 말씀해주세요)",
+                trimmed_summaries.join("\n")
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    AceContextResult {
+        context,
+        trimmed_memories_notice: trimmed_notice,
+    }
 }
 
 /// Extract time, place, and person keywords from memory content
@@ -641,242 +671,7 @@ pub(super) struct AceContextResult {
     pub trimmed_memories_notice: Option<String>,
 }
 
-/// Build context using the 4-layer ACE architecture.
-///
-/// - **Layer 0**: Immediate context — last `immediate_turns` of conversation (verbatim)
-/// - **Layer 1**: Attachment memo — already applied to history[] entries (no work here)
-/// - **Layer 2**: RAG enrichment — search long-term memory + ontology for related past conversations
-/// - **Layer 3**: Budget guard — trim oldest RAG results if total exceeds budget
-pub(super) async fn build_ace_context(
-    mem: &dyn Memory,
-    user_msg: &str,
-    min_relevance_score: f64,
-    session_id: Option<&str>,
-    ontology: Option<&OntologyRepo>,
-    _recent_turns: &[ChatMessage], // Layer 0 is managed by caller via history[]
-    config: &AceConfig,
-) -> AceContextResult {
-    let mut sections: Vec<ContextSection> = Vec::new();
-    let mut total_chars: usize = 0;
-
-    // ── Layer 0: Immediate context (직전 N턴 원문, 절대 제거 안 함) ──
-    // This is the "방금 말한 거", "아까 그거" reference window.
-    // Already in history[], so we don't add it to context preamble.
-    // Layer 0 is managed by the caller (loop_.rs) keeping history[] intact.
-
-    // ── Phase: Essential profile recall (항상 로드) ──
-    let profile_block = build_profile_context(mem).await;
-    if !profile_block.is_empty() {
-        let chars = profile_block.chars().count();
-        total_chars += chars;
-        sections.push(ContextSection {
-            content: profile_block,
-            chars,
-            priority: SectionPriority::Essential, // never trimmed
-            timestamp: None,
-        });
-    }
-
-    // ── Layer 2a: RAG memory search (관련 과거 대화 검색) ──
-    let mut seen_keys = HashSet::new();
-    if let Ok(entries) = mem.recall(user_msg, MAX_RECALL_ENTRIES, session_id).await {
-        let relevant: Vec<_> = entries
-            .iter()
-            .filter(|e| {
-                e.score.map_or(true, |s| s >= min_relevance_score)
-                    && !memory::is_assistant_autosave_key(&e.key)
-            })
-            .collect();
-
-        if !relevant.is_empty() {
-            let mut block = String::from("[관련 과거 대화 및 기억 (RAG 검색)]\n");
-            for entry in &relevant {
-                seen_keys.insert(entry.key.clone());
-                let ts = if entry.timestamp.is_empty() {
-                    String::new()
-                } else {
-                    let short = if entry.timestamp.len() > 19 {
-                        &entry.timestamp[..19]
-                    } else {
-                        &entry.timestamp
-                    };
-                    format!(" [{}]", short)
-                };
-                let _ = writeln!(block, "- {}:{} {}", entry.key, ts, entry.content);
-            }
-            let chars = block.chars().count();
-            total_chars += chars;
-            // Use the most recent timestamp from entries for sorting
-            let latest_ts = relevant
-                .iter()
-                .filter_map(|e| {
-                    if e.timestamp.is_empty() { None } else { Some(e.timestamp.as_str()) }
-                })
-                .max()
-                .map(String::from);
-            sections.push(ContextSection {
-                content: block,
-                chars,
-                priority: SectionPriority::RagMemory,
-                timestamp: latest_ts,
-            });
-        }
-    }
-
-    // ── Layer 2b: Ontology graph search (인물/사건/장소 관계) ──
-    if let Some(repo) = ontology {
-        let owner = session_id.unwrap_or("cli_interactive");
-        if let Ok(objects) = repo.search_objects(owner, None, user_msg, MAX_ONTOLOGY_ENTRIES) {
-            if !objects.is_empty() {
-                let mut block = String::from("[관련 관계 정보 (온톨로지)]\n");
-                let mut cross_keywords = Vec::new();
-                for obj in &objects {
-                    let title = obj.title.as_deref().unwrap_or("(untitled)");
-                    let props = if obj.properties.is_null()
-                        || obj.properties.as_object().is_some_and(|m| m.is_empty())
-                    {
-                        String::new()
-                    } else {
-                        obj.properties.to_string()
-                    };
-                    if props.is_empty() {
-                        let _ = writeln!(block, "- {title}");
-                    } else {
-                        let _ = writeln!(block, "- {title}: {props}");
-                    }
-                    if let Some(t) = obj.title.as_deref() {
-                        cross_keywords.push(t.to_string());
-                    }
-                }
-
-                let chars = block.chars().count();
-                total_chars += chars;
-                sections.push(ContextSection {
-                    content: block,
-                    chars,
-                    priority: SectionPriority::Ontology,
-                    timestamp: None,
-                });
-
-                // ── Layer 2c: Cross-search (온톨로지 → 메모리 교차검색) ──
-                if !cross_keywords.is_empty() {
-                    let cross_query = cross_keywords.iter().take(5).cloned().collect::<Vec<_>>().join(" ");
-                    if let Ok(enriched) = mem.recall(&cross_query, MAX_CROSS_SEARCH_ENTRIES, session_id).await {
-                        let new_entries: Vec<_> = enriched
-                            .iter()
-                            .filter(|e| {
-                                e.score.unwrap_or(1.0) >= min_relevance_score
-                                    && !memory::is_assistant_autosave_key(&e.key)
-                                    && !seen_keys.contains(&e.key)
-                            })
-                            .collect();
-                        if !new_entries.is_empty() {
-                            let mut block = String::from("[교차검색 — 관련 추가 기억]\n");
-                            for entry in &new_entries {
-                                seen_keys.insert(entry.key.clone());
-                                let _ = writeln!(block, "- {}: {}", entry.key, entry.content);
-                            }
-                            let chars = block.chars().count();
-                            total_chars += chars;
-                            sections.push(ContextSection {
-                                content: block,
-                                chars,
-                                priority: SectionPriority::CrossSearch,
-                                timestamp: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Layer 3: Budget guard — trim oldest RAG results if over budget ──
-    let budget = config.total_budget_chars;
-    let mut trimmed_notice: Option<String> = None;
-
-    if total_chars > budget {
-        // Sort trimmable sections by priority (lowest first), then by age (oldest first)
-        let mut trimmable_indices: Vec<usize> = sections
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| s.priority.is_trimmable())
-            .map(|(i, _)| i)
-            .collect();
-
-        // Trim from lowest priority first (CrossSearch → RagMemory → Ontology)
-        trimmable_indices.sort_by(|&a, &b| {
-            sections[a].priority.rank().cmp(&sections[b].priority.rank())
-        });
-
-        let mut trimmed_summaries: Vec<String> = Vec::new();
-        let mut removed_indices = Vec::new();
-
-        for &idx in &trimmable_indices {
-            if total_chars <= budget {
-                break;
-            }
-            total_chars -= sections[idx].chars;
-            // Build a short summary of what was trimmed
-            let first_line = sections[idx]
-                .content
-                .lines()
-                .skip(1) // skip the header
-                .find(|l| l.trim().len() > 5)
-                .unwrap_or("(내용)")
-                .trim()
-                .chars()
-                .take(60)
-                .collect::<String>();
-            let ts = sections[idx].timestamp.as_deref().unwrap_or("날짜 미상");
-            trimmed_summaries.push(format!("  • [{ts}] {first_line}"));
-            removed_indices.push(idx);
-        }
-
-        // Remove trimmed sections (in reverse order to preserve indices)
-        removed_indices.sort_unstable();
-        for idx in removed_indices.into_iter().rev() {
-            sections.remove(idx);
-        }
-
-        // Build user notification about hidden memories
-        if !trimmed_summaries.is_empty() {
-            let notice = format!(
-                "\n---\n💡 아래 과거 기억이 저장되어 있지만 컨텍스트 예산 초과로 \
-                 이번 대화에는 포함되지 않았습니다:\n{}\n\
-                 추가로 검색해드릴까요? (\"기억 검색해줘\" 라고 말씀해주세요)\n---",
-                trimmed_summaries.join("\n")
-            );
-            trimmed_notice = Some(notice);
-        }
-    }
-
-    // Assemble final context
-    let mut context = String::with_capacity(total_chars + 512);
-    for section in &sections {
-        context.push_str(&section.content);
-        context.push('\n');
-    }
-
-    AceContextResult {
-        context,
-        trimmed_memories_notice: trimmed_notice,
-    }
-}
-
-/// ACE configuration passed to the context builder.
-pub(super) struct AceConfig {
-    pub total_budget_chars: usize,
-    pub rag_max_chars: usize,
-}
-
-struct ContextSection {
-    content: String,
-    chars: usize,
-    priority: SectionPriority,
-    timestamp: Option<String>,
-}
-
+// SectionPriority is used by the unified build_context() for Layer 3 budget guard.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SectionPriority {
     Essential,   // user profile — never trimmed

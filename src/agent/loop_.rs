@@ -40,8 +40,7 @@ mod history;
 mod parsing;
 mod promotion;
 
-#[allow(unused_imports)]
-use context::{build_ace_context, build_context, build_cross_session_context, build_hardware_context, AceConfig};
+use context::{build_context, build_cross_session_context, build_hardware_context, AceContextResult};
 use detection::{DetectionVerdict, LoopDetectionConfig, LoopDetector};
 use execution::{
     execute_tools_parallel, execute_tools_sequential, should_execute_tools_in_parallel,
@@ -2745,9 +2744,11 @@ pub async fn run(
             let _ = mem.store(&user_key, &msg, MemoryCategory::Core, None).await;
         }
 
-        // Inject memory + ontology + short-term conversation + hardware RAG context
-        let mem_context =
-            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score, None, ontology_repo.as_ref()).await;
+        // ACE Layer 2: Unified context — profile + RAG memory + ontology + cross-search + Layer 3 budget guard
+        let ace_budget = config.agent.session.ace_total_budget_chars;
+        let AceContextResult { context: mem_context, trimmed_memories_notice: trimmed_notice } =
+            build_context(mem.as_ref(), &msg, config.memory.min_relevance_score, None, ontology_repo.as_ref(), ace_budget).await;
+
         let rag_limit = if config.agent.compact_context { 2 } else { 5 };
         let hw_context = hardware_rag
             .as_ref()
@@ -2768,7 +2769,7 @@ pub async fn run(
             {
                 Ok(turns) if !turns.is_empty() => build_cross_session_context(
                     &turns,
-                    1, // skip the current message we just appended above
+                    1,
                     sess_cfg.cross_session_max_bytes,
                     sess_cfg.cross_session_turn_max_chars,
                 ),
@@ -2778,23 +2779,6 @@ pub async fn run(
             String::new()
         };
         let context = format!("{mem_context}{cross_session_context}{hw_context}");
-
-        // ACE Layer 3: Budget guard — trim context if it exceeds the character budget.
-        // Preserves the most recent/relevant context, trims oldest parts.
-        let ace_budget = config.agent.session.ace_total_budget_chars;
-        let context_chars = context.chars().count();
-        let (context, trimmed_notice) = if context_chars > ace_budget && ace_budget > 0 {
-            // Keep the last ace_budget chars (most recent = most relevant)
-            let trimmed: String = context.chars().skip(context_chars - ace_budget).collect();
-            let notice = format!(
-                "\n💡 과거 기억 중 일부({} → {}자로 축소)가 이번 대화에 포함되지 않았습니다. \
-                 추가로 검색이 필요하면 \"기억 검색해줘\"라고 말씀해주세요.\n",
-                context_chars, ace_budget
-            );
-            (trimmed, Some(notice))
-        } else {
-            (context, None)
-        };
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
         let mut enriched = if context.is_empty() {
@@ -3009,12 +2993,13 @@ pub async fn run(
             }
 
             // Inject memory + ontology + hardware RAG context into user message
-            let mem_context = build_context(
+            let AceContextResult { context: mem_context, .. } = build_context(
                 mem.as_ref(),
                 &user_input,
                 config.memory.min_relevance_score,
                 None,
                 ontology_repo.as_ref(),
+                config.agent.session.ace_total_budget_chars,
             )
             .await;
             let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -3476,12 +3461,13 @@ pub async fn process_message_with_session(
     system_prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
 
     let ontology_repo = crate::ontology::OntologyRepo::open(&config.workspace_dir).ok();
-    let mem_context = build_context(
+    let AceContextResult { context: mem_context, .. } = build_context(
         mem.as_ref(),
         message,
         config.memory.min_relevance_score,
         session_id,
         ontology_repo.as_ref(),
+        config.agent.session.ace_total_budget_chars,
     )
     .await;
     let rag_limit = if config.agent.compact_context { 2 } else { 5 };
@@ -5696,7 +5682,7 @@ Tail"#;
         .await
         .unwrap();
 
-        let context = build_context(&mem, "status updates", 0.0, None, None).await;
+        let AceContextResult { context, .. } = build_context(&mem, "status updates", 0.0, None, None, 2_000_000).await;
         assert!(context.contains("user_msg_real"));
         assert!(!context.contains("assistant_resp_poisoned"));
         assert!(!context.contains("fabricated event"));
