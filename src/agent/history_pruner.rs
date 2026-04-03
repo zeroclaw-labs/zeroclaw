@@ -143,6 +143,14 @@ pub fn prune_history(messages: &mut Vec<ChatMessage>, config: &HistoryPrunerConf
         }
     }
 
+    // Phase 3 – ensure first non-system message is `user`.
+    // Some providers (e.g. Zhipu GLM) reject `system -> assistant` sequences.
+    crate::agent::history::align_to_user_boundary(
+        messages,
+        config.keep_recent,
+        &mut dropped_messages,
+    );
+
     PruneStats {
         messages_before,
         messages_after: messages.len(),
@@ -205,6 +213,7 @@ mod tests {
         let tool_result = "a".repeat(160);
         let mut messages = vec![
             msg("system", "sys"),
+            msg("user", "do something"),
             msg("assistant", "calling tool X"),
             msg("tool", &tool_result),
             msg("user", "thanks"),
@@ -218,9 +227,9 @@ mod tests {
         };
         let stats = prune_history(&mut messages, &config);
         assert_eq!(stats.collapsed_pairs, 1);
-        assert_eq!(messages.len(), 4);
-        assert_eq!(messages[1].role, "assistant");
-        assert!(messages[1].content.starts_with("[Tool result: "));
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[2].role, "assistant");
+        assert!(messages[2].content.starts_with("[Tool result: "));
     }
 
     #[test]
@@ -279,5 +288,32 @@ mod tests {
         let stats = prune_history(&mut messages, &config);
         assert_eq!(stats.messages_before, 0);
         assert_eq!(stats.messages_after, 0);
+    }
+
+    #[test]
+    fn prune_aligns_to_user_boundary_after_budget_drop() {
+        let big = "x".repeat(40_000);
+        let mut messages = vec![
+            msg("system", "sys"),
+            msg("user", &big),
+            msg("assistant", "old-reply"),
+            msg("user", "recent-user"),
+            msg("assistant", "recent-assistant"),
+        ];
+        let config = HistoryPrunerConfig {
+            enabled: true,
+            max_tokens: 100,
+            keep_recent: 2,
+            collapse_tool_results: false,
+        };
+        let stats = prune_history(&mut messages, &config);
+        assert!(stats.dropped_messages >= 1);
+        let first_non_sys = messages.iter().position(|m| m.role != "system").unwrap();
+        assert_eq!(
+            messages[first_non_sys].role,
+            "user",
+            "first non-system message should be user, got {:?}",
+            messages.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
     }
 }

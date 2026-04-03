@@ -77,6 +77,10 @@ pub(crate) fn fast_trim_tool_results(
 
 /// Emergency: drop oldest non-system, non-recent messages from history.
 /// Returns number of messages dropped.
+///
+/// After the main drop pass, continues removing messages until the first
+/// non-system message has role `user`, so that the resulting sequence
+/// satisfies provider constraints (e.g. Zhipu GLM rejects `system -> assistant`).
 pub(crate) fn emergency_history_trim(
     history: &mut Vec<crate::providers::ChatMessage>,
     keep_recent: usize,
@@ -92,6 +96,7 @@ pub(crate) fn emergency_history_trim(
             dropped += 1;
         }
     }
+    align_to_user_boundary(history, keep_recent, &mut dropped);
     dropped
 }
 
@@ -107,10 +112,38 @@ pub(crate) fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// After trimming, drop leading non-system messages until the first one has
+/// role `user`. This prevents sequences like `system -> assistant -> …` which
+/// some providers (e.g. Zhipu GLM) reject.
+///
+/// `keep_recent` specifies how many trailing messages must stay untouched.
+/// Dropped count is accumulated into `dropped`.
+pub(crate) fn align_to_user_boundary(
+    history: &mut Vec<ChatMessage>,
+    keep_recent: usize,
+    dropped: &mut usize,
+) {
+    loop {
+        let first = history.iter().position(|m| m.role != "system");
+        match first {
+            Some(idx)
+                if history[idx].role != "user"
+                    && idx < history.len().saturating_sub(keep_recent) =>
+            {
+                history.remove(idx);
+                *dropped += 1;
+            }
+            _ => break,
+        }
+    }
+}
+
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
+///
+/// After the bulk drain, extends the removal to the next `user` message so that
+/// providers requiring `system* -> user` ordering are satisfied.
 pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
-    // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
         history.len() - 1
@@ -124,7 +157,11 @@ pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 
     let start = if has_system { 1 } else { 0 };
     let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let mut drain_end = start + to_remove;
+    while drain_end < history.len() && history[drain_end].role != "user" {
+        drain_end += 1;
+    }
+    history.drain(start..drain_end);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,4 +206,169 @@ pub(crate) fn save_interactive_session_history(path: &Path, history: &[ChatMessa
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
     std::fs::write(path, payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::providers::ChatMessage;
+
+    // ── trim_history boundary alignment tests ─────────────────────
+
+    #[test]
+    fn trim_history_aligns_to_user_boundary() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::user("u2"),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("u3"),
+            ChatMessage::assistant("a3"),
+        ];
+        // Keep 4 non-system → remove 2 oldest (u1, a1).
+        // After drain the first non-system is u2 (user) — no extra alignment needed.
+        trim_history(&mut history, 4);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[1].role, "user");
+        assert_eq!(history[1].content, "u2");
+    }
+
+    #[test]
+    fn trim_history_extends_drain_past_assistant() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::tool("t1"),
+            ChatMessage::user("u2"),
+            ChatMessage::assistant("a2"),
+        ];
+        // Keep 3 non-system → remove 2 (u1, a1). Drain ends at index 3 = tool.
+        // Boundary alignment extends drain to include tool, so first non-system = u2.
+        trim_history(&mut history, 3);
+        assert_eq!(history[0].role, "system");
+        assert_eq!(history[1].role, "user");
+        assert_eq!(history[1].content, "u2");
+    }
+
+    #[test]
+    fn trim_history_noop_when_within_limit() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+        ];
+        trim_history(&mut history, 10);
+        assert_eq!(history.len(), 3);
+    }
+
+    // ── emergency_history_trim boundary alignment tests ───────────
+
+    #[test]
+    fn emergency_trim_aligns_to_user_boundary() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::assistant("a2"),
+            ChatMessage::user("u2"),
+            ChatMessage::assistant("a3"),
+        ];
+        // target_drop = 6/3 = 2, keep_recent = 2.
+        // Drops u1, a1. First non-system is now a2 (assistant).
+        // Boundary alignment drops a2 as well. First non-system = u2.
+        let dropped = emergency_history_trim(&mut history, 2);
+        assert!(dropped >= 2);
+        assert_eq!(history[0].role, "system");
+        let first_non_sys = history.iter().position(|m| m.role != "system").unwrap();
+        assert_eq!(history[first_non_sys].role, "user");
+    }
+
+    #[test]
+    fn emergency_trim_noop_when_already_user_first() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a1"),
+        ];
+        let dropped = emergency_history_trim(&mut history, 2);
+        assert_eq!(dropped, 0);
+        assert_eq!(history.len(), 3);
+    }
+
+    // ── align_to_user_boundary unit tests ─────────────────────────
+
+    #[test]
+    fn align_noop_when_user_is_first() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+        ];
+        let mut dropped = 0;
+        align_to_user_boundary(&mut msgs, 0, &mut dropped);
+        assert_eq!(dropped, 0);
+        assert_eq!(msgs.len(), 3);
+    }
+
+    #[test]
+    fn align_drops_assistant_and_tool_before_user() {
+        let mut msgs = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::assistant("a1"),
+            ChatMessage::tool("t1"),
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("a2"),
+        ];
+        let mut dropped = 0;
+        align_to_user_boundary(&mut msgs, 0, &mut dropped);
+        assert_eq!(dropped, 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content, "u1");
+    }
+
+    #[test]
+    fn align_respects_keep_recent() {
+        let mut msgs = vec![ChatMessage::system("sys"), ChatMessage::assistant("a1")];
+        let mut dropped = 0;
+        // a1 is protected by keep_recent=1
+        align_to_user_boundary(&mut msgs, 1, &mut dropped);
+        assert_eq!(dropped, 0);
+        assert_eq!(msgs.len(), 2);
+    }
+
+    #[test]
+    fn align_noop_on_empty() {
+        let mut msgs: Vec<ChatMessage> = vec![];
+        let mut dropped = 0;
+        align_to_user_boundary(&mut msgs, 0, &mut dropped);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn align_noop_when_only_system() {
+        let mut msgs = vec![ChatMessage::system("sys")];
+        let mut dropped = 0;
+        align_to_user_boundary(&mut msgs, 0, &mut dropped);
+        assert_eq!(dropped, 0);
+    }
+
+    #[test]
+    fn align_with_multiple_system_messages() {
+        let mut msgs = vec![
+            ChatMessage::system("sys1"),
+            ChatMessage::system("sys2"),
+            ChatMessage::assistant("response"),
+            ChatMessage::user("followup"),
+        ];
+        let mut dropped = 0;
+        align_to_user_boundary(&mut msgs, 0, &mut dropped);
+        assert_eq!(dropped, 1);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[1].role, "system");
+        assert_eq!(msgs[2].role, "user");
+        assert_eq!(msgs[2].content, "followup");
+    }
 }

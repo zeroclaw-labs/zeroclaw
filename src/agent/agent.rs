@@ -578,8 +578,18 @@ impl Agent {
         }
 
         if other_messages.len() > max {
-            let drop_count = other_messages.len() - max;
-            other_messages.drain(0..drop_count);
+            let mut drain_end = other_messages.len() - max;
+            while drain_end < other_messages.len() {
+                let is_user = matches!(
+                    &other_messages[drain_end],
+                    ConversationMessage::Chat(chat) if chat.role == "user"
+                );
+                if is_user {
+                    break;
+                }
+                drain_end += 1;
+            }
+            other_messages.drain(0..drain_end);
         }
 
         self.history = system_messages;
