@@ -303,6 +303,12 @@ Examples:
         /// Host to bind to; defaults to config gateway.host
         #[arg(long)]
         host: Option<String>,
+
+        /// Run in foreground instead of daemonizing. Required for systemd
+        /// Type=simple services to prevent systemd from treating the parent
+        /// exit after a fork as a crash.
+        #[arg(long)]
+        no_fork: bool,
     },
 
     /// Manage OS service lifecycle (launchd/systemd user service)
@@ -1160,7 +1166,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Daemon { port, host } => {
+        Commands::Daemon { port, host, no_fork: _ } => {
             if let Ok(exe) = std::env::current_exe() {
                 let exe_str = exe.to_string_lossy();
                 if exe_str.contains(".cargo/bin") || exe_str.contains("/home/") {

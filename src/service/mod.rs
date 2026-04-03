@@ -751,7 +751,7 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exe} daemon\n\
+         ExecStart={exe} daemon --no-fork\n\
          Restart=always\n\
          RestartSec=3\n\
          # Ensure HOME is set so headless browsers can create profile/cache dirs.\n\
