@@ -296,7 +296,7 @@ ci-all = [
 
 [profile.dev]
 incremental = true
-opt-level = 1
+opt-level = 0
 
 [profile.release]
 opt-level = "z"      # Optimize for size

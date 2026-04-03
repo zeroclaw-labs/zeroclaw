@@ -12,7 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
-use std::io;
+use std::io::{self, IsTerminal};
 
 use crate::config::Config;
 use crate::config::schema::{
@@ -570,6 +570,24 @@ impl App {
 // ── Public entry point ──────────────────────────────────────────────
 
 pub async fn run_tui_onboarding() -> Result<()> {
+    // When launched via `curl | bash`, stdin is a pipe, not a TTY.
+    // Crossterm reads terminal events from stdin, so we must reopen
+    // stdin from /dev/tty before entering raw mode.
+    #[cfg(unix)]
+    if !io::stdin().is_terminal() {
+        use std::fs::File;
+        let tty = File::open("/dev/tty").context("Failed to open /dev/tty for TUI input")?;
+        let fd = std::os::unix::io::IntoRawFd::into_raw_fd(tty);
+        // Safety: we just opened this fd and are replacing stdin (fd 0) with it.
+        unsafe {
+            if libc::dup2(fd, 0) == -1 {
+                libc::close(fd);
+                anyhow::bail!("Failed to redirect stdin from /dev/tty");
+            }
+            libc::close(fd);
+        }
+    }
+
     enable_raw_mode().context("Failed to enable raw mode")?;
     io::stdout()
         .execute(EnterAlternateScreen)
