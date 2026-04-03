@@ -549,6 +549,17 @@ impl Provider for AnthropicProvider {
             .header("content-type", "application/json")
             .json(&native_request);
 
+        // Debug: log request details for 400 error diagnosis
+        tracing::debug!(
+            model = clean_model,
+            messages_count = native_request.messages.len(),
+            has_system = native_request.system.is_some(),
+            has_tools = native_request.tools.is_some(),
+            tools_count = native_request.tools.as_ref().map(|t| t.len()).unwrap_or(0),
+            max_tokens = native_request.max_tokens,
+            "Anthropic API request"
+        );
+
         let response = self.apply_auth(req, credential).send().await?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);

@@ -51,7 +51,7 @@ use reliable::ReliableProvider;
 use serde::Deserialize;
 use std::path::PathBuf;
 
-const MAX_API_ERROR_CHARS: usize = 200;
+const MAX_API_ERROR_CHARS: usize = 1000;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
 const MINIMAX_CN_BASE_URL: &str = "https://api.minimaxi.com/v1";
 const MINIMAX_OAUTH_GLOBAL_TOKEN_ENDPOINT: &str = "https://api.minimax.io/oauth/token";
@@ -844,6 +844,13 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read provider error body>".to_string());
+    // Log the FULL error for debugging (not truncated)
+    tracing::error!(
+        provider,
+        %status,
+        body_len = body.len(),
+        "API error full body: {body}"
+    );
     let sanitized = sanitize_api_error(&body);
     anyhow::anyhow!("{provider} API error ({status}): {sanitized}")
 }
