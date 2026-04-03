@@ -503,7 +503,7 @@ impl LarkChannel {
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            false,
+            config.mention_only,
             LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
@@ -3092,6 +3092,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
@@ -3291,6 +3292,7 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
