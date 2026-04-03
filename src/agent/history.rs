@@ -217,13 +217,11 @@ mod tests {
         trim_history(&mut history, 2);
 
         // No message with role "tool" should be the first non-system message
-        for msg in &history[1..] {
-            if msg.role == "tool" {
-                // A tool message is only valid if preceded by an assistant message
-                panic!("orphaned tool result found after trim: {:?}", msg.content);
-            }
-            break; // only need to check the first non-system message
-        }
+        assert_ne!(
+            history.get(1).map(|m| m.role.as_str()),
+            Some("tool"),
+            "orphaned tool result found after trim"
+        );
     }
 
     #[test]
