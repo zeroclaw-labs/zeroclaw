@@ -69,9 +69,20 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     let fields = match &input.data {
         Data::Struct(data) => match &data.fields {
             Fields::Named(fields) => &fields.named,
-            _ => panic!("Configurable only supports structs with named fields"),
+            _ => {
+                return syn::Error::new_spanned(
+                    &input,
+                    "Configurable only supports structs with named fields",
+                )
+                .to_compile_error()
+                .into();
+            }
         },
-        _ => panic!("Configurable can only be derived for structs"),
+        _ => {
+            return syn::Error::new_spanned(&input, "Configurable can only be derived for structs")
+                .to_compile_error()
+                .into();
+        }
     };
 
     // ── Secret codegen accumulators (unchanged) ──

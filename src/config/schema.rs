@@ -2569,7 +2569,7 @@ impl Default for SecretsConfig {
 ///
 /// Delegates OS-level mouse, keyboard, and screenshot actions to a local sidecar.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
-#[prefix = "browser"]
+#[prefix = "browser.computer-use"]
 pub struct BrowserComputerUseConfig {
     /// Sidecar endpoint for computer-use actions (OS-level mouse/keyboard/screenshot)
     #[serde(default = "default_browser_computer_use_endpoint")]
@@ -4963,7 +4963,7 @@ pub struct StorageProviderSection {
 
 /// Storage provider backend configuration for remote storage backends.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Configurable)]
-#[prefix = "storage"]
+#[prefix = "storage.provider"]
 pub struct StorageProviderConfig {
     /// Storage engine key (e.g. "sqlite", "qdrant").
     #[serde(default)]
@@ -6243,6 +6243,7 @@ impl Default for TunnelConfig {
 pub struct CloudflareTunnelConfig {
     /// Cloudflare Tunnel token (from Zero Trust dashboard)
     #[serde(default)]
+    #[secret]
     pub token: String,
 }
 
@@ -6262,6 +6263,7 @@ pub struct TailscaleTunnelConfig {
 pub struct NgrokTunnelConfig {
     /// ngrok auth token
     #[serde(default)]
+    #[secret]
     pub auth_token: String,
     /// Optional custom domain
     #[serde(default)]
@@ -6454,6 +6456,7 @@ pub struct ChannelsConfig {
     pub voice_call: Option<crate::channels::voice_call::VoiceCallConfig>,
     /// Voice wake word detection channel configuration.
     #[cfg(feature = "voice-wake")]
+    #[nested]
     pub voice_wake: Option<VoiceWakeConfig>,
     /// MQTT channel configuration (SOP listener).
     #[nested]
@@ -6514,7 +6517,9 @@ impl ChannelsConfig {
             if is_section && !has_explicit_enabled {
                 // Section exists without explicit `enabled` — backfill true
                 let prop_path = format!("channels.{}.enabled", key.replace('_', "-"));
-                let _ = self.set_prop(&prop_path, "true");
+                if let Err(e) = self.set_prop(&prop_path, "true") {
+                    tracing::warn!("backfill_enabled: failed to set {prop_path}: {e}");
+                }
             }
         }
     }
@@ -7323,7 +7328,7 @@ impl ChannelConfig for WatiConfig {
 
 /// Nextcloud Talk bot configuration (webhook receive + OCS send API).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Configurable)]
-#[prefix = "channels.nextcloud"]
+#[prefix = "channels.nextcloud-talk"]
 pub struct NextcloudTalkConfig {
     /// Whether this channel is active (must be explicitly enabled). Default: false.
     #[serde(default)]
@@ -16551,5 +16556,26 @@ api_key = "sk-test"
         let mut config: Config = toml::from_str(toml).unwrap();
         config.channels_config.backfill_enabled(toml);
         assert!(config.channels_config.telegram.is_none());
+    }
+
+    #[test]
+    async fn backfill_enabled_works_with_toml_comments() {
+        let toml = r#"
+# My matrix setup
+[channels_config.matrix]
+homeserver = "https://matrix.org"  # production server
+access_token = "tok"
+room_id = "!r:m"
+allowed_users = ["@u:m"]
+# enabled intentionally omitted
+"#;
+        let mut config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.channels_config.matrix.as_ref().unwrap().enabled);
+
+        config.channels_config.backfill_enabled(toml);
+        assert!(
+            config.channels_config.matrix.as_ref().unwrap().enabled,
+            "backfill should activate channel even when config has comments"
+        );
     }
 }

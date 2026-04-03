@@ -499,7 +499,30 @@ That's it. The `#[secret]` annotation automatically:
 - Converts the field name from `snake_case` to `kebab-case` in the CLI
 
 Field names are derived automatically: `bot_token` on a struct with
-`#[prefix = "channels.your_channel"]` becomes `channels.your-channel.bot-token`.
+`#[prefix = "channels.your-channel"]` becomes `channels.your-channel.bot-token`.
+
+### Adding enum fields
+
+If your config struct has an enum field (e.g. `stream_mode: StreamMode`), the enum
+type must implement `HasPropKind`. Add it to the `impl_enum_prop_kind!` block in
+`src/config/schema.rs`:
+
+```rust
+impl_enum_prop_kind!(
+    // ... existing enums ...
+    YourNewEnum,
+);
+```
+
+If the enum is defined outside `schema.rs`, add the impl at the enum's definition site:
+
+```rust
+impl crate::config::HasPropKind for YourNewEnum {
+    const PROP_KIND: crate::config::PropKind = crate::config::PropKind::Enum;
+}
+```
+
+The compiler will error if this is missing — the error names the trait and the type.
 
 ## How to Add a New Observer
 
