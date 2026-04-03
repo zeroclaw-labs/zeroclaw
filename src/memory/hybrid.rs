@@ -261,6 +261,8 @@ mod tests {
             timestamp: "2026-02-27T00:00:00Z".to_string(),
             session_id: None,
             score: Some(score),
+        recall_count: 0,
+        last_recalled: None,
         }
     }
 

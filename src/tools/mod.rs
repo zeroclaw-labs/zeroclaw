@@ -574,6 +574,117 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
+    // ── Media generation tools (Freepik, Runway, Suno, ElevenLabs) ──
+    // Registered when API keys are available via config or environment.
+    {
+        let media_cfg = &root_config.media_api;
+
+        // Freepik image tools (generate, upscale, img2video)
+        let freepik_key = media_cfg
+            .freepik
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("FREEPIK_API_KEY").ok())
+            .unwrap_or_default();
+        if media_cfg.freepik.enabled || !freepik_key.is_empty() {
+            tool_arcs.push(Arc::new(ImageGenTool::new(freepik_key.clone())));
+            tool_arcs.push(Arc::new(ImageUpscaleTool::new(freepik_key.clone())));
+            tool_arcs.push(Arc::new(FreepikImageToVideoTool::new(freepik_key)));
+        }
+
+        // Runway video generation
+        let runway_key = media_cfg
+            .runway
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("RUNWAY_API_KEY").ok())
+            .unwrap_or_default();
+        if media_cfg.runway.enabled || !runway_key.is_empty() {
+            tool_arcs.push(Arc::new(VideoGenTool::with_config(
+                runway_key,
+                media_cfg.runway.api_url.clone(),
+                media_cfg.runway.model.clone(),
+            )));
+        }
+
+        // Suno music generation
+        let suno_key = media_cfg
+            .suno
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("SUNO_API_KEY").ok())
+            .unwrap_or_default();
+        if media_cfg.suno.enabled || !suno_key.is_empty() {
+            tool_arcs.push(Arc::new(MusicGenTool::with_api_url(
+                suno_key,
+                media_cfg.suno.api_url.clone(),
+            )));
+        }
+
+        // ElevenLabs premium TTS (dual billing: user key vs platform key)
+        let user_elevenlabs_key = media_cfg
+            .elevenlabs
+            .api_key
+            .clone()
+            .or_else(|| std::env::var("ELEVENLABS_API_KEY").ok());
+        if let Some(key) = user_elevenlabs_key {
+            if !key.is_empty() {
+                tool_arcs.push(Arc::new(ElevenLabsTtsTool::new_user_key(key)));
+            }
+        } else if let Some(admin_key) = std::env::var("ADMIN_ELEVENLABS_API_KEY").ok() {
+            if !admin_key.is_empty() && media_cfg.elevenlabs.enabled {
+                tool_arcs.push(Arc::new(ElevenLabsTtsTool::new_platform_key(
+                    admin_key,
+                    media_cfg.elevenlabs.credit_multiplier,
+                )));
+            }
+        }
+    }
+
+    // ── Calendar tools (Google, Outlook, Kakao) ──
+    // Registered when OAuth tokens are available.
+    {
+        let cal_cfg = &root_config.calendar;
+
+        if cal_cfg.google.enabled {
+            if let Some(ref token) = cal_cfg.google.refresh_token {
+                if !token.is_empty() {
+                    let provider = CalendarProvider::Google {
+                        access_token: token.clone(),
+                        calendar_id: cal_cfg.google.calendar_id.clone(),
+                    };
+                    tool_arcs.push(Arc::new(CalendarListEventsTool::new(provider.clone())));
+                    tool_arcs.push(Arc::new(CalendarCreateEventTool::new(provider)));
+                }
+            }
+        }
+
+        if cal_cfg.outlook.enabled {
+            if let Some(ref token) = cal_cfg.outlook.refresh_token {
+                if !token.is_empty() {
+                    let provider = CalendarProvider::Outlook {
+                        access_token: token.clone(),
+                    };
+                    tool_arcs.push(Arc::new(CalendarListEventsTool::new(provider.clone())));
+                    tool_arcs.push(Arc::new(CalendarCreateEventTool::new(provider)));
+                }
+            }
+        }
+
+        if cal_cfg.kakao.enabled {
+            if let Some(ref token) = cal_cfg.kakao.access_token {
+                if !token.is_empty() {
+                    let provider = CalendarProvider::Kakao {
+                        access_token: token.clone(),
+                        calendar_id: cal_cfg.kakao.calendar_id.clone(),
+                    };
+                    tool_arcs.push(Arc::new(CalendarListEventsTool::new(provider.clone())));
+                    tool_arcs.push(Arc::new(CalendarCreateEventTool::new(provider)));
+                }
+            }
+        }
+    }
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tool_arcs.push(Arc::new(ComposioTool::new(
