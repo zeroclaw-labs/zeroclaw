@@ -2201,7 +2201,7 @@ impl Provider for OpenAiCompatibleProvider {
             request.messages.to_vec()
         };
 
-        let tools = Self::convert_tool_specs(request.tools);
+        let tools = self.convert_tool_specs(request.tools, model);
         let payload = if has_tools {
             serde_json::to_value(NativeChatRequest {
                 model: model.to_string(),
