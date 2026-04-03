@@ -1,6 +1,6 @@
 use crate::cron::Schedule;
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Local, Utc};
 use cron::Schedule as CronExprSchedule;
 use std::str::FromStr;
 
@@ -20,7 +20,11 @@ pub fn next_run_for_schedule(schedule: &Schedule, from: DateTime<Utc>) -> Result
                 })?;
                 Ok(next_local.with_timezone(&Utc))
             } else {
-                cron.after(&from)
+                // When no timezone is specified, use the system's local timezone
+                // instead of defaulting to UTC
+                let local_tz = Local::now().timezone();
+                let localized_from = from.with_timezone(&local_tz);
+                cron.after(&localized_from)
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("No future occurrence for expression: {expr}"))
             }
@@ -256,9 +260,10 @@ mod tests {
         // 2026-02-16 is a Monday. With "0 9 * * 1-5" (Mon-Fri at 09:00 UTC),
         // the next run from Sunday 2026-02-15 should be Monday 2026-02-16.
         let sunday = Utc.with_ymd_and_hms(2026, 2, 15, 0, 0, 0).unwrap();
+        // Explicitly specify UTC timezone to test UTC behavior
         let schedule = Schedule::Cron {
             expr: "0 9 * * 1-5".into(),
-            tz: None,
+            tz: Some("UTC".into()),
         };
         let next = next_run_for_schedule(&schedule, sunday).unwrap();
         // Should be Monday 2026-02-16 at 09:00 UTC (weekday = Mon)
@@ -270,9 +275,10 @@ mod tests {
     fn weekday_1_5_does_not_fire_on_saturday_or_sunday() {
         // From Friday evening, next run should skip Sat/Sun → Monday
         let friday_evening = Utc.with_ymd_and_hms(2026, 2, 20, 18, 0, 0).unwrap();
+        // Explicitly specify UTC timezone to test UTC behavior
         let schedule = Schedule::Cron {
             expr: "0 9 * * 1-5".into(),
-            tz: None,
+            tz: Some("UTC".into()),
         };
         let next = next_run_for_schedule(&schedule, friday_evening).unwrap();
         // Should be Monday 2026-02-23 at 09:00 UTC
@@ -284,9 +290,10 @@ mod tests {
     fn weekday_0_means_sunday() {
         // "0 10 * * 0" should fire on Sunday only
         let monday = Utc.with_ymd_and_hms(2026, 2, 16, 0, 0, 0).unwrap();
+        // Explicitly specify UTC timezone to test UTC behavior
         let schedule = Schedule::Cron {
             expr: "0 10 * * 0".into(),
-            tz: None,
+            tz: Some("UTC".into()),
         };
         let next = next_run_for_schedule(&schedule, monday).unwrap();
         assert_eq!(next.weekday(), chrono::Weekday::Sun);
@@ -296,9 +303,10 @@ mod tests {
     fn weekday_7_means_sunday() {
         // "0 10 * * 7" should also fire on Sunday (alias)
         let monday = Utc.with_ymd_and_hms(2026, 2, 16, 0, 0, 0).unwrap();
+        // Explicitly specify UTC timezone to test UTC behavior
         let schedule = Schedule::Cron {
             expr: "0 10 * * 7".into(),
-            tz: None,
+            tz: Some("UTC".into()),
         };
         let next = next_run_for_schedule(&schedule, monday).unwrap();
         assert_eq!(next.weekday(), chrono::Weekday::Sun);
