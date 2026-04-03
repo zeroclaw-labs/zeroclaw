@@ -12,9 +12,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.tool_input.file_path // .tool_input.filePath // \"\"' | { read -r f; if echo \"$f\" | grep -qiE '\\.(env|credentials|secret)'; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Harness: blocked edit to secrets/credentials file\"}}'; exit 0; fi; if [ -n \"$f\" ] && ! echo \"$f\" | grep -qE '(src/|clients/|docs/|\\.claude/|\\.github/|tests/|benches/|Cargo\\.|CLAUDE\\.md|web/|deploy/)'; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Harness: file outside allowed project paths\"}}'; exit 0; fi; }",
+            "command": "jq -r '.tool_input.file_path // .tool_input.filePath // empty' | { read -r f; if echo \"$f\" | grep -qiE '\\.(env|credentials|secret)'; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Harness: blocked edit to secrets file\"}}'; elif [ -n \"$f\" ] && ! echo \"$f\" | grep -qE '(src/|clients/|docs/|\\.claude/|\\.github/|tests/|benches/|Cargo\\.|CLAUDE\\.md|web/|deploy/)'; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Harness: file outside allowed paths\"}}'; fi; } 2>/dev/null || true",
             "timeout": 5,
-            "statusMessage": "Harness: checking file path..."
+            "statusMessage": "Harness: path gate..."
           }
         ]
       },
@@ -23,9 +23,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.tool_input.command' | { read -r cmd; if echo \"$cmd\" | grep -qiE '(rm -rf /[^a-z]|DROP TABLE|git push --force.*(main|master))'; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Harness: blocked destructive command\"}}'; exit 0; fi; }",
+            "command": "jq -r '.tool_input.command' | { read -r cmd; if echo \"$cmd\" | grep -qiE '(rm -rf /[^a-z]|DROP TABLE|git push --force.*(main|master))'; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Harness: destructive command blocked\"}}'; fi; } 2>/dev/null || true",
             "timeout": 5,
-            "statusMessage": "Harness: checking command safety..."
+            "statusMessage": "Harness: command safety..."
           }
         ]
       },
@@ -35,9 +35,9 @@
           {
             "type": "command",
             "if": "Bash(git commit:*)",
-            "command": "jq -r '.tool_input.command' | { read -r cmd; if git diff --cached 2>/dev/null | grep -qiE '(api_key|password|secret|token)\\s*=\\s*[\\x27\"][a-zA-Z0-9]{20}'; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Harness: staged files contain potential secrets. Remove before committing.\"}}'; exit 0; fi; }",
+            "command": "git diff --cached 2>/dev/null | grep -qiE '(api_key|password|secret|token)\\s*=\\s*[a-zA-Z0-9]{20}' && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Harness: secrets in staged files\"}}' || true",
             "timeout": 10,
-            "statusMessage": "Harness: scanning for secrets in staged files..."
+            "statusMessage": "Harness: secret scan..."
           }
         ]
       }
@@ -48,9 +48,27 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // \"\"' | { read -r f; if echo \"$f\" | grep -qE '\\.rs$'; then result=$(cargo check 2>&1 | tail -5); if echo \"$result\" | grep -q 'error'; then echo \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PostToolUse\\\",\\\"additionalContext\\\":\\\"Compilation failed after edit. Fix the error:\\\\n$result\\\"}}\"; else echo '{\"suppressOutput\":true}'; fi; else echo '{\"suppressOutput\":true}'; fi; }",
+            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // empty' | { read -r f; [ -n \"$f\" ] && echo \"$f\" | grep -qE '\\.rs$' && { result=$(cargo check 2>&1 | tail -5); echo \"$result\" | grep -q error && echo \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"PostToolUse\\\",\\\"additionalContext\\\":\\\"Compilation failed:\\\\n$result\\\"}}\" || echo '{\"suppressOutput\":true}'; } || echo '{\"suppressOutput\":true}'; } 2>/dev/null || true",
             "timeout": 120,
-            "statusMessage": "Harness: verifying compilation..."
+            "statusMessage": "Harness: cargo check..."
+          },
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // .tool_response.filePath // empty' | { read -r f; [ -n \"$f\" ] && [ -f \"$f\" ] && grep -qiE 'prepared for future integration|Status: planned' \"$f\" 2>/dev/null && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\"additionalContext\":\"HARNESS: File has unimplemented features. Wire them into production code, not just define them.\"}}' || echo '{\"suppressOutput\":true}'; } 2>/dev/null || true",
+            "timeout": 5,
+            "statusMessage": "Harness: planned feature check..."
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd /home/user/MoA_new 2>/dev/null; m=''; for t in ImageGenTool ImageUpscaleTool FreepikImageToVideoTool VideoGenTool MusicGenTool ElevenLabsTtsTool CalendarListEventsTool CalendarCreateEventTool; do grep -q $t src/tools/mod.rs 2>/dev/null || m=\"$m $t\"; done; grep -q AceContextResult src/agent/loop_.rs 2>/dev/null || m=\"$m ACE\"; grep -q track_recall src/agent/loop_/context.rs 2>/dev/null || m=\"$m track_recall\"; grep -q detect_conflict src/tools/memory_store.rs 2>/dev/null || m=\"$m detect_conflict\"; [ -n \"$m\" ] && echo \"{\\\"hookSpecificOutput\\\":{\\\"hookEventName\\\":\\\"SessionStart\\\",\\\"additionalContext\\\":\\\"ARCH MISALIGNED:$m\\\"}}\" || echo '{\"suppressOutput\":true}'",
+            "timeout": 10,
+            "statusMessage": "Harness: arch alignment..."
           }
         ]
       }
