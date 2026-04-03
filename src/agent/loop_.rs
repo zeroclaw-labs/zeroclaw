@@ -2778,12 +2778,34 @@ pub async fn run(
             String::new()
         };
         let context = format!("{mem_context}{cross_session_context}{hw_context}");
+
+        // ACE Layer 3: Budget guard — trim context if it exceeds the character budget.
+        // Preserves the most recent/relevant context, trims oldest parts.
+        let ace_budget = config.agent.session.ace_total_budget_chars;
+        let context_chars = context.chars().count();
+        let (context, trimmed_notice) = if context_chars > ace_budget && ace_budget > 0 {
+            // Keep the last ace_budget chars (most recent = most relevant)
+            let trimmed: String = context.chars().skip(context_chars - ace_budget).collect();
+            let notice = format!(
+                "\n💡 과거 기억 중 일부({} → {}자로 축소)가 이번 대화에 포함되지 않았습니다. \
+                 추가로 검색이 필요하면 \"기억 검색해줘\"라고 말씀해주세요.\n",
+                context_chars, ace_budget
+            );
+            (trimmed, Some(notice))
+        } else {
+            (context, None)
+        };
+
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
+        let mut enriched = if context.is_empty() {
             format!("[{now}] {msg}")
         } else {
             format!("{context}[{now}] {msg}")
         };
+        // Append trimmed memory notice so the LLM can inform the user
+        if let Some(notice) = trimmed_notice {
+            enriched.push_str(&notice);
+        }
 
         let mut history = vec![
             ChatMessage::system(&system_prompt),
