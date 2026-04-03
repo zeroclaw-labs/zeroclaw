@@ -58,6 +58,8 @@ pub struct SkillTool {
     pub command: String,
     #[serde(default)]
     pub args: HashMap<String, String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 /// Skill manifest parsed from SKILL.toml

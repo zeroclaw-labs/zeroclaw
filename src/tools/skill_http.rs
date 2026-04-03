@@ -20,6 +20,7 @@ pub struct SkillHttpTool {
     tool_description: String,
     url_template: String,
     args: HashMap<String, String>,
+    headers: HashMap<String, String>,
 }
 
 impl SkillHttpTool {
@@ -33,6 +34,7 @@ impl SkillHttpTool {
             tool_description: tool.description.clone(),
             url_template: tool.command.clone(),
             args: tool.args.clone(),
+            headers: tool.headers.clone(),
         }
     }
 
@@ -106,7 +108,23 @@ impl Tool for SkillHttpTool {
             .build()
             .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {e}"))?;
 
-        let response = match client.get(&url).send().await {
+        let mut request = client.get(&url);
+        for (key, value) in &self.headers {
+            let value_substituted = {
+                let mut v = value.clone();
+                if let Some(obj) = args.as_object() {
+                    for (arg_key, arg_val) in obj {
+                        let placeholder = format!("{{{{{}}}}}", arg_key);
+                        let replacement = arg_val.as_str().unwrap_or_default();
+                        v = v.replace(&placeholder, replacement);
+                    }
+                }
+                v
+            };
+            request = request.header(key, value_substituted);
+        }
+
+        let response = match request.send().await {
             Ok(resp) => resp,
             Err(e) => {
                 return Ok(ToolResult {
