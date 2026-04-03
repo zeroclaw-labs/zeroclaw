@@ -77,6 +77,8 @@ pub(crate) fn fast_trim_tool_results(
 
 /// Emergency: drop oldest non-system, non-recent messages from history.
 /// Returns number of messages dropped.
+/// Avoids orphaning tool_use/tool_result pairs by also removing any
+/// consecutive tool results that follow the removed assistant message.
 pub(crate) fn emergency_history_trim(
     history: &mut Vec<crate::providers::ChatMessage>,
     keep_recent: usize,
@@ -88,8 +90,16 @@ pub(crate) fn emergency_history_trim(
         if history[i].role == "system" {
             i += 1;
         } else {
+            // If removing an assistant message, also remove its following tool results
+            let is_assistant = history[i].role == "assistant";
             history.remove(i);
             dropped += 1;
+            if is_assistant {
+                while i < history.len().saturating_sub(keep_recent) && history[i].role == "tool" {
+                    history.remove(i);
+                    dropped += 1;
+                }
+            }
         }
     }
     dropped
@@ -109,6 +119,8 @@ pub(crate) fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
+/// After trimming, repairs any orphaned tool_use/tool_result pairs at the boundary
+/// to prevent Anthropic API 400 errors.
 pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
@@ -124,7 +136,16 @@ pub(crate) fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 
     let start = if has_system { 1 } else { 0 };
     let to_remove = non_system_count - max_history;
-    history.drain(start..start + to_remove);
+    let mut drain_end = start + to_remove;
+
+    // Extend drain to avoid orphaning tool results at the boundary.
+    // If the first kept message is a "tool" result, it belongs to an assistant
+    // tool_call that we just drained — remove it (and any consecutive tool results) too.
+    while drain_end < history.len() && history[drain_end].role == "tool" {
+        drain_end += 1;
+    }
+
+    history.drain(start..drain_end);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,4 +190,100 @@ pub(crate) fn save_interactive_session_history(path: &Path, history: &[ChatMessa
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
     std::fs::write(path, payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trim_history_skips_orphaned_tool_results() {
+        // Simulate: system, user, assistant (tool_call), tool (result), user, assistant
+        // When trimming removes the assistant with tool_call, it must also remove
+        // the following tool result to avoid orphaned tool_use/tool_result pairs.
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q1"),
+            ChatMessage::assistant("calling tool"),
+            ChatMessage {
+                role: "tool".into(),
+                content: "tool result".into(),
+            },
+            ChatMessage::user("q2"),
+            ChatMessage::assistant("final answer"),
+        ];
+        // max_history=2 means keep 2 non-system messages => need to remove 4
+        // drain starts at 1, removes indices 1..5
+        trim_history(&mut history, 2);
+
+        // No message with role "tool" should be the first non-system message
+        for msg in &history[1..] {
+            if msg.role == "tool" {
+                // A tool message is only valid if preceded by an assistant message
+                panic!("orphaned tool result found after trim: {:?}", msg.content);
+            }
+            break; // only need to check the first non-system message
+        }
+    }
+
+    #[test]
+    fn trim_history_removes_consecutive_orphaned_tool_results() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("old"),
+            ChatMessage::assistant("calling tools"),
+            ChatMessage {
+                role: "tool".into(),
+                content: "result 1".into(),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "result 2".into(),
+            },
+            ChatMessage::user("new q"),
+            ChatMessage::assistant("new answer"),
+        ];
+        // Keep 2 => remove 5 non-system, but there are only 6 non-system,
+        // so drain would cut at index 5 (= "new q"), leaving tool results.
+        // With fix: drain extends past the tool results at boundary.
+        trim_history(&mut history, 3);
+
+        // First non-system message should not be a tool result
+        assert_ne!(
+            history.get(1).map(|m| m.role.as_str()),
+            Some("tool"),
+            "first non-system message after trim should not be an orphaned tool result"
+        );
+    }
+
+    #[test]
+    fn emergency_trim_does_not_orphan_tool_results() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q1"),
+            ChatMessage::assistant("calling tool"),
+            ChatMessage {
+                role: "tool".into(),
+                content: "result".into(),
+            },
+            ChatMessage::user("q2"),
+            ChatMessage::assistant("answer"),
+            ChatMessage::user("q3"),
+            ChatMessage::assistant("answer2"),
+            ChatMessage::user("q4"),
+            ChatMessage::assistant("answer3"),
+        ];
+        emergency_history_trim(&mut history, 2);
+
+        // Verify no tool message exists without a preceding assistant message
+        for i in 1..history.len() {
+            if history[i].role == "tool" {
+                assert_eq!(
+                    history[i - 1].role,
+                    "assistant",
+                    "tool result at index {i} has no preceding assistant message"
+                );
+            }
+        }
+    }
 }
