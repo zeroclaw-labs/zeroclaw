@@ -1326,7 +1326,8 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
 }
 
 fn supports_live_model_fetch(provider_name: &str) -> bool {
-    if provider_name.trim().starts_with("custom:") {
+    let provider_name = provider_name.trim();
+    if provider_name.starts_with("custom:") || provider_name.starts_with("anthropic-custom:") {
         return true;
     }
 
@@ -1507,6 +1508,46 @@ async fn fetch_openai_compatible_models(
     Ok(parse_openai_compatible_model_ids(&payload))
 }
 
+async fn fetch_anthropic_compatible_models(
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>> {
+    let Some(api_key) = api_key else {
+        bail!("Anthropic-compatible model fetch requires API key or OAuth token");
+    };
+
+    let client = build_model_fetch_client()?;
+    let mut request = client
+        .get(endpoint)
+        .header("anthropic-version", "2023-06-01");
+
+    if api_key.starts_with("sk-ant-oat01-") {
+        request = request
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("anthropic-beta", "oauth-2025-04-20");
+    } else {
+        request = request.header("x-api-key", api_key);
+    }
+
+    let response = request
+        .send()
+        .await
+        .with_context(|| format!("model fetch failed: GET {endpoint}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        bail!("Anthropic-compatible model list request failed (HTTP {status}): {body}");
+    }
+
+    let payload: Value = response
+        .json()
+        .await
+        .context("failed to parse Anthropic-compatible model list response")?;
+
+    Ok(parse_openai_compatible_model_ids(&payload))
+}
+
 async fn fetch_openrouter_models(api_key: Option<&str>) -> Result<Vec<String>> {
     let client = build_model_fetch_client()?;
     let mut request = client.get("https://openrouter.ai/api/v1/models");
@@ -1634,7 +1675,10 @@ fn resolve_live_models_endpoint(
     provider_name: &str,
     provider_api_url: Option<&str>,
 ) -> Option<String> {
-    if let Some(raw_base) = provider_name.strip_prefix("custom:") {
+    if let Some(raw_base) = provider_name
+        .strip_prefix("custom:")
+        .or_else(|| provider_name.strip_prefix("anthropic-custom:"))
+    {
         let normalized = raw_base.trim().trim_end_matches('/');
         if normalized.is_empty() {
             return None;
@@ -1741,10 +1785,21 @@ async fn fetch_live_models_for_provider(
             if let Some(endpoint) =
                 resolve_live_models_endpoint(requested_provider_name, provider_api_url)
             {
-                let allow_unauthenticated =
-                    allows_unauthenticated_model_fetch(requested_provider_name);
-                fetch_openai_compatible_models(&endpoint, api_key.as_deref(), allow_unauthenticated)
+                if requested_provider_name
+                    .trim()
+                    .starts_with("anthropic-custom:")
+                {
+                    fetch_anthropic_compatible_models(&endpoint, api_key.as_deref()).await?
+                } else {
+                    let allow_unauthenticated =
+                        allows_unauthenticated_model_fetch(requested_provider_name);
+                    fetch_openai_compatible_models(
+                        &endpoint,
+                        api_key.as_deref(),
+                        allow_unauthenticated,
+                    )
                     .await?
+                }
             } else {
                 Vec::new()
             }
@@ -2337,7 +2392,7 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
         "🏠 Local / private (Ollama, llama.cpp server, vLLM — no API key needed)",
-        "🔧 Custom — bring your own OpenAI-compatible API",
+        "🔧 Custom — bring your own OpenAI- or Anthropic-compatible API",
     ];
 
     let tier_idx = Select::new()
@@ -2430,32 +2485,79 @@ async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String,
         println!(
             "  {} {}",
             style("Custom Provider Setup").white().bold(),
-            style("— any OpenAI-compatible API").dim()
+            style("— any OpenAI-compatible or Anthropic-compatible API").dim()
         );
-        print_bullet("ZeroClaw works with ANY API that speaks the OpenAI chat completions format.");
-        print_bullet("Examples: LiteLLM, LocalAI, vLLM, text-generation-webui, LM Studio, etc.");
+        let custom_provider_types = [
+            "OpenAI-compatible endpoint (custom:<URL>)",
+            "Anthropic-compatible endpoint (anthropic-custom:<URL>)",
+        ];
+        let custom_provider_idx = Select::new()
+            .with_prompt("  Select custom provider type")
+            .items(custom_provider_types)
+            .default(0)
+            .interact()?;
+
+        let (provider_prefix, base_url_prompt, key_prompt, model_prompt, model_default) =
+            if custom_provider_idx == 0 {
+                (
+                    "custom",
+                    "  API base URL (e.g. http://localhost:1234 or https://my-api.com)",
+                    "  API key (or Enter to skip if not needed)",
+                    "  Model name (e.g. llama3, gpt-4o, mistral)",
+                    "default",
+                )
+            } else {
+                (
+                    "anthropic-custom",
+                    "  API base URL (e.g. https://my-anthropic-proxy.com/v1)",
+                    "  API key or OAuth setup-token",
+                    "  Model name (e.g. claude-sonnet-4-5-20250929)",
+                    "claude-sonnet-4-5-20250929",
+                )
+            };
+
+        if custom_provider_idx == 0 {
+            print_bullet(
+                "ZeroClaw works with ANY API that speaks the OpenAI chat completions format.",
+            );
+            print_bullet(
+                "Examples: LiteLLM, LocalAI, vLLM, text-generation-webui, LM Studio, etc.",
+            );
+        } else {
+            print_bullet(
+                "ZeroClaw can target any endpoint compatible with Anthropic's messages/models APIs.",
+            );
+        }
         println!();
 
-        let base_url: String = Input::new()
-            .with_prompt("  API base URL (e.g. http://localhost:1234 or https://my-api.com)")
-            .interact_text()?;
+        let base_url: String = Input::new().with_prompt(base_url_prompt).interact_text()?;
 
         let base_url = base_url.trim().trim_end_matches('/').to_string();
         if base_url.is_empty() {
             anyhow::bail!("Custom provider requires a base URL.");
         }
+        let parsed = reqwest::Url::parse(&base_url)
+            .context("Custom provider base URL must be a valid URL")?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            anyhow::bail!("Custom provider base URL must use http:// or https://");
+        }
 
         let api_key: String = Input::new()
-            .with_prompt("  API key (or Enter to skip if not needed)")
-            .allow_empty(true)
+            .with_prompt(key_prompt)
+            .allow_empty(custom_provider_idx == 0)
             .interact_text()?;
+        if custom_provider_idx == 1 && api_key.trim().is_empty() {
+            anyhow::bail!(
+                "Anthropic-compatible custom provider requires an API key or OAuth setup-token."
+            );
+        }
 
         let model: String = Input::new()
-            .with_prompt("  Model name (e.g. llama3, gpt-4o, mistral)")
-            .default("default")
+            .with_prompt(model_prompt)
+            .default(model_default)
             .interact_text()?;
 
-        let provider_name = format!("custom:{base_url}");
+        let provider_name = format!("{provider_prefix}:{base_url}");
 
         println!(
             "  {} Provider: {} | Model: {}",
@@ -3073,6 +3175,10 @@ fn local_provider_choices() -> Vec<(&'static str, &'static str)> {
 
 /// Map provider name to its conventional env var
 fn provider_env_var(name: &str) -> &'static str {
+    if name.trim().starts_with("anthropic-custom:") {
+        return "ANTHROPIC_API_KEY";
+    }
+
     if canonical_provider_name(name) == "qwen-code" {
         return "QWEN_OAUTH_TOKEN";
     }
@@ -7248,6 +7354,12 @@ mod tests {
     fn supports_live_model_fetch_for_supported_and_unsupported_providers() {
         assert!(supports_live_model_fetch("openai"));
         assert!(supports_live_model_fetch("anthropic"));
+        assert!(supports_live_model_fetch(
+            "custom:https://proxy.example.com/v1"
+        ));
+        assert!(supports_live_model_fetch(
+            "anthropic-custom:https://proxy.example.com/v1"
+        ));
         assert!(supports_live_model_fetch("gemini"));
         assert!(supports_live_model_fetch("google"));
         assert!(supports_live_model_fetch("grok"));
@@ -7436,6 +7548,10 @@ mod tests {
         );
         assert_eq!(
             resolve_live_models_endpoint("custom:https://proxy.example.com/v1/models", None),
+            Some("https://proxy.example.com/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("anthropic-custom:https://proxy.example.com/v1", None),
             Some("https://proxy.example.com/v1/models".to_string())
         );
     }
@@ -7641,6 +7757,10 @@ mod tests {
     fn provider_env_var_known_providers() {
         assert_eq!(provider_env_var("openrouter"), "OPENROUTER_API_KEY");
         assert_eq!(provider_env_var("anthropic"), "ANTHROPIC_API_KEY");
+        assert_eq!(
+            provider_env_var("anthropic-custom:https://proxy.example.com/v1"),
+            "ANTHROPIC_API_KEY"
+        );
         assert_eq!(provider_env_var("openai-codex"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("openai"), "OPENAI_API_KEY");
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
