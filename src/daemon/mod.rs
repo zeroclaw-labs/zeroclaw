@@ -54,6 +54,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     crate::health::mark_component_ok("daemon");
 
+    // Shared broadcast channel so all daemon components (gateway, cron,
+    // heartbeat) can publish real-time events to dashboard clients.
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+
     if config.heartbeat.enabled {
         let _ =
             crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir)
@@ -65,6 +69,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
+        let gateway_event_tx = event_tx.clone();
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -72,7 +77,10 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { Box::pin(crate::gateway::run_gateway(&host, port, cfg)).await }
+                let tx = gateway_event_tx.clone();
+                async move {
+                    Box::pin(crate::gateway::run_gateway(&host, port, cfg, Some(tx))).await
+                }
             },
         ));
     }
@@ -126,13 +134,15 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     if config.cron.enabled {
         let scheduler_cfg = config.clone();
+        let scheduler_event_tx = event_tx.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
             initial_backoff,
             max_backoff,
             move || {
                 let cfg = scheduler_cfg.clone();
-                async move { Box::pin(crate::cron::scheduler::run(cfg)).await }
+                let tx = scheduler_event_tx.clone();
+                async move { Box::pin(crate::cron::scheduler::run(cfg, Some(tx))).await }
             },
         ));
     } else {
@@ -280,17 +290,25 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                             } else {
                                 continue;
                             };
-                        let _ = crate::cron::scheduler::deliver_announcement(
+                        let delivery_fut = crate::cron::scheduler::deliver_announcement(
                             &dm_config, &channel, &target, &alert,
-                        )
-                        .await;
+                        );
+                        match tokio::time::timeout(Duration::from_secs(30), delivery_fut).await {
+                            Ok(Err(e)) => {
+                                tracing::warn!("Deadman alert delivery failed: {e}");
+                            }
+                            Err(_) => {
+                                tracing::warn!("Deadman alert delivery timed out (30s)");
+                            }
+                            Ok(Ok(())) => {}
+                        }
                     }
                 }
             }
         });
     }
 
-    let base_interval = config.heartbeat.interval_minutes.max(5);
+    let base_interval = config.heartbeat.interval_minutes.max(1);
     let mut sleep_mins = base_interval;
 
     loop {
@@ -335,7 +353,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 "[Heartbeat Task | decision] {}",
                 HeartbeatEngine::build_decision_prompt(&tasks),
             );
-            match Box::pin(crate::agent::run(
+            let phase1_fut = Box::pin(crate::agent::run(
                 config.clone(),
                 Some(decision_prompt),
                 None,
@@ -345,9 +363,24 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
-            ))
-            .await
-            {
+            ));
+            let phase1_result = if config.heartbeat.task_timeout_secs > 0 {
+                match tokio::time::timeout(
+                    Duration::from_secs(config.heartbeat.task_timeout_secs),
+                    phase1_fut,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Phase 1 decision timed out ({}s)",
+                        config.heartbeat.task_timeout_secs
+                    )),
+                }
+            } else {
+                phase1_fut.await
+            };
+            match phase1_result {
                 Ok(response) => {
                     let indices = HeartbeatEngine::parse_decision_response(&response, tasks.len());
                     if indices.is_empty() {
@@ -424,7 +457,7 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 (None, None) => task_prompt,
             };
             let temp = config.default_temperature;
-            match Box::pin(crate::agent::run(
+            let phase2_fut = Box::pin(crate::agent::run(
                 config.clone(),
                 Some(prompt),
                 None,
@@ -434,9 +467,24 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 false,
                 None,
                 None,
-            ))
-            .await
-            {
+            ));
+            let phase2_result = if config.heartbeat.task_timeout_secs > 0 {
+                match tokio::time::timeout(
+                    Duration::from_secs(config.heartbeat.task_timeout_secs),
+                    phase2_fut,
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Heartbeat task timed out ({}s)",
+                        config.heartbeat.task_timeout_secs
+                    )),
+                }
+            } else {
+                phase2_fut.await
+            };
+            match phase2_result {
                 Ok(output) => {
                     crate::health::mark_component_ok("heartbeat");
                     #[allow(clippy::cast_possible_truncation)]
@@ -484,19 +532,32 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                         output
                     };
                     if let Some((channel, target)) = &delivery {
-                        if let Err(e) = crate::cron::scheduler::deliver_announcement(
-                            &config,
-                            channel,
-                            target,
-                            &announcement,
+                        let delivery_result = tokio::time::timeout(
+                            Duration::from_secs(30),
+                            crate::cron::scheduler::deliver_announcement(
+                                &config,
+                                channel,
+                                target,
+                                &announcement,
+                            ),
                         )
-                        .await
-                        {
-                            crate::health::mark_component_error(
-                                "heartbeat",
-                                format!("delivery failed: {e}"),
-                            );
-                            tracing::warn!("Heartbeat delivery failed: {e}");
+                        .await;
+                        match delivery_result {
+                            Ok(Err(e)) => {
+                                crate::health::mark_component_error(
+                                    "heartbeat",
+                                    format!("delivery failed: {e}"),
+                                );
+                                tracing::warn!("Heartbeat delivery failed: {e}");
+                            }
+                            Err(_) => {
+                                crate::health::mark_component_error(
+                                    "heartbeat",
+                                    "delivery timed out (30s)".to_string(),
+                                );
+                                tracing::warn!("Heartbeat delivery timed out (30s)");
+                            }
+                            Ok(Ok(())) => {}
                         }
                     }
                 }
