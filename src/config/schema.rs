@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
@@ -8894,6 +8894,31 @@ fn read_codex_openai_api_key() -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn known_top_level_config_keys() -> &'static HashSet<String> {
+    static KNOWN_KEYS: OnceLock<HashSet<String>> = OnceLock::new();
+    KNOWN_KEYS.get_or_init(|| {
+        let mut keys: HashSet<String> = serde_json::to_value(schemars::schema_for!(Config))
+            .ok()
+            .and_then(|schema_json| {
+                schema_json
+                    .get("properties")
+                    .and_then(serde_json::Value::as_object)
+                    .map(|properties| properties.keys().cloned().collect())
+            })
+            .unwrap_or_default();
+
+        // JSON Schema exposes canonical field names, but serde aliases remain
+        // accepted in config TOML and should not trigger unknown-key warnings.
+        keys.extend(
+            ["model_provider", "model", "mcpServers"]
+                .into_iter()
+                .map(String::from),
+        );
+
+        keys
+    })
+}
+
 /// Ensure that essential bootstrap files exist in the workspace directory.
 ///
 /// When the workspace is created outside of `zeroclaw onboard` (e.g., non-tty
@@ -9005,16 +9030,7 @@ impl Config {
             // This replaces the previous serde_ignored-based approach which
             // had false-positive issues with #[serde(default)] nested structs.
             if let Ok(raw) = contents.parse::<toml::Table>() {
-                // Build the set of known top-level keys from a default Config
-                // serialization round-trip.  This is computed once and cached.
-                static KNOWN_KEYS: OnceLock<Vec<String>> = OnceLock::new();
-                let known = KNOWN_KEYS.get_or_init(|| {
-                    toml::to_string(&Config::default())
-                        .ok()
-                        .and_then(|s| s.parse::<toml::Table>().ok())
-                        .map(|t| t.keys().cloned().collect())
-                        .unwrap_or_default()
-                });
+                let known = known_top_level_config_keys();
                 for key in raw.keys() {
                     if !known.contains(key) {
                         tracing::warn!(
@@ -11210,6 +11226,154 @@ mod tests {
                 .is_some(),
             "schema should include reusable type definitions"
         );
+    }
+
+    #[test]
+    async fn unknown_key_detector_knows_optional_top_level_fields_and_aliases() {
+        let known = known_top_level_config_keys();
+
+        for key in [
+            "api_key",
+            "api_url",
+            "api_path",
+            "provider_max_tokens",
+            "locale",
+            "conversational_ai",
+            "model_provider",
+            "model",
+            "mcpServers",
+        ] {
+            assert!(
+                known.contains(key),
+                "unknown-key detector should treat {key:?} as valid"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::large_futures)]
+    async fn load_or_init_does_not_warn_for_optional_keys_or_top_level_aliases() {
+        let _env_guard = env_override_lock().await;
+        let temp_home =
+            std::env::temp_dir().join(format!("zeroclaw_test_home_{}", uuid::Uuid::new_v4()));
+        let workspace_dir = temp_home.join("profile-a");
+        let config_path = workspace_dir.join("config.toml");
+        let isolated_env_keys = [
+            "ZEROCLAW_API_KEY",
+            "API_KEY",
+            "ZEROCLAW_PROVIDER",
+            "PROVIDER",
+            "ZEROCLAW_MODEL_PROVIDER",
+            "ZEROCLAW_MODEL",
+            "MODEL",
+            "OPENAI_API_KEY",
+        ];
+
+        fs::create_dir_all(&workspace_dir).await.unwrap();
+        fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+api_key = "sk-test-key"
+api_url = "https://example.invalid/v1"
+model_provider = "sub2api"
+model = "gpt-5.3-codex"
+bogus_key = true
+
+[model_providers.sub2api]
+name = "sub2api"
+base_url = "https://api.tonsof.blue/v1"
+wire_api = "responses"
+requires_openai_auth = true
+
+[mcpServers]
+enabled = true
+"#,
+        )
+        .await
+        .unwrap();
+
+        let original_home = std::env::var("HOME").ok();
+        let original_env: Vec<(&str, Option<String>)> = isolated_env_keys
+            .into_iter()
+            .map(|key| (key, std::env::var(key).ok()))
+            .collect();
+        for key in isolated_env_keys {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var(key) };
+        }
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("HOME", &temp_home) };
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("ZEROCLAW_WORKSPACE", &workspace_dir) };
+
+        let capture = SharedLogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+
+        let config = Box::pin(Config::load_or_init()).await.unwrap();
+
+        drop(guard);
+        let logs = capture.captured();
+
+        assert_eq!(config.api_key.as_deref(), Some("sk-test-key"));
+        assert_eq!(
+            config.api_url.as_deref(),
+            Some("https://example.invalid/v1")
+        );
+        assert_eq!(config.default_model.as_deref(), Some("gpt-5.3-codex"));
+        assert!(config.model_providers.contains_key("sub2api"));
+        assert!(config.mcp.enabled);
+        assert!(
+            !logs.contains(r#"Unknown config key ignored: "api_key""#),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains(r#"Unknown config key ignored: "api_url""#),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains(r#"Unknown config key ignored: "model_provider""#),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains(r#"Unknown config key ignored: "model""#),
+            "{logs}"
+        );
+        assert!(
+            !logs.contains(r#"Unknown config key ignored: "mcpServers""#),
+            "{logs}"
+        );
+        assert!(
+            logs.contains(r#"Unknown config key ignored: "bogus_key""#),
+            "{logs}"
+        );
+
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_WORKSPACE") };
+        if let Some(home) = original_home {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::set_var("HOME", home) };
+        } else {
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var("HOME") };
+        }
+        for (key, value) in original_env {
+            if let Some(value) = value {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(key, value) };
+            } else {
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(key) };
+            }
+        }
+        let _ = fs::remove_dir_all(temp_home).await;
     }
 
     #[cfg(unix)]
