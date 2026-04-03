@@ -420,6 +420,23 @@ zeroclaw agent --provider openai-codex -m "hello"
 zeroclaw agent --provider anthropic -m "hello"
 ```
 
+For standard OpenAI Codex subscription auth, keep `config.toml` minimal:
+
+```toml
+default_provider = "openai-codex"
+default_model = "gpt-5-codex"
+```
+
+Notes:
+
+- Normal OpenAI Codex subscription auth uses stored auth profiles,
+  not top-level `api_key` / `api_url`.
+- Only set `api_key` / `api_url` when intentionally targeting a
+  custom OpenAI-compatible gateway or endpoint.
+- If you see `provider streaming failed, falling back to non-streaming
+  chat`, ZeroClaw retries the same request in non-streaming mode.
+  Check `zeroclaw auth status` before changing provider config.
+
 ## Agent workspace + skills
 
 Workspace root: `~/.zeroclaw/workspace/` (configurable via config).

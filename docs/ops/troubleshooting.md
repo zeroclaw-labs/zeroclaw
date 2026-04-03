@@ -142,6 +142,38 @@ Persist in your shell profile if needed.
 
 ## Runtime / Gateway
 
+### OpenAI Codex subscription auth warns about config or streaming
+
+Symptoms:
+
+- `default_provider = "openai-codex"` is set, but runs still feel misconfigured
+- config loading warns about unknown top-level `api_key` / `api_url`
+- agent logs `provider streaming failed, falling back to non-streaming chat`
+
+Checks:
+
+```bash
+zeroclaw auth status
+zeroclaw auth login --provider openai-codex --device-code
+zeroclaw agent --provider openai-codex -m "hello"
+```
+
+Use this minimal `config.toml` shape for normal subscription auth:
+
+```toml
+default_provider = "openai-codex"
+default_model = "gpt-5-codex"
+```
+
+Notes:
+
+- Standard OpenAI Codex subscription auth uses stored auth profiles,
+  so top-level `api_key` / `api_url` should usually stay unset.
+- `api_key` / `api_url` are only needed for custom OpenAI-compatible
+  gateways or other explicit endpoint overrides.
+- The streaming fallback warning by itself is not an auth failure;
+  ZeroClaw retries the request in non-streaming mode.
+
 ### Gateway unreachable
 
 Checks:
@@ -201,6 +233,14 @@ Checks:
 ```bash
 zeroclaw service status
 ```
+
+There is no `zeroclaw service logs` command. If the service is
+installed, inspect platform logs instead:
+
+- Linux: `journalctl --user -u zeroclaw.service -f`
+- macOS: `log stream --predicate 'process == "zeroclaw"'`
+- If you are running `zeroclaw daemon` directly in a terminal, use
+  that foreground output instead of service log commands.
 
 Recovery:
 
