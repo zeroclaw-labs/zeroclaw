@@ -184,7 +184,20 @@ impl SessionBackend for SqliteSessionBackend {
             Err(_) => return Vec::new(),
         };
 
-        rows.filter_map(|r| r.ok()).collect()
+        let mut messages: Vec<ChatMessage> = rows.filter_map(|r| r.ok()).collect();
+
+        // Repair any orphaned tool messages left by previous history trimming
+        // or context compression bugs to prevent Anthropic API 400 errors.
+        let repaired = crate::agent::history::repair_tool_pairs(&mut messages);
+        if repaired > 0 {
+            tracing::warn!(
+                repaired,
+                session_key,
+                "Removed orphaned tool messages from restored session"
+            );
+        }
+
+        messages
     }
 
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {

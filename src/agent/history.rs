@@ -105,6 +105,32 @@ pub(crate) fn emergency_history_trim(
     dropped
 }
 
+/// Remove orphaned tool messages from history.
+///
+/// A `tool` message is orphaned if the message immediately before it is not
+/// an `assistant` message (which would contain the corresponding `tool_use`).
+/// This can happen after history trimming, context compression, or session
+/// restore from a corrupted state. Returns the number of messages removed.
+pub(crate) fn repair_tool_pairs(history: &mut Vec<ChatMessage>) -> usize {
+    let mut removed = 0;
+    let mut i = 0;
+    while i < history.len() {
+        if history[i].role == "tool" {
+            let prev_is_assistant = i > 0 && history[i - 1].role == "assistant";
+            let prev_is_tool = i > 0 && history[i - 1].role == "tool";
+            // A tool result is valid if preceded by assistant (first result) or
+            // another tool (consecutive results from the same tool_use turn).
+            if !prev_is_assistant && !prev_is_tool {
+                history.remove(i);
+                removed += 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    removed
+}
+
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 pub(crate) fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
@@ -283,5 +309,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn repair_tool_pairs_removes_leading_orphan() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage {
+                role: "tool".into(),
+                content: "orphaned result".into(),
+            },
+            ChatMessage::user("hello"),
+        ];
+        let removed = repair_tool_pairs(&mut history);
+        assert_eq!(removed, 1);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].role, "user");
+    }
+
+    #[test]
+    fn repair_tool_pairs_keeps_valid_pairs() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q"),
+            ChatMessage::assistant("calling tool"),
+            ChatMessage {
+                role: "tool".into(),
+                content: "result 1".into(),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "result 2".into(),
+            },
+            ChatMessage::user("thanks"),
+        ];
+        let removed = repair_tool_pairs(&mut history);
+        assert_eq!(removed, 0);
+        assert_eq!(history.len(), 6);
+    }
+
+    #[test]
+    fn repair_tool_pairs_removes_orphan_after_user() {
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("q"),
+            ChatMessage {
+                role: "tool".into(),
+                content: "orphaned".into(),
+            },
+            ChatMessage::assistant("answer"),
+        ];
+        let removed = repair_tool_pairs(&mut history);
+        assert_eq!(removed, 1);
+        assert_eq!(history.len(), 3);
     }
 }
