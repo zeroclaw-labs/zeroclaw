@@ -188,6 +188,9 @@ impl Observer for ChannelNotifyObserver {
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
 /// Senders that requested `/new` and must force a fresh prompt on their next message.
 type PendingNewSessionSet = Arc<Mutex<HashSet<String>>>;
+/// Maps history_key → session UUID for OpenRouter log grouping.
+/// Regenerated on `/new` so each conversation gets a distinct session.
+type ProviderSessionIdMap = Arc<Mutex<HashMap<String, String>>>;
 /// Maximum history messages to keep per sender.
 const MAX_CHANNEL_HISTORY: usize = 50;
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -367,6 +370,7 @@ struct ChannelRuntimeContext {
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
     pending_new_sessions: PendingNewSessionSet,
+    provider_session_ids: ProviderSessionIdMap,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
     api_key: Option<String>,
@@ -1076,6 +1080,26 @@ fn take_pending_new_session(ctx: &ChannelRuntimeContext, sender_key: &str) -> bo
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(sender_key)
+}
+
+/// Return the current provider session UUID for `sender_key`, creating one if absent.
+/// When `force_new` is true the old UUID is replaced so a fresh OpenRouter session begins.
+fn get_or_create_provider_session_id(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    force_new: bool,
+) -> String {
+    let mut map = ctx
+        .provider_session_ids
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if force_new || !map.contains_key(sender_key) {
+        let id = uuid::Uuid::new_v4().to_string();
+        map.insert(sender_key.to_string(), id.clone());
+        id
+    } else {
+        map[sender_key].clone()
+    }
 }
 
 fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -> String {
@@ -2573,6 +2597,10 @@ async fn process_channel_message(
         // older cached turns reappear before this message starts.
         clear_sender_history(ctx.as_ref(), &history_key);
     }
+
+    let provider_session_id =
+        get_or_create_provider_session_id(ctx.as_ref(), &history_key, force_fresh_session);
+    active_provider.set_session_id(Some(&provider_session_id));
 
     let had_prior_history = if force_fresh_session {
         false
@@ -5469,6 +5497,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories: Arc::new(Mutex::new(HashMap::new())),
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
         api_key: config.api_key.clone(),
@@ -5911,6 +5940,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6033,6 +6063,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6111,6 +6142,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6208,6 +6240,7 @@ mod tests {
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6788,6 +6821,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6876,6 +6910,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -6978,6 +7013,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7065,6 +7101,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7162,6 +7199,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7280,6 +7318,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(route_overrides)),
             api_key: None,
@@ -7379,6 +7418,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7491,6 +7531,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7593,6 +7634,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7685,6 +7727,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -7903,6 +7946,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8013,6 +8057,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8142,6 +8187,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8268,6 +8314,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8372,6 +8419,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -8459,6 +8507,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -9245,6 +9294,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -9384,6 +9434,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -9566,6 +9617,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -9681,6 +9733,7 @@ BTC is currently around $65,000 based on latest tool output."#
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(histories)),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10266,6 +10319,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10360,6 +10414,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10488,6 +10543,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10660,6 +10716,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10781,6 +10838,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -10894,6 +10952,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -11027,6 +11086,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
@@ -11301,6 +11361,7 @@ This is an example JSON object for profile settings."#;
             min_relevance_score: 0.0,
             conversation_histories: Arc::new(Mutex::new(HashMap::new())),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        provider_session_ids: Arc::new(Mutex::new(HashMap::new())),
             provider_cache: Arc::new(Mutex::new(HashMap::new())),
             route_overrides: Arc::new(Mutex::new(HashMap::new())),
             api_key: None,
