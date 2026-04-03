@@ -236,7 +236,8 @@ allowed_numbers = ["*"]
 
 Lưu ý:
 
-- Build với `cargo build --features whatsapp-web` (hoặc lệnh run tương đương).
+- Build/chạy với `--features whatsapp-web`.
+- Nếu cài vào PATH, dùng `cargo install --path . --force --locked --features whatsapp-web`.
 - Giữ `session_path` trên bộ nhớ lưu trữ bền vững để tránh phải liên kết lại sau khi khởi động lại.
 - Định tuyến trả lời sử dụng JID của chat nguồn, vì vậy cả trả lời trực tiếp và nhóm đều hoạt động đúng.
 

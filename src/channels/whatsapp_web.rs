@@ -10,6 +10,8 @@
 //! This channel requires the `whatsapp-web` feature flag:
 //! ```sh
 //! cargo build --features whatsapp-web
+//! # If installed to PATH:
+//! cargo install --path . --force --locked --features whatsapp-web
 //! ```
 //!
 //! # Configuration
@@ -1632,14 +1634,16 @@ impl Channel for WhatsAppWebChannel {
     async fn send(&self, _message: &SendMessage) -> Result<()> {
         anyhow::bail!(
             "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web"
+            Enable with: cargo build --features whatsapp-web \
+            (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)"
         );
     }
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
         anyhow::bail!(
             "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web"
+            Enable with: cargo build --features whatsapp-web \
+            (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)"
         );
     }
 
@@ -1650,14 +1654,16 @@ impl Channel for WhatsAppWebChannel {
     async fn start_typing(&self, _recipient: &str) -> Result<()> {
         anyhow::bail!(
             "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web"
+            Enable with: cargo build --features whatsapp-web \
+            (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)"
         );
     }
 
     async fn stop_typing(&self, _recipient: &str) -> Result<()> {
         anyhow::bail!(
             "WhatsApp Web channel requires the 'whatsapp-web' feature. \
-            Enable with: cargo build --features whatsapp-web"
+            Enable with: cargo build --features whatsapp-web \
+            (or, if installed to PATH: cargo install --path . --force --locked --features whatsapp-web)"
         );
     }
 }

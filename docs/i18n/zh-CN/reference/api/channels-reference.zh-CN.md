@@ -255,7 +255,8 @@ allowed_numbers = [\"*\"]
 
 注意事项：
 
-- 使用 `cargo build --features whatsapp-web` 构建（或等效的运行命令）。
+- 构建/运行时请带上 `--features whatsapp-web`。
+- 如果安装到 PATH，请使用 `cargo install --path . --force --locked --features whatsapp-web`。
 - 将 `session_path` 保留在持久存储上，以避免重启后重新链接。
 - 回复路由使用发起聊天的 JID，因此直接和群组回复都能正常工作。
 
