@@ -67,6 +67,8 @@ pub struct DelegateTool {
     multimodal_config: crate::config::MultimodalConfig,
     /// Global delegate tool config providing default timeout values.
     delegate_config: DelegateToolConfig,
+    /// Skills prompt injection mode (from config.skills.prompt_injection_mode).
+    skills_prompt_mode: crate::config::SkillsPromptInjectionMode,
     /// Workspace directory inherited from the root agent context.
     workspace_dir: PathBuf,
     /// Cancellation token for cascade control of background tasks.
@@ -104,6 +106,7 @@ impl DelegateTool {
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
@@ -144,6 +147,7 @@ impl DelegateTool {
             parent_tools: Arc::new(RwLock::new(Vec::new())),
             multimodal_config: crate::config::MultimodalConfig::default(),
             delegate_config: DelegateToolConfig::default(),
+            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
             memory: None,
@@ -165,6 +169,12 @@ impl DelegateTool {
     /// Attach global delegate tool configuration for default timeout values.
     pub fn with_delegate_config(mut self, config: DelegateToolConfig) -> Self {
         self.delegate_config = config;
+        self
+    }
+
+    /// Attach skills prompt injection mode (from config.skills.prompt_injection_mode).
+    pub fn with_skills_prompt_mode(mut self, mode: crate::config::SkillsPromptInjectionMode) -> Self {
+        self.skills_prompt_mode = mode;
         self
     }
 
@@ -1048,7 +1058,7 @@ impl DelegateTool {
             model_name: &agent_config.model,
             tools: sub_tools,
             skills: &skills,
-            skills_prompt_mode: crate::config::SkillsPromptInjectionMode::Full,
+            skills_prompt_mode: self.skills_prompt_mode,
             identity_config: None,
             dispatcher_instructions: "",
             tool_descriptions: None,
