@@ -44,6 +44,61 @@ pub(super) fn require_auth(
     }
 }
 
+// ── Session helpers ──────────────────────────────────────────────
+
+use crate::channels::session_backend::{SessionBackend, SessionMetadata};
+
+/// Extract session_id and channel from session key.
+/// Gateway WebSocket sessions use "gw_" prefix.
+/// Other sessions use "{channel}_{...}" format.
+fn extract_session_info(key: &str) -> (&str, &str) {
+    if let Some(id) = key.strip_prefix("gw_") {
+        (id, "gateway")
+    } else {
+        // Extract channel from "{channel}_{rest}" format
+        let parts: Vec<&str> = key.splitn(2, '_').collect();
+        if parts.len() >= 2 {
+            (key, parts[0])
+        } else {
+            (key, "unknown")
+        }
+    }
+}
+
+/// Map backend session state to frontend status.
+/// Backend: "idle" | "running" | "error" -> Frontend: "idle" | "active" | "closed"
+fn map_session_status(backend_state: Option<&str>) -> &'static str {
+    match backend_state {
+        Some("running") => "active",
+        Some("error") => "closed",
+        _ => "idle",
+    }
+}
+
+/// Convert SessionMetadata to JSON response format.
+fn session_to_json(meta: &SessionMetadata, backend: &dyn SessionBackend) -> serde_json::Value {
+    let (session_id, channel) = extract_session_info(&meta.key);
+    let backend_state = backend
+        .get_session_state(&meta.key)
+        .ok()
+        .flatten()
+        .map(|s| s.state);
+    let status = map_session_status(backend_state.as_deref());
+
+    let mut entry = serde_json::json!({
+        "id": session_id,
+        "channel": channel,
+        "started_at": meta.created_at.to_rfc3339(),
+        "last_activity": meta.last_activity.to_rfc3339(),
+        "status": status,
+        "message_count": meta.message_count,
+    });
+    if let Some(name) = &meta.name {
+        entry["name"] = serde_json::Value::String(name.clone());
+    }
+    entry
+}
+
 // ── Query parameters ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1282,20 +1337,8 @@ pub async fn handle_api_sessions_list(
 
     let all_metadata = backend.list_sessions_with_metadata();
     let gw_sessions: Vec<serde_json::Value> = all_metadata
-        .into_iter()
-        .filter_map(|meta| {
-            let session_id = meta.key.strip_prefix("gw_")?;
-            let mut entry = serde_json::json!({
-                "session_id": session_id,
-                "created_at": meta.created_at.to_rfc3339(),
-                "last_activity": meta.last_activity.to_rfc3339(),
-                "message_count": meta.message_count,
-            });
-            if let Some(name) = meta.name {
-                entry["name"] = serde_json::Value::String(name);
-            }
-            Some(entry)
-        })
+        .iter()
+        .map(|meta| session_to_json(meta, backend.as_ref()))
         .collect();
 
     Json(serde_json::json!({ "sessions": gw_sessions })).into_response()
@@ -1438,16 +1481,8 @@ pub async fn handle_api_sessions_running(
 
     let running = backend.list_running_sessions();
     let sessions: Vec<serde_json::Value> = running
-        .into_iter()
-        .filter_map(|meta| {
-            let session_id = meta.key.strip_prefix("gw_")?;
-            Some(serde_json::json!({
-                "session_id": session_id,
-                "created_at": meta.created_at.to_rfc3339(),
-                "last_activity": meta.last_activity.to_rfc3339(),
-                "message_count": meta.message_count,
-            }))
-        })
+        .iter()
+        .map(|meta| session_to_json(meta, backend.as_ref()))
         .collect();
 
     Json(serde_json::json!({ "sessions": sessions })).into_response()
