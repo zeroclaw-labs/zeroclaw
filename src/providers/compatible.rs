@@ -885,7 +885,15 @@ impl StreamToolCallAccumulator {
         };
 
         Some(ProviderToolCall {
-            id: self.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            id: self.id.unwrap_or_else(|| {
+                use rand::Rng;
+                const CHARSET: &[u8] =
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+                let mut rng = rand::thread_rng();
+                (0..9)
+                    .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
+                    .collect()
+            }),
             name,
             arguments: normalized_arguments,
         })
