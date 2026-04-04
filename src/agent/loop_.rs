@@ -3577,6 +3577,26 @@ pub async fn process_message_with_session(
                     .append_turn("assistant", response, Some("gateway"), Some(sender_id))
                     .await;
             }
+
+            // ── Memory promotion: short-term → Core + ontology ────────
+            // Same as CLI interactive mode (line 2882), but for /api/chat path.
+            // Without this, ontology objects are never created from gateway chat,
+            // and cross-search (Phase 3-4) has no data to work with.
+            if config.memory.auto_save {
+                let ontology_repo =
+                    crate::ontology::OntologyRepo::open(&config.workspace_dir).ok();
+                promote_turn(
+                    &mem,
+                    ontology_repo.as_ref(),
+                    message,
+                    response,
+                    "gateway",
+                    sender_id,
+                    &[],
+                    sender_id,
+                )
+                .await;
+            }
         }
     }
 
