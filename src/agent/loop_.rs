@@ -2000,6 +2000,9 @@ pub(crate) fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, 
 #[derive(Debug, Default)]
 struct StreamedChatOutcome {
     response_text: String,
+    /// Accumulated reasoning/thinking content from the stream (kept separate
+    /// from `response_text` so it is not shown to the user).
+    reasoning_content: Option<String>,
     tool_calls: Vec<ToolCall>,
     forwarded_live_deltas: bool,
 }
@@ -2060,6 +2063,18 @@ async fn consume_provider_streaming_response(
                 // do not affect the agent's tool dispatch loop.
             }
             StreamEvent::TextDelta(chunk) => {
+                // Accumulate reasoning/thinking content separately so it
+                // is not shown to the user but can be passed through in
+                // history for providers that require it.
+                if let Some(ref reasoning) = chunk.reasoning {
+                    if !reasoning.is_empty() {
+                        outcome
+                            .reasoning_content
+                            .get_or_insert_with(String::new)
+                            .push_str(reasoning);
+                    }
+                }
+
                 if chunk.delta.is_empty() {
                     continue;
                 }
@@ -2104,6 +2119,19 @@ async fn consume_provider_streaming_response(
                         delta_sender = None;
                     }
                 }
+            }
+        }
+    }
+
+    // For models that place their actual answer solely in `reasoning_content`
+    // (e.g. Qwen3, GLM-4), use it as the response text when no regular content
+    // was streamed.  Strip `<think>` tags just like the non-streaming path does.
+    if outcome.response_text.is_empty() {
+        if let Some(ref reasoning) = outcome.reasoning_content {
+            let stripped = strip_think_tags(reasoning);
+            if !stripped.is_empty() {
+                outcome.response_text = stripped;
+                outcome.reasoning_content = None;
             }
         }
     }
@@ -2556,7 +2584,7 @@ pub(crate) async fn run_tool_call_loop(
                         text: Some(streamed.response_text),
                         tool_calls: streamed.tool_calls,
                         usage: None,
-                        reasoning_content: None,
+                        reasoning_content: streamed.reasoning_content,
                     })
                 }
                 Err(stream_err) => {
