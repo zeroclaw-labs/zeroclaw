@@ -11562,6 +11562,7 @@ auto_save = true
                 discord_history: None,
                 slack: None,
                 mattermost: None,
+                web: None,
                 webhook: None,
                 imessage: None,
                 matrix: None,
@@ -12587,6 +12588,7 @@ allowed_users = ["@ops:matrix.org"]
             discord_history: None,
             slack: None,
             mattermost: None,
+            web: None,
             webhook: None,
             imessage: Some(IMessageConfig {
                 allowed_contacts: vec!["+1".into()],
@@ -12959,6 +12961,7 @@ channel_ids = ["C123", "D456"]
             discord_history: None,
             slack: None,
             mattermost: None,
+            web: None,
             webhook: None,
             imessage: None,
             matrix: None,

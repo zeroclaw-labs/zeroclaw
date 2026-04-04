@@ -303,11 +303,11 @@ pub async fn handle_ws_connection(
                     }
                 }
             }
-            Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {
+            Some(Ok(Message::Close(_)) | Err(_)) | None => {
                 channel.connection_count.fetch_sub(1, Ordering::Relaxed);
                 return;
             }
-            _ => continue,
+            _ => {}
         }
     };
 
@@ -395,8 +395,8 @@ pub async fn handle_ws_connection(
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    _ => continue,
+                    Some(Ok(Message::Close(_)) | Err(_)) | None => break,
+                    _ => {},
                 }
             }
             msg = broadcast_rx.recv() => {

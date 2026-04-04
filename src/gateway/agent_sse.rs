@@ -79,7 +79,7 @@ struct StreamingTool {
 
 impl StreamingTool {
     fn new(
-        tool: &Box<dyn Tool>,
+        tool: &dyn Tool,
         registry: Arc<Vec<Box<dyn Tool>>>,
         event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> Self {
@@ -275,7 +275,9 @@ pub async fn handle_agent_sse(
         history.push(ChatMessage::system(&prompt));
     }
 
-    let user_message = if !had_prior_history {
+    let user_message = if had_prior_history {
+        message
+    } else {
         let (min_relevance_score, session_id_for_memory) = {
             let config_guard = state.config.lock();
             (config_guard.memory.min_relevance_score, session_id.clone())
@@ -292,8 +294,6 @@ pub async fn handle_agent_sse(
         } else {
             format!("{memory_context}{message}")
         }
-    } else {
-        message
     };
     history.push(ChatMessage::user(&user_message));
 
@@ -374,7 +374,7 @@ pub async fn handle_agent_sse(
             .iter()
             .map(|tool| {
                 Box::new(StreamingTool::new(
-                    tool,
+                    tool.as_ref(),
                     Arc::clone(&tools_registry),
                     event_tx.clone(),
                 )) as Box<dyn Tool>
@@ -386,8 +386,7 @@ pub async fn handle_agent_sse(
         tokio::spawn(async move {
             while let Some(delta) = delta_rx.recv().await {
                 match delta {
-                    DraftEvent::Clear => continue,
-                    DraftEvent::Progress(_) => continue,
+                    DraftEvent::Clear | DraftEvent::Progress(_) => {}
                     DraftEvent::Content(text) => {
                         let _ = event_tx_delta.send(AgentEvent::chunk(text)).await;
                     }
