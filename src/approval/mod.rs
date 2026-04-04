@@ -622,7 +622,7 @@ mod tests {
         let mut config = AutonomyConfig::default();
         config.auto_approve = vec!["jp-stock-analyzer__*".into()];
         let mgr = ApprovalManager::for_non_interactive(&config);
-        
+
         assert!(!mgr.needs_approval("jp-stock-analyzer__get_stats"));
         assert!(!mgr.needs_approval("jp-stock-analyzer__search"));
         assert!(mgr.needs_approval("other_tool"));
