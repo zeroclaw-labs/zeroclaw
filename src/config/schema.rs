@@ -10953,15 +10953,11 @@ async fn sync_directory(path: &Path) -> Result<()> {
 
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-        let dir = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .with_context(|| format!("Failed to open directory for fsync: {}", path.display()))?;
-        dir.sync_all()
-            .with_context(|| format!("Failed to fsync directory metadata: {}", path.display()))?;
+        // Windows does not reliably support fsync on directory handles.
+        // FlushFileBuffers requires write access, which is not always
+        // available, and NTFS already provides metadata consistency
+        // guarantees that make directory fsync unnecessary.
+        let _ = path;
         Ok(())
     }
 
