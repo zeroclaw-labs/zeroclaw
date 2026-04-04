@@ -1,6 +1,7 @@
 use crate::providers::ChatMessage;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json;
 use std::path::Path;
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
@@ -28,6 +29,27 @@ pub(crate) fn truncate_tool_result(output: &str, max_chars: usize) -> String {
     if max_chars == 0 || output.len() <= max_chars {
         return output.to_string();
     }
+
+    // Try to handle structured JSON tool results (used by OpenAI/DeepSeek/etc.)
+    // without corrupting the JSON envelope and losing the tool_call_id.
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(output) {
+        if let (Some(id), Some(content)) = (
+            value.get("tool_call_id").and_then(|v| v.as_str()),
+            value.get("content").and_then(|v| v.as_str()),
+        ) {
+            // Truncate only the inner content string.
+            let id = id.to_string();
+            let truncated_content = truncate_tool_result(content, max_chars);
+
+            // Rebuild the JSON envelope
+            return serde_json::json!({
+                "tool_call_id": id,
+                "content": truncated_content
+            })
+            .to_string();
+        }
+    }
+
     let head_len = max_chars * 2 / 3;
     let tail_len = max_chars.saturating_sub(head_len);
     let head_end = floor_char_boundary(output, head_len);
@@ -169,4 +191,32 @@ pub(crate) fn save_interactive_session_history(path: &Path, history: &[ChatMessa
     let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
     std::fs::write(path, payload)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_tool_result_preserves_json_structure() {
+        // Mock a tool result JSON string as seen in OpenAI provider
+        let tool_call_id = "call_1234567890abcdef";
+        let content = "x".repeat(5000);
+        let json_content = serde_json::json!({
+            "tool_call_id": tool_call_id,
+            "content": content
+        })
+        .to_string();
+
+        // Truncate to 2000 chars
+        let truncated = truncate_tool_result(&json_content, 2000);
+
+        // This should now be VALID JSON because of the fix
+        let parsed: serde_json::Value = serde_json::from_str(&truncated).expect("Should be valid JSON");
+
+        assert_eq!(parsed.get("tool_call_id").unwrap().as_str().unwrap(), tool_call_id);
+        let inner_content = parsed.get("content").unwrap().as_str().unwrap();
+        assert!(inner_content.contains("characters truncated"));
+        assert!(inner_content.len() < 5000);
+    }
 }
